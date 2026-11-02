@@ -38,6 +38,13 @@ fn surface() -> crate::config::agent_surface::AgentSurface {
     let mut surface = helpers::build_minimal_outbound_channel();
     surface.surface_id = "fabric-transit-surface".to_string();
     surface.name = "fabric-transit-surface".to_string();
+    surface
+        .access_point
+        .caller_authentication = Some(
+        serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/agent"] }] }))
+        .unwrap(),
+    );
     let transit = surface
         .transit
         .as_mut()

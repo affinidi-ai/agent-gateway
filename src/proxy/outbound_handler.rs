@@ -4626,6 +4626,10 @@ pub(crate) fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<St
                 .filter(|_| {
                     ctx.virtual_channel
                         .delegated_credentials_for_fabric_callers
+                        && ctx
+                            .surface
+                            .fabric_caller_authentication_gap()
+                            .is_none()
                 });
         }
         return claims
@@ -12342,7 +12346,7 @@ mod tests {
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let mut state = test_outbound_state();
         state.mcp_continuations = Some(continuation_runtime(now, 60));
-        let mut surface = test_surface();
+        let mut surface = telling_users_apart(test_surface());
         surface.outbound_credentials =
             vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
         let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
@@ -12445,7 +12449,7 @@ mod tests {
             let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("consent"));
             point["delegated_credentials_for_fabric_callers"] = json!(true);
             point["protocol"] = json!(protocol);
-            let surface = transit_surface(json!([point]), json!([]));
+            let surface = telling_users_apart(transit_surface(json!([point]), json!([])));
             let (resolved, point) = resolved_transit_point(&surface, None, "partner");
             let mut ctx = legacy_delegation_context(resolved, point);
             let mut claims = verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash);
@@ -14848,6 +14852,21 @@ mod tests {
         point
     }
 
+    /// `surface` with caller authentication that tells a partner's users
+    /// apart: a JWT that names an audience.
+    fn telling_users_apart(
+        mut surface: crate::config::agent_surface::AgentSurface
+    ) -> crate::config::agent_surface::AgentSurface {
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] }] }))
+            .unwrap(),
+        );
+        surface
+    }
+
     fn transit_surface(
         points: serde_json::Value,
         variants: serde_json::Value,
@@ -15392,7 +15411,7 @@ mod tests {
         let call = |opted_in: bool, claims: crate::proxy::transit_token::TransitTokenClaims| {
             let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"));
             point["delegated_credentials_for_fabric_callers"] = json!(opted_in);
-            let surface = transit_surface(json!([point]), json!([]));
+            let surface = telling_users_apart(transit_surface(json!([point]), json!([])));
             let (resolved, point) = resolved_transit_point(&surface, None, "partner");
             let mut ctx = legacy_delegation_context(resolved, point);
             ctx.transit_token_claims = Some(claims);
@@ -15421,6 +15440,21 @@ mod tests {
             "the caller the receiving surface verified keys its grant on a Transit Point that opts in"
         );
         refused(call(false, verified_fabric_claims(Some(peer_did), &alice_hash))).await;
+
+        // A surface stored with the switch and caller authentication that
+        // cannot tell a partner's users apart, here an API key, releases
+        // nothing, whatever principal the token carries.
+        let mut shared_key = call(true, verified_fabric_claims(Some(peer_did), &alice_hash));
+        let mut surface = (*shared_key.surface).clone();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{ "type": "api_key", "secret_id": "keys",
+                "extraction": { "source": "http_header", "field": "x-api-key" } }] }))
+            .unwrap(),
+        );
+        shared_key.surface = Arc::new(surface);
+        refused(shared_key).await;
 
         // The peer's word about its caller never keys a grant: not its DID, not
         // a top-level hash, whatever grants exist under them.

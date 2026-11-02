@@ -136,13 +136,15 @@ impl AgentSurface {
 
     /// Why this surface's caller authentication cannot tell apart the users a
     /// paired gateway sends requests for over Fabric, or `None` when it can.
-    /// Delegated per-user credentials for Fabric callers, on the surface's
-    /// Target or its Transit Points, are keyed by the caller it verifies, so
+    /// Delegated per-user credentials for Fabric callers on its Transit Points
+    /// are keyed by the caller it verifies, so
     /// only a credential that names the end user keeps one user's grant from
     /// another's: a resource token (`mcp_http.authorization`), or a
     /// `jwt_bearer` method with an audience (its own, or the one
     /// `protected_resource` binds) and a JWT verification strategy. The admin
-    /// API also checks that the strategy names an issuer.
+    /// API also checks that the strategy names an issuer. An `mtls` method
+    /// never verifies a request that arrives over Fabric, so it is no gap: it
+    /// leaves such a request with no verified caller, which is refused.
     pub fn fabric_caller_authentication_gap(&self) -> Option<&'static str> {
         use crate::source_auth::SourceAuthConfig;
         let methods = self
@@ -159,7 +161,10 @@ impl AgentSurface {
             .mcp_http
             .as_ref()
             .is_some_and(|http| http.authorization.is_some());
-        if methods.is_empty() {
+        let verifies_over_fabric = methods
+            .iter()
+            .any(|method| !matches!(method, SourceAuthConfig::Mtls(_)));
+        if !verifies_over_fabric {
             return (!resource_tokens).then_some("it verifies no caller");
         }
         methods
@@ -195,20 +200,8 @@ impl AgentSurface {
                 SourceAuthConfig::DidAuth(_) => {
                     Some("a did_auth session names the DID that signed in, not the user a partner acts for")
                 }
-                SourceAuthConfig::Mtls(_) => Some("an mtls method never verifies a request that arrives over Fabric"),
+                SourceAuthConfig::Mtls(_) => None,
             })
-    }
-
-    /// Whether the Target's per-user delegated credentials are released to
-    /// requests a paired gateway sends over Fabric: the surface sets
-    /// `delegated_credentials_for_fabric_callers` and its caller
-    /// authentication tells a partner's users apart. A surface stored with the
-    /// switch and any other caller authentication releases none.
-    pub fn releases_delegated_credentials_to_fabric_callers(&self) -> bool {
-        self.delegated_credentials_for_fabric_callers
-            && self
-                .fabric_caller_authentication_gap()
-                .is_none()
     }
 
     /// Slot 1 — caller identity extracted from inbound request (CA → AP).
@@ -879,7 +872,6 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            delegated_credentials_for_fabric_callers: false,
         }
     }
 

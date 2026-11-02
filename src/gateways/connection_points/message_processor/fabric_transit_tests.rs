@@ -251,9 +251,9 @@ fn a2a_body() -> Value {
 /// request a peer sends, whatever tokens the peer sent: valid for each of the
 /// surface's Transit Points and no other, naming the peer's record and issuer
 /// DID and the Fabric crossings the request made, continuing the request's
-/// trace, and carrying the principal the surface's `source_auth` verified only
-/// as `fabric.principal_hash`, never as the top-level `user_identity_hash`. The
-/// hop count header never reaches the agent.
+/// trace. The surface's API key names every key in its secret as one caller,
+/// so the token carries no principal for it, and never a top-level
+/// `user_identity_hash`. The hop count header never reaches the agent.
 #[tokio::test]
 async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it() {
     if ran_in_child("ATG_FABRIC_TRANSIT_TOKEN_CHILD").await {
@@ -291,13 +291,6 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
         None,
         "a key the surface refused verifies no caller"
     );
-    let verified_caller = crate::source_auth::AuthenticatedIdentity::ApiKey {
-        key_name: "peer-callers".to_string(),
-        provider_agent_id: None,
-    }
-    .principal_hash(None);
-    assert!(verified_caller.is_some());
-
     for (case, hops_header, expected_hops) in [("an older peer", None, 1), ("three crossings", Some("3"), 3)] {
         let mut headers = json!({ "content-type": "application/json", "x-api-key": CALLER_KEY,
             "X-Transit-Token": "token-the-peer-sent", "x-transit-token": "another-token-the-peer-sent" });
@@ -341,7 +334,7 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
                 peer_issuer_did: Some(PEER_ISSUER_DID.to_string()),
                 hops: expected_hops,
                 caller_did: None,
-                principal_hash: verified_caller.clone(),
+                principal_hash: None,
             }),
             "{case}"
         );
@@ -390,8 +383,8 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
         claims
             .fabric
             .and_then(|fabric| fabric.principal_hash),
-        verified_caller,
-        "the principal is the key the surface verified, never the identity the payload names"
+        None,
+        "a key the surface verified names no user, and the identity the payload names is never the principal"
     );
 }
 
@@ -700,6 +693,14 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     let issuer = test_issuer();
     let mut surface = surface("a2a", "https://agent.example", &["crm", "billing"]);
     surface.tenant_id = Some("tenant-a".to_string());
+    let shared_key_surface = surface.clone();
+    surface
+        .access_point
+        .caller_authentication = Some(
+        serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": "idp", "audiences": [JWT_AUDIENCE] }] }))
+        .unwrap(),
+    );
     let transit = surface
         .transit
         .as_mut()
@@ -771,6 +772,33 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
         Value::Object(verified.caller_context_fields),
         json!({ "email": "alice@example.com", "name": "Alice" }),
         "the claims some Transit Point of the surface allowlists"
+    );
+
+    let key = crate::source_auth::AuthenticatedIdentity::ApiKey {
+        key_name: "peer-callers".to_string(),
+        provider_agent_id: None,
+    };
+    let mut keyed = caller(None, IdentityVerification::Unverified);
+    keyed.verified_identity = Some(&key);
+    let (token, _) = fabric_receive_transit_token(
+        Some(&issuer),
+        Some(30),
+        &shared_key_surface,
+        "https://agent.example/rpc",
+        false,
+        &keyed,
+        Some("trace"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        issuer
+            .validate(&token, 300)
+            .unwrap()
+            .fabric
+            .and_then(|fabric| fabric.principal_hash),
+        None,
+        "an API key the surface verified names every key in its secret as one caller, so no principal"
     );
 }
 
@@ -872,58 +900,6 @@ async fn install_delegation_stores(
     super::init_gateway_base_url("https://receiver.example".to_string()).await;
 }
 
-/// A receiving gateway under `root` whose surface, `surface` with its caller
-/// authentication replaced, verifies a JWT `fixture`'s issuer signs for
-/// [`JWT_AUDIENCE`].
-async fn jwt_receiver(
-    root: &std::path::Path,
-    fixture: &crate::component_tests::helpers::jwt::JwksFixture,
-    mut surface: AgentSurface,
-) -> (Gateway, tempfile::TempDir) {
-    use crate::jwt_bearer::storage::JwtVerificationStrategyStorage;
-    let strategies = Arc::new(
-        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.join("strategies"))
-            .await
-            .unwrap(),
-    );
-    let strategy = strategies
-        .create(
-            serde_json::from_value(json!({
-                "id": "partner-idp", "name": "Partner IdP", "expected_issuer": fixture.issuer,
-                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
-                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    surface
-        .access_point
-        .caller_authentication = Some(
-        serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
-            "jwt_verification_strategy_id": strategy.id, "audiences": [JWT_AUDIENCE] }] }))
-        .unwrap(),
-    );
-    receiver_with_strategies(root, &surface, strategies).await
-}
-
-/// A JWT `fixture`'s issuer signs for `subject` and [`JWT_AUDIENCE`], and the
-/// identity hash the receiving surface computes for it.
-fn user_jwt(
-    fixture: &crate::component_tests::helpers::jwt::JwksFixture,
-    subject: &str,
-) -> (String, String) {
-    use crate::component_tests::helpers::jwt::{now_secs, sign_jwt};
-    let claims = json!({ "iss": fixture.issuer, "sub": subject, "aud": JWT_AUDIENCE, "exp": now_secs() + 300 });
-    let hash = crate::source_auth::AuthenticatedIdentity::JwtBearer {
-        subject: subject.to_string(),
-        claims: claims.clone(),
-    }
-    .principal_hash(None)
-    .unwrap();
-    (sign_jwt(claims, &fixture.kid), hash)
-}
-
 /// An A2A request whose agent identity extension names `metadata`.
 fn naming(metadata: Value) -> Value {
     let mut body = a2a_body();
@@ -950,16 +926,13 @@ async fn refused(message: &ReceivedMessage) -> (Value, Value, Vec<(RejectionStag
     (response, body, rejected)
 }
 
-/// A partner's request reaches a per-user credential of the Target only on a
-/// surface that sets `delegated_credentials_for_fabric_callers`. Without it, a
+/// A partner's request never reaches a per-user credential of the Target. A
 /// request a per-user binding applies to is refused with `403` and a fixed
 /// reason before the Target is called, and recorded as a `request_rejected`,
-/// even when a grant is stored for the caller the surface verified. A
-/// partner's key names every one of its users alike, so a surface that
-/// verifies one releases nothing to partners even when it is stored with the
-/// switch, which the admin API refuses for it.
+/// even when a grant is stored for the caller the surface verified or for the
+/// one the peer names.
 #[tokio::test]
-async fn a_partner_request_gets_no_per_user_credential_on_a_surface_that_does_not_opt_in() {
+async fn a_partner_request_gets_no_per_user_credential_on_fabric_receive() {
     if ran_in_child("ATG_FABRIC_RECEIVE_NOT_OPTED_IN_CHILD").await {
         return;
     }
@@ -974,34 +947,27 @@ async fn a_partner_request_gets_no_per_user_credential_on_a_surface_that_does_no
     }
     .principal_hash(None)
     .unwrap();
-    install_delegation_stores(root.path(), &target.url, &[(partner.as_str(), "partner-access")]).await;
+    install_delegation_stores(
+        root.path(),
+        &target.url,
+        &[(partner.as_str(), "partner-access"), ("did:web:alice.example", "alice-did-access")],
+    )
+    .await;
 
-    for opted_in in [false, true] {
-        delegating.delegated_credentials_for_fabric_callers = opted_in;
-        FileSystemAgentSurfaceStore::new(
-            root.path()
-                .join("agent_surfaces"),
-        )
-        .await
-        .unwrap()
-        .save(&delegating)
-        .await
-        .unwrap();
-        for user in ["alice", "bob"] {
-            let (response, body, rejected) = refused(&forward_request(
-                root.path(),
-                json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
-                naming(json!({ "agentId": user })),
-            ))
-            .await;
-            assert_eq!(response["status"], 403, "{opted_in} {user}: {response}");
-            assert_eq!(body["reason"], "delegation_not_enabled_for_partners", "{opted_in} {user}: {body}");
-            assert_eq!(
-                rejected,
-                [(RejectionStage::Admission, RejectionReason::DelegationNotEnabledForPartners, true)],
-                "{opted_in} {user}"
-            );
-        }
+    for named in [json!({ "agentId": "alice" }), json!({ "agentId": "bob", "did": "did:web:alice.example" })] {
+        let (response, body, rejected) = refused(&forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+            naming(named.clone()),
+        ))
+        .await;
+        assert_eq!(response["status"], 403, "{named}: {response}");
+        assert_eq!(body["reason"], "delegation_not_enabled_for_partners", "{named}: {body}");
+        assert_eq!(
+            rejected,
+            [(RejectionStage::Admission, RejectionReason::DelegationNotEnabledForPartners, true)],
+            "{named}"
+        );
     }
     assert!(target.received().is_empty(), "the Target is never called");
 }
@@ -1044,104 +1010,6 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
     assert_eq!(body["reason"], "partner_caller_not_verified", "{body}");
     assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
     assert_eq!(target.received().len(), reached, "the Target is not called");
-}
-
-/// On a surface that opts in, the receiving surface keys its Target's
-/// per-user grants only by the caller its own caller authentication verified.
-/// A pseudonym or DID the peer's request names never selects a stored grant,
-/// even one stored under exactly that identity, and without a verified caller
-/// a binding that applies refuses the request before the Target is called.
-#[tokio::test]
-async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive() {
-    if ran_in_child("ATG_FABRIC_RECEIVE_DELEGATION_CHILD").await {
-        return;
-    }
-    use sha2::Digest;
-
-    let fixture = crate::component_tests::helpers::jwt::JwksFixture::start().await;
-    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
-    let root = tempfile::tempdir().unwrap();
-    let mut delegating = surface("a2a", &target.url, &[]);
-    delegating.outbound_credentials = vec![binding(PER_USER_PROVIDER)];
-    delegating.delegated_credentials_for_fabric_callers = true;
-    let _receiver = jwt_receiver(root.path(), &fixture, delegating).await;
-    let (jwt, user) = user_jwt(&fixture, "user-123");
-    let victim_pseudonym = format!("sha256:{:x}", sha2::Sha256::digest(b"\"victim\""));
-    install_delegation_stores(
-        root.path(),
-        &target.url,
-        &[
-            (user.as_str(), "user-123-access"),
-            (victim_pseudonym.as_str(), "victim-pseudonym-access"),
-            ("did:web:victim.example", "victim-did-access"),
-        ],
-    )
-    .await;
-    let send = |authorization: Option<&str>, metadata: Value| {
-        let mut headers = json!({ "content-type": "application/json" });
-        if let Some(authorization) = authorization {
-            headers["authorization"] = json!(format!("Bearer {authorization}"));
-        }
-        forward_request(root.path(), headers, naming(metadata))
-    };
-
-    for metadata in [json!({ "agentId": "victim" }), json!({ "agentId": "victim", "did": "did:web:victim.example" })] {
-        let response = forward_response(&send(Some(&jwt), metadata.clone())).await;
-        assert_eq!(response["status"], 200, "{metadata}: {response}");
-        let received = target
-            .received()
-            .pop()
-            .unwrap();
-        assert_eq!(
-            header_values(&received, "authorization"),
-            ["Bearer user-123-access"],
-            "{metadata}: the caller the surface verified, never the one the peer named"
-        );
-    }
-
-    let reached = target.received().len();
-    let (response, body, _) = refused(&send(None, json!({ "agentId": "victim" }))).await;
-    assert_eq!(response["status"], 403, "no caller the surface verified: {response}");
-    assert_eq!(body["reason"], "partner_caller_not_verified", "{body}");
-    assert_eq!(target.received().len(), reached, "the Target is not called");
-}
-
-/// A partner's request never starts consent. Whoever completes an
-/// authorization URL binds their account to the caller it names, and on Fabric
-/// it would travel through the partner, so an opted-in caller with no grant
-/// is refused with `403` and a fixed reason, with no authorization URL,
-/// recorded as a `request_rejected`, and the Target is not called.
-#[tokio::test]
-async fn a_partner_request_never_starts_consent_for_a_per_user_credential() {
-    if ran_in_child("ATG_FABRIC_RECEIVE_NO_CONSENT_CHILD").await {
-        return;
-    }
-    let fixture = crate::component_tests::helpers::jwt::JwksFixture::start().await;
-    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
-    let root = tempfile::tempdir().unwrap();
-    let mut delegating = surface("a2a", &target.url, &[]);
-    delegating.outbound_credentials = vec![binding(PER_USER_PROVIDER)];
-    delegating.delegated_credentials_for_fabric_callers = true;
-    let _receiver = jwt_receiver(root.path(), &fixture, delegating).await;
-    install_delegation_stores(root.path(), &target.url, &[]).await;
-    let (jwt, _) = user_jwt(&fixture, "user-without-a-grant");
-
-    let (response, body, rejected) = refused(&forward_request(
-        root.path(),
-        json!({ "content-type": "application/json", "authorization": format!("Bearer {jwt}") }),
-        a2a_body(),
-    ))
-    .await;
-    assert_eq!(response["status"], 403, "{response}");
-    assert_eq!(body["reason"], "consent_not_available_for_partners", "{body}");
-    assert!(
-        !response
-            .to_string()
-            .contains("provider.example/authorize"),
-        "no authorization URL: {response}"
-    );
-    assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentNotAvailableForPartners, true)]);
-    assert!(target.received().is_empty(), "the Target is not called");
 }
 
 /// Each receive-side refusal of delegated credentials answers `403`: an MCP

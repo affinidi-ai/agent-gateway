@@ -175,11 +175,6 @@ pub struct SurfaceOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_credentials: Option<Vec<OutboundCredentialBinding>>,
 
-    /// Per-variant `delegated_credentials_for_fabric_callers`. `None` keeps the
-    /// base surface's, except in `complete` mode, where it is off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegated_credentials_for_fabric_callers: Option<bool>,
-
     /// Per-variant override of the management dashboard's opaque canvas
     /// blob (positions, viewport, canvas-only NPC/human/caller nodes).
     /// When `Some`, replaces the base surface's `canvas` wholesale at
@@ -202,9 +197,6 @@ impl SurfaceOverrides {
             && self.identity_slots.is_none()
             && self
                 .outbound_credentials
-                .is_none()
-            && self
-                .delegated_credentials_for_fabric_callers
                 .is_none()
             && self.canvas.is_none()
     }
@@ -834,13 +826,6 @@ impl AgentSurface {
         if let Some(creds) = overrides.outbound_credentials {
             resolved.outbound_credentials = creds;
         }
-        if complete {
-            resolved.delegated_credentials_for_fabric_callers = overrides
-                .delegated_credentials_for_fabric_callers
-                .unwrap_or(false);
-        } else if let Some(opted_in) = overrides.delegated_credentials_for_fabric_callers {
-            resolved.delegated_credentials_for_fabric_callers = opted_in;
-        }
         // Per-variant canvas blob fully replaces the base — the
         // dashboard captures positions for variant-only TPs and any
         // canvas-only NPCs (e.g. "External Target" connected to a
@@ -1020,7 +1005,6 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            delegated_credentials_for_fabric_callers: false,
         }
     }
 

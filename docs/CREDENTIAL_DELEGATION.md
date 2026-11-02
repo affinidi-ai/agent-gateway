@@ -174,7 +174,10 @@ A transit token the gateway issued for a request that arrived over Fabric (see
 sets `delegated_credentials_for_fabric_callers: true` (off by default), and then only by its
 `fabric.principal_hash`: the caller the receiving surface's own `source_auth` or resource token
 verified on that request, the same identity hash its Access Point computes for the same
-credential. The caller DID or pseudonym the peer gateway sent, and a top-level
+credential. The receiving surface sets it only when its caller authentication tells a partner's
+users apart, and the Transit Point checks its own surface again at call time, so a surface stored
+with the switch and an API key, for example through a file, releases nothing to partners. The
+caller DID or pseudonym the peer gateway sent, and a top-level
 `user_identity_hash`, never key a grant, and the caller DID is never the agent half of a key
 either, so such a call needs the Transit Point's managed identity: its own `managed_identity`,
 or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
@@ -261,12 +264,13 @@ The admin API refuses the switch, with `400`, on a surface or variant whose call
 authentication cannot tell a partner's users apart. Only two kinds can: a resource token
 (`mcp_http.authorization`), and a `jwt_bearer` method that names an audience (its own
 `audiences`, or the resource `protected_resource` binds) through a JWT verification strategy
-that names an issuer. Every method the Access Point lists must be one of them: `api_key` names
-every key in its secret as one caller, the partner's and direct callers' alike; an
+that names an issuer. Every other method the Access Point lists must be one of them, or mTLS,
+which never verifies a request over Fabric and so leaves it with no verified caller: `api_key`
+names every key in its secret as one caller, the partner's and direct callers' alike; an
 `api_key_provider` key names the client that holds it; a `did_auth` session names the DID that
-signed in, not the user a partner acts for; mTLS never verifies a request over Fabric; and a
-`jwt_bearer` method with no audience accepts a token the identity provider issued for another
-service. The same rule refuses a Transit Point's switch of that name (see
+signed in, not the user a partner acts for; and a `jwt_bearer` method with no audience accepts a
+token the identity provider issued for another service. A surface that lists only mTLS, and no
+resource token, verifies no caller and is refused too. The same rule refuses a Transit Point's switch of that name (see
 [The caller on a Transit Point](#the-caller-on-a-transit-point)). A surface stored with the
 switch and any other caller authentication, for example through a file, releases nothing to
 partners. A `PUT` that omits the switch, on the surface or in a variant's overrides, keeps it

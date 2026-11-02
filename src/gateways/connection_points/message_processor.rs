@@ -4135,7 +4135,13 @@ pub(super) fn fabric_receive_transit_token(
                 .map(str::to_string),
             hops: caller.hops,
             caller_did: caller_did.map(str::to_string),
-            principal_hash: crate::proxy::handler::source_auth_user_hash(caller.verified_identity, surface),
+            principal_hash: crate::proxy::handler::source_auth_user_hash(caller.verified_identity, surface).filter(
+                |_| {
+                    surface
+                        .fabric_caller_authentication_gap()
+                        .is_none()
+                },
+            ),
         },
     };
     match issuer.issue_for_fabric_request(request, surface.issued_transit_token_lifetime_secs(max_lifetime_secs)) {
@@ -5853,8 +5859,7 @@ async fn process_forward_request_in_request_scope(
         let called_tool = crate::mcp::tool_analyzer::called_tool_name(&body_bytes);
         let refusal = if !fabric_delegation_applies(&outbound_creds, called_tool.as_deref()) {
             None
-        } else if !surface.releases_delegated_credentials_to_fabric_callers()
-            && fabric_per_user_binding_applies(
+        } else if fabric_per_user_binding_applies(
                 &outbound_creds,
                 called_tool.as_deref(),
                 get_credential_provider_store().as_ref(),
