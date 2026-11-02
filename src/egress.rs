@@ -1129,6 +1129,40 @@ mod tests {
     }
 
     #[test]
+    fn pin_url_refuses_a_hostname_that_resolves_to_a_blocked_address() {
+        let checked = std::cell::RefCell::new(Vec::new());
+        let result = pin_url(Url::parse("http://localhost:9/agent").unwrap(), |ip| {
+            checked.borrow_mut().push(ip);
+            ip.is_loopback()
+        });
+
+        let Err(EgressError::Blocked(reason)) = result else {
+            panic!("a hostname resolving to a blocked address must be refused, got {result:?}");
+        };
+        assert!(reason.starts_with("host 'localhost' resolves to blocked address"), "{reason}");
+        assert!(
+            !checked.borrow().is_empty()
+                && checked
+                    .borrow()
+                    .iter()
+                    .all(IpAddr::is_loopback),
+            "{checked:?}"
+        );
+
+        let pinned = pin_url(Url::parse("http://localhost:9/agent").unwrap(), is_cloud_metadata_resolved_ip)
+            .expect("localhost is not a metadata address");
+        assert_eq!(pinned.host, "localhost");
+        assert!(
+            pinned
+                .addrs
+                .iter()
+                .all(|addr| addr.ip().is_loopback() && addr.port() == 9),
+            "{:?}",
+            pinned.addrs
+        );
+    }
+
+    #[test]
     fn pinned_forward_client_reports_a_host_that_does_not_resolve_as_dns() {
         let result = pinned_forward_client("http://nonexistent.host.invalid/agent", Duration::from_secs(5));
         assert!(matches!(result, Err(EgressError::Dns(_))), "got {result:?}");

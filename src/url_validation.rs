@@ -588,6 +588,23 @@ mod tests {
         assert!(result.is_ok(), "Expected '{}' to be allowed, but got error: {}", url, result.unwrap_err());
     }
 
+    #[test]
+    fn a_resolved_cloud_metadata_address_is_recognised_in_every_form() {
+        use std::net::IpAddr;
+        let metadata: Vec<IpAddr> = CLOUD_METADATA_IPV4
+            .iter()
+            .map(|ip| IpAddr::V4(*ip))
+            .chain(["fd00:ec2::254", "::ffff:169.254.169.254", "::ffff:100.100.100.200"].map(|ip| ip.parse().unwrap()))
+            .collect();
+        assert_eq!(metadata.len(), 7);
+        for ip in metadata {
+            assert!(is_cloud_metadata_resolved_ip(ip), "{ip} must be a metadata address");
+        }
+        for ip in ["127.0.0.1", "::1", "10.0.0.1", "169.254.1.1"] {
+            assert!(!is_cloud_metadata_resolved_ip(ip.parse().unwrap()), "{ip} must not be a metadata address");
+        }
+    }
+
     // ── Cloud metadata IPs ──────────────────────────────────────────────
 
     #[test]
