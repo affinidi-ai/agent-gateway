@@ -281,8 +281,9 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
 
 /// The signed-JWT settings of an external consent provider: only a client
 /// that authenticates with `private_key_jwt` has them, and then it needs a
-/// signing key, signs with RS256 or PS256, names an `https` audience if any,
-/// and is itself the issuer and subject of its assertion.
+/// signing key, signs with RS256 or PS256, names no audience, since its
+/// assertion is always addressed to its issuer, and is itself the issuer and
+/// subject of its assertion.
 fn validate_client_assertion(
     provider: &CredentialProvider,
     method: crate::credential_providers::TokenEndpointAuthMethod,
@@ -319,12 +320,10 @@ fn validate_client_assertion(
     {
         return Err(Invalid("private_key_jwt signs with RS256 or PS256"));
     }
-    if jwt
-        .jwt_audience
-        .as_deref()
-        .is_some_and(|audience| !is_strict_https_url(audience))
-    {
-        return Err(Invalid("jwt_audience must be a public https URL"));
+    if jwt.jwt_audience.is_some() {
+        return Err(Invalid(
+            "a private_key_jwt client's assertion is always addressed to its issuer, so jwt_audience is refused",
+        ));
     }
     Ok(())
 }
@@ -1039,6 +1038,9 @@ pub(crate) mod tests {
             ("another issuer", |p| p.jwt.jwt_issuer = Some("someone@example.com".into())),
             ("another subject", |p| p.jwt.jwt_subject = Some("someone".into())),
             ("an http audience", |p| p.jwt.jwt_audience = Some("http://203.0.113.10/token".into())),
+            ("an audience, which is always the issuer", |p| {
+                p.jwt.jwt_audience = Some("https://203.0.113.10/token".into())
+            }),
         ];
         for (case, change) in cases {
             let mut provider = signing.clone();

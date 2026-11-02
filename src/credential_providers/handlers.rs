@@ -160,9 +160,11 @@ async fn validate_consent_strategy(
     Ok(())
 }
 
+/// Refuse a secret reference that `may_use`, given the secret's tenant, does
+/// not admit, or the caller's scope does not cover.
 async fn validate_secret_references(
     state: &CredentialProviderState,
-    tenant_id: Option<&str>,
+    may_use: impl Fn(Option<&str>) -> bool,
     references: impl IntoIterator<Item = Option<&str>>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
@@ -180,7 +182,7 @@ async fn validate_secret_references(
                 ProviderValidationError::SecretLookupFailed
             })?
             .ok_or(ProviderValidationError::SecretNotAccessible)?;
-        if !can_reference(tenant_id, secret.tenant_id.as_deref())
+        if !may_use(secret.tenant_id.as_deref())
             || !scope_allows_resource(
                 resource_scope(scope),
                 tenant_context(context),
@@ -337,7 +339,7 @@ async fn validate_provider_settings(
     validate_jwt_provider(provider)?;
     validate_secret_references(
         state,
-        provider.tenant_id.as_deref(),
+        |secret_tenant_id| provider.may_use_secret(secret_tenant_id),
         [
             provider
                 .client_id_secret_ref
@@ -1126,7 +1128,7 @@ async fn validate_key_material_request(
     }
     validate_secret_references(
         state,
-        tenant_id,
+        |secret_tenant_id| can_reference(tenant_id, secret_tenant_id),
         [
             jwt.jwt_signing_key_secret_ref
                 .as_deref(),
@@ -2267,6 +2269,84 @@ mod external_provider_tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// An external consent provider uses its own tenant's secrets only, for
+    /// its client secret and its signing key: never an untenanted operator
+    /// secret, nor another tenant's. An untenanted provider uses untenanted
+    /// ones only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_external_provider_references_only_its_own_tenants_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata();
+        metadata
+            .token_endpoint_auth_methods_supported
+            .as_mut()
+            .unwrap()
+            .push("private_key_jwt".into());
+        let state = state(&directory, Ok(metadata)).await;
+        let key = crate::delegation_vault::jwt_assertion::test_keys::rsa_pkcs8();
+        for (secret_id, tenant) in
+            [("tenant-a-secret", Some("tenant-a")), ("operator-secret", None), ("tenant-b-secret", Some("tenant-b"))]
+        {
+            state
+                .secrets_store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant.map(str::to_string),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: key.private_pem.clone(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let request = |slug: &str, method: &str, secret: &str| {
+            create_request(|body| {
+                body["provider_id"] = json!(slug);
+                body["token_endpoint_auth_method"] = json!(method);
+                if method == "private_key_jwt" {
+                    body["jwt_signing_key_secret_ref"] = json!(secret);
+                } else {
+                    body["client_secret_secret_ref"] = json!(secret);
+                }
+            })
+        };
+        for method in ["client_secret_post", "private_key_jwt"] {
+            for secret in ["operator-secret", "tenant-b-secret"] {
+                let (status, body) = create(&state, "tenant-a", request("refused", method, secret)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{method} with {secret}: {body}");
+                assert_eq!(body["error"], "Secret reference is not accessible", "{method} with {secret}");
+            }
+            let (status, body) =
+                create(&state, "tenant-a", request(&format!("own-{method}"), method, "tenant-a-secret")).await;
+            assert_eq!(status, StatusCode::CREATED, "{method} with its own tenant's secret: {body}");
+
+            let operator = |secret: &str| {
+                create_provider(
+                    State(state.clone()),
+                    None,
+                    None,
+                    None,
+                    request(&format!("operator-{method}-{secret}"), method, secret),
+                )
+            };
+            let refused = operator("tenant-a-secret")
+                .await
+                .into_response();
+            assert_eq!(
+                refused.status(),
+                StatusCode::BAD_REQUEST,
+                "an operator provider with a tenant's {method} secret"
+            );
+            let created = operator("operator-secret")
+                .await
+                .into_response();
+            assert_eq!(created.status(), StatusCode::CREATED, "an operator provider with an operator {method} secret");
+        }
+        assert_eq!(stored(&state).await.len(), 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

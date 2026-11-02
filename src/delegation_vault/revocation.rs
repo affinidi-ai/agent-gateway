@@ -614,8 +614,10 @@ impl ClientCredential {
     /// The authentication of `provider`'s client on one request. A
     /// `private_key_jwt` client signs a new assertion
     /// ([`super::jwt_assertion::client_auth_assertion_claims`]), so each
-    /// request has its own `jti`. `None` when the credential does not fit the
-    /// method or the assertion cannot be signed.
+    /// request has its own `jti`, addressed to the provider's issuer, the
+    /// audience RFC 7523bis requires, never to an endpoint its tenant wrote.
+    /// `None` when the credential does not fit the method or the assertion
+    /// cannot be signed.
     pub(super) fn authenticate(
         &self,
         provider: &CredentialProvider,
@@ -633,12 +635,13 @@ impl ClientCredential {
                 (Vec::new(), Some(basic_authorization(client_id, secret)))
             }
             (TokenEndpointAuthMethod::PrivateKeyJwt, Self::SigningKey { key, certificate }) => {
-                let claims = super::jwt_assertion::client_auth_assertion_claims(
+                let mut claims = super::jwt_assertion::client_auth_assertion_claims(
                     provider,
                     client_id,
                     chrono::Utc::now().timestamp(),
                 )
                 .ok()?;
+                claims.aud = provider.issuer.clone()?;
                 let assertion = super::jwt_assertion::sign_assertion(
                     key,
                     provider.jwt_signing_algorithm()?,
@@ -672,8 +675,9 @@ impl ClientCredential {
 /// The `client_assertion_type` of a JWT client assertion (RFC 7523 section 2.2).
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
-/// The value of the secret `reference`, from `provider`'s own tenant or an
-/// untenanted secret.
+/// The value of the secret `reference`, when `provider` may use it
+/// ([`CredentialProvider::may_use_secret`]): an external consent provider's
+/// own tenant's only.
 async fn provider_secret(
     provider: &CredentialProvider,
     secrets: &Arc<dyn SecretsStore>,
@@ -684,7 +688,8 @@ async fn provider_secret(
         .await
         .ok()
         .flatten()?;
-    crate::tenancy::can_reference(provider.tenant_id.as_deref(), secret.tenant_id.as_deref())
+    provider
+        .may_use_secret(secret.tenant_id.as_deref())
         .then(|| zeroize::Zeroizing::new(secret.value))
 }
 
@@ -972,14 +977,16 @@ pub(crate) mod tests {
 
     /// A `private_key_jwt` client signs a new assertion for each request with
     /// the shared assertion code: issuer and subject its client id, audience
-    /// its token endpoint, and a `jti` of its own, its key read only from the
-    /// provider's tenant.
+    /// its issuer, never a `jwt_audience` nor the token endpoint, and a `jti`
+    /// of its own, its key read only from the provider's own tenant.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_private_key_jwt_client_signs_a_new_assertion_for_each_request() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let key = crate::delegation_vault::jwt_assertion::test_keys::rsa_pkcs8();
-        for (secret_id, tenant) in [("signing-key", Some("tenant-a")), ("other-tenant-key", Some("tenant-b"))] {
+        for (secret_id, tenant) in
+            [("signing-key", Some("tenant-a")), ("other-tenant-key", Some("tenant-b")), ("untenanted-key", None)]
+        {
             secrets
                 .create(crate::secrets::CreateSecretRequest {
                     tenant_id: tenant.map(str::to_string),
@@ -996,6 +1003,7 @@ pub(crate) mod tests {
         let server = RecordingServer::start(200).await;
         let mut signing = provider(Some(&server.url), "private_key_jwt", None);
         signing.token_endpoint = Some("https://203.0.113.10/token".to_string());
+        signing.jwt.jwt_audience = Some("https://honest.example/token".to_string());
         signing
             .jwt
             .jwt_signing_key_secret_ref = Some("signing-key".to_string());
@@ -1027,7 +1035,7 @@ pub(crate) mod tests {
                 .map(|(_, value)| value.clone())
                 .expect("a client assertion");
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::PS256);
-            validation.set_audience(&["https://203.0.113.10/token"]);
+            validation.set_audience(&["https://203.0.113.10"]);
             let claims = jsonwebtoken::decode::<serde_json::Value>(
                 &assertion,
                 &jsonwebtoken::DecodingKey::from_rsa_pem(key.public_pem.as_bytes()).unwrap(),
@@ -1046,17 +1054,48 @@ pub(crate) mod tests {
         }
         assert_eq!(ids.len(), 2, "each request has an assertion of its own");
 
-        signing
-            .jwt
-            .jwt_signing_key_secret_ref = Some("other-tenant-key".to_string());
+        for (other, case) in
+            [("other-tenant-key", "another tenant's key is never used"), ("untenanted-key", "nor an untenanted one")]
+        {
+            signing
+                .jwt
+                .jwt_signing_key_secret_ref = Some(other.to_string());
+            assert_eq!(
+                revoke(&signing, &grant(false), Some(&secrets), Some(&server.origin()))
+                    .await
+                    .outcome,
+                RevocationOutcome::ClientUnavailable,
+                "{case}"
+            );
+        }
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// An external consent provider's client secret is read only from the
+    /// provider's own tenant: an untenanted operator secret is never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untenanted_client_secret_is_never_sent_for_a_tenants_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, None).await;
+        let server = RecordingServer::start(200).await;
+        let tenants = provider(Some(&server.url), "client_secret_post", Some("client-secret"));
         assert_eq!(
-            revoke(&signing, &grant(false), Some(&secrets), Some(&server.origin()))
+            revoke(&tenants, &grant(false), Some(&secrets), Some(&server.origin()))
                 .await
                 .outcome,
-            RevocationOutcome::ClientUnavailable,
-            "another tenant's key is never used"
+            RevocationOutcome::ClientUnavailable
         );
-        assert_eq!(server.requests().len(), 2);
+        assert!(server.requests().is_empty());
+
+        let mut operators = tenants;
+        operators.tenant_id = None;
+        assert_eq!(
+            revoke(&operators, &grant(false), Some(&secrets), Some(&server.origin()))
+                .await
+                .outcome,
+            RevocationOutcome::Revoked,
+            "an untenanted provider uses an untenanted secret"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

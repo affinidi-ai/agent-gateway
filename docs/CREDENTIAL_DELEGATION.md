@@ -112,11 +112,18 @@ Its fields:
 | `revocation_endpoint` | The RFC 7009 endpoint, exactly when the issuer's metadata names one |
 | `client_id` | Required, a plain value: a client id is not a secret. `client_id_secret_ref` is refused |
 | `token_endpoint_auth_method` | `none`, `client_secret_basic`, `client_secret_post` or `private_key_jwt`. `client_secret_secret_ref` is required for `client_secret_basic` and `client_secret_post` and refused for the others |
-| `jwt_signing_key_secret_ref`, `jwt_certificate_secret_ref`, `jwt_key_id`, `jwt_signing_algorithm`, `jwt_audience` | Only with `private_key_jwt`, the [signed-JWT settings](#providers-that-sign-a-jwt) of an `oauth2_client_credentials_jwt_auth` provider: the signing key is required, the algorithm is `PS256` (the default) or `RS256`, and the audience, when set, a public `https` URL, the token endpoint by default. The key and certificate are checked when the provider is created and are read from the provider's tenant or an untenanted secret. `jwt_issuer` and `jwt_subject` are refused, since the client is the issuer and subject of its assertion. Without `private_key_jwt` all are refused |
+| `jwt_signing_key_secret_ref`, `jwt_certificate_secret_ref`, `jwt_key_id`, `jwt_signing_algorithm` | Only with `private_key_jwt`, the [signed-JWT settings](#providers-that-sign-a-jwt) of an `oauth2_client_credentials_jwt_auth` provider: the signing key is required and the algorithm is `PS256` (the default) or `RS256`. The key and certificate are checked when the provider is created. `jwt_audience` is refused, since the assertion is always addressed to the issuer, and so are `jwt_issuer` and `jwt_subject`, since the client is the issuer and subject of its assertion. Without `private_key_jwt` all are refused |
 | `callback_url` | Required, `https`: the redirect URI the other system registered |
 | `resource` | Required, a canonical public `https` URI (RFC 8707): the protected resource the grants are for. Its origin is the only one a Transit Point sends the provider's grants to ([External consent on a Transit Point](#external-consent-on-a-transit-point)), and it must be permitted for the issuer (below). The API returns it as `resource_origin`, so a client can show the person where the grant will go |
 | `allow_unadvertised_pkce` | Optional, `false` by default. `true` admits an issuer whose metadata does not list `code_challenge_methods_supported`; see below |
 | `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
+
+An external consent provider uses its own tenant's secrets only, for its client secret, its
+signing key and its certificate: never an untenanted secret, nor another tenant's, since its
+client authenticates at endpoints its tenant chose. An untenanted provider uses untenanted
+secrets only. Both are checked when the provider is created and again on every use, so a
+provider moved to another tenant stops using the secrets of the one it left. A provider without
+an `issuer` may use its own tenant's secrets or untenanted ones.
 
 Every endpoint, and `resource`, must be an `https` URL without credentials or fragment whose
 host is no literal loopback, private, link-local or cloud-metadata address (the Strict egress
@@ -774,11 +781,9 @@ says: `client_id` in the form for `none`, the id and secret in the form for
 `client_secret_post`, HTTP Basic for `client_secret_basic`, and for `private_key_jwt` the id with
 a client assertion (RFC 7523 section 2.2) signed for each request by the same code an
 `oauth2_client_credentials_jwt_auth` provider uses: issuer and subject the client id, audience
-`jwt_audience` or else the token endpoint, a `jti` of its own and a five-minute lifetime. Some
-servers want the revocation endpoint as the audience of a revocation's assertion; set
-`jwt_audience` to a value the server accepts at both endpoints, such as its issuer, when they
-differ. The secret or key is resolved from the provider's own tenant, or an untenanted secret,
-and never another tenant's. The call goes
+the provider's `issuer` (the authorization server's issuer identifier, as RFC 7523bis requires,
+never an endpoint), a `jti` of its own and a five-minute lifetime. The secret or key is resolved
+from the provider's own tenant only. The call goes
 through the pinned Strict egress client, `https` only, without redirects, ignoring any proxy,
 with a 10-second timeout per request, and its response body is never read or logged. One
 grant's revocation ends within 30 seconds wherever it waits, resolving its client's secret and

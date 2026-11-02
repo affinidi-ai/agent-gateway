@@ -342,6 +342,21 @@ impl CredentialProvider {
     pub fn is_external_consent(&self) -> bool {
         self.issuer.is_some()
     }
+
+    /// Whether this provider may use a secret of `secret_tenant_id`. An
+    /// external consent provider uses its own tenant's secrets only, an
+    /// untenanted one untenanted secrets only, since its client authenticates
+    /// at endpoints its tenant chose; any other provider its own tenant's or
+    /// an untenanted one.
+    pub fn may_use_secret(
+        &self,
+        secret_tenant_id: Option<&str>,
+    ) -> bool {
+        if self.is_external_consent() {
+            return self.tenant_id.as_deref() == secret_tenant_id;
+        }
+        crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
+    }
 }
 
 /// Request to create a new credential provider

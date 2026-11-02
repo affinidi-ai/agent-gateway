@@ -8,7 +8,9 @@ changes:
         a `token_endpoint_auth_method` (`none`, `client_secret_basic`, `client_secret_post` or
         `private_key_jwt`, whose client signs its assertion with a key named by the signed-JWT
         settings of an `oauth2_client_credentials_jwt_auth` provider, checked at create as
-        theirs are) and an RFC 7009 `revocation_endpoint`. Such an external consent provider is checked when
+        theirs are, and addresses it to the provider's issuer, so `jwt_audience` is refused) and
+        an RFC 7009 `revocation_endpoint`. An external provider uses its own tenant's secrets
+        only, checked when it is created and on every use. Such an external consent provider is checked when
         it is created: its endpoints must be public `https` URLs, it needs a public `https`
         `resource`, and the gateway reads the issuer's RFC 8414 or OpenID Connect metadata
         through a pinned fetch under the Strict egress posture, without requiring a `jwks_uri`,
