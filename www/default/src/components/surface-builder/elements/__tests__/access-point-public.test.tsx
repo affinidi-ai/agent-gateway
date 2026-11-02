@@ -158,7 +158,7 @@ describe('AccessPointPanel Public access switch', () => {
   });
 
   describe('on a surface stored without public', () => {
-    const renderLegacy = (config: Record<string, unknown>, readOnly = false) => {
+    const showLegacyPanel = (config: Record<string, unknown>, readOnly = false) => {
       const updateField = jest.fn();
       render(
         <SurfaceMetaProvider value={{ legacyAccessPoint: true, readOnly } as any}>
@@ -169,7 +169,7 @@ describe('AccessPointPanel Public access switch', () => {
     };
 
     it('shows the legacy state and closes the Access Point on request', () => {
-      const updateField = renderLegacy({});
+      const updateField = showLegacyPanel({});
 
       expect(screen.getByTestId('access-point-public-switch')).not.toBeChecked();
       expect(screen.getByTestId('access-point-legacy-notice')).toHaveTextContent(
@@ -180,13 +180,13 @@ describe('AccessPointPanel Public access switch', () => {
     });
 
     it('offers no close action when read-only', () => {
-      renderLegacy({}, true);
+      showLegacyPanel({}, true);
       expect(screen.getByTestId('access-point-legacy-notice')).toBeInTheDocument();
       expect(screen.queryByTestId('access-point-close-button')).not.toBeInTheDocument();
     });
 
     it('says it will be closed once the operator closes it', () => {
-      renderLegacy({ public: false });
+      showLegacyPanel({ public: false });
       expect(screen.queryByTestId('access-point-legacy-notice')).not.toBeInTheDocument();
       expect(screen.getByTestId('access-point-closing-notice')).toHaveTextContent(
         CLOSING_ACCESS_POINT_TEXT
@@ -194,7 +194,7 @@ describe('AccessPointPanel Public access switch', () => {
     });
 
     it('returns to the legacy state when Public access is turned off', () => {
-      const updateField = renderLegacy({ public: true });
+      const updateField = showLegacyPanel({ public: true });
       fireEvent.click(screen.getByTestId('access-point-public-switch'));
       expect(updateField).toHaveBeenCalledWith('public', undefined);
     });
