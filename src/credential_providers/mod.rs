@@ -457,7 +457,9 @@ impl CredentialProvider {
     /// external consent provider uses its own tenant's secrets only, an
     /// untenanted one untenanted secrets only, since its client authenticates
     /// at endpoints its tenant chose; any other provider its own tenant's or
-    /// an untenanted one.
+    /// an untenanted one. This is the runtime and kept-reference check: a save
+    /// also needs an exact tenant match unless the reference is kept in warn
+    /// mode.
     pub fn may_use_secret(
         &self,
         secret_tenant_id: Option<&str>,

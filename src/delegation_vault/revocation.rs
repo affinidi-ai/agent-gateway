@@ -556,8 +556,9 @@ pub(super) struct ClientAuthentication {
 }
 
 impl ClientCredential {
-    /// The credential `provider`'s method needs, each secret from the
-    /// provider's own tenant or an untenanted one.
+    /// The credential `provider`'s method needs. A provider with an issuer uses
+    /// its own tenant's secrets only (an untenanted one, untenanted secrets); any
+    /// other provider its own tenant's or an untenanted one.
     pub(super) async fn resolve(
         provider: &CredentialProvider,
         secrets: Option<&Arc<dyn SecretsStore>>,

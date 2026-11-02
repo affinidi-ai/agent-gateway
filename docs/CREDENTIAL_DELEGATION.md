@@ -71,7 +71,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | | `warn` (default) | `enforce` |
 | --- | --- | --- |
 | Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
-| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params` and JWT issuer, subject and audience unchanged | Saved | 400 |
+| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params` and JWT issuer, subject and audience unchanged | Saved, except on a provider with an `issuer`, which never keeps a secret outside its own tenant | 400 |
 | `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate in another tenant, before the key is read | The same |
 | Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
 
@@ -132,7 +132,9 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
 - An API key is read from the secrets store on every use and never cached.
 - Every token request (Client Credentials, JWT Bearer, `private_key_jwt` and refresh) is sent
   on a client pinned to the addresses the token endpoint resolved to when it was checked, with
-  redirects off. A host resolving to loopback, an unspecified address or cloud metadata is
+  redirects off. The pin holds when no HTTP proxy is configured: a client that honours
+  `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` lets the proxy resolve the host
+  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving to loopback, an unspecified address or cloud metadata is
   refused before any request, reported as `TokenEndpointRefused` ("credential provider token
   endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
   `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
@@ -231,8 +233,9 @@ An external consent provider uses its own tenant's secrets only, for its client 
 signing key and its certificate: never an untenanted secret, nor another tenant's, since its
 client authenticates at endpoints its tenant chose. An untenanted provider uses untenanted
 secrets only. Both are checked when the provider is created and again on every use, so a
-provider moved to another tenant stops using the secrets of the one it left. A provider without
-an `issuer` may use its own tenant's secrets or untenanted ones.
+provider moved to another tenant stops using the secrets of the one it left. For the rule on
+other providers, and when a stored reference is kept, see
+[Provider secrets belong to the provider's tenant](#provider-secrets-belong-to-the-providers-tenant).
 
 Every endpoint, and `resource`, must be an `https` URL without credentials or fragment whose
 host is no literal loopback, private, link-local or cloud-metadata address (the Strict egress
@@ -646,7 +649,9 @@ does, and the outcome depends on the path:
 - For delegation, only providers that send the gateway's own credential are held to the rule:
   `api_key`, `oauth2_client_credentials`, `oauth2_client_credentials_jwt_auth` and
   `oauth2_jwt_bearer`. An appliance-wide `oauth2_authorization_code` provider sends the end
-  user's token and stays usable on a tenant surface.
+  user's token and stays usable on a tenant surface, except a provider with an `issuer`
+  ([External consent providers](#external-consent-providers)), which must be of the surface's
+  own tenant exactly.
 - Appliance-wide surfaces are unaffected. Their custom metadata may name a secret of any
   tenant, at runtime and on save, until a reassignment gives the surface a tenant.
 

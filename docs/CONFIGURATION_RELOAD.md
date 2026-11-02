@@ -250,7 +250,12 @@ configurations that break a rule are refused on save. `"enforce"` also refuses t
 `tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
 credential provider; a reference to another tenant's is refused in both modes (see
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
-unknown value fails startup, and an absent section means both rules are `"warn"`.
+unknown value fails startup, and an absent section means both rules are `"warn"`. A provider with
+an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
+its issuer metadata and revocation calls have their own 10 second timeouts, not
+`token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and
+needs a restart, see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#gatewayjson).
 
 ## Fabric envelope lifetime
 

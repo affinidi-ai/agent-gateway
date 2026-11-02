@@ -505,7 +505,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   refreshes, and the legacy and `2026-07-28` authorization-code exchanges. The
   token endpoint is resolved once, off the async runtime, and the request goes
   to that address with redirects off; a blocked address is refused before any
-  request. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
+  request. The pin holds when no HTTP proxy is configured: with `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` set, the proxy resolves the host itself. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
   `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
@@ -570,7 +571,9 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   exact `http` or loopback fixture, never cloud metadata. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
 
-Both helpers share one `pin_and_build` body.
+`pinned_forward_client` and `pinned_strict_client` share one `pin_and_build` body; the
+metadata and vendor clients above build their client with `pinned_direct_client`, which ignores
+proxies.
 
 ### DID resolution host policy
 
