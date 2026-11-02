@@ -10181,7 +10181,10 @@ async fn resolve_configured_caller_identity(
     if crate::proxy::paths::is_public_request(method, path) {
         return Ok(None);
     }
-    if inbound_identity_from_api_key(&state.surface) {
+    if state
+        .surface
+        .inbound_identity_from_api_key()
+    {
         return resolve_presented_api_key_identity(
             state,
             channel_name,
@@ -10290,6 +10293,14 @@ async fn resolve_configured_caller_identity(
                 }
                 Err(e) if e.is::<crate::identity::IdentityOriginUnavailable>() => {
                     warn!(channel = channel_name, leg, error = %e, "API key identity role could not be recorded — refused");
+                    crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                        channel_name,
+                        "from_api_key",
+                        "identity_origin_unavailable",
+                        started
+                            .elapsed()
+                            .as_secs_f64(),
+                    );
                     return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, CALLER_IDENTITY_UNRESOLVED));
                 }
                 Err(e) => {
@@ -10325,10 +10336,6 @@ async fn resolve_configured_caller_identity(
 
 const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
 
-pub(crate) fn inbound_identity_from_api_key(surface: &crate::config::agent_surface::AgentSurface) -> bool {
-    matches!(surface.inbound_identity(), Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
-}
-
 /// Whether the configured caller identity runs on this request. It fills in
 /// when the body carried no identity; on an inbound `from_api_key` slot it
 /// replaces any body identity, so a presented key cannot be traded for a VP's
@@ -10340,7 +10347,7 @@ fn configured_caller_identity_applies(
     path: &str,
 ) -> bool {
     !body_identity_resolved
-        || (inbound_identity_from_api_key(surface) && !crate::proxy::paths::is_public_request(method, path))
+        || (surface.inbound_identity_from_api_key() && !crate::proxy::paths::is_public_request(method, path))
 }
 
 /// On an inbound `from_api_key` surface the caller is the presented key, so
@@ -10353,7 +10360,7 @@ fn bind_api_key_caller_did(
     agent: Option<&mut crate::surface_context::AgentContext>,
     extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
 ) {
-    if inbound_identity_from_api_key(surface)
+    if surface.inbound_identity_from_api_key()
         && !crate::proxy::paths::is_public_request(method, path)
         && let Some(agent) = agent
     {
@@ -10452,6 +10459,11 @@ async fn resolve_presented_api_key_identity(
             warn!(channel = channel_name, leg, "Caller API key already identifies a Managed Agent — refused");
             track("role_clash");
             return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
+        }
+        Err(e) if e.is::<crate::identity::IdentityOriginUnavailable>() => {
+            warn!(channel = channel_name, leg, error = %e, "Caller API key identity role could not be recorded — refused");
+            track("identity_origin_unavailable");
+            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, CALLER_IDENTITY_UNRESOLVED));
         }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for the presented API key");
@@ -21917,13 +21929,14 @@ allow if {
                 .await
                 .unwrap_err();
 
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert!(
                 body_text(response)
                     .await
-                    .contains("Caller identity could not be issued")
+                    .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
             );
-            assert_eq!(resolve_count("pak-origin-caller", "vc_issuer_error"), 1);
+            assert_eq!(resolve_count("pak-origin-caller", "identity_origin_unavailable"), 1);
+            assert_eq!(resolve_count("pak-origin-caller", "vc_issuer_error"), 0);
         }
 
         #[tokio::test]
@@ -21957,6 +21970,7 @@ allow if {
                     .await
                     .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
             );
+            assert_eq!(resolve_count("pak-origin-managed", "identity_origin_unavailable"), 1);
         }
 
         #[tokio::test]

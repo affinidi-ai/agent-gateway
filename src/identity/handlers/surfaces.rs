@@ -192,7 +192,7 @@ fn validate_api_key_identities(
         };
         SurfaceApiError::BadRequest(format!("{prefix}{message}"))
     };
-    let inbound_from_api_key = crate::proxy::handler::inbound_identity_from_api_key(surface);
+    let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
         match surface.source_auth() {
             Some(SourceAuthConfig::ApiKey(config))

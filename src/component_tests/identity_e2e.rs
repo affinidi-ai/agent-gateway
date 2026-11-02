@@ -2522,10 +2522,24 @@ fn write_self_gateway_denying_asserted_did(gateways_dir: &str) {
     .expect("write self gateway fixture");
 }
 
-async fn send_asserted_caller_did_under_gateway_policy(
-    surface: crate::config::agent_surface::AgentSurface
-) -> reqwest::StatusCode {
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_gateway_policy_never_sees_a_body_asserted_did() {
+    let mut body_did_kept = inbound_identity_surface(
+        json!({ "type": "static", "did": STATIC_CALLER_DID }),
+        AGENT_DID_IS_ASSERTED_POLICY_ID,
+    );
+    body_did_kept.surface_id = "body-did-kept".into();
+    body_did_kept.name = "body-did-kept".into();
+    body_did_kept
+        .access_point
+        .route = "/kept".into();
+    let mut api_key_identity = inbound_api_key_identity_surface(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID);
+    api_key_identity.surface_id = "api-key-identity".into();
     let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        helpers::configure_gateway_route_prefixes(
+            bootstrap,
+            &[("smoke", "smoke", "/smoke"), ("kept", "kept", "/kept")],
+        );
         write_caller_verification_policies(temp_dir);
         write_api_key_secret(
             &bootstrap
@@ -2539,37 +2553,35 @@ async fn send_asserted_caller_did_under_gateway_policy(
                 .storage_paths
                 .gateways,
         );
-        gw_config.surfaces = vec![surface];
+        gw_config.surfaces = vec![api_key_identity, body_did_kept];
     })
     .await;
-    reqwest::Client::new()
-        .post(&h.gateway_url)
-        .header("x-api-key", INBOUND_CALLER_KEY)
-        .json(&asserted_caller_did_body())
-        .send()
-        .await
-        .expect("inbound request failed")
-        .status()
-}
+    let send = |url: String| async move {
+        reqwest::Client::new()
+            .post(url)
+            .header("x-api-key", INBOUND_CALLER_KEY)
+            .json(&asserted_caller_did_body())
+            .send()
+            .await
+            .expect("inbound request failed")
+            .status()
+    };
 
-#[tokio::test(flavor = "multi_thread")]
-async fn inbound_from_api_key_gateway_policy_never_sees_a_body_asserted_did() {
     assert_eq!(
-        send_asserted_caller_did_under_gateway_policy(inbound_api_key_identity_surface(
-            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID
-        ))
-        .await,
+        send(h.gateway_url.clone()).await,
         200,
         "gateway policy must not see the body-asserted DID on an API key surface"
     );
     assert_eq!(
-        send_asserted_caller_did_under_gateway_policy(inbound_identity_surface(
-            json!({ "type": "static", "did": STATIC_CALLER_DID }),
-            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID,
-        ))
-        .await,
+        send(format!("{}/kept/rpc", h.gateway_base)).await,
         403,
-        "the gateway policy denies the asserted DID where the body DID is kept"
+        "the same gateway policy denies the asserted DID where the body DID is kept"
+    );
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
     );
 }
 

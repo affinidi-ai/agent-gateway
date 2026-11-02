@@ -856,6 +856,7 @@ Request-time refusals return a fixed body and log the cause server-side. Each co
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 | No VC issuer is configured | `500` | `vc_issuer_missing` |
 | DID issuance fails | `502` | `vc_issuer_error` |
+| The key's identity record has no role and the role cannot be recorded | `503` | `identity_origin_unavailable` |
 | The key already identifies a Managed Agent | `500` | `role_clash` |
 
 ### `from_jwt_claim`

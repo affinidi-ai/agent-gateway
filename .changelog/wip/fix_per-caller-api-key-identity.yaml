@@ -51,6 +51,9 @@ changes:
         API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
         it, on the surface or an enabled variant, is refused with 400, as is combining it with
         `mcp_http.authorization`. A missing VC issuer returns 500 and an issuance failure 502.
+        When an existing API key identity record has no role and the role cannot be stored,
+        the caller and Managed Agent paths both return 503 (metric
+        `identity_origin_unavailable`).
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching
       description: >-
