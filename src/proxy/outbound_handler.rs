@@ -5161,17 +5161,25 @@ async fn step_inject_external_grant(
     );
     ctx.grant_destination = Some(destination);
     apply_credential_injections(ctx, &injections)?;
-    if let Err(error) = vault
-        .mark_grant_used(&grant.id)
-        .await
-    {
-        debug!(
-            target: "credential_delegation",
-            request_id = %ctx.request_id,
-            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
-            error = %error,
-            "Failed to record a grant's use"
-        );
+    if grant.use_is_due(chrono::Utc::now()) {
+        let vault = Arc::clone(vault);
+        let id = grant.id.clone();
+        let request_id = ctx.request_id.clone();
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
+        tokio::spawn(async move {
+            if let Err(error) = vault
+                .mark_grant_used(&id)
+                .await
+            {
+                debug!(
+                    target: "credential_delegation",
+                    request_id = %request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    error = %error,
+                    "Failed to record a grant's use"
+                );
+            }
+        });
     }
     crate::delegation_vault::audit::emit("token_injected", || {
         let mut event = crate::delegation_vault::audit::audit_event(

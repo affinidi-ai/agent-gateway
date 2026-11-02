@@ -388,7 +388,22 @@ impl DelegatedGrant {
         self.expires_at
             .is_some_and(|expires_at| Utc::now() >= expires_at)
     }
+
+    /// Whether a release at `now` records the grant's use: it has none
+    /// recorded, or the last is at least [`USE_RECORD_INTERVAL_SECS`] old, so a
+    /// busy Transit Point does not rewrite its grant on every call.
+    pub fn use_is_due(
+        &self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.last_used_at
+            .is_none_or(|last| now - last >= chrono::Duration::seconds(USE_RECORD_INTERVAL_SECS))
+    }
 }
+
+/// How old a grant's last recorded use must be before a release records it
+/// again.
+pub const USE_RECORD_INTERVAL_SECS: i64 = 3600;
 
 /// A stored grant, and the grant of the same key it replaced, whose tokens the
 /// caller revokes.
@@ -430,6 +445,17 @@ pub(crate) mod tests {
             updated_at: now,
             last_used_at: None,
         }
+    }
+
+    #[test]
+    fn a_grants_use_is_recorded_at_most_once_an_interval() {
+        let now = Utc::now();
+        let mut used = grant(&key(), "access");
+        assert!(used.use_is_due(now), "a grant never used");
+        used.last_used_at = Some(now - chrono::Duration::seconds(USE_RECORD_INTERVAL_SECS - 1));
+        assert!(!used.use_is_due(now), "one used within the interval");
+        used.last_used_at = Some(now - chrono::Duration::seconds(USE_RECORD_INTERVAL_SECS));
+        assert!(used.use_is_due(now), "one whose last use is an interval old");
     }
 
     #[test]
