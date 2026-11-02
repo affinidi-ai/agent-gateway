@@ -154,6 +154,10 @@ changes:
       title: Warn instead of erroring on an http token endpoint in the dashboard
       description: >-
         The credential provider editor now shows a warning, not an invalid-field error, for an http token endpoint, explaining that new or changed ones need an exact entry in credential_policy.insecure_token_endpoints and that an unchanged stored one is still accepted in warn mode.
+    - timestamp: '2026-11-02T13:20:00Z'
+      title: Report a preview target that does not resolve as unreachable
+      description: >-
+        An agent card preview of a host that does not resolve now reports unreachable (502) instead of blocked_by_egress (403), as the served card route does. The event hook retry reason now says the host name could not be resolved.
   removed: []
   security:
     - timestamp: '2026-10-30T23:00:04Z'
@@ -203,4 +207,8 @@ changes:
         provider can fill with echoed request values, no longer reach logs, error text or
         delegation audit details. The authorization callback logs the provider's error code
         the same way and no longer logs its description.
+    - timestamp: '2026-11-02T13:21:00Z'
+      title: Hold custom metadata secrets to the tenant of the surface that sends them
+      description: >-
+        On a tenant surface, a $SECRET: reference in the Target's custom metadata, in either response custom metadata or in the shared Transit Point custom metadata resolves only a secret of the surface's own tenant, or an appliance-wide one in warn mode. Another tenant's secret, a new appliance-wide secret and a new reference to a secret that does not exist are refused on save with 400, a reassignment that would create one answers 409, and the request path refuses them at runtime. References already stored are kept in warn mode only while the leg that sends them keeps its endpoint. A surface with no tenant is unchanged.
   breaking: []
