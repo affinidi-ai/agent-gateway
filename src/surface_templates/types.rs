@@ -164,14 +164,16 @@ impl StorableEntity for SurfaceTemplate {
     /// a template saved before per-Transit-Point lists keeps its checks. A
     /// placeholder or empty target endpoint keeps the target list. The
     /// snapshot's `transit_point_source_auth` is kept in step with its Transit
-    /// Points, as a stored surface's is.
+    /// Points, as a stored surface's is, and a `transit_token_mode: reference` in it
+    /// is rewritten to `embedded`.
     fn migrate_raw_json(value: &mut serde_json::Value) -> anyhow::Result<bool> {
         Ok(value
             .get_mut("surface")
             .is_some_and(|surface| {
                 let split = crate::config::agent_surface::split_template_target_trust_checks(surface);
                 let marked = crate::config::agent_surface::mark_transit_point_source_auth(surface);
-                split || marked
+                let embedded = crate::config::agent_surface::rewrite_reference_transit_tokens(surface);
+                split || marked || embedded
             }))
     }
 }
@@ -282,6 +284,20 @@ impl CreateSurfaceTemplate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored `transit_token_mode: reference` in a template's surface, on the base and in a variant's
+    /// overrides, is rewritten to `embedded` and reported as a change.
+    #[test]
+    fn migrate_rewrites_a_stored_reference_transit_token_mode() {
+        let mut json = serde_json::json!({ "surface": {
+            "transit": { "transit_token_mode": "reference" },
+            "variants": [{ "alias": "dev", "overrides": { "transit": { "shared": {
+                "transit_token_mode": "reference" } } } }]
+        } });
+        assert!(SurfaceTemplate::migrate_raw_json(&mut json).unwrap());
+        assert_eq!(json["surface"]["transit"]["transit_token_mode"], "embedded");
+        assert_eq!(json["surface"]["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
+    }
 
     #[test]
     fn known_scope_roundtrip() {

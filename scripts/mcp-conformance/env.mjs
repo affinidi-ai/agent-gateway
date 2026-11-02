@@ -127,7 +127,6 @@ const surfaces = [
       ],
       outbound_listen_address: outbound,
       transit_token_mode: 'embedded',
-      sign_requests: false,
     },
   },
   {

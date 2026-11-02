@@ -53,29 +53,12 @@ const TransitConfigPanel: React.FC<ConfigPanelProps> = ({ config, updateField })
         </Form.Text>
       </div>
 
-      <div className="config-section">
+      <div className="config-section" data-testid="transit-config-token-mode">
         <label>Transit Token Mode</label>
-        <Form.Select
-          size="sm"
-          value={config.transit_token_mode || 'embedded'}
-          onChange={e => updateField('transit_token_mode', e.target.value)}
-        >
-          <option value="embedded">Embedded (signed into token, readable by the agent)</option>
-          <option value="reference">Reference (server-side store)</option>
-        </Form.Select>
+        <div className="small">Embedded (signed into the token, readable by the agent)</div>
         <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-          How the caller context is carried to downstream gateways.
+          The transit token carries the caller context itself; it is signed, not encrypted.
         </Form.Text>
-      </div>
-
-      <div className="config-section">
-        <Form.Check
-          type="switch"
-          id="tc-sign-requests"
-          label="Sign every outbound request"
-          checked={config.sign_requests !== false}
-          onChange={e => updateField('sign_requests', e.target.checked)}
-        />
       </div>
 
       <hr />

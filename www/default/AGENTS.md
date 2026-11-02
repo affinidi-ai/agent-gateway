@@ -122,8 +122,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
   `transit-point-listener-url`.
 - **Transit Settings** has no listener authentication control: the gateway does not support
-  `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
-  says the embedded token is signed and readable by the agent, not encrypted.
+  `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
+  chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so
+  the panel offers no `reference` option and every save sends `transit_token_mode: embedded`.
+  Neither the panel, its canvas summary, the
+  Transit Point factory nor a variant's overrides set `sign_requests`, which the gateway
+  ignores.
 - The Transit Point panel's **Who can call this Transit Point** section
   (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
   (`transit-point-require-transit-token-switch`), the **Caller authentication** select

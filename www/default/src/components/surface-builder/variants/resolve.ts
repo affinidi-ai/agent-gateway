@@ -63,10 +63,8 @@ const TARGET_FIELDS = [
 ] as const;
 
 const SHARED_TRANSIT_FIELDS = [
-  'transit_token_mode',
   'transit_policy',
   'rate_limit',
-  'sign_requests',
   'workload_binding',
   'extension_rules',
   'custom_metadata',
