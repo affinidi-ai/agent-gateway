@@ -148,8 +148,15 @@ already `"off"`; it may choose any other level. See
 | Integrations, their endpoints and event sets (`/v1/integrations`) | No, `403` | No, `403`; integrations describe the whole appliance, so a tenant or resource-scoped PAT can neither read nor change them, and none can be given a tenant owner |
 | Connection Points of an appliance-wide Gateway | List, read, metrics and messages | No, `403` on create, update, delete, exposed surfaces, use, reconnect, and marking or deleting messages. Connection Points are created only on the appliance's own Gateway, which is appliance-wide, so a tenant PAT cannot create Connection Points |
 
-A tenant surface may reference an appliance-wide record in general, with one exception: it
-may not send the appliance's own credential upstream. An appliance-wide secret used as
+A tenant surface may reference an appliance-wide record in general, but it may not send the
+appliance's own credential upstream, with three exceptions (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)):
+an appliance-wide A2A Proxy that an operator published, which a tenant surface uses with that
+proxy's own shared appliance-wide Direct Line secret in both modes; a stored appliance-wide
+reference kept in the default `warn` mode while its destination is unchanged (below); and an
+appliance-wide `oauth2_authorization_code` provider without an `issuer`, whose gateway client ID
+and client secret go only to that provider's own authorization and token endpoints for the code
+exchange and refresh. An appliance-wide secret used as
 `static_secret` Target authentication or named by a `$SECRET:<id>` value in custom metadata
 (the Target's `custom_metadata` and `response_custom_metadata`, the Access Point's
 `response_custom_metadata`, and the Transit Points' shared `custom_metadata`), and an
@@ -172,7 +179,8 @@ sent it: the endpoint of each Target and Transit Point, and the caller for respo
 metadata) and refused once `credential_policy.tenant_credential_isolation` is `enforce` (see
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#credential-policy)). Appliance-wide
 secrets stay usable for caller authentication, and an appliance-wide
-`oauth2_authorization_code` provider stays usable. See
+`oauth2_authorization_code` provider stays usable, except a provider with an `issuer`, which
+must be of the surface's own tenant. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs).
 
 The agent card preview follows the same rule (see

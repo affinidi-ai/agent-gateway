@@ -72,7 +72,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | --- | --- | --- |
 | Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
 | Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params`, `default_scopes` and JWT issuer, subject and audience unchanged | Saved, except on a provider with an `issuer`, which never keeps a secret outside its own tenant | 400 |
-| `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate in another tenant, before the key is read | The same |
+| `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate outside the provider's tenant (another tenant's or, for a tenant provider, an appliance-wide one), before the key is read | The same |
 | Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
 
 A stored reference is kept only while it goes where it went before. An update that changes one
@@ -85,9 +85,16 @@ that leg.
 
 In `enforce` mode a service token or API key whose secret is outside the provider's tenant
 reports `SecretUnavailable`, and no token request is sent. A cached service token is checked
-against the same rule on every use, from the secrets' metadata, so it stops being served as soon
-as the rule is enforced. Move such secrets into the provider's tenant before switching to
-`enforce`.
+against the same rule on every use, reading each secret the type sends by id, so it stops being
+served as soon as the rule is enforced. Move such secrets into the provider's tenant before
+switching to `enforce`.
+
+The save rule above covers every reference the provider stores. A leftover reference in a field
+the provider's type does not send, such as an `api_key_secret_ref` kept after a provider changed
+from `api_key`, is ignored at runtime (see [Service tokens](#service-tokens)), but it still counts
+for the provider save rule, for the surface save rule in
+[Tenant isolation on a surface's upstream legs](#tenant-isolation-on-a-surfaces-upstream-legs)
+and for the startup credential policy report.
 
 ### Providers that sign a JWT
 
@@ -160,7 +167,9 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   those secrets or moving one to another tenant therefore requests a new token instead of
   reusing one issued under the old settings. A reference the type does not send, such as an
   `api_key_secret_ref` kept after a provider changed from `api_key`, is neither read nor part of
-  the key, so rotating or deleting its secret changes nothing.
+  the key, so rotating or deleting its secret changes nothing at runtime; it still counts for the
+save rules and the startup report ([Provider secrets belong to the provider's
+tenant](#provider-secrets-belong-to-the-providers-tenant)).
   Each use looks up only those secrets, one read each (decrypted when
   encryption at rest is on), and a token request reads each secret it sends once more by its
   id; neither asks the store for a listing, though the filesystem store rescans its directory to
@@ -536,7 +545,7 @@ provider](#deleting-a-provider)).
 
 The token is a service token (see above), cached in the vault under the agent half
 `surface:<surface_id>` and the user half `__target_auth__:<hash>` of the provider, its scopes
-and its secret versions. Changing the provider or one of its secrets changes the hash, so a
+and its secret versions. Changing the provider or one of the secrets its type sends changes the hash, so a
 token issued under the old settings is never reused; a Target and a Transit Point that use one
 provider with different scopes each keep their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
@@ -667,19 +676,6 @@ does, and the outcome depends on the path:
 - Appliance-wide surfaces are unaffected. Their custom metadata may name a secret of any
   tenant, at runtime and on save, until a reassignment gives the surface a tenant.
 
-Proxies are the exception. An MCP Proxy holds no credential of its own: its upstream
-authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
-Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
-another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
-accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with
-a warning in `warn` mode and refused in `enforce` mode, where a request through the proxy also
-fails as target unavailable, as for a missing secret, before its value is used. An
-appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
-modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
-sends the secret nor read it. A tenant reassignment that would give a tenant proxy an
-appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
-secret becomes appliance-wide.
-
 Saving a surface applies the same rule: a save that adds a reference breaking it is refused
 with `400` "reference is not accessible", while a reference the stored surface already held
 is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept only on the
@@ -694,14 +690,14 @@ metadata is not kept when it is moved or copied into response metadata, while on
 in response metadata is kept there when the Target's endpoint changes. Only enabled custom
 metadata counts as already sent, so enabling stored metadata is checked as a new reference; a
 save still checks every reference in disabled metadata, and keeps one named only there when the
-stored surface held it at the same destination, in enabled or disabled metadata. On a tenant surface a `$SECRET:` that
-names no existing secret is refused like another tenant's secret, whether it is new or already
+stored surface held it at the same destination, in enabled or disabled metadata. A save that
+changes the endpoint of a leg that sends a kept appliance-wide reference, moves the reference to
+another leg, or adds a leg that would send it is refused with `400` in `warn` mode too. On a
+tenant surface a `$SECRET:` that names no existing secret is refused like another tenant's secret, whether it is new or already
 stored, in `warn` mode too, so a save never keeps a reference to a secret that was deleted.
 Deleting a secret does not check the surfaces that name it, so a surface stored before the
 deletion keeps the reference until its next save. A surface with no tenant may still name a
-missing secret. A save that changes such a leg's
-endpoint, moves the reference to another leg, or adds a leg that would send it is refused with
-`400` in `warn` mode too. A tenant reassignment that would create such a reference answers
+missing secret. A tenant reassignment that would create a reference breaking the rule answers
 `409`, and so does giving a surface whose custom metadata names a missing secret a different
 tenant. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
 
@@ -711,6 +707,19 @@ appliance-wide provider: a save keeps it only on the legs that already sent it a
 endpoint, refuses it on a new or redirected leg with `400` "Credential provider reference is not
 accessible", and refuses it everywhere in `enforce` mode. The startup credential policy report
 names such a surface. A provider holding only its own tenant's secrets attaches freely.
+
+A2A Proxies hold their own secret. An MCP Proxy holds no credential of its own: its upstream
+authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
+Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
+another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
+accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with
+a warning in `warn` mode and refused in `enforce` mode, where a request through the proxy also
+fails as target unavailable, as for a missing secret, before its value is used. An
+appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
+modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
+sends the secret nor read it. A tenant reassignment that would give a tenant proxy an
+appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
+secret becomes appliance-wide.
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
 `fallback`), and the cause is logged only. A refused legacy binding records

@@ -241,7 +241,7 @@ needs a restart.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
-| `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider may only use secrets of its own tenant; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant). |
+| `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether credential providers may use only secrets of their own tenant, and tenant surfaces (including their custom metadata and the credential providers they bind) and tenant A2A Proxies only their own tenant's secrets and providers; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant) and [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs). |
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
 | `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants, refreshes, the legacy code exchange and the modern consent exchange. The 64 KiB response limit and the no-redirect rule are unchanged. |
 
