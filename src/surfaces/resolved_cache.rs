@@ -309,6 +309,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         }
     }
 
@@ -335,6 +336,7 @@ mod tests {
                 transit: None,
                 identity_slots: None,
                 outbound_credentials: None,
+                delegated_credentials_for_fabric_callers: None,
                 canvas: None,
             },
         }

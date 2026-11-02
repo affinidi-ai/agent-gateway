@@ -160,6 +160,7 @@ impl GatewayConfig {
                 mcp_http: None,
                 trust_check_split: false,
                 transit_point_source_auth: false,
+                delegated_credentials_for_fabric_callers: false,
             }],
             tls: TlsConfig {
                 cert_path: PathBuf::from("cert.pem"),

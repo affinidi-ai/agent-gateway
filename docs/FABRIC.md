@@ -481,9 +481,25 @@ The receiving gateway applies its own surface's `outbound_credentials` toward it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
 whose `params.name` it lists, read after admission has refused batches and ambiguous keys. It keys
 the grant only by the caller its own source authentication verified on the request: a pseudonym,
-DID or presentation the peer's request names never selects stored credentials, and without a
-verified caller a binding that applies refuses the request with `403` before the Target is called
+DID or presentation the peer's request names never selects stored credentials. That caller is
+usually the partner's own `target_auth` credential, which names all of the partner's users alike,
+so per-user grants reach a legacy Fabric request only on a surface that sets
+`delegated_credentials_for_fabric_callers: true`, which the admin API accepts only beside caller
+authentication that tells a partner's users apart. Service-level credentials need no switch. The
+receiving gateway never starts consent for a Fabric request, so an opted-in caller with no grant
+is refused too. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
+`partner_caller_not_verified` or `consent_not_available_for_partners`), answered before the Target
+is called and recorded as a `request_rejected`; an agent card fetch is never refused for a binding
 (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+
+The gateway that receives a request applies these rules; the sending gateway's release does not
+matter. In a mixed-version fleet, a receiving node that predates them still keys its Target's
+grants by the caller the peer's request names, releases per-user grants to partners without the
+switch, and answers a missing grant with an authorization URL the partner sees. Such a node stays
+exposed until it is upgraded, so upgrade every node that receives Fabric requests before relying
+on these rules. A node that predates the surface's switch refuses to load a surface that sets it,
+on the surface or in a variant, rather than serve it without these rules, and a `PUT` through
+such a node saves the surface without it, which turns it off.
 
 When the agent behind the receiving surface then calls one of its own Transit Points with the
 transit token it got for the peer's request, that Transit Point releases a delegated per-user
@@ -503,10 +519,13 @@ What the agent serving a partner's request gets back from an opted-in Transit Po
   `fabric.principal_hash` and the Transit Point's managed identity;
 - otherwise, as for any caller with no grant, the consent answer: `401` with a
   `consent_required` body whose authorization URL carries consent state keyed by that
-  `fabric.principal_hash`, never by the DID or a top-level hash the token carries. The agent
-  passes it back through the partner gateway, and whoever completes it binds their provider
-  account to that caller, so the next call from the same caller is sent with that grant. This
-  is why the switch belongs only where the receiving surface verifies a per-user credential;
+  `fabric.principal_hash`, never by the DID, a top-level hash the token carries or a client the
+  Transit Point verified. If the agent passes it back through the partner gateway, whoever
+  completes it binds their provider account to that caller, so the next call from the same
+  caller, and that user's direct calls through the same Transit Point, which use the same grant,
+  are sent with it. This is why the admin API accepts the switch only where the receiving
+  surface verifies a per-user credential, and why it belongs only beside partners trusted with
+  the users' tokens;
 - on a `2026-07-28` MCP call, whose grant is keyed by the Transit Point's resource-token
   caller, the grant only when that caller is the one the receiving surface verified; otherwise
   `403` (`-32001`).

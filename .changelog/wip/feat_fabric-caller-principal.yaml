@@ -32,21 +32,38 @@ changes:
         request that arrived over Fabric when a delegated credential binding applied. A Transit
         Point that sets the new `delegated_credentials_for_fabric_callers: true` now releases
         the grant of the caller in the token's `fabric.principal_hash`, and only that caller's;
-        the caller DID the peer named never keys a grant. It is off by default, and only a
-        Transit Point that requires the transit token may set it: the admin API refuses one
-        that does not with `400`. Set it only when the receiving surface verifies a per-user
-        credential, such as a JWT whose `sub` is the end user: when it verifies the partner's
-        own key, one grant serves every request the partner sends, for all of its users. The
-        Transit Point also needs a managed identity, and a save of one that sets the switch
-        without one answers with a `Warning` header, since a binding there refuses every Fabric
-        caller. A `PUT` of the surface or of a variant that omits the switch keeps the stored
-        value while the Transit Point requires the transit token, since the Surface Builder does
-        not show it. It has an effect only on a Transit Point that also sets
+        the caller DID the peer named never keys a grant. It is off by default, and the admin
+        API refuses it with `400` on a Transit Point that does not require the transit token,
+        and on a surface, or a variant, whose caller authentication cannot tell a partner's
+        users apart: anything but a resource token, or a `jwt_bearer` method that names an
+        audience through a JWT verification strategy that names an issuer. With `api_key`, for
+        example, every key in the secret, the partner's and direct callers' alike, would be one
+        caller with one grant. That grant is the same one the user's direct calls through the
+        Transit Point use, so whoever completes the consent URL of an opted-in caller's first
+        call binds it for both. The Transit Point also needs a managed identity, and a save of
+        one that sets the switch without one answers with a `Warning` header, since a binding
+        there refuses every Fabric caller. A `PUT` of the surface or of a variant that omits the
+        switch keeps the stored value while the Transit Point requires the transit token and the
+        surface's caller authentication tells users apart, since the Surface Builder does not
+        show it. It has an effect only on a Transit Point that also sets
         `allow_fabric_callers`. Without it, or when the receiving surface verified no caller,
         the call is refused as before and the log gives the reason. The token decides the
         caller, as any transit token does, so a client the Transit Point's own `source_auth`
         verified on the same call keys no grant, and without the switch such a call is refused
         rather than served with that client's grant.
+    - timestamp: '2026-11-02T12:00:00.000Z'
+      title: Release a Target's per-user credentials to partner requests only on opt-in
+      description: >-
+        A surface's new `delegated_credentials_for_fabric_callers: true`, also settable per
+        variant, releases its Target's per-user (`oauth2_authorization_code`) grants to legacy
+        requests a paired gateway sends over Fabric, keyed by the caller the surface's own
+        caller authentication verified. It is off by default, and the admin API refuses it with
+        `400` unless the surface's caller authentication tells a partner's users apart, as for
+        a Transit Point's switch of that name. A surface stored with it beside other caller
+        authentication releases nothing to partners. A `PUT` of the surface or a variant that
+        omits it keeps it while that view still tells users apart, since the Surface Builder
+        does not show it. Service-level bindings need no switch. `2026-07-28` MCP requests keep
+        their own rule: a resource-token caller and verified consent.
   changed: []
   fixed: []
   removed: []
@@ -64,6 +81,21 @@ changes:
         releases no credential, is served as before), and on a `2026-07-28` MCP request the
         agent half of the key is a caller DID only a connection issuer's presentation proved.
         Grants stored under a caller the peer named are no longer looked up.
+    - timestamp: '2026-11-02T12:00:00.000Z'
+      title: Keep one partner credential from sharing a user's grant on Fabric receive
+      description: >-
+        The caller a receiving surface verifies on a Fabric request is normally the partner's
+        own `target_auth` credential, which names every one of the partner's users alike, so a
+        per-user grant keyed by it served all of them: the first user to complete consent bound
+        their provider account for the rest. A per-user binding now refuses a legacy Fabric
+        request with `403` and the reason `delegation_not_enabled_for_partners` unless the
+        surface sets `delegated_credentials_for_fabric_callers`. The receiving gateway also no
+        longer starts consent for a Fabric request, whose authorization URL would travel through
+        the partner and bind whoever completes it: a caller with no grant gets `403` and
+        `consent_not_available_for_partners`. A request with no verified caller gets
+        `partner_caller_not_verified`. Each refusal is an MCP JSON-RPC error (`-32001`) or a
+        problem JSON naming only that reason, and is recorded as a `request_rejected` audit event
+        at `admission`.
     - timestamp: '2026-11-02T03:00:00.000Z'
       title: Refuse a partner's modern MCP Transit Point call the opt-in does not cover
       description: >-
@@ -73,4 +105,18 @@ changes:
         partner's request, it was served with the resource-token caller's grant. It now follows
         the Fabric rule: a binding that applies refuses the call with `403` unless the Transit
         Point opts in and its resource-token caller is the one the receiving surface verified.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-02T12:00:00.000Z'
+      title: Require a verified caller, and the opt-in, for credentials on Fabric receive
+      description: >-
+        A partner's legacy request to a Target with delegated credential bindings was keyed by
+        the caller identity the partner named. Now a binding that applies, service-level ones
+        (`api_key` and client credentials providers) included, refuses the request with `403`
+        unless the receiving surface's own caller authentication verified a caller on it, such
+        as the key the partner's `target_auth` sends; a per-user (`oauth2_authorization_code`)
+        binding also needs `delegated_credentials_for_fabric_callers` on the surface, and a
+        caller with no grant is refused rather than asked for consent. Partners that relied on
+        the identity they named, or on consent through the partner, stop getting credentials:
+        give the receiving surface caller authentication the partner's `target_auth` satisfies
+        for service-level bindings, and for per-user ones a JWT whose `sub` is the end user,
+        with an audience, plus the switch. Agent card and discovery reads are not affected.

@@ -103,6 +103,18 @@ pub struct AgentSurface {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbound_credentials: Vec<OutboundCredentialBinding>,
 
+    /// Releases the per-user (`oauth2_authorization_code`) grants of
+    /// `outbound_credentials` to requests a paired gateway sends over Fabric,
+    /// keyed by the caller this surface's own caller authentication verified
+    /// on the request. Off by default, when such a request to a Target a
+    /// per-user binding applies to is refused with `403`; service-level
+    /// bindings are not affected. Only a surface whose caller authentication
+    /// tells a partner's users apart may set it
+    /// ([`Self::fabric_caller_authentication_gap`]); a surface stored with it
+    /// otherwise releases nothing to partners.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated_credentials_for_fabric_callers: bool,
+
     /// Three independent identity slots, one per edge in the request/response
     /// pipeline. Each slot owns its own extraction config (`payload_extraction`,
     /// `from_api_key`, `from_mtls`, `static`).
@@ -1411,10 +1423,11 @@ pub struct TransitPoint {
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
     /// may set it, and it has an effect only beside `allow_fabric_callers`.
-    /// Set it only when the receiving surface verifies a per-user credential,
-    /// such as a JWT whose `sub` is the end user: when it verifies the
-    /// partner's own key, every request from that partner has the same key,
-    /// so one grant serves all of its users.
+    /// The admin API refuses it on a surface whose caller authentication
+    /// cannot tell a partner's users apart
+    /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
+    /// key, where every request from that partner, and every direct caller
+    /// with a key in the same secret, has the same key.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegated_credentials_for_fabric_callers: bool,
 
@@ -4918,6 +4931,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         };
 
         assert_eq!(surface.base_url("gw.example.com"), "https://gw.example.com:8443/agents/sales");
@@ -5066,6 +5080,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         };
 
         assert!(
@@ -6555,6 +6570,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");
         assert_eq!(value["issuer_id"], serde_json::json!("issuer-42"));

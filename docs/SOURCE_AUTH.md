@@ -267,7 +267,13 @@ that:
   audience, or one the Access Point's rules refuse, such as mTLS trust that names no
   certificate;
 - sets `delegated_credentials_for_fabric_callers` but does not require a transit token, the
-  only way a Fabric caller reaches it (see [Transit token](#transit-token)).
+  only way a Fabric caller reaches it (see [Transit token](#transit-token));
+- sets `delegated_credentials_for_fabric_callers` on a surface, or in a variant, whose Access
+  Point caller authentication cannot tell a partner's users apart: anything but a resource
+  token, or a `jwt_bearer` method that names an audience through a JWT verification strategy
+  that names an issuer. With `api_key`, for example, every key in the secret, the partner's and
+  direct callers' alike, is one caller with one grant (see
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 
 A surface stored with such a Transit Point still loads, with a warning in the log naming the
 Transit Point and, for one a variant defines, the variant, but the Transit Point refuses every
@@ -303,7 +309,8 @@ method that is missing its secret, header, strategy or audience cannot be saved,
 says why. A refusal from the admin API shows in the same section in plain words. Turning
 caller authentication off sends `"source_auth": null`. The panel shows neither
 `allow_fabric_callers` nor `delegated_credentials_for_fabric_callers`; a dashboard save keeps
-both, the second while the Transit Point still requires the transit token.
+both, the second while the Transit Point still requires the transit token and the surface's
+caller authentication still tells a partner's users apart.
 
 These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
@@ -315,8 +322,9 @@ with `400` unless it requires a transit token or is marked `allow_unauthenticate
 `PUT` that omits `allow_unauthenticated_callers` keeps it while the Transit Point still
 authenticates no caller, and drops it once the Transit Point authenticates its callers. A
 `PUT` that omits `delegated_credentials_for_fabric_callers` keeps it while the Transit Point
-still requires a transit token, and drops it once it does not; a value the `PUT` sends is
-saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
+still requires a transit token and the surface's caller authentication, in the Transit Point's
+view, still tells a partner's users apart, and drops it once either does not; a value the `PUT`
+sends is saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
@@ -518,8 +526,9 @@ caller as `verification: fabric_peer`, verified only with a `fabric.principal_ha
 [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and its DID never verified,
 even when a presentation carried it. Static `target_auth`
 credentials are added as for any caller. Delegated per-user credentials are released for it
-only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, and only
-for the caller in `fabric.principal_hash` (see
+only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, which the
+admin API accepts only on a surface whose caller authentication tells a partner's users apart,
+and only for the caller in `fabric.principal_hash` (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 A Transit Point's audit records name a caller in `fabric.principal_hash` with
 `auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a

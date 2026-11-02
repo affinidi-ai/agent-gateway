@@ -9,8 +9,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{
-    FabricReceiveCaller, ProcessingResult, fabric_caller_did_and_source, fabric_receive_transit_token,
-    fabric_response_workload_binding, transit_token_unavailable_refusal,
+    FabricDelegationRefusal, FabricReceiveCaller, ProcessingResult, fabric_caller_did_and_source,
+    fabric_delegation_refusal, fabric_receive_transit_token, fabric_response_workload_binding,
+    transit_token_unavailable_refusal,
 };
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::component_tests::helpers::RecordingTarget;
@@ -773,64 +774,69 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 }
 
-/// The receiving surface keys its Target's delegated credentials only by the
-/// caller its own source authentication verified. A pseudonym or DID the
-/// peer's request names never selects a stored grant, even one stored under
-/// exactly that identity, and without a verified caller a binding that
-/// applies refuses the request before the Target is called.
-#[tokio::test]
-async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive() {
-    if ran_in_child("ATG_FABRIC_RECEIVE_DELEGATION_CHILD").await {
-        return;
+const PER_USER_PROVIDER: &str = "per-user";
+const SERVICE_PROVIDER: &str = "service";
+const SERVICE_KEY: &str = "service-key-value";
+const JWT_AUDIENCE: &str = "https://receiver.example/agent";
+
+/// A binding of the receiving surface's Target to `provider`. The key of
+/// [`SERVICE_PROVIDER`] travels in `x-service-key`, a per-user grant as the
+/// `Authorization` bearer.
+fn binding(provider: &str) -> crate::config::types::OutboundCredentialBinding {
+    let mut binding = json!({ "credential_provider_id": provider, "scopes": ["read"] });
+    if provider == SERVICE_PROVIDER {
+        binding["inject_as"] = json!({ "type": "custom_header", "name": "x-service-key", "format": "{value}" });
     }
+    serde_json::from_value(binding).unwrap()
+}
+
+/// The stores the receiving gateway resolves its Target's delegated
+/// credentials from, under `root`: an authorization code provider
+/// [`PER_USER_PROVIDER`], a grant of it for the Target at `target_url` to each
+/// `(user identity hash, access token)` in `grants`, and an API key provider
+/// [`SERVICE_PROVIDER`] whose key is [`SERVICE_KEY`].
+async fn install_delegation_stores(
+    root: &std::path::Path,
+    target_url: &str,
+    grants: &[(&str, &str)],
+) {
     use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
     use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
-    use sha2::Digest;
+    use crate::secrets::SecretsStore;
 
-    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
-    let root = tempfile::tempdir().unwrap();
-    let mut delegating = surface("a2a", &target.url, &[]);
-    delegating.outbound_credentials =
-        vec![serde_json::from_value(json!({ "credential_provider_id": "provider", "scopes": ["read"] })).unwrap()];
-    let _receiver = receiver(root.path(), &delegating).await;
     let providers = Arc::new(
-        FileSystemCredentialProviderStore::new(root.path().join("providers"))
+        FileSystemCredentialProviderStore::new(root.join("providers"))
             .await
             .unwrap(),
     );
-    providers
-        .create(
-            serde_json::from_value(json!({ "id": "provider", "name": "Provider", "provider_id": "provider",
-                "resource": "https://provider.example/api",
-                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z" }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let vault = Arc::new(
-        FileSystemDelegationVaultStore::new(root.path().join("vault"))
-            .await
-            .unwrap(),
-    );
-    let partner = crate::source_auth::AuthenticatedIdentity::ApiKey {
-        key_name: "peer-callers".to_string(),
-        provider_agent_id: None,
-    }
-    .principal_hash(None)
-    .unwrap();
-    let victim_pseudonym = format!("sha256:{:x}", sha2::Sha256::digest(b"\"victim\""));
-    for (id, user_identity_hash, access_token) in [
-        ("partner", partner.as_str(), "partner-access"),
-        ("victim-pseudonym", victim_pseudonym.as_str(), "victim-pseudonym-access"),
-        ("victim-did", "did:web:victim.example", "victim-did-access"),
+    for provider in [
+        json!({ "id": PER_USER_PROVIDER, "name": "Per user", "provider_id": PER_USER_PROVIDER,
+            "resource": "https://provider.example/api",
+            "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id" }),
+        json!({ "id": SERVICE_PROVIDER, "name": "Service", "provider_id": SERVICE_PROVIDER,
+            "provider_type": "api_key", "api_key_secret_ref": "service-key" }),
     ] {
+        let mut provider = provider;
+        provider["created_at"] = json!("2026-09-01T00:00:00Z");
+        provider["updated_at"] = json!("2026-09-01T00:00:00Z");
+        providers
+            .create(serde_json::from_value(provider).unwrap())
+            .await
+            .unwrap();
+    }
+    let vault = Arc::new(
+        FileSystemDelegationVaultStore::new(root.join("vault"))
+            .await
+            .unwrap(),
+    );
+    for (index, (user_identity_hash, access_token)) in grants.iter().enumerate() {
         vault
             .store(
                 serde_json::from_value(json!({
-                    "id": id, "agent_did": target.url, "user_identity_hash": user_identity_hash,
-                    "credential_provider_id": "provider", "provider_id": "provider",
-                    "access_token": access_token, "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
-                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "id": format!("grant-{index}"), "agent_did": target_url, "user_identity_hash": user_identity_hash,
+                    "credential_provider_id": PER_USER_PROVIDER, "provider_id": PER_USER_PROVIDER,
+                    "access_token": access_token, "refresh_token": format!("{access_token}-refresh"),
+                    "scopes": ["read"], "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
                     "consent_granted_at": "2026-09-01T00:00:00Z",
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
@@ -839,32 +845,248 @@ async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive(
             .await
             .unwrap();
     }
+    let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+        root.join("delegation-secrets")
+            .to_str()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    for (secret_id, value) in [("client-id", "receiver-client"), ("service-key", SERVICE_KEY)] {
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.to_string(),
+                secret_id: secret_id.to_string(),
+                description: None,
+                value: value.to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
     super::init_credential_provider_store(providers).await;
     super::init_delegation_vault_store(vault).await;
-    super::init_secrets_store(Arc::new(
-        crate::secrets::FilesystemSecretsStore::new_async(
-            root.path()
-                .join("delegation-secrets")
-                .to_str()
-                .unwrap(),
+    super::init_secrets_store(Arc::new(secrets)).await;
+    super::init_gateway_base_url("https://receiver.example".to_string()).await;
+}
+
+/// A receiving gateway under `root` whose surface, `surface` with its caller
+/// authentication replaced, verifies a JWT `fixture`'s issuer signs for
+/// [`JWT_AUDIENCE`].
+async fn jwt_receiver(
+    root: &std::path::Path,
+    fixture: &crate::component_tests::helpers::jwt::JwksFixture,
+    mut surface: AgentSurface,
+) -> (Gateway, tempfile::TempDir) {
+    use crate::jwt_bearer::storage::JwtVerificationStrategyStorage;
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.join("strategies"))
+            .await
+            .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "partner-idp", "name": "Partner IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
         )
         .await
+        .unwrap();
+    surface
+        .access_point
+        .caller_authentication = Some(
+        serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": strategy.id, "audiences": [JWT_AUDIENCE] }] }))
         .unwrap(),
-    ))
-    .await;
-    super::init_gateway_base_url("https://receiver.example".to_string()).await;
-    let naming = |metadata: Value| {
-        let mut body = a2a_body();
-        body["params"]["message"]["extensions"] = json!([crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION]);
-        body["params"]["message"]["metadata"] = json!({ crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: metadata });
-        body
+    );
+    receiver_with_strategies(root, &surface, strategies).await
+}
+
+/// A JWT `fixture`'s issuer signs for `subject` and [`JWT_AUDIENCE`], and the
+/// identity hash the receiving surface computes for it.
+fn user_jwt(
+    fixture: &crate::component_tests::helpers::jwt::JwksFixture,
+    subject: &str,
+) -> (String, String) {
+    use crate::component_tests::helpers::jwt::{now_secs, sign_jwt};
+    let claims = json!({ "iss": fixture.issuer, "sub": subject, "aud": JWT_AUDIENCE, "exp": now_secs() + 300 });
+    let hash = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        subject: subject.to_string(),
+        claims: claims.clone(),
+    }
+    .principal_hash(None)
+    .unwrap();
+    (sign_jwt(claims, &fixture.kid), hash)
+}
+
+/// An A2A request whose agent identity extension names `metadata`.
+fn naming(metadata: Value) -> Value {
+    let mut body = a2a_body();
+    body["params"]["message"]["extensions"] = json!([crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION]);
+    body["params"]["message"]["metadata"] = json!({ crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: metadata });
+    body
+}
+
+/// The forward-response for `message` with the reason its body names, and the
+/// `request_rejected` records it wrote.
+async fn refused(message: &ReceivedMessage) -> (Value, Value, Vec<(RejectionStage, RejectionReason, bool)>) {
+    let (response, events) = crate::audit::producer::capture(forward_response(message)).await;
+    let body: Value = response["body"]
+        .as_str()
+        .and_then(|body| serde_json::from_str(body).ok())
+        .unwrap_or(Value::Null);
+    let rejected = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected { stage, reason, .. } => Some((*stage, *reason, event.via_fabric)),
+            _ => None,
+        })
+        .collect();
+    (response, body, rejected)
+}
+
+/// A partner's request reaches a per-user credential of the Target only on a
+/// surface that sets `delegated_credentials_for_fabric_callers`. Without it, a
+/// request a per-user binding applies to is refused with `403` and a fixed
+/// reason before the Target is called, and recorded as a `request_rejected`,
+/// even when a grant is stored for the caller the surface verified. A
+/// partner's key names every one of its users alike, so a surface that
+/// verifies one releases nothing to partners even when it is stored with the
+/// switch, which the admin API refuses for it.
+#[tokio::test]
+async fn a_partner_request_gets_no_per_user_credential_on_a_surface_that_does_not_opt_in() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_NOT_OPTED_IN_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.outbound_credentials = vec![binding(PER_USER_PROVIDER)];
+    let _receiver = receiver(root.path(), &delegating).await;
+    let partner = crate::source_auth::AuthenticatedIdentity::ApiKey {
+        key_name: "peer-callers".to_string(),
+        provider_agent_id: None,
+    }
+    .principal_hash(None)
+    .unwrap();
+    install_delegation_stores(root.path(), &target.url, &[(partner.as_str(), "partner-access")]).await;
+
+    for opted_in in [false, true] {
+        delegating.delegated_credentials_for_fabric_callers = opted_in;
+        FileSystemAgentSurfaceStore::new(
+            root.path()
+                .join("agent_surfaces"),
+        )
+        .await
+        .unwrap()
+        .save(&delegating)
+        .await
+        .unwrap();
+        for user in ["alice", "bob"] {
+            let (response, body, rejected) = refused(&forward_request(
+                root.path(),
+                json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+                naming(json!({ "agentId": user })),
+            ))
+            .await;
+            assert_eq!(response["status"], 403, "{opted_in} {user}: {response}");
+            assert_eq!(body["reason"], "delegation_not_enabled_for_partners", "{opted_in} {user}: {body}");
+            assert_eq!(
+                rejected,
+                [(RejectionStage::Admission, RejectionReason::DelegationNotEnabledForPartners, true)],
+                "{opted_in} {user}"
+            );
+        }
+    }
+    assert!(target.received().is_empty(), "the Target is never called");
+}
+
+/// A service-level binding, such as an API key provider, keys no caller's
+/// grant, so it reaches a partner's request without the opt-in, as long as the
+/// receiving surface verified a caller of the request; without one the request
+/// is refused with `403` before the Target is called.
+#[tokio::test]
+async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_SERVICE_CREDENTIAL_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.outbound_credentials = vec![binding(SERVICE_PROVIDER)];
+    let _receiver = receiver(root.path(), &delegating).await;
+    install_delegation_stores(root.path(), &target.url, &[]).await;
+    let send = |key: &str| {
+        forward_request(root.path(), json!({ "content-type": "application/json", "x-api-key": key }), a2a_body())
     };
-    let send = |key: &str, metadata: Value| {
-        forward_request(root.path(), json!({ "content-type": "application/json", "x-api-key": key }), naming(metadata))
+
+    let response = forward_response(&send(CALLER_KEY)).await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(
+        header_values(
+            &target
+                .received()
+                .pop()
+                .unwrap(),
+            "x-service-key"
+        ),
+        [SERVICE_KEY]
+    );
+
+    let reached = target.received().len();
+    let (response, body, rejected) = refused(&send("not-the-key")).await;
+    assert_eq!(response["status"], 403, "{response}");
+    assert_eq!(body["reason"], "partner_caller_not_verified", "{body}");
+    assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
+    assert_eq!(target.received().len(), reached, "the Target is not called");
+}
+
+/// On a surface that opts in, the receiving surface keys its Target's
+/// per-user grants only by the caller its own caller authentication verified.
+/// A pseudonym or DID the peer's request names never selects a stored grant,
+/// even one stored under exactly that identity, and without a verified caller
+/// a binding that applies refuses the request before the Target is called.
+#[tokio::test]
+async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_DELEGATION_CHILD").await {
+        return;
+    }
+    use sha2::Digest;
+
+    let fixture = crate::component_tests::helpers::jwt::JwksFixture::start().await;
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.outbound_credentials = vec![binding(PER_USER_PROVIDER)];
+    delegating.delegated_credentials_for_fabric_callers = true;
+    let _receiver = jwt_receiver(root.path(), &fixture, delegating).await;
+    let (jwt, user) = user_jwt(&fixture, "user-123");
+    let victim_pseudonym = format!("sha256:{:x}", sha2::Sha256::digest(b"\"victim\""));
+    install_delegation_stores(
+        root.path(),
+        &target.url,
+        &[
+            (user.as_str(), "user-123-access"),
+            (victim_pseudonym.as_str(), "victim-pseudonym-access"),
+            ("did:web:victim.example", "victim-did-access"),
+        ],
+    )
+    .await;
+    let send = |authorization: Option<&str>, metadata: Value| {
+        let mut headers = json!({ "content-type": "application/json" });
+        if let Some(authorization) = authorization {
+            headers["authorization"] = json!(format!("Bearer {authorization}"));
+        }
+        forward_request(root.path(), headers, naming(metadata))
     };
 
     for metadata in [json!({ "agentId": "victim" }), json!({ "agentId": "victim", "did": "did:web:victim.example" })] {
-        let response = forward_response(&send(CALLER_KEY, metadata.clone())).await;
+        let response = forward_response(&send(Some(&jwt), metadata.clone())).await;
         assert_eq!(response["status"], 200, "{metadata}: {response}");
         let received = target
             .received()
@@ -872,15 +1094,128 @@ async fn a_caller_the_peer_names_never_selects_a_stored_grant_on_fabric_receive(
             .unwrap();
         assert_eq!(
             header_values(&received, "authorization"),
-            ["Bearer partner-access"],
+            ["Bearer user-123-access"],
             "{metadata}: the caller the surface verified, never the one the peer named"
         );
     }
 
     let reached = target.received().len();
-    let response = forward_response(&send("not-the-key", json!({ "agentId": "victim" }))).await;
+    let (response, body, _) = refused(&send(None, json!({ "agentId": "victim" }))).await;
     assert_eq!(response["status"], 403, "no caller the surface verified: {response}");
+    assert_eq!(body["reason"], "partner_caller_not_verified", "{body}");
     assert_eq!(target.received().len(), reached, "the Target is not called");
+}
+
+/// A partner's request never starts consent. Whoever completes an
+/// authorization URL binds their account to the caller it names, and on Fabric
+/// it would travel through the partner, so an opted-in caller with no grant
+/// is refused with `403` and a fixed reason, with no authorization URL,
+/// recorded as a `request_rejected`, and the Target is not called.
+#[tokio::test]
+async fn a_partner_request_never_starts_consent_for_a_per_user_credential() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_NO_CONSENT_CHILD").await {
+        return;
+    }
+    let fixture = crate::component_tests::helpers::jwt::JwksFixture::start().await;
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.outbound_credentials = vec![binding(PER_USER_PROVIDER)];
+    delegating.delegated_credentials_for_fabric_callers = true;
+    let _receiver = jwt_receiver(root.path(), &fixture, delegating).await;
+    install_delegation_stores(root.path(), &target.url, &[]).await;
+    let (jwt, _) = user_jwt(&fixture, "user-without-a-grant");
+
+    let (response, body, rejected) = refused(&forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "authorization": format!("Bearer {jwt}") }),
+        a2a_body(),
+    ))
+    .await;
+    assert_eq!(response["status"], 403, "{response}");
+    assert_eq!(body["reason"], "consent_not_available_for_partners", "{body}");
+    assert!(
+        !response
+            .to_string()
+            .contains("provider.example/authorize"),
+        "no authorization URL: {response}"
+    );
+    assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentNotAvailableForPartners, true)]);
+    assert!(target.received().is_empty(), "the Target is not called");
+}
+
+/// Each receive-side refusal of delegated credentials answers `403`: an MCP
+/// request with a JSON-RPC error carrying its id, `-32001` and the fixed
+/// reason, any other request with a problem JSON naming the reason. Each is
+/// recorded once as a `request_rejected` at the `admission` stage.
+#[tokio::test]
+async fn a_refused_partner_delegation_is_recorded_and_answers_mcp_with_a_json_rpc_error() {
+    let surface = surface("mcp", "https://agent.example", &[]);
+    let facts = crate::audit::request_events::RequestFacts {
+        surface_id: &surface.surface_id,
+        channel_name: &surface.name,
+        trace_id: Some("trace-from-the-peer"),
+        via_fabric: true,
+    };
+    let request = serde_json::to_vec(
+        &json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "lookup" } }),
+    )
+    .unwrap();
+    for (refusal, reason, recorded) in [
+        (
+            FabricDelegationRefusal::CallerNotVerified,
+            "partner_caller_not_verified",
+            RejectionReason::ConsentIdentityRequired,
+        ),
+        (
+            FabricDelegationRefusal::NotEnabledForPartners,
+            "delegation_not_enabled_for_partners",
+            RejectionReason::DelegationNotEnabledForPartners,
+        ),
+        (
+            FabricDelegationRefusal::ConsentNotAvailable,
+            "consent_not_available_for_partners",
+            RejectionReason::ConsentNotAvailableForPartners,
+        ),
+    ] {
+        for mcp in [true, false] {
+            let (result, events) =
+                crate::audit::producer::capture(async { fabric_delegation_refusal(&facts, mcp, &request, refusal) })
+                    .await;
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a refusal, got {result:?}");
+            };
+            assert_eq!(response_body["status"], 403);
+            let body: Value = serde_json::from_str(
+                response_body["body"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            if mcp {
+                assert_eq!(body["id"], 7, "{body}");
+                assert_eq!(body["error"]["code"], -32001, "{body}");
+                assert_eq!(body["error"]["data"]["reason"], reason, "{body}");
+            } else {
+                assert_eq!(body["status"], 403, "{body}");
+                assert_eq!(body["reason"], reason, "{body}");
+            }
+            let rejected: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    DelegationAuditAction::RequestRejected { stage, reason, .. } => {
+                        Some((*stage, *reason, event.via_fabric, event.trace_id.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rejected,
+                [(RejectionStage::Admission, recorded, true, Some("trace-from-the-peer".to_string()))],
+                "{reason} mcp={mcp}"
+            );
+        }
+    }
 }
 
 /// A surface that verifies no caller of its own gives its agent a token with

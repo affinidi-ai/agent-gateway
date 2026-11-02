@@ -134,6 +134,83 @@ impl AgentSurface {
             .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
     }
 
+    /// Why this surface's caller authentication cannot tell apart the users a
+    /// paired gateway sends requests for over Fabric, or `None` when it can.
+    /// Delegated per-user credentials for Fabric callers, on the surface's
+    /// Target or its Transit Points, are keyed by the caller it verifies, so
+    /// only a credential that names the end user keeps one user's grant from
+    /// another's: a resource token (`mcp_http.authorization`), or a
+    /// `jwt_bearer` method with an audience (its own, or the one
+    /// `protected_resource` binds) and a JWT verification strategy. The admin
+    /// API also checks that the strategy names an issuer.
+    pub fn fabric_caller_authentication_gap(&self) -> Option<&'static str> {
+        use crate::source_auth::SourceAuthConfig;
+        let methods = self
+            .access_point
+            .caller_authentication
+            .as_ref()
+            .map(|authentication| {
+                authentication
+                    .methods
+                    .as_slice()
+            })
+            .unwrap_or_default();
+        let resource_tokens = self
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some());
+        if methods.is_empty() {
+            return (!resource_tokens).then_some("it verifies no caller");
+        }
+        methods
+            .iter()
+            .find_map(|method| match method {
+                SourceAuthConfig::JwtBearer(jwt)
+                    if jwt
+                        .jwt_verification_strategy_id
+                        .trim()
+                        .is_empty() =>
+                {
+                    Some("its jwt_bearer method names no JWT verification strategy, so no issuer")
+                }
+                SourceAuthConfig::JwtBearer(jwt)
+                    if jwt.audiences.is_empty()
+                        && self
+                            .protected_resource()
+                            .is_none() =>
+                {
+                    Some(
+                        "its jwt_bearer method names no audience, so it accepts a token the identity provider issued \
+                         for another service",
+                    )
+                }
+                SourceAuthConfig::JwtBearer(_) => None,
+                SourceAuthConfig::ApiKey(_) => Some(
+                    "an api_key method names every key in its secret as one caller, the partner's and direct \
+                     callers' alike",
+                ),
+                SourceAuthConfig::ApiKeyProvider(_) => {
+                    Some("an api_key_provider key names the client that holds it, not a user")
+                }
+                SourceAuthConfig::DidAuth(_) => {
+                    Some("a did_auth session names the DID that signed in, not the user a partner acts for")
+                }
+                SourceAuthConfig::Mtls(_) => Some("an mtls method never verifies a request that arrives over Fabric"),
+            })
+    }
+
+    /// Whether the Target's per-user delegated credentials are released to
+    /// requests a paired gateway sends over Fabric: the surface sets
+    /// `delegated_credentials_for_fabric_callers` and its caller
+    /// authentication tells a partner's users apart. A surface stored with the
+    /// switch and any other caller authentication releases none.
+    pub fn releases_delegated_credentials_to_fabric_callers(&self) -> bool {
+        self.delegated_credentials_for_fabric_callers
+            && self
+                .fabric_caller_authentication_gap()
+                .is_none()
+    }
+
     /// Slot 1 — caller identity extracted from inbound request (CA → AP).
     #[inline]
     pub fn inbound_identity(&self) -> Option<&crate::source_auth::ManagedIdentityConfig> {
@@ -802,6 +879,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         }
     }
 

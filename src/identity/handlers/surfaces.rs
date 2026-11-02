@@ -1157,6 +1157,170 @@ fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
     warnings
 }
 
+/// Refuses a surface that releases per-user delegated credentials to partners,
+/// with its own `delegated_credentials_for_fabric_callers` or a Transit
+/// Point's, on the surface or in an enabled variant, when that view's caller
+/// authentication cannot tell a partner's users apart
+/// ([`AgentSurface::fabric_caller_authentication_gap`]), or names a JWT
+/// verification strategy that, in `issuers`, names no issuer.
+fn fabric_caller_delegation_refusal(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    for (variant, view) in surface_views(surface) {
+        let label = variant.map_or_else(String::new, |alias| format!("variant '{alias}': "));
+        let releases = |gap: String| -> Result<(), String> {
+            if view.delegated_credentials_for_fabric_callers {
+                return Err(format!(
+                    "{label}delegated_credentials_for_fabric_callers needs caller authentication that tells a \
+                     partner's users apart, and {gap}"
+                ));
+            }
+            if let Some(point) = view
+                .transit_points()
+                .iter()
+                .find(|point| point.delegated_credentials_for_fabric_callers)
+            {
+                return Err(format!(
+                    "{label}Transit Point '{}' sets delegated_credentials_for_fabric_callers, which needs caller \
+                     authentication on the surface that tells a partner's users apart, and {gap}",
+                    point.alias
+                ));
+            }
+            Ok(())
+        };
+        if let Some(gap) = view.fabric_caller_authentication_gap() {
+            releases(gap.to_string())?;
+            continue;
+        }
+        let (access_point, _) = jwt_bearer_methods(&view, None);
+        if let Some(strategy) = access_point
+            .iter()
+            .map(|config| {
+                config
+                    .jwt_verification_strategy_id
+                    .as_str()
+            })
+            .find(|strategy| {
+                issuers
+                    .get(*strategy)
+                    .is_none_or(|issuer| issuer.trim().is_empty())
+            })
+        {
+            releases(format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read"))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`fabric_caller_delegation_refusal`] as the admin API answers it, reading
+/// the issuers of the JWT verification strategies the surface names.
+async fn validate_fabric_caller_delegation(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    let releases = surface_views(surface)
+        .iter()
+        .any(|(_, view)| {
+            view.delegated_credentials_for_fabric_callers
+                || view
+                    .transit_points()
+                    .iter()
+                    .any(|point| point.delegated_credentials_for_fabric_callers)
+        });
+    if !releases {
+        return Ok(());
+    }
+    fabric_caller_delegation_refusal(surface, &jwt_strategy_issuers(state, surface).await)
+        .map_err(SurfaceApiError::BadRequest)
+}
+
+/// PUT carries the whole record, or a variant PUT its whole overrides, but the
+/// Surface Builder does not show `delegated_credentials_for_fabric_callers`,
+/// so a save from it omits it. An omitted switch, on the surface or in a
+/// variant's overrides, is kept while the view it applies to still tells a
+/// partner's users apart, and dropped once it does not; a stored variant
+/// override that turns it off is always kept.
+fn retain_fabric_caller_delegation(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    if sent
+        .get("delegated_credentials_for_fabric_callers")
+        .is_none()
+        && existing.delegated_credentials_for_fabric_callers
+        && surface
+            .fabric_caller_authentication_gap()
+            .is_none()
+    {
+        surface.delegated_credentials_for_fabric_callers = true;
+    }
+    let variant_ids: Vec<String> = surface
+        .variants
+        .iter()
+        .map(|variant| variant.id.clone())
+        .collect();
+    for (index, variant_id) in variant_ids.iter().enumerate() {
+        let sent_overrides = sent
+            .get("variants")
+            .and_then(|variants| variants.get(index))
+            .and_then(|variant| variant.get("overrides"));
+        retain_variant_fabric_caller_delegation(surface, existing, variant_id, sent_overrides);
+    }
+}
+
+/// Keeps the stored `delegated_credentials_for_fabric_callers` override of
+/// `surface`'s variant `variant_id` that `sent_overrides`, the overrides the
+/// request sent for it, leave out; see [`retain_fabric_caller_delegation`].
+fn retain_variant_fabric_caller_delegation(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    variant_id: &str,
+    sent_overrides: Option<&serde_json::Value>,
+) {
+    if sent_overrides.is_some_and(|overrides| {
+        overrides
+            .get("delegated_credentials_for_fabric_callers")
+            .is_some()
+    }) {
+        return;
+    }
+    let Some(stored) = existing
+        .variants
+        .iter()
+        .find(|variant| variant.id == variant_id)
+        .and_then(|variant| {
+            variant
+                .overrides
+                .delegated_credentials_for_fabric_callers
+        })
+    else {
+        return;
+    };
+    let Some(mut overrides) = surface
+        .variants
+        .iter()
+        .find(|variant| variant.id == variant_id)
+        .map(|variant| variant.overrides.clone())
+    else {
+        return;
+    };
+    overrides.delegated_credentials_for_fabric_callers = Some(stored);
+    if stored && !variant_tells_users_apart(surface, variant_id, &overrides) {
+        return;
+    }
+    for variant in surface
+        .variants
+        .iter_mut()
+        .filter(|variant| variant.id == variant_id)
+    {
+        variant
+            .overrides
+            .delegated_credentials_for_fabric_callers = Some(stored);
+    }
+}
+
 /// Each Transit Point, on the surface or in an enabled variant, whose
 /// `jwt_bearer` accepts tokens issued for the Access Point, base or enabled
 /// variant: the same JWT verification strategy and an audience both name. An
@@ -1898,6 +2062,7 @@ pub async fn create_surface(
     )?;
     validate_protected_resource_issuers(&state, &surface).await?;
     validate_mcp_resource_declarations(&state, &surface).await?;
+    validate_fabric_caller_delegation(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
         .await
@@ -2006,6 +2171,7 @@ pub async fn update_surface(
     retain_a2a_settings(&mut surface, &existing);
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
+    retain_fabric_caller_delegation(&mut surface, &existing, &sent);
 
     let saved = validate_and_save_surface(
         &state,
@@ -2337,7 +2503,9 @@ fn retain_mcp_settings(
 /// `allow_unauthenticated_callers` is kept while the Transit Point still
 /// authenticates no caller, and dropped once it does. An omitted
 /// `delegated_credentials_for_fabric_callers` is kept while the Transit Point
-/// still requires the transit token, and dropped once it does not.
+/// still requires the transit token and the surface's caller authentication,
+/// in the view the Transit Point belongs to, still tells a partner's users
+/// apart, and dropped once either does not.
 fn retain_transit_caller_authentication(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
@@ -2346,17 +2514,27 @@ fn retain_transit_caller_authentication(
     fn sent_points(transit: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
         transit.and_then(|transit| transit.get("points"))
     }
+    let tells_users_apart = surface
+        .fabric_caller_authentication_gap()
+        .is_none();
+    let variants_tell_users_apart: Vec<bool> = surface
+        .variants
+        .iter()
+        .map(|variant| variant_tells_users_apart(surface, &variant.id, &variant.overrides))
+        .collect();
     if let (Some(transit), Some(stored)) = (&mut surface.transit, &existing.transit) {
         retain_transit_points_caller_authentication(
             &mut transit.points,
             &stored.points,
             sent_points(sent.get("transit")),
+            tells_users_apart,
         );
     }
-    for (index, variant) in surface
+    for ((index, variant), tells_users_apart) in surface
         .variants
         .iter_mut()
         .enumerate()
+        .zip(variants_tell_users_apart)
     {
         let stored_points = variant_stored_points(existing, &variant.id);
         let points = variant
@@ -2370,9 +2548,42 @@ fn retain_transit_caller_authentication(
                 .and_then(|variants| variants.get(index))
                 .and_then(|variant| variant.get("overrides"))
                 .and_then(|overrides| overrides.get("transit"));
-            retain_transit_points_caller_authentication(points, stored_points, sent_points(sent_transit));
+            retain_transit_points_caller_authentication(
+                points,
+                stored_points,
+                sent_points(sent_transit),
+                tells_users_apart,
+            );
         }
     }
+}
+
+/// Whether `surface`'s variant `variant_id`, with `overrides`, tells a
+/// partner's users apart ([`AgentSurface::fabric_caller_authentication_gap`]),
+/// enabled or not. A variant that cannot be resolved counts as one that does,
+/// and the save rules check it.
+fn variant_tells_users_apart(
+    surface: &AgentSurface,
+    variant_id: &str,
+    overrides: &crate::config::agent_surface_variants::SurfaceOverrides,
+) -> bool {
+    let mut probe = surface.clone();
+    let Some(variant) = probe
+        .variants
+        .iter_mut()
+        .find(|variant| variant.id == variant_id)
+    else {
+        return true;
+    };
+    variant.enabled = true;
+    variant.overrides = overrides.clone();
+    let alias = variant.alias.clone();
+    probe
+        .resolve_variant(Some(&alias))
+        .map_or(true, |view| {
+            view.fabric_caller_authentication_gap()
+                .is_none()
+        })
 }
 
 /// The Transit Points a stored variant's own overrides define, else the stored
@@ -2406,11 +2617,13 @@ fn variant_stored_points<'a>(
 /// `allow_unauthenticated_callers`, `allow_fabric_callers` and
 /// `delegated_credentials_for_fabric_callers` that `sent_points`, the JSON the
 /// request sent for `points`, leaves out; see
-/// `retain_transit_caller_authentication`.
+/// `retain_transit_caller_authentication`. `tells_users_apart` is whether the
+/// view the Transit Points belong to tells a partner's users apart.
 fn retain_transit_points_caller_authentication(
     points: &mut [crate::config::agent_surface::TransitPoint],
     stored: &[crate::config::agent_surface::TransitPoint],
     sent_points: Option<&serde_json::Value>,
+    tells_users_apart: bool,
 ) {
     for (index, point) in points.iter_mut().enumerate() {
         let Some(previous) = stored
@@ -2450,6 +2663,7 @@ fn retain_transit_points_caller_authentication(
         if !sends_fabric_caller_delegation
             && previous.delegated_credentials_for_fabric_callers
             && point.require_transit_token
+            && tells_users_apart
         {
             point.delegated_credentials_for_fabric_callers = true;
         }
@@ -2739,6 +2953,7 @@ async fn validate_and_save_surface(
     refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
     validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
+    validate_fabric_caller_delegation(state, &surface).await?;
 
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
@@ -3612,20 +3827,8 @@ pub async fn update_variant(
     // setting unless they remove it, and the Transit Points' caller
     // authentication they leave out, as a PUT of the whole surface does.
     let mut retained = Vec::new();
+    let sends_overrides = body.overrides.is_some();
     if let Some(mut overrides) = body.overrides {
-        if let (Some(points), Some(stored_points)) = (
-            overrides
-                .transit
-                .as_mut()
-                .and_then(|transit| transit.points.as_mut()),
-            variant_stored_points(&existing, &variant_id),
-        ) {
-            retain_transit_points_caller_authentication(
-                points,
-                stored_points,
-                sent.pointer("/overrides/transit/points"),
-            );
-        }
         if !removes_protected_resource(sent.pointer("/overrides/access_point"))
             && retain_protected_resource(
                 overrides
@@ -3649,7 +3852,25 @@ pub async fn update_variant(
         {
             retained.push(variant.alias.clone());
         }
+        let tells_users_apart = variant_tells_users_apart(&existing, &variant_id, &overrides);
+        if let (Some(points), Some(stored_points)) = (
+            overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut()),
+            variant_stored_points(&existing, &variant_id),
+        ) {
+            retain_transit_points_caller_authentication(
+                points,
+                stored_points,
+                sent.pointer("/overrides/transit/points"),
+                tells_users_apart,
+            );
+        }
         variant.overrides = overrides;
+    }
+    if sends_overrides {
+        retain_variant_fabric_caller_delegation(&mut surface, &existing, &variant_id, sent.get("overrides"));
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
@@ -4815,9 +5036,27 @@ mod validation_tests {
         }
     }
 
+    /// `surface` with an Access Point that verifies its callers with `methods`.
+    fn with_caller_authentication(
+        mut surface: AgentSurface,
+        methods: serde_json::Value,
+    ) -> AgentSurface {
+        surface
+            .access_point
+            .caller_authentication = Some(serde_json::from_value(serde_json::json!({ "methods": methods })).unwrap());
+        surface
+    }
+
+    /// A `jwt_bearer` method that names an audience and the JWT verification
+    /// strategy `idp`.
+    fn per_user_jwt() -> serde_json::Value {
+        serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] })
+    }
+
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,
     /// so a PUT, of the surface or a variant within it, that omits it keeps the
-    /// stored value while the Transit Point still requires the transit token; a
+    /// stored value while the Transit Point still requires the transit token and
+    /// the surface's caller authentication tells a partner's users apart; a
     /// value the request sends is honoured.
     #[test]
     fn a_put_that_omits_a_transit_points_fabric_caller_delegation_keeps_it_while_it_applies() {
@@ -4843,33 +5082,221 @@ mod validation_tests {
             "transit": { "points": sent_points },
             "variants": [{ "id": "candidate", "overrides": { "transit": { "points": sent_points } } }]
         });
-        let mut surface = surface_with_transit_points(sent_points.clone(), sent_points);
+        for (methods, expected) in [
+            (serde_json::json!([per_user_jwt()]), [true, false, false, false]),
+            (serde_json::json!([caller_key()]), [false, false, false, false]),
+        ] {
+            let mut surface = with_caller_authentication(
+                surface_with_transit_points(sent_points.clone(), sent_points.clone()),
+                methods,
+            );
 
-        retain_transit_caller_authentication(&mut surface, &existing, &sent);
+            retain_transit_caller_authentication(&mut surface, &existing, &sent);
 
-        let variant_points = surface.variants[0]
-            .overrides
-            .transit
-            .as_ref()
-            .and_then(|transit| transit.points.clone())
-            .unwrap();
-        for points in [
-            &surface
+            let variant_points = surface.variants[0]
+                .overrides
                 .transit
                 .as_ref()
-                .unwrap()
-                .points,
-            &variant_points,
-        ] {
-            let opted_in: Vec<bool> = points
-                .iter()
-                .map(|point| point.delegated_credentials_for_fabric_callers)
-                .collect();
-            assert_eq!(opted_in, [true, false, false, false], "kept, cleared, dropped without the token, never set");
-            for point in points {
-                assert_eq!(point.validate_caller_authentication(), Ok(()), "{}", point.alias);
+                .and_then(|transit| transit.points.clone())
+                .unwrap();
+            for points in [
+                &surface
+                    .transit
+                    .as_ref()
+                    .unwrap()
+                    .points,
+                &variant_points,
+            ] {
+                let opted_in: Vec<bool> = points
+                    .iter()
+                    .map(|point| point.delegated_credentials_for_fabric_callers)
+                    .collect();
+                assert_eq!(
+                    opted_in, expected,
+                    "kept while the surface tells users apart, cleared, dropped without the token, never set"
+                );
+                for point in points {
+                    assert_eq!(point.validate_caller_authentication(), Ok(()), "{}", point.alias);
+                }
             }
         }
+    }
+
+    /// A surface releases per-user delegated credentials to partners, on its
+    /// Target or a Transit Point, only when its caller authentication tells a
+    /// partner's users apart: a resource token, or a JWT naming an audience
+    /// through a strategy that names an issuer. A save of any other is
+    /// refused, on the surface and in a variant, and a variant may turn the
+    /// surface's switch off.
+    #[test]
+    fn only_a_surface_that_tells_a_partners_users_apart_releases_per_user_credentials_to_partners() {
+        let issuers = std::collections::HashMap::from([
+            ("idp".to_string(), "https://idp.example".to_string()),
+            ("blank".to_string(), String::new()),
+        ]);
+        let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
+        let opted_in = |methods: serde_json::Value| {
+            let mut surface = with_caller_authentication(
+                surface_with_transit_points(serde_json::json!([]), serde_json::json!([])),
+                methods,
+            );
+            surface.delegated_credentials_for_fabric_callers = true;
+            surface
+        };
+        let surface_switch = "delegated_credentials_for_fabric_callers needs caller authentication that tells a \
+                              partner's users apart, and";
+
+        let mut resource_tokens = surface_with_transit_points(serde_json::json!([]), serde_json::json!([]));
+        resource_tokens.delegated_credentials_for_fabric_callers = true;
+        resource_tokens.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({ "authorization": { "resource": "https://gw.example/mcp" } }))
+                .unwrap(),
+        );
+        let mut discovery = opted_in(serde_json::json!([jwt("idp", serde_json::json!([]))]));
+        discovery
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .unwrap()
+            .protected_resource = Some(
+            serde_json::from_value(serde_json::json!({ "resource": "https://gw.example/mcp",
+                "authorization_servers": ["https://idp.example"] }))
+            .unwrap(),
+        );
+        for (case, surface) in [
+            ("a JWT naming an audience", opted_in(serde_json::json!([per_user_jwt()]))),
+            ("a JWT whose audience discovery binds", discovery),
+            ("a resource token", resource_tokens),
+        ] {
+            assert_eq!(fabric_caller_delegation_refusal(&surface, &issuers), Ok(()), "{case}");
+        }
+
+        for (case, methods, reason) in [
+            ("no caller authentication", serde_json::json!([]), "it verifies no caller"),
+            ("an API key", serde_json::json!([caller_key()]), "every key in its secret as one caller"),
+            (
+                "an API key beside a JWT",
+                serde_json::json!([per_user_jwt(), caller_key()]),
+                "every key in its secret as one caller",
+            ),
+            (
+                "an API Key Provider key",
+                serde_json::json!([{ "type": "api_key_provider", "agent_id": "keys",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" } }]),
+                "names the client that holds it",
+            ),
+            ("a JWT naming no audience", serde_json::json!([jwt("idp", serde_json::json!([]))]), "names no audience"),
+            (
+                "a JWT naming no strategy",
+                serde_json::json!([jwt("", serde_json::json!(["api://agent"]))]),
+                "names no JWT verification strategy",
+            ),
+            (
+                "a JWT whose strategy cannot be read",
+                serde_json::json!([jwt("missing", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'missing' names no issuer",
+            ),
+            (
+                "a JWT whose strategy names no issuer",
+                serde_json::json!([jwt("blank", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'blank' names no issuer",
+            ),
+        ] {
+            let refusal = fabric_caller_delegation_refusal(&opted_in(methods), &issuers).unwrap_err();
+            assert!(refusal.starts_with(surface_switch), "{case}: {refusal}");
+            assert!(refusal.contains(reason), "{case}: {refusal}");
+        }
+
+        let mut variant_key = opted_in(serde_json::json!([per_user_jwt()]));
+        variant_key.variants[0].enabled = true;
+        variant_key.variants[0]
+            .overrides
+            .access_point = Some(
+            serde_json::from_value(serde_json::json!({ "caller_authentication": { "methods": [caller_key()] } }))
+                .unwrap(),
+        );
+        let refusal = fabric_caller_delegation_refusal(&variant_key, &issuers).unwrap_err();
+        assert!(refusal.starts_with(&format!("variant 'candidate': {surface_switch}")), "{refusal}");
+        variant_key.variants[0]
+            .overrides
+            .delegated_credentials_for_fabric_callers = Some(false);
+        assert_eq!(fabric_caller_delegation_refusal(&variant_key, &issuers), Ok(()), "the variant turns it off");
+
+        let point = serde_json::json!([{ "alias": "crm", "target_endpoint": "https://crm.example",
+            "require_transit_token": true, "delegated_credentials_for_fabric_callers": true }]);
+        let transit_point_switch = |methods: serde_json::Value| {
+            with_caller_authentication(surface_with_transit_points(point.clone(), point.clone()), methods)
+        };
+        let refusal =
+            fabric_caller_delegation_refusal(&transit_point_switch(serde_json::json!([caller_key()])), &issuers)
+                .unwrap_err();
+        assert!(
+            refusal.starts_with(
+                "Transit Point 'crm' sets delegated_credentials_for_fabric_callers, which needs caller \
+                 authentication on the surface that tells a partner's users apart, and"
+            ),
+            "{refusal}"
+        );
+        assert!(refusal.contains("every key in its secret as one caller"), "{refusal}");
+        assert_eq!(
+            fabric_caller_delegation_refusal(&transit_point_switch(serde_json::json!([per_user_jwt()])), &issuers),
+            Ok(())
+        );
+    }
+
+    /// The Surface Builder does not show the surface's
+    /// `delegated_credentials_for_fabric_callers`, so a PUT that omits it, on
+    /// the surface or in a variant's overrides, keeps the stored value while
+    /// the view it applies to still tells a partner's users apart, and drops
+    /// it once it does not; a value the request sends is saved, and a variant
+    /// that turns the switch off keeps it off.
+    #[test]
+    fn a_put_that_omits_the_surfaces_fabric_caller_delegation_keeps_it_while_it_applies() {
+        let surface_with = |methods: serde_json::Value, opted_in: bool, variant: Option<bool>| {
+            let mut surface = with_caller_authentication(
+                surface_with_transit_points(serde_json::json!([]), serde_json::json!([])),
+                methods,
+            );
+            surface.delegated_credentials_for_fabric_callers = opted_in;
+            surface.variants[0].enabled = true;
+            surface.variants[0]
+                .overrides
+                .delegated_credentials_for_fabric_callers = variant;
+            surface
+        };
+        let omitted = serde_json::json!({ "variants": [{ "id": "candidate", "overrides": {} }] });
+        let switch = |surface: &AgentSurface| {
+            (
+                surface.delegated_credentials_for_fabric_callers,
+                surface.variants[0]
+                    .overrides
+                    .delegated_credentials_for_fabric_callers,
+            )
+        };
+
+        let stored = surface_with(serde_json::json!([per_user_jwt()]), true, Some(true));
+        let mut put = surface_with(serde_json::json!([per_user_jwt()]), false, None);
+        retain_fabric_caller_delegation(&mut put, &stored, &omitted);
+        assert_eq!(switch(&put), (true, Some(true)), "kept");
+
+        let mut put = surface_with(serde_json::json!([caller_key()]), false, None);
+        retain_fabric_caller_delegation(&mut put, &stored, &omitted);
+        assert_eq!(switch(&put), (false, None), "dropped once an API key verifies the callers");
+
+        let mut put = surface_with(serde_json::json!([per_user_jwt()]), false, Some(false));
+        retain_fabric_caller_delegation(
+            &mut put,
+            &stored,
+            &serde_json::json!({ "delegated_credentials_for_fabric_callers": false,
+                "variants": [{ "id": "candidate",
+                    "overrides": { "delegated_credentials_for_fabric_callers": false } }] }),
+        );
+        assert_eq!(switch(&put), (false, Some(false)), "the values sent");
+
+        let stored_off = surface_with(serde_json::json!([caller_key()]), false, Some(false));
+        let mut put = surface_with(serde_json::json!([caller_key()]), false, None);
+        retain_fabric_caller_delegation(&mut put, &stored_off, &omitted);
+        assert_eq!(switch(&put), (false, Some(false)), "a variant that turns it off keeps it off");
     }
 
     #[test]
@@ -5557,6 +5984,7 @@ mod validation_tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            delegated_credentials_for_fabric_callers: false,
         }
     }
 

@@ -183,12 +183,25 @@ Point that sets the switch, on the surface or in an enabled variant, answers wit
 header saying so. The switch has an effect only on a Transit Point that also sets
 `allow_fabric_callers`, since a token issued for a partner's request opens no other.
 
-Set the switch only when the receiving surface verifies a per-user credential on each Fabric
-request: a JWT whose `sub` is the end user, with an audience naming this gateway. The receiving
-surface normally verifies the credential the peer's `target_auth` presents, and when that is the
-partner's own key, every request the partner sends has the same identity hash. One partner
-credential is then one grant: the first of the partner's users to complete consent binds their
-account, and every later request from that partner, for any of its users, is sent with it.
+The switch is safe only when the receiving surface verifies a per-user credential on each Fabric
+request, so the admin API refuses it, with `400`, on a surface whose caller authentication, on
+the surface or in the variant the Transit Point belongs to, cannot tell a partner's users apart
+(see [The caller on Fabric receive](#the-caller-on-fabric-receive)). The receiving surface
+normally verifies the credential the peer's `target_auth` presents. With `api_key`, the
+identity hash is the secret's id, so every key in that secret, the partner's and those of the
+surface's direct callers alike, is one caller with one grant: the first of them to complete
+consent binds their account, and every later request with any of those keys, from the partner
+for any of its users or from a direct caller, is sent with it. A JWT whose `sub` is the end
+user, with an audience naming this gateway, keys each user apart. A `PUT` that omits the switch
+drops it once the surface's caller authentication no longer tells users apart.
+
+The grant a Fabric caller gets on a Transit Point is the same grant that user's direct calls
+through that Transit Point use: the Transit Point's managed identity and the same identity hash.
+An opted-in caller with no grant yet gets the consent answer below, and whoever completes that
+authorization URL binds their provider account to the user, for direct calls through that
+Transit Point too. The URL goes to the managed agent, which may pass it back to the partner, so
+set the switch only for partners trusted with the users' credentials: a partner that holds a
+user's JWT for this gateway can already start consent for that user directly.
 
 Without the switch, or when the receiving surface verified no caller, a binding that applies
 refuses the call with `403` and the target is not called. The log says delegated credentials
@@ -222,14 +235,66 @@ answer of [When a token is missing](#when-a-token-is-missing), with consent stat
 
 The receiving gateway keys its Target's grants by the identity hash of the caller its own
 surface's source authentication verified on the request, the same value its Access Point
-computes for the same credential. A pseudonym, a DID or a presentation the peer's request names
-never selects a grant: any paired gateway can name any caller, and a connection issuer can sign a
-presentation for any DID. When the surface verified no caller, a binding that applies refuses the
-request with `403` and the Target is not called. On a `2026-07-28` MCP request the user half of the
-key is the resource-token caller the surface verified, and the agent half is a caller DID only
-when a presentation from one of the connection's issuers proved it; otherwise the request is
-refused with `403` (`-32001`). Grants stored under a caller the peer named, before this rule, are
-never looked up again; remove them as in
+computes for the same credential, and the Target's URL as the agent half. A pseudonym, a DID or
+a presentation the peer's request names never selects a grant: any paired gateway can name any
+caller, and a connection issuer can sign a presentation for any DID.
+
+The caller the surface verifies is normally the credential the peer's `target_auth` presents,
+often the partner's own key, which names every one of the partner's users alike. So per-user
+grants (`oauth2_authorization_code` providers) are released to a legacy Fabric request only on
+a surface that sets `delegated_credentials_for_fabric_callers: true` (off by default, and
+overridable per variant; a `complete` variant that leaves it out has it off):
+
+```json
+{
+  "outbound_credentials": [{ "credential_provider_id": "calendar", "scopes": ["read"] }],
+  "delegated_credentials_for_fabric_callers": true
+}
+```
+
+The admin API refuses the switch, with `400`, on a surface or variant whose caller
+authentication cannot tell a partner's users apart. Only two kinds can: a resource token
+(`mcp_http.authorization`), and a `jwt_bearer` method that names an audience (its own
+`audiences`, or the resource `protected_resource` binds) through a JWT verification strategy
+that names an issuer. Every method the Access Point lists must be one of them: `api_key` names
+every key in its secret as one caller, the partner's and direct callers' alike; an
+`api_key_provider` key names the client that holds it; a `did_auth` session names the DID that
+signed in, not the user a partner acts for; mTLS never verifies a request over Fabric; and a
+`jwt_bearer` method with no audience accepts a token the identity provider issued for another
+service. The same rule refuses a Transit Point's switch of that name (see
+[The caller on a Transit Point](#the-caller-on-a-transit-point)). A surface stored with the
+switch and any other caller authentication, for example through a file, releases nothing to
+partners. A `PUT` that omits the switch, on the surface or in a variant's overrides, keeps it
+while that view's caller authentication still tells users apart, and drops it once it does not,
+since the Surface Builder does not show it; a variant that turns it off keeps it off.
+
+A legacy Fabric request a binding applies to is refused with `403`, before the Target is called,
+when:
+
+| Reason | When |
+| --- | --- |
+| `delegation_not_enabled_for_partners` | A per-user binding applies and the surface does not release per-user grants to partners. |
+| `partner_caller_not_verified` | Any binding applies and the surface verified no caller of the request. |
+| `consent_not_available_for_partners` | The caller has no grant yet. Consent is never started for a Fabric request: whoever completes an authorization URL binds their account to the caller, and on Fabric the URL would travel through the partner. |
+
+The reason is the only part of the refusal the peer sees: a JSON-RPC error with `-32001`, the
+request's id and `data.reason` on an MCP surface, an `application/problem+json` body with
+`reason` otherwise. Each is recorded as a `request_rejected` audit event at the `admission`
+stage, with the reasons `delegation_not_enabled_for_partners`, `consent_identity_required` and
+`consent_not_available_for_partners`. Service-level bindings (`api_key`,
+`oauth2_client_credentials`, `oauth2_jwt_bearer`, `oauth2_client_credentials_jwt_auth`) key no
+caller's grant and reach a partner's request without the switch, once the surface verified a
+caller. A grant the receive side releases is keyed by the Target's URL, never by the managed
+agent DID or surface id a direct call keys, so a Fabric caller's grants and its direct grants
+never mix; with consent refused, only a grant already stored under the Target's URL and that
+caller is released. An agent card or other discovery read releases no credential and is never
+refused for one.
+
+On a `2026-07-28` MCP request the user half of the key is the resource-token caller the surface
+verified, and the agent half is a caller DID only when a presentation from one of the
+connection's issuers proved it; otherwise the request is refused with `403` (`-32001`). Its
+consent verifies the consenting user, so the switch does not apply to it. Grants stored under a
+caller the peer named, before this rule, are never looked up again; remove them as in
 [Removing grants keyed by the old identity hash](#removing-grants-keyed-by-the-old-identity-hash).
 
 ## Target authentication from a credential provider
@@ -333,7 +398,8 @@ credential, as it is without the `target_auth` one.
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores
 are not available, and on the `elicit` outcomes above. Fabric receive refuses a request whose
-caller its surface did not verify (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
+caller its surface did not verify, a per-user binding on a surface that does not release them to
+partners, and consent (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
 
 A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
 not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose
