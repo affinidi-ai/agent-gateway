@@ -2499,21 +2499,23 @@ allow if {
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
 }
 
-#[test]
-fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
-    if std::env::var_os("ATG_FABRIC_DISCOVERY_CHILD").is_none() {
+/// Runs `flow` in a test process of its own. Fabric receive reads process-wide
+/// stores (surfaces, source auth) that the first gateway booted in a process
+/// owns, so a flow that installs its own would otherwise see another test's.
+fn run_in_own_process<F: std::future::Future<Output = ()>>(flow: impl FnOnce() -> F) {
+    if std::env::var_os("ATG_FABRIC_ISOLATED_CHILD").is_none() {
         let test_name = std::thread::current()
             .name()
             .unwrap()
             .to_string();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test_name, "--nocapture"])
-            .env("ATG_FABRIC_DISCOVERY_CHILD", "1")
+            .env("ATG_FABRIC_ISOLATED_CHILD", "1")
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "isolated Fabric discovery test failed:\n{}\n{}",
+            "isolated Fabric test {test_name} failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -2523,7 +2525,12 @@ fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(Box::pin(fabric_discovery_flow()));
+        .block_on(Box::pin(flow()));
+}
+
+#[test]
+fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
+    run_in_own_process(fabric_discovery_flow);
 }
 
 /// An MCP Access Point that publishes protected resource metadata binds a
@@ -2695,6 +2702,200 @@ async fn fabric_discovery_flow() {
         let response = send(Some("ghost"), Some(token_for(audience))).await;
         assert_eq!(response["status"], 404, "{response}");
         assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
+    }
+}
+
+#[test]
+fn fabric_receive_refuses_a_failed_caller_on_a_closed_access_point() {
+    run_in_own_process(closed_access_point_fabric_flow);
+}
+
+/// A closed Access Point refuses a Fabric caller without a valid credential
+/// before policy and the Target, in the caller's protocol shape, while a
+/// surface stored without `on_failure` still forwards it. A closed Access
+/// Point stored without caller authentication is not ready and refuses every
+/// caller with `503`.
+async fn closed_access_point_fabric_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "closed-idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface = |id: &str, protocol: &str, on_failure: Option<&str>| {
+        let mut caller_authentication =
+            json!({"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}]});
+        if let Some(on_failure) = on_failure {
+            caller_authentication["on_failure"] = json!(on_failure);
+        }
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "caller_authentication": caller_authentication},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }))
+        .unwrap()
+    };
+    let not_ready = |id: &str, protocol: &str| {
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "public": false},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }))
+        .unwrap()
+    };
+    for stored in [
+        surface("closed-mcp", "mcp", Some("reject")),
+        surface("closed-a2a", "a2a", Some("reject")),
+        surface("legacy-mcp", "mcp", None),
+        not_ready("unready-mcp", "mcp"),
+        not_ready("unready-a2a", "a2a"),
+    ] {
+        store
+            .save(&stored)
+            .await
+            .unwrap();
+    }
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str, token: Option<String>| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(token) = token {
+            headers["authorization"] = json!(format!("Bearer {token}"));
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": format!("/{channel_id}"), "headers": headers,
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let foreign_token =
+        sign_jwt(json!({"iss": "https://other.example", "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    let body = |response: &Value| -> Value {
+        serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    for token in [None, Some(foreign_token.clone())] {
+        let refused = send("closed-mcp", token.clone()).await;
+        assert_eq!(refused["status"], 401, "{refused}");
+        assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
+        assert_eq!(
+            body(&refused),
+            json!({"jsonrpc": "2.0", "id": "call", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
+            }})
+        );
+
+        let refused = send("closed-a2a", token).await;
+        assert_eq!(refused["status"], 401, "{refused}");
+        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
+        assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+    }
+
+    let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    let admitted = send("closed-mcp", Some(valid)).await;
+    assert_eq!(admitted["status"], 200, "{admitted}");
+    assert_eq!(reached(), 1, "a valid caller reaches the Target");
+
+    let forwarded = send("legacy-mcp", Some(foreign_token)).await;
+    assert_eq!(forwarded["status"], 200, "{forwarded}");
+    assert_eq!(reached(), 2, "a surface stored without on_failure forwards a failed caller to policy");
+
+    let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    for token in [None, Some(valid)] {
+        let refused = send("unready-mcp", token.clone()).await;
+        assert_eq!(refused["status"], 503, "{refused}");
+        assert_eq!(
+            body(&refused),
+            json!({"jsonrpc": "2.0", "id": "call", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                "message": crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE
+            }})
+        );
+
+        let refused = send("unready-a2a", token).await;
+        assert_eq!(refused["status"], 503, "{refused}");
+        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE);
+        assert_eq!(reached(), 2, "a not-ready Access Point never reaches the Target");
     }
 }
 

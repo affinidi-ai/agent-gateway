@@ -22,6 +22,7 @@ import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceTemplateItem } from '../../api';
 import { SurfaceMetaProvider, type DidwebvhConfig } from './SurfaceMetaContext';
 import type { SurfacePolicyDefinitionLoadState } from './elements/policy/status';
+import type { AccessPointNotice } from './elements/access-point/readiness';
 import { hasPolicyDefinitionReference, policyDefinitionsWarning } from './elements/policy/status';
 
 export type SurfaceFormMode = 'create' | 'edit';
@@ -160,6 +161,13 @@ export interface SurfaceFormShellProps {
   agentCardRefreshKey?: unknown;
   /** True when the saved surface has enabled Surface Variants. */
   hasVariants?: boolean;
+  /**
+   * Readiness notice shown under the Access Point URL, decided by the page;
+   * absent while the Access Point is ready.
+   */
+  accessPointNotice?: AccessPointNotice | null;
+  /** The stored surface has no `access_point.public`: a legacy Access Point. */
+  legacyAccessPoint?: boolean;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -318,6 +326,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   isDirty = false,
   agentCardRefreshKey,
   hasVariants = false,
+  accessPointNotice,
+  legacyAccessPoint,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -361,6 +371,20 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
     sidebarWidthRef.current = sidebarWidth;
   }, [sidebarWidth]);
   const [isResizingSidebar, setIsResizingSidebar] = React.useState(false);
+
+  // "Configure Authentication": the builder can't select an empty slot, so
+  // select the Access Point and point at the Caller Context in the palette,
+  // which is dragged onto the caller arrow.
+  const [paletteHighlight, setPaletteHighlight] = React.useState<{
+    type: SurfaceNodeType;
+  } | null>(null);
+  const handleNodeClick = builder.handleNodeClick;
+  const handleConfigureAuthentication = React.useCallback(() => {
+    setActiveTab('surface');
+    handleNodeClick('access-point');
+    setSidebarCollapsed(false);
+    setPaletteHighlight({ type: 'caller-auth' });
+  }, [handleNodeClick, setActiveTab]);
   const handleSidebarResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
     setIsResizingSidebar(true);
@@ -827,6 +851,9 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
         saveError,
         saveWarnings,
+        accessPointNotice,
+        legacyAccessPoint,
+        onConfigureAuthentication: handleConfigureAuthentication,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,
         setTagsCsv: setMeta.setTagsCsv,
@@ -983,6 +1010,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                           variant="inline"
                           existingNodes={builder.state.nodes}
                           protocol={meta.protocol}
+                          highlight={paletteHighlight}
                           onAnyDragStart={() => {
                             if (activeTab !== 'surface') setActiveTab('surface');
                           }}

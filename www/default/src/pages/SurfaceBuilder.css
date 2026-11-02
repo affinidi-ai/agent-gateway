@@ -340,6 +340,99 @@ body.dark-theme .surface-access-point-url-widget .alert {
   color: #f1f5f9;
 }
 
+/* "Not ready for external access" notice under the Entry point URL on the
+   canvas, in the warning yellow. */
+.access-point-readiness {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-bottom: 1rem;
+  font-size: 12px;
+}
+
+.access-point-readiness__text {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.access-point-readiness__action {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--warning);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.6);
+}
+
+.access-point-readiness__action:hover,
+.access-point-readiness__action:focus-visible {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.22);
+  border-color: var(--warning);
+}
+
+/* Public access switch under the Entry point URL in the Access Point panel.
+   Its label matches the other section labels (Routing, Listen Path), and the
+   label's bottom margin and the input's top margin are dropped so the two
+   centre on one line. */
+.access-point-public-access {
+  margin-top: 10px;
+}
+
+.config-section .access-point-public-switch .form-check-label {
+  font-size: 10px;
+  margin-bottom: 0;
+}
+
+.config-section .access-point-public-switch .form-check-input {
+  margin-top: 0;
+}
+
+body.dark-theme .access-point-readiness__text,
+body.dark-theme .access-point-readiness__action {
+  color: #fbbf24;
+}
+
+body.dark-theme .access-point-readiness__action {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(251, 191, 36, 0.5);
+}
+
+body.dark-theme .access-point-readiness__action:hover,
+body.dark-theme .access-point-readiness__action:focus-visible {
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.25);
+}
+
+/* On the canvas the notice hangs under the URL pill, so the top bar keeps
+   its height and the toolbar does not move. */
+.surface-access-point-url-widget {
+  position: relative;
+}
+
+.surface-access-point-url-widget .access-point-readiness {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  flex-wrap: nowrap;
+  margin-bottom: 0;
+  padding: 4px 10px;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+  pointer-events: auto;
+}
+
+body.dark-theme .surface-access-point-url-widget .access-point-readiness {
+  background: rgba(30, 41, 59, 0.85);
+  border-color: rgba(251, 191, 36, 0.4);
+}
+
 /* Floating canvas toolbar (undo / redo / auto-layout) at the end of the
    canvas top bar. Mirrors the glassmorphism of the variants widget. */
 .surface-toolbar-widget {
@@ -1544,6 +1637,25 @@ body.dark-theme .surface-canvas-callout__tail {
 body.dark-theme .palette-item--help-open {
   background: rgba(120, 150, 240, 0.12);
   outline-color: rgba(120, 150, 240, 0.55);
+}
+
+/* Palette item the "Configure Authentication" action points at. */
+.palette-item--highlight {
+  background: rgba(245, 158, 11, 0.12);
+  outline: 2px solid rgba(245, 158, 11, 0.8);
+  animation: palette-item-highlight 800ms ease-in-out 3;
+}
+
+@keyframes palette-item-highlight {
+  50% {
+    box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .palette-item--highlight {
+    animation: none;
+  }
 }
 
 .surface-help-balloon {

@@ -1,6 +1,7 @@
 import { createContext, useContext } from 'react';
 import type { AgentSurface } from '../../api';
 import type { Protocol } from './elements/types';
+import type { AccessPointNotice } from './elements/access-point/readiness';
 
 export type DidwebvhInjectionMode = 'header' | 'signed_header' | 'protocol_native';
 
@@ -57,6 +58,15 @@ export interface SurfaceMetaValue {
    * A new array on every save, so a panel can tell one save from the next.
    */
   saveWarnings?: readonly string[] | null;
+  /** Readiness notice shown under the Access Point URL; absent while it is ready. */
+  accessPointNotice?: AccessPointNotice | null;
+  /**
+   * The stored surface has no `access_point.public`: a legacy Access Point,
+   * which hands callers whose credential fails to policy unless it is closed.
+   */
+  legacyAccessPoint?: boolean;
+  /** Selects the Access Point and points at the Caller Context element in the palette. */
+  onConfigureAuthentication?: () => void;
   setName: (v: string) => void;
   setDescription: (v: string) => void;
   setTagsCsv: (v: string) => void;

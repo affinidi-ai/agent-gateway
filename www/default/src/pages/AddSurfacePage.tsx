@@ -8,6 +8,7 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
+import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -18,6 +19,11 @@ import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
+import { withCallerAccessSettled } from '../components/surface-builder/elements/access-point/publicAccess';
+import {
+  accessPointStatus,
+  chooseAccessPointNotice,
+} from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -35,7 +41,6 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
-import { joinWarnings } from '../utils/warningHeader';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -449,7 +454,9 @@ const AddSurfacePage: React.FC = () => {
     setSaving(true);
     setError(null);
     try {
-      const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
+      const payload: Partial<AgentSurface> = withCallerAccessSettled(
+        withA2aValidationSettled(buildSurfacePayload())
+      );
       let headerWarnings: string[] = [];
       const created = await apiClient.createSurface(payload, {
         onWarnings: warnings => {
@@ -459,18 +466,7 @@ const AddSurfacePage: React.FC = () => {
       justCreatedRef.current = true;
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      // One toast: a later one replaces an earlier one.
-      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
-      if (allWarnings.length === 0) {
-        showToast('success', `Agent Surface "${name}" created`);
-      } else {
-        showToast(
-          'error',
-          `Agent Surface "${name}" created, with warnings:\n${joinWarnings(allWarnings)}`,
-          { autoRemove: true, duration: 10000 }
-        );
-      }
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, { headerWarnings });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
       if (headerWarnings.length > 0 && created?.surface_id) {
@@ -554,7 +550,13 @@ const AddSurfacePage: React.FC = () => {
     handleCreate();
   }, builder.commit);
 
-  const configEditorValue = jsonOverride ?? JSON.stringify(buildSurfacePayload(), null, 2);
+  const draftPayload = buildSurfacePayload();
+  const configEditorValue = jsonOverride ?? JSON.stringify(draftPayload, null, 2);
+  // Nothing is saved yet, so the draft decides; the gateway creates it closed.
+  const accessPointNotice = chooseAccessPointNotice(
+    null,
+    accessPointStatus(draftPayload, { isNew: true })
+  );
 
   /**
    * Live-apply a user-pasted/edited AgentSurface payload from the
@@ -850,6 +852,7 @@ const AddSurfacePage: React.FC = () => {
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
+        accessPointNotice={accessPointNotice}
         manageActions={
           <div className="d-flex gap-2">
             <button

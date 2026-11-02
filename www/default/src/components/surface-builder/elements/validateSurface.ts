@@ -32,7 +32,10 @@ export interface ValidationIssue {
 }
 
 /**
- * Validate the built payload. Cheap, side-effect-free, no async.
+ * Validate the built payload. Cheap, side-effect-free, no async. Caller
+ * access never blocks a save and raises no issue here: the gateway's save
+ * answers with a `Warning` header for a public, a not-ready, and a legacy
+ * Access Point that admits every caller.
  */
 export function validateSurfacePayload(payload: any): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
@@ -49,6 +52,8 @@ export function validateSurfacePayload(payload: any): ValidationIssue[] {
       path: 'name',
     });
   }
+
+  // Listed before the other warnings, which the save toasts cap at three.
 
   // Target endpoint — required for any surface that proxies to an
   // upstream. Surfaces wired exclusively to NPCs (managed agents) may

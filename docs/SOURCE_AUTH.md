@@ -53,17 +53,83 @@ than serving surfaces whose caller authentication would be skipped. A request, d
 over Fabric, that reaches a surface with caller authentication configured while no middleware
 is installed is refused with `500` rather than forwarded unauthenticated.
 
-A missing or invalid credential does not refuse the request. That includes an mTLS
-certificate that lacks the configured binding field. The request continues with no caller
-identity, and policy sees `input.source_auth` as
+### Closed and public Access Points
+
+`access_point.public` and `caller_authentication.on_failure` decide whether an Access Point
+admits callers without a valid credential
+([`agent_surface.rs`](../src/config/agent_surface.rs)).
+
+| `access_point.public` | Meaning |
+| --- | --- |
+| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. It keeps the behaviour its stored fields describe: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
+| `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. A failed caller is refused whatever `on_failure` stores, including on a surface edited by hand. |
+| `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save answers with a `Warning` header. |
+
+On a closed surface the admin API, on create and on every update:
+
+- saves a surface, or an enabled variant, whose Access Point has no `caller_authentication`
+  method, and answers with a `Warning` header saying it is not ready for external access. An MCP
+  Access Point protected by `mcp_http.authorization` counts as authenticating its callers;
+- sets `caller_authentication.on_failure` to `reject`, on the base and on every variant
+  override that sets `caller_authentication`;
+- keeps the stored `public` value when an update leaves it out, so a client that drops the
+  field cannot reopen the surface.
+
+#### Not ready Access Points
+
+A closed Access Point (`public: false`) without source authentication (no
+`caller_authentication` method and, on MCP, no `mcp_http.authorization`) is not ready for
+external access. Only `public: false` closes an Access Point: a legacy surface with
+`on_failure: reject` and no method stays ready and admits every caller. The state is derived
+from the surface as served, base or variant, and never stored, so the Access Point serves as
+soon as a save adds source authentication or sets `public: true`. Until then it refuses every
+request, discovery reads included, with `503` before source authentication, policy and the
+target, on direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets and Fabric receive.
+MCP callers get a JSON-RPC error carrying the request id; other callers get
+`application/problem+json`. The body says only that the Access Point is not available; the
+reason is logged, and each refusal is recorded in the Audit Log as `request_rejected` with the
+reason `access_point_not_ready`. Legacy and public Access Points are always ready, and so are
+onboarding surfaces, which capture a request and never forward it.
+
+Surface responses carry a read-only top-level `access_point_status`, `ready` or
+`not_ready`, for the surface the Access Point URL serves: the default variant when the surface
+has one, otherwise the base. Variant responses carry it for that variant.
+
+On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
+with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
+`a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
+so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
+protects, and repeated wrong credentials aren't throttled by it either. Use high-entropy API keys
+and limit requests per client upstream of the gateway if credential guessing is a concern. MCP callers get a JSON-RPC error carrying the request id; other callers get
+`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only that the credential
+is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
+onboarding surfaces are unaffected.
+
+Create and update responses are the saved surface plus `access_point_status`. A save warns
+in `Warning` headers (code 299), before the Transit Point warnings described below, when the
+Access Point is public, when it or an enabled variant is not ready (a variant's warning is
+prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
+admits every caller. A write request that sends a response back unchanged has its top-level
+`access_point_status` dropped before parsing.
+
+A gateway rolled back to a release without these fields cannot load the surfaces that store
+them, which is every surface created after the upgrade; see
+[Upgrading and rolling back](#upgrading-and-rolling-back).
+
+### Failed credentials with `on_failure: continue`
+
+With `on_failure: continue`, a missing or invalid credential does not refuse the request.
+That includes an mTLS certificate that lacks the configured binding field. The request
+continues with no caller identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
 surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
 Fabric send and Fabric receive. A Transit Point refuses such a caller itself (see
-[Transit Point callers](#transit-point-callers)). A surface that must reject unauthenticated
-callers at its Access Point therefore needs a policy that denies them:
+[Transit Point callers](#transit-point-callers)). To reject unauthenticated callers at such an
+Access Point, close it (`public: false` with caller authentication), or attach a policy that
+denies them:
 
 ```rego
 package surface.policy
@@ -379,6 +445,15 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
   rolling back, also remove `source_auth` from such templates, or back up
   `_storage/agent_surface_templates/` before upgrading and restore it on rollback. Templates
   are always stored as plain JSON.
+- A release that predates closed Access Points rejects `access_point.public` and
+  `caller_authentication.on_failure` (both reject unknown fields), so it skips, with a logged
+  error, every surface that stores either one. That is every surface the admin API or the
+  dashboard created after the upgrade, and every surface an operator closed or opened since.
+  Their routes answer `404` and they leave the dashboard and Fabric discovery: they are down,
+  not open. The records stay on disk and load again once the upgrade is reapplied. Removing
+  the fields to load such a surface on the older release opens it: one without source
+  authentication then admits every caller, and one with it hands a failed caller to policy.
+  Back up `_storage/agent_surfaces/` before upgrading.
 
 ### Transit Point source authentication
 
