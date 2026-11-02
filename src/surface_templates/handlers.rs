@@ -179,6 +179,7 @@ pub async fn create_template(
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let mut tpl = req.into_template(id, now);
+    refuse_reference_transit_tokens(&tpl)?;
     tpl.settle_surface_markers();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
@@ -232,11 +233,26 @@ async fn update_stored_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
+    refuse_reference_transit_tokens(&tpl)?;
     tpl.settle_surface_markers();
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
     Ok(tpl)
+}
+
+/// Refuse a template whose surface sets `transit_token_mode: reference`, on
+/// the surface or in a variant's overrides, as a surface save refuses it, so a
+/// template never stores a surface every create from it would refuse.
+fn refuse_reference_transit_tokens(tpl: &SurfaceTemplate) -> Result<(), TemplateApiError> {
+    match tpl
+        .surface
+        .as_ref()
+        .and_then(crate::config::agent_surface::reference_transit_token_refusal)
+    {
+        Some(refusal) => Err(TemplateApiError::BadRequest(refusal)),
+        None => Ok(()),
+    }
 }
 
 /// `GET /v1/surface-templates/{id}/export`
@@ -308,6 +324,7 @@ pub async fn import_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
+    refuse_reference_transit_tokens(&tpl)?;
     if tpl.id.trim().is_empty()
         || s.get(&tpl.id)
             .await
@@ -622,6 +639,47 @@ mod tests {
                 .is_none(),
             "no target list, so no marker is persisted"
         );
+    }
+
+    /// A template whose surface asks for `transit_token_mode: reference`, on
+    /// the surface or in a variant's overrides, is refused when it is saved,
+    /// as a surface save refuses it, rather than stored to fail when a surface
+    /// is created from it; `embedded` is saved.
+    #[tokio::test]
+    async fn a_template_asking_for_reference_transit_tokens_is_refused_when_saved() {
+        use crate::config::agent_surface::TRANSIT_TOKEN_REFERENCE_REFUSED;
+        let with_mode = |base: &str, variant: &str| {
+            let mut surface = fabric_surface(Some(true));
+            surface["transit"]["transit_token_mode"] = serde_json::json!(base);
+            surface["variants"] = serde_json::json!([{ "id": "candidate", "alias": "candidate", "name": "Candidate",
+                "overrides": { "transit": { "shared": { "transit_token_mode": variant } } } }]);
+            surface
+        };
+        for (case, surface, refused) in [
+            ("the surface", with_mode("reference", "embedded"), Some(TRANSIT_TOKEN_REFERENCE_REFUSED.to_string())),
+            (
+                "a variant",
+                with_mode("embedded", "reference"),
+                Some(format!("variant 'candidate' {TRANSIT_TOKEN_REFERENCE_REFUSED}")),
+            ),
+            ("embedded", with_mode("embedded", "embedded"), None),
+        ] {
+            let (store, template, _dir) = stored_template(None).await;
+            let mut update = template.clone();
+            update.surface = Some(surface);
+            let direct = match refuse_reference_transit_tokens(&update) {
+                Ok(()) => None,
+                Err(TemplateApiError::BadRequest(message)) => Some(message),
+                Err(other) => panic!("{case}: {other:?}"),
+            };
+            assert_eq!(direct, refused, "{case}: the check create and import run too");
+            let saved = update_stored_template(&store, template.id.clone(), &None, &None, update).await;
+            match (saved, refused) {
+                (Err(TemplateApiError::BadRequest(message)), Some(refused)) => assert_eq!(message, refused, "{case}"),
+                (Ok(_), None) => {}
+                (other, refused) => panic!("{case}: expected {refused:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

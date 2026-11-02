@@ -1103,7 +1103,7 @@ pub struct TransitConfig {
 }
 
 /// Shared transit configuration applied to all transit points.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedTransitConfig {
     /// Transit token mode (how caller context is carried). Only `embedded` is
     /// supported, and it is what every surface gets: the admin API refuses
@@ -1131,8 +1131,9 @@ pub struct SharedTransitConfig {
     /// Has no effect, whatever its value, and is deprecated. Whether a Transit
     /// Point sends a signed VP follows its `managed_identity` and
     /// `identity_injection.inject_vp`. A stored `false` gets a warning when the
-    /// surface loads, since the operator may expect requests without a VP.
-    #[serde(default = "default_true")]
+    /// surface loads, since the operator may expect requests without a VP. It
+    /// is written only when `false`, so a read and save never adds it.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub sign_requests: bool,
 
     /// Extension validation rules for outbound request bodies.
@@ -1222,15 +1223,39 @@ pub const TRANSIT_TOKEN_REFERENCE_REFUSED: &str = "transit.transit_token_mode 'r
 pub const TRANSIT_SOURCE_AUTH_REFUSED: &str = "transit.source_auth is not enforced, so a surface that sets it has \
      every Transit Point request refused; remove it, and set source_auth on each Transit Point instead";
 
+impl Default for SharedTransitConfig {
+    fn default() -> Self {
+        Self {
+            transit_token_mode: TransitTokenMode::default(),
+            transit_token_lifetime_secs: None,
+            transit_policy: None,
+            rate_limit: None,
+            sign_requests: true,
+            extension_rules: None,
+            custom_metadata: None,
+            response_extension_rules: None,
+            opa_policy_definition_id: None,
+            source_auth: None,
+        }
+    }
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// How the transit token carries caller context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransitTokenMode {
     /// Context carried in the signed token itself, readable by the managed
-    /// agent (stateless, larger token).
+    /// agent (stateless, larger token). The only mode the gateway issues.
     #[default]
     Embedded,
-    /// Context stored server-side; token is a short reference key.
+    /// Deprecated: no server-side store exists. Accepted when a stored surface
+    /// loads, with a warning, and served as [`Self::Embedded`]; the admin API
+    /// refuses it on a surface, a variant and a template
+    /// ([`TRANSIT_TOKEN_REFERENCE_REFUSED`]).
     Reference,
 }
 
@@ -1843,6 +1868,46 @@ impl StorableEntity for AgentSurface {
     }
 }
 
+/// Whether a surface's transit settings, or a variant's overrides of them, as
+/// JSON, set `transit_token_mode: reference`.
+fn asks_for_reference_transit_tokens(shared: &serde_json::Value) -> bool {
+    shared
+        .get("transit_token_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("reference")
+}
+
+/// The refusal for a surface as JSON, such as a template's, that sets
+/// `transit_token_mode: reference` on the surface or in a variant's
+/// overrides, worded as a surface save words it; `None` when it does not.
+pub(crate) fn reference_transit_token_refusal(value: &serde_json::Value) -> Option<String> {
+    if value
+        .get("transit")
+        .is_some_and(asks_for_reference_transit_tokens)
+    {
+        return Some(TRANSIT_TOKEN_REFERENCE_REFUSED.to_string());
+    }
+    value
+        .get("variants")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|variant| {
+            variant
+                .pointer("/overrides/transit/shared")
+                .is_some_and(asks_for_reference_transit_tokens)
+        })
+        .map(|variant| {
+            format!(
+                "variant '{}' {TRANSIT_TOKEN_REFERENCE_REFUSED}",
+                variant
+                    .get("alias")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+            )
+        })
+}
+
 /// Warn about a stored surface that sets a transit setting the gateway does not
 /// act on, on the base surface or in a variant's overrides: `transit_token_mode:
 /// reference` (the tokens are embedded all the same) and `sign_requests: false`
@@ -1857,11 +1922,7 @@ fn warn_inert_transit_settings(value: &serde_json::Value) {
         let Some(shared) = shared else {
             return;
         };
-        if shared
-            .get("transit_token_mode")
-            .and_then(serde_json::Value::as_str)
-            == Some("reference")
-        {
+        if asks_for_reference_transit_tokens(shared) {
             tracing::warn!(
                 surface_id = %surface_id,
                 variant = %variant,
@@ -4209,6 +4270,25 @@ mod tests {
         }
         let mut json = serde_json::json!({ "surface_id": "no-transit" });
         assert_eq!(inert_transit_warnings(&mut json), vec![]);
+    }
+
+    /// `sign_requests` is written only when it is `false`, the value a load
+    /// warns of, so a read and save of a surface, or of one built with the
+    /// defaults, never writes the setting that does nothing.
+    #[test]
+    fn sign_requests_is_written_only_when_false() {
+        let written = |shared: &SharedTransitConfig| {
+            serde_json::to_value(shared)
+                .unwrap()
+                .get("sign_requests")
+                .cloned()
+        };
+        assert_eq!(written(&SharedTransitConfig::default()), None, "the default");
+        let read: SharedTransitConfig = serde_json::from_value(serde_json::json!({ "sign_requests": true })).unwrap();
+        assert_eq!(written(&read), None, "a stored true");
+        let unsigned: SharedTransitConfig =
+            serde_json::from_value(serde_json::json!({ "sign_requests": false })).unwrap();
+        assert_eq!(written(&unsigned), Some(serde_json::json!(false)), "a stored false is kept");
     }
 
     /// A surface stored with `reference` still deserializes and serves embedded

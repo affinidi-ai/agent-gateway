@@ -721,7 +721,9 @@ fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
 /// one (`stored`): a save that keeps it, such as a dashboard round trip, is
 /// accepted, and the gateway holds it to the nearer bound. So is a Transit
 /// Point, on the surface or in a variant's overrides, whose caller
-/// authentication cannot be enforced.
+/// authentication cannot be enforced. `transit_token_mode: reference`, on the
+/// surface or in a variant's overrides, is refused even when it is the stored
+/// value; a stored one is served as `embedded` until a save replaces it.
 fn validate_transit_points(
     surface: &mut AgentSurface,
     max_lifetime_secs: u64,

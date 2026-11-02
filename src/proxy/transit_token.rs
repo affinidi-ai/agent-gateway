@@ -4,10 +4,10 @@
 //! This token proves the request originated from an authenticated inbound session and carries
 //! the caller's identity context forward.
 //!
-//! Two modes are supported:
-//! - **Embedded**: All context is carried in the token itself, signed but not encrypted, so the
-//!   managed agent can read every claim (stateless, larger token).
-//! - **Reference**: Context stored server-side; token is a short reference key (not yet implemented).
+//! All context is carried in the token itself, signed but not encrypted, so the managed agent can
+//! read every claim. `transit_token_mode: reference` is deprecated: no server-side store exists, a
+//! stored surface that sets it loads with a warning and gets these embedded tokens, and the admin
+//! API refuses it.
 //!
 //! Tokens are HS256 JWTs signed with a random key the gateway creates on its first start and keeps
 //! with its own keys, so every instance sharing that storage signs and accepts the same tokens.
