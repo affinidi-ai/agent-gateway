@@ -443,6 +443,8 @@ bindings on the legacy and modern delegation paths, and every whole-string `$SEC
 in custom metadata: the Target's `custom_metadata` and `response_custom_metadata`, the Access
 Point's `response_custom_metadata` and the Transit Points' shared `custom_metadata`, at any depth
 of the payload. Response custom metadata is returned to the caller, so it follows the same rule.
+The gateway does not inject the Access Point's `response_custom_metadata`, but a save still checks
+it as part of the Target's leg.
 A custom metadata secret that cannot be sent fails its injection as a secret that does not exist
 does: an MCP request is refused, and an A2A request or response is forwarded without the metadata.
 
