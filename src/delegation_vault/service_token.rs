@@ -863,6 +863,58 @@ mod tests {
             (identity, slot)
         }
 
+        /// The time before which the key's next token request is held back; the backoff
+        /// starts when the failed request ends, so it includes the request's own duration.
+        async fn retry_at(
+            &self,
+            provider: &CredentialProvider,
+            scopes: &[&str],
+        ) -> DateTime<Utc> {
+            let (_, slot) = self
+                .grant_slot(provider, scopes)
+                .await;
+            slot.lock()
+                .await
+                .retry_at
+                .expect("a failed token request starts the backoff")
+        }
+
+        /// Sends a token request at `at` that fails, checks the backoff it starts lasts
+        /// `delay_secs` from the end of that request, that a request just before the retry time
+        /// is held back without reaching the endpoint, and returns just after the retry time.
+        async fn failed_request_then_backoff(
+            &self,
+            provider: &CredentialProvider,
+            at: DateTime<Utc>,
+            delay_secs: i64,
+            requests: usize,
+        ) -> DateTime<Utc> {
+            assert_eq!(
+                self.acquire(provider, &["read"], at)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed),
+                "{delay_secs} s"
+            );
+            assert_eq!(self.requests().len(), requests, "{delay_secs} s");
+            let retry_at = self
+                .retry_at(provider, &["read"])
+                .await;
+            assert!(
+                retry_at >= seconds(at, delay_secs) && retry_at < seconds(at, delay_secs + 3),
+                "{delay_secs} s: {retry_at}"
+            );
+            assert_eq!(
+                self.acquire(provider, &["read"], after(retry_at, -100))
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed),
+                "{delay_secs} s"
+            );
+            assert_eq!(self.requests().len(), requests, "{delay_secs} s: held back before the retry time");
+            after(retry_at, 100)
+        }
+
         fn requests(&self) -> Vec<HashMap<String, String>> {
             self.endpoint
                 .forms
@@ -1072,16 +1124,22 @@ mod tests {
             (stored.id, stored.expires_at, stored.updated_at),
             (cached.id.clone(), cached.expires_at, cached.updated_at)
         );
+        let retry_at = fixture
+            .retry_at(&provider, &[])
+            .await;
+        assert!(retry_at >= after(renew_at, 1_000) && retry_at < after(renew_at, 4_000), "{retry_at}");
 
-        assert_eq!(
-            issued(
-                fixture
-                    .acquire(&provider, &[], after(renew_at, 500))
-                    .await
-            ),
-            ("issued".into(), Freshness::Stale),
-            "a renewal held back by the backoff serves the token as stale"
-        );
+        for held_back in [after(renew_at, 500), after(retry_at, -100)] {
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &[], held_back)
+                        .await
+                ),
+                ("issued".into(), Freshness::Stale),
+                "a renewal held back by the backoff serves the token as stale"
+            );
+        }
         assert_eq!(fixture.requests().len(), 2);
 
         fixture.fail(false);
@@ -1089,7 +1147,7 @@ mod tests {
         assert_eq!(
             issued(
                 fixture
-                    .acquire(&provider, &[], after(renew_at, 1_100))
+                    .acquire(&provider, &[], after(retry_at, 100))
                     .await
             ),
             ("renewed".into(), Freshness::Fresh)
@@ -2062,18 +2120,24 @@ mod tests {
                     .err(),
                 Some(error)
             );
-            assert_eq!(
-                fixture
-                    .acquire(&provider, &["read"], after(now, 500))
-                    .await
-                    .err(),
-                Some(ServiceTokenError::TokenRequestFailed),
-                "{error}"
-            );
+            let retry_at = fixture
+                .retry_at(&provider, &["read"])
+                .await;
+            assert!(retry_at >= after(now, 1_000) && retry_at < after(now, 4_000), "{error}: {retry_at}");
+            for held_back in [after(now, 500), after(retry_at, -100)] {
+                assert_eq!(
+                    fixture
+                        .acquire(&provider, &["read"], held_back)
+                        .await
+                        .err(),
+                    Some(ServiceTokenError::TokenRequestFailed),
+                    "{error}"
+                );
+            }
             assert_eq!(fixture.requests().len(), 1, "{error}");
             assert_eq!(
                 fixture
-                    .acquire(&provider, &["read"], after(now, 1_200))
+                    .acquire(&provider, &["read"], after(retry_at, 100))
                     .await
                     .err(),
                 Some(error)
@@ -2120,21 +2184,39 @@ mod tests {
             .provider(client_credentials())
             .await;
         fixture.fail(true);
-        let now = Utc::now();
-        let attempt = |millis| fixture.acquire(&provider, &["read"], after(now, millis));
-        for (millis, requests) in [(0, 1), (900, 1), (1_200, 2), (3_100, 2), (3_400, 3), (7_300, 3), (7_600, 4)] {
-            assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
-            assert_eq!(fixture.requests().len(), requests, "{millis}");
+        let mut at = Utc::now();
+        let mut requests = 0;
+        for delay_secs in [1, 2, 4, 8] {
+            requests += 1;
+            at = fixture
+                .failed_request_then_backoff(&provider, at, delay_secs, requests)
+                .await;
         }
         fixture.fail(false);
-        assert_eq!(issued(attempt(16_000).await), ("issued".into(), Freshness::Fresh));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], at)
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        requests += 1;
+        assert_eq!(fixture.requests().len(), requests);
 
         fixture.fail(true);
-        let expired = 16_000 + 3_600_000;
-        for (millis, requests) in [(expired, 6), (expired + 900, 6), (expired + 1_200, 7)] {
-            assert_eq!(attempt(millis).await.err(), Some(ServiceTokenError::TokenRequestFailed), "{millis}");
-            assert_eq!(fixture.requests().len(), requests, "{millis}");
-        }
+        requests += 1;
+        let released = fixture
+            .failed_request_then_backoff(&provider, seconds(at, 3_600), 1, requests)
+            .await;
+        assert_eq!(
+            fixture
+                .acquire(&provider, &["read"], released)
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert_eq!(fixture.requests().len(), requests + 1, "a success clears the backoff, so the first delay applies");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
