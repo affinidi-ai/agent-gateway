@@ -312,8 +312,12 @@ receive does not read this mode; the request body sets the caller there (see
   asserts the key's own DID.
 - With no caller identity, such as after a failed key, `input.agent.did` is absent and
   those trust-registry claims are always dropped.
-- Gateway and global policy run before the key resolves, so they see no
-  `input.agent.did` and none of those claims on these surfaces.
+- Gateway-plane policy, including its global policy, runs before the key resolves, so it
+  sees no `input.agent.did` and none of those claims on these surfaces.
+- On a `fabric://` target only `access_point.inbound_policy` sees the key's DID, in
+  `input.extension_identity` (and `input.agent` when the Access Point has a Trust Check).
+  `target.policy` keeps its existing input, the target agent's card and the request body, so
+  a per-caller rule there matches `input.source_auth.key_name`.
 - A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
   [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
   refuses it.

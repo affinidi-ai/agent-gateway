@@ -2035,8 +2035,8 @@ pub(crate) mod tests {
     async fn removing_many_grants_revokes_them_at_once_and_deletes_each() {
         let directory = tempfile::tempdir().unwrap();
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
-        let delay = Duration::from_millis(300);
-        let server = RecordingServer::start_with_delay(200, delay).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let server = RecordingServer::start_answering(vec![Answer::status(200).held(&gate)]).await;
         let (vault, grants) = vault_with(&directory, REVOCATION_CONCURRENCY).await;
         let revoker = Revoker {
             providers: HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]),
@@ -2046,15 +2046,35 @@ pub(crate) mod tests {
             vault: Some(vault.clone()),
         };
 
-        let started = std::time::Instant::now();
-        delete_then_revoke(&vault, grants, revoker, (), None)
-            .await
-            .unwrap()
+        let revocations = delete_then_revoke(&vault, grants, revoker, (), None)
             .await
             .unwrap();
-        let elapsed = started.elapsed();
-        let serial = delay * 2 * u32::try_from(REVOCATION_CONCURRENCY).unwrap();
-        assert!(elapsed < serial / 2, "{elapsed:?} is close to revoking one grant after another ({serial:?})");
+        let _ = tokio::time::timeout(REVOCATION_TIMEOUT / 2, async {
+            while server.requests().len() < REVOCATION_CONCURRENCY {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let in_flight: Vec<String> = server
+            .requests()
+            .iter()
+            .take(REVOCATION_CONCURRENCY)
+            .filter_map(|(_, body)| {
+                url::form_urlencoded::parse(body.as_bytes())
+                    .find(|(name, _)| name == "token_type_hint")
+                    .map(|(_, hint)| hint.into_owned())
+            })
+            .collect();
+        assert_eq!(
+            in_flight,
+            vec!["refresh_token"; REVOCATION_CONCURRENCY],
+            "every grant's first revocation is in flight before any is answered"
+        );
+        gate.add_permits(2 * REVOCATION_CONCURRENCY);
+        tokio::time::timeout(Duration::from_secs(60), revocations)
+            .await
+            .expect("the revocations end")
+            .unwrap();
         assert_eq!(server.revoked_tokens().len(), 2 * REVOCATION_CONCURRENCY);
         assert!(
             vault

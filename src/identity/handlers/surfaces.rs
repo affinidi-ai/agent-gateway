@@ -7067,9 +7067,9 @@ mod validation_tests {
 
     #[test]
     fn inbound_from_api_key_is_accepted_behind_an_api_key_or_provider_caller_method() {
-        for caller in [api_key_caller("caller-keys"), provider_caller()] {
-            let s = inbound_api_key_surface(&[caller.clone(), jwt_caller()]);
-            assert!(validate_api_key_identities(&s, "").is_ok(), "{caller}");
+        for (case, caller) in [("api key", api_key_caller("caller-keys")), ("api key provider", provider_caller())] {
+            let s = inbound_api_key_surface(&[caller, jwt_caller()]);
+            assert!(validate_api_key_identities(&s, "").is_ok(), "{case}");
         }
     }
 
@@ -7142,7 +7142,7 @@ mod validation_tests {
 
     #[test]
     fn stored_from_api_key_slots_need_a_non_empty_key_id() {
-        for id in [None, Some(""), Some("  ")] {
+        for (case, id) in [("no id", None), ("empty id", Some("")), ("blank id", Some("  "))] {
             let mut protected = base_surface();
             protected
                 .identity_slots
@@ -7150,7 +7150,7 @@ mod validation_tests {
             assert!(
                 refusal(validate_api_key_identities(&protected, ""))
                     == format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
-                "{id:?}"
+                "{case}"
             );
 
             let mut external = base_surface();
@@ -7160,7 +7160,7 @@ mod validation_tests {
             assert!(
                 refusal(validate_api_key_identities(&external, ""))
                     == format!("identity_slots.external: {API_KEY_IDENTITY_NEEDS_ID}"),
-                "{id:?}"
+                "{case}"
             );
         }
 

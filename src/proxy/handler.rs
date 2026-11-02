@@ -22793,4 +22793,169 @@ mod fabric_extended_card_tests {
             .collect();
         assert_eq!(trust_checks, vec![("target".to_string(), Some("did:x:target".to_string()), None)]);
     }
+
+    struct FabricPolicyCase {
+        name: &'static str,
+        inbound: String,
+        target: String,
+        expected: axum::http::StatusCode,
+    }
+
+    #[tokio::test]
+    async fn fabric_send_gives_the_presented_key_did_to_the_inbound_policy_only() {
+        const KEY_ID: &str = "atgk_pak_fabric_caller";
+        const CARD_DID: &str = "did:web:target.example";
+        let key = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: KEY_ID.to_string(),
+            provider_agent_id: Some("provider-agent".to_string()),
+        };
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let vc_issuer = Arc::new(vc_issuer);
+        let card_server = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({
+                "name": "target agent",
+                "capabilities": {"extensions": [{
+                    "uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+                    "did": CARD_DID
+                }]}
+            })
+            .to_string(),
+        )
+        .await;
+        let key_surface = |peer: &mut FabricPeer| {
+            peer.state.vc_issuer = Some(vc_issuer.clone());
+            let mut surface = (*peer.state.surface).clone();
+            surface.identity_slots.inbound =
+                Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: None });
+            surface
+                .access_point
+                .listen_address = card_server.url();
+            surface
+        };
+        let mut setup = fabric_peer_answering(200, json!({})).await;
+        setup.state.surface = Arc::new(key_surface(&mut setup));
+        let key_did = super::resolve_configured_caller_identity(
+            &setup.state,
+            "POST",
+            "/a2a",
+            "Fabric A2A",
+            "fabric",
+            Some(&key),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("an API Key Provider key resolves a caller DID")
+        .did;
+        assert_ne!(key_did, CARD_DID);
+        let inbound_rule = |did: &str| {
+            format!(
+                "package surface.policy\ndefault allow = false\nallow if {{\n    input.extension_identity.did == \"{did}\"\n    input.extension_identity.verification == \"source_auth\"\n}}"
+            )
+        };
+        let card_and_body_target_rule = format!(
+            "package surface.policy\ndefault allow = false\nallow if {{\n    input.agent.did == \"{CARD_DID}\"\n    not input.extension_identity\n    input.source_auth.key_name == \"{KEY_ID}\"\n}}"
+        );
+        let cases = [
+            FabricPolicyCase {
+                name: "inbound sees the key DID, target sees the card DID",
+                inbound: inbound_rule(&key_did),
+                target: card_and_body_target_rule.clone(),
+                expected: axum::http::StatusCode::OK,
+            },
+            FabricPolicyCase {
+                name: "inbound rule naming another DID denies",
+                inbound: inbound_rule("did:example:other"),
+                target: card_and_body_target_rule,
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+            FabricPolicyCase {
+                name: "target rule needing the caller identity denies",
+                inbound: inbound_rule(&key_did),
+                target: "package surface.policy\ndefault allow = false\nallow if input.extension_identity.did"
+                    .to_string(),
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+        ];
+
+        for case in cases {
+            let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+            let mut surface = key_surface(&mut peer);
+            let (inbound_rego, target_rego) = (case.inbound, case.target);
+            let policy_dir = tempfile::tempdir().unwrap();
+            let policies = Arc::new(
+                crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                    policy_dir
+                        .path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .await
+                .unwrap(),
+            );
+            for (id, rego) in [("inbound", inbound_rego), ("target", target_rego)] {
+                let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+                    "id": id, "name": id, "policy_type": "agent_surface",
+                    "policy": rego, "created_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap();
+                policies
+                    .save(policy)
+                    .await
+                    .unwrap();
+            }
+            surface
+                .access_point
+                .inbound_policy = Some(crate::config::agent_surface::PolicyRef {
+                policy_definition_id: "inbound".to_string(),
+                require_agent_context: false,
+            });
+            surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+                policy_definition_id: "target".to_string(),
+                require_agent_context: false,
+            });
+            let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+            policy_manager.set_policy_definition_store(policies);
+            policy_manager
+                .update_channel_policy(&surface)
+                .await
+                .unwrap();
+            peer.state.policy_manager = Some(policy_manager);
+            peer.state.surface = Arc::new(surface);
+            let body = json!({
+                "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+                "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+            });
+
+            let result = Box::pin(super::handle_fabric_request(
+                peer.state.clone(),
+                "Fabric A2A",
+                axum::http::Method::POST,
+                "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                axum::http::HeaderMap::new(),
+                "127.0.0.1:12345".to_string(),
+                std::time::Instant::now(),
+                super::ConnectionGuard::new(None, None),
+                axum::body::Bytes::from(body.to_string()),
+                "trace-1".to_string(),
+                None,
+                Some(key.clone()),
+                Some(crate::surface_context::SourceAuthContext::ApiKey { key_name: KEY_ID.to_string() }),
+                None,
+                crate::mcp::meta::McpMetadataContext::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await;
+
+            let status = match result {
+                Ok(response) | Err(response) => response.status(),
+            };
+            assert_eq!(status, case.expected, "{}", case.name);
+        }
+    }
 }

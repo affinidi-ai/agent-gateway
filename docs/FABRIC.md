@@ -218,7 +218,10 @@ either. On that path no audit record is written, and a presentation it cannot ve
 because no verifier is configured counts as rejected. A surface-configured
 `inbound_identity`, meaning `static`, `from_mtls`, `from_api_key`, or `from_jwt_claim`,
 still applies, except on public discovery paths where none is resolved. An inbound
-`from_api_key` replaces even a verified presentation with the presented key's DID.
+`from_api_key` replaces even a verified presentation with the presented key's DID. On a Fabric
+send it does so for `access_point.inbound_policy` only; `target.policy` keeps the target agent's
+card and the request body (see
+[`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)).
 
 The fabric receive path does not read an inbound `from_api_key`: there the presentation or
 the identity extension in the request body sets the caller.

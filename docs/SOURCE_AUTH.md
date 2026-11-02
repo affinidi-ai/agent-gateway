@@ -818,7 +818,9 @@ Per-key caller identity therefore needs an API Key Provider.
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
 - On a direct request, the key's DID replaces any identity the request body asserts, such as
   an identity presentation or a credential extension. [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)
-  describes what that does to `input.agent`.
+  describes what that does to `input.agent`. On a `fabric://` target only
+  `access_point.inbound_policy` sees the key's DID; `target.policy` keeps the target agent's
+  card and the request body, so a per-caller rule there matches `input.source_auth.key_name`.
 - The Transit token `sub`, the Workload Binding `userIdentity.id`, and the Transit Point OAuth
   grants looked up by that `sub` are therefore per presented key.
 - A write drops a stored inbound `api_key_id` from the surface and every variant, and the

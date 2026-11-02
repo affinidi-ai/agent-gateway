@@ -61,9 +61,10 @@ changes:
         the key's own DID, or no caller identity resolves, the trust-registry claims it made
         (`provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
         `agent_dna` and trust verifications) are dropped, so Trust Check presets that read
-        `input.agent.provider_did` deny. Gateway and global policy see no `input.agent.did`
-        and none of those claims on these surfaces. Fabric receive does not read this mode; the request body sets the
-        caller there.
+        `input.agent.provider_did` deny. Gateway-plane policy, including its global policy,
+        sees no `input.agent.did` and none of those claims on these surfaces. On a `fabric://`
+        target only `access_point.inbound_policy` sees the key's DID; `target.policy` keeps its
+        input. Fabric receive does not read this mode; the request body sets the caller there.
   breaking:
     - timestamp: '2026-11-02T00:00:00Z'
       title: Fail closed when an inbound From API Key caller does not use an API key
