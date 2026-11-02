@@ -130,9 +130,11 @@ discovery (`caller_authentication.protected_resource`), and Save removes a setti
 operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
-The Access Point panel's **Public access** switch writes `access_point.public`; creating a
-surface with no Caller Context and the switch off is blocked, and saving a public surface, or
-a surface without `public` and without a Caller Context, warns after the save; see
+The Access Point panel's **Public access** switch writes `access_point.public`. A closed
+surface with no Caller Context saves but is not ready, shown as "Not ready for external
+access" under the Access Point URL with a **Configure Authentication** action. Saving a public
+surface, a not-ready one, or a surface without `public` and without a Caller Context, warns
+after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
@@ -165,13 +167,15 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. Two exceptions refuse
+let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
 a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
-(`caller_authentication.on_failure: reject`), and an MCP Access Point that publishes protected
-resource metadata (direct requests get the discovery challenge). The admin API creates every
-surface closed unless `access_point.public` is `true`, and refuses a closed surface without
-caller authentication; surfaces without `public` keep forwarding failed callers to policy,
-which must deny `input.source_auth.method == "failed"` to reject them.
+(`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
+`reject`, and an MCP Access Point that publishes protected resource metadata (direct requests
+get the discovery challenge). The admin API creates every surface closed unless
+`access_point.public` is `true`; a closed surface without source authentication is not ready
+and refuses every request with `503`. Surfaces without `public` keep forwarding failed callers
+to policy unless `on_failure` is `reject`, and policy must deny
+`input.source_auth.method == "failed"` to reject them.
 See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
 [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 

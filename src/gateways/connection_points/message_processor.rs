@@ -4153,6 +4153,17 @@ pub(super) fn fabric_receive_transit_token(
     }
 }
 
+/// The `id` an Access Point refusal of a Fabric request answers: the JSON-RPC
+/// request's on an MCP surface, else none.
+fn refused_mcp_request_id(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body_bytes: &[u8],
+) -> Option<Value> {
+    (surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp)
+        .then(|| crate::mcp::request_validation::request_id_from_bytes(body_bytes))
+        .flatten()
+}
+
 pub(crate) async fn process_forward_request(message: &ReceivedMessage) -> ProcessingResult {
     process_forward_request_inner(message, None).await
 }
@@ -4625,6 +4636,20 @@ async fn process_forward_request_in_request_scope(
         trace_id: audit_trace_id,
         via_fabric: true,
     };
+
+    // A closed Access Point without source authentication is not ready: it
+    // refuses every request before source authentication, policy and the
+    // Target, as the direct path does.
+    if surface.refuses_every_request() {
+        return axum_response_to_forward_result(crate::source_auth::errors::refuse_unavailable_access_point(
+            &surface,
+            &audit_facts,
+            resolved_alias,
+            refused_mcp_request_id(&surface, &body_bytes),
+        ))
+        .await;
+    }
+
     let token_refused = |error| crate::audit::request_events::resource_token_failed(&audit_facts, error, None);
     // The protected resource the route publishes binds the caller's token
     // audience here as on the direct path, and its challenge answers a token
@@ -4808,14 +4833,10 @@ async fn process_forward_request_in_request_scope(
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
                         }
                         if refused {
-                            let mcp_request_id = (surface.access_point.protocol
-                                == crate::config::agent_surface::SurfaceProtocol::Mcp)
-                                .then(|| crate::mcp::request_validation::request_id_from_bytes(&body_bytes))
-                                .flatten();
                             let refusal = crate::source_auth::errors::caller_refusal(
                                 &surface.access_point.protocol,
                                 &resolved_auth_config,
-                                mcp_request_id,
+                                refused_mcp_request_id(&surface, &body_bytes),
                             );
                             return axum_response_to_forward_result(refusal).await;
                         }

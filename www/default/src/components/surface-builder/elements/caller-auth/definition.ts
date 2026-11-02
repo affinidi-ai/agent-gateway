@@ -57,12 +57,17 @@ export const callerAuthDefinition: NodeDefinition = {
       <p>Extracts caller authentication context from inbound call <em>before</em> any policy or
       payment gate runs. Drops on the caller → access-point arrow.
       Singleton: one auth method per Surface.</p>
-      <p>A new surface needs this element unless its Access Point has
-      <strong>Public access</strong> on, and it refuses a caller whose
-      credential is missing or invalid with <code>401</code>. A surface
-      created before this check keeps forwarding such callers to policy as
-      <code>source_auth.method == "failed"</code>; add a policy that denies
-      unverified callers to require credentials there.</p>
+      <p>A closed Access Point (<strong>Public access</strong> off) is not
+      ready for external access until it has this element, or on an MCP
+      surface an authorization resource (<code>mcp_http.authorization</code>):
+      until then it answers every caller with <code>503</code>, and the
+      Access Point shows "Not ready for external access". It turns on as
+      soon as a save adds one. A ready closed Access Point refuses a caller
+      whose credential is missing or invalid with <code>401</code>. A public
+      Access Point, or a surface without the Public access setting, forwards
+      such callers to policy as <code>source_auth.method == "failed"</code>;
+      add a policy that denies unverified callers to require credentials
+      there.</p>
       <p><strong>Methods:</strong></p>
       <ul>
         <li><strong>JWT bearer</strong>: verify a signed JWT against a

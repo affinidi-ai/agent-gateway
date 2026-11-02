@@ -287,13 +287,14 @@ pub struct AccessPoint {
     pub a2a: Option<A2aAccessPointSettings>,
 
     /// Whether callers without credentials may use the Access Point. The admin
-    /// API sets it on every surface it creates: `false` (the default) requires
-    /// `caller_authentication` and refuses a caller whose credential is missing
-    /// or invalid; `true` opens the Access Point to anyone who can reach it.
-    /// Absent on surfaces created before it existed, and on surfaces the admin
-    /// API did not create, which keep the behaviour their stored
+    /// API sets it on every surface it creates: `false` (the default) refuses a
+    /// caller whose credential is missing or invalid, and refuses every caller
+    /// until the Access Point has caller authentication (see
+    /// [`AgentSurface::access_point_status`]); `true` opens it to anyone who can reach it,
+    /// and a caller whose credential fails continues to policy. Absent on a
+    /// legacy surface, which keeps the behaviour its stored
     /// `caller_authentication` describes. Surface-level, not overridable per
-    /// variant.
+    /// variant. See [`AgentSurface::apply_public_access`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
 }
@@ -503,10 +504,25 @@ impl OnFailure {
     }
 }
 
-/// Why the admin API refuses to save a closed Access Point (`public: false`)
-/// without caller authentication.
-pub const CALLER_AUTHENTICATION_REQUIRED: &str = "access_point.caller_authentication is required for a new surface. \
-     Add a caller authentication method, or set access_point.public to true to allow callers without credentials.";
+/// The warning on every admin API save of a closed Access Point (`public:
+/// false`) without source authentication, which refuses every caller until it
+/// gets one. A variant's warning is prefixed `variant '<alias>': `.
+pub const ACCESS_POINT_NOT_READY_WARNING: &str = "This Access Point is not ready for external access. Add source \
+     authentication (a caller_authentication method), or set access_point.public to true to allow callers without \
+     credentials.";
+
+/// Whether an Access Point serves callers. Derived from the surface it is
+/// served from on every read, never stored, and independent of
+/// [`SurfaceStatus`], the operator's switch.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessPointStatus {
+    /// Callers reach source authentication, policy and the Target.
+    Ready,
+    /// A closed Access Point without source authentication: every request is
+    /// refused with `503`, discovery reads included.
+    NotReady,
+}
 
 /// The warning on every admin API save of a surface whose Access Point is public.
 pub const PUBLIC_ACCESS_POINT_WARNING: &str =
@@ -3267,16 +3283,20 @@ impl AgentSurface {
         }
     }
 
-    /// Applies a closed Access Point (`access_point.public` is `false`): its
-    /// caller authentication, and every variant override of it, rejects a
-    /// caller whose credential is missing or invalid, and the surface and each
-    /// variant it can serve authenticate callers, with a caller authentication
-    /// method or MCP resource authorization, which refuses failed callers
-    /// itself. Any other surface is left as it is.
-    pub fn close_access_point(&mut self) -> Result<(), String> {
-        if self.access_point.public != Some(false) {
-            return Ok(());
-        }
+    /// Applies `access_point.public` to the surface's caller authentication
+    /// and every variant override of it.
+    ///
+    /// - `false` (closed): a caller whose credential is missing or invalid is
+    ///   rejected. Without source authentication the Access Point is not
+    ///   ready (see [`Self::access_point_status`]).
+    /// - `true` (public): a failed caller continues to policy.
+    /// - missing (legacy): left as it is.
+    pub fn apply_public_access(&mut self) {
+        let on_failure = match self.access_point.public {
+            Some(false) => OnFailure::Reject,
+            Some(true) => OnFailure::Continue,
+            None => return,
+        };
         let variant_overrides = self
             .variants
             .iter_mut()
@@ -3294,19 +3314,52 @@ impl AgentSurface {
             .iter_mut()
             .chain(variant_overrides)
         {
-            caller_authentication.on_failure = OnFailure::Reject;
+            caller_authentication.on_failure = on_failure;
         }
-        if !self.authenticates_callers() {
-            return Err(CALLER_AUTHENTICATION_REQUIRED.to_string());
+    }
+
+    /// Whether this Access Point serves callers, on the surface as it is
+    /// served (the base, or a resolved variant). A closed Access Point
+    /// (`public: false`) is ready only once it authenticates callers; a public
+    /// or legacy one always is.
+    pub fn access_point_status(&self) -> AccessPointStatus {
+        if self.access_point.public == Some(false) && !self.authenticates_callers() {
+            AccessPointStatus::NotReady
+        } else {
+            AccessPointStatus::Ready
         }
-        for variant in &self.variants {
-            if let Ok(resolved) = self.resolve_variant(Some(&variant.alias))
-                && !resolved.authenticates_callers()
-            {
-                return Err(format!("variant '{}': {CALLER_AUTHENTICATION_REQUIRED}", variant.alias));
-            }
-        }
-        Ok(())
+    }
+
+    /// Whether every request to this Access Point is refused with `503`
+    /// before source authentication, policy and the Target, on the direct
+    /// path and over Fabric: it is not ready, and it isn't an onboarding
+    /// surface.
+    pub fn refuses_every_request(&self) -> bool {
+        !self.is_onboarding() && self.access_point_status() == AccessPointStatus::NotReady
+    }
+
+    /// The [`ACCESS_POINT_NOT_READY_WARNING`]s for the surface and each
+    /// enabled variant whose Access Point is not ready. A disabled variant is
+    /// never served, not even as the default variant (`select_variant`), so
+    /// it gets none.
+    pub fn access_point_not_ready_warnings(&self) -> Vec<String> {
+        let base = (self.access_point_status() == AccessPointStatus::NotReady)
+            .then(|| ACCESS_POINT_NOT_READY_WARNING.to_string());
+        let variants = self
+            .variants
+            .iter()
+            .filter(|variant| {
+                variant.enabled
+                    && self
+                        .serve_selected(Some(variant))
+                        .surface
+                        .access_point_status()
+                        == AccessPointStatus::NotReady
+            })
+            .map(|variant| format!("variant '{}': {ACCESS_POINT_NOT_READY_WARNING}", variant.alias));
+        base.into_iter()
+            .chain(variants)
+            .collect()
     }
 
     fn authenticates_callers(&self) -> bool {
@@ -3318,12 +3371,15 @@ impl AgentSurface {
     }
 
     /// Whether a caller whose credential is missing or invalid is refused
-    /// before policy and the Target.
+    /// before policy and the Target: on a closed Access Point, even one
+    /// edited by hand without `on_failure`, or when `on_failure` is `reject`.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
-        self.access_point
-            .caller_authentication
-            .as_ref()
-            .is_some_and(|caller_authentication| caller_authentication.on_failure == OnFailure::Reject)
+        self.access_point.public == Some(false)
+            || self
+                .access_point
+                .caller_authentication
+                .as_ref()
+                .is_some_and(|caller_authentication| caller_authentication.on_failure == OnFailure::Reject)
     }
 
     pub fn validate_mcp_metadata(&self) -> Result<(), String> {
@@ -3820,53 +3876,100 @@ mod tests {
     }
 
     #[test]
-    fn closing_an_access_point_requires_caller_authentication_and_rejects_failures() {
+    fn a_closed_access_point_rejects_failed_callers_without_a_stored_on_failure() {
+        let surface: super::AgentSurface = serde_json::from_value(surface_with_access_point(
+            serde_json::json!({"caller_authentication": api_key_caller_authentication(), "public": false}),
+        ))
+        .unwrap();
+
+        assert!(surface.rejects_failed_caller_authentication());
+    }
+
+    #[test]
+    fn test_closed_access_point_without_caller_authentication_is_not_ready_and_rejects_failures() {
         let close = |stored: serde_json::Value| {
             let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+            surface.apply_public_access();
             surface
-                .close_access_point()
-                .map(|()| surface)
         };
 
         for open in [
             serde_json::json!({"public": false}),
             serde_json::json!({"public": false, "caller_authentication": {"methods": []}}),
         ] {
+            let surface = close(surface_with_access_point(open));
+            assert_eq!(surface.access_point_status(), super::AccessPointStatus::NotReady);
             assert_eq!(
-                close(surface_with_access_point(open))
-                    .err()
-                    .as_deref(),
-                Some(super::CALLER_AUTHENTICATION_REQUIRED)
+                surface.access_point_not_ready_warnings(),
+                vec![super::ACCESS_POINT_NOT_READY_WARNING.to_string()]
             );
         }
 
         let mut continuing = api_key_caller_authentication();
         continuing["on_failure"] = serde_json::json!("continue");
         let closed =
-            close(surface_with_access_point(serde_json::json!({"public": false, "caller_authentication": continuing})))
-                .unwrap();
+            close(surface_with_access_point(serde_json::json!({"public": false, "caller_authentication": continuing})));
         assert!(closed.rejects_failed_caller_authentication());
+        assert_eq!(closed.access_point_status(), super::AccessPointStatus::Ready);
+        assert_eq!(closed.access_point_not_ready_warnings(), Vec::<String>::new());
 
         for unchanged in [serde_json::json!({"public": true}), serde_json::json!({})] {
-            let surface = close(surface_with_access_point(unchanged.clone())).unwrap();
+            let surface = close(surface_with_access_point(unchanged.clone()));
             assert_eq!(surface.access_point.public, unchanged["public"].as_bool());
             assert!(!surface.rejects_failed_caller_authentication());
+            assert_eq!(
+                surface.access_point_status(),
+                super::AccessPointStatus::Ready,
+                "public and legacy Access Points are always ready: {unchanged}"
+            );
         }
         let mut resource_authorized =
             surface_with_access_point(serde_json::json!({"public": false, "protocol": "mcp"}));
         resource_authorized["mcp_http"] =
             serde_json::json!({"authorization": {"resource": "https://gateway.example/agent", "scopes": []}});
-        assert!(close(resource_authorized).is_ok(), "MCP resource authorization authenticates callers");
+        assert_eq!(
+            close(resource_authorized).access_point_status(),
+            super::AccessPointStatus::Ready,
+            "MCP resource authorization authenticates callers"
+        );
 
         let legacy = close(surface_with_access_point(
             serde_json::json!({"caller_authentication": api_key_caller_authentication()}),
-        ))
-        .unwrap();
+        ));
         assert!(!legacy.rejects_failed_caller_authentication());
     }
 
     #[test]
-    fn closing_an_access_point_applies_to_every_variant_it_can_serve() {
+    fn test_access_point_status_serializes_snake_case() {
+        assert_eq!(serde_json::to_value(super::AccessPointStatus::Ready).unwrap(), "ready");
+        assert_eq!(serde_json::to_value(super::AccessPointStatus::NotReady).unwrap(), "not_ready");
+    }
+
+    #[test]
+    fn a_public_access_point_admits_failed_callers_whatever_it_stored() {
+        let mut rejecting = api_key_caller_authentication();
+        rejecting["on_failure"] = serde_json::json!("reject");
+        let mut stored =
+            surface_with_access_point(serde_json::json!({"public": true, "caller_authentication": rejecting.clone()}));
+        stored["variants"] = serde_json::json!([{
+            "id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+            "overrides": {"access_point": {"caller_authentication": rejecting}}
+        }]);
+        let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        surface.apply_public_access();
+
+        assert!(!surface.rejects_failed_caller_authentication());
+        assert!(
+            !surface
+                .resolve_variant(Some("beta"))
+                .unwrap()
+                .rejects_failed_caller_authentication()
+        );
+    }
+
+    #[test]
+    fn test_closed_access_point_status_applies_to_every_variant_it_can_serve() {
         let variant = |enabled: bool, overrides: serde_json::Value| serde_json::json!({"id": "beta", "alias": "beta", "name": "Beta", "enabled": enabled, "overrides": overrides});
         let closed_with = |variant: serde_json::Value| {
             let mut stored = surface_with_access_point(
@@ -3874,30 +3977,40 @@ mod tests {
             );
             stored["variants"] = serde_json::json!([variant]);
             let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+            surface.apply_public_access();
             surface
-                .close_access_point()
-                .map(|()| surface)
         };
         let cleared = serde_json::json!({"complete": true, "access_point": {}});
 
+        let surface = closed_with(variant(true, cleared.clone()));
+        assert_eq!(surface.access_point_status(), super::AccessPointStatus::Ready, "the base stays ready");
         assert_eq!(
-            closed_with(variant(true, cleared.clone()))
-                .err()
-                .as_deref(),
-            Some(format!("variant 'beta': {}", super::CALLER_AUTHENTICATION_REQUIRED).as_str())
+            surface
+                .resolve_variant(Some("beta"))
+                .unwrap()
+                .access_point_status(),
+            super::AccessPointStatus::NotReady
         );
-        assert!(closed_with(variant(false, cleared)).is_ok());
+        assert_eq!(
+            surface.access_point_not_ready_warnings(),
+            vec![format!("variant 'beta': {}", super::ACCESS_POINT_NOT_READY_WARNING)]
+        );
+        assert_eq!(
+            closed_with(variant(false, cleared)).access_point_not_ready_warnings(),
+            Vec::<String>::new(),
+            "a disabled variant is never served"
+        );
 
         let surface = closed_with(variant(
             true,
             serde_json::json!({"access_point": {"caller_authentication": api_key_caller_authentication()}}),
-        ))
-        .unwrap();
+        ));
         let resolved = surface
             .resolve_variant(Some("beta"))
             .unwrap();
         assert!(resolved.rejects_failed_caller_authentication());
         assert!(surface.rejects_failed_caller_authentication());
+        assert_eq!(resolved.access_point_status(), super::AccessPointStatus::Ready);
     }
 
     #[test]

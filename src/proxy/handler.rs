@@ -1772,6 +1772,25 @@ async fn proxy_handler_with_mcp_runtime(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
+    // A closed Access Point without source authentication is not ready: it
+    // refuses every request, discovery reads included, before source
+    // authentication, policy and the Target.
+    if state
+        .surface
+        .refuses_every_request()
+    {
+        return Ok(refuse_not_ready_access_point(
+            &state.surface,
+            &state.network_config,
+            mcp_versions,
+            state
+                .active_variant_alias
+                .as_deref(),
+            req,
+        )
+        .await);
+    }
+
     // Start timing the request
     let start_time = std::time::Instant::now();
 
@@ -9508,9 +9527,7 @@ async fn refuse_access_point_variant(
     .await
 }
 
-/// Refuses an Access Point caller whose credential is missing or invalid. An
-/// MCP request's body is read, within the surface's MCP body limit, only to
-/// echo its `id`.
+/// Refuses an Access Point caller whose credential is missing or invalid.
 async fn refuse_failed_caller(
     surface: &crate::config::agent_surface::AgentSurface,
     network_config: &crate::config::NetworkConfig,
@@ -9518,18 +9535,46 @@ async fn refuse_failed_caller(
     auth_config: &crate::source_auth::SourceAuthConfig,
     req: Request,
 ) -> Response {
-    let mcp_request_id = if surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp {
-        crate::mcp::request_validation::refused_request_id(
-            surface.mcp_http.as_ref(),
-            &network_config.get_inbound_external_urls(),
-            versions,
-            Some(req.into_body()),
-        )
-        .await
-    } else {
-        None
-    };
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
     crate::source_auth::errors::caller_refusal(&surface.access_point.protocol, auth_config, mcp_request_id)
+}
+
+/// Refuses a request to an Access Point that is not ready, recording the
+/// refusal once.
+async fn refuse_not_ready_access_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    variant_alias: Option<&str>,
+    req: Request,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::refuse_unavailable_access_point(
+        surface,
+        &routing_facts(surface),
+        variant_alias,
+        mcp_request_id,
+    )
+}
+
+/// The `id` a refusal of an MCP request answers. The body is read, within the
+/// surface's MCP body limit, only to echo it.
+async fn refused_mcp_request_id(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+) -> Option<serde_json::Value> {
+    if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp {
+        return None;
+    }
+    crate::mcp::request_validation::refused_request_id(
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        Some(req.into_body()),
+    )
+    .await
 }
 
 fn normalize_route_for_match(route: &str) -> String {
@@ -18225,9 +18270,23 @@ allow if {
                 "credential delegation for an anonymous caller",
                 direct_router_state(state, a2a_surface(delegated)),
                 "/a2a/rpc",
-                message,
+                message.clone(),
                 403,
                 (RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, 403, None),
+            ),
+            (
+                "closed Access Point without source authentication",
+                direct_router_state(
+                    state,
+                    a2a_surface(json!({"access_point": {
+                        "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                        "public": false
+                    }})),
+                ),
+                "/a2a/rpc",
+                message,
+                503,
+                (RejectionStage::Admission, RejectionReason::AccessPointNotReady, 503, None),
             ),
         ];
         for (case, router, path, body, status, expected) in cases {

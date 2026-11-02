@@ -61,30 +61,53 @@ admits callers without a valid credential
 
 | `access_point.public` | Meaning |
 | --- | --- |
-| absent | A surface stored before these fields existed, built from DynamoDB, or restored or edited by hand without them. It keeps the behaviour below: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
-| `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. |
-| `true` | Public: callers without credentials are admitted. Every save response carries a warning. |
+| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. It keeps the behaviour its stored fields describe: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
+| `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. A failed caller is refused whatever `on_failure` stores, including on a surface edited by hand. |
+| `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save response carries a warning. |
 
 On a closed surface the admin API, on create and on every update:
 
-- refuses with `400` a surface, or an enabled variant, whose Access Point has no
-  `caller_authentication` method. An MCP Access Point protected by `mcp_http.authorization`
-  counts as authenticating its callers;
+- saves a surface, or an enabled variant, whose Access Point has no `caller_authentication`
+  method, and adds a `warnings` entry saying it is not ready for external access. An MCP
+  Access Point protected by `mcp_http.authorization` counts as authenticating its callers;
 - sets `caller_authentication.on_failure` to `reject`, on the base and on every variant
   override that sets `caller_authentication`;
 - keeps the stored `public` value when an update leaves it out, so a client that drops the
   field cannot reopen the surface.
 
-With `on_failure: reject`, a missing or invalid credential is refused with `401` before policy
-and the target, on direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets and Fabric
-receive. MCP callers get a JSON-RPC error carrying the request id; other callers get
+#### Not ready Access Points
+
+A closed Access Point (`public: false`) without source authentication (no
+`caller_authentication` method and, on MCP, no `mcp_http.authorization`) is not ready for
+external access. Only `public: false` closes an Access Point: a legacy surface with
+`on_failure: reject` and no method stays ready and admits every caller. The state is derived
+from the surface as served, base or variant, and never stored, so the Access Point serves as
+soon as a save adds source authentication or sets `public: true`. Until then it refuses every
+request, discovery reads included, with `503` before source authentication, policy and the
+target, on direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets and Fabric receive.
+MCP callers get a JSON-RPC error carrying the request id; other callers get
+`application/problem+json`. The body says only that the Access Point is not available; the
+reason is logged, and each refusal is recorded in the Audit Log as `request_rejected` with the
+reason `access_point_not_ready`. Onboarding surfaces are unaffected. Legacy and public Access Points are
+always ready.
+
+Surface responses carry a read-only top-level `access_point_status`, `ready` or
+`not_ready`, for the base surface; variant responses carry it for the resolved variant.
+
+On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
+with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
+`a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
+so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
+protects, and repeated wrong credentials aren't throttled by it either. Use high-entropy API keys
+and limit requests per client upstream of the gateway if credential guessing is a concern. MCP callers get a JSON-RPC error carrying the request id; other callers get
 `application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only that the credential
 is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
-Create and update responses are the saved surface plus `"warnings": [...]` when there is
-something to warn about. A write request that sends a save response back unchanged has its
-top-level `warnings` dropped before parsing.
+Create and update responses are the saved surface plus `access_point_status`, and
+`"warnings": [...]` when there is something to warn about. A write request that sends a save
+response back unchanged has its top-level `warnings` and `access_point_status` dropped before
+parsing.
 
 A gateway rolled back to a version without these fields cannot load surfaces that store them
 (`access_point` and `caller_authentication` reject unknown fields). It logs and skips them, and

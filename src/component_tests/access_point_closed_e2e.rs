@@ -1,16 +1,17 @@
-//! New Access Points are closed: the admin API refuses a new surface without
-//! caller authentication unless it is marked public, and a closed Access Point
-//! refuses a caller whose credential is missing or invalid with `401`, in the
-//! caller's protocol shape, before policy and the Target. Public discovery
-//! reads stay open, and a surface stored without the new fields keeps the
-//! behaviour it had.
+//! New Access Points are closed: a closed Access Point without caller
+//! authentication saves with a warning but is not ready, and refuses every
+//! request with `503`, discovery reads included. Once it has caller
+//! authentication it refuses a caller whose credential is missing or invalid
+//! with `401`, in the caller's protocol shape, before policy and the Target,
+//! and public discovery reads stay open. A legacy surface (no
+//! `access_point.public`) keeps continuing a failed caller to policy.
 
 use super::helpers::{
     GatewayHarness, MockServer, build_minimal_channel, configure_admin_api, configure_gateway_route_prefixes,
     write_api_key_secret,
 };
-use crate::config::agent_surface::{CALLER_AUTHENTICATION_REQUIRED, PUBLIC_ACCESS_POINT_WARNING};
-use crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED;
+use crate::config::agent_surface::{ACCESS_POINT_NOT_READY_WARNING, PUBLIC_ACCESS_POINT_WARNING};
+use crate::source_auth::errors::{ACCESS_POINT_UNAVAILABLE, CALLER_CREDENTIAL_REFUSED};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 
@@ -181,12 +182,77 @@ impl ClosedGateway {
         self.send(request).await
     }
 
+    async fn get(
+        &self,
+        path: &str,
+    ) -> (u16, Value) {
+        let (status, _, body) = self
+            .send(
+                self.admin
+                    .get(format!("{}{path}", self.surfaces())),
+            )
+            .await;
+        (status, body)
+    }
+
+    async fn patch(
+        &self,
+        url: &str,
+        patch: &Value,
+    ) -> (u16, Value) {
+        let (status, _, body) = self
+            .send(
+                self.admin
+                    .patch(url)
+                    .header("content-type", "application/merge-patch+json")
+                    .json(patch),
+            )
+            .await;
+        (status, body)
+    }
+
+    /// Rewrites the stored file of surface `id` as an operator editing the
+    /// store by hand would, and reloads the gateway's configuration.
+    async fn edit_stored_surface(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut Value),
+    ) {
+        let stored_path = std::fs::read_dir(&self.surfaces_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(id)))
+            .expect("stored surface file");
+        let mut stored: Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+        edit(&mut stored);
+        std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let (status, _, _) = self
+            .send(
+                self.admin
+                    .post(format!("{}/api/v1/config/reload", self.h.gateway_base)),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
     fn reached(&self) -> usize {
         self.h
             .mock
             .request_count
             .load(Ordering::SeqCst)
     }
+}
+
+fn assert_unavailable_problem(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &Value,
+    context: &str,
+) {
+    assert_eq!(status, 503, "{context}: {body}");
+    assert_eq!(headers["content-type"], "application/problem+json", "{context}");
+    assert_eq!(body["detail"], ACCESS_POINT_UNAVAILABLE, "{context}: the refusal never says why: {body}");
+    assert_eq!(body["status"], 503, "{context}");
 }
 
 fn surface_id(surface: &Value) -> &str {
@@ -196,24 +262,80 @@ fn surface_id(surface: &Value) -> &str {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_surface_without_caller_authentication_is_refused_unless_public() {
+async fn a_new_surface_without_caller_authentication_is_created_not_ready_and_refuses_every_caller() {
     let g = ClosedGateway::start(Vec::new()).await;
 
-    let (status, refused) = g
+    let (status, created) = g
         .create(&g.body("/smoke/unsecured", "a2a", json!({})))
         .await;
-    assert_eq!(status, 400, "{refused}");
-    assert_eq!(refused["details"], CALLER_AUTHENTICATION_REQUIRED, "{refused}");
-    let (status, refused) = g
-        .create(&g.body("/smoke/unsecured", "a2a", json!({"public": false, "caller_authentication": {"methods": []}})))
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["public"], false);
+    assert_eq!(created["access_point_status"], "not_ready");
+    assert_eq!(created["warnings"], json!([ACCESS_POINT_NOT_READY_WARNING]));
+    assert!(
+        created["access_point"]
+            .get("access_point_status")
+            .is_none(),
+        "{created}"
+    );
+    let id = surface_id(&created).to_string();
+    let (status, emptied) = g
+        .create(&g.body("/smoke/emptied", "a2a", json!({"public": false, "caller_authentication": {"methods": []}})))
         .await;
-    assert_eq!(status, 400, "{refused}");
+    assert_eq!(status, 201, "{emptied}");
+    assert_eq!(emptied["access_point_status"], "not_ready");
+
+    let (status, read) = g.get(&format!("/{id}")).await;
+    assert_eq!(status, 200, "{read}");
+    assert_eq!(read["access_point_status"], "not_ready");
+    assert!(read.get("warnings").is_none(), "only a save warns: {read}");
+    let (status, listed) = g.get("").await;
+    assert_eq!(status, 200, "{listed}");
+    let listed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|surface| surface["surface_id"] == id.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(listed["access_point_status"], "not_ready");
+
+    let (status, headers, body) = g
+        .call("/smoke/unsecured", &a2a_request(), None)
+        .await;
+    assert_unavailable_problem(status, &headers, &body, "a call");
+    for path in ["/.well-known/agent-card.json", "/.well-known/agent.json", "/agent-card.json"] {
+        let response = reqwest::Client::new()
+            .get(format!("{}/smoke/unsecured{path}", g.h.gateway_base))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        assert_unavailable_problem(status, &headers, &body, path);
+    }
+    assert_eq!(g.reached(), 0, "a not-ready Access Point never reaches the Target");
+
+    let (status, saved) = g.put(&id, &created).await;
+    assert_eq!(status, 200, "a save response can be sent back as it is: {saved}");
+    assert_eq!(saved["warnings"], json!([ACCESS_POINT_NOT_READY_WARNING]), "the warning is on every save");
+    assert_eq!(saved["access_point_status"], "not_ready");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_public_surface_is_ready_and_admits_callers_without_credentials() {
+    let g = ClosedGateway::start(Vec::new()).await;
 
     let (status, created) = g
         .create(&g.body("/smoke/public", "a2a", json!({"public": true})))
         .await;
     assert_eq!(status, 201, "{created}");
     assert_eq!(created["access_point"]["public"], true);
+    assert_eq!(created["access_point_status"], "ready");
     assert_eq!(created["warnings"], json!([PUBLIC_ACCESS_POINT_WARNING]));
 
     let (status, _, _) = g
@@ -227,6 +349,106 @@ async fn a_new_surface_without_caller_authentication_is_refused_unless_public() 
         .await;
     assert_eq!(status, 200, "a save response can be sent back as it is: {saved}");
     assert_eq!(saved["warnings"], json!([PUBLIC_ACCESS_POINT_WARNING]), "the warning is on every save");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_not_ready_mcp_access_point_refuses_with_a_json_rpc_error_carrying_the_request_id() {
+    let g = ClosedGateway::start(Vec::new()).await;
+    let (status, created) = g
+        .create(&g.body("/smoke/unsecured-mcp", "mcp", json!({})))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point_status"], "not_ready");
+    let tools_list = json!({"jsonrpc": "2.0", "id": "unready-1", "method": "tools/list", "params": {}});
+
+    for key in [None, Some(VALID_KEY)] {
+        let (status, _, body) = g
+            .call("/smoke/unsecured-mcp", &tools_list, key)
+            .await;
+        assert_eq!(status, 503, "{key:?}: {body}");
+        assert_eq!(
+            body,
+            json!({"jsonrpc": "2.0", "id": "unready-1", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR, "message": ACCESS_POINT_UNAVAILABLE
+            }})
+        );
+    }
+    assert_eq!(g.reached(), 0, "a not-ready Access Point never reaches the Target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_caller_authentication_makes_a_not_ready_access_point_ready() {
+    let g = ClosedGateway::start(Vec::new()).await;
+    let (status, created) = g
+        .create(&g.body("/smoke/later", "a2a", json!({})))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point_status"], "not_ready");
+
+    let mut secured = created.clone();
+    secured["access_point"]["caller_authentication"] = api_key_authentication();
+    let (status, saved) = g
+        .put(surface_id(&created), &secured)
+        .await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["access_point_status"], "ready");
+    assert_eq!(saved["access_point"]["caller_authentication"]["on_failure"], "reject");
+    assert!(
+        saved
+            .get("warnings")
+            .is_none(),
+        "{saved}"
+    );
+
+    let (status, _, body) = g
+        .call("/smoke/later", &a2a_request(), Some(VALID_KEY))
+        .await;
+    assert_eq!(status, 200, "a valid caller is served with no other step: {body}");
+    assert_eq!(g.reached(), 1);
+    let (status, _, body) = g
+        .call("/smoke/later", &a2a_request(), None)
+        .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+    assert_eq!(g.reached(), 1, "a refused caller never reaches the Target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_surface_stored_without_caller_authentication_refuses_every_caller() {
+    let g = ClosedGateway::start(Vec::new()).await;
+    let (status, created) = g
+        .create(&g.body("/smoke/hand-edited", "a2a", json!({"caller_authentication": api_key_authentication()})))
+        .await;
+    assert_eq!(status, 201, "{created}");
+
+    g.edit_stored_surface(surface_id(&created), |stored| {
+        stored["access_point"]
+            .as_object_mut()
+            .unwrap()
+            .remove("caller_authentication");
+        assert_eq!(stored["access_point"]["public"], false);
+    })
+    .await;
+    // The reload reaches the listener asynchronously; until then the stored
+    // API key still refuses a caller without one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while g
+        .call("/smoke/hand-edited", &a2a_request(), None)
+        .await
+        .0
+        == 401
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    for key in [None, Some(VALID_KEY)] {
+        let (status, headers, body) = g
+            .call("/smoke/hand-edited", &a2a_request(), key)
+            .await;
+        assert_unavailable_problem(status, &headers, &body, &format!("{key:?}"));
+    }
+    assert_eq!(g.reached(), 0, "a store edited by hand never opens a closed Access Point");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -299,23 +521,13 @@ async fn a_closed_mcp_access_point_refuses_with_a_json_rpc_error_carrying_the_re
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_closed_surface_cannot_be_reopened_by_an_update_or_a_variant() {
+async fn removing_caller_authentication_from_a_closed_surface_makes_it_not_ready() {
     let g = ClosedGateway::start(Vec::new()).await;
     let (status, created) = g
         .create(&g.body("/smoke/kept-closed", "a2a", json!({"caller_authentication": api_key_authentication()})))
         .await;
     assert_eq!(status, 201, "{created}");
     let id = surface_id(&created).to_string();
-
-    let mut dropped = created.clone();
-    let access_point = dropped["access_point"]
-        .as_object_mut()
-        .unwrap();
-    access_point.remove("public");
-    access_point.remove("caller_authentication");
-    let (status, refused) = g.put(&id, &dropped).await;
-    assert_eq!(status, 400, "{refused}");
-    assert_eq!(refused["details"], CALLER_AUTHENTICATION_REQUIRED);
 
     let mut without_public = created.clone();
     without_public["access_point"]
@@ -330,38 +542,135 @@ async fn a_closed_surface_cannot_be_reopened_by_an_update_or_a_variant() {
     assert_eq!(saved["access_point"]["public"], false, "a PUT that drops public keeps it");
     assert_eq!(saved["access_point"]["caller_authentication"]["on_failure"], "reject");
 
-    let (status, _, refused) = g
-        .send(
-            g.admin
-                .patch(format!("{}/{id}", g.surfaces()))
-                .header("content-type", "application/merge-patch+json")
-                .json(&json!({"access_point": {"public": null, "caller_authentication": null}})),
-        )
-        .await;
-    assert_eq!(status, 400, "{refused}");
-
-    let mut cleared_by_variant = saved.clone();
-    cleared_by_variant["variants"] = json!([{"id": "open", "alias": "open", "name": "Open", "enabled": true,
-        "overrides": {"complete": true, "access_point": {}}}]);
-    let (status, refused) = g
-        .put(&id, &cleared_by_variant)
-        .await;
-    assert_eq!(status, 400, "{refused}");
-    assert_eq!(refused["details"], format!("variant 'open': {CALLER_AUTHENTICATION_REQUIRED}"));
-
-    let mut opened = saved.clone();
-    opened["access_point"]["public"] = json!(true);
-    opened["access_point"]
+    let mut dropped = created.clone();
+    let access_point = dropped["access_point"]
         .as_object_mut()
-        .unwrap()
-        .remove("caller_authentication");
-    let (status, public) = g.put(&id, &opened).await;
-    assert_eq!(status, 200, "an explicit public opt-out is accepted: {public}");
-    assert_eq!(public["warnings"], json!([PUBLIC_ACCESS_POINT_WARNING]));
+        .unwrap();
+    access_point.remove("public");
+    access_point.remove("caller_authentication");
+    let (status, saved) = g.put(&id, &dropped).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["access_point"]["public"], false, "it is never reopened");
+    assert_eq!(saved["access_point_status"], "not_ready");
+    assert_eq!(saved["warnings"], json!([ACCESS_POINT_NOT_READY_WARNING]));
+
+    for key in [None, Some(VALID_KEY)] {
+        let (status, headers, body) = g
+            .call("/smoke/kept-closed", &a2a_request(), key)
+            .await;
+        assert_unavailable_problem(status, &headers, &body, &format!("{key:?}"));
+    }
+    assert_eq!(g.reached(), 0, "a not-ready Access Point never reaches the Target");
+
+    let (status, patched) = g
+        .patch(&format!("{}/{id}", g.surfaces()), &json!({"access_point": {"public": null}}))
+        .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["access_point"]["public"], false, "a PATCH that clears public keeps it");
+    assert_eq!(patched["access_point_status"], "not_ready");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_surface_stored_before_the_change_keeps_its_behaviour() {
+async fn a_closed_surface_saved_as_public_admits_callers_without_credentials() {
+    let g = ClosedGateway::start(Vec::new()).await;
+    let (status, created) = g
+        .create(&g.body("/smoke/opened", "a2a", json!({"caller_authentication": api_key_authentication()})))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let id = surface_id(&created).to_string();
+
+    let mut opened = created.clone();
+    opened["access_point"]["public"] = json!(true);
+    let (status, saved) = g.put(&id, &opened).await;
+    assert_eq!(status, 200, "{saved}");
+    assert!(
+        saved["access_point"]["caller_authentication"]
+            .get("on_failure")
+            .is_none(),
+        "a public Access Point continues a failed caller, whatever was sent: {saved}"
+    );
+    assert_eq!(saved["warnings"], json!([PUBLIC_ACCESS_POINT_WARNING]));
+
+    for key in [None, Some("wrong-key")] {
+        let (status, _, body) = g
+            .call("/smoke/opened", &a2a_request(), key)
+            .await;
+        assert_eq!(status, 200, "{key:?}: {body}");
+    }
+    assert_eq!(g.reached(), 2, "a public Access Point forwards a caller without credentials");
+
+    let mut closed = saved.clone();
+    closed["access_point"]["public"] = json!(false);
+    let (status, saved) = g.put(&id, &closed).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["access_point"]["caller_authentication"]["on_failure"], "reject");
+    let (status, _, _) = g
+        .call("/smoke/opened", &a2a_request(), None)
+        .await;
+    assert_eq!(status, 401, "turning Public access off closes it again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_without_caller_authentication_is_not_ready_while_the_base_stays_ready() {
+    let g = ClosedGateway::start(Vec::new()).await;
+    let (status, created) = g
+        .create(&g.body("/smoke/variant", "a2a", json!({"caller_authentication": api_key_authentication()})))
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let id = surface_id(&created).to_string();
+    let variants = format!("{}/{id}/variants", g.surfaces());
+
+    let (status, _, variant) = g
+        .send(
+            g.admin
+                .post(&variants)
+                .json(&json!({"alias": "beta", "name": "Beta"})),
+        )
+        .await;
+    assert_eq!(status, 201, "a variant that keeps the base caller authentication is accepted: {variant}");
+    assert_eq!(variant["access_point_status"], "ready", "{variant}");
+    let variant_url = format!(
+        "{variants}/{}",
+        variant["id"]
+            .as_str()
+            .unwrap()
+    );
+
+    let (status, saved) = g
+        .patch(&variant_url, &json!({"enabled": true, "overrides": {"complete": true, "access_point": {}}}))
+        .await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["warnings"], json!([format!("variant 'beta': {ACCESS_POINT_NOT_READY_WARNING}")]));
+    assert_eq!(saved["access_point_status"], "ready", "the base stays ready");
+    let (status, _, updated) = g
+        .send(
+            g.admin
+                .put(&variant_url)
+                .json(&json!({"name": "Beta"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["access_point_status"], "not_ready", "a variant response reports that variant: {updated}");
+    let (status, resolved) = g
+        .get(&format!("/{id}/variants/beta/resolved"))
+        .await;
+    assert_eq!(status, 200, "{resolved}");
+    assert_eq!(resolved["access_point_status"], "not_ready");
+
+    let (status, headers, body) = g
+        .call("/smoke/variant$beta", &a2a_request(), Some(VALID_KEY))
+        .await;
+    assert_unavailable_problem(status, &headers, &body, "the variant");
+    assert_eq!(g.reached(), 0);
+    let (status, _, body) = g
+        .call("/smoke/variant", &a2a_request(), Some(VALID_KEY))
+        .await;
+    assert_eq!(status, 200, "the base still serves a valid caller: {body}");
+    assert_eq!(g.reached(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_surface_keeps_its_behaviour() {
     let mut open = build_minimal_channel();
     open.surface_id = "legacy-open".to_string();
     open.access_point.route = "/legacy-open".to_string();
@@ -385,31 +694,20 @@ async fn a_surface_stored_before_the_change_keeps_its_behaviour() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_update_of_a_surface_stored_without_public_keeps_todays_rules() {
+async fn an_update_of_a_legacy_surface_keeps_the_legacy_rules() {
     let g = ClosedGateway::start(Vec::new()).await;
     let (status, created) = g
         .create(&g.body("/smoke/legacy", "a2a", json!({"public": true})))
         .await;
     assert_eq!(status, 201, "{created}");
     let id = surface_id(&created).to_string();
-    let stored_path = std::fs::read_dir(&g.surfaces_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(&id)))
-        .expect("stored surface file");
-    let mut stored: Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
-    stored["access_point"]
-        .as_object_mut()
-        .unwrap()
-        .remove("public");
-    std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
-    let (status, _, _) = g
-        .send(
-            g.admin
-                .post(format!("{}/api/v1/config/reload", g.h.gateway_base)),
-        )
-        .await;
-    assert_eq!(status, 200);
+    g.edit_stored_surface(&id, |stored| {
+        stored["access_point"]
+            .as_object_mut()
+            .unwrap()
+            .remove("public");
+    })
+    .await;
 
     let (status, _, loaded) = g
         .send(
@@ -419,7 +717,7 @@ async fn an_update_of_a_surface_stored_without_public_keeps_todays_rules() {
         .await;
     assert_eq!(status, 200, "{loaded}");
     let (status, saved) = g.put(&id, &loaded).await;
-    assert_eq!(status, 200, "an update keeps today's rules: {saved}");
+    assert_eq!(status, 200, "an update keeps the legacy rules: {saved}");
     assert!(
         saved["access_point"]
             .get("public")

@@ -145,6 +145,14 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .as_object_mut()
         .unwrap()
         .remove("warnings");
+    assert_eq!(
+        removed
+            .as_object_mut()
+            .unwrap()
+            .remove("access_point_status"),
+        Some(json!("ready")),
+        "the status is derived, never stored"
+    );
     for path in mode_paths {
         assert!(
             removed

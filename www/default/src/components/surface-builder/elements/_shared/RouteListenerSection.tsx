@@ -37,6 +37,8 @@ export interface RouteListenerSectionProps {
   bannerHelp?: React.ReactNode;
   /** `data-testid` of the banner; its copy button gets `<bannerTestId>-copy-button`. */
   bannerTestId: string;
+  /** Rendered directly under the banner, such as the Access Point's readiness notice. */
+  bannerFooter?: React.ReactNode;
   /**
    * Replace the top history snapshot after the seed runs so undo skips
    * past the auto-seeded defaults. Optional; only APs (auto-created on
@@ -142,6 +144,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   bannerLabel,
   bannerHelp,
   bannerTestId,
+  bannerFooter,
   replaceCommit,
   hasAttemptedSave,
 }) => {
@@ -378,6 +381,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
         testId={bannerTestId}
         url={fullRouteDisplay}
         warning={pathError ?? undefined}
+        footer={bannerFooter}
       />
 
       <div className="config-section">
@@ -518,6 +522,8 @@ export interface RouteListenerBannerProps {
   warning?: string;
   /** Placeholder text when `url` is empty and there's no warning. */
   placeholder?: string;
+  /** Rendered directly under the banner, such as a status about the URL. */
+  footer?: React.ReactNode;
 }
 
 /**
@@ -532,12 +538,15 @@ export const RouteListenerBanner: React.FC<RouteListenerBannerProps> = ({
   url,
   warning,
   placeholder = '(select address and prefix)',
+  footer,
 }) => {
   const hasUrl = !!url && !warning;
   const display = warning ? warning : url || placeholder;
-  return (
+  const banner = (
     <div
-      className={`alert ${warning ? 'alert-warning' : 'alert-success'} route-listener-banner mb-3`}
+      className={`alert ${warning ? 'alert-warning' : 'alert-success'} route-listener-banner ${
+        footer ? 'mb-1' : 'mb-3'
+      }`}
       style={{ fontSize: '13px' }}
       data-testid={testId}
     >
@@ -566,5 +575,12 @@ export const RouteListenerBanner: React.FC<RouteListenerBannerProps> = ({
         />
       )}
     </div>
+  );
+  if (!footer) return banner;
+  return (
+    <>
+      {banner}
+      {footer}
+    </>
   );
 };

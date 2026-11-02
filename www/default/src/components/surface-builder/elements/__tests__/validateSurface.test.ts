@@ -3,9 +3,7 @@
  */
 
 import {
-  ACCESS_POINT_CLOSED_MESSAGE,
   ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
-  ACCESS_POINT_PUBLIC_MESSAGE,
   validateSurfacePayload,
   hasBlockingIssues,
 } from '../validateSurface';
@@ -33,54 +31,33 @@ describe('validateSurfacePayload', () => {
       access_point: { route: '/a', ...extra },
     });
 
-    it('blocks a new surface with no Caller Context and Public access off', () => {
+    it('lets a new surface with no Caller Context save, leaving the not-ready warning to the gateway', () => {
       const issues = validateSurfacePayload(open(), { isNew: true });
-      expect(issues).toContainEqual(
-        expect.objectContaining({
-          severity: 'error',
-          message: ACCESS_POINT_CLOSED_MESSAGE,
-          nodeId: 'access-point',
-        })
-      );
-    });
-
-    it('treats an empty methods list as no Caller Context', () => {
-      const issues = validateSurfacePayload(
-        open({ caller_authentication: { methods: [] }, public: false }),
-        { isNew: true }
-      );
-      expect(hasBlockingIssues(issues)).toBe(true);
-    });
-
-    it('accepts a new MCP surface protected by a resource token without a Caller Context', () => {
-      const issues = validateSurfacePayload(
-        { ...open(), mcp_http: { authorization: { scopes: ['tools:call'] } } },
-        { isNew: true }
-      );
-      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
       expect(hasBlockingIssues(issues)).toBe(false);
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
     });
 
-    it('blocks a stored closed surface that loses its Caller Context', () => {
-      const issues = validateSurfacePayload(open({ public: false }));
-      expect(issues.find(i => i.message === ACCESS_POINT_CLOSED_MESSAGE)).toMatchObject({
-        severity: 'error',
+    it('lets a stored closed surface without caller authentication save', () => {
+      for (const extra of [{}, { caller_authentication: { methods: [] } }]) {
+        const issues = validateSurfacePayload(open({ public: false, ...extra }));
+        expect(hasBlockingIssues(issues)).toBe(false);
+        expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
+      }
+    });
+
+    it('does not warn about a stored MCP surface protected by a resource token', () => {
+      const issues = validateSurfacePayload({
+        ...open(),
+        mcp_http: { authorization: { scopes: ['tools:call'] } },
       });
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
     });
 
-    it('warns, without blocking, when Public access is on', () => {
+    it('raises no access issue when Public access is on, leaving its warning to the gateway', () => {
       for (const isNew of [true, false]) {
         const issues = validateSurfacePayload(open({ public: true }), { isNew });
-        expect(hasBlockingIssues(issues)).toBe(false);
-        expect(issues).toContainEqual(
-          expect.objectContaining({ severity: 'warning', message: ACCESS_POINT_PUBLIC_MESSAGE })
-        );
+        expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
       }
-      const withAuth = validateSurfacePayload({
-        ...ok(),
-        access_point: { ...ok().access_point, public: true },
-      });
-      expect(withAuth.map(i => i.message)).toEqual([ACCESS_POINT_PUBLIC_MESSAGE]);
     });
 
     it('warns, without blocking, on a surface stored without public and no Caller Context', () => {

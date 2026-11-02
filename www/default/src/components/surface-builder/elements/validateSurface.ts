@@ -13,6 +13,7 @@
  */
 
 import { registry } from './registry';
+import { hasCallerAuthentication, type CallerAccessPayload } from './access-point/readiness';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -36,46 +37,18 @@ export interface ValidateSurfaceOptions {
   isNew?: boolean;
 }
 
-export const ACCESS_POINT_CLOSED_MESSAGE =
-  'This Access Point is closed to all callers. Add a Caller Context, or turn on Public access.';
-export const ACCESS_POINT_PUBLIC_MESSAGE =
-  'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
 export const ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE =
   'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
 
 /**
- * Caller access rules. A new surface, or one stored with `public: false`,
- * needs a caller authentication method, or an MCP resource token
- * (`mcp_http.authorization`), unless it is public. A surface stored without
- * `public` keeps admitting anonymous callers, so it only warns.
+ * Caller access rules. Nothing blocks the save: a closed Access Point with no
+ * caller authentication saves as not ready, and the gateway's save response
+ * warns about it, as it does for a public one. A surface stored without
+ * `public` keeps admitting anonymous callers, so it warns here.
  */
-function accessPointAccessIssues(payload: any, isNew: boolean): ValidationIssue[] {
-  const ap = payload?.access_point;
-  const methods = ap?.caller_authentication?.methods;
-  const hasCallerAuth =
-    (Array.isArray(methods) && methods.length > 0) || payload?.mcp_http?.authorization != null;
-  const isPublic = ap?.public === true;
-  if (isPublic) {
-    return [
-      {
-        severity: 'warning',
-        message: ACCESS_POINT_PUBLIC_MESSAGE,
-        nodeId: 'access-point',
-        path: 'access_point.public',
-      },
-    ];
-  }
-  if (hasCallerAuth) return [];
-  if (isNew || ap?.public === false) {
-    return [
-      {
-        severity: 'error',
-        message: ACCESS_POINT_CLOSED_MESSAGE,
-        nodeId: 'access-point',
-        path: 'access_point.caller_authentication',
-      },
-    ];
-  }
+function accessPointAccessIssues(payload: CallerAccessPayload, isNew: boolean): ValidationIssue[] {
+  if (isNew || typeof payload?.access_point?.public === 'boolean') return [];
+  if (hasCallerAuthentication(payload)) return [];
   return [
     {
       severity: 'warning',

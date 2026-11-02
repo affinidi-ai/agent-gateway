@@ -1450,12 +1450,32 @@ async fn operator_has_created_the_surface_as_public(
     create_new_surface(world, &route, true).await;
 }
 
+#[given(expr = "the operator has created the surface for route {string} without its source authentication")]
+async fn operator_has_created_the_surface_without_its_source_authentication(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let mut payload = crate::steps::when::build_new_surface_payload(world, &route, false).await;
+    payload["access_point"]
+        .as_object_mut()
+        .expect("surface payload must have an access_point object")
+        .remove("caller_authentication");
+    create_new_surface_from(world, payload).await;
+}
+
 async fn create_new_surface(
     world: &mut SurfaceWorld,
     route: &str,
     public: bool,
 ) {
     let payload = crate::steps::when::build_new_surface_payload(world, route, public).await;
+    create_new_surface_from(world, payload).await;
+}
+
+async fn create_new_surface_from(
+    world: &mut SurfaceWorld,
+    payload: serde_json::Value,
+) {
     crate::steps::when::create_surface(world, payload).await;
 
     assert_surface_setup_created(world, "new surface setup");
@@ -1467,6 +1487,49 @@ async fn create_new_surface(
         Some(surface_name) => remember_named_surface_under_test_id(world, &surface_name),
         None => remember_surface_under_test_id(world),
     }
+}
+
+#[given("the operator has marked the surface public")]
+async fn operator_has_marked_the_surface_public(world: &mut SurfaceWorld) {
+    crate::steps::when::mark_surface_public(world).await;
+    assert_admin_setup_status(world, 200, "marking the surface public");
+}
+
+#[given("the operator has added its source authentication to the surface")]
+async fn operator_has_added_its_source_authentication(world: &mut SurfaceWorld) {
+    crate::steps::when::add_source_authentication(world).await;
+    assert_admin_setup_status(world, 200, "adding source authentication to the surface");
+}
+
+#[given("the operator has removed source authentication from the surface")]
+async fn operator_has_removed_source_authentication(world: &mut SurfaceWorld) {
+    crate::steps::when::remove_source_authentication(world).await;
+    assert_admin_setup_status(world, 200, "removing source authentication from a closed surface");
+}
+
+#[given(expr = "the operator has added a complete-mode variant {string} without source authentication to the surface")]
+async fn operator_has_added_complete_variant_without_source_authentication(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    crate::steps::when::add_complete_variant_without_source_authentication(world, &alias).await;
+    assert_admin_setup_status(world, 200, "adding a variant without source authentication");
+}
+
+fn assert_admin_setup_status(
+    world: &SurfaceWorld,
+    expected: u16,
+    context: &str,
+) {
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("admin_response must be set after surface setup");
+    assert_eq!(
+        response.status, expected,
+        "{} should answer {}, got status {} body {}",
+        context, expected, response.status, response.body
+    );
 }
 
 #[given(expr = "the operator has attempted to create a surface for route {string} with invalid configuration")]

@@ -122,22 +122,54 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
   `transit-point-listener-url`.
 - **Public access** is a switch in the Access Point panel (`access-point-public-switch`, with an
-  always-visible `access-point-public-warning` while on). It writes `access_point.public`, which
-  is surface-level (an `ACCESS_POINT_IDENTIFIER_FIELDS` entry, never a variant override). A
-  surface stored without the field sends none until the operator flips the switch, so saving it
-  keeps its rules. The Access Point and Caller Context elements carry `public` and
-  `caller_authentication.on_failure` through a load and save unchanged. `validateSurfacePayload`
-  owns the save prompts, listed before its other warnings:
-  - No Caller Context and Public access off, on a new surface or one stored with
-    `public: false`: a blocking error toast, "This Access Point is closed to all callers. Add a
-    Caller Context, or turn on Public access.", whose **Show me** selects the Access Point. No API
-    call is made.
-  - Public access on: a `warning` toast after every successful save, "Warning: This Access Point
-    is public. …".
+  always-visible `access-point-public-warning` while on), directly under the Entry point URL
+  (`RouteListenerBanner`'s `footer`), with no section heading above it. Its label is styled
+  like the other section labels, such as Routing. It
+  writes `access_point.public`, which
+  is surface-level (an `ACCESS_POINT_IDENTIFIER_FIELDS` entry, never a variant override). The
+  Access Point and Caller Context elements carry `public` and `caller_authentication.on_failure`
+  through a load and rebuild unchanged; `withCallerAccessSettled`
+  (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
+  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
+  legacy state, "Not enforced (legacy)", under the switch with a **Close Access Point** button
+  (`access-point-close-button`, hidden when read-only) that sets `public: false`. Turning the
+  switch off there clears `public`, so turning it on and off again keeps the stored rules. A
+  `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
+  sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
+- **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
+  a new surface) with no caller authentication method and no `mcp_http.authorization` is not
+  ready: it saves, and callers get 503 until a save adds a Caller Context or turns Public access
+  on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
+  (`access-point/readiness.ts`) is the one copy of that rule, and the notice uses it;
+  `validateSurfacePayload` uses only its `hasCallerAuthentication` check, for the legacy
+  no-Caller-Context warning. Every surface response carries a read-only `access_point_status`, which
+  `toBackendSurface` (`src/api.ts`) leaves out of writes.
+  - The notice sits under the canvas Entry point URL, which keeps its copy button
+    (`surface-access-point-readiness`), rendered by `AccessPointReadinessNotice` through
+    `RouteListenerBanner`'s `footer`, in the warning yellow. The Access Point panel doesn't
+    repeat it. The page
+    decides it (`chooseAccessPointNotice`) and passes it through `SurfaceFormShell` to
+    `SurfaceMetaContext`. The create page uses the draft. The edit page uses the saved state:
+    `access_point_status` for the base, the stored variant resolved over the surface for a
+    variant; it refreshes from the save response, so it clears without a reload. Nothing shows
+    while ready.
+  - Not ready: "Not ready for external access" with a **Configure Authentication** button
+    (`<notice>-configure-authentication-button`, hidden when read-only). It selects the Access
+    Point, expands the sidebar and highlights the Caller Context element in the palette
+    (`palette-item-caller-auth`). The builder has no way to select or open an empty slot, so it
+    can't open the Caller Context slot itself.
+  - Saved not ready but the unsaved canvas would be ready: "Not ready for external access. Save
+    to activate.", with no button.
+  The save prompts:
+  - Not ready: the gateway's save response `warnings` carry "This Access Point is not ready for
+    external access. …", shown as "Warning: …" after the save.
+  - Public access on: the gateway's save response `warnings` carry "This Access Point is
+    public. …", shown as "Warning: …" after every successful save.
   - Stored without `public` and no Caller Context: the save goes ahead, then a `warning` toast,
     "Warning: This Access Point has no Caller Context. …".
   Post-save warnings go through `showSurfaceSaveWarnings` (`elements/saveWarnings.ts`) as
-  `warning` toasts, at most three.
+  `warning` toasts, at most three: the response's `warnings` first, then the dashboard's own,
+  each message once.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so

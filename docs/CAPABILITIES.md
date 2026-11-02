@@ -184,11 +184,14 @@ Several independent layers, evaluated before a request is forwarded.
 | MCP tool policies | An OPA policy attached to an individual MCP tool. |
 | MCP tool gating | An ordered allow/deny firewall over MCP tool names, matched by pattern and optionally activated by a policy condition. It hides tools from discovery and blocks their invocation. |
 
-A missing or invalid caller credential does not by itself refuse the request. The request
-continues with no caller identity and the failure is passed to policy, so a surface that
-must reject unauthenticated callers needs a policy that denies them. An MCP Access Point
-that publishes protected resource metadata instead refuses the request with a `401`, direct
-or over Fabric; a direct request's challenge points at that metadata. See
+A closed Access Point, which the admin API creates by default, refuses a missing or invalid
+caller credential with a `401` before policy and the Target; until it has caller
+authentication it is not ready and refuses every request with a `503`. On a public or legacy Access
+Point the request continues with no caller identity and the failure is passed to policy, so
+such a surface that must reject unauthenticated callers needs a policy that denies them. An
+MCP Access Point that publishes protected resource metadata always refuses the request with
+a `401`, direct or over Fabric; a direct request's challenge points at that metadata. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points) and
 [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
 A policy can express rules such as "only agents using a particular model may call these

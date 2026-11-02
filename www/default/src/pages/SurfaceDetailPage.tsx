@@ -24,6 +24,12 @@ import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
 import { withDroppedProtectedResourcesRemoved } from '../components/surface-builder/elements/caller-auth/protectedResource';
+import { withCallerAccessSettled } from '../components/surface-builder/elements/access-point/publicAccess';
+import {
+  accessPointStatus,
+  chooseAccessPointNotice,
+  savedAccessPointStatus,
+} from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -1264,10 +1270,11 @@ const SurfaceDetailPage: React.FC = () => {
       // A PUT that leaves out a stored discovery setting keeps it, so one the
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
+      payload = withCallerAccessSettled(payload);
       let headerWarnings: string[] = [];
-      const updated = await apiClient.updateSurface(surfaceId, payload, {
-        onWarnings: warnings => {
-          headerWarnings = warnings;
+      const { warnings, ...updated } = await apiClient.updateSurface(surfaceId, payload, {
+        onWarnings: received => {
+          headerWarnings = received;
         },
       });
       setSavedWarnings({ surfaceId, warnings: headerWarnings });
@@ -1360,7 +1367,10 @@ const SurfaceDetailPage: React.FC = () => {
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving.
-      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
+        headerWarnings,
+        warnings,
+      });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1608,6 +1618,16 @@ const SurfaceDetailPage: React.FC = () => {
     }
   })();
   const configEditorValue = jsonOverride ?? JSON.stringify(livePayloadWithVariants, null, 2);
+  // The saved state of the view on the canvas decides, so the notice clears
+  // once a save makes the Access Point ready; until then an unsaved fix says
+  // to save.
+  const accessPointNotice = chooseAccessPointNotice(
+    savedAccessPointStatus(surface, variantSnapshots.activeVariantId),
+    accessPointStatus(withCallerAccessSettled(livePayload as Partial<AgentSurface>))
+  );
+  // Stored without `public`: Public access shows a legacy state, which the
+  // operator can close.
+  const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
 
   const policyDefinitionsSaveBlocker = surfacePolicyBlockingReason(
     builder.state.nodes,
@@ -1681,6 +1701,8 @@ const SurfaceDetailPage: React.FC = () => {
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
         saveWarnings={saveWarnings}
+        accessPointNotice={accessPointNotice}
+        legacyAccessPoint={legacyAccessPoint}
         surfaceId={surface?.surface_id}
         lastActivity={
           // Backend doesn't carry `last_activity` on the surface payload;
@@ -1710,6 +1732,7 @@ const SurfaceDetailPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
+                data-testid="surface-save-button"
                 onClick={handleSave}
                 disabled={saving || deleting}
                 title={saveDisabledReason || (saving ? 'Saving…' : 'Save changes')}

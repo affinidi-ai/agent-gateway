@@ -131,6 +131,9 @@ pub fn deny_response(
 /// credential failed is logged, never sent.
 pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invalid";
 
+/// The `WWW-Authenticate` challenge an MCP JWT Bearer refusal carries.
+const MCP_BEARER_CHALLENGE: &str = "Bearer realm=\"agent-gateway\"";
+
 /// The `401` for a caller whose credential is missing or invalid, on an Access
 /// Point whose caller authentication rejects such callers. An MCP caller gets a
 /// JSON-RPC error answering `mcp_request_id`; any other caller gets
@@ -154,13 +157,69 @@ pub fn caller_refusal(
             if matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
                 response.headers_mut().insert(
                     axum::http::header::WWW_AUTHENTICATE,
-                    axum::http::HeaderValue::from_static("Bearer realm=\"agent-gateway\""),
+                    axum::http::HeaderValue::from_static(MCP_BEARER_CHALLENGE),
                 );
             }
             response
         }
         _ => a2a_deny(auth_config, CALLER_CREDENTIAL_REFUSED, status, "Unauthorized", true),
     }
+}
+
+/// What a caller of an Access Point that is not ready is told. Why it is not
+/// ready is logged, never sent.
+pub const ACCESS_POINT_UNAVAILABLE: &str = "This Access Point is not available.";
+
+/// The `503` for every request to an Access Point that is not ready: closed
+/// (`public: false`) with no source authentication. An MCP caller gets a
+/// JSON-RPC error answering `mcp_request_id`; any other caller gets
+/// `application/problem+json`, as a Transit Point that can't be served does.
+pub fn access_point_unavailable(
+    protocol: &SurfaceProtocol,
+    mcp_request_id: Option<serde_json::Value>,
+) -> Response {
+    let status = StatusCode::SERVICE_UNAVAILABLE;
+    match protocol {
+        SurfaceProtocol::Mcp => crate::mcp::errors::create_mcp_error_response_with_status(
+            status,
+            mcp_request_id,
+            crate::mcp::errors::error_codes::INTERNAL_ERROR,
+            ACCESS_POINT_UNAVAILABLE,
+            None,
+        ),
+        _ => crate::a2a::errors::create_error_response(status, ACCESS_POINT_UNAVAILABLE),
+    }
+}
+
+/// Refuses a request to `surface`, whose Access Point is not ready
+/// ([`AgentSurface::refuses_every_request`]), on the direct path and over
+/// Fabric: logs why, records `request_rejected` with the reason
+/// `access_point_not_ready`, and answers with [`access_point_unavailable`].
+///
+/// [`AgentSurface::refuses_every_request`]: crate::config::agent_surface::AgentSurface::refuses_every_request
+pub fn refuse_unavailable_access_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    variant_alias: Option<&str>,
+    mcp_request_id: Option<serde_json::Value>,
+) -> Response {
+    crate::channel_warn!(
+        surface.surface_id,
+        "Access Point is not ready (variant={:?}, via_fabric={}, reason=no source authentication) — refusing with 503",
+        variant_alias,
+        facts.via_fabric
+    );
+    let response = access_point_unavailable(&surface.access_point.protocol, mcp_request_id);
+    let rpc_error_code = (surface.access_point.protocol == SurfaceProtocol::Mcp)
+        .then_some(i64::from(crate::mcp::errors::error_codes::INTERNAL_ERROR));
+    crate::audit::request_events::request_rejected(
+        facts,
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::AccessPointNotReady,
+        response.status().as_u16(),
+        rpc_error_code,
+    );
+    response
 }
 
 fn a2a_deny(
@@ -209,7 +268,7 @@ fn mcp_deny(
         .header("content-type", "application/problem+json");
 
     if challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
-        builder = builder.header("www-authenticate", "Bearer realm=\"agent-gateway\"");
+        builder = builder.header("www-authenticate", MCP_BEARER_CHALLENGE);
     }
 
     builder
@@ -337,6 +396,34 @@ mod tests {
             assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::INTERNAL_ERROR);
             assert_eq!(body["error"]["message"], CALLER_CREDENTIAL_REFUSED);
         }
+    }
+
+    #[tokio::test]
+    async fn test_access_point_unavailable_is_503_in_the_callers_protocol_shape() {
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Ap2] {
+            let resp = access_point_unavailable(&protocol, Some(serde_json::json!(7)));
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(resp.headers()["content-type"], "application/problem+json");
+            assert!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .is_none()
+            );
+            let body = body_json(resp).await;
+            assert_eq!(body["detail"], ACCESS_POINT_UNAVAILABLE);
+            assert_eq!(body["status"], 503);
+            assert!(body.get("id").is_none());
+        }
+
+        let resp = access_point_unavailable(&SurfaceProtocol::Mcp, Some(serde_json::json!("call-1")));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"jsonrpc": "2.0", "id": "call-1", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR, "message": ACCESS_POINT_UNAVAILABLE
+            }})
+        );
     }
 
     #[tokio::test]

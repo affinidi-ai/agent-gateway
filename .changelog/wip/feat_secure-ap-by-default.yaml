@@ -4,25 +4,49 @@ changes:
     - timestamp: '2026-10-30T12:00:00Z'
       title: Add access_point.public and caller_authentication.on_failure to surfaces
       description: >-
-        `access_point.public: true` lets a surface admit callers without credentials, and every
+        `access_point.public: true` lets a surface admit callers without credentials, sets
+        `on_failure` to `continue` on every save so a failed caller goes on to policy, and every
         save of such a surface returns a `warnings` entry. `caller_authentication.on_failure:
-        reject` refuses a missing or invalid credential with `401` before policy, as a JSON-RPC
-        error carrying the request id for MCP callers and `application/problem+json` otherwise,
-        on direct inbound, `proxy://`, `a2a-proxy://` and Fabric receive. The dashboard adds a
-        Public access switch to the Access Point panel. A gateway rolled back to an earlier
-        release skips surfaces that store either field, with a logged error, until it is
-        upgraded again; the files stay on disk.
-  changed:
-    - timestamp: '2026-10-30T12:00:00Z'
-      title: ⭐ Create new Access Points closed to callers without credentials
+        reject` refuses a missing or invalid credential with `401` before policy and before the
+        surface rate limit, as a JSON-RPC error carrying the request id for MCP callers and
+        `application/problem+json` otherwise, on direct inbound, `proxy://`, `a2a-proxy://` and
+        Fabric receive. The dashboard adds a Public access switch to the Access Point panel, and
+        shows a surface stored without `public` as a legacy Access Point that it can close,
+        warning when one is saved without a Caller Context. A
+        gateway rolled back to an earlier release skips surfaces that store either field, with a
+        logged error, until it is upgraded again; the files stay on disk.
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Report whether an Access Point is ready for external access
       description: >-
-        The admin API and dashboard now create surfaces with `access_point.public: false` and
-        `on_failure: reject`, and refuse with `400` a closed surface, update or variant without
-        caller authentication, so an Access Point no longer admits anonymous callers until
-        someone adds a Caller Context. Set `public: true` to opt out. Surfaces stored before
-        this release, built from DynamoDB, or restored without the fields keep their behaviour,
-        and the dashboard warns when one is saved without a Caller Context.
+        Surface responses from the admin API carry a read-only top-level
+        `access_point_status`, `ready` or `not_ready`; variant responses report it for the
+        resolved variant. It is never stored, and a write that sends it back has it dropped.
+        The dashboard shows "Not ready for external access" under the Access Point URL, with a
+        Configure Authentication action, until the saved surface is ready. Each request a
+        not-ready Access Point refuses is recorded in the Audit Log as `request_rejected` with
+        the reason `access_point_not_ready`.
+  changed:
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Show dashboard save warnings as warnings, not errors
+      description: >-
+        Post-save `Warning: …` toasts on the surface create and edit pages now use warning
+        styling instead of error styling.
   fixed: []
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: ⭐ Create surfaces with closed Access Points by default
+      description: >-
+        The admin API and dashboard now create surfaces with `access_point.public: false`, so
+        an Access Point no longer admits anonymous callers: a missing or invalid credential is
+        refused with `401`. A closed Access Point without source authentication (a
+        `caller_authentication` method, or on MCP `mcp_http.authorization`) is saved, with
+        `access_point_status: not_ready` and a `warnings` entry, but answers every request,
+        discovery reads included, with `503` until source authentication is added or
+        `public` is set to `true`. The same applies after a PUT, PATCH, variant change or
+        promote that leaves a closed surface, or one of its enabled variants, without source
+        authentication. API and CLI clients that create surfaces must add source authentication
+        or send `access_point.public: true`, and should check `access_point_status` or
+        `warnings` in the response. Surfaces stored before this release, built from DynamoDB,
+        or restored without `public` keep their behaviour.

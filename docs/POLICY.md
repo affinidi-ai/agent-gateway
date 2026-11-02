@@ -253,9 +253,9 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-A closed Access Point (`caller_authentication.on_failure: reject`, which the admin API sets on
-every surface it creates unless it is public) refuses a missing or invalid credential with
-`401` before policy, see
+A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
+it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
+refuse a missing or invalid credential with `401` before policy, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
 does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding

@@ -1627,34 +1627,28 @@ async fn valid_surface_create_request_submitted(
     create_valid_surface_for_route(world, &route).await;
 }
 
-#[when(expr = "the operator attempts to create a surface for route {string} without source authentication")]
-async fn surface_without_source_authentication_create_request_submitted(
-    world: &mut SurfaceWorld,
-    route: String,
-) {
-    let payload = build_new_surface_payload(world, &route, false).await;
-    create_surface(world, payload).await;
+pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
+    let mut payload = get_saved_surface_without_warnings(world, "marking the surface public");
+    payload["access_point"]["public"] = serde_json::json!(true);
+
+    update_created_surface(world, payload, "marking the surface public").await;
 }
 
-#[when(expr = "the operator creates a public surface for route {string}")]
-async fn public_surface_create_request_submitted(
-    world: &mut SurfaceWorld,
-    route: String,
-) {
-    let payload = build_new_surface_payload(world, &route, true).await;
-    create_surface(world, payload).await;
+/// Save the scenario's source authentication on the created surface.
+pub(crate) async fn add_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_saved_surface_without_warnings(world, "adding source authentication");
+    let auth = world
+        .surface_config
+        .source_auth
+        .as_ref()
+        .expect("the scenario's source authentication must be configured");
+    payload["access_point"]["caller_authentication"] =
+        serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] });
+
+    update_created_surface(world, payload, "adding source authentication").await;
 }
 
-#[when("the operator saves the surface again")]
-async fn operator_saves_the_surface_again(world: &mut SurfaceWorld) {
-    // The save response goes back as it came, `warnings` included, as a client
-    // that edits the response would send it.
-    let payload = get_current_admin_surface_body(world, "saving the surface again");
-    update_created_surface(world, payload, "saving the surface again").await;
-}
-
-#[when("the operator removes source authentication from the surface")]
-async fn operator_removes_source_authentication(world: &mut SurfaceWorld) {
+pub(crate) async fn remove_source_authentication(world: &mut SurfaceWorld) {
     let mut payload = get_saved_surface_without_warnings(world, "removing source authentication");
     payload["access_point"]
         .as_object_mut()
@@ -1664,10 +1658,9 @@ async fn operator_removes_source_authentication(world: &mut SurfaceWorld) {
     update_created_surface(world, payload, "removing source authentication").await;
 }
 
-#[when(expr = "the operator adds a complete-mode variant {string} without source authentication to the surface")]
-async fn operator_adds_complete_variant_without_source_authentication(
+pub(crate) async fn add_complete_variant_without_source_authentication(
     world: &mut SurfaceWorld,
-    alias: String,
+    alias: &str,
 ) {
     let mut payload = get_saved_surface_without_warnings(world, "adding a variant");
     let target_endpoint = payload["target"]["endpoint"].clone();

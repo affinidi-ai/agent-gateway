@@ -83,7 +83,7 @@ function MockSurfaceFormShell(props: any) {
       >
         Set target
       </button>
-      <output data-testid="selected-node">{props.builder.state.selectedNodeId ?? ''}</output>
+      <output data-testid="access-point-notice">{props.accessPointNotice ?? ''}</output>
       {props.manageActions}
     </div>
   );
@@ -279,26 +279,40 @@ describe('AddSurfacePage caller access on create', () => {
     fireEvent.click(button);
   };
 
-  it('blocks a surface with no Caller Context and Public access off, with Show me', async () => {
+  it("creates a surface with no Caller Context and shows the response's not-ready warning", async () => {
+    const notReady =
+      'This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.';
+    createSurface.mockResolvedValue({ warnings: [notReady] } as unknown as AgentSurface);
     renderPage();
     await routeSeeded();
 
     create();
 
-    expect(createSurface).not.toHaveBeenCalled();
-    expect(toast).toHaveBeenCalledTimes(1);
-    const [type, message, options] = toast.mock.calls[0];
-    expect(type).toBe('error');
-    expect(message).toBe(
-      'This Access Point is closed to all callers. Add a Caller Context, or turn on Public access.'
+    await waitFor(() => expect(createSurface).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining(`created, with warnings:\n${notReady}`),
+        expect.anything()
+      )
     );
-    expect(options.action.label).toBe('Show me');
-
-    act(() => options.action.onClick());
-    expect(screen.getByTestId('selected-node')).toHaveTextContent('access-point');
+    expect(toast.mock.calls.filter(c => c[0] === 'error')).toEqual([]);
+    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toHaveLength(1);
   });
 
-  it('creates a public surface and warns that it is public', async () => {
+  it('shows the not-ready notice from the draft until Public access is on', async () => {
+    renderPage();
+    await routeSeeded();
+
+    expect(screen.getByTestId('access-point-notice')).toHaveTextContent(/^not_ready$/);
+    fireEvent.click(screen.getByText('Turn on Public access'));
+    expect(screen.getByTestId('access-point-notice')).toHaveTextContent(/^$/);
+  });
+
+  it("creates a public surface and shows the response's public warning once", async () => {
+    const publicMessage =
+      'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
+    createSurface.mockResolvedValue({ warnings: [publicMessage] } as unknown as AgentSurface);
     renderPage();
     await routeSeeded();
     fireEvent.click(screen.getByText('Turn on Public access'));
@@ -308,12 +322,11 @@ describe('AddSurfacePage caller access on create', () => {
     await waitFor(() =>
       expect(toast).toHaveBeenCalledWith(
         'warning',
-        expect.stringContaining(
-          'created, with warnings:\nThis Access Point is public. Anyone who can reach it can call your agent without credentials.'
-        ),
+        expect.stringContaining(`created, with warnings:\n${publicMessage}`),
         expect.anything()
       )
     );
+    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toHaveLength(1);
     expect(createSurface).toHaveBeenCalledTimes(1);
     expect(createSurface.mock.calls[0][0].access_point.public).toBe(true);
   });
@@ -367,8 +380,6 @@ describe('AddSurfacePage create warnings', () => {
     });
     renderAt();
     await routeSeeded();
-    // A closed Access Point with no Caller Context is not created.
-    fireEvent.click(screen.getByText('Turn on Public access'));
     fireEvent.click(screen.getByTitle('Create surface'));
     await waitFor(() => expect(showToast).toHaveBeenCalled());
   };

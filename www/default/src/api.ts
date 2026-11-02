@@ -549,8 +549,8 @@ class APIClient {
   async createSurface(
     surface: Partial<AgentSurface>,
     options?: { onWarnings?: (warnings: string[]) => void }
-  ): Promise<AgentSurface> {
-    const s = await this.request<AgentSurface>('/surfaces', {
+  ): Promise<SavedSurface> {
+    const s = await this.request<SavedSurface>('/surfaces', {
       method: 'POST',
       body: JSON.stringify(toBackendSurface(surface)),
       onResponse: warningsReader(options?.onWarnings),
@@ -562,8 +562,8 @@ class APIClient {
     surfaceId: string,
     surface: Partial<AgentSurface>,
     options?: { onWarnings?: (warnings: string[]) => void }
-  ): Promise<AgentSurface> {
-    const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
+  ): Promise<SavedSurface> {
+    const s = await this.request<SavedSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
       onResponse: warningsReader(options?.onWarnings),
@@ -1364,7 +1364,18 @@ export interface AgentSurface {
    * callers with `source_auth`. Derived on every save; a write's value is ignored.
    */
   transit_point_source_auth?: boolean;
+  /**
+   * Read-only, set by the gateway on every surface response. `not_ready`: the
+   * Access Point is closed (`public: false`) with no caller authentication, so
+   * callers get 503 until one is added or Public access is turned on.
+   */
+  access_point_status?: AccessPointStatus;
 }
+
+export type AccessPointStatus = 'ready' | 'not_ready';
+
+/** A surface create or update response: the stored surface plus the gateway's `warnings`. */
+export type SavedSurface = AgentSurface & { warnings?: string[] };
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
@@ -1456,9 +1467,11 @@ function withoutDerivedMarks<T>(surface: T): T {
   return rest as T;
 }
 
-function toBackendSurface(surface: Partial<AgentSurface>): any {
-  surface = withoutDerivedMarks(surface);
-  if (!surface || !surface.target) return withTrustCheckSplit(surface);
+function toBackendSurface(written: Partial<AgentSurface>): any {
+  if (!written) return withTrustCheckSplit(written);
+  // The gateway derives `access_point_status`; a write never carries it.
+  const { access_point_status: _status, ...surface } = withoutDerivedMarks(written);
+  if (!surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
   // Preserve any operator-set inject_vp toggle (Managed Agent panel); default

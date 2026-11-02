@@ -3,13 +3,25 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { registry } from '../index';
 import type { PayloadContext } from '../types';
-import AccessPointPanel from '../access-point/AccessPointPanel';
+import AccessPointPanel, {
+  CLOSE_ACCESS_POINT_LABEL,
+  CLOSING_ACCESS_POINT_TEXT,
+  LEGACY_ACCESS_POINT_TEXT,
+} from '../access-point/AccessPointPanel';
+import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 import { nodesFromSurface } from '../../nodesFromSurface';
 import { showSurfaceSaveToast } from '../saveWarnings';
+import { withCallerAccessSettled } from '../access-point/publicAccess';
 import { showToast } from '../../../../utils/toaster';
 import type { AgentSurface } from '../../../../api';
 
-jest.mock('../_shared/RouteListenerSection', () => () => null);
+// The Public access switch is the URL banner's footer, so the stub renders only that.
+jest.mock(
+  '../_shared/RouteListenerSection',
+  () =>
+    ({ bannerFooter }: { bannerFooter?: unknown }) =>
+      bannerFooter ?? null
+);
 jest.mock('../../../../utils/toaster', () => ({
   ...jest.requireActual('../../../../utils/toaster'),
   showToast: jest.fn(),
@@ -17,7 +29,7 @@ jest.mock('../../../../utils/toaster', () => ({
 
 const toast = showToast as jest.Mock;
 
-const PUBLIC_WARNING =
+const PUBLIC_MESSAGE =
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
 const NO_CALLER_CONTEXT_WARNING =
   'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
@@ -130,6 +142,12 @@ describe('AccessPointPanel Public access switch', () => {
     expect(updateField).toHaveBeenCalledWith('public', true);
   });
 
+  it('has no Access heading above the switch', () => {
+    render(<AccessPointPanel {...props({})} />);
+    expect(screen.queryByText(/^Access$/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('access-point-public-switch')).toBeInTheDocument();
+  });
+
   it('shows the warning while on and can be turned off', () => {
     const updateField = jest.fn();
     render(<AccessPointPanel {...props({ public: true }, updateField)} />);
@@ -137,6 +155,54 @@ describe('AccessPointPanel Public access switch', () => {
     expect(screen.getByTestId('access-point-public-warning')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('access-point-public-switch'));
     expect(updateField).toHaveBeenCalledWith('public', false);
+  });
+
+  describe('on a surface stored without public', () => {
+    const renderLegacy = (config: Record<string, unknown>, readOnly = false) => {
+      const updateField = jest.fn();
+      render(
+        <SurfaceMetaProvider value={{ legacyAccessPoint: true, readOnly } as any}>
+          <AccessPointPanel {...props(config, updateField)} />
+        </SurfaceMetaProvider>
+      );
+      return updateField;
+    };
+
+    it('shows the legacy state and closes the Access Point on request', () => {
+      const updateField = renderLegacy({});
+
+      expect(screen.getByTestId('access-point-public-switch')).not.toBeChecked();
+      expect(screen.getByTestId('access-point-legacy-notice')).toHaveTextContent(
+        LEGACY_ACCESS_POINT_TEXT
+      );
+      fireEvent.click(screen.getByRole('button', { name: CLOSE_ACCESS_POINT_LABEL }));
+      expect(updateField).toHaveBeenCalledWith('public', false);
+    });
+
+    it('offers no close action when read-only', () => {
+      renderLegacy({}, true);
+      expect(screen.getByTestId('access-point-legacy-notice')).toBeInTheDocument();
+      expect(screen.queryByTestId('access-point-close-button')).not.toBeInTheDocument();
+    });
+
+    it('says it will be closed once the operator closes it', () => {
+      renderLegacy({ public: false });
+      expect(screen.queryByTestId('access-point-legacy-notice')).not.toBeInTheDocument();
+      expect(screen.getByTestId('access-point-closing-notice')).toHaveTextContent(
+        CLOSING_ACCESS_POINT_TEXT
+      );
+    });
+
+    it('returns to the legacy state when Public access is turned off', () => {
+      const updateField = renderLegacy({ public: true });
+      fireEvent.click(screen.getByTestId('access-point-public-switch'));
+      expect(updateField).toHaveBeenCalledWith('public', undefined);
+    });
+  });
+
+  it('shows no legacy state on a closed or new surface', () => {
+    render(<AccessPointPanel {...props({})} />);
+    expect(screen.queryByTestId('access-point-legacy-notice')).not.toBeInTheDocument();
   });
 
   it('writes the field into the payload once set', () => {
@@ -147,18 +213,74 @@ describe('AccessPointPanel Public access switch', () => {
   });
 });
 
+describe('withCallerAccessSettled', () => {
+  const legacy = storedSurface({ caller_authentication: API_KEY_AUTH });
+
+  // The loaded surface with the Access Point's `public` set on the canvas.
+  const withPublic = (stored: AgentSurface, value: boolean | undefined): any => {
+    const nodes = nodesFromSurface(stored).map(n =>
+      n.id === 'access-point' ? { ...n, config: { ...n.config, public: value } } : n
+    );
+    return withCallerAccessSettled(registry.buildPayload(makeCtx(nodes)) as any).access_point;
+  };
+
+  it('sends no public for a surface stored without it until the operator sets it', () => {
+    expect(withPublic(legacy, undefined)).not.toHaveProperty('public');
+  });
+
+  it('sends public: false once the operator closes a surface stored without it', () => {
+    const ap = withPublic(legacy, false);
+    expect(ap.public).toBe(false);
+    expect(ap.caller_authentication).toEqual(API_KEY_AUTH);
+  });
+
+  it('leaves out on_failure once public is sent, so the gateway derives it', () => {
+    const payload = {
+      access_point: {
+        public: true,
+        caller_authentication: { ...API_KEY_AUTH, on_failure: 'reject' },
+      },
+      variants: [
+        {
+          id: 'v1',
+          alias: 'beta',
+          name: 'Beta',
+          overrides: {
+            access_point: { caller_authentication: { ...API_KEY_AUTH, on_failure: 'reject' } },
+          },
+        },
+      ],
+    } as unknown as Partial<AgentSurface>;
+    const settled = withCallerAccessSettled(payload);
+    expect(settled.access_point?.caller_authentication).toEqual(API_KEY_AUTH);
+    expect(settled.variants?.[0].overrides.access_point.caller_authentication).toEqual(
+      API_KEY_AUTH
+    );
+  });
+
+  it('keeps on_failure on a surface stored without public that sends none', () => {
+    const ap = withCallerAccessSettled({
+      access_point: { caller_authentication: { ...API_KEY_AUTH, on_failure: 'continue' } },
+    } as unknown as Partial<AgentSurface>).access_point;
+    expect(ap?.caller_authentication?.on_failure).toBe('continue');
+  });
+});
+
 describe('showSurfaceSaveToast', () => {
   beforeEach(() => toast.mockReset());
 
-  it('warns on every save of a public surface', () => {
+  it("shows the save response's warnings, each once", () => {
     const saved = storedSurface({ public: true, caller_authentication: API_KEY_AUTH });
-    showSurfaceSaveToast('Saved', saved);
-    showSurfaceSaveToast('Saved', saved);
+    showSurfaceSaveToast('Saved', saved, { warnings: [PUBLIC_MESSAGE, PUBLIC_MESSAGE, 7] });
 
-    expect(
-      toast.mock.calls.filter(c => c[1] === `Saved, with warnings:\n${PUBLIC_WARNING}`)
-    ).toHaveLength(2);
-    expect(toast.mock.calls.every(c => c[0] === 'warning')).toBe(true);
+    expect(toast.mock.calls).toEqual([
+      ['warning', `Saved, with warnings:\n${PUBLIC_MESSAGE}`, expect.anything()],
+    ]);
+  });
+
+  it('adds no public warning of its own', () => {
+    showSurfaceSaveToast('Saved', storedSurface({ public: true }));
+    expect(toast.mock.calls).toEqual([['success', 'Saved']]);
   });
 
   it('warns about a stored surface with no Caller Context', () => {
@@ -176,12 +298,13 @@ describe('showSurfaceSaveToast', () => {
       storedSurface({ public: true, caller_authentication: API_KEY_AUTH }),
       {
         headerWarnings: ['from the gateway'],
+        warnings: [PUBLIC_MESSAGE],
       }
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(
       'warning',
-      `Saved, with warnings:\nfrom the gateway\n${PUBLIC_WARNING}`,
+      `Saved, with warnings:\nfrom the gateway\n${PUBLIC_MESSAGE}`,
       expect.anything()
     );
   });

@@ -17,6 +17,11 @@ import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
+import { withCallerAccessSettled } from '../components/surface-builder/elements/access-point/publicAccess';
+import {
+  accessPointStatus,
+  chooseAccessPointNotice,
+} from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -449,7 +454,9 @@ const AddSurfacePage: React.FC = () => {
     setSaving(true);
     setError(null);
     try {
-      const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
+      const payload: Partial<AgentSurface> = withCallerAccessSettled(
+        withA2aValidationSettled(buildSurfacePayload())
+      );
       let headerWarnings: string[] = [];
       const created = await apiClient.createSurface(payload, {
         onWarnings: warnings => {
@@ -462,6 +469,7 @@ const AddSurfacePage: React.FC = () => {
       showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, {
         isNew: true,
         headerWarnings,
+        warnings: created?.warnings,
       });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
@@ -546,7 +554,13 @@ const AddSurfacePage: React.FC = () => {
     handleCreate();
   }, builder.commit);
 
-  const configEditorValue = jsonOverride ?? JSON.stringify(buildSurfacePayload(), null, 2);
+  const draftPayload = buildSurfacePayload();
+  const configEditorValue = jsonOverride ?? JSON.stringify(draftPayload, null, 2);
+  // Nothing is saved yet, so the draft decides; the gateway creates it closed.
+  const accessPointNotice = chooseAccessPointNotice(
+    null,
+    accessPointStatus(draftPayload, { isNew: true })
+  );
 
   /**
    * Live-apply a user-pasted/edited AgentSurface payload from the
@@ -842,6 +856,7 @@ const AddSurfacePage: React.FC = () => {
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
+        accessPointNotice={accessPointNotice}
         manageActions={
           <div className="d-flex gap-2">
             <button

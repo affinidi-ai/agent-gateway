@@ -914,22 +914,15 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
-#[then(expr = "the admin API response warns {string}")]
-fn admin_api_response_warns(
-    world: &mut SurfaceWorld,
-    expected: String,
-) {
-    let body = &get_admin_response(world).body;
-    let warned = body
-        .get("warnings")
-        .and_then(|warnings| warnings.as_array())
-        .is_some_and(|warnings| {
-            warnings
-                .iter()
-                .filter_map(|warning| warning.as_str())
-                .any(|warning| warning.contains(&expected))
-        });
-    assert!(warned, "expected the admin API response to warn {expected:?}; body was {body}");
+#[then("the response says only that the Access Point is not available")]
+fn response_says_only_access_point_not_available(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Service Unavailable",
+        "status": 503,
+        "detail": "This Access Point is not available."
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "not-ready Access Point refusal");
 }
 
 #[then("the response says only that the caller credential is missing or invalid")]
