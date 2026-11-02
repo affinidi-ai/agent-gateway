@@ -263,8 +263,9 @@ endpoint URL.
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
-provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it belongs to a
-tenant but names an appliance-wide secret. A surface breaks `tenant_credential_isolation` when it
+provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a
+secret outside its own tenant: a tenant provider holding an appliance-wide or another tenant's secret, or an
+appliance-wide provider holding a tenant's secret. A surface breaks `tenant_credential_isolation` when it
 belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
 or provider that no longer exists is not reported.
 

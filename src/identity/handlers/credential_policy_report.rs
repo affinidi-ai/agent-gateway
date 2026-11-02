@@ -36,17 +36,20 @@ fn token_endpoint_breaks_https(
             .is_some_and(|endpoint| !egress.permits_token_endpoint(endpoint))
 }
 
-/// Does a tenant provider name an appliance-wide secret? A secret that no longer exists
-/// is not a breach.
+/// Does a provider name a secret outside its own tenant, the check the runtime applies? A
+/// secret that no longer exists is not a breach.
 fn provider_breaks_isolation(
     provider: &CredentialProvider,
     secret_tenants: &HashMap<&str, Option<&str>>,
 ) -> bool {
-    provider.tenant_id.is_some()
-        && provider
-            .secret_refs()
-            .into_iter()
-            .any(|secret_ref| secret_tenants.get(secret_ref) == Some(&None))
+    provider
+        .secret_refs()
+        .into_iter()
+        .any(|secret_ref| {
+            secret_tenants
+                .get(secret_ref)
+                .is_some_and(|tenant| provider.secret_is_outside_tenant(*tenant))
+        })
 }
 
 /// Does a tenant surface send an appliance-wide secret or credential provider upstream?
@@ -253,11 +256,19 @@ mod tests {
             provider("own-secret", Some("t1"), Some("https://idp/token"), Some("S_OWN")),
             provider("appliance", None, Some("https://idp/token"), Some("S_WIDE")),
             provider("missing", Some("t1"), Some("https://idp/token"), Some("S_GONE")),
+            provider("other-tenant-secret", Some("t1"), Some("https://idp/token"), Some("S_OTHER")),
+            provider("wide-with-tenant-secret", None, Some("https://idp/token"), Some("S_OWN")),
+            provider("wide-with-other-tenant-secret", None, Some("https://idp/token"), Some("S_OTHER")),
         ];
-        let secrets = [("S_WIDE", None), ("S_OWN", Some("t1"))];
+        let secrets = [("S_WIDE", None), ("S_OWN", Some("t1")), ("S_OTHER", Some("t2"))];
         assert_eq!(
             breaches_of(&providers, &secrets, CredentialPolicyConfig::default()),
-            vec![("wide-secret".to_string(), RULE_TENANT_CREDENTIAL_ISOLATION)]
+            vec![
+                ("wide-secret".to_string(), RULE_TENANT_CREDENTIAL_ISOLATION),
+                ("other-tenant-secret".to_string(), RULE_TENANT_CREDENTIAL_ISOLATION),
+                ("wide-with-tenant-secret".to_string(), RULE_TENANT_CREDENTIAL_ISOLATION),
+                ("wide-with-other-tenant-secret".to_string(), RULE_TENANT_CREDENTIAL_ISOLATION),
+            ]
         );
     }
 
