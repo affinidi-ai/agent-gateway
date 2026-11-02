@@ -161,4 +161,14 @@ changes:
         delegation audit, and enforce refuses it; another tenant's secret or provider is
         always refused. Upgrade note: move the secrets and providers into the tenant before
         the default becomes enforce.
+    - timestamp: '2026-11-02T07:05:47Z'
+      title: Log only the OAuth error code from credential provider token endpoints
+      description: >-
+        A refused token request, refresh, code exchange or SAML Graph API token request now
+        logs, returns and audits only the OAuth error code of the response, or
+        unrecognized_error when the code is missing, longer than 64 bytes or outside the
+        RFC 6749 character set. error_description, error_uri and the rest of the body, which a
+        provider can fill with echoed request values, no longer reach logs, error text or
+        delegation audit details. The authorization callback logs the provider's error code
+        the same way and no longer logs its description.
   breaking: []

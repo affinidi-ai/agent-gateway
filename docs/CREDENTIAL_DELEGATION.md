@@ -155,7 +155,7 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   Unexpired tokens, user grants, pending consents and refresh claims are kept. A failure to
   remove them is logged as a warning only. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
-  than `credential_policy.token_request_timeout_secs` (30 by default); only the response's OAuth `error` fields are logged.
+  than `credential_policy.token_request_timeout_secs` (30 by default); only the response's OAuth `error` code is logged (see _Logging token endpoint errors_ below).
 - When scopes were requested, the issued `scope` must name the same set, or the token is
   refused; when none were requested, the issued scopes are kept.
 - The provider is read again after the token request, and a provider changed meanwhile
@@ -180,6 +180,20 @@ missing or refused secret (`SecretUnavailable`), a secrets store or vault error
 (`StoreUnavailable`), a token endpoint the egress or https rule refuses (`TokenEndpointRefused`,
 `TokenEndpointNotHttps`), a provider changed during the request (`ProviderChanged`) or an
 unsupported provider type. The wait is kept in memory on each replica and resets on restart.
+
+### Logging token endpoint errors
+
+A credential provider's token endpoint can answer an error response that echoes the request or
+explains it in free text. The gateway keeps only its OAuth `error` code (RFC 6749 section 5.2):
+1 to 64 bytes of `%x20-21 / %x23-5B / %x5D-7E`, or `unrecognized_error` when the code is missing or
+breaks that rule. `error_description`, `error_uri` and the rest of the body are never logged,
+returned in an error message or written to a delegation audit detail. This holds for code
+exchange, refresh, service token grants, the Microsoft Graph API token used for SAML avatars and
+the `error` an authorization callback carries.
+
+Logs about a token request may name the provider id, the surface id, the HTTP status and the
+OAuth error code. They never carry a secret, a client assertion, a token, the response body or
+`error_description`.
 
 ## Binding a provider to a surface
 

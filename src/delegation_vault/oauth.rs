@@ -210,7 +210,7 @@ async fn exchange_code_for_tokens_with(
         .context("Failed to read token response body")?;
 
     if !status.is_success() {
-        let reason = token_error_reason(&body);
+        let reason = token_error_code(&body);
         warn!(
             target: "credential_delegation",
             provider_id = %provider.provider_id,
@@ -258,26 +258,38 @@ async fn exchange_code_for_tokens_with(
     Ok(token_response)
 }
 
-/// The `error` and `error_description` of a token-endpoint error response (RFC 6749
-/// section 5.2), JSON or form-encoded. The rest of the body is never logged or returned:
-/// providers can echo request parameters in it.
-pub(crate) fn token_error_reason(body: &str) -> String {
+/// The code answered for an OAuth error that is missing or not a valid RFC 6749 code.
+pub(crate) const UNRECOGNIZED_ERROR: &str = "unrecognized_error";
+
+/// The `error` code of a token-endpoint error response (RFC 6749 section 5.2), JSON or
+/// form-encoded, checked by [`oauth_error_code`]. Nothing else in the body is logged or
+/// returned: `error_description`, `error_uri` and echoed request parameters can carry
+/// secrets.
+pub(crate) fn token_error_code(body: &str) -> String {
     #[derive(serde::Deserialize)]
     struct TokenErrorBody {
         error: Option<String>,
-        error_description: Option<String>,
     }
 
-    let parsed = serde_json::from_str::<TokenErrorBody>(body)
+    serde_json::from_str::<TokenErrorBody>(body)
         .ok()
-        .or_else(|| serde_urlencoded::from_str::<TokenErrorBody>(body).ok());
-    match parsed {
-        Some(TokenErrorBody {
-            error: Some(error),
-            error_description: Some(description),
-        }) => format!("{error}: {description}"),
-        Some(TokenErrorBody { error: Some(error), .. }) => error,
-        _ => "no OAuth error code in response".to_string(),
+        .or_else(|| serde_urlencoded::from_str::<TokenErrorBody>(body).ok())
+        .and_then(|parsed| parsed.error)
+        .map_or_else(|| UNRECOGNIZED_ERROR.to_string(), |error| oauth_error_code(&error).to_string())
+}
+
+/// `error` when it is 1 to 64 bytes of the RFC 6749 section 5.2 error character set
+/// (`%x20-21 / %x23-5B / %x5D-7E`), otherwise [`UNRECOGNIZED_ERROR`].
+pub(crate) fn oauth_error_code(error: &str) -> &str {
+    let valid = !error.is_empty()
+        && error.len() <= 64
+        && error
+            .bytes()
+            .all(|byte| matches!(byte, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E));
+    if valid {
+        error
+    } else {
+        UNRECOGNIZED_ERROR
     }
 }
 
@@ -369,7 +381,7 @@ async fn refresh_access_token_with(
             status = %status,
             "Token refresh failed — user may need to re-consent"
         );
-        return Err(anyhow!("Token refresh failed (HTTP {}): {}", status, token_error_reason(&body)));
+        return Err(anyhow!("Token refresh failed (HTTP {}): {}", status, token_error_code(&body)));
     }
 
     let token_response: OAuthTokenResponse = serde_json::from_str(&body)
@@ -659,8 +671,29 @@ pub struct TokenEndpointRefused;
 #[error("token_endpoint must be an https URL")]
 pub struct TokenEndpointNotHttps;
 
+#[cfg(test)]
+tokio::task_local! {
+    static EGRESS_OVERRIDE: TokenEgress;
+}
+
 impl TokenEgress {
+    /// Runs `future` with [`Self::from_environment`] answering `self`, so a test can
+    /// reach a loopback token endpoint through a caller that builds its own egress.
+    #[cfg(test)]
+    pub(crate) async fn scope<F: std::future::Future>(
+        self,
+        future: F,
+    ) -> F::Output {
+        EGRESS_OVERRIDE
+            .scope(self, future)
+            .await
+    }
+
     pub fn from_environment() -> Self {
+        #[cfg(test)]
+        if let Ok(egress) = EGRESS_OVERRIDE.try_with(Clone::clone) {
+            return egress;
+        }
         let policy = crate::config::credential_policy::credential_policy().clone();
         Self {
             timeout: std::time::Duration::from_secs(policy.token_request_timeout_secs),
@@ -754,7 +787,7 @@ impl TokenEgress {
 /// POST a token request and read its JSON response, at most 64 KiB within the egress timeout.
 /// The access token must be a non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
-/// an error, and only its OAuth `error` fields are logged.
+/// an error, and only its OAuth `error` code is logged.
 async fn request_token(
     provider: &CredentialProvider,
     endpoint: &str,
@@ -794,7 +827,7 @@ async fn request_token(
                 target: "credential_delegation",
                 provider_id = %provider.provider_id,
                 status = %status,
-                reason = %token_error_reason(&String::from_utf8_lossy(&bytes)),
+                reason = %token_error_code(&String::from_utf8_lossy(&bytes)),
                 "Provider token request rejected"
             );
         }
@@ -1269,20 +1302,32 @@ mod tests {
     }
 
     #[test]
-    fn token_error_reason_keeps_only_the_oauth_error_fields() {
-        let json_body = r#"{"error":"invalid_grant","error_description":"Code expired","refresh_token":"rt-secret-marker","code":"auth-code-marker"}"#;
-        let form_body = "error=invalid_client&client_secret=cs-secret-marker";
+    fn token_error_code_keeps_only_the_oauth_error_code() {
+        let json_body = r#"{"error":"invalid_grant","error_description":"Code expired description-marker","error_uri":"https://idp.example/uri-marker","refresh_token":"rt-secret-marker"}"#;
+        let form_body = "error=invalid_client&error_description=description-marker&client_secret=cs-secret-marker";
 
-        assert_eq!(token_error_reason(json_body), "invalid_grant: Code expired");
-        assert_eq!(token_error_reason(form_body), "invalid_client");
-        assert_eq!(
-            token_error_reason("<html>upstream echoed token-secret-marker</html>"),
-            "no OAuth error code in response"
-        );
-        assert_eq!(
-            token_error_reason(r#"{"error":{"code":"nested-secret-marker"}}"#),
-            "no OAuth error code in response"
-        );
+        assert_eq!(token_error_code(json_body), "invalid_grant");
+        assert_eq!(token_error_code(form_body), "invalid_client");
+        assert_eq!(token_error_code(r#"{"error":"vendor code 7!"}"#), "vendor code 7!");
+    }
+
+    #[test]
+    fn token_error_code_refuses_a_missing_or_invalid_code() {
+        let longest = "e".repeat(64);
+        assert_eq!(token_error_code(&format!(r#"{{"error":"{longest}"}}"#)), longest);
+        for body in [
+            "<html>upstream echoed token-secret-marker</html>".to_string(),
+            r#"{"error":{"code":"nested-secret-marker"}}"#.to_string(),
+            r#"{"error_description":"description-marker"}"#.to_string(),
+            r#"{"error":""}"#.to_string(),
+            r#"{"error":"bad\"quote"}"#.to_string(),
+            r#"{"error":"back\\slash"}"#.to_string(),
+            r#"{"error":"line\nbreak"}"#.to_string(),
+            r#"{"error":"non_ascii_\u00e9"}"#.to_string(),
+            format!(r#"{{"error":"{}"}}"#, "e".repeat(65)),
+        ] {
+            assert_eq!(token_error_code(&body), UNRECOGNIZED_ERROR, "{body}");
+        }
     }
 
     async fn secrets_with_tenants() -> (tempfile::TempDir, Arc<dyn SecretsStore>) {
@@ -1453,13 +1498,14 @@ mod tests {
         async fn fixture() -> Fixture {
             let directory = tempfile::tempdir().unwrap();
             let secrets: Arc<dyn SecretsStore> = Arc::new(
-                crate::secrets::FilesystemSecretsStore::new(
+                crate::secrets::FilesystemSecretsStore::new_async(
                     directory
                         .path()
                         .join("secrets")
                         .to_str()
                         .unwrap(),
                 )
+                .await
                 .unwrap(),
             );
             let key = test_keys::rsa_pkcs8();
@@ -1784,6 +1830,7 @@ mod tests {
                 let text = format!("{error:#}");
                 assert!(!text.contains("PRIVATE KEY"), "{text}");
                 assert!(!text.contains("issued-access"), "{text}");
+                assert!(!text.contains("Invalid JWT Signature"), "{text}");
             }
             let endpoint = token_endpoint(200, issued()).await;
             let mut unknown_key = provider(&endpoint.url, settings);
@@ -1929,6 +1976,54 @@ mod tests {
                 .unwrap();
             assert_eq!(form["grant_type"], "refresh_token");
             assert_eq!(form["refresh_token"], "refresh");
+        }
+
+        #[tokio::test]
+        async fn a_refused_token_request_logs_and_returns_only_the_oauth_error_code() {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let fixture = fixture().await;
+            let endpoint = token_endpoint(
+                400,
+                json!({"error": "invalid_grant", "error_description": "description-marker",
+                       "error_uri": "https://idp.example/uri-marker"}),
+            )
+            .await;
+            let provider = provider(
+                &endpoint.url,
+                json!({"provider_type": "oauth2_client_credentials",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+            let exchange = exchange_code_for_tokens_with(
+                &provider,
+                "code",
+                "https://203.0.113.10",
+                &fixture.secrets,
+                None,
+                &endpoint.egress,
+            )
+            .await
+            .unwrap_err();
+            let refresh = refresh_access_token_with(&provider, "refresh", &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap_err();
+            let service = fetch_scoped_client_credentials_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap_err();
+
+            assert_eq!(format!("{exchange:#}"), "Token exchange failed (HTTP 400 Bad Request): invalid_grant");
+            assert_eq!(format!("{refresh:#}"), "Token refresh failed (HTTP 400 Bad Request): invalid_grant");
+            assert_eq!(format!("{service:#}"), "Provider token request rejected");
+            let text = logs.text();
+            for message in ["Token exchange failed", "Provider token request rejected"] {
+                let line = text
+                    .lines()
+                    .find(|line| line.contains(message))
+                    .unwrap_or_else(|| panic!("{message} is logged: {text}"));
+                assert!(line.contains("reason=invalid_grant"), "{line}");
+            }
+            for marker in ["description-marker", "uri-marker", "client-secret"] {
+                assert!(!text.contains(marker), "{marker} reached the log: {text}");
+            }
         }
 
         fn https_rule(

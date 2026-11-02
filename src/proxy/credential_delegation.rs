@@ -2504,6 +2504,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_refused_refresh_logs_and_audits_only_the_oauth_error_code() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let app = axum::Router::new().fallback(axum::routing::post(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "description-marker",
+                    "error_uri": "https://idp.example/uri-marker"
+                })),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.token_endpoint = Some(token_endpoint.clone());
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
+        let vault: Arc<dyn DelegationVaultStorage> =
+            MockVaultStore::new(VaultLookupResult::ExpiredRefreshable(make_token(true, true)));
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint),
+            policy: Default::default(),
+        };
+
+        let (results, events) = crate::audit::producer::capture(egress.scope(resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
+            None,
+            &vault,
+            &providers,
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )))
+        .await;
+
+        let expected = "Token refresh failed (HTTP 400 Bad Request): invalid_grant";
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::RefreshFailed);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some(expected)
+        );
+        let refresh_failed: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, DelegationAuditAction::RefreshFailed))
+            .collect();
+        assert_eq!(refresh_failed.len(), 1, "{events:?}");
+        assert_eq!(
+            refresh_failed[0]
+                .detail
+                .as_deref(),
+            Some(expected)
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("Token refresh failed — requesting new consent"))
+            .unwrap_or_else(|| panic!("the refused refresh is logged: {text}"));
+        assert!(line.contains("invalid_grant"), "{line}");
+        for marker in ["description-marker", "uri-marker"] {
+            assert!(!text.contains(marker), "{marker} reached the log: {text}");
+            assert!(!format!("{events:?}").contains(marker), "{marker} reached the audit: {events:?}");
+        }
+    }
+
     async fn resolve_for_tenant(
         provider_type: CredentialProviderType,
         provider_tenant: Option<&str>,

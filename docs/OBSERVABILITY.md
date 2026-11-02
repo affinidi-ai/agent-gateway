@@ -111,6 +111,15 @@ name marks a credential, such as `authorization`, `cookie`, `token`, `session_id
 target. [Log redaction](CONFIGURATION_REFERENCE.md#log-redaction) lists the built-in rules and the
 exact credential names.
 
+### Token endpoint errors
+
+Log lines about a credential provider's token request (target `credential_delegation`, and the
+SAML Graph API token request) may carry the provider id, the surface id, the HTTP status and the
+OAuth `error` code, or `unrecognized_error` when the code is missing or not a valid RFC 6749 code
+of at most 64 bytes. They never carry a secret, a client assertion, a token, the response body or
+`error_description`. See
+[Logging token endpoint errors](CREDENTIAL_DELEGATION.md#logging-token-endpoint-errors).
+
 ## Request correlation
 
 HTTP tracing and policy auditing attach correlation data to request spans and structured events.
