@@ -108,8 +108,9 @@ changes:
         grant that cannot be read refuses only the changes that remove its own binding, with 503
         (409 for a tenant reassignment) naming the grant, and nothing else on the gateway. A
         PUT or PATCH that leaves out the id of a Transit Point with external consent keeps the
-        stored id of the one with the same alias, so a save never revokes grants for omitting
-        ids. Surface
+        stored id of the one with the same alias in the same list, the surface's or the same
+        variant's own, so a save never revokes grants for omitting ids, and a variant's copy of
+        a Transit Point it inherits is a Transit Point of its own. Surface
         writes are serialised per surface, and a write removes the grants of what it changes
         from the surface stored at that moment, so a write built from a stale read cannot leave
         a grant behind. Without a secrets store a change still

@@ -332,7 +332,7 @@ pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&
 /// target or binding there. Its grants are kept under that id, so they are
 /// used only under that one Transit Point's settings, never under another
 /// variant's copy of it.
-fn check_external_transit_point_ids(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+pub(super) fn check_external_transit_point_ids(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
     let lists = transit_point_lists(surface);
     let external: HashSet<&str> = lists
         .iter()

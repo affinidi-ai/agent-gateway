@@ -2603,6 +2603,46 @@ fn variant_stored_points<'a>(
         })
 }
 
+/// The Transit Points a stored variant's own overrides define, without the
+/// surface's that a variant without its own list inherits.
+fn variant_own_points<'a>(
+    existing: &'a AgentSurface,
+    variant_id: &str,
+) -> Option<&'a [crate::config::agent_surface::TransitPoint]> {
+    existing
+        .variants
+        .iter()
+        .find(|stored| stored.id == variant_id)
+        .and_then(|stored| {
+            stored
+                .overrides
+                .transit
+                .as_ref()
+        })
+        .and_then(|transit| transit.points.as_deref())
+}
+
+/// The Transit Points a variant PUT sends, `points`, with what the save keeps
+/// of the stored ones, `sent_points` being their JSON: the ids of external
+/// consent Transit Points from the variant's own stored list only
+/// ([`carry_point_ids`]), so the copy of an inherited one is a Transit Point
+/// of its own, and the caller authentication they leave out from the
+/// variant's list or, for a variant that inherits, the surface's
+/// ([`variant_stored_points`]).
+fn settle_variant_put_points(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    existing: &AgentSurface,
+    variant_id: &str,
+    sent_points: Option<&serde_json::Value>,
+) {
+    if let Some(own_points) = variant_own_points(existing, variant_id) {
+        carry_point_ids(points, own_points, sent_points);
+    }
+    if let Some(stored_points) = variant_stored_points(existing, variant_id) {
+        retain_transit_points_caller_authentication(points, stored_points, sent_points);
+    }
+}
+
 /// A save that leaves out the `id` of a Transit Point with a
 /// `consent_mode: external` binding keeps the id stored for the Transit Point
 /// with its alias in the same place, the surface's own list or the variant's
@@ -2625,17 +2665,7 @@ fn carry_transit_point_ids(
         .iter_mut()
         .enumerate()
     {
-        let stored = existing
-            .variants
-            .iter()
-            .find(|stored| stored.id == variant.id)
-            .and_then(|stored| {
-                stored
-                    .overrides
-                    .transit
-                    .as_ref()
-            })
-            .and_then(|transit| transit.points.as_deref());
+        let stored = variant_own_points(existing, &variant.id);
         let points = variant
             .overrides
             .transit
@@ -3989,31 +4019,12 @@ pub async fn update_variant(
         {
             retained.push(variant.alias.clone());
         }
-        if let (Some(points), Some(own_points)) = (
-            overrides
-                .transit
-                .as_mut()
-                .and_then(|transit| transit.points.as_mut()),
-            variant
-                .overrides
-                .transit
-                .as_ref()
-                .and_then(|transit| transit.points.as_ref()),
-        ) {
-            carry_point_ids(points, own_points, sent.pointer("/overrides/transit/points"));
-        }
-        if let (Some(points), Some(stored_points)) = (
-            overrides
-                .transit
-                .as_mut()
-                .and_then(|transit| transit.points.as_mut()),
-            variant_stored_points(&existing, &variant_id),
-        ) {
-            retain_transit_points_caller_authentication(
-                points,
-                stored_points,
-                sent.pointer("/overrides/transit/points"),
-            );
+        if let Some(points) = overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut())
+        {
+            settle_variant_put_points(points, &existing, &variant_id, sent.pointer("/overrides/transit/points"));
         }
         variant.overrides = overrides;
     }
@@ -5372,6 +5383,54 @@ mod validation_tests {
             "hop-vendor",
             "a sent id is kept"
         );
+    }
+
+    /// A variant PUT carries a Transit Point's id only from the variant's own
+    /// stored list, as a surface PUT does: a variant that inherits the
+    /// surface's points and is sent its own copy of an external one, without
+    /// an id, as the Surface Builder sends it, gets a new Transit Point, and is
+    /// saved, instead of taking the surface's id and being refused for using
+    /// it in two places. A variant with its own list keeps its own ids.
+    #[test]
+    fn a_variant_put_carries_transit_point_ids_from_the_variants_own_list_only() {
+        let binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner"});
+        let base_points = serde_json::json!([
+            { "id": "hop-vendor", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }
+        ]);
+        let sent_points = serde_json::json!([
+            { "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp", "require_transit_token": true,
+                "transit_credentials": binding }
+        ]);
+        let mut inheriting = surface_with_transit_points(base_points.clone(), serde_json::json!([]));
+        inheriting.variants[0]
+            .overrides
+            .transit = None;
+        let mut points: Vec<crate::config::agent_surface::TransitPoint> =
+            serde_json::from_value(sent_points.clone()).unwrap();
+
+        settle_variant_put_points(&mut points, &inheriting, "candidate", Some(&sent_points));
+        assert_ne!(points[0].id, "hop-vendor", "the surface's id is not carried into the variant's copy");
+        identify_transit_points(&mut points, "variant 'candidate' ").unwrap();
+        let mut saved = inheriting.clone();
+        saved.variants[0]
+            .overrides
+            .transit = Some(serde_json::from_value(serde_json::json!({ "points": points })).unwrap());
+        assert!(
+            super::super::surface_tenancy::check_external_transit_point_ids(&saved).is_ok(),
+            "the variant's copy is a Transit Point of its own"
+        );
+
+        let own = surface_with_transit_points(
+            base_points,
+            serde_json::json!([{ "id": "hop-variant", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }]),
+        );
+        let mut points: Vec<crate::config::agent_surface::TransitPoint> =
+            serde_json::from_value(sent_points.clone()).unwrap();
+        settle_variant_put_points(&mut points, &own, "candidate", Some(&sent_points));
+        assert_eq!(points[0].id, "hop-variant", "a variant with its own list keeps its own id");
     }
 
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,
