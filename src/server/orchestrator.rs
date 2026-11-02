@@ -510,10 +510,14 @@ pub async fn run_axum_proxy(
     for adjustment in config.transit_token_lifetime_adjustments(transit_token_max_lifetime_secs) {
         warn!("{adjustment}");
     }
-    // Provider create and surface save keep the origins they start with, so
-    // every later load of gateway.json keeps them too.
+    // Provider create, surface save and the connect API keep the external
+    // consent settings they start with, so every later load of gateway.json
+    // keeps them too.
     bootstrap_config
         .pin_external_consent_resource_origins()
+        .context("Configuration validation failed")?;
+    bootstrap_config
+        .pin_external_consent_issuers()
         .context("Configuration validation failed")?;
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
@@ -1719,6 +1723,30 @@ pub async fn run_axum_proxy(
                 "external_consent_resource_origins in gateway.json names entries that are not plain https origins \
                  (each must be an exact origin, with no wildcard, path or userinfo); they permit nothing"
             );
+        }
+        match &network_config.external_consent_issuers {
+            Some(issuers) => {
+                let invalid = crate::credential_providers::external::invalid_issuer_entries(issuers);
+                if !invalid.is_empty() {
+                    error!(
+                        target: "credential_delegation",
+                        entries = ?invalid,
+                        "external_consent_issuers in gateway.json names entries that are not plain https issuers or \
+                         origins (each issuer exact, each origin with no wildcard, path or userinfo); they permit \
+                         nothing"
+                    );
+                }
+                info!(
+                    target: "credential_delegation",
+                    issuers = issuers.len(),
+                    "external_consent_issuers is set: external consent providers may name only the issuers it lists"
+                );
+            }
+            None => info!(
+                target: "credential_delegation",
+                "external_consent_issuers is not set: external consent providers may name any issuer whose metadata \
+                 they match"
+            ),
         }
 
         if let Some(config) = bootstrap_config
@@ -3397,6 +3425,9 @@ pub async fn run_axum_proxy(
                 network_config
                     .external_consent_resource_origins
                     .clone(),
+                network_config
+                    .external_consent_issuers
+                    .clone(),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {
@@ -3418,9 +3449,33 @@ pub async fn run_axum_proxy(
                 vault_population_notifier: Some(
                     crate::delegation_vault::notifier::global_vault_population_notifier().clone(),
                 ),
+                egress_allowlist: crate::egress::bdd_egress_allowlist(),
+                resource_origins: Arc::new(
+                    network_config
+                        .external_consent_resource_origins
+                        .clone(),
+                ),
+                issuers: Arc::new(
+                    network_config
+                        .external_consent_issuers
+                        .clone(),
+                ),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");
+            }
+            if let Some(surfaces) = dv_state
+                .agent_surface_store
+                .clone()
+            {
+                crate::delegation_vault::sweep::Sweeper {
+                    vault: dv_store.clone(),
+                    surfaces,
+                    providers: cp_store.clone(),
+                    secrets: Some(secrets_store.clone()),
+                    exact_allowlist: crate::egress::bdd_egress_allowlist(),
+                }
+                .spawn();
             }
             let dv_mgmt_router = crate::delegation_vault::router::create_delegation_vault_router(
                 dv_state.clone(),

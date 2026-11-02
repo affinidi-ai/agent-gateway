@@ -1826,6 +1826,9 @@ mod tests {
             token_endpoint_auth_method: None,
             client_id: None,
             allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         }
     }
 

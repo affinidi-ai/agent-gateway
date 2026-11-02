@@ -66,6 +66,27 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub external_consent_resource_origins: HashMap<String, Vec<String>>,
 
+    /// The only issuers the credential providers of external consent may name,
+    /// when set: each issuer identifier, compared exactly, maps to the origins
+    /// its authorization, token and revocation endpoints and its `jwks_uri` may
+    /// use beyond the issuer's own host, such as
+    /// `{"https://accounts.google.com": ["https://oauth2.googleapis.com"]}`.
+    /// Unset, any issuer whose metadata the provider matches is permitted. Only
+    /// this file sets it; no tenant or API caller can add to it. An entry that
+    /// is not a plain `https` issuer or origin permits nothing and is named at
+    /// startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_consent_issuers: Option<HashMap<String, Vec<String>>>,
+
+    /// How many refreshes of a grant by binding the authorization server may
+    /// refuse, by an answer other than `invalid_grant`, since the last that
+    /// succeeded, before a call whose grant cannot be used answers
+    /// `connect_required` rather than `connector_unavailable`. The grant is
+    /// kept. From 1 to 20; a value outside is taken as the nearer bound; 3 when
+    /// unset.
+    #[serde(default = "default_external_consent_refresh_refusals")]
+    pub external_consent_refresh_refusals: u32,
+
     /// Logging overrides (only redaction rules are used from gateway.json;
     /// level/json/log_directory come from config.toml)
     #[serde(default)]
@@ -95,6 +116,10 @@ pub struct NetworkConfig {
         deserialize_with = "deserialize_transit_token_max_lifetime_secs"
     )]
     pub transit_token_max_lifetime_secs: u64,
+}
+
+fn default_external_consent_refresh_refusals() -> u32 {
+    3
 }
 
 fn default_transit_token_max_lifetime_secs() -> u64 {

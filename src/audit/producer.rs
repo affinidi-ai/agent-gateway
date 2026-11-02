@@ -179,10 +179,11 @@ where
     held.take()
 }
 
-/// Run `future` on a task of its own, as `tokio::spawn` does. Under [`capture`]
-/// in a test the task keeps the capture, so the records it submits are captured
-/// too; otherwise it holds no deferred scope, and its records are submitted as
-/// they come.
+/// Run `future` on a task of its own, in the request being served when there
+/// is one ([`crate::observability::policy_audit::spawn_in_request`]). Under
+/// [`capture`] in a test the task keeps the capture, so the records it submits
+/// are captured too; otherwise it holds no deferred scope, and its records are
+/// submitted as they come.
 pub fn spawn_audited<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
@@ -194,9 +195,9 @@ where
         .is_ok()
         && let Ok(held) = DEFERRED.try_with(Arc::clone)
     {
-        return tokio::spawn(CAPTURING.scope((), DEFERRED.scope(held, future)));
+        return crate::observability::policy_audit::spawn_in_request(CAPTURING.scope((), DEFERRED.scope(held, future)));
     }
-    tokio::spawn(future)
+    crate::observability::policy_audit::spawn_in_request(future)
 }
 
 /// Holds the records submitted inside [`DeferredAudit::scope`] until the

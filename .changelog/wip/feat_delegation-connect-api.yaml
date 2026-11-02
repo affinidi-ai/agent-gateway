@@ -1,0 +1,150 @@
+branch: feat/delegation-connect-api
+changes:
+  added:
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Let the operator list the only issuers external consent providers may name
+      description: >-
+        The new `external_consent_issuers` of gateway.json, set only by the operator's file,
+        lists the issuers the credential providers of external consent may name, each compared
+        exactly, with the origins its authorization, token and revocation endpoints and its
+        metadata's `jwks_uri` may use beyond the issuer's own host. When it is set, a provider
+        whose issuer is not listed, or one of whose endpoints is off the issuer's host and not
+        listed for it, is refused with `provider_issuer_not_permitted` before the issuer's
+        metadata is fetched, a surface cannot bind it, and its grants are neither connected,
+        refreshed nor released. Matching its own metadata no longer suffices on a gateway whose
+        providers another system creates. Unset, as by default, an operator's token may create
+        a provider for any issuer whose metadata it matches, as before, but a tenant's token
+        cannot create a provider with an issuer at all: it is refused with
+        `external_consent_issuers_required`, which tells the operator to set the list, since the
+        tenant would choose the endpoints its client authenticates at. An entry that is not a
+        plain `https` issuer or
+        origin permits nothing and is named at startup. It is read once, at startup, and a
+        configuration reload keeps it, so provider create, surface save, the connect API and
+        requests always agree. The issuer's RFC 9207 support is now recorded from its metadata
+        when the provider is created.
+    - timestamp: '2026-10-30T23:00:00Z'
+      title: Start and complete external consent connects through the connect API
+      description: >-
+        POST /api/v1/delegation-vault/connects starts a connect for a consent_mode external
+        binding a surface serves and a principal, after checking its subject, its scopes against
+        the binding's and its redirect URI against the provider's callback URL, and answers only
+        the S256 challenge of a PKCE verifier the gateway keeps, encrypted, for ten minutes; a
+        binding may have 32 open, each principal 4, counted from the connects' file names. POST /api/v1/delegation-vault/connects/{id}/complete claims the
+        connect once, checks the authorization response's RFC 9207 iss against the provider's
+        issuer (required when the issuer's metadata says it sends one), redeems the code at the
+        provider's token endpoint through pinned Strict egress, ignoring any proxy as the other
+        vendor calls of external consent do, with the verifier and resource, the client
+        authenticating as its token_endpoint_auth_method says, a private_key_jwt client with an
+        assertion signed for the request and addressed to the issuer, and keeps the grant only while its
+        binding is saved with the scopes asked for. The exchange and refresh share the token
+        request of every other credential provider type: a 30 second timeout and a 64 KiB cap. A
+        provider created before the issuer's RFC 9207 support was recorded needs iss too. A
+        grant it replaces, and tokens it cannot keep, are revoked. Pending connects and
+        refresh claims are left out of storage exports, and a Transit Point with
+        consent_mode external may not take the id target, kept for the Access Point Target's
+        grants. Failures carry a fixed reason; the vendor's answer is never
+        echoed or logged. The new delegation_vault.connect permission, administrators only by
+        default, gates both, and the report of a surface's grants.
+    - timestamp: '2026-10-30T23:10:00Z'
+      title: Report and remove grants by binding, revoking each at the vendor
+      description: >-
+        GET /api/v1/delegation-vault/grants reports a surface's external consent bindings: whether
+        the owner is connected, how many callers are, and with principal one caller's own grant,
+        as metadata only. DELETE /api/v1/delegation-vault/grants/{id} and DELETE
+        /api/v1/delegation-vault/grants remove one grant or a binding's, deleting and then
+        revoking each at its authorization server, under the surface's lock, so a grant a
+        concurrent surface write puts back is removed too. delegation-vault is now a resource kind for
+        these routes and the connect API, so a tenant's access token manages its own tenant's
+        surfaces' grants, and only those. A grant asked for beyond its binding's scopes as saved
+        now is never released, and narrowing a binding's scopes removes and revokes such grants.
+    - timestamp: '2026-10-30T23:20:00Z'
+      title: Refresh grants by binding single-flight and retry a vendor 401 once
+      description: >-
+        A grant by binding is refreshed before it is sent once a minute or a tenth of its life is
+        left, through a refresh claimed once across every node sharing the vault, timed when the
+        vault's lock is held and in progress until its window ends whatever clock read its
+        start, run on a task of its own so a dropped call never leaves it half done, asking for
+        the scopes its connect asked for, with its provider's resource; the rotated tokens are
+        written before the new one is used, however late they come, and a written refresh
+        stands even when its claim cannot be cleared. invalid_grant deletes and revokes the
+        grant, only while it is still the version refreshed, so a grant connected again
+        meanwhile is kept; another failure, the client refused included, keeps it and retries
+        after a doubling wait of at most 15 minutes. Refusals other than invalid_grant are
+        counted, and once they reach gateway.json's new external_consent_refresh_refusals (3 by
+        default) a call that cannot use the grant answers connect_required, the grant kept. A
+        vendor's 401 whose Bearer challenge says invalid_token gets one refresh and one retry for
+        a body up to 1 MiB; a grant that cannot be refreshed, or a refresh token refused, is
+        removed and revoked while it still holds the token refused; a second 401 after a refresh,
+        or one without such a challenge, keeps the grant and answers connector_unavailable.
+        Tokens a refresh did not write are revoked, and tokens whose write cannot be confirmed
+        are kept. A call waiting for another's refresh is woken by it. A 403 insufficient_scope
+        answers scope_insufficient with the scope, never stepping up silently.
+    - timestamp: '2026-10-30T23:25:00Z'
+      title: Compare granted scopes and revoke grants as each vendor needs
+      description: >-
+        An external consent provider's scope_comparison says how the scopes a token endpoint
+        grants are compared with those asked for: exact by default, or oidc, google or microsoft,
+        which do not take the standard identity scopes those vendors add, or Microsoft's
+        resource-qualified and recased names, for a wider grant. revocation_ends_authorization,
+        for a vendor such as Google whose revocation of one token ends the vendor account's whole
+        authorization of the client, keeps the gateway from revoking a grant while another grant
+        of the same vendor account is stored, the account being the sub of the ID token a connect
+        obtained from the provider's issuer for its client; a grant whose account is not known
+        is revoked. When the vault cannot tell, the removed grant is kept, encrypted and out of
+        storage exports, for the daily sweep to decide, and revoked after 30 days all the same.
+        Both are set at create and fixed for the provider's life. Tokens no grant keeps are
+        audited with unkept_tokens.
+    - timestamp: '2026-10-30T23:30:00Z'
+      title: Sweep the delegation vault's grants by binding daily
+      description: >-
+        Once a day while the node is active, expired pending connects, grants whose binding the
+        surface no longer serves, or whose scopes it no longer permits in every place that serves
+        it, grants written under an earlier identity hash pepper, expired grants that cannot be
+        refreshed, and grants expired more than 30 days ago whose refresh has failed since, are
+        removed and revoked, binding by binding, read and decided under the surface's lock. A
+        binding whose surface or provider cannot be read is left until the next sweep. The sweep
+        also decides the revocations removals left to it.
+    - timestamp: '2026-11-02T20:00:00Z'
+      title: Keep revocations under way so a gateway stop does not lose them
+      description: >-
+        Before a removed grant is revoked at its vendor it is kept, encrypted like the grants,
+        in the vault's delegated_grant_revocations directory, and forgotten once the revocation
+        reached the vendor, whatever it answered. A gateway that stops while revocations are in
+        flight tries them again when it starts, and the daily sweep tries any left. A revocation
+        that could not reach its vendor is tried again the same way, at most five times in all,
+        each attempt audited as token_revoked, ending retry:pending while it will be tried
+        again and retry:exhausted on the last. One whose grant the vault holds again is
+        forgotten unrevoked. Nothing is kept while at-rest encryption is off, so no token is
+        written in plaintext.
+  changed:
+    - timestamp: '2026-10-30T23:40:00Z'
+      title: Refuse a Transit Point call whose grant is missing with a fixed reason
+      description: >-
+        A Transit Point call whose consent_mode external grant cannot be released is refused with
+        a fixed reason instead of a generic 503: connect_required (403, with the subject and, for
+        a caller, a hint of the caller), scope_insufficient (403) or connector_unavailable (503),
+        as a JSON-RPC error with the reason in its data on MCP Transit Points and as a problem
+        JSON on the others. A 2026-07-28 MCP request to such a Transit Point is refused as an
+        unsupported protocol version.
+    - timestamp: '2026-10-30T23:50:00Z'
+      title: Ask an MCP Transit Point's target for an uncompressed answer
+      description: >-
+        An MCP Transit Point forwards Accept-Encoding identity in place of the managed agent's
+        value, since the gateway reads the answer as sent for tool gating and response checks,
+        and refuses with 502 an answer compressed all the same.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Revoke readable grants when an operator removes grants by binding
+      description: >-
+        DELETE /api/v1/delegation-vault/grants/{id} and DELETE /api/v1/delegation-vault/grants now
+        delete and revoke every grant they can read, and purge, unrevoked, only those that cannot
+        be decrypted or parsed, which an operator alone may do: a session, or an access token
+        with neither a tenant nor a resource pattern. A grant that cannot be read during a disk or
+        key service outage is neither removed nor purged, and the removal answers 503. The
+        binding query takes hop (transit_point_id is still accepted), and credential_provider_id
+        may be left out while the surface binds one there. It answers removed, grant_ids and
+        purged. Each removal deletes only the connection it read, refreshed since or not, never a
+        grant the person connected again in between.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -402,8 +402,9 @@ mod tests {
         );
     }
 
-    /// Grants by binding hold refresh tokens, so an export leaves their
-    /// directory out of the vault.
+    /// Grants by binding, and the removed grants whose revocation waits for
+    /// the daily sweep, hold refresh tokens, so an export leaves their
+    /// directories out of the vault.
     #[test]
     fn an_export_leaves_out_the_vaults_grants() {
         let dir = create_test_storage();
@@ -413,6 +414,22 @@ mod tests {
             .join(crate::delegation_vault::grants::GRANTS_DIRECTORY);
         fs::create_dir_all(&grants).unwrap();
         fs::write(grants.join("grant-1.json"), r#"{"refresh_token":"vendor-refresh-token"}"#).unwrap();
+        let connects = storage_root
+            .join("delegation_vault")
+            .join(crate::delegation_vault::connects::PENDING_CONNECTS_DIRECTORY);
+        fs::create_dir_all(&connects).unwrap();
+        fs::write(connects.join("connect-1.json"), r#"{"code_verifier":"vendor-refresh-token"}"#).unwrap();
+        let refreshes = storage_root
+            .join("delegation_vault")
+            .join(crate::delegation_vault::storage::GRANT_REFRESH_CLAIMS_DIRECTORY);
+        fs::create_dir_all(&refreshes).unwrap();
+        fs::write(refreshes.join("grant-1.json"), r#"{"id":"grant-1","refresh_digest":"vendor-refresh-token"}"#)
+            .unwrap();
+        let deferred = storage_root
+            .join("delegation_vault")
+            .join(crate::delegation_vault::storage::DEFERRED_REVOCATIONS_DIRECTORY);
+        fs::create_dir_all(&deferred).unwrap();
+        fs::write(deferred.join("revocation-1.json"), r#"{"grant":{"refresh_token":"vendor-refresh-token"}}"#).unwrap();
 
         let mut stats = ExportStats::default();
         let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
@@ -425,7 +442,13 @@ mod tests {
                 .name()
                 .unwrap()
                 .into_owned();
-            assert!(!name.contains("delegated_grants"), "{name}");
+            assert!(
+                !name.contains("delegated_grants")
+                    && !name.contains("pending_connects")
+                    && !name.contains(crate::delegation_vault::storage::GRANT_REFRESH_CLAIMS_DIRECTORY)
+                    && !name.contains(crate::delegation_vault::storage::DEFERRED_REVOCATIONS_DIRECTORY),
+                "{name}"
+            );
             let mut content = String::new();
             std::io::Read::read_to_string(&mut file, &mut content).unwrap();
             assert!(!content.contains("vendor-refresh-token"), "{name}");

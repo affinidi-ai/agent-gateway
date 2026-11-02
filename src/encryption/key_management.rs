@@ -110,7 +110,17 @@ impl KmsDataKeys for AwsKmsDataKeysClient {
             .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(ciphertext_blob))
             .send()
             .await
-            .context("AWS KMS decrypt request failed")?;
+            .map_err(|error| {
+                let rejected = error
+                    .as_service_error()
+                    .is_some_and(rejects_the_wrapped_key);
+                let error = anyhow::Error::new(error).context("AWS KMS decrypt request failed");
+                if rejected {
+                    anyhow::Error::new(KmsKeyRejected(format!("{error:#}")))
+                } else {
+                    error
+                }
+            })?;
 
         let plaintext = response
             .plaintext
@@ -118,6 +128,21 @@ impl KmsDataKeys for AwsKmsDataKeysClient {
 
         Ok(Zeroizing::new(plaintext.into_inner()))
     }
+}
+
+/// KMS answered that a value's wrapped data key is not one it can decrypt:
+/// the value is unreadable under this key, whenever it is asked again. Every
+/// other KMS failure is the key service's
+/// [`super::EncryptionUnavailable`]. Carries the failure's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct KmsKeyRejected(pub String);
+
+/// Whether a `kms:Decrypt` refusal is about the value's wrapped key rather
+/// than the key service: the ciphertext is not KMS's, or was wrapped under
+/// another key.
+fn rejects_the_wrapped_key(error: &aws_sdk_kms::operation::decrypt::DecryptError) -> bool {
+    error.is_invalid_ciphertext_exception() || error.is_incorrect_key_exception()
 }
 
 /// Key manager responsible for loading and managing encryption keys
@@ -347,6 +372,30 @@ pub fn generate_and_print_master_key() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only KMS's refusal of the wrapped key itself makes a value unreadable;
+    /// a disabled key, an internal error or an unreachable KMS does not.
+    #[test]
+    fn only_a_refused_wrapped_key_makes_a_value_unreadable() {
+        use aws_sdk_kms::operation::decrypt::DecryptError;
+        use aws_sdk_kms::types::error::{
+            DependencyTimeoutException, DisabledException, IncorrectKeyException, InvalidCiphertextException,
+            KmsInternalException,
+        };
+        assert!(rejects_the_wrapped_key(&DecryptError::InvalidCiphertextException(
+            InvalidCiphertextException::builder().build()
+        )));
+        assert!(rejects_the_wrapped_key(&DecryptError::IncorrectKeyException(
+            IncorrectKeyException::builder().build()
+        )));
+        for transient in [
+            DecryptError::DisabledException(DisabledException::builder().build()),
+            DecryptError::KmsInternalException(KmsInternalException::builder().build()),
+            DecryptError::DependencyTimeoutException(DependencyTimeoutException::builder().build()),
+        ] {
+            assert!(!rejects_the_wrapped_key(&transient), "{transient:?}");
+        }
+    }
 
     #[test]
     fn test_generate_key() {
