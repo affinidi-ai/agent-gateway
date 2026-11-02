@@ -85,6 +85,46 @@ impl AgentSurface {
             .and_then(|ca| ca.methods.first())
     }
 
+    /// The DID Auth configurations that mint sessions: the Access Point's first
+    /// caller-authentication method, on the surface and in each variant whose
+    /// overrides set the Access Point's caller authentication, with that
+    /// variant. Only the first method serves `/authenticate`, and a Transit
+    /// Point mints no session.
+    pub fn session_did_auth_configs(
+        &self
+    ) -> Vec<(Option<&super::agent_surface_variants::SurfaceVariant>, &crate::source_auth::models::DidAuthAuthConfig)>
+    {
+        fn did_auth(
+            authentication: &super::agent_surface::CallerAuthentication
+        ) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+            match authentication.methods.first() {
+                Some(crate::source_auth::SourceAuthConfig::DidAuth(config)) => Some(config),
+                _ => None,
+            }
+        }
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .and_then(did_auth)
+            .map(|config| (None, config))
+            .into_iter()
+            .chain(
+                self.variants
+                    .iter()
+                    .filter_map(move |variant| {
+                        variant
+                            .overrides
+                            .access_point
+                            .as_ref()?
+                            .caller_authentication
+                            .as_ref()
+                            .and_then(did_auth)
+                            .map(|config| (Some(variant), config))
+                    }),
+            )
+            .collect()
+    }
+
     /// Whether any of the Access Point's caller-authentication methods
     /// accepts a caller who names itself: DID Auth without `allowed_dids`
     /// accepts any DID that signs its challenge, so whoever mints one is

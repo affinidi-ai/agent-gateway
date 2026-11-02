@@ -240,25 +240,28 @@ impl GatewayConfig {
     /// the longest a session lasts. Such a surface loads, and its sessions are
     /// held to the longest; the gateway logs each line at `WARN` when it starts.
     pub fn did_auth_session_ttl_adjustments(&self) -> Vec<String> {
-        use crate::source_auth::{SourceAuthConfig, models::DidAuthAuthConfig};
+        use crate::source_auth::models::DidAuthAuthConfig;
 
         self.surfaces
             .iter()
-            .filter_map(|surface| {
-                let Some(SourceAuthConfig::DidAuth(cfg)) = surface.source_auth() else {
-                    return None;
-                };
-                let ttl = cfg
-                    .session_ttl_seconds
-                    .filter(|ttl| *ttl > DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS)?;
-                Some(format!(
-                    "Surface '{}' ({}): did_auth.session_ttl_seconds is {ttl}, above the longest, {} seconds; its \
-                     sessions last {} seconds",
-                    surface.name,
-                    surface.surface_id,
-                    DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS,
-                    cfg.effective_session_ttl_seconds()
-                ))
+            .flat_map(|surface| {
+                surface
+                    .session_did_auth_configs()
+                    .into_iter()
+                    .filter_map(move |(variant, cfg)| {
+                        let ttl = cfg
+                            .session_ttl_seconds
+                            .filter(|ttl| *ttl > DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS)?;
+                        let place = variant.map_or_else(String::new, |variant| format!("variant '{}' ", variant.alias));
+                        Some(format!(
+                            "Surface '{}' ({}): {place}did_auth.session_ttl_seconds is {ttl}, above the longest, {} \
+                             seconds; its sessions last {} seconds",
+                            surface.name,
+                            surface.surface_id,
+                            DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS,
+                            cfg.effective_session_ttl_seconds()
+                        ))
+                    })
             })
             .collect()
     }
@@ -410,16 +413,31 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 ///
 /// Enforces the mTLS trust rules the runtime relies on, every
 /// `DidAuthAuthConfig` invariant boot also checks (see
-/// [`validate_did_auth_config`]), and the DID Auth session TTL bound, unless
-/// `stored`, the surface as stored, has the same TTL.
+/// [`validate_did_auth_config`]), and the DID Auth session TTL bound on every
+/// method that mints sessions, the surface's and each variant's
+/// ([`AgentSurface::session_did_auth_configs`](crate::config::agent_surface::AgentSurface::session_did_auth_configs)),
+/// unless `stored`, the surface as stored, has the same TTL in the same place.
 pub fn validate_source_auth_config(
     surface: &crate::config::agent_surface::AgentSurface,
     stored: Option<&crate::config::agent_surface::AgentSurface>,
 ) -> anyhow::Result<()> {
-    match surface.source_auth() {
-        Some(src) => validate_source_auth_method(src, stored.and_then(|stored| stored.source_auth()), &surface.name),
-        None => Ok(()),
+    if let Some(src) = surface.source_auth() {
+        validate_stored_source_auth_method(src, &surface.name)?;
     }
+    let stored_configs = stored.map_or_else(Vec::new, |stored| stored.session_did_auth_configs());
+    for (variant, cfg) in surface.session_did_auth_configs() {
+        let kept = stored_configs
+            .iter()
+            .any(|(stored_variant, stored_cfg)| {
+                stored_variant.map(|variant| &variant.id) == variant.map(|variant| &variant.id)
+                    && stored_cfg.session_ttl_seconds == cfg.session_ttl_seconds
+            });
+        if !kept {
+            let place = variant.map_or_else(String::new, |variant| format!("variant '{}' ", variant.alias));
+            validate_session_ttl_bound(cfg.session_ttl_seconds, &surface.name, &place)?;
+        }
+    }
+    Ok(())
 }
 
 /// Validate one source authentication method being saved, set on the Access
@@ -441,7 +459,7 @@ pub(crate) fn validate_source_auth_method(
             Some(SourceAuthConfig::DidAuth(stored)) if stored.session_ttl_seconds == cfg.session_ttl_seconds
         );
         if !kept {
-            validate_session_ttl_bound(cfg.session_ttl_seconds, surface_name)?;
+            validate_session_ttl_bound(cfg.session_ttl_seconds, surface_name, "")?;
         }
     }
     Ok(())
@@ -452,12 +470,13 @@ pub(crate) fn validate_source_auth_method(
 fn validate_session_ttl_bound(
     session_ttl_seconds: Option<u64>,
     surface_name: &str,
+    place: &str,
 ) -> anyhow::Result<()> {
     use crate::source_auth::models::DidAuthAuthConfig;
 
     if let Some(ttl) = session_ttl_seconds.filter(|ttl| *ttl > DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS) {
         anyhow::bail!(
-            "Channel '{}': did_auth.session_ttl_seconds {} exceeds max {}",
+            "Channel '{}': {place}did_auth.session_ttl_seconds {} exceeds max {}",
             surface_name,
             ttl,
             DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS
@@ -756,6 +775,63 @@ mod tests {
         assert!(
             validate_source_auth_surface(&surface_with_session_ttl("zero", Some(0))).is_err(),
             "a stored session TTL of zero still stops the load"
+        );
+    }
+
+    /// A variant's own Access Point DID Auth mints its sessions too: a TTL
+    /// above the longest there is named at startup and refused on a save that
+    /// sets it, and kept on one that leaves it. A DID Auth method that is not
+    /// the first mints no session and is neither named nor refused.
+    #[test]
+    fn a_variants_session_ttl_above_the_longest_is_named_and_refused_as_the_surfaces() {
+        let did_auth = |ttl: u64| {
+            serde_json::json!({
+                "type": "did_auth",
+                "extraction": { "source": "http_header", "field": "X-DID-Auth-Session" },
+                "allowed_dids": ["did:example:alice"],
+                "session_ttl_seconds": ttl
+            })
+        };
+        let surface = |variant_ttl: u64| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "surface_id": "varied",
+                "name": "varied",
+                "access_point": {
+                    "listen_address": "0.0.0.0:8443", "route": "/varied", "protocol": "mcp",
+                    "caller_authentication": { "methods": [
+                        { "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                            "secret_id": "caller-key" },
+                        did_auth(604_800)
+                    ] }
+                },
+                "target": { "endpoint": "https://agent.internal" },
+                "variants": [{ "id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+                    "overrides": { "access_point": { "caller_authentication": { "methods": [did_auth(variant_ttl)] } } } }]
+            }))
+            .unwrap()
+        };
+        let mut config = GatewayConfig::default_config();
+        config.surfaces = vec![surface(172_800)];
+        assert_eq!(
+            config.did_auth_session_ttl_adjustments(),
+            ["Surface 'varied' (varied): variant 'candidate' did_auth.session_ttl_seconds is 172800, above the \
+              longest, 86400 seconds; its sessions last 86400 seconds"]
+        );
+        let error = validate_source_auth_config(&config.surfaces[0], None)
+            .expect_err("a variant's TTL above the longest is refused on a save that sets it");
+        assert_eq!(
+            error.to_string(),
+            "Channel 'varied': variant 'candidate' did_auth.session_ttl_seconds 172800 exceeds max 86400"
+        );
+        validate_source_auth_config(&config.surfaces[0], Some(&config.surfaces[0]))
+            .expect("a save that keeps the variant's stored TTL passes");
+        validate_source_auth_config(&surface(86_400), None)
+            .expect("the method that is not the first mints no session, so its TTL is not bounded");
+        config.surfaces = vec![surface(86_400)];
+        assert!(
+            config
+                .did_auth_session_ttl_adjustments()
+                .is_empty()
         );
     }
 

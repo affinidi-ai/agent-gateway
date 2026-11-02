@@ -18,6 +18,14 @@ changes:
         was without the `target_auth` one. A target that answered such a `HEAD` only with the
         credential now answers it as it answers an anonymous `GET`. Which paths count as
         discovery documents is described in `docs/SOURCE_AUTH.md`.
+    - timestamp: '2026-11-03T10:00:00Z'
+      title: Hold a variant's own DID Auth session TTL to the 24-hour cap
+      description: >-
+        A variant whose Access Point overrides its caller authentication mints sessions with its
+        own first method, so a session_ttl_seconds above 86400 there is now refused on a save
+        that sets it and named in a warning at startup, as the surface's own already was. A
+        save that keeps a stored value is accepted, and a DID Auth method that is not the first,
+        which mints no session, is not bounded.
   fixed:
     - timestamp: '2026-11-03T12:00:00Z'
       title: Check every unfingerprinted delegated grant against the identity pepper
