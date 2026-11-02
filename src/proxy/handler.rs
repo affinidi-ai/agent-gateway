@@ -11567,7 +11567,7 @@ async fn handle_fabric_request_inner(
 
     // Surface-Level OPA Policy check (fabric:// path)
     if state.surface.opa_enabled()
-        && !(fabric_target_url.ends_with("/agent.json") || fabric_target_url.ends_with("/agent-card.json"))
+        && !crate::proxy::paths::is_public_request(method.as_str(), &fabric_target_url)
         && state
             .policy_manager
             .as_ref()
@@ -16587,6 +16587,8 @@ pub(crate) fn compute_transit_token_caller_context(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod fabric_send_policy_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]

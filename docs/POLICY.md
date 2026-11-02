@@ -23,6 +23,11 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of an
+agent card or `.well-known` discovery path (`paths::is_public_request`). This holds on the
+direct path, Fabric receive, and the sending gateway of a `fabric://` Target, so a `POST` to a
+path that merely ends in `/agent-card.json` or `/agent.json` is evaluated like any other call.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
