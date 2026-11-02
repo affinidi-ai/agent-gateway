@@ -646,7 +646,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credentials"
                   element={
-                    <ProtectedRoute permission="settings.view">
+                    <ProtectedRoute permissionsAny={['settings.view', 'credential_providers.view']}>
                       <CredentialsPage />
                     </ProtectedRoute>
                   }
@@ -731,7 +731,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credential-providers/new"
                   element={
-                    <ProtectedRoute permission="settings.edit">
+                    <ProtectedRoute permission="credential_providers.edit">
                       <EditCredentialProviderPage />
                     </ProtectedRoute>
                   }
@@ -739,7 +739,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credential-providers/:id"
                   element={
-                    <ProtectedRoute permission="settings.edit">
+                    <ProtectedRoute permission="credential_providers.view">
                       <EditCredentialProviderPage />
                     </ProtectedRoute>
                   }

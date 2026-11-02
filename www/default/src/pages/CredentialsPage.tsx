@@ -28,16 +28,20 @@ const VALID_TABS: TabKey[] = [
   'delegated-access',
   'sts-clients',
 ];
+const SETTINGS_TABS: TabKey[] = ['jwt-verification', 'credential-tokens', 'delegated-access'];
 
 const CredentialsPage: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
+  const { hasPermission, loading: permissionsLoading } = usePermissions();
+  const canViewProviders = !permissionsLoading && hasPermission('credential_providers.view');
+  const canViewSettingsTabs = !permissionsLoading && hasPermission('settings.view');
+  const defaultTab: TabKey = canViewSettingsTabs ? 'jwt-verification' : 'credential-providers';
   const initialTab: TabKey =
-    tabFromUrl && VALID_TABS.includes(tabFromUrl) ? tabFromUrl : 'jwt-verification';
+    tabFromUrl && VALID_TABS.includes(tabFromUrl) ? tabFromUrl : defaultTab;
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const [searchTerm, setSearchTerm] = useState('');
-  const { hasPermission, loading: permissionsLoading } = usePermissions();
   const canViewAudit = !permissionsLoading && hasPermission('audit.view');
   const canViewSts = !permissionsLoading && hasPermission('sts_clients.view');
   const vault = useDelegationVault();
@@ -49,11 +53,24 @@ const CredentialsPage: React.FC = () => {
   const [stsClientsCount, setStsClientsCount] = useState(0);
 
   useEffect(() => {
-    if (!permissionsLoading && !canViewSts && activeTab === 'sts-clients') {
-      setActiveTab('jwt-verification');
-      setSearchParams({ tab: 'jwt-verification' }, { replace: true });
+    if (permissionsLoading) return;
+    const hidden =
+      (activeTab === 'sts-clients' && !canViewSts) ||
+      (activeTab === 'credential-providers' && !canViewProviders) ||
+      (SETTINGS_TABS.includes(activeTab) && !canViewSettingsTabs);
+    if (hidden) {
+      const fallback: TabKey = canViewSettingsTabs ? 'jwt-verification' : 'credential-providers';
+      setActiveTab(fallback);
+      setSearchParams({ tab: fallback }, { replace: true });
     }
-  }, [activeTab, canViewSts, permissionsLoading, setSearchParams]);
+  }, [
+    activeTab,
+    canViewSts,
+    canViewProviders,
+    canViewSettingsTabs,
+    permissionsLoading,
+    setSearchParams,
+  ]);
 
   const viewHistory = () => navigate(auditLogPath(DELEGATION_ENDED_CATEGORIES));
   const viewActivity = (userHash: string) =>
@@ -92,70 +109,78 @@ const CredentialsPage: React.FC = () => {
         }}
         className="mb-3 custom-channel-tabs"
       >
-        <Tab
-          eventKey="jwt-verification"
-          tabAttrs={{ 'data-testid': 'credentials-jwt-verification-tab-trigger' }}
-          title={
-            <>
-              <i className="fas fa-id-badge"></i> JWT Verification {tabBadge(strategiesCount)}
-            </>
-          }
-        >
-          <StrategiesTab
-            externalSearchTerm={searchTerm}
-            onFilteredCountChange={setStrategiesCount}
-          />
-        </Tab>
+        {canViewSettingsTabs && (
+          <Tab
+            eventKey="jwt-verification"
+            tabAttrs={{ 'data-testid': 'credentials-jwt-verification-tab-trigger' }}
+            title={
+              <>
+                <i className="fas fa-id-badge"></i> JWT Verification {tabBadge(strategiesCount)}
+              </>
+            }
+          >
+            <StrategiesTab
+              externalSearchTerm={searchTerm}
+              onFilteredCountChange={setStrategiesCount}
+            />
+          </Tab>
+        )}
 
-        <Tab
-          eventKey="credential-providers"
-          tabAttrs={{ 'data-testid': 'credentials-credential-providers-tab-trigger' }}
-          title={
-            <>
-              <i className="fas fa-id-card"></i> Credential Providers {tabBadge(providersCount)}
-            </>
-          }
-        >
-          <CredentialProvidersTab
-            externalSearchTerm={searchTerm}
-            onFilteredCountChange={setProvidersCount}
-            onProvidersChange={vault.refresh}
-          />
-        </Tab>
+        {canViewProviders && (
+          <Tab
+            eventKey="credential-providers"
+            tabAttrs={{ 'data-testid': 'credentials-credential-providers-tab-trigger' }}
+            title={
+              <>
+                <i className="fas fa-id-card"></i> Credential Providers {tabBadge(providersCount)}
+              </>
+            }
+          >
+            <CredentialProvidersTab
+              externalSearchTerm={searchTerm}
+              onFilteredCountChange={setProvidersCount}
+              onProvidersChange={vault.refresh}
+            />
+          </Tab>
+        )}
 
-        <Tab
-          eventKey="credential-tokens"
-          tabAttrs={{ 'data-testid': 'credentials-credential-tokens-tab-trigger' }}
-          title={
-            <>
-              <i className="fas fa-lock"></i> Credential Tokens {tabBadge(tokensCount)}
-            </>
-          }
-        >
-          <CredentialTokensTab
-            vault={vault}
-            externalSearchTerm={searchTerm}
-            onFilteredCountChange={setTokensCount}
-            onViewActivity={canViewAudit ? viewActivity : undefined}
-          />
-        </Tab>
+        {canViewSettingsTabs && (
+          <Tab
+            eventKey="credential-tokens"
+            tabAttrs={{ 'data-testid': 'credentials-credential-tokens-tab-trigger' }}
+            title={
+              <>
+                <i className="fas fa-lock"></i> Credential Tokens {tabBadge(tokensCount)}
+              </>
+            }
+          >
+            <CredentialTokensTab
+              vault={vault}
+              externalSearchTerm={searchTerm}
+              onFilteredCountChange={setTokensCount}
+              onViewActivity={canViewAudit ? viewActivity : undefined}
+            />
+          </Tab>
+        )}
 
-        <Tab
-          eventKey="delegated-access"
-          tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
-          title={
-            <>
-              <i className="fas fa-user-check"></i> Delegated Access {tabBadge(delegationsCount)}
-            </>
-          }
-        >
-          <DelegatedAccessTab
-            vault={vault}
-            externalSearchTerm={searchTerm}
-            onFilteredCountChange={setDelegationsCount}
-            onViewHistory={canViewAudit ? viewHistory : undefined}
-          />
-        </Tab>
+        {canViewSettingsTabs && (
+          <Tab
+            eventKey="delegated-access"
+            tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
+            title={
+              <>
+                <i className="fas fa-user-check"></i> Delegated Access {tabBadge(delegationsCount)}
+              </>
+            }
+          >
+            <DelegatedAccessTab
+              vault={vault}
+              externalSearchTerm={searchTerm}
+              onFilteredCountChange={setDelegationsCount}
+              onViewHistory={canViewAudit ? viewHistory : undefined}
+            />
+          </Tab>
+        )}
 
         {canViewSts && (
           <Tab

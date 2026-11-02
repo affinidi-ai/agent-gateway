@@ -9,8 +9,9 @@ import { showToast } from '../../utils/toaster';
 jest.mock('../../api', () => ({
   apiClient: { get: jest.fn(), put: jest.fn(), post: jest.fn(), fetch: jest.fn() },
 }));
+let mockDenied = new Set<string>();
 jest.mock('../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => true, loading: false }),
+  usePermissions: () => ({ hasPermission: (p: string) => !mockDenied.has(p), loading: false }),
 }));
 jest.mock('../../context/PageTitleContext', () => ({ usePageTitle: () => undefined }));
 jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
@@ -675,6 +676,74 @@ describe('EditCredentialProviderPage tenant-aware secrets and https error', () =
     expect(
       screen.queryByTestId('credential-provider-token-endpoint-https-warning')
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('EditCredentialProviderPage permissions', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDenied = new Set();
+  });
+  afterAll(() => {
+    mockDenied = new Set();
+  });
+
+  it('opens read-only for a user with view but not edit', async () => {
+    mockDenied = new Set(['credential_providers.edit']);
+    renderPage(provider(null));
+    expect(await screen.findByTestId('credential-provider-editor-read-only-notice')).toBeVisible();
+    expect(screen.queryByTestId('credential-provider-editor-save-button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /delete/i })).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue(ENTRA_V2)).toBeDisabled();
+    expect(screen.getByDisplayValue('Foundry')).toBeDisabled();
+  });
+
+  it('shows Save and editable inputs for a user with edit', async () => {
+    renderPage(provider(null));
+    expect(await screen.findByTestId('credential-provider-editor-save-button')).toBeEnabled();
+    expect(screen.queryByTestId('credential-provider-editor-read-only-notice')).toBeNull();
+    expect(screen.getByDisplayValue(ENTRA_V2)).toBeEnabled();
+  });
+});
+
+describe('EditCredentialProviderPage retype refusal', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDenied = new Set();
+  });
+
+  it('shows the server message and the named references inline', async () => {
+    renderPage(provider(null));
+    mockFetch.mockImplementation((url: string, init?: RequestInit) =>
+      Promise.resolve(
+        init?.method === 'PUT'
+          ? {
+              ok: false,
+              status: 409,
+              statusText: 'Conflict',
+              text: () =>
+                Promise.resolve(
+                  JSON.stringify({
+                    message:
+                      "The credential provider is used for Target authentication, which cannot use a provider that needs a user's consent",
+                    references: [{ kind: 'surface', id: 's1', name: 'Billing surface' }],
+                    hidden_references: 1,
+                  })
+                ),
+            }
+          : url.startsWith('/api/v1/credential-providers/')
+            ? { ok: true, json: () => Promise.resolve(provider(null)) }
+            : { ok: false, json: () => Promise.resolve([]) }
+      )
+    );
+    fireEvent.click(await screen.findByTestId('credential-provider-editor-save-button'));
+
+    const references = await screen.findByTestId('credential-provider-editor-references');
+    expect(references).toHaveTextContent('Surface: Billing surface');
+    expect(references).toHaveTextContent('and 1 more you cannot view');
+    expect(
+      screen.getByText(/which cannot use a provider that needs a user's consent/)
+    ).toBeVisible();
   });
 });
 

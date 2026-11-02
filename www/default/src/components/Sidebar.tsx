@@ -54,7 +54,7 @@ const Sidebar: React.FC = () => {
       label: 'Credentials',
       icon: 'fa-id-card',
       path: '/credentials',
-      permission: 'settings.view' as const,
+      permissionsAny: ['settings.view', 'credential_providers.view'] as const,
     },
     {
       id: 'policies',

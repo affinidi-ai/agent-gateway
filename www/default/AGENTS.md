@@ -1474,6 +1474,16 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
+- Credential provider pages follow their own permissions, not `settings.*`.
+  `/credential-providers/new` needs `credential_providers.edit`; `/credential-providers/:id`
+  needs `credential_providers.view`. A user with view but not edit gets the editor read-only: the
+  form is a disabled `fieldset`, there is no Save (`Cmd+S` and Enter do nothing), and
+  `credential-provider-editor-read-only-notice` explains why. The tab shows **Add Provider**
+  with `.edit` and the row delete button with `.delete`.
+- The Credentials page and its sidebar entry open for `settings.view` or
+  `credential_providers.view` (`ProtectedRoute` takes `permissionsAny`). The Credential Providers
+  tab needs `.view`; the JWT Verification and Credential Tokens tabs need `settings.view`. A user
+  without `settings.view` lands on the Credential Providers tab.
 
 ## Secret editor
 
