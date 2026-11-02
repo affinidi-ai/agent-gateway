@@ -53,15 +53,29 @@ impl Default for CredentialPolicyConfig {
 }
 
 impl CredentialPolicyConfig {
-    /// Refuses a `token_request_timeout_secs` of 0 or above 120.
+    /// Refuses a `token_request_timeout_secs` of 0 or above 120, and an
+    /// `insecure_token_endpoints` entry that is not an absolute http URL without userinfo.
     pub fn validate(&self) -> Result<(), String> {
-        if (1..=MAX_TOKEN_REQUEST_TIMEOUT_SECS).contains(&self.token_request_timeout_secs) {
-            return Ok(());
+        if !(1..=MAX_TOKEN_REQUEST_TIMEOUT_SECS).contains(&self.token_request_timeout_secs) {
+            return Err(format!(
+                "token_request_timeout_secs must be from 1 to {MAX_TOKEN_REQUEST_TIMEOUT_SECS}, got {}",
+                self.token_request_timeout_secs
+            ));
         }
-        Err(format!(
-            "token_request_timeout_secs must be from 1 to {MAX_TOKEN_REQUEST_TIMEOUT_SECS}, got {}",
-            self.token_request_timeout_secs
-        ))
+        for entry in &self.insecure_token_endpoints {
+            let Ok(mut url) = url::Url::parse(entry.trim()) else {
+                return Err(format!("insecure_token_endpoints entry \"{entry}\" is not a valid URL"));
+            };
+            if url.scheme() != "http" {
+                return Err(format!("insecure_token_endpoints entry \"{entry}\" must be an http URL"));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                return Err(format!("insecure_token_endpoints entry \"{url}\" must not carry credentials"));
+            }
+        }
+        Ok(())
     }
 
     /// Whether `insecure_token_endpoints` names `url` exactly, compared as parsed URLs.
@@ -184,6 +198,76 @@ mod tests {
             Err("token_request_timeout_secs must be from 1 to 120, got 0".to_string())
         );
         assert!(toml::from_str::<CredentialPolicyConfig>("token_request_timeout_secs = -1").is_err());
+    }
+
+    #[test]
+    fn an_insecure_token_endpoint_entry_must_be_an_http_url_without_credentials() {
+        let with = |entry: &str| CredentialPolicyConfig {
+            insecure_token_endpoints: vec![entry.to_string()],
+            ..Default::default()
+        };
+        assert_eq!(with("http://idp.internal/token").validate(), Ok(()));
+        assert_eq!(with(" http://idp.internal:8080/token ").validate(), Ok(()));
+        assert_eq!(
+            with("htp://idp.internal/token").validate(),
+            Err("insecure_token_endpoints entry \"htp://idp.internal/token\" must be an http URL".to_string())
+        );
+        assert_eq!(
+            with("idp.internal/token").validate(),
+            Err("insecure_token_endpoints entry \"idp.internal/token\" is not a valid URL".to_string())
+        );
+        assert_eq!(
+            with("https://idp.internal/token").validate(),
+            Err("insecure_token_endpoints entry \"https://idp.internal/token\" must be an http URL".to_string())
+        );
+        assert_eq!(
+            with("http://user:hunter2@idp.internal/token").validate(),
+            Err("insecure_token_endpoints entry \"http://idp.internal/token\" must not carry credentials".to_string())
+        );
+        let mixed = CredentialPolicyConfig {
+            insecure_token_endpoints: vec!["http://idp.internal/token".into(), "http//typo".into()],
+            ..Default::default()
+        };
+        assert!(
+            mixed
+                .validate()
+                .unwrap_err()
+                .contains("http//typo")
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_validation_refuses_a_malformed_insecure_token_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let cert = directory
+            .path()
+            .join("cert.pem");
+        let key = directory
+            .path()
+            .join("key.pem");
+        std::fs::write(&cert, "").unwrap();
+        std::fs::write(&key, "").unwrap();
+        let config = |entry: &str| -> crate::config::BootstrapConfig {
+            toml::from_str(&format!(
+                "backup_encryption_key = \"00\"\n[credential_policy]\ninsecure_token_endpoints = [\"{entry}\"]\n[tls]\ncert_path = {:?}\nkey_path = {:?}\n",
+                cert.to_str().unwrap(),
+                key.to_str().unwrap()
+            ))
+            .unwrap()
+        };
+        assert!(
+            config("http://idp.internal/token")
+                .validate()
+                .is_ok()
+        );
+        let error = config("htp://idp.internal/token")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Invalid [credential_policy] config: insecure_token_endpoints entry \"htp://idp.internal/token\" must be an http URL"
+        );
     }
 
     #[test]
