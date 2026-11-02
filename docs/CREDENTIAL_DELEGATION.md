@@ -163,9 +163,10 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   the key, so rotating or deleting its secret changes nothing.
   Each use looks up only those secrets, one read each (decrypted when
   encryption at rest is on), and a token request reads each secret it sends once more by its
-  id; neither lists the secrets store. A secret the type sends that no longer exists reports
-  `SecretUnavailable` and a secrets store error `StoreUnavailable`; neither serves the cached
-  token nor sends a request.
+  id; neither asks the store for a listing, though the filesystem store rescans its directory to
+  rebuild its id index when it is asked for an id it does not know. A secret the type sends that
+  no longer exists reports `SecretUnavailable` and a secrets store error `StoreUnavailable`;
+  neither serves the cached token nor sends a request.
 - After a new token is stored, the expired tokens of the same agent, provider and purpose
   (those left by earlier settings, scopes or secret versions) are removed from the vault.
   Unexpired tokens, user grants, pending consents and refresh claims are kept. A failure to

@@ -133,6 +133,18 @@ changes:
       title: Report a preview target that does not resolve as unreachable
       description: >-
         An agent card preview of a host that does not resolve now reports unreachable (502) instead of blocked_by_egress (403), as the served card route does when it fetches without Target authentication. A served card fetched with Target authentication and the proxy forward still answer 403 blocked by egress for such a host. The event hook and mediator directory reasons, JWKS fetch errors and x402 facilitator construction errors now name a failed host lookup as such.
+    - timestamp: '2026-11-02T15:20:00Z'
+      title: Read credential provider secrets by id instead of listing the secrets store
+      description: >-
+        A service token grant and an API key read now look up each secret they send by its secret id. Acquiring a service token no longer reads every secret file from disk. The tenant check, its warning and the errors are unchanged.
+    - timestamp: '2026-11-02T15:21:00Z'
+      title: Ignore secret references a credential provider's type does not use
+      description: >-
+        The service token cache key and its existence and tenant checks now cover only the secrets the provider's type sends. A reference left from another type, such as an API key kept after a provider became client credentials, no longer fails requests when its secret is deleted, and rotating it no longer renews the token.
+    - timestamp: '2026-11-02T15:22:00Z'
+      title: Keep a service token request's slot while a caller holds it
+      description: >-
+        The per-key single-flight and retry backoff slots are released only when no caller holds them and no failure is remembered. With many keys in use, a second request for the same key therefore waits for the one in flight instead of sending its own. A failure count is forgotten ten minutes after its retry time.
   removed: []
   security:
     - timestamp: '2026-10-30T23:00:04Z'
