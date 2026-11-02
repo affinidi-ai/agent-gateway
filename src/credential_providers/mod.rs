@@ -679,6 +679,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_external_provider_uses_its_own_tenants_secrets_only_and_any_other_may_also_use_untenanted_ones() {
+        let provider = |tenant: Option<&str>, issuer: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": "api_key",
+                "api_key_secret_ref": "KEY", "tenant_id": tenant, "issuer": issuer,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let issuer = Some("https://issuer.example");
+
+        let external = provider(Some("tenant-a"), issuer);
+        assert!(external.may_use_secret(Some("tenant-a")));
+        assert!(!external.may_use_secret(None));
+        assert!(!external.may_use_secret(Some("tenant-b")));
+
+        let untenanted_external = provider(None, issuer);
+        assert!(untenanted_external.may_use_secret(None));
+        assert!(!untenanted_external.may_use_secret(Some("tenant-a")));
+
+        let tenant = provider(Some("tenant-a"), None);
+        assert!(tenant.may_use_secret(Some("tenant-a")));
+        assert!(tenant.may_use_secret(None));
+        assert!(!tenant.may_use_secret(Some("tenant-b")));
+
+        let untenanted = provider(None, None);
+        assert!(untenanted.may_use_secret(None));
+        assert!(!untenanted.may_use_secret(Some("tenant-a")));
+    }
+
+    #[test]
     fn a_reference_is_kept_only_in_its_own_field_while_the_destination_is_unchanged() {
         let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
             "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",

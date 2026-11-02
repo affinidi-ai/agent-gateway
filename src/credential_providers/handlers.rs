@@ -2170,6 +2170,61 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_with_an_issuer_never_keeps_a_secret_outside_its_tenant_even_in_warn_mode() {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-b".into()),
+                name: "B_KEY".into(),
+                secret_id: "B_KEY".into(),
+                description: None,
+                value: "tenant-b-value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let stored = |issuer: Option<&str>, secret_ref: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "stored", "name": "Key", "provider_id": "stored", "provider_type": "api_key",
+                "api_key_secret_ref": secret_ref, "tenant_id": "tenant-a", "issuer": issuer,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let warn = TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: CredentialPolicyConfig {
+                tenant_credential_isolation: RuleMode::Warn,
+                ..Default::default()
+            },
+        };
+        let check = |provider: CredentialProvider| {
+            let state = state.clone();
+            let warn = warn.clone();
+            async move {
+                validate_provider_settings(&state, &provider, Some(&provider), &warn, &tenant_a_context(), &None).await
+            }
+        };
+        let issuer = Some("https://issuer.example");
+        assert!(matches!(
+            check(stored(issuer, "CLIENT_SECRET")).await,
+            Err(ProviderValidationError::SecretNotAccessible)
+        ));
+        assert!(matches!(check(stored(issuer, "B_KEY")).await, Err(ProviderValidationError::SecretNotAccessible)));
+        assert!(
+            check(stored(None, "CLIENT_SECRET"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_refuses_an_appliance_wide_key_for_a_tenant_provider() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
