@@ -204,7 +204,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   keeps what its controls do not set: `elicit_timeout_secs`, `elicit_fallback` and an external
   consent binding's `subject` round-trip through the form, and the consent select
   (`transit-point-consent-mode-select`) shows a stored `elicit` or `external` mode as a disabled
-  option. An `external` binding's select is disabled, with a line saying whose grant it uses
+  option. An `external` binding is read-only: its provider, scopes, consent mode and injection
+  inputs are disabled, and only the switch that removes it stays enabled, with a line saying
+  whose grant it uses and that changing or removing it revokes its grants
   (`transit-point-binding-subject`): such a binding is changed through the API.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent

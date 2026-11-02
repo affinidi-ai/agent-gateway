@@ -85,8 +85,9 @@ changes:
         legacy and `2026-07-28` paths refuse one, and surface-level `outbound_credentials` cannot
         ask for `external`. A surface with such a binding cannot move to another tenant until
         the binding is removed. The Surface Builder keeps such a binding, and its subject, when
-        the surface is saved, and shows it read-only; an external consent provider can be
-        renamed and rescoped from the dashboard.
+        the surface is saved, and shows it read-only, offering only its removal, which revokes
+        its grants; an external consent provider can be renamed and rescoped from the
+        dashboard.
     - timestamp: '2026-10-30T23:30:00Z'
       title: Revoke a binding's grants when a surface change removes the binding
       description: >-

@@ -149,6 +149,8 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
   }, []);
 
   const enabled = value !== null && value !== undefined;
+  /** Another system obtains an external binding's grant, so only its removal is offered here. */
+  const readOnly = value?.consent_mode === 'external';
 
   const toggle = () => {
     if (enabled) onChange(null);
@@ -185,7 +187,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               size="sm"
               value={value.credential_provider_id}
               onChange={e => update('credential_provider_id', e.target.value)}
-              disabled={loading}
+              disabled={loading || readOnly}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
               {providers.map(p => (
@@ -243,6 +245,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               value={value.scopes}
               onChange={e => update('scopes', e.target.value)}
               placeholder="repo, read:user (empty = provider defaults)"
+              disabled={readOnly}
             />
           </Form.Group>
 
@@ -265,7 +268,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               size="sm"
               data-testid="transit-point-consent-mode-select"
               value={value.consent_mode}
-              disabled={value.consent_mode === 'external'}
+              disabled={readOnly}
               onChange={e =>
                 update('consent_mode', e.target.value as TransitCredentialsForm['consent_mode'])
               }
@@ -278,7 +281,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 </option>
               )}
             </Form.Select>
-            {value.consent_mode === 'external' && (
+            {readOnly && (
               <Form.Text
                 className="text-muted d-block"
                 data-testid="transit-point-binding-subject"
@@ -287,7 +290,8 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 {value.subject === 'caller'
                   ? 'Each caller uses the grant of their own account.'
                   : 'Every caller uses the one grant of the account that connected.'}{' '}
-                Another system obtains the grant; change this binding through the API.
+                Another system obtains the grant; change this binding through the API. Changing or
+                removing this binding revokes its grants.
               </Form.Text>
             )}
           </Form.Group>
@@ -312,6 +316,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               onChange={e =>
                 update('inject_as_type', e.target.value as TransitCredentialsForm['inject_as_type'])
               }
+              disabled={readOnly}
             >
               <option value="bearer_header">Bearer header</option>
               <option value="custom_header">Custom header</option>
@@ -329,6 +334,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                   value={value.inject_as_custom_name ?? ''}
                   onChange={e => update('inject_as_custom_name', e.target.value)}
                   placeholder="X-GitHub-Token"
+                  disabled={readOnly}
                 />
               </Form.Group>
               <Form.Group className="mb-1">
@@ -339,6 +345,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                   value={value.inject_as_custom_format ?? ''}
                   onChange={e => update('inject_as_custom_format', e.target.value)}
                   placeholder="token {value}"
+                  disabled={readOnly}
                 />
               </Form.Group>
             </>
@@ -353,6 +360,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 value={value.inject_as_meta_field ?? ''}
                 onChange={e => update('inject_as_meta_field', e.target.value)}
                 placeholder="oauth_token"
+                disabled={readOnly}
               />
             </Form.Group>
           )}
