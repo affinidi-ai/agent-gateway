@@ -268,7 +268,7 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let vault = Arc::clone(vault);
     let (report, deletions) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
+    let task = crate::audit::producer::spawn_audited(async move {
         let mut deleted = Vec::with_capacity(grant_ids.len());
         let mut failure = None;
         for id in grant_ids {
