@@ -1479,19 +1479,19 @@ mod tests {
     fn a_metadata_secret_of_a_surface_with_no_tenant_is_held_to_a_tenant_only_once_the_surface_has_one() {
         const CROSS_TENANT: &str = "The proposed tenant would make this reference cross-tenant";
         for isolation in [RuleMode::Warn, RuleMode::Enforce] {
-            for (secret_tenant, requested) in
+            for (referenced_tenant, requested) in
                 [(Some("tenant-a"), Some("tenant-b")), (Some("tenant-a"), None), (None, Some("tenant-b"))]
             {
                 assert!(
                     conflict_reasons(
-                        metadata_edge(None, secret_tenant),
+                        metadata_edge(None, referenced_tenant),
                         ResourceKind::Secrets,
                         "secret-1",
                         requested,
                         isolation
                     )
                     .is_empty(),
-                    "{secret_tenant:?} {requested:?} {isolation:?}"
+                    "{referenced_tenant:?} {requested:?} {isolation:?}"
                 );
             }
             assert!(
