@@ -139,6 +139,18 @@ changes:
         `payment` integration from an earlier build keeps receiving all of them after the upgrade.
   changed:
     - timestamp: '2026-11-02T00:00:00Z'
+      title: Put the agent-pay UI behind the agent_pay_delegation feature flag
+      description: >-
+        The Payment Gateways tab and pages, the Payments page, Use as payment gateway, the Payment
+        element in the surface builder palette and payment templates now show only while the
+        `agent_pay_delegation` feature flag is on (Settings › System › Feature Flags, default off).
+        A surface that already has a Payment element keeps it and can still be edited and saved.
+        While the flag is off the gateway also refuses to connect a payment gateway or turn a peer into one, with 403; payment
+        gateways already connected keep working. The flag, like `mediator_federation`, can no
+        longer be overridden in a user's own settings, so the dashboard always shows what the
+        gateway enforces, and it is turned on at startup when the appliance already has a payment
+        gateway and no operator has set it.
+    - timestamp: '2026-11-02T00:00:00Z'
       title: Show the Payments page as one list of payments
       description: >-
         The Payments page no longer has Ledger and Audit trail tabs or the outcome chart; it is a

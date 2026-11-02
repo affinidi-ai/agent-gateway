@@ -531,6 +531,16 @@ route. Payment gateways have their own routes and permissions (`/v1/payment-gate
 `payment_gateways.*`, see [RBAC](RBAC.md#gateways-and-payment-gateways)); `/v1/gateways/*`
 neither lists them nor acts on them.
 
+- Adding a payment gateway needs the `agent_pay_delegation` feature flag (Settings › System ›
+  Feature Flags, default off, read from the system settings,
+  [`agent_pay_flag.rs`](../src/gateways/agent_pay_flag.rs)). While it is off,
+  `POST /v1/payment-gateways/connect-via-oob` and `POST /v1/gateways/{id}/payment-role` answer
+  `403`; payment gateways already connected keep taking payments and every read route still
+  works. The dashboard hides its agent-pay UI while it is off. A user's own settings cannot
+  override this flag or `mediator_federation`
+  ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
+  when a payment gateway already exists and the flag has not been set either way, so an upgrade
+  never hides a payment gateway that is taking payments.
 - `POST /v1/payment-gateways/connect-via-oob` connects to an agent-pay connection point with the
   same body as `POST /v1/gateways/connect-via-oob` and creates a payment gateway whose exposure is
   `none`. agent-pay's administrator approves every connection, so the gateway stays

@@ -92,7 +92,10 @@ _Gateway picker_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-buil
 Connections has a **Payment Gateways** tab beside Gateways, Mediators and Registries, with a
 connect wizard that waits for agent-pay's approval and verifies the peer with `gateway-info`, a
 detail page per payment gateway, and a **Use as payment gateway** action on the Gateways tab; see
-_Connections page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#connections-page).
+_Connections page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#connections-page). All of
+it, the Payments page, the Payment element in the palette and payment templates show only while the
+`agent_pay_delegation` feature flag is on (default off); a surface's existing Payment element
+always stays. See _Feature flags_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#feature-flags).
 
 The Surface Builder's Payment manifest preview shows each payment method with the logo agent-pay
 sent beside the manifest, served by `GET /v1/gateways/payment-logos/{sha256}`, or a generic icon;

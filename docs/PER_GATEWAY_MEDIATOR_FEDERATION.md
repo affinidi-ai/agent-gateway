@@ -208,7 +208,8 @@ Validate the two mediators on their own with `cross_mediator_forwarding`
   the acceptor. While it is off, `connect-via-oob` refuses
   `acceptor_mediator_id` with `400`. While it is on, the **Connect via OOB**
   wizard shows a mediator picker listing the gateway's active, registered
-  mediators. The inviter does not need the flag.
+  mediators. The inviter does not need the flag. It is system-only: a user's own
+  settings cannot turn it on or off.
 - Connect: GW1 issues the invitation, and GW2 accepts it with M2 selected.
   Leaving the picker on its default keeps the shared mediator (§2).
 

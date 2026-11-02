@@ -8,6 +8,8 @@ import { PageTitleProvider } from '../context/PageTitleContext';
 import Sidebar from '../components/Sidebar';
 import RedirectKeepingQuery from '../components/shared/RedirectKeepingQuery';
 import ProtectedRoute from '../components/ProtectedRoute';
+import AgentPayRoute from '../components/AgentPayRoute';
+import { connectionsPermissions, useAgentPayFlag } from '../utils/featureFlags';
 import ScrollToTop from '../components/ScrollToTop';
 import Header from '../components/Header';
 import Dashboard from './Dashboard';
@@ -106,8 +108,6 @@ const IssuerEditRedirect: React.FC = () => {
   return <IssuersRedirect issuer={id} />;
 };
 
-const CONNECTIONS_PERMISSIONS = ['gateways.view', 'payment_gateways.view'] as const;
-
 const AuthoritiesRedirect: React.FC<{ authority?: string }> = ({ authority }) => {
   const searchParams = new URLSearchParams({ tab: 'authorities' });
 
@@ -138,6 +138,7 @@ const ProxiesRouteAccess: React.FC = () => {
 const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
   const { state, actions } = useApp();
   const { loading: permissionsLoading } = usePermissions();
+  const { enabled: agentPayOn, loaded: agentPayLoaded } = useAgentPayFlag();
   const hasRefreshedCache = useRef<boolean>(false);
   const [version, setVersion] = useState('-.-.-');
   const [isInitializing, setIsInitializing] = useState(true);
@@ -314,9 +315,11 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/connections"
                   element={
-                    <ProtectedRoute permission={CONNECTIONS_PERMISSIONS}>
-                      <ConnectionsPage />
-                    </ProtectedRoute>
+                    agentPayLoaded ? (
+                      <ProtectedRoute permission={connectionsPermissions(agentPayOn)}>
+                        <ConnectionsPage />
+                      </ProtectedRoute>
+                    ) : null
                   }
                 />
                 <Route
@@ -379,7 +382,9 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   path="/payment-gateways/connect"
                   element={
                     <ProtectedRoute permission="payment_gateways.edit">
-                      <AddPaymentGatewayWizardPage />
+                      <AgentPayRoute>
+                        <AddPaymentGatewayWizardPage />
+                      </AgentPayRoute>
                     </ProtectedRoute>
                   }
                 />
@@ -387,7 +392,9 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   path="/payment-gateways/:id"
                   element={
                     <ProtectedRoute permission="payment_gateways.view">
-                      <PaymentGatewayDetailPage />
+                      <AgentPayRoute>
+                        <PaymentGatewayDetailPage />
+                      </AgentPayRoute>
                     </ProtectedRoute>
                   }
                 />
@@ -395,7 +402,9 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   path="/payment-gateways"
                   element={
                     <ProtectedRoute permission="payment_gateways.view">
-                      <Navigate to="/connections?tab=payment-gateways" replace />
+                      <AgentPayRoute>
+                        <Navigate to="/connections?tab=payment-gateways" replace />
+                      </AgentPayRoute>
                     </ProtectedRoute>
                   }
                 />
@@ -585,7 +594,9 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   path="/payments"
                   element={
                     <ProtectedRoute permission="payments.view">
-                      <PaymentsPage />
+                      <AgentPayRoute fallback={ROUTES.DASHBOARD}>
+                        <PaymentsPage />
+                      </AgentPayRoute>
                     </ProtectedRoute>
                   }
                 />

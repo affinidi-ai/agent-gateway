@@ -306,6 +306,37 @@ fn register_resource_limit_counters(
     });
 }
 
+/// Keeps the agent-pay UI visible on an appliance that already has a payment
+/// gateway, so an upgrade never hides one that is taking payments. An operator's
+/// explicit setting, on or off, is kept.
+async fn enable_agent_pay_ui_in_use(store: &crate::gateways::FileSystemGatewayStore) {
+    use crate::gateways::GatewayStore;
+
+    let has_payment_gateway = match store.list_all().await {
+        Ok(gateways) => gateways
+            .iter()
+            .any(|gateway| gateway.is_payment_gateway()),
+        Err(e) => {
+            warn!("Failed to list gateways for the agent-pay flag: {}", e);
+            return;
+        }
+    };
+    let Some(settings) = crate::storage::settings_store::global_settings_store() else {
+        return;
+    };
+    if !has_payment_gateway {
+        return;
+    }
+    match settings
+        .enable_flag_if_unset(crate::gateways::agent_pay_flag::FLAG_AGENT_PAY)
+        .await
+    {
+        Ok(true) => info!("Turned on agent_pay_delegation: this appliance already has a payment gateway"),
+        Ok(false) => {}
+        Err(e) => warn!("Failed to turn on agent_pay_delegation: {}", e),
+    }
+}
+
 fn count_remote_gateways(
     gateways: Vec<crate::gateways::types::Gateway>,
     role: GatewayRole,
@@ -1611,6 +1642,7 @@ pub async fn run_axum_proxy(
                         Ok(n) => info!("Migrated {n} gateway(s) that take payments to payment gateways"),
                         Err(e) => warn!("Failed to migrate payment gateways: {}", e),
                     }
+                    enable_agent_pay_ui_in_use(&store).await;
                     info!("Gateway store initialized");
                     Some(Arc::new(store))
                 }

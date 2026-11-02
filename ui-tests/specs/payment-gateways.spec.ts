@@ -8,6 +8,7 @@
 
 import type { Page, Route } from "@playwright/test";
 import { expect, test } from "../helpers/fixtures";
+import { withFeatureFlag } from "../helpers/featureFlags";
 
 const BASE_URL = process.env.AG_BASE_URL || "http://localhost:8080";
 
@@ -74,7 +75,28 @@ async function mockPaymentGateways(
   return { deletes };
 }
 
+test.describe("agent-pay off", () => {
+  test("hides the Payment Gateways tab and sends its pages back to Connections", async ({
+    page,
+  }) => {
+    await withFeatureFlag(page, "agent_pay_delegation", false);
+    await mockPaymentGateways(page, [ACTIVE]);
+    await page.goto(`${BASE_URL}/connections?tab=payment-gateways`);
+    await expect(
+      page.getByTestId("connections-tab-payment-gateways"),
+    ).toHaveCount(0);
+
+    await page.goto(`${BASE_URL}/payment-gateways/connect`);
+    await expect(page).toHaveURL(/\/connections$/);
+    await expect(page.getByTestId("wizard-step-details")).toHaveCount(0);
+  });
+});
+
 test.describe("Payment Gateways tab", () => {
+  test.beforeEach(async ({ page }) => {
+    await withFeatureFlag(page, "agent_pay_delegation");
+  });
+
   test("explains agent-pay when there is no payment gateway and opens the wizard", async ({
     page,
   }) => {
@@ -142,6 +164,10 @@ test.describe("Payment Gateways tab", () => {
 });
 
 test.describe("Connect Payment Gateway wizard", () => {
+  test.beforeEach(async ({ page }) => {
+    await withFeatureFlag(page, "agent_pay_delegation");
+  });
+
   test("needs a name before it asks for the connection point link", async ({
     page,
   }) => {

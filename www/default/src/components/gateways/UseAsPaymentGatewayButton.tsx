@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
+import { useAgentPayFlag } from '../../utils/featureFlags';
 import { getErrorMessage } from '../../utils/apiError';
 import type { GatewayRecord } from '../../utils/gateways';
 import { showToast } from '../../utils/toaster';
@@ -27,8 +28,8 @@ interface UseAsPaymentGatewayButtonProps {
 
 /**
  * Turns an active remote peer into a payment gateway, after a confirm, and
- * opens the Payment Gateways tab. Needs both `gateways.edit` and
- * `payment_gateways.edit`.
+ * opens the Payment Gateways tab. Needs `agent_pay_delegation` on and both
+ * `gateways.edit` and `payment_gateways.edit`.
  */
 const UseAsPaymentGatewayButton: React.FC<UseAsPaymentGatewayButtonProps> = ({
   gateway,
@@ -39,9 +40,11 @@ const UseAsPaymentGatewayButton: React.FC<UseAsPaymentGatewayButtonProps> = ({
 }) => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
+  const { enabled: agentPayOn } = useAgentPayFlag();
   const [busy, setBusy] = useState(false);
 
   if (
+    !agentPayOn ||
     !canBecomePaymentGateway(gateway) ||
     !hasPermission('gateways.edit') ||
     !hasPermission('payment_gateways.edit')

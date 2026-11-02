@@ -27,13 +27,16 @@ const renderTab = (settings: Settings = SETTINGS) =>
   );
 
 describe('SystemTab feature flags', () => {
-  it.each(['metrics', 'mediator_federation'])('names the %s switch after its flag', flag => {
-    renderTab();
+  it.each(['metrics', 'agent_pay_delegation', 'mediator_federation'])(
+    'names the %s switch after its flag',
+    flag => {
+      renderTab();
 
-    expect(screen.getByRole('switch', { name: flag })).toBe(
-      screen.getByTestId(`settings-flag-${flag}`)
-    );
-  });
+      expect(screen.getByRole('switch', { name: flag })).toBe(
+        screen.getByTestId(`settings-flag-${flag}`)
+      );
+    }
+  );
 
   it('reflects the flag state on the named switch', () => {
     renderTab();
@@ -42,10 +45,29 @@ describe('SystemTab feature flags', () => {
     expect(screen.getByRole('switch', { name: 'mediator_federation' })).not.toBeChecked();
   });
 
-  it('has no Agent-Pay delegation switch', () => {
+  it('shows agent-pay off unless the flag is explicitly true', () => {
     renderTab();
+    expect(screen.getByRole('switch', { name: 'agent_pay_delegation' })).not.toBeChecked();
+  });
 
-    expect(screen.queryByTestId('settings-flag-agent_pay_delegation')).not.toBeInTheDocument();
+  it('turns agent-pay on with an explicit true', async () => {
+    const updateSettings = jest.fn().mockResolvedValue(undefined);
+    render(
+      <SystemTab
+        isSubmitting={false}
+        onTruncateMetrics={jest.fn()}
+        settings={{ feature_flags: { metrics: false } } as unknown as Settings}
+        updateSettings={updateSettings}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('switch', { name: 'agent_pay_delegation' }));
+
+    await waitFor(() =>
+      expect(updateSettings).toHaveBeenCalledWith({
+        feature_flags: { metrics: false, agent_pay_delegation: true },
+      })
+    );
   });
 
   // Accepted A2A versions are set per A2A surface, on its Access Point.

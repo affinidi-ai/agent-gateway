@@ -770,6 +770,12 @@ export interface FeatureFlags {
    *  `false` to hide the sidebar entry. The `/metrics` routes remain
    *  reachable directly even when hidden. */
   metrics?: boolean;
+  /** Show the agent-pay UI: Connections › Payment Gateways and its pages, the
+   *  Payments page, the Payment element in the surface builder palette, payment templates and Use as
+   *  payment gateway. Default off (treated as `false` when undefined). A surface
+   *  that already has a Payment element keeps it, editable, either way; the
+   *  gateway also refuses to add a payment gateway while it is off. */
+  agent_pay_delegation?: boolean;
   /** Experimental per-gateway mediator choice. Default off (treated as `false`
    *  when undefined); set explicitly to `true` to enable. When on, the Connect
    *  via OOB wizard shows the mediator picker and the API accepts

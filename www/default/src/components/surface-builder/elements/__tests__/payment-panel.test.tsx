@@ -15,6 +15,16 @@ jest.mock('../../../../api', () => ({
   },
 }));
 
+let mockAgentPayOn = true;
+
+jest.mock('../../../../utils/featureFlags', () => ({
+  useAgentPayFlag: () => ({ enabled: mockAgentPayOn, loaded: true }),
+}));
+
+beforeEach(() => {
+  mockAgentPayOn = true;
+});
+
 const mockGet = apiClient.get as jest.Mock;
 const mockManifest = apiClient.getPaymentManifest as jest.Mock;
 
@@ -144,6 +154,18 @@ describe('PaymentPanel', () => {
     expect(link).not.toHaveTextContent(/^\s*Add Gateway\s*$/);
     expect(screen.queryByTestId('payment-gateway-select')).not.toBeInTheDocument();
     expect(screen.queryByTestId('payment-gateway-note')).not.toBeInTheDocument();
+  });
+
+  it('keeps an existing Payment element usable but offers no Add link while agent-pay is off', async () => {
+    mockAgentPayOn = false;
+    mockGet.mockResolvedValue({ data: [] });
+    render(<Harness initial={{}} />);
+
+    expect(await screen.findByTestId('payment-no-gateway')).toHaveTextContent(
+      'No connected payment gateway'
+    );
+    expect(screen.queryByTestId('payment-add-gateway-link')).not.toBeInTheDocument();
+    expect(screen.getByTestId('payment-timeout-input')).toBeInTheDocument();
   });
 
   it('points the muted Add link at the payment gateway wizard too', async () => {

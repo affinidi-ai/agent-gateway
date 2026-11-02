@@ -13,6 +13,12 @@ jest.mock('../../../context/PermissionsContext', () => ({
   }),
 }));
 
+let mockAgentPayOn = true;
+
+jest.mock('../../../utils/featureFlags', () => ({
+  useAgentPayFlag: () => ({ enabled: mockAgentPayOn, loaded: true }),
+}));
+
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 jest.mock('../../../api', () => {
@@ -50,6 +56,7 @@ function renderButton(onError: jest.Mock = jest.fn(), gateway = peer) {
 beforeEach(() => {
   jest.clearAllMocks();
   mockPermissions = { 'gateways.edit': true, 'payment_gateways.edit': true };
+  mockAgentPayOn = true;
   jest.spyOn(window, 'confirm').mockReturnValue(true);
 });
 
@@ -61,6 +68,13 @@ describe('UseAsPaymentGatewayButton', () => {
     ['payment_gateways.edit', { 'gateways.edit': true }],
   ])('is hidden without %s', (_missing, permissions) => {
     mockPermissions = permissions;
+    renderButton();
+
+    expect(screen.queryByTestId('use-pay')).not.toBeInTheDocument();
+  });
+
+  it('is hidden while agent-pay is off, whatever the permissions', () => {
+    mockAgentPayOn = false;
     renderButton();
 
     expect(screen.queryByTestId('use-pay')).not.toBeInTheDocument();

@@ -490,7 +490,8 @@ fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-sta
 
 ## Payments page
 
-`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`) is one list of payments, with no tabs, chart or audit trail view, and reads the
+`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown only while
+`agent_pay_delegation` is on (see _Feature flags_), is one list of payments, with no tabs, chart or audit trail view, and reads the
 append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
 `outcome` from the filter) and shows one row per payment check with an outcome badge; a
 held row shows its case id. The Surface cell says `via <payment surface> on <payment
@@ -804,10 +805,11 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
 **Mediators** and **Registries**, kept in `?tab=` (`gateways`, `payment-gateways`,
 `mediators`, `trust-registries`). The active tab follows the URL, so a link to another tab of
 the page switches it; an unknown or hidden value opens the first tab shown. The page (route and
-sidebar entry) opens with either `gateways.view` or `payment_gateways.view`
-(`ProtectedRoute` accepts a list, any one of which is enough). **Gateways** shows only with
-`gateways.view` and **Payment Gateways** (`connections-tab-payment-gateways`) only with
-`payment_gateways.view`. One filter box serves every tab; each tab reports its
+sidebar entry) opens with `gateways.view`, or also with `payment_gateways.view` while
+`agent_pay_delegation` is on (`ProtectedRoute` accepts a list, any one of which is enough; the
+route waits for the settings before deciding). **Gateways** shows only with `gateways.view` and
+**Payment Gateways** (`connections-tab-payment-gateways`) only with `payment_gateways.view` and
+`agent_pay_delegation` on (see _Feature flags_). One filter box serves every tab; each tab reports its
 filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
 portals its add button into the tab banner.
 
@@ -961,6 +963,25 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 - The switch carries `data-testid="settings-flag-<flag>"`, `role="switch"`, and
   `aria-labelledby` pointing at the row's flag-name cell, so its accessible name is the
   flag key.
+- `agent_pay_delegation` (`settings-flag-agent_pay_delegation`) is default off and shows the
+  agent-pay UI. Read it through `utils/featureFlags.ts` (`agentPayEnabled`, `useAgentPayFlag`),
+  never inline. While off: Connections has no **Payment Gateways** tab and a payment-gateways-only
+  caller no longer reaches Connections; `/payment-gateways`, `/payment-gateways/connect` and
+  `/payment-gateways/:id` go to `/connections` (`components/AgentPayRoute.tsx`, which renders
+  nothing until the settings have loaded, so a deep link is not redirected early); **Use as
+  payment gateway** is not shown; the palette does not offer the **Payment** element
+  (`registry.paletteItems(protocol, hidden)`) and the templates panel hides templates that add
+  one (`templateTakesPayments`); the Payment element's gateway picker shows no Add link
+  (`addGatewayLink={null}`). A surface that already has a Payment element keeps it, rendered and
+  editable, so opening and saving it never drops its `payment_policy`. The Payments page is gated
+  too: its sidebar entry (`featureFlag: 'agent_pay_delegation'`) is hidden and `/payments` (and
+  `/x402payments`, which redirects to it) goes to the dashboard (`AgentPayRoute`'s `fallback`).
+  Like `mediator_federation`, it is
+  system-only: a user's own flag overrides never change it, so the UI always matches the gateway,
+  which refuses to add a payment gateway while it is off. The gateway turns it on at startup when a
+  payment gateway already exists and no operator has set it either way. The Connections permission
+  list (`connectionsPermissions`) is shared by the route and the sidebar. When the settings cannot
+  be loaded, `FALLBACK_SETTINGS` (every flag off) is used so the pages waiting for them render.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and

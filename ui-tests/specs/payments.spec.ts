@@ -8,6 +8,7 @@
 
 import type { Page, Route } from "@playwright/test";
 import { expect, test } from "../helpers/fixtures";
+import { withFeatureFlag } from "../helpers/featureFlags";
 
 const BASE_URL = process.env.AG_BASE_URL || "http://localhost:8080";
 const SURFACE_ID = "payments-ui-surface";
@@ -384,7 +385,24 @@ async function mockLedgerApis(page: Page, options: { legacy?: boolean } = {}) {
   };
 }
 
+test.describe("Payments page while agent-pay is off", () => {
+  test("is not offered and sends a visit back to the dashboard", async ({
+    page,
+  }) => {
+    await withFeatureFlag(page, "agent_pay_delegation", false);
+    await page.goto(`${BASE_URL}/x402payments`);
+
+    await expect(page.getByTestId("nav-payments")).toHaveCount(0);
+    await expect(page.getByTestId("page-payments")).toHaveCount(0);
+    await expect(page).not.toHaveURL(/\/payments/);
+  });
+});
+
 test.describe("Payments page", () => {
+  test.beforeEach(async ({ page }) => {
+    await withFeatureFlag(page, "agent_pay_delegation");
+  });
+
   test("the old route redirects here, and the ledger filters by outcome", async ({
     page,
   }) => {

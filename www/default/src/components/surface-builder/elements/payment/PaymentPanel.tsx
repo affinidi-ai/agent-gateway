@@ -26,6 +26,7 @@ import {
   migrateLegacyPaymentConfig,
 } from './policy';
 import type { PaymentNodeConfig } from './types';
+import { useAgentPayFlag } from '../../../../utils/featureFlags';
 
 /** The connected agent-pay gateways that expose at least one payment surface. */
 async function loadPaymentGateways(force: boolean): Promise<GatewayOption[]> {
@@ -74,6 +75,7 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
   openFullscreenEditor,
 }) => {
   const config: PaymentNodeConfig = panelConfig;
+  const { enabled: agentPayOn } = useAgentPayFlag();
   const isPaymentSupported = protocol === 'mcp' || protocol === 'a2a';
   const legacy = config.unsupported_legacy;
   const active = isPaymentSupported && !legacy;
@@ -200,7 +202,7 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
           }
           noGatewayTitle="No connected payment gateway"
           noGatewayText="Connect an agent-pay payment gateway that exposes a payment surface, then select it here."
-          addGatewayLink={deepLinks.paymentGateway}
+          addGatewayLink={agentPayOn ? deepLinks.paymentGateway : null}
           addGatewayLabel="Add Payment Gateway"
           surfaceLabel="Payment Surface"
           surfacePlaceholder="Select a payment surface…"

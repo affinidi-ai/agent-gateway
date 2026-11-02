@@ -20,8 +20,8 @@ interface GatewaySurfacePickerProps {
   gatewayHelp: React.ReactNode;
   noGatewayTitle: string;
   noGatewayText: string;
-  /** Where the Add link opens, in a new tab; defaults to the Connect Gateway wizard. */
-  addGatewayLink?: string;
+  /** Where the Add link opens, in a new tab; defaults to the Connect Gateway wizard. `null` shows no link. */
+  addGatewayLink?: string | null;
   addGatewayLabel?: string;
   /** Shown for a saved gateway that is not in the list. */
   savedGatewayName?: string;
@@ -98,13 +98,15 @@ const GatewaySurfacePicker: React.FC<GatewaySurfacePickerProps> = ({
               {noGatewayTitle}
             </div>
             <div className="surface-info-panel-summary">{noGatewayText}</div>
-            <AddResourceLink
-              to={addGatewayLink}
-              testid={`${testIdPrefix}-add-gateway-link`}
-              className="btn btn-outline-primary btn-sm w-100 mt-2"
-            >
-              <i className="fas fa-link me-1" aria-hidden="true" /> {addGatewayLabel}
-            </AddResourceLink>
+            {addGatewayLink && (
+              <AddResourceLink
+                to={addGatewayLink}
+                testid={`${testIdPrefix}-add-gateway-link`}
+                className="btn btn-outline-primary btn-sm w-100 mt-2"
+              >
+                <i className="fas fa-link me-1" aria-hidden="true" /> {addGatewayLabel}
+              </AddResourceLink>
+            )}
           </div>
         ) : (
           <>
@@ -148,7 +150,8 @@ const GatewaySurfacePicker: React.FC<GatewaySurfacePickerProps> = ({
                 </button>
               </Form.Text>
             ) : (
-              !state.gatewaysLoading && (
+              !state.gatewaysLoading &&
+              addGatewayLink && (
                 <Form.Text className="text-muted d-block" style={HINT_STYLE}>
                   {noGateways ? `${noGatewayTitle}. ` : "Don't see the one you need? "}
                   <AddResourceLink to={addGatewayLink} testid={`${testIdPrefix}-add-gateway-link`}>

@@ -12,6 +12,12 @@ jest.mock('../../context/PermissionsContext', () => ({
   }),
 }));
 
+let mockAgentPayOn = true;
+
+jest.mock('../../utils/featureFlags', () => ({
+  useAgentPayFlag: () => ({ enabled: mockAgentPayOn, loaded: true }),
+}));
+
 jest.mock('../GatewaysPage', () => () => <div data-testid="stub-gateways" />);
 jest.mock('../MediatorsPage', () => () => <div data-testid="stub-mediators" />);
 jest.mock('../TrustRegistriesPage', () => () => <div data-testid="stub-registries" />);
@@ -51,6 +57,16 @@ const activeTab = () => screen.getByRole('tab', { selected: true }).textContent 
 describe('ConnectionsPage', () => {
   beforeEach(() => {
     mockPermissions = { 'gateways.view': true, 'payment_gateways.view': true };
+    mockAgentPayOn = true;
+  });
+
+  it('hides the Payment Gateways tab while agent-pay is off', () => {
+    mockAgentPayOn = false;
+    renderPage('/connections?tab=payment-gateways');
+
+    expect(screen.queryByTestId('connections-tab-payment-gateways')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('stub-payment-gateways')).not.toBeInTheDocument();
+    expect(activeTab()).toContain('Gateways');
   });
 
   it('shows the Payment Gateways tab to a user with payment_gateways.view', () => {

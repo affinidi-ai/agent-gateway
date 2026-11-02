@@ -1,3 +1,4 @@
+pub mod agent_pay_flag;
 pub mod approve;
 pub mod connection_points;
 pub mod did_cache;

@@ -161,6 +161,18 @@ describe('ElementRegistry', () => {
       expect(a2a).not.toContain('target');
     });
 
+    it('leaves out the hidden types and keeps their definitions', () => {
+      expect(registry.paletteItems('mcp').map(d => d.type)).toContain('payment');
+      const hidden = new Set(['payment']);
+      expect(registry.paletteItems('mcp', hidden).map(d => d.type)).not.toContain('payment');
+      expect(
+        Object.values(registry.paletteByCategory('mcp', hidden))
+          .flat()
+          .map(d => d!.type)
+      ).not.toContain('payment');
+      expect(registry.get('payment')).toBeDefined();
+    });
+
     it('offers Metadata Extraction only on A2A / AP2 surfaces', () => {
       expect(registry.paletteItems('a2a').map(d => d.type)).toContain('metadata-extraction');
       expect(registry.paletteItems('ap2').map(d => d.type)).toContain('metadata-extraction');

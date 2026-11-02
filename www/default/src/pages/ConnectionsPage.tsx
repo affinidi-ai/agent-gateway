@@ -3,6 +3,7 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
 import { usePermissions } from '../context/PermissionsContext';
+import { useAgentPayFlag } from '../utils/featureFlags';
 import GatewaysPage from './GatewaysPage';
 import MediatorsPage from './MediatorsPage';
 import PaymentGatewaysPage from './PaymentGatewaysPage';
@@ -21,7 +22,8 @@ const ConnectionsPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = usePermissions();
   const showGateways = hasPermission('gateways.view');
-  const showPaymentGateways = hasPermission('payment_gateways.view');
+  const { enabled: agentPayOn } = useAgentPayFlag();
+  const showPaymentGateways = agentPayOn && hasPermission('payment_gateways.view');
   const validTabs = ALL_TABS.filter(
     tab =>
       (tab !== 'gateways' || showGateways) && (tab !== 'payment-gateways' || showPaymentGateways)

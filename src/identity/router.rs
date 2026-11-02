@@ -1011,7 +1011,9 @@ pub fn create_identity_api_router(
                 "/v1/gateways/{id}/payment-role",
                 gate(
                     peer_gate(
-                        post(crate::gateways::handlers::set_payment_role::<crate::gateways::FileSystemGatewayStore>),
+                        crate::gateways::agent_pay_flag::gate_adding_payment_gateways(post(
+                            crate::gateways::handlers::set_payment_role::<crate::gateways::FileSystemGatewayStore>,
+                        )),
                         Feature::GatewaysEdit,
                     ),
                     Feature::PaymentGatewaysEdit,
@@ -1027,13 +1029,13 @@ pub fn create_identity_api_router(
             .route(
                 "/v1/payment-gateways/connect-via-oob",
                 payment_gate(
-                    post(
+                    crate::gateways::agent_pay_flag::gate_adding_payment_gateways(post(
                         crate::gateways::handlers::connect_via_oob::<
                             crate::gateways::FileSystemGatewayStore,
                             crate::gateways::FileSystemConnectionPointStore,
                             crate::mediators::FileSystemMediatorStore,
                         >,
-                    ),
+                    )),
                     Feature::PaymentGatewaysEdit,
                 ),
             )
