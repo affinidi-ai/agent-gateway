@@ -103,7 +103,9 @@ pub fn resolve_metadata_references<'a>(
 
                     let tenancy = runtime.tenancy;
                     let secret_tenant = secret.tenant_id.as_deref();
-                    if !crate::tenancy::can_reference_with_rule(tenancy.tenant_id, secret_tenant, tenancy.mode) {
+                    if tenancy.tenant_id.is_some()
+                        && !crate::tenancy::can_reference_with_rule(tenancy.tenant_id, secret_tenant, tenancy.mode)
+                    {
                         warn!(
                             channel = channel_name,
                             secret_id = secret_id_ref,
@@ -1838,14 +1840,29 @@ mod tests {
                 Err("Secret with secret_id 'other' not found".to_string()),
                 "{mode:?}"
             );
-            assert_eq!(resolve_secret(&store, None, mode, "wide").await, Ok(json!("wide-value")), "{mode:?}");
-            assert_eq!(
-                resolve_secret(&store, None, mode, "own").await,
-                Err("Secret with secret_id 'own' not found".to_string()),
-                "{mode:?}"
-            );
             assert_eq!(
                 resolve_secret(&store, Some("tenant-a"), mode, "missing").await,
+                Err("Secret with secret_id 'missing' not found".to_string()),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_with_no_tenant_resolves_a_metadata_secret_of_any_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = crate::secrets::test_support::tenant_secrets().await;
+
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            for secret_id in ["own", "wide", "other"] {
+                assert_eq!(
+                    resolve_secret(&store, None, mode, secret_id).await,
+                    Ok(json!(format!("{secret_id}-value"))),
+                    "{mode:?}"
+                );
+            }
+            assert_eq!(
+                resolve_secret(&store, None, mode, "missing").await,
                 Err("Secret with secret_id 'missing' not found".to_string()),
                 "{mode:?}"
             );

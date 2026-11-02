@@ -456,7 +456,8 @@ does: an MCP request is refused, and an A2A request or response is forwarded wit
   `api_key`, `oauth2_client_credentials`, `oauth2_client_credentials_jwt_auth` and
   `oauth2_jwt_bearer`. An appliance-wide `oauth2_authorization_code` provider sends the end
   user's token and stays usable on a tenant surface.
-- Appliance-wide surfaces are unaffected.
+- Appliance-wide surfaces are unaffected. Their custom metadata may name a secret of any
+  tenant, at runtime and on save, until a reassignment gives the surface a tenant.
 
 Saving a surface applies the same rule: a save that adds a reference breaking it is refused
 with `400` "reference is not accessible", while a reference the stored surface already held

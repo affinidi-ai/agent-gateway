@@ -47,6 +47,9 @@ pub async fn validate_surface_references(
     };
 
     for reference in collect_surface_reference_keys(surface)? {
+        if reference.custom_metadata && surface.tenant_id.is_none() {
+            continue;
+        }
         authorizer
             .validate_reference(&reference)
             .await?;
@@ -109,9 +112,10 @@ pub(crate) struct SurfaceReferenceKey {
     pub id: String,
     /// A secret a tenant surface sends upstream, which must not be appliance-wide.
     pub same_tenant: bool,
-    /// A `$SECRET:` helper in custom metadata, whose secret need not exist: one that does
-    /// not resolve fails when the metadata is injected, not when the surface is saved.
-    pub may_be_missing: bool,
+    /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
+    /// any secret there, and the secret need not exist: one that does not resolve fails when
+    /// the metadata is injected, not when the surface is saved.
+    pub custom_metadata: bool,
 }
 
 pub(crate) fn collect_surface_reference_keys(
@@ -134,7 +138,7 @@ pub(crate) fn collect_surface_reference_keys(
         let duplicate = later.kind == kept.kind && later.id == kept.id;
         if duplicate {
             kept.same_tenant |= later.same_tenant;
-            kept.may_be_missing &= later.may_be_missing;
+            kept.custom_metadata &= later.custom_metadata;
         }
         duplicate
     });
@@ -409,7 +413,7 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Secret", error))?
         else {
-            return if reference.may_be_missing {
+            return if reference.custom_metadata {
                 Ok(())
             } else {
                 Err(inaccessible("Secret"))
@@ -912,14 +916,14 @@ fn push_reference_key(
     kind: ResourceKind,
     id: &str,
     same_tenant: bool,
-    may_be_missing: bool,
+    custom_metadata: bool,
 ) {
     if !id.trim().is_empty() {
         references.push(SurfaceReferenceKey {
             kind,
             id: id.to_string(),
             same_tenant,
-            may_be_missing,
+            custom_metadata,
         });
     }
 }
@@ -1424,12 +1428,12 @@ mod tests {
     fn metadata_secrets(keys: &[SurfaceReferenceKey]) -> Vec<(String, bool, bool)> {
         keys.iter()
             .filter(|key| key.kind == ResourceKind::Secrets && key.id != "target-secret")
-            .map(|key| (key.id.clone(), key.same_tenant, key.may_be_missing))
+            .map(|key| (key.id.clone(), key.same_tenant, key.custom_metadata))
             .collect()
     }
 
     #[test]
-    fn a_secret_helper_nested_in_any_custom_metadata_is_a_same_tenant_reference_that_may_be_missing() {
+    fn a_secret_helper_nested_in_any_custom_metadata_is_a_same_tenant_custom_metadata_reference() {
         let keys = collect_surface_reference_keys(&metadata_surface()).unwrap();
 
         assert_eq!(
@@ -1441,7 +1445,7 @@ mod tests {
                 ("transit-meta".to_string(), true, true),
             ]
         );
-        assert!(!key(&keys, ResourceKind::Secrets, "target-secret").may_be_missing);
+        assert!(!key(&keys, ResourceKind::Secrets, "target-secret").custom_metadata);
     }
 
     #[test]
@@ -1492,7 +1496,7 @@ mod tests {
 
         let shared = key(&keys, ResourceKind::Secrets, "shared-secret");
         assert!(shared.same_tenant);
-        assert!(!shared.may_be_missing);
+        assert!(!shared.custom_metadata);
     }
 
     #[test]

@@ -86,6 +86,10 @@ pub struct OwnershipReference {
     /// appliance-wide target.
     #[serde(skip)]
     same_tenant: bool,
+    /// A surface names the target only in custom metadata, which holds it to a tenant only
+    /// while the surface has one.
+    #[serde(skip)]
+    custom_metadata: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -449,22 +453,27 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             for reference in collect_surface_reference_keys(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })? {
-                if reference.may_be_missing && !secret_exists(state, &reference.id).await? {
+                if reference.custom_metadata && !secret_exists(state, &reference.id).await? {
                     continue;
                 }
                 let same_tenant = reference.same_tenant
                     || (reference.kind == ResourceKind::CredentialProviders
                         && provider_sends_gateway_credential(state, &reference.id).await?);
-                add_reference_with_rule(
+                if let Some(edge) = ownership_reference(
                     state,
-                    &mut references,
                     source.clone(),
                     reference.kind,
                     &reference.id,
                     "surface configuration",
                     same_tenant,
                 )
-                .await?;
+                .await?
+                {
+                    references.push(OwnershipReference {
+                        custom_metadata: reference.custom_metadata,
+                        ..edge
+                    });
+                }
             }
         }
     }
@@ -721,8 +730,20 @@ async fn add_reference_with_rule(
     context: &str,
     same_tenant: bool,
 ) -> Result<(), OwnershipApiError> {
+    references.extend(ownership_reference(state, source, kind, id, context, same_tenant).await?);
+    Ok(())
+}
+
+async fn ownership_reference(
+    state: &IdentityApiState,
+    source: OwnershipEndpoint,
+    kind: ResourceKind,
+    id: &str,
+    context: &str,
+    same_tenant: bool,
+) -> Result<Option<OwnershipReference>, OwnershipApiError> {
     if id.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let normalized_kind = if kind == ResourceKind::ApiKeys {
         ResourceKind::Surfaces
@@ -748,13 +769,13 @@ async fn add_reference_with_rule(
         Some(resource) => endpoint_from_owned(&resource),
         None => endpoint(normalized_kind, id, None, false),
     };
-    references.push(OwnershipReference {
+    Ok(Some(OwnershipReference {
         source,
         target,
         context: context.to_string(),
         same_tenant,
-    });
-    Ok(())
+        custom_metadata: false,
+    }))
 }
 
 async fn secret_exists(
@@ -796,6 +817,8 @@ async fn provider_sends_gateway_credential(
 /// The conflicts a reassignment would cause. A tenant source that sends an appliance-wide
 /// target's credential is a conflict when the reassignment creates that situation, or when
 /// `isolation` is enforced; one that already exists is left alone while it is only warned about.
+/// A secret a surface names only in custom metadata is held to a tenant only while the surface
+/// has one.
 fn reassignment_conflicts(
     references: &[OwnershipReference],
     kind: ResourceKind,
@@ -827,6 +850,9 @@ fn reassignment_conflicts(
                     .tenant_id
                     .as_deref()
             };
+            if reference.custom_metadata && source_tenant.is_none() {
+                return None;
+            }
             let reason = if !reference.target.exists {
                 Some("Referenced resource does not exist".to_string())
             } else if !can_reference(source_tenant, target_tenant) {
@@ -1255,6 +1281,7 @@ mod tests {
             target: endpoint(ResourceKind::Secrets, "secret-1", target_tenant.map(str::to_string), true),
             context: "test".to_string(),
             same_tenant: false,
+            custom_metadata: false,
         }
     }
 
@@ -1355,6 +1382,78 @@ mod tests {
                 )
                 .len(),
                 1
+            );
+        }
+    }
+
+    fn metadata_edge(
+        source_tenant: Option<&str>,
+        target_tenant: Option<&str>,
+    ) -> OwnershipReference {
+        OwnershipReference {
+            custom_metadata: true,
+            ..credential_edge(source_tenant, target_tenant)
+        }
+    }
+
+    #[test]
+    fn a_metadata_secret_of_a_surface_with_no_tenant_is_held_to_a_tenant_only_once_the_surface_has_one() {
+        const CROSS_TENANT: &str = "The proposed tenant would make this reference cross-tenant";
+        for isolation in [RuleMode::Warn, RuleMode::Enforce] {
+            for (secret_tenant, requested) in
+                [(Some("tenant-a"), Some("tenant-b")), (Some("tenant-a"), None), (None, Some("tenant-b"))]
+            {
+                assert!(
+                    conflict_reasons(
+                        metadata_edge(None, secret_tenant),
+                        ResourceKind::Secrets,
+                        "secret-1",
+                        requested,
+                        isolation
+                    )
+                    .is_empty(),
+                    "{secret_tenant:?} {requested:?} {isolation:?}"
+                );
+            }
+            assert!(
+                conflict_reasons(
+                    metadata_edge(Some("tenant-a"), Some("tenant-a")),
+                    ResourceKind::Surfaces,
+                    "surface-1",
+                    None,
+                    isolation
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                conflict_reasons(
+                    metadata_edge(None, Some("tenant-a")),
+                    ResourceKind::Surfaces,
+                    "surface-1",
+                    Some("tenant-b"),
+                    isolation
+                ),
+                vec![CROSS_TENANT.to_string()]
+            );
+            assert_eq!(
+                conflict_reasons(
+                    metadata_edge(Some("tenant-a"), Some("tenant-a")),
+                    ResourceKind::Secrets,
+                    "secret-1",
+                    Some("tenant-b"),
+                    isolation
+                ),
+                vec![CROSS_TENANT.to_string()]
+            );
+            assert!(
+                conflict_reasons(
+                    metadata_edge(None, Some("tenant-a")),
+                    ResourceKind::Surfaces,
+                    "surface-1",
+                    Some("tenant-a"),
+                    isolation
+                )
+                .is_empty()
             );
         }
     }

@@ -950,21 +950,18 @@ async fn assert_new_metadata_secrets_follow_the_tenant(api: &Api) {
             );
         }
     }
-    assert_saved(
-        api.create(&with_metadata(api, "/smoke/metadata-appliance-surface", None, METADATA_PLACES[0], "appliance-key"))
+    for saved in ["appliance-key", "tenant-key", "other-tenant-key", "no-such-secret"] {
+        assert_saved(
+            api.create(&with_metadata(
+                api,
+                &format!("/smoke/metadata-appliance-surface-{saved}"),
+                None,
+                METADATA_PLACES[0],
+                saved,
+            ))
             .await,
-    );
-    assert_refused(
-        api.create(&with_metadata(
-            api,
-            "/smoke/metadata-appliance-surface-tenant-secret",
-            None,
-            METADATA_PLACES[0],
-            "tenant-key",
-        ))
-        .await,
-        NOT_ACCESSIBLE_SECRET,
-    );
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1052,4 +1049,31 @@ async fn a_reassignment_that_would_give_a_tenant_surface_an_appliance_wide_custo
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["tenant_id"], "tenant-a", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_with_no_tenant_names_any_metadata_secret_until_it_is_given_a_tenant() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let surface = api
+        .created_id(&with_metadata(&api, "/smoke/tenant-metadata", None, METADATA_PLACES[0], "tenant-key"))
+        .await;
+
+    let (status, body) = api
+        .reassign("secrets", &api.secret_uuids["tenant-key"], Some("tenant-b"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], "tenant-b", "{body}");
+
+    let (status, body) = api
+        .reassign("surfaces", &surface, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["conflicts"][0]["reason"], "The proposed tenant would make this reference cross-tenant", "{body}");
+    assert_eq!(api.stored(&surface).await["tenant_id"], Value::Null, "a blocked reassignment changes nothing");
+
+    let (status, body) = api
+        .reassign("surfaces", &surface, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], "tenant-b", "{body}");
 }
