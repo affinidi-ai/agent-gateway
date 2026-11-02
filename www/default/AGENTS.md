@@ -258,7 +258,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   option. An `external` binding is read-only: its provider, scopes, consent mode and injection
   inputs are disabled, and only the switch that removes it stays enabled, with a line saying
   whose grant it uses and that changing or removing it revokes its grants
-  (`transit-point-binding-subject`): such a binding is changed through the API.
+  (`transit-point-binding-subject`): such a binding is changed through the API. The Credential
+  Delegation element (`_shared/OutboundCredentialsListSection.tsx`) does the same for the Access
+  Point Target's binding with external consent in `outbound_credentials`
+  (`credential-delegation-consent-mode-select`, `credential-delegation-binding-subject`), and asks
+  for an agent identity only beside a binding without external consent, since the gateway
+  refuses a presentation of the agent beside one.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent
   editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,

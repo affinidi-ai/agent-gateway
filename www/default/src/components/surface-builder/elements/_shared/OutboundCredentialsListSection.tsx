@@ -32,7 +32,9 @@ interface CredentialProviderOption {
 export interface OutboundCredentialFormRow {
   credential_provider_id: string;
   scopes: string;
-  consent_mode: 'on_demand' | 'pre_authorize' | 'elicit';
+  consent_mode: 'on_demand' | 'pre_authorize' | 'elicit' | 'external';
+  /** Whose account an `external` binding's grant is: kept from the stored value. */
+  subject?: 'owner' | 'caller';
   elicit_timeout_secs?: number;
   elicit_fallback?: 'on_demand' | 'fail';
   required_for_mode: 'all' | 'tools';
@@ -90,6 +92,7 @@ export function outboundCredentialFormToApi(f: OutboundCredentialFormRow): any |
       elicit_timeout_secs: f.elicit_timeout_secs ?? 300,
       elicit_fallback: f.elicit_fallback ?? 'on_demand',
     }),
+    ...(f.subject !== undefined && { subject: f.subject }),
     inject_as,
   };
 }
@@ -123,6 +126,7 @@ export function outboundCredentialApiToForm(api: any): OutboundCredentialFormRow
     credential_provider_id: api.credential_provider_id,
     scopes: Array.isArray(api.scopes) ? api.scopes.join(', ') : '',
     consent_mode: api.consent_mode ?? 'on_demand',
+    ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
     elicit_timeout_secs: api.elicit_timeout_secs ?? 300,
     elicit_fallback: api.elicit_fallback ?? 'on_demand',
     required_for_mode,
@@ -328,7 +332,9 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
             </Form.Label>
             <Form.Select
               size="sm"
+              data-testid="credential-delegation-consent-mode-select"
               value={row.consent_mode}
+              disabled={row.consent_mode === 'external'}
               onChange={e =>
                 updateRow(idx, {
                   consent_mode: e.target.value as OutboundCredentialFormRow['consent_mode'],
@@ -338,7 +344,24 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
               <option value="on_demand">On demand (signal consent_required)</option>
               <option value="pre_authorize">Pre-authorize (block until granted)</option>
               <option value="elicit">Elicit (MCP elicitation/create prompt)</option>
+              {row.consent_mode === 'external' && (
+                <option value="external" disabled>
+                  External consent (set through the API)
+                </option>
+              )}
             </Form.Select>
+            {row.consent_mode === 'external' && (
+              <Form.Text
+                className="text-muted d-block"
+                data-testid="credential-delegation-binding-subject"
+                style={{ fontSize: '10px' }}
+              >
+                {row.subject === 'caller'
+                  ? "Each caller's requests to the Target carry the grant of their own account."
+                  : "Every caller's requests to the Target carry the one grant of the account that connected."}{' '}
+                Another system obtains the grant; change this binding through the API.
+              </Form.Text>
+            )}
             {row.consent_mode === 'elicit' && (
               <div className="mt-2 ps-2" style={{ borderLeft: '2px solid rgba(0,0,0,0.1)' }}>
                 <Form.Label className="small text-muted mb-0">Elicit timeout (seconds)</Form.Label>
