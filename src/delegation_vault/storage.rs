@@ -660,7 +660,7 @@ impl FileSystemDelegationVaultStore {
     /// stored were written under: true when none is stored, or one that can be
     /// read has the id this pepper derives for it. A fingerprint lost with
     /// grants beside it, under a wrong pepper, then never passes for ours.
-    async fn a_stored_grant_has_this_peppers_id(&self) -> Result<bool> {
+    async fn unrecorded_grants_are_ours(&self) -> Result<bool> {
         let ids = self
             .grant_ids_with_prefix("")
             .await?;
@@ -677,35 +677,41 @@ impl FileSystemDelegationVaultStore {
         Ok(false)
     }
 
-    /// Whether grants are stored that were written under another pepper.
+    /// Whether grants are stored that were written under another pepper: the
+    /// fingerprint names another, or none is recorded and no stored grant has
+    /// this pepper's id ([`Self::unrecorded_grants_are_ours`]).
     async fn pepper_mismatch(&self) -> Result<bool> {
-        Ok(self.stored_pepper().await? == StoredPepper::Another
-            && !self
+        match self.stored_pepper().await? {
+            StoredPepper::Ours => Ok(false),
+            StoredPepper::Another => Ok(!self
                 .grant_ids_with_prefix("")
                 .await?
-                .is_empty())
+                .is_empty()),
+            StoredPepper::Unrecorded => Ok(!self
+                .unrecorded_grants_are_ours()
+                .await?),
+        }
     }
 
     /// Record this gateway's pepper beside the grants before one is written,
-    /// refusing while grants written under another are stored. A fingerprint
-    /// with no grant beside it is replaced. Called with the mutation lock held.
+    /// refusing while grants written under another are stored, whether the
+    /// fingerprint names it or was lost ([`Self::pepper_mismatch`]). A
+    /// fingerprint with no grant beside it is replaced. Called with the
+    /// mutation lock held.
     async fn claim_pepper_locked(&self) -> Result<()> {
-        match self.stored_pepper().await? {
-            StoredPepper::Ours => return Ok(()),
-            StoredPepper::Another
-                if !self
-                    .grant_ids_with_prefix("")
-                    .await?
-                    .is_empty() =>
-            {
-                return Err(PepperMismatch.into());
-            }
-            StoredPepper::Another => warn!(
+        let stored = self.stored_pepper().await?;
+        if stored == StoredPepper::Ours {
+            return Ok(());
+        }
+        if self.pepper_mismatch().await? {
+            return Err(PepperMismatch.into());
+        }
+        if stored == StoredPepper::Another {
+            warn!(
                 target: "credential_delegation",
                 "The delegated grants' pepper fingerprint named another identity hash pepper, but no grant is \
                  stored; it now names this gateway's"
-            ),
-            StoredPepper::Unrecorded => {}
+            );
         }
         crate::storage::filesystem::atomic_write_file_with_mode(
             &self
@@ -1468,20 +1474,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     }
 
     async fn derives_stored_grant_ids(&self) -> Result<bool> {
-        if !self.stable_grant_ids {
-            return Ok(false);
-        }
-        match self.stored_pepper().await? {
-            StoredPepper::Ours => Ok(true),
-            StoredPepper::Another => Ok(self
-                .grant_ids_with_prefix("")
-                .await?
-                .is_empty()),
-            StoredPepper::Unrecorded => {
-                self.a_stored_grant_has_this_peppers_id()
-                    .await
-            }
-        }
+        Ok(self.stable_grant_ids && !self.pepper_mismatch().await?)
     }
 
     async fn grant_by_id(
@@ -2749,6 +2742,77 @@ mod tests {
         );
     }
 
+    /// With the fingerprint file lost, a gateway with another pepper is told
+    /// apart by the grants themselves: none has the id its pepper derives, so
+    /// it refuses to store or release a grant, says why at startup, and never
+    /// records its own fingerprint over them. The pepper they were written
+    /// under goes on as before and records its fingerprint again.
+    #[tokio::test]
+    async fn a_lost_fingerprint_never_lets_another_pepper_claim_the_grants() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let directory = tempfile::tempdir().unwrap();
+        let fingerprint = directory
+            .path()
+            .join("delegated_grants/pepper-fingerprint");
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        encrypted_vault(directory.path())
+            .await
+            .store_grant(grant(&key(), "first-access"))
+            .await
+            .unwrap();
+        std::fs::remove_file(&fingerprint).unwrap();
+
+        configure_pepper_bytes_for_tests(&[2; 32]);
+        let logs = FormattedLogs::capture();
+        let other = encrypted_vault(directory.path()).await;
+        let startup = logs.text();
+        assert!(startup.contains("written under another identity hash pepper"), "{startup}");
+        let refused = other
+            .store_grant(grant(&key(), "second-access"))
+            .await
+            .unwrap_err();
+        assert!(refused.is::<super::super::grants::PepperMismatch>(), "{refused}");
+        assert!(!fingerprint.exists(), "another pepper's fingerprint is never recorded over the grants");
+        assert!(
+            other
+                .grant(&key())
+                .await
+                .unwrap_err()
+                .is::<super::super::grants::PepperMismatch>()
+        );
+        assert!(
+            !other
+                .derives_stored_grant_ids()
+                .await
+                .unwrap()
+        );
+
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        let first = encrypted_vault(directory.path()).await;
+        assert!(
+            first
+                .derives_stored_grant_ids()
+                .await
+                .unwrap()
+        );
+        first
+            .store_grant(grant(&key(), "again-access"))
+            .await
+            .expect("the grants' own pepper stores as before");
+        assert!(fingerprint.exists(), "and records its fingerprint again");
+        assert_eq!(
+            first
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "again-access"
+        );
+    }
+
     fn corrupt(
         directory: &std::path::Path,
         id: &str,
@@ -3131,6 +3195,16 @@ mod tests {
         use crate::delegation_vault::grants::tests::{grant, key};
         let directory = tempfile::tempdir().unwrap();
         let vault = encrypted_vault(directory.path()).await;
+        vault
+            .store_grant(grant(
+                &GrantKey {
+                    credential_provider_id: "other-provider".into(),
+                    ..key()
+                },
+                "genuine-access",
+            ))
+            .await
+            .unwrap();
         let mut planted = grant(
             &GrantKey {
                 surface_id: "attacker-surface".into(),

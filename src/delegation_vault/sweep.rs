@@ -1020,12 +1020,6 @@ mod tests {
         store(earlier.clone(), "earlier", 3600).await;
         let earlier_id = earlier.record_id();
         crate::identity::credential_identity::configure_pepper_bytes_for_tests(&[2; 32]);
-        std::fs::remove_file(
-            directory
-                .path()
-                .join("vault/delegated_grants/pepper-fingerprint"),
-        )
-        .unwrap();
         store(served.clone(), "served", 3600).await;
         store(GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor"), "unbound", 3600).await;
         store(GrantKey::owner(Some("tenant-a"), "deleted-surface", "served", "vendor"), "orphan", 3600).await;

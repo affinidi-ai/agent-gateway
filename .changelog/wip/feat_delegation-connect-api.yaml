@@ -196,6 +196,8 @@ changes:
         the wrong one, deleted every grant and revoked its tokens at the vendors ten minutes after
         start, in a shared vault for every node. While the pepper is unset, or grants written
         under another are stored, the sweep now removes no grant and logs a warning. That holds
-        when the pepper fingerprint file is lost too: the sweep then goes ahead only once a stored
-        grant it can read has the id the gateway's pepper derives for it.
+        when the pepper fingerprint file is lost too: unless a stored grant the gateway can read
+        has the id its pepper derives, the grants count as written under another pepper, so the
+        gateway neither sweeps, stores nor releases them, and never records its own fingerprint
+        over them, which would have let a later sweep remove them all.
   breaking: []

@@ -874,7 +874,10 @@ cause, and then stores no grant, releases none (`identity_hash_pepper_mismatch`)
 every change that removes an external consent binding or deletes an external consent provider
 with `503`: it cannot find their grants under its own ids. Restore the pepper the grants were
 written under, or [purge them](#removing-grants). A fingerprint with no grant
-beside it is replaced by the next gateway that stores one.
+beside it is replaced by the next gateway that stores one. When the fingerprint file is missing
+while grants are stored, the grants decide: unless one the gateway can read has the id its
+pepper derives, the gateway treats them as written under another pepper in every way above, and
+never records its own fingerprint over them.
 
 A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
 `ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant
@@ -1348,9 +1351,8 @@ vault removes ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.r
 While `AG_IDENTITY_HASH_PEPPER` is not set, or the grants stored were written under another
 pepper ([Grants by binding](#grants-by-binding)), every grant's id differs from the one the
 gateway derives, so the sweep removes no grant at all and logs a warning: a lost or mistyped
-pepper on one node never deletes or revokes the grants. When the pepper fingerprint file is
-missing while grants are stored, the sweep goes ahead only once a grant it can read has the id
-the gateway's pepper derives for it. Restore the pepper they were written
+pepper on one node never deletes or revokes the grants, whether or not the fingerprint file is
+still there. Restore the pepper they were written
 under, or [purge them](#removing-grants). Pending connects and kept revocations are still swept.
 
 Each grant removed is revoked, as every removal is. The sweep also decides the revocations a
