@@ -28,7 +28,8 @@ use url::Url;
 
 use crate::url_validation::{
     is_blocked_resolved_ip, is_blocked_resolved_webhook_ip, is_cloud_metadata_resolved_ip,
-    validate_resolved_cloud_metadata_url, validate_resolved_url, validate_url_not_cloud_metadata, validate_webhook_url,
+    validate_resolved_cloud_metadata_url, validate_resolved_url, validate_url_not_cloud_metadata,
+    validate_url_not_cloud_metadata_host, validate_webhook_url,
 };
 
 /// Maximum number of redirects [`guarded_send_inner`] will follow before giving up.
@@ -287,14 +288,15 @@ fn pin_and_build(
 /// a localhost sidecar or same-VPC upstream. Pins the connection to the vetted
 /// address so DNS cannot be re-resolved to an internal address between vetting
 /// and connect (rebinding TOCTOU), and disables redirects so an upstream 3xx is
-/// returned to the caller rather than followed to an unvetted `Location`.
+/// returned to the caller rather than followed to an unvetted `Location`. A host
+/// that does not resolve is [`EgressError::Dns`], not a block.
 ///
 /// Resolves DNS (blocking OS resolver); call from a blocking context.
 pub(crate) fn pinned_forward_client(
     raw_url: &str,
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
-    let url = validate_resolved_cloud_metadata_url(raw_url).map_err(EgressError::Blocked)?;
+    let url = validate_url_not_cloud_metadata_host(raw_url).map_err(EgressError::Blocked)?;
     pin_and_build(url, is_cloud_metadata_resolved_ip, timeout)
 }
 
@@ -808,6 +810,12 @@ mod tests {
             let result = pinned_forward_client(raw, Duration::from_secs(5));
             assert!(matches!(result, Err(EgressError::Blocked(_))), "metadata must be blocked: {raw}, got {result:?}");
         }
+    }
+
+    #[test]
+    fn pinned_forward_client_reports_a_host_that_does_not_resolve_as_dns() {
+        let result = pinned_forward_client("http://nonexistent.host.invalid/agent", Duration::from_secs(5));
+        assert!(matches!(result, Err(EgressError::Dns(_))), "got {result:?}");
     }
 
     #[tokio::test]

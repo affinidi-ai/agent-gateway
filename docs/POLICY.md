@@ -514,7 +514,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
   but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
   or without `target.auth`, and records nothing; a blocked target reports
-  `blocked_by_egress`.
+  `blocked_by_egress` (`403`), and a host that does not resolve reports `unreachable`
+  (`502`).
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned

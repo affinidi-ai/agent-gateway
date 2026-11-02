@@ -652,12 +652,21 @@ impl TargetCardFetch<'_> {
         if !self.mode.serves() {
             return unrecorded_pinned_client(state, target_url)
                 .await
-                .ok_or_else(|| {
-                    warn!(channel = channel_name, target = %loggable::url(target_url), "Agent card preview blocked by egress policy");
-                    CardFailure::new(
-                        FetchFault::BlockedByEgress,
-                        create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"),
-                    )
+                .map_err(|e| match e {
+                    PinFailure::Egress(crate::egress::EgressError::Blocked(_)) => {
+                        warn!(channel = channel_name, target = %loggable::url(target_url), "Agent card preview blocked by egress policy");
+                        CardFailure::new(
+                            FetchFault::BlockedByEgress,
+                            create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"),
+                        )
+                    }
+                    e => {
+                        warn!(channel = channel_name, target = %loggable::url(target_url), error = %e, "Agent card preview could not reach the target");
+                        CardFailure::new(
+                            FetchFault::Unreachable,
+                            create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream"),
+                        )
+                    }
                 });
         }
         if !credential_sent {
@@ -771,12 +780,29 @@ impl TargetCardFetch<'_> {
     }
 }
 
-/// A client pinned to the vetted address of `target_url`, or `None` when the
-/// egress policy refuses it. Nothing is recorded.
+#[derive(Debug)]
+enum PinFailure {
+    Egress(crate::egress::EgressError),
+    Task(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for PinFailure {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Egress(e) => e.fmt(f),
+            Self::Task(e) => write!(f, "egress validation task failed: {e}"),
+        }
+    }
+}
+
+/// A client pinned to the vetted address of `target_url`. Nothing is recorded.
 async fn unrecorded_pinned_client(
     state: &ProxyState,
     target_url: &str,
-) -> Option<reqwest::Client> {
+) -> Result<reqwest::Client, PinFailure> {
     let candidate = target_url.to_string();
     let timeout = std::time::Duration::from_secs(
         state
@@ -785,8 +811,9 @@ async fn unrecorded_pinned_client(
             .timeout_seconds,
     );
     match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
-        Ok(Ok((client, _target))) => Some(client),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Ok((client, _target))) => Ok(client),
+        Ok(Err(e)) => Err(PinFailure::Egress(e)),
+        Err(e) => Err(PinFailure::Task(e)),
     }
 }
 
@@ -975,6 +1002,25 @@ mod tests {
         assert_eq!(failure.fault, FetchFault::BlockedByEgress);
         assert_eq!(failure.response.status(), StatusCode::FORBIDDEN);
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_preview_of_a_host_that_does_not_resolve_is_unreachable_not_blocked() {
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let state = state(json!({"endpoint": "http://no-such-host.invalid/agent"}), &metrics).await;
+
+        let (failure, events) = crate::audit::producer::capture(build(&state, CardMode::Preview)).await;
+
+        let failure = failure.unwrap_err();
+        assert_eq!(failure.fault, FetchFault::Unreachable);
+        assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(
+            recorded(&metrics, 1)
+                .await
+                .is_empty(),
+            "a preview records no gateway fault"
+        );
     }
 
     #[tokio::test]

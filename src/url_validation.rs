@@ -199,6 +199,36 @@ pub(crate) fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
 /// loopback and unspecified addresses are rejected both statically and after DNS
 /// resolution.  When `false` only cloud-provider metadata endpoints are blocked,
 /// and loopback / RFC 1918 are allowed — see [`validate_resolved_cloud_metadata_url`].
+/// The static half of [`validate_resolved_cloud_metadata_url`]: an http(s) URL
+/// with a host, no embedded credentials, and a host that is not a cloud-provider
+/// metadata service. Resolves nothing.
+pub(crate) fn validate_url_not_cloud_metadata_host(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("URL must not be empty".into());
+    }
+    let parsed = parse_http_url(trimmed)?;
+    if parsed.host().is_none()
+        || parsed
+            .host_str()
+            .is_some_and(|h| h.is_empty())
+    {
+        return Err("URL must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain embedded credentials".into());
+    }
+    let host = parsed.host().unwrap();
+    if is_cloud_metadata_host(&host) {
+        return Err(format!(
+            "URL host '{}' is blocked: cloud-provider metadata services are not allowed \
+             as target endpoints",
+            host
+        ));
+    }
+    Ok(parsed)
+}
+
 fn validate_resolved_url_inner(
     raw: &str,
     block_loopback: bool,
@@ -206,29 +236,7 @@ fn validate_resolved_url_inner(
     let parsed = if block_loopback {
         validate_url_not_cloud_metadata(raw)?
     } else {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err("URL must not be empty".into());
-        }
-        let p = parse_http_url(trimmed)?;
-        if p.host().is_none()
-            || p.host_str()
-                .is_some_and(|h| h.is_empty())
-        {
-            return Err("URL must include a host".into());
-        }
-        if !p.username().is_empty() || p.password().is_some() {
-            return Err("URL must not contain embedded credentials".into());
-        }
-        let host = p.host().unwrap();
-        if is_cloud_metadata_host(&host) {
-            return Err(format!(
-                "URL host '{}' is blocked: cloud-provider metadata services are not allowed \
-                 as target endpoints",
-                host
-            ));
-        }
-        p
+        validate_url_not_cloud_metadata_host(raw)?
     };
 
     // IP literals were already validated statically — no DNS to do.
