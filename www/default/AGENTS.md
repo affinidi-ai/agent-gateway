@@ -498,6 +498,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
   message names the setting shows in the section and in the sidebar, which also shows whether
   discovery is on.
+- **Accepted Audiences** adds a value left in the field when the field loses focus or on
+  Cmd/Ctrl+S, so a typed audience is saved without pressing Enter, comma, or Add. It adds
+  nothing while discovery is on, and skips empty and duplicate values.
 - A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
   operator switched off as `protected_resource: null` in the same PUT
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
