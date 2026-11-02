@@ -538,9 +538,11 @@ The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with 
 Authentication and reports whether the credential was sent or why it could not be obtained, never
 the token.
 
-`POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
-only `static_secret` target authentication, so listing the tools of an MCP server behind an
-OAuth-protected endpoint needs a static secret for now.
+`POST /v1/mcp-proxies/discover-tools`, the Surface Builder's design-time tool listing, still
+accepts only `static_secret` target authentication, so listing the tools of an MCP server behind
+an OAuth-protected endpoint needs a static secret for now. A tenant caller may use only its own
+tenant's secret there: an appliance-wide one is refused with `400` in `warn` mode too, since the
+request goes to an endpoint the caller chose and nothing is stored to keep working.
 ### External consent on a Transit Point
 
 A Transit Point's `transit_credentials` with `consent_mode: external` binds an

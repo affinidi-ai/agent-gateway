@@ -254,7 +254,11 @@ requires MCP Proxy edit plus Secret view authority, validates raw endpoints with
 `validate_resolved_url`, dials through a per-request Strict-pinned,
 redirect-disabled client (`egress::pinned_strict_client`), independently
 authorizes stored Proxy and Secret references, and requires resource-scoped PATs
-to discover through a stored MCP Proxy rather than a caller-supplied endpoint.
+to discover through a stored MCP Proxy rather than a caller-supplied endpoint. A tenant PAT
+may discover only with its own tenant's secrets: an appliance-wide secret is refused like
+another tenant's, with `400` "Target auth secret is not accessible", whatever
+`tenant_credential_isolation` says, because discovery sends the secret to an endpoint the
+caller chose and stores nothing.
 
 Ownership changes are administrator-only: `GET
 /v1/tenant-ownership/{kind}/{id}/impact` reports incoming/outgoing references and
