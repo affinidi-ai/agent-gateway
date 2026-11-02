@@ -16461,6 +16461,60 @@ mod tests {
         assert_eq!(kept.scopes.len(), 5, "the vendor's own words are kept: {:?}", kept.scopes);
     }
 
+    /// A grant the person consented to more narrowly than its connect asked
+    /// is refreshed for the scopes it holds only, never for ones it was not
+    /// granted (RFC 6749 section 6), and an answer that names no scope keeps
+    /// the scopes the grant held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_narrowed_grant_is_refreshed_for_the_scopes_it_holds() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let answer = Answer::json(
+            200,
+            json!({"token_type": "Bearer", "expires_in": 3600, "access_token": "refreshed",
+                "refresh_token": "refreshed-refresh"}),
+        );
+        let authorization_server = RecordingServer::start_answering(vec![answer]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "stale");
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+        grant.requested_scopes = Some(vec!["read".into(), "write".into()]);
+        grant.scopes = vec!["read".into()];
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(grant)
+            .await
+            .unwrap();
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", "owner");
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["transit_credentials"]["scopes"] = json!(["read", "write"]);
+        let surface = transit_surface(json!([point]), json!([]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        let (_, body) = authorization_server.requests()[0].clone();
+        let sent: std::collections::HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(sent["scope"], "read", "only the scope the grant holds");
+        let kept = stored_grant(&state, &key)
+            .await
+            .unwrap();
+        assert_eq!(kept.access_token, "refreshed");
+        assert_eq!(kept.scopes, ["read"], "an answer naming no scope keeps the grant's");
+        assert_eq!(kept.requested_scopes, Some(vec!["read".to_string(), "write".to_string()]));
+    }
+
     /// A grant asked for beyond its binding's scopes as saved now, as one
     /// left by a binding later narrowed, is never released: the call answers
     /// `connect_required`, since a new connect asks within the binding. A

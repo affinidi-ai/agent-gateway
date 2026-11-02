@@ -920,10 +920,13 @@ otherwise waits up to ten seconds for the refreshed one: a refresh on the same n
 soon as it ends, and one on another node is seen when it reads the grant again, after a wait
 that grows from a quarter of a second to two seconds. The request
 ([`src/delegation_vault/token_endpoint.rs`](../src/delegation_vault/token_endpoint.rs)) goes to
-the provider's `token_endpoint` with the refresh token, the scopes the connect asked for (which
-the person consented to, not the vendor's spelling of them) and the provider's `resource`, the
-client authenticating as at revocation (a `private_key_jwt` client with a new signed assertion),
-through pinned Strict egress. The request is sent and read by the token request every
+the provider's `token_endpoint` with the refresh token, the scopes the connect asked for (in the
+spelling the person consented to, not the vendor's) that the grant still holds, as its provider
+compares them ([Granted scopes](#granted-scopes)), so a grant the person consented to more
+narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
+provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
+(a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
+the scopes the grant held. The request is sent and read by the token request every
 credential provider shares, the service tokens' included, with a 30-second timeout and a 64 KiB
 cap on the answer, which must be a `Bearer` token. The rotated tokens are written
 under the lock, for the version the claim was made for, before the new access token is sent,
@@ -1002,7 +1005,10 @@ challenge: `{connect_id, code_challenge, code_challenge_method: "S256", expires_
 system builds the authorization request with that challenge and its own `state`.
 
 `POST /api/v1/delegation-vault/connects/{connect_id}/complete` with `{code, iss}` completes it.
-The connect is claimed once, which moves it, its verifier wiped, to the claimed connects
+The code's shape, the provider (still an external consent provider of the connect's tenant, and
+[permitted](#permitted-issuers)) and `iss` (step 1 below) are checked first; a completion they
+refuse leaves the connect open, so it can be completed again with the right values. The connect
+is then claimed once, which moves it, its verifier wiped, to the claimed connects
 (`pending_connects/claimed`), kept until it expires so a second claim answers `already_used`:
 the connect is read and decrypted, and its claimed copy written, outside the vault's lock, which
 only decides, by the file names, which claim came first. Then:
@@ -1027,7 +1033,7 @@ server's words are never echoed or logged.
 | --- | --- | --- |
 | `409` | `already_used` | The connect was completed, or tried, before |
 | `410` | `expired` | Ten minutes passed |
-| `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is spent |
+| `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is not claimed, and stays open |
 | `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, or more scopes were granted than asked for |
 | `409` | `binding_removed`, `binding_changed`, `provider_unavailable` | The binding or the provider went away, or the binding was narrowed below the scopes asked for, while the person consented |
 | `403` | `issuer_not_permitted`, `resource_not_permitted` | The operator's rules no longer permit the provider |
@@ -1111,7 +1117,8 @@ Before any of a batch of removed grants is revoked, each is kept, encrypted, in 
 revocation reached the vendor, whatever the vendor answered, or the grant was otherwise decided
 (below). A grant a change removes is kept as soon as it is deleted, while the change is saved,
 and forgotten when the change is not saved and the grant is put back. A gateway that stops while revocations are in flight, as in a deploy, tries them again
-when it starts, and the daily sweep tries any left. A revocation that could not reach its vendor
+when it starts and each time it becomes active, and the daily sweep tries any left. A revocation
+the sweep decides is kept the same way, as a pending one. A revocation that could not reach its vendor
 (`unreachable`, the 30-second limit included) is kept and tried again the same way, at most five
 times in all: its `token_revoked` event ends `,retry:pending` while it will be tried again and
 `,retry:exhausted` on the last, after which its tokens stay valid until they expire or the person
@@ -1286,7 +1293,7 @@ writes.
 | Route | Removes |
 | --- | --- |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}` | One grant, by its id (as the report or a refusal names it): `204`, `404` when there is none or it is another tenant's, `400` for an id that is not a grant's. It removes the connection it read, refreshed since or not; a grant the person connected again in between is kept |
-| `DELETE /api/v1/delegation-vault/grants?surface_id=&hop=[&credential_provider_id=][&principal=][&tenant_id=]` | Every grant of one binding, the owner's and each caller's, or only `principal`'s (`owner`, or a caller's identity hash). `transit_point_id` is accepted for `hop`. `credential_provider_id` may be left out while the surface still binds a provider at `hop`; name it for a binding the surface no longer has. An operator names the `tenant_id` of a surface that no longer exists; a tenant's token always means its own. Answers `{"removed": n, "grant_ids": [...], "purged": [...]}` |
+| `DELETE /api/v1/delegation-vault/grants?surface_id=&hop=[&credential_provider_id=][&principal=][&tenant_id=]` | Every grant of one binding, the owner's and each caller's, or only `principal`'s (`owner`, or a caller's identity hash). `transit_point_id` is accepted for `hop`. `credential_provider_id` may be left out while the surface still binds a provider at `hop`; name it for a binding the surface no longer has. An operator names the `tenant_id` of a surface that no longer exists; a tenant's token always means its own. Answers `{"removed": n, "grant_ids": [...], "purged": [...]}`, or `503` `surfaces_unavailable` while the surface cannot be read |
 
 The binding need not be saved any more, so the grants a removed binding left behind can be
 removed. Both routes read and delete the grants under the surface's lock, as a surface write and
@@ -1338,11 +1345,18 @@ vault removes ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.r
   since, which answer `connector_unavailable` or `connect_required` and which nobody connected
   again.
 
+While `AG_IDENTITY_HASH_PEPPER` is not set, or the grants stored were written under another
+pepper ([Grants by binding](#grants-by-binding)), every grant's id differs from the one the
+gateway derives, so the sweep removes no grant at all and logs a warning: a lost or mistyped
+pepper on one node never deletes or revokes the grants. Restore the pepper they were written
+under, or [purge them](#removing-grants). Pending connects and kept revocations are still swept.
+
 Each grant removed is revoked, as every removal is. The sweep also decides the revocations a
 removal left to it (`deferred`, [Revoking grants at the vendor](#revoking-grants-at-the-vendor)),
 with their providers, revoking each whose vendor account no other stored grant holds, and each
-that waited 30 days, and tries again the pending revocations kept, which the gateway also tries
-when it starts; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
+that waited 30 days, as pending revocations, so one that cannot reach its vendor is kept and
+tried again; and it tries again the pending revocations kept, which the gateway also tries when
+it starts and each time it becomes active; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
 file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
 and only then reads the binding's grants and decides, so a grant the person connected again
 while the sweep waited is the one it decides on. Every grant is decrypted once or twice a day. A

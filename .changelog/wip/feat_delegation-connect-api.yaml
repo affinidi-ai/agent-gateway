@@ -155,6 +155,45 @@ changes:
         under its own transit settings and Access Point, with a Warning on save; that a provider
         delete answers 503 while the surface store is unavailable; and that surface writes of
         every tenant wait while a deleted provider's grants are read and deleted.
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Keep retrying a revocation the sweep decides while its vendor is unreachable
+      description: >-
+        A revocation left to the daily sweep was forgotten once the sweep tried it, whether or not
+        it reached the vendor, so an outage left the tokens valid with nothing left to retry. It is
+        now kept as a pending revocation, retried up to five times like any other.
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Answer 503 when removing a binding's grants while its surface cannot be read
+      description: >-
+        Removing a binding's grants treated a surface store error as a deleted surface, and could
+        answer 200 having removed nothing, or a misleading 400. It now answers 503
+        surfaces_unavailable and removes nothing.
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Refresh a narrowed grant only for the scopes it holds
+      description: >-
+        A refresh asked again for every scope the connect asked for, even those the person did not
+        grant, which RFC 6749 forbids and standards-following servers refuse. It now asks for the
+        scopes the grant still holds, compared by the provider's scope_comparison, and an answer
+        that names no scope keeps the grant's scopes rather than recording the requested ones.
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Retry pending revocations when a standby node becomes active
+      description: >-
+        Revocations kept when a gateway stopped were retried at startup only on an active node, so
+        a node that started in standby left them until its daily sweep. They are now retried each
+        time the node becomes active.
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Leave a connect open when its completion is refused for iss or its provider
+      description: >-
+        Completing a connect claimed it, wiping its verifier, before iss and the provider were
+        checked, so a missing iss or a provider refused for a moment forced a new consent. Those
+        checks now run first, and a completion they refuse leaves the connect open.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-02T23:00:00Z'
+      title: Never sweep grants while the identity hash pepper is unset or changed
+      description: >-
+        The daily sweep took every grant whose id differs from the one the gateway derives for
+        grants of an earlier pepper, so a node started without AG_IDENTITY_HASH_PEPPER, or with
+        the wrong one, deleted every grant and revoked its tokens at the vendors ten minutes after
+        start, in a shared vault for every node. While the pepper is unset, or grants written
+        under another are stored, the sweep now removes no grant and logs a warning.
   breaking: []

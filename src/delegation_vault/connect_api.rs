@@ -438,6 +438,14 @@ pub async fn complete_connect(
     {
         return error(StatusCode::BAD_REQUEST, "invalid_code", "code must be a non-empty authorization code");
     }
+    let provider = match permitted_provider(&state, &pending.credential_provider_id, pending.tenant_id.as_deref()).await
+    {
+        Ok(provider) => provider,
+        Err((status, reason)) => return refused_before_claim(&pending, status, reason),
+    };
+    if let Err((status, reason)) = check_iss(&provider, request.iss.as_deref()) {
+        return refused_before_claim(&pending, status, reason);
+    }
     let claimed = match state
         .vault_store
         .claim_connect(&pending.id, Utc::now())
@@ -456,7 +464,7 @@ pub async fn complete_connect(
             );
         }
     };
-    let outcome = redeem(&state, &manager, &claimed, &request).await;
+    let outcome = redeem(&state, &manager, &claimed, &request, provider).await;
     let (status, reason) = match &outcome {
         Ok(_) => (StatusCode::OK, "connected"),
         Err((status, reason)) => (*status, *reason),
@@ -485,23 +493,50 @@ pub async fn complete_connect(
     }
 }
 
-/// Redeem a claimed connect's code and keep the grant.
+/// Check the authorization response's RFC 9207 `iss` against `provider`.
+fn check_iss(
+    provider: &CredentialProvider,
+    iss: Option<&str>,
+) -> Result<(), (StatusCode, &'static str)> {
+    match iss {
+        Some(iss) if Some(iss) != provider.issuer.as_deref() => Err((StatusCode::BAD_REQUEST, "iss_mismatch")),
+        // Required unless the issuer's metadata said it sends none: a provider
+        // created before that was recorded may be one whose issuer sends it.
+        None if provider.authorization_response_iss_parameter_supported != Some(false) => {
+            Err((StatusCode::BAD_REQUEST, "iss_missing"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a completion whose checks failed before the connect was claimed,
+/// so the connect can still be completed.
+fn refused_before_claim(
+    pending: &PendingConnect,
+    status: StatusCode,
+    reason: &'static str,
+) -> Response {
+    info!(
+        target: "credential_delegation",
+        connect_id = %pending.id,
+        surface_id = ?pending.surface_id,
+        hop = ?pending.hop,
+        credential_provider_id = %pending.credential_provider_id,
+        outcome = reason,
+        "External consent connect refused before it was claimed"
+    );
+    failed(status, reason)
+}
+
+/// Redeem a claimed connect's code with `provider`, checked before the claim,
+/// and keep the grant.
 async fn redeem(
     state: &DelegationVaultState,
     manager: &Manager,
     connect: &PendingConnect,
     request: &CompleteConnectRequest,
+    provider: CredentialProvider,
 ) -> Result<DelegatedGrant, (StatusCode, &'static str)> {
-    let provider = permitted_provider(state, &connect.credential_provider_id, connect.tenant_id.as_deref()).await?;
-    match request.iss.as_deref() {
-        Some(iss) if Some(iss) != provider.issuer.as_deref() => return Err((StatusCode::BAD_REQUEST, "iss_mismatch")),
-        // Required unless the issuer's metadata said it sends none: a provider
-        // created before that was recorded may be one whose issuer sends it.
-        None if provider.authorization_response_iss_parameter_supported != Some(false) => {
-            return Err((StatusCode::BAD_REQUEST, "iss_missing"));
-        }
-        _ => {}
-    }
     let verifier = connect
         .code_verifier
         .as_deref()
@@ -962,11 +997,20 @@ pub async fn delete_binding_grants(
         .agent_surface_store
         .as_ref()
     {
-        Some(surfaces) => surfaces
+        Some(surfaces) => match surfaces
             .get(&query.surface_id)
             .await
-            .ok()
-            .flatten(),
+        {
+            Ok(surface) => surface,
+            Err(error) => {
+                warn!(target: "credential_delegation", error = %error, "Failed to read a surface to remove its grants");
+                return self::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "surfaces_unavailable",
+                    "Surfaces are unavailable",
+                );
+            }
+        },
         None => None,
     };
     let tenant_id = match &stored_surface {
@@ -1535,10 +1579,11 @@ mod tests {
     }
 
     /// A completion with another `iss`, or none when the issuer says it sends
-    /// one, is refused before the code is redeemed; the connect is spent.
+    /// one, is refused before the connect is claimed and the code redeemed, so
+    /// the connect can still be completed with the provider's `iss`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_completion_is_refused_for_an_iss_that_is_not_the_providers() {
-        let fixture = Fixture::new(vec![token_answer("unused")]).await;
+        let fixture = Fixture::new(vec![token_answer("first"), token_answer("second")]).await;
         for (body, reason) in [
             (json!({"code": "the-code", "iss": "https://attacker.example"}), "iss_mismatch"),
             (json!({"code": "the-code"}), "iss_missing"),
@@ -1554,19 +1599,13 @@ mod tests {
                 .complete(&connect_id, body)
                 .await;
             assert_eq!((status, answer), (StatusCode::BAD_REQUEST, json!({"status": "failed", "reason": reason})));
-            assert_eq!(
-                fixture
-                    .complete(&connect_id, json!({"code": "the-code", "iss": fixture.issuer()}))
-                    .await
-                    .0,
-                StatusCode::CONFLICT
-            );
+            let (status, answer) = fixture
+                .complete(&connect_id, json!({"code": "the-code", "iss": fixture.issuer()}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["status"], "connected");
         }
-        assert!(
-            fixture
-                .token_requests()
-                .is_empty()
-        );
+        assert_eq!(fixture.token_requests().len(), 2, "only the completions with the provider's iss redeemed the code");
     }
 
     /// A provider created before the gateway recorded whether its issuer
@@ -2288,5 +2327,70 @@ mod tests {
         .status();
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(file.exists(), "nothing is purged by binding either");
+    }
+
+    struct UnreadableSurfaces;
+
+    #[async_trait::async_trait]
+    impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
+        async fn save(
+            &self,
+            _surface: &AgentSurface,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("disk unavailable")
+        }
+
+        async fn get(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<Option<AgentSurface>> {
+            anyhow::bail!("disk unavailable")
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>> {
+            anyhow::bail!("disk unavailable")
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("disk unavailable")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_binding_removal_answers_503_while_its_surface_cannot_be_read() {
+        let fixture = Fixture::new(vec![]).await;
+        let mut state = fixture.state.clone();
+        state.agent_surface_store = Some(Arc::new(UnreadableSurfaces));
+        let query = |credential_provider_id: Option<&str>| BindingGrantsQuery {
+            surface_id: "surface".into(),
+            hop: "owner-hop".into(),
+            credential_provider_id: credential_provider_id.map(str::to_string),
+            tenant_id: None,
+            principal: None,
+        };
+        for credential_provider_id in [None, Some("vendor")] {
+            let (status, body) = read(
+                delete_binding_grants(
+                    State(state.clone()),
+                    caller(),
+                    None,
+                    None,
+                    None,
+                    Query(query(credential_provider_id)),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["code"], "surfaces_unavailable");
+        }
+        let (status, body) = read(
+            delete_binding_grants(State(fixture.state.clone()), caller(), None, None, None, Query(query(None))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 }

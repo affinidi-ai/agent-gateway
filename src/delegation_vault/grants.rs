@@ -420,12 +420,13 @@ pub struct DelegatedGrant {
     #[serde(default = "default_token_type")]
     pub token_type: String,
     /// The scopes the token holds, as the authorization server last named
-    /// them, or the ones asked for when it named none.
+    /// them; when it named none, the ones asked for at the connect, or those
+    /// held before at a refresh.
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// The scopes the connect asked for, which the person consented to and
-    /// every refresh asks for again; `None` for a grant that does not record
-    /// them, whose [`Self::scopes`] stand for them.
+    /// The scopes the connect asked for, which the person consented to; every
+    /// refresh asks again for those of them the grant still holds. `None` for
+    /// a grant that does not record them, whose [`Self::scopes`] stand for them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

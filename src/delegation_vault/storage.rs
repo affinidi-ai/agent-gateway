@@ -287,6 +287,14 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
+    /// Whether this gateway derives the record ids the grants stored were
+    /// written under: `AG_IDENTITY_HASH_PEPPER` is set, and no grant stored
+    /// was written under another pepper. Until it does, a grant's id says
+    /// nothing about whether it can still be released.
+    async fn derives_stored_grant_ids(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// The grant stored under the record id `id`, read whatever pepper it was
     /// written under; `None` when there is none. Fails when it cannot be read.
     async fn grant_by_id(
@@ -1436,6 +1444,10 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     async fn grant_ids(&self) -> Result<Vec<String>> {
         self.grant_ids_with_prefix("")
             .await
+    }
+
+    async fn derives_stored_grant_ids(&self) -> Result<bool> {
+        Ok(self.stable_grant_ids && !self.pepper_mismatch().await?)
     }
 
     async fn grant_by_id(

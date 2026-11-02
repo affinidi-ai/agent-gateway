@@ -591,13 +591,16 @@ impl ReleaseContext<'_> {
             .grant()
             .scopes_asked_for()
             .to_vec();
+        let held = provider
+            .scope_comparison
+            .held(&requested, &claim.grant().scopes);
         let answer = super::token_endpoint::request_token(
             provider,
             self.secrets,
             self.exact_allowlist,
             TokenRequest::Refresh {
                 refresh_token: &refresh_token,
-                scopes: &requested,
+                scopes: &held,
             },
         )
         .await;
@@ -607,7 +610,7 @@ impl ReleaseContext<'_> {
                 let granted = answer
                     .scopes
                     .clone()
-                    .unwrap_or_else(|| requested.clone());
+                    .unwrap_or_else(|| claim.grant().scopes.clone());
                 let tokens = ObtainedTokens {
                     access_token: answer.access_token,
                     refresh_token: answer.refresh_token,

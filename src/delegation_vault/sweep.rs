@@ -7,7 +7,8 @@
 //! which can never be released again; grants whose access token expired and
 //! cannot be refreshed; and grants whose access token expired more than
 //! [`FAILING_GRANT_DAYS`] days ago and whose refresh has failed ever since.
-//! Every grant it removes is revoked at its authorization server, as every
+//! While the pepper is not set, or is not the one the grants stored were
+//! written under, it removes no grant. Every grant it removes is revoked at its authorization server, as every
 //! removal is. It also decides the revocations a removal left to it because
 //! the vault could not tell whether the vendor account's authorization was
 //! still in use ([`super::revocation::revoke_deferred`]), and tries again the
@@ -96,24 +97,32 @@ fn binding_prefix(id: &str) -> Option<&str> {
 }
 
 impl Sweeper {
-    /// Try again the pending revocations kept, at once, then run the sweep
-    /// every [`SWEEP_INTERVAL`], the first after [`FIRST_SWEEP_DELAY`], while
-    /// the node is active.
+    /// Try again the pending revocations kept, at once while the node is
+    /// active and again each time it becomes active, then run the sweep every
+    /// [`SWEEP_INTERVAL`], the first after [`FIRST_SWEEP_DELAY`], while the
+    /// node is active.
     pub fn spawn(self) {
         tokio::spawn(async move {
+            let mut mode_changes = crate::server::mode::subscribe_mode_changes();
             if !crate::server::mode::is_standby() {
-                let tried = self.retry_pending().await;
-                tracing::info!(
-                    target: "credential_delegation",
-                    pending_revocations = tried,
-                    "Tried again the revocations pending when the gateway stopped"
-                );
+                self.retry_pending_logged()
+                    .await;
             }
             let mut interval =
                 tokio::time::interval_at(tokio::time::Instant::now() + FIRST_SWEEP_DELAY, SWEEP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut listening = true;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    change = mode_changes.recv(), if listening => {
+                        listening = !matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed));
+                        if became_active(&change) && !crate::server::mode::is_standby() {
+                            self.retry_pending_logged().await;
+                        }
+                        continue;
+                    }
+                }
                 if crate::server::mode::is_standby() {
                     continue;
                 }
@@ -154,6 +163,30 @@ impl Sweeper {
         report.deferred_revocations = self
             .decide_deferred(now, &mut providers)
             .await;
+        match self
+            .vault
+            .derives_stored_grant_ids()
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    "Swept no grant: AG_IDENTITY_HASH_PEPPER is not set, or the grants stored were written under \
+                     another pepper, so no grant's id tells whether it can still be released; restore the pepper \
+                     they were written under, or have an operator purge them"
+                );
+                return report;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    error = %error,
+                    "Swept no grant: the pepper the grants stored were written under cannot be read"
+                );
+                return report;
+            }
+        }
         let ids = match self.vault.grant_ids().await {
             Ok(ids) => ids,
             Err(error) => {
@@ -175,6 +208,15 @@ impl Sweeper {
                 .await;
         }
         report
+    }
+
+    async fn retry_pending_logged(&self) {
+        let tried = self.retry_pending().await;
+        tracing::info!(
+            target: "credential_delegation",
+            pending_revocations = tried,
+            "Tried again the revocations kept pending"
+        );
     }
 
     /// Try again the pending revocations kept, with the providers of their
@@ -405,6 +447,16 @@ impl Sweeper {
     }
 }
 
+/// Whether a mode change, as received, may have made the node active: a
+/// promotion, or changes missed while the receiver lagged.
+fn became_active(change: &Result<crate::server::mode::ModeChange, tokio::sync::broadcast::error::RecvError>) -> bool {
+    match change {
+        Ok(change) => change.mode == crate::server::mode::ServerMode::Active,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+    }
+}
+
 /// Whether an expired grant can still be refreshed, with `provider`, its
 /// provider, when there is one.
 fn refreshable(
@@ -553,6 +605,94 @@ mod tests {
         ) -> anyhow::Result<Option<CredentialProvider>> {
             anyhow::bail!("unreadable")
         }
+    }
+
+    /// Kept revocations are tried again on a promotion to active, and after
+    /// mode changes were missed, never on a step down to standby.
+    #[test]
+    fn a_promotion_tries_the_kept_revocations_again() {
+        use crate::server::mode::{ModeChange, ServerMode};
+        use tokio::sync::broadcast::error::RecvError;
+        let change = |mode| Ok(ModeChange { mode, generation: 1 });
+        assert!(became_active(&change(ServerMode::Active)));
+        assert!(!became_active(&change(ServerMode::Standby)));
+        assert!(became_active(&Err(RecvError::Lagged(3))));
+        assert!(!became_active(&Err(RecvError::Closed)));
+    }
+
+    /// While the grants stored were written under another pepper, or no
+    /// pepper is set, every grant's id differs from the one this gateway
+    /// derives: the sweep removes and revokes none of them, whatever else it
+    /// would remove them for. With the pepper restored it sweeps as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_removes_no_grant_while_the_pepper_is_not_the_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let mut sweeper = sweeper(&directory, &server, false).await;
+        store(&sweeper, &GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor"), "served", 3600).await;
+        store(&sweeper, &GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor"), "unbound", 3600).await;
+        let fingerprint = directory
+            .path()
+            .join("vault/delegated_grants/pepper-fingerprint");
+        let ours = std::fs::read_to_string(&fingerprint).unwrap();
+        let open = |pepper_set: bool| {
+            let path = directory.path().join("vault");
+            async move {
+                crate::identity::credential_identity::configure_pepper_for_tests(pepper_set);
+                let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
+                    crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(path)
+                        .await
+                        .unwrap(),
+                );
+                vault
+            }
+        };
+
+        std::fs::write(&fingerprint, "another pepper").unwrap();
+        sweeper.vault = open(true).await;
+        assert_eq!(
+            sweeper
+                .sweep(Utc::now())
+                .await,
+            SweepReport::default(),
+            "another pepper"
+        );
+
+        std::fs::write(&fingerprint, &ours).unwrap();
+        sweeper.vault = open(false).await;
+        assert_eq!(
+            sweeper
+                .sweep(Utc::now())
+                .await,
+            SweepReport::default(),
+            "no pepper set"
+        );
+
+        assert_eq!(
+            sweeper
+                .vault
+                .grant_ids()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(server.requests().is_empty(), "nothing was revoked");
+
+        sweeper.vault = open(true).await;
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+        assert_eq!(report.unbound_grants, 1, "with the pepper restored");
+        assert_eq!(
+            sweeper
+                .vault
+                .grant_ids()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// When the provider store cannot be read, the sweep cannot tell whether

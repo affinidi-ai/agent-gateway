@@ -31,8 +31,8 @@ pub enum TokenRequest<'a> {
     /// Redeem an authorization code with the PKCE verifier only the gateway
     /// holds, for the redirect URI the authorization request named.
     AuthorizationCode { code: &'a str, redirect_uri: &'a str, code_verifier: &'a str },
-    /// Refresh a grant, asking again for the scopes its connect asked for,
-    /// which the person consented to.
+    /// Refresh a grant, asking again for the scopes its connect asked for
+    /// that the grant still holds.
     Refresh { refresh_token: &'a str, scopes: &'a [String] },
 }
 

@@ -155,21 +155,8 @@ pub async fn revoke_grant(
     exact_allowlist: Option<&str>,
     actor: Option<&AuditCallerContext>,
 ) -> GrantRevocation {
-    revoke_noted(provider, grant, secrets, exact_allowlist, actor, None).await
-}
-
-/// [`revoke_grant`], its audit record's `detail` ending with `note` when
-/// there is one.
-async fn revoke_noted(
-    provider: &CredentialProvider,
-    grant: &DelegatedGrant,
-    secrets: Option<&Arc<dyn SecretsStore>>,
-    exact_allowlist: Option<&str>,
-    actor: Option<&AuditCallerContext>,
-    note: Option<&'static str>,
-) -> GrantRevocation {
     let revocation = revoke(provider, grant, secrets, exact_allowlist).await;
-    record_revocation(&provider.id, Some(&provider.name), grant, revocation, actor, note.as_slice());
+    record_revocation(&provider.id, Some(&provider.name), grant, revocation, actor, &[]);
     revocation
 }
 
@@ -664,24 +651,6 @@ async fn decide_each(
 }
 
 impl Revoker {
-    async fn revoke(
-        &self,
-        provider: &CredentialProvider,
-        grant: &DelegatedGrant,
-        note: Option<&'static str>,
-    ) -> GrantRevocation {
-        revoke_noted(
-            provider,
-            grant,
-            self.secrets.as_ref(),
-            self.exact_allowlist
-                .as_deref(),
-            self.actor.as_ref(),
-            note,
-        )
-        .await
-    }
-
     /// Revoke `grant` at `provider`, then settle `kept`, its pending
     /// revocation, and audit the outcome: `kept` is forgotten once the
     /// revocation reached the vendor, whatever it answered; while it could not
@@ -784,8 +753,9 @@ impl Revoker {
 /// Decide the revocations kept, as of `now`: the pending ones are tried
 /// again ([`revoke_pending`]); those a removal left to the daily sweep
 /// ([`SKIPPED_DEFERRED`]) are each revoked once no other grant of its vendor
-/// account is stored, or recorded `skipped` ([`SKIPPED_AUTHORIZATION_IN_USE`])
-/// when one is, and forgotten either way. One the vault still cannot tell
+/// account is stored, as a pending revocation is, so one that cannot reach its
+/// vendor is kept and tried again; or recorded `skipped`
+/// ([`SKIPPED_AUTHORIZATION_IN_USE`]) when one is, and forgotten. One the vault still cannot tell
 /// about is kept, until it has waited [`DEFERRED_REVOCATION_DAYS`] days, when
 /// it is revoked all the same: a revocation is delayed, never lost.
 /// `revoker.providers` must hold the provider of each kept grant that still
@@ -846,9 +816,16 @@ pub async fn revoke_deferred(
                         &[],
                     ),
                     (Some(false), _) | (None, true) => {
+                        let grant = grant.clone();
+                        let pending = DeferredRevocation {
+                            deferral: Deferral::Pending,
+                            ..deferral
+                        };
                         revoker
-                            .revoke(provider, grant, None)
+                            .revoke_kept(provider, &grant, Some(pending), None)
                             .await;
+                        decided += 1;
+                        continue;
                     }
                     (None, false) => continue,
                 }
@@ -2824,6 +2801,53 @@ pub(crate) mod tests {
         );
         let (decided, events) = crate::audit::producer::capture(revoke_pending(revoker)).await;
         assert_eq!((decided, events.len()), (0, 0));
+    }
+
+    /// A revocation the sweep decides that cannot reach its vendor is kept as
+    /// a pending one, its attempt counted, rather than forgotten: a deferred
+    /// revocation is delayed, never lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decided_revocation_that_cannot_reach_its_vendor_is_kept_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let (vault, _) = vault_with(&directory, 0).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "hop", "provider");
+        vault
+            .defer_revocation(account_grant(&key, "deferred", Some("account-1")))
+            .await
+            .unwrap();
+        let revoker = Revoker {
+            providers: HashMap::from([(
+                "provider".to_string(),
+                provider(Some("http://127.0.0.1:1/revoke"), "none", None),
+            )]),
+            secrets: Some(secrets),
+            exact_allowlist: Some("http://127.0.0.1:1".to_string()),
+            actor: None,
+            vault: Some(vault.clone()),
+        };
+        let (decided, events) = crate::audit::producer::capture(revoke_deferred(revoker, chrono::Utc::now())).await;
+        assert_eq!(decided, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.detail.as_deref())
+                .collect::<Vec<_>>(),
+            ["vendor_revocation:unreachable,access_token:unreachable,retry:pending"]
+        );
+        let kept = pending_after_restart(&directory).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].attempts, 1);
+        assert_eq!(kept[0].grant.access_token, "deferred");
+        assert_eq!(
+            vault
+                .deferred_revocations()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the deferred record became the pending one"
+        );
     }
 
     /// A pending revocation whose grant the vault holds again, as one put

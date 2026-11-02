@@ -72,6 +72,24 @@ impl ScopeComparison {
             .collect()
     }
 
+    /// The scopes of `requested`, in their own spelling, that `granted`
+    /// holds as this comparison spells them; the vendor's standard identity
+    /// scopes always count as held.
+    pub fn held(
+        self,
+        requested: &[String],
+        granted: &[String],
+    ) -> Vec<String> {
+        requested
+            .iter()
+            .filter(|scope| {
+                self.widened(granted, std::slice::from_ref(*scope))
+                    .is_empty()
+            })
+            .cloned()
+            .collect()
+    }
+
     /// `scope` as this comparison spells it.
     fn normal(
         self,
@@ -141,6 +159,25 @@ mod tests {
             ScopeComparison::Google.widened(&requested, &scopes("https://www.googleapis.com/auth/Drive.ReadOnly")),
             ["https://www.googleapis.com/auth/Drive.ReadOnly"],
             "Google's scopes keep their case"
+        );
+    }
+
+    /// A grant narrower than its request holds only some of the scopes asked
+    /// for, kept in the spelling they were asked with, as the vendor spells
+    /// them compared by the vendor's rules.
+    #[test]
+    fn the_scopes_held_are_those_asked_for_that_the_grant_names() {
+        let requested = scopes("Mail.Read Mail.Send openid");
+        let granted = scopes("https://graph.microsoft.com/mail.read");
+        assert_eq!(ScopeComparison::Microsoft.held(&requested, &granted), scopes("Mail.Read openid"));
+        assert_eq!(ScopeComparison::Exact.held(&requested, &granted), Vec::<String>::new(), "exactly, none is held");
+        assert_eq!(ScopeComparison::Exact.held(&requested, &requested), requested, "a full grant holds every scope");
+        assert_eq!(
+            ScopeComparison::Google.held(
+                &scopes("https://www.googleapis.com/auth/drive.readonly email"),
+                &scopes("https://www.googleapis.com/auth/userinfo.email")
+            ),
+            scopes("email")
         );
     }
 
