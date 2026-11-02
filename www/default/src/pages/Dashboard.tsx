@@ -910,6 +910,7 @@ const Dashboard: React.FC = () => {
           title="Aggregated Connections Over Time"
           headerActions={
             <Form.Select
+              data-testid="dashboard-bucket-select"
               aria-label="Select time interval for aggregated connections chart"
               className="form-control form-control-sm dropdown-styling"
               style={{ width: 'auto' }}
@@ -970,6 +971,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'pie' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-pie-button"
                   onClick={() => setChannelChartView('pie')}
                 >
                   Pie
@@ -977,6 +979,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'bar' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-bar-button"
                   onClick={() => setChannelChartView('bar')}
                 >
                   Bar
@@ -984,6 +987,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'connections' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-connections-button"
                   onClick={() => setChannelChartView('connections')}
                 >
                   Connections
@@ -1099,6 +1103,7 @@ const Dashboard: React.FC = () => {
                   onDelete={async () => {
                     await actions.truncateMetrics();
                   }}
+                  data-testid="dashboard-metrics-delete-button"
                   title="Clear all stored metrics data"
                   variant="danger"
                 >
@@ -1106,6 +1111,7 @@ const Dashboard: React.FC = () => {
                 </DeleteButton>
                 <button
                   className="btn btn-sm btn-outline-primary"
+                  data-testid="dashboard-logs-button"
                   onClick={() => navigate('/logs')}
                   title="View system logs"
                 >
@@ -1113,6 +1119,7 @@ const Dashboard: React.FC = () => {
                 </button>
                 <button
                   className="btn btn-sm btn-outline-primary"
+                  data-testid="dashboard-settings-button"
                   onClick={() => navigate('/settings')}
                   title="Configure dashboard settings"
                 >

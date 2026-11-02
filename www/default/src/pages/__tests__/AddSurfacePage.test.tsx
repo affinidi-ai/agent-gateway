@@ -1,12 +1,14 @@
 import React from 'react';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import AddSurfacePage from '../AddSurfacePage';
 import { apiClient } from '../../api';
 import type { AgentSurface } from '../../api';
 import { fetchRoutingConfig } from '../../components/surface-builder/elements/access-point/defaults';
+import { showToast } from '../../utils/toaster';
 
+jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
 jest.mock('../../components/surface-builder/SurfaceCanvas', () => ({
   getIncompleteReason: () => null,
 }));
@@ -20,6 +22,25 @@ jest.mock('../../components/surface-builder/hooks/useSurfacePolicyDefinitions', 
 jest.mock('../../components/surface-builder/templates/useSurfaceTemplates', () => ({
   useSurfaceTemplates: () => ({ templates: [], loading: false, error: null }),
 }));
+let mockCompleteCanvas = false;
+jest.mock('../../components/surface-builder/hooks/useSurfaceBuilder', () => {
+  const actual = jest.requireActual('../../components/surface-builder/hooks/useSurfaceBuilder');
+  return {
+    ...actual,
+    useSurfaceBuilder: (...args: unknown[]) => {
+      const builder = actual.useSurfaceBuilder(...args);
+      if (!mockCompleteCanvas) return builder;
+      return {
+        ...builder,
+        hasIncompleteNodes: false,
+        state: {
+          ...builder.state,
+          nodes: builder.state.nodes.map((n: object) => ({ ...n, configured: true })),
+        },
+      };
+    },
+  };
+});
 jest.mock(
   '../../components/surface-builder/SurfaceFormShell',
   () => (props: any) => MockSurfaceFormShell(props)
@@ -43,6 +64,7 @@ function MockSurfaceFormShell(props: any) {
       <button onClick={() => props.onApplyJsonPayload(JSON.parse(props.configEditorValue))}>
         Apply config
       </button>
+      {props.manageActions}
     </div>
   );
 }
@@ -204,5 +226,84 @@ describe('AddSurfacePage default name and unsaved changes', () => {
     fireEvent.click(screen.getByText('Switch to MCP'));
 
     expect(screen.getByTestId('name')).toHaveTextContent(/^payments$/);
+  });
+});
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <output data-testid="location">
+      {location.pathname} {JSON.stringify(location.state)}
+    </output>
+  );
+}
+
+describe('AddSurfacePage create warnings', () => {
+  beforeAll(() => {
+    mockCompleteCanvas = true;
+  });
+  afterAll(() => {
+    mockCompleteCanvas = false;
+  });
+
+  const warning =
+    "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080";
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    (showToast as jest.Mock).mockReset();
+    routingConfig.mockReset();
+    routingConfig.mockResolvedValue({
+      available_listen_addresses: ['https://gw.example'],
+      channel_path_prefix: [{ id: 'agents', name: 'Agents', prefix: '/agents' }],
+    });
+    jest.spyOn(apiClient, 'listSurfaces').mockResolvedValue(existing);
+  });
+
+  const renderAt = () =>
+    render(
+      <MemoryRouter initialEntries={['/surfaces/new?protocol=a2a']}>
+        <Routes>
+          <Route path="/surfaces/new" element={<AddSurfacePage />} />
+          <Route path="*" element={<LocationProbe />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+  const create = async (warnings: string[]) => {
+    jest.spyOn(apiClient, 'createSurface').mockImplementation(async (_payload, options) => {
+      options?.onWarnings?.(warnings);
+      return { surface_id: 'new-id' } as AgentSurface;
+    });
+    renderAt();
+    await routeSeeded();
+    fireEvent.click(screen.getByTitle('Create surface'));
+    await waitFor(() => expect(showToast).toHaveBeenCalled());
+  };
+
+  it("opens the new surface's page with the gateway warnings, in one toast", async () => {
+    await create([warning]);
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledWith(
+      'error',
+      expect.stringContaining(`created, with warnings:\n${warning}`),
+      expect.objectContaining({ autoRemove: true })
+    );
+    expect(screen.getByTestId('location')).toHaveTextContent(
+      `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
+    );
+  });
+
+  it('returns to the surface list when the gateway answers with none', async () => {
+    await create([]);
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('Transit Point'),
+      expect.anything()
+    );
+    expect(screen.getByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 });

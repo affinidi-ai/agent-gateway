@@ -110,6 +110,28 @@ pub fn capture_from_bearer_jwt(
     })
 }
 
+/// Capture caller context from the claims of a JWT the Transit Point's own
+/// authentication already verified (its `source_auth` or resource token).
+/// Reads the verified claims and never the request's `Authorization` header,
+/// so a token the caller sent that nothing verified cannot supply fields.
+pub fn capture_from_verified_claims(
+    claims: &Value,
+    allowlist: &[String],
+) -> Result<CapturedCallerContext, CallerContextCaptureError> {
+    let empty = Map::new();
+    let fields = select_allowlisted(
+        claims
+            .as_object()
+            .unwrap_or(&empty),
+        allowlist,
+    )?;
+    Ok(CapturedCallerContext {
+        fields,
+        user_hash: None,
+        source: CallerContextSource::AuthorizationBearerJwt,
+    })
+}
+
 /// Capture caller context from the current request's DID-authenticated
 /// identity.
 ///

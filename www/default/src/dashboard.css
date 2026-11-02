@@ -58,6 +58,13 @@
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
 
+  /* Layout chrome. .topbar, #content and .sticky-footer take their sizes from
+     these (the topbar height and footer padding match sb-admin-2), and pages
+     that fill the viewport, like the Audit Log, subtract them. */
+  --topbar-height: 4.375rem;
+  --content-padding-top: calc(5rem + 15px);
+  --footer-height: calc(4rem + 0.8rem);
+
   /* Form Controls */
   --control-height: calc(1.5em + 1.25rem + 2px);
   --control-height-sm: calc(1.5em + 0.5rem + 2px);
@@ -1312,6 +1319,13 @@ select.dropdown-styling option {
   border-radius: var(--radius-sm);
 }
 
+/* The Identities table has ten columns: its cells use Bootstrap's own table-sm horizontal padding so the table fits its box at 1280px wide */
+.table-sm.identities-table > thead > tr > th,
+.table-sm.identities-table > tbody > tr > td {
+  padding-right: 0.25rem;
+  padding-left: 0.25rem;
+}
+
 /* Modern Buttons */
 .btn {
   font-weight: 600;
@@ -1557,6 +1571,7 @@ select.dropdown-styling option {
   right: 0;
   left: 220px;
   /* overridden via inline style in Header.tsx */
+  height: var(--topbar-height);
   z-index: 1030;
   background: rgba(255, 255, 255, 0.3);
   -webkit-backdrop-filter: blur(12px);
@@ -1589,7 +1604,7 @@ html.dark-theme-fs:fullscreen::backdrop {
  * top/left/right gives full pages a bit more breathing room around the
  * .container-fluid that wraps each page body. */
 #content {
-  padding-top: calc(5rem + 15px);
+  padding-top: var(--content-padding-top);
   padding-left: 15px;
   padding-right: 15px;
   min-height: calc(100vh - 5rem);
@@ -1972,6 +1987,7 @@ body.dark-theme #log-content {
 /* Enhanced Footer with Glassmorphism */
 .sticky-footer {
   flex-shrink: 0;
+  height: var(--footer-height);
   background: transparent;
   border-top: none;
   box-shadow: none;
@@ -2899,11 +2915,19 @@ body.dark-theme .audit-policy-evidence-chip {
   color: var(--dark-text);
 }
 
-/* --- Viewport-filling master/detail --- */
+/* --- Viewport-filling master/detail ---
+   Side by side, the page fills the viewport between the fixed topbar and its
+   gap (--content-padding-top) and the sticky footer (--footer-height), so the
+   document does not scroll and the list and evidence scroll inside their
+   panels. The card body is a two-column grid: the "About the Audit Log"
+   banner and the list share the left column, and the detail panel takes the
+   full height of the right one, which keeps its evidence body readable on
+   short laptop screens. Where the panels would be too narrow, the stacked
+   rule below lays them out one above the other instead. */
 .audit-page {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 5rem - 30px);
+  height: calc(100vh - var(--content-padding-top) - var(--footer-height));
   min-height: 0;
 }
 
@@ -2917,29 +2941,43 @@ body.dark-theme .audit-policy-evidence-chip {
 .audit-card-body {
   flex: 1 1 auto;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  column-gap: 1rem;
   overflow: hidden;
 }
 
+/* With no entry to show, the list takes the full width. */
+.audit-card-body:not(:has(.audit-drawer--open)) {
+  grid-template-columns: minmax(0, 1fr) 0;
+  column-gap: 0;
+}
+
+.audit-card-body > .alert {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+/* The shell's children sit in the card body grid; AuditPage still reads its
+   flex-direction, which is a column only in the stacked rule. */
 .audit-shell {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  align-items: stretch;
-  gap: 1rem;
+  display: contents;
 }
 
 .audit-shell-list {
-  flex: 1 1 0;
+  grid-column: 1;
+  grid-row: 2;
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
 }
 
 .audit-drawer {
-  flex: 0 1 0;
+  grid-column: 2;
+  grid-row: 1 / 3;
   min-width: 0;
+  min-height: 0;
   align-self: stretch;
   max-height: 100%;
   display: flex;
@@ -2947,9 +2985,7 @@ body.dark-theme .audit-policy-evidence-chip {
   overflow: hidden;
   opacity: 0;
   border-radius: var(--radius-md);
-  transition:
-    flex-grow var(--transition-normal),
-    opacity var(--transition-normal);
+  transition: opacity var(--transition-normal);
 }
 
 .audit-drawer--open {
@@ -3647,27 +3683,94 @@ body.dark-theme .audit-skeleton-line {
   }
 }
 
-@media (max-width: 991.98px) {
+/* Stacked master/detail: below 1440px wide two panels side by side are too
+   narrow to read (about 510px each at 1366px, with each entry wrapping to
+   over 230px tall). There the list sits above the detail and the page
+   scrolls as one, with no scroll box inside it. Selecting an entry scrolls
+   the page to the detail panel (AuditPage reads the computed flex-direction
+   of .audit-shell). The filters and the card header (title, Forward records,
+   Refresh) stay pinned under the fixed topbar (--topbar-height) while the page scrolls,
+   and the scroll margin keeps the panel and the entry below them. AuditPage
+   publishes the two heights as --audit-filters-height and
+   --audit-header-height. */
+@media (max-width: 1439.98px) {
+  /* #content-wrapper hides its sideways overflow, which makes it a scroll
+     container that never scrolls, so nothing inside it could stick. clip cuts
+     the same overflow without being a scroll container. */
+  #wrapper #content-wrapper:has(.audit-page) {
+    overflow-x: clip;
+  }
+
   .audit-page {
     height: auto;
   }
 
+  .audit-filters {
+    position: sticky;
+    top: var(--topbar-height);
+    z-index: 20;
+    padding: 0.75rem 1rem 0.25rem;
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.85);
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+    box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.25);
+  }
+
+  .audit-card {
+    overflow: clip;
+  }
+
+  .audit-card-header {
+    position: sticky;
+    top: calc(var(--topbar-height) + var(--audit-filters-height, 0px));
+    z-index: 19;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.25);
+  }
+
+  body.dark-theme .audit-filters,
+  body.dark-theme .audit-card-header {
+    background: rgba(30, 41, 59, 0.92);
+  }
+
   .audit-card-body {
+    display: flex;
+    flex-direction: column;
     overflow: visible;
   }
 
   .audit-shell {
+    display: flex;
     flex-direction: column;
+    gap: 1rem;
   }
 
   .audit-shell-list {
+    flex: none;
     overflow: visible;
     min-height: 0;
   }
 
   .audit-drawer {
+    flex: none;
     max-height: none;
     align-self: stretch;
+    scroll-margin-top: calc(
+      var(--topbar-height) + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) +
+        0.75rem
+    );
+  }
+
+  .audit-drawer-body {
+    overflow-y: visible;
+  }
+
+  .audit-item {
+    scroll-margin-top: calc(
+      var(--topbar-height) + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) +
+        0.75rem
+    );
   }
 }
 

@@ -1198,10 +1198,10 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
 /// `fabric_verified` when it names the caller the receiving surface verified
 /// (`fabric.principal_hash`), with that caller's identity hash and allowlisted
 /// `sub`, `email` and `name` only, and no `iss`, since the peer issued none of
-/// them. It is `fabric_asserted` otherwise, with the DID the peer's request
-/// named, which this gateway did not verify, as `sub` and the peer that
-/// asserted it as `iss`. Both are a `fabric_peer` caller in Transit Point
-/// policy.
+/// them. It is `fabric_asserted` otherwise, with the caller DID a presentation
+/// from one of the peer's connection issuers carried (`fabric.caller_did`),
+/// which this gateway did not verify, as `sub` and the peer that vouched for
+/// it as `iss`. Both are a `fabric_peer` caller in Transit Point policy.
 pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Option<AuditCallerContext> {
     let field = |name: &str| {
         claims
@@ -1231,7 +1231,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
             sub: if verified {
                 field("sub")
             } else {
-                claims.sub.clone()
+                fabric.caller_did.clone()
             },
             token_id: None,
             email: verified
@@ -2553,17 +2553,18 @@ mod tests {
     }
 
     fn fabric_transit_claims(
-        sub: Option<&str>,
+        caller_did: Option<&str>,
         peer_issuer_did: Option<&str>,
         principal_hash: Option<&str>,
         fields: serde_json::Value,
     ) -> crate::proxy::transit_token::TransitTokenClaims {
-        let mut claims = transit_claims(sub, fields);
+        let mut claims = transit_claims(None, fields);
         claims.identity_source = Some("fabric-presentation".to_string());
         claims.fabric = Some(crate::proxy::transit_token::FabricTransitClaims {
             peer_gateway_id: "partner-record".to_string(),
             peer_issuer_did: peer_issuer_did.map(str::to_string),
             hops: 1,
+            caller_did: caller_did.map(str::to_string),
             principal_hash: principal_hash.map(str::to_string),
         });
         claims

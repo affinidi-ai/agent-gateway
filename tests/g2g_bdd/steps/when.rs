@@ -109,6 +109,17 @@ pub(crate) async fn transit_token_received_by(
     world: &G2gWorld,
     agent_name: &str,
 ) -> String {
+    last_transit_token_received_by(world, agent_name)
+        .await
+        .unwrap_or_else(|| panic!("managed agent '{agent_name}' received no transit token"))
+}
+
+/// The transit token on the last request `agent_name` served, other than an
+/// agent card fetch, if it carried one.
+pub(crate) async fn last_transit_token_received_by(
+    world: &G2gWorld,
+    agent_name: &str,
+) -> Option<String> {
     let (gw_index, surface_id) = world.target(agent_name);
     world
         .harness()
@@ -130,7 +141,6 @@ pub(crate) async fn transit_token_received_by(
                 .get("x-transit-token")
                 .cloned()
         })
-        .unwrap_or_else(|| panic!("managed agent '{agent_name}' received no transit token"))
 }
 
 #[when(expr = "managed agent {string} calls Transit Point {string} with the transit token it received")]

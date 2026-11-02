@@ -148,6 +148,7 @@ const ProxiesPage: React.FC = () => {
         {hasPermission('mcp_proxies.edit') && (
           <>
             <AppButton
+              data-testid="mcp-proxies-add-button"
               variant="primary"
               size="md"
               className="shadow-sm"
@@ -191,6 +192,7 @@ const ProxiesPage: React.FC = () => {
                 {filteredMcpProxies.map(proxy => (
                   <tr
                     key={proxy.id}
+                    data-testid={`mcp-proxy-row-${proxy.id}`}
                     onClick={() => navigate(`/proxies/mcp-proxies/${proxy.id}`)}
                     style={{ cursor: 'pointer' }}
                   >
@@ -217,6 +219,7 @@ const ProxiesPage: React.FC = () => {
                     </td>
                     <td className="d-flex flex-column flex-lg-row gap-2 align-items-start align-items-lg-center">
                       <AppButton
+                        data-testid={`mcp-proxy-edit-button-${proxy.id}`}
                         variant="primary"
                         size="sm"
                         className="shadow-sm"
@@ -229,6 +232,7 @@ const ProxiesPage: React.FC = () => {
                         iconStart={<i className="fas fa-edit" aria-hidden="true" />}
                       />
                       <DeleteButton
+                        data-testid={`mcp-proxy-delete-button-${proxy.id}`}
                         onDelete={() => handleDeleteMcpProxy(proxy.id)}
                         className="btn-sm"
                         title={
@@ -254,10 +258,11 @@ const ProxiesPage: React.FC = () => {
   );
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-proxies">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div>
           <SearchInput
+            data-testid="proxies-search-input"
             value={searchTerm}
             onChange={setSearchTerm}
             placeholder="Filter Proxies...."

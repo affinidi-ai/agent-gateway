@@ -133,9 +133,13 @@ const EditOidcProviderPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-oidc-provider-editor">
       <div className="mb-3">
-        <button className="btn btn-secondary btn-sm" onClick={() => navigate('/oidc-providers')}>
+        <button
+          className="btn btn-secondary btn-sm"
+          data-testid="oidc-provider-editor-back-button"
+          onClick={() => navigate('/oidc-providers')}
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
@@ -266,7 +270,12 @@ const EditOidcProviderPage: React.FC = () => {
             <hr />
 
             <div className="d-flex">
-              <button type="submit" className="btn btn-primary me-2" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="oidc-provider-editor-save-button"
+                className="btn btn-primary me-2"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span className="spinner-border spinner-border-sm me-1" /> Saving…
@@ -281,6 +290,7 @@ const EditOidcProviderPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary"
+                data-testid="oidc-provider-editor-cancel-button"
                 onClick={() => navigate('/oidc-providers')}
                 disabled={saving}
               >

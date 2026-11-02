@@ -16,15 +16,15 @@ changes:
         that admits a verified caller by its hash also admits it when it arrives over Fabric;
         add `not input.transit.caller.fabric` to keep out partner requests that carry the
         transit token issued for them, on a Transit Point that requires it. `verified` covers
-        the hash only, never the DID the peer named: a rule on `did` needs `did_verified`. Its
-        audit records
+        the hash only, never the DID the peer named, so match the caller by its hash, never by
+        `did`. Its audit records
         name it with `auth_method: fabric_verified`, its identity hash as `user_identity_hash`
         and the claims the receiving surface verified, with the peer as `peer_gateway` and no
         `iss`, ahead of a caller the Transit Point verified itself, as a verified Access Point
         token is; a caller the receiving surface did not verify is `fabric_asserted`, with
-        `peer_gateway` too. The DID the peer named stays unverified (`did_verified: false`)
-        and never names that caller. The principal is nested under `fabric`, so a release that
-        does not read it sees no principal.
+        `peer_gateway` too. The caller DID a presentation carried (`fabric.caller_did`) stays
+        unverified and never names that caller. The principal is nested under `fabric`, so a
+        release that does not read it sees no principal.
     - timestamp: '2026-10-30T15:00:00.000Z'
       title: Release delegated credentials to partner callers on Transit Points that opt in
       description: >-
@@ -41,12 +41,12 @@ changes:
         without one answers with a `Warning` header, since a binding there refuses every Fabric
         caller. A `PUT` of the surface or of a variant that omits the switch keeps the stored
         value while the Transit Point requires the transit token, since the Surface Builder does
-        not show it. Without it, or when the receiving surface verified no caller,
-        the call is refused as before and the log gives the reason. A caller the Transit
-        Point's own `source_auth` verified keys its own grant only when the token names no
-        caller the receiving surface verified, the order its policy input and audit records
-        follow, so without the switch such a call is refused rather than served with the
-        Transit Point caller's grant.
+        not show it. It has an effect only on a Transit Point that also sets
+        `allow_fabric_callers`. Without it, or when the receiving surface verified no caller,
+        the call is refused as before and the log gives the reason. The token decides the
+        caller, as any transit token does, so a client the Transit Point's own `source_auth`
+        verified on the same call keys no grant, and without the switch such a call is refused
+        rather than served with that client's grant.
   changed: []
   fixed: []
   removed: []

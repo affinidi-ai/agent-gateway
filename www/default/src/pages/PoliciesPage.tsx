@@ -31,12 +31,13 @@ const PoliciesPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-policies">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="policies-search-input"
             placeholder="Filter Gateway, Agent Surfaces, Paywall policies..."
             width="384px"
           />
@@ -54,6 +55,7 @@ const PoliciesPage: React.FC = () => {
       >
         <Tab
           eventKey="gateway"
+          tabAttrs={{ 'data-testid': 'policies-gateway-tab-trigger' }}
           title={
             <>
               <i className="fas fa-shield-alt"></i> Gateway {tabBadge(gatewayCount)}
@@ -71,6 +73,7 @@ const PoliciesPage: React.FC = () => {
 
         <Tab
           eventKey="agent_surface"
+          tabAttrs={{ 'data-testid': 'policies-agent-surface-tab-trigger' }}
           title={
             <>
               <i className="fas fa-exchange-alt"></i> Agent Surfaces
@@ -89,6 +92,7 @@ const PoliciesPage: React.FC = () => {
 
         <Tab
           eventKey="paywall"
+          tabAttrs={{ 'data-testid': 'policies-paywall-tab-trigger' }}
           title={
             <>
               <i className="fas fa-credit-card"></i> Paywall {tabBadge(paywallCount)}

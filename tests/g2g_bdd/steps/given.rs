@@ -440,6 +440,14 @@ pub async fn transit_point_requires_a_transit_token(
     transit_point_spec_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} allows Fabric callers")]
+pub async fn transit_point_allows_fabric_callers(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).allow_fabric_callers = true;
+}
+
 /// How long a fresh pairing may take to record the peer's issuer DID.
 const PAIRING_ISSUER_DID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 

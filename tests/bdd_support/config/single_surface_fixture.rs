@@ -28,6 +28,7 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
+    pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
     pub mcp_tool_gating: Option<serde_json::Value>,
     pub mcp_tool_gating_condition_policy: Option<RequestPolicyFixture>,
@@ -53,6 +54,8 @@ pub struct SurfaceConfigBuilder {
     pub transit_source_auth: bool,
     /// How long the surface's transit tokens live, in seconds.
     pub transit_token_lifetime_secs: Option<u64>,
+    /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
+    pub transit_token_max_lifetime_secs: Option<u64>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -83,6 +86,7 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             target_auth: None,
+            target_auth_provider: None,
             mcp_tool_policy: None,
             mcp_tool_gating: None,
             mcp_tool_gating_condition_policy: None,
@@ -106,6 +110,7 @@ impl Default for SurfaceConfigBuilder {
             transit_points: Vec::new(),
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
+            transit_token_max_lifetime_secs: None,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
@@ -315,6 +320,35 @@ pub struct SurfaceTargetAuthConfig {
     pub header_format: String,
     pub fallback: String,
     pub secret_value: Option<String>,
+}
+
+/// A Target authenticated with a credential provider's token. The harness serves the
+/// provider's token endpoint and sets `token_endpoint` before the gateway starts.
+#[derive(Debug, Clone)]
+pub struct SurfaceTargetAuthProviderConfig {
+    pub grant: TargetAuthProviderGrant,
+    pub fallback: String,
+    pub token_status: u16,
+    pub expires_in: u64,
+    pub token_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAuthProviderGrant {
+    ClientCredentials,
+    JwtBearer,
+}
+
+impl SurfaceTargetAuthProviderConfig {
+    pub fn new(grant: TargetAuthProviderGrant) -> Self {
+        Self {
+            grant,
+            fallback: "reject".to_string(),
+            token_status: 200,
+            expires_in: 3600,
+            token_endpoint: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

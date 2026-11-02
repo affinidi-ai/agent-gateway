@@ -221,7 +221,7 @@ fn verify_pinned(
 // ── Trust: CA chain ────────────────────────────────────────────────────────
 
 /// Verifies the client certificate's chain against the configured CAs and
-/// returns the SHA-256 of the CA certificate the verified chain ends at.
+/// returns the SHA-256 of the subject and public key of the CA the verified chain ends at.
 fn verify_ca_chain(
     peer: &PeerCertInfo,
     leaf: &X509Certificate<'_>,
@@ -298,13 +298,17 @@ fn verify_ca_chain(
         })?;
 
     let anchor = path.anchor();
-    anchors
-        .iter()
-        .position(|candidate| candidate == anchor)
-        .map(|index| ca[index].fingerprint)
-        .ok_or_else(|| SourceAuthError::Internal {
-            reason: "Verified client certificate chain ends at no configured CA".to_string(),
-        })
+    let mut hasher = Sha256::new();
+    for part in [
+        anchor.subject.as_ref(),
+        anchor
+            .subject_public_key_info
+            .as_ref(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn require_eku(
@@ -965,6 +969,58 @@ mod tests {
         }
     }
 
+    /// Renewing a CA with the same subject and key (a new serial and validity) keeps
+    /// its callers' identity hash, and a CA with another key gives them another.
+    #[test]
+    fn renewing_a_ca_with_the_same_subject_and_key_keeps_the_identity_hash() {
+        let key = KeyPair::generate().expect("ca keypair");
+        let reissue = |serial: u64| {
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.distinguished_name = DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Org CA");
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params.serial_number = Some(serial.into());
+            let signing_key = KeyPair::from_pem(&key.serialize_pem()).expect("same ca key");
+            let cert = params
+                .clone()
+                .self_signed(&signing_key)
+                .expect("ca certificate");
+            (cert.pem().into_bytes(), rcgen::Issuer::new(params, signing_key))
+        };
+        let (old_pem, old_issuer) = reissue(1);
+        let (renewed_pem, _) = reissue(2);
+        assert_ne!(old_pem, renewed_pem, "the renewed certificate is another certificate");
+        let (other_pem, _, other_issuer) = ca_named("Org CA", None);
+        let cfg = MtlsAuthConfig {
+            trust: MtlsTrust::Ca {
+                ca_certificate_ids: vec!["ca0".into()],
+                require_client_auth_eku: true,
+                check_crl: false,
+                require_ocsp: false,
+            },
+            identity_binding: MtlsIdentityBinding::SubjectCn,
+            allowed_subjects: vec![],
+            allow_forwarded: true,
+        };
+        let hash_for = |client: &PeerCertInfo, ca_pem: &[u8]| {
+            let ca = to_entries(&[ca_pem]);
+            let trust = ResolvedTrustMaterial { pinned: &[], ca: &ca };
+            verify_peer_cert(client, &cfg, trust, SystemTime::now())
+                .expect("the chain verifies")
+                .principal_hash(None)
+        };
+        let alice = peer_from_der(client_named("alice", &old_issuer));
+        let before = hash_for(&alice, &old_pem);
+        assert_ne!(before, None);
+        assert_eq!(hash_for(&alice, &renewed_pem), before, "a renewed CA with the same key keeps the hash");
+
+        let other_alice = peer_from_der(client_named("alice", &other_issuer));
+        assert_ne!(hash_for(&other_alice, &other_pem), before, "a CA with another key is another caller");
+    }
+
     /// A CA certificate whose subject is `CN=<name>`, self-signed or signed by
     /// `signer`: its PEM, its DER and the issuer that signs with it.
     fn ca_named(
@@ -1013,14 +1069,14 @@ mod tests {
             .to_vec()
     }
 
-    /// The identity hash keys an mTLS caller by the certificate its trust was
-    /// verified against: the configured CA that ends its chain, or the pinned
-    /// certificate. A leaf whose chain ends at another CA, through an
+    /// The identity hash keys an mTLS caller by the trust anchor that verified
+    /// it: the subject and key of the configured CA that ends its chain, or the
+    /// pinned certificate. A leaf whose chain ends at another CA, through an
     /// intermediate named like the first CA, is another caller although its
     /// subject and issuer name are the same; so is a pinned certificate with
     /// the same subject as another.
     #[test]
-    fn the_identity_hash_keys_an_mtls_caller_by_the_certificate_that_verified_it() {
+    fn the_identity_hash_keys_an_mtls_caller_by_the_trust_anchor_that_verified_it() {
         let ca_trust = |cas: &[&[u8]]| MtlsAuthConfig {
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: (0..cas.len())

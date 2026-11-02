@@ -22,6 +22,7 @@ import {
 // Agent Surface types
 import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { formatApiError } from './utils/apiError';
+import { parseWarningHeader } from './utils/warningHeader';
 
 const API_BASE = '/api/v1';
 
@@ -149,9 +150,10 @@ export const sessionManager = new SessionManager();
 class APIClient {
   private async request<T>(
     endpoint: string,
-    options?: RequestInit & { timeout?: number }
+    options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
   ): Promise<T> {
     const url = `${API_BASE}${endpoint}`;
+    const { onResponse, ...fetchOptions } = options ?? {};
 
     // Setup timeout using AbortController
     const controller = new AbortController();
@@ -161,7 +163,7 @@ class APIClient {
 
     try {
       const response = await fetch(url, {
-        ...options,
+        ...fetchOptions,
         headers: {
           'Content-Type': 'application/json',
           ...sessionManager.getAuthHeaders(),
@@ -171,6 +173,7 @@ class APIClient {
       });
 
       await signalTermsAcceptanceRequired(response);
+      onResponse?.(response);
 
       if (response.status === 401) {
         sessionManager.expireSession();
@@ -537,18 +540,33 @@ class APIClient {
     return fromBackendSurface(s);
   }
 
-  async createSurface(surface: Partial<AgentSurface>): Promise<AgentSurface> {
+  /**
+   * `onWarnings` receives the messages of the response's `Warning: 299`
+   * headers, the gateway's non-blocking notes on what was just saved, such as
+   * a Transit Point that serves callers it does not authenticate on an address
+   * other hosts reach. It is called with an empty list when there are none.
+   */
+  async createSurface(
+    surface: Partial<AgentSurface>,
+    options?: { onWarnings?: (warnings: string[]) => void }
+  ): Promise<AgentSurface> {
     const s = await this.request<AgentSurface>('/surfaces', {
       method: 'POST',
       body: JSON.stringify(toBackendSurface(surface)),
+      onResponse: warningsReader(options?.onWarnings),
     });
     return fromBackendSurface(s);
   }
 
-  async updateSurface(surfaceId: string, surface: Partial<AgentSurface>): Promise<AgentSurface> {
+  async updateSurface(
+    surfaceId: string,
+    surface: Partial<AgentSurface>,
+    options?: { onWarnings?: (warnings: string[]) => void }
+  ): Promise<AgentSurface> {
     const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
+      onResponse: warningsReader(options?.onWarnings),
     });
     return fromBackendSurface(s);
   }
@@ -1335,6 +1353,11 @@ export interface AgentSurface {
    */
   default_variant_id?: string;
   last_activity?: string | null;
+  /**
+   * Set by the gateway while a Transit Point, base or variant, authenticates its
+   * callers with `source_auth`. Derived on every save; a write's value is ignored.
+   */
+  transit_point_source_auth?: boolean;
 }
 
 /**
@@ -1368,6 +1391,12 @@ export interface TransitPoint {
   networking?: any;
   identity_injection?: { inject_vp: boolean };
   transit_credentials?: any;
+  /** Whether callers must carry the surface's transit token. Default true. */
+  require_transit_token?: boolean;
+  /** Authenticates the Transit Point's callers: API key, API key provider, JWT bearer or mTLS. */
+  source_auth?: Record<string, unknown>;
+  /** The explicit marking that the Transit Point serves callers it does not authenticate. */
+  allow_unauthenticated_callers?: boolean;
   /** Per-Transit-Point MCP Tool Gating firewall (`{ gates: [...] }`, MCP only). */
   mcp_tool_gating?: { gates?: any[] };
 }
@@ -1399,7 +1428,30 @@ export function templateWithTrustCheckSplit<T>(template: T): T {
   return { ...template, surface: withTrustCheckSplit(surface) };
 }
 
+/** A response handler that passes its `Warning: 299` messages on, if anyone listens. */
+function warningsReader(
+  onWarnings: ((warnings: string[]) => void) | undefined
+): ((response: Response) => void) | undefined {
+  return onWarnings
+    ? response => onWarnings(parseWarningHeader(response.headers?.get('Warning')))
+    : undefined;
+}
+
+/**
+ * The gateway keeps `transit_point_source_auth` in step with the Transit
+ * Points it stores and ignores a value a write sends, so a write never carries
+ * the copy it read.
+ */
+function withoutDerivedMarks<T>(surface: T): T {
+  if (!surface || typeof surface !== 'object' || !('transit_point_source_auth' in surface)) {
+    return surface;
+  }
+  const { transit_point_source_auth: _derived, ...rest } = surface as Record<string, unknown>;
+  return rest as T;
+}
+
 function toBackendSurface(surface: Partial<AgentSurface>): any {
+  surface = withoutDerivedMarks(surface);
   if (!surface || !surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;

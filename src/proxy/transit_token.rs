@@ -194,6 +194,11 @@ pub struct FabricTransitClaims {
     pub peer_issuer_did: Option<String>,
     /// Fabric crossings, the one that delivered the request included.
     pub hops: u8,
+    /// The caller DID a presentation from one of the peer's connection issuers
+    /// carried. Kept out of `sub`, which a release that predates this claim
+    /// would read as the caller this gateway verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
     /// The identity hash of the caller the receiving surface's own
     /// `source_auth` or resource token verified on the request, never one the
     /// peer asserted. Nested here, not in `user_identity_hash`, so a release
@@ -203,12 +208,10 @@ pub struct FabricTransitClaims {
 }
 
 /// What a token issued on Fabric receive carries about the caller beyond the
-/// `fabric` claim. Its only principal is `fabric.principal_hash`, the caller
-/// the receiving surface verified itself.
+/// `fabric` claim. It never carries a `sub`, and its only principal is
+/// `fabric.principal_hash`, the caller the receiving surface verified itself.
 pub struct FabricTransitTokenRequest<'request> {
     pub surface_id: &'request str,
-    /// The caller DID the peer's request names, when it names one.
-    pub caller_did: Option<&'request str>,
     pub identity_source: &'request str,
     pub trace_id: Option<&'request str>,
     pub allowed_transit_points: Vec<String>,
@@ -259,13 +262,11 @@ impl TransitTokenIssuer {
             allowed_transit_points,
             serde_json::Map::new(),
             crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS,
-            crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
         )
     }
 
-    /// Issue a transit token that lives `lifetime_secs`, which must be from
-    /// `min_lifetime_secs` (the appliance's `transit_token_min_lifetime_secs`) to
-    /// 900 seconds, and also carries an
+    /// Issue a transit token that lives `lifetime_secs`, which must be from 30
+    /// to 900 seconds, and also carries an
     /// allowlisted set of caller-context fields for Transit Point Workload
     /// Binding. The caller is responsible for having already filtered
     /// `caller_context_fields` down to the operator-configured allowlist; the
@@ -282,9 +283,8 @@ impl TransitTokenIssuer {
         allowed_transit_points: Vec<String>,
         caller_context_fields: serde_json::Map<String, serde_json::Value>,
         lifetime_secs: u64,
-        min_lifetime_secs: u64,
     ) -> Result<String> {
-        let (iat, exp) = Self::validity(lifetime_secs, min_lifetime_secs)?;
+        let (iat, exp) = Self::validity(lifetime_secs)?;
         let claims = TransitTokenClaims {
             iss: self.gateway_id.clone(),
             sub: caller_did.map(|s| s.to_string()),
@@ -311,15 +311,12 @@ impl TransitTokenIssuer {
         &self,
         request: FabricTransitTokenRequest<'_>,
         lifetime_secs: u64,
-        min_lifetime_secs: u64,
     ) -> Result<(String, String)> {
-        let (iat, exp) = Self::validity(lifetime_secs, min_lifetime_secs)?;
+        let (iat, exp) = Self::validity(lifetime_secs)?;
         let jti = uuid::Uuid::new_v4().to_string();
         let claims = TransitTokenClaims {
             iss: self.gateway_id.clone(),
-            sub: request
-                .caller_did
-                .map(str::to_string),
+            sub: None,
             surface_id: request.surface_id.to_string(),
             iat,
             exp,
@@ -342,15 +339,12 @@ impl TransitTokenIssuer {
     }
 
     /// The `iat` and `exp` of a token issued now that lives `lifetime_secs`,
-    /// which must be from `min_lifetime_secs` to 900 seconds.
-    fn validity(
-        lifetime_secs: u64,
-        min_lifetime_secs: u64,
-    ) -> Result<(u64, u64)> {
-        use crate::config::agent_surface::MAX_TRANSIT_TOKEN_LIFETIME_SECS;
-        if !(min_lifetime_secs..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
+    /// which must be from 30 to 900 seconds.
+    fn validity(lifetime_secs: u64) -> Result<(u64, u64)> {
+        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
+        if !(MIN_TRANSIT_TOKEN_LIFETIME_SECS..=MAX_TRANSIT_TOKEN_LIFETIME_SECS).contains(&lifetime_secs) {
             anyhow::bail!(
-                "transit token lifetime must be from {min_lifetime_secs} to \
+                "transit token lifetime must be from {MIN_TRANSIT_TOKEN_LIFETIME_SECS} to \
                  {MAX_TRANSIT_TOKEN_LIFETIME_SECS} seconds, not {lifetime_secs}"
             );
         }
@@ -373,18 +367,22 @@ impl TransitTokenIssuer {
         encode(&header, claims, &key).context("failed to encode transit token")
     }
 
-    /// Validate a transit token and return the claims. A token whose `kid` does not name this
-    /// issuer's key, or that has none, is refused before its signature is checked. A token is
-    /// accepted any number of times until it expires; one issued in the future, living longer
-    /// than `allowed_lifetime_secs`, or without a token ID is refused.
-    ///
-    /// `allowed_lifetime_secs` is the lifetime the token's surface sets when the token is
-    /// presented, so shortening it refuses the tokens already issued for longer, and lengthening
-    /// it keeps the shorter ones only until their own expiry.
+    /// [`Self::validate_for_transit_point`] without the surface and Transit Point checks.
+    #[cfg(test)]
     pub fn validate(
         &self,
         token: &str,
         allowed_lifetime_secs: u64,
+    ) -> Result<TransitTokenClaims> {
+        let claims = self.decode_claims(token)?;
+        check_lifetime(&claims, allowed_lifetime_secs)?;
+        Ok(claims)
+    }
+
+    /// Every check of [`Self::validate_for_transit_point`] that needs only the token.
+    fn decode_claims(
+        &self,
+        token: &str,
     ) -> Result<TransitTokenClaims> {
         let header = decode_header(token).context("transit token validation failed")?;
         if header.kid.as_deref() != Some(self.key.kid.as_str()) {
@@ -410,9 +408,6 @@ impl TransitTokenIssuer {
         if claims.exp <= claims.iat {
             anyhow::bail!("transit token lifetime is not one this gateway issues");
         }
-        if claims.exp - claims.iat > allowed_lifetime_secs {
-            anyhow::bail!("transit token lives longer than its surface allows");
-        }
         if claims.jti.is_empty() {
             anyhow::bail!("transit token has no token ID");
         }
@@ -420,9 +415,16 @@ impl TransitTokenIssuer {
         Ok(claims)
     }
 
-    /// Validate a transit token against the lifetime its surface allows, see
-    /// [`Self::validate`], and check it was issued for `surface_id` and opens the Transit Point
-    /// named `transit_point_name`.
+    /// Validate a transit token and return the claims. A token whose `kid` does not name this
+    /// issuer's key, or that has none, is refused before its signature is checked. A token is
+    /// accepted any number of times until it expires; one issued in the future, without a token
+    /// ID, issued for another surface than `surface_id`, not opening the Transit Point named
+    /// `transit_point_name`, or living longer than `allowed_lifetime_secs` is refused, in that
+    /// order, so a token for another surface is refused as such whatever its lifetime.
+    ///
+    /// `allowed_lifetime_secs` is the lifetime `surface_id` sets when the token is presented, so
+    /// shortening it refuses the tokens already issued for longer, and lengthening it keeps the
+    /// shorter ones only until their own expiry.
     pub fn validate_for_transit_point(
         &self,
         token: &str,
@@ -430,7 +432,7 @@ impl TransitTokenIssuer {
         transit_point_name: &str,
         allowed_lifetime_secs: u64,
     ) -> Result<TransitTokenClaims> {
-        let claims = self.validate(token, allowed_lifetime_secs)?;
+        let claims = self.decode_claims(token)?;
 
         if claims.surface_id.is_empty() || claims.surface_id != surface_id {
             anyhow::bail!("transit token was issued for another surface");
@@ -446,9 +448,20 @@ impl TransitTokenIssuer {
         {
             anyhow::bail!("transit token not authorized for transit point '{}'", transit_point_name);
         }
+        check_lifetime(&claims, allowed_lifetime_secs)?;
 
         Ok(claims)
     }
+}
+
+fn check_lifetime(
+    claims: &TransitTokenClaims,
+    allowed_lifetime_secs: u64,
+) -> Result<()> {
+    if claims.exp - claims.iat > allowed_lifetime_secs {
+        anyhow::bail!("transit token lives longer than its surface allows");
+    }
+    Ok(())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -862,6 +875,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refuses_a_longer_lived_token_for_another_surface_as_issued_for_another_surface() {
+        let issuer = test_issuer();
+        let now = now();
+        let token = issuer
+            .sign(&claims_for("surface-b", now, now + 900))
+            .unwrap();
+
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "surface-a", "partner", LIFETIME)),
+            "transit token was issued for another surface"
+        );
+        assert_eq!(
+            refusal(issuer.validate_for_transit_point(&token, "surface-b", "partner", LIFETIME)),
+            "transit token lives longer than its surface allows"
+        );
+    }
+
     /// Why `validated` was refused, with every cause.
     fn refusal(validated: Result<TransitTokenClaims>) -> String {
         format!("{:#}", validated.unwrap_err())
@@ -954,7 +985,6 @@ mod tests {
                 vec![],
                 serde_json::Map::new(),
                 lifetime_secs,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap()
     }
@@ -1060,7 +1090,6 @@ mod tests {
                 vec!["delta".to_string()],
                 fields.clone(),
                 LIFETIME,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap();
 
@@ -1080,9 +1109,7 @@ mod tests {
 
     #[test]
     fn the_issuer_refuses_a_lifetime_outside_the_bounds() {
-        use crate::config::agent_surface::{
-            DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS as MIN_TRANSIT_TOKEN_LIFETIME_SECS, MAX_TRANSIT_TOKEN_LIFETIME_SECS,
-        };
+        use crate::config::agent_surface::{MAX_TRANSIT_TOKEN_LIFETIME_SECS, MIN_TRANSIT_TOKEN_LIFETIME_SECS};
         let issuer = test_issuer();
         for lifetime in [0, MIN_TRANSIT_TOKEN_LIFETIME_SECS - 1, MAX_TRANSIT_TOKEN_LIFETIME_SECS + 1, u64::MAX] {
             let result = issuer.issue_with_caller_context(
@@ -1095,7 +1122,6 @@ mod tests {
                 vec![],
                 serde_json::Map::new(),
                 lifetime,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             );
             assert!(result.is_err(), "{lifetime}");
         }
@@ -1111,7 +1137,6 @@ mod tests {
                     vec![],
                     serde_json::Map::new(),
                     lifetime,
-                    crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
                 )
                 .unwrap();
             assert!(
@@ -1123,34 +1148,6 @@ mod tests {
         }
     }
 
-    /// The shortest lifetime the issuer mints follows the minimum it is given, both ways.
-    #[test]
-    fn the_issuers_shortest_lifetime_follows_the_minimum_it_is_given() {
-        let issuer = test_issuer();
-        let issue = |lifetime: u64, min_lifetime: u64| {
-            issuer.issue_with_caller_context(
-                "surf-001",
-                None,
-                None,
-                None,
-                None,
-                None,
-                vec![],
-                serde_json::Map::new(),
-                lifetime,
-                min_lifetime,
-            )
-        };
-        assert!(issue(10, 10).is_ok());
-        assert!(issue(9, 10).is_err());
-        assert!(issue(120, 120).is_ok());
-        assert!(issue(119, 120).is_err());
-        assert!(
-            issue(10, crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS).is_err(),
-            "the default floor is 30"
-        );
-    }
-
     #[test]
     fn workload_binding_token_preserves_arbitrary_json_values_as_is() {
         let issuer = test_issuer();
@@ -1159,18 +1156,7 @@ mod tests {
         fields.insert("nested".to_string(), serde_json::json!({ "a": { "b": [1, 2, 3] } }));
 
         let token = issuer
-            .issue_with_caller_context(
-                "surf-001",
-                None,
-                None,
-                None,
-                None,
-                None,
-                vec![],
-                fields.clone(),
-                LIFETIME,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
-            )
+            .issue_with_caller_context("surf-001", None, None, None, None, None, vec![], fields.clone(), LIFETIME)
             .unwrap();
         let claims = issuer
             .validate(&token, LIFETIME)
@@ -1229,7 +1215,6 @@ mod tests {
                 vec!["delta".to_string()],
                 fields,
                 LIFETIME,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
             )
             .unwrap();
 
@@ -1249,7 +1234,6 @@ mod tests {
     fn fabric_request(caller_did: Option<&str>) -> FabricTransitTokenRequest<'_> {
         FabricTransitTokenRequest {
             surface_id: "surf-001",
-            caller_did,
             identity_source: "fabric-presentation",
             trace_id: Some("trace-1"),
             allowed_transit_points: vec!["delta".to_string()],
@@ -1258,6 +1242,7 @@ mod tests {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                caller_did: caller_did.map(str::to_string),
                 principal_hash: None,
             },
         }
@@ -1273,18 +1258,14 @@ mod tests {
         request
     }
 
-    /// A token issued on Fabric receive names the peer and the crossings, never a
-    /// principal, lives the lifetime asked for, and opens only the Transit Points
-    /// it lists.
+    /// A token issued on Fabric receive names the peer, the crossings and the
+    /// caller DID in its `fabric` claim, never a principal or a `sub`, lives the
+    /// lifetime asked for, and opens only the Transit Points it lists.
     #[test]
     fn a_fabric_token_carries_the_peer_and_its_crossings_and_no_principal() {
         let issuer = test_issuer();
         let (token, jti) = issuer
-            .issue_for_fabric_request(
-                fabric_request(Some("did:web:caller.example")),
-                120,
-                crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MIN_LIFETIME_SECS,
-            )
+            .issue_for_fabric_request(fabric_request(Some("did:web:caller.example")), 120)
             .unwrap();
 
         let claims = issuer
@@ -1292,7 +1273,7 @@ mod tests {
             .unwrap();
         assert_eq!(claims.jti, jti);
         assert_eq!(claims.exp - claims.iat, 120);
-        assert_eq!(claims.sub.as_deref(), Some("did:web:caller.example"));
+        assert_eq!(claims.sub, None);
         assert_eq!(
             claims
                 .identity_source
@@ -1313,6 +1294,7 @@ mod tests {
                 peer_gateway_id: "peer-record".to_string(),
                 peer_issuer_did: Some("did:web:partner.example".to_string()),
                 hops: 3,
+                caller_did: Some("did:web:caller.example".to_string()),
                 principal_hash: None,
             })
         );
@@ -1323,7 +1305,7 @@ mod tests {
         );
         assert!(
             issuer
-                .issue_for_fabric_request(fabric_request(None), 1000, 30)
+                .issue_for_fabric_request(fabric_request(None), 1000)
                 .is_err(),
             "the lifetime bounds apply"
         );
@@ -1337,7 +1319,7 @@ mod tests {
     fn a_fabric_token_carries_the_receivers_verified_principal_only_in_its_fabric_claim() {
         let issuer = test_issuer();
         let (token, _) = issuer
-            .issue_for_fabric_request(verified_fabric_request(Some("did:web:caller.example")), LIFETIME, 30)
+            .issue_for_fabric_request(verified_fabric_request(Some("did:web:caller.example")), LIFETIME)
             .unwrap();
 
         let claims = issuer
@@ -1358,9 +1340,11 @@ mod tests {
     }
 
     /// A release that predates the `fabric` claim reads a Fabric token's claims
-    /// without it, and one that predates `fabric.principal_hash` reads the
-    /// `fabric` claim without it: neither sees a principal, whatever the
-    /// receiving surface verified, so neither keys a delegated credential by it.
+    /// without it, and so sees no principal and no `sub`, and one that predates
+    /// `fabric.principal_hash` reads the `fabric` claim without it: neither sees
+    /// a principal, whatever the receiving surface verified, so neither keys a
+    /// delegated credential by it or takes the caller DID a peer vouched for as
+    /// a caller it verified.
     #[test]
     fn a_reader_without_the_fabric_claim_sees_no_principal_in_a_fabric_token() {
         #[derive(Deserialize)]
@@ -1374,6 +1358,7 @@ mod tests {
             peer_gateway_id: String,
             peer_issuer_did: Option<String>,
             hops: u8,
+            caller_did: Option<String>,
         }
         #[derive(Deserialize)]
         struct FirstFabricReleaseClaims {
@@ -1387,13 +1372,13 @@ mod tests {
             [fabric_request(Some("did:web:caller.example")), verified_fabric_request(Some("did:web:caller.example"))]
         {
             let (token, _) = issuer
-                .issue_for_fabric_request(request, LIFETIME, 30)
+                .issue_for_fabric_request(request, LIFETIME)
                 .unwrap();
             let earlier = decode::<EarlierClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
                 .unwrap()
                 .claims;
             assert_eq!(earlier.user_identity_hash, None);
-            assert_eq!(earlier.sub.as_deref(), Some("did:web:caller.example"));
+            assert_eq!(earlier.sub, None);
 
             let first_fabric =
                 decode::<FirstFabricReleaseClaims>(&token, &DecodingKey::from_secret(&[7; 32]), &validation)
@@ -1406,6 +1391,7 @@ mod tests {
                     peer_gateway_id: "peer-record".to_string(),
                     peer_issuer_did: Some("did:web:partner.example".to_string()),
                     hops: 3,
+                    caller_did: Some("did:web:caller.example".to_string()),
                 })
             );
         }

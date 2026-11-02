@@ -149,6 +149,8 @@ export interface SurfaceFormShellProps {
    * context to show an error next to the field it names, beside `topBanner`.
    */
   saveError?: string | null;
+  /** Warnings the last successful save answered with; panels show the ones naming them. */
+  saveWarnings?: readonly string[] | null;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -292,6 +294,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   surfacePolicyLoadState,
   hasAttemptedSave,
   saveError,
+  saveWarnings,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -756,6 +759,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
         activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
         saveError,
+        saveWarnings,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,
         setTagsCsv: setMeta.setTagsCsv,

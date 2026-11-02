@@ -78,6 +78,7 @@ const LogsFilterBar: React.FC<LogsFilterBarProps> = ({
       }}
     >
       <SearchInput
+        data-testid="logs-search-input"
         value={searchQuery}
         onChange={onSearchChange}
         width="240px"
@@ -146,6 +147,7 @@ const LogsFilterBar: React.FC<LogsFilterBarProps> = ({
     <AppButton
       variant={problemsActive ? 'danger' : 'outline-danger'}
       size="sm"
+      data-testid="logs-problems-button"
       onClick={onProblemsOnly}
       disabled={!problemsAvailable}
       title={

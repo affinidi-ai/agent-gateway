@@ -33,6 +33,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { joinWarnings } from '../utils/warningHeader';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -449,16 +450,36 @@ const AddSurfacePage: React.FC = () => {
     setError(null);
     try {
       const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
-      await apiClient.createSurface(payload);
+      let headerWarnings: string[] = [];
+      const created = await apiClient.createSurface(payload, {
+        onWarnings: warnings => {
+          headerWarnings = warnings;
+        },
+      });
       justCreatedRef.current = true;
-      showToast('success', `Agent Surface "${name}" created`);
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
       const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
+      // One toast: a later one replaces an earlier one.
+      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
+      if (allWarnings.length === 0) {
+        showToast('success', `Agent Surface "${name}" created`);
+      } else {
+        showToast(
+          'error',
+          `Agent Surface "${name}" created, with warnings:\n${joinWarnings(allWarnings)}`,
+          { autoRemove: true, duration: 10000 }
+        );
       }
-      navigate('/surfaces');
+      // Warnings from the gateway go with the operator to the new surface's
+      // page, which lists them, since the toast goes after a few seconds.
+      if (headerWarnings.length > 0 && created?.surface_id) {
+        navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
+          state: { saveWarnings: headerWarnings },
+        });
+      } else {
+        navigate('/surfaces');
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to create surface');
     } finally {
@@ -642,7 +663,10 @@ const AddSurfacePage: React.FC = () => {
   // builder renders.
   if (protocolPickerShown) {
     return (
-      <div className="container-fluid surface-page-fill surface-page-fill--picker">
+      <div
+        className="container-fluid surface-page-fill surface-page-fill--picker"
+        data-testid="page-add-surface"
+      >
         <div className="surface-canvas-protocol-picker">
           <div
             className="card shadow channel-editor-card surface-picker-card"
@@ -689,6 +713,7 @@ const AddSurfacePage: React.FC = () => {
                     return (
                       <li
                         key={tpl.id}
+                        data-testid={`surface-template-row-${tpl.id}`}
                         className="surface-template-row surface-template-row--static"
                       >
                         <div
@@ -727,6 +752,7 @@ const AddSurfacePage: React.FC = () => {
                             type="button"
                             className="btn btn-sm btn-primary surface-template-row__action"
                             disabled={applying}
+                            data-testid={`surface-template-use-button-${tpl.id}`}
                             aria-label={`Use template ${tpl.name}`}
                             title={`Use template ${tpl.name}`}
                             onClick={e => {
@@ -762,6 +788,7 @@ const AddSurfacePage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary btn-sm"
+                data-testid="add-surface-cancel-button"
                 onClick={() => navigate('/surfaces')}
               >
                 Cancel
@@ -774,7 +801,7 @@ const AddSurfacePage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid surface-page-fill">
+    <div className="container-fluid surface-page-fill" data-testid="page-add-surface">
       {error && (
         <div className="alert alert-danger" role="alert">
           <i className="fas fa-exclamation-circle me-2" />
@@ -828,6 +855,7 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              data-testid="add-surface-back-button"
               onClick={discard}
               disabled={saving}
               title="Back to surfaces"
@@ -837,6 +865,7 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-success btn-sm"
+              data-testid="add-surface-create-button"
               onClick={handleCreate}
               disabled={saving || !!saveDisabledReason}
               title={saveDisabledReason || (saving ? 'Creating…' : 'Create surface')}

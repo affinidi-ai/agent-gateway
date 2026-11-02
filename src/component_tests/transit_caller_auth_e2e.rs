@@ -276,7 +276,7 @@ async fn a_transit_point_sends_its_target_no_caller_info_or_did_identity_header(
 }
 
 /// A Transit Point that authenticates its callers with a JWT puts the verified
-/// caller in its policy input with `verification: source_auth`, so a policy can
+/// client in its policy input with `verification: source_auth`, so a policy can
 /// admit Alice and refuse Bob; the target sees only Alice's call and never her
 /// token.
 #[tokio::test(flavor = "multi_thread")]
@@ -288,10 +288,9 @@ async fn a_jwt_caller_reaches_the_policy_input_so_a_policy_can_admit_one_caller_
 default allow := false
 
 allow if {{
-    input.transit.caller.verified
-    input.transit.caller.verification == "source_auth"
-    input.transit.caller.identity_source == "jwt_bearer"
-    input.transit.caller.user_identity_hash == "{:x}"
+    input.transit.client.verification == "source_auth"
+    input.transit.client.method == "jwt_bearer"
+    input.transit.client.user_identity_hash == "{:x}"
     input.source_auth.claims.tid == "contoso"
 }}
 "#,

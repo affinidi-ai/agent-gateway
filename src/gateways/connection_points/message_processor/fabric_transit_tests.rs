@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{FabricReceiveCaller, ProcessingResult, fabric_caller_did_and_source, fabric_receive_transit_token};
+use super::{
+    FabricReceiveCaller, ProcessingResult, fabric_caller_did_and_source, fabric_receive_transit_token,
+    fabric_response_workload_binding, transit_token_unavailable_refusal,
+};
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::component_tests::helpers::RecordingTarget;
 use crate::config::agent_surface::AgentSurface;
@@ -90,7 +93,9 @@ fn surface(
 ) -> AgentSurface {
     let points: Vec<Value> = aliases
         .iter()
-        .map(|alias| json!({ "alias": alias, "target_endpoint": format!("https://{alias}.example") }))
+        .map(|alias| {
+            json!({ "alias": alias, "target_endpoint": format!("https://{alias}.example"), "allow_fabric_callers": true })
+        })
         .collect();
     let mut surface = json!({
         "surface_id": SURFACE_ID, "name": SURFACE_ID,
@@ -334,6 +339,7 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
                 peer_gateway_id: peer.id.clone(),
                 peer_issuer_did: Some(PEER_ISSUER_DID.to_string()),
                 hops: expected_hops,
+                caller_did: None,
                 principal_hash: verified_caller.clone(),
             }),
             "{case}"
@@ -430,7 +436,7 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
                 _ => None,
             })
             .collect();
-        assert_eq!(rejected, [(RejectionStage::Routing, reason, None)], "{hops}: no HTTP status on Fabric");
+        assert_eq!(rejected, [(RejectionStage::Routing, reason, None)], "{hops}");
         assert!(
             events
                 .iter()
@@ -712,6 +718,7 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
             caller,
             Some("trace"),
         )
+        .unwrap()
         .unwrap();
         issuer
             .validate(&token, 300)
@@ -719,14 +726,17 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     };
 
     let presented = claims(&caller(Some("did:web:agent.example"), IdentityVerification::Vp));
-    assert_eq!(presented.sub.as_deref(), Some("did:web:agent.example"));
+    let presented_fabric = presented
+        .fabric
+        .clone()
+        .unwrap();
     assert_eq!(
-        presented
-            .fabric
-            .and_then(|fabric| fabric.principal_hash),
-        None,
-        "a presentation names the caller, it does not verify it"
+        presented_fabric
+            .caller_did
+            .as_deref(),
+        Some("did:web:agent.example")
     );
+    assert_eq!(presented_fabric.principal_hash, None, "a presentation names the caller, it does not verify it");
     assert!(
         presented
             .caller_context_fields
@@ -889,32 +899,71 @@ async fn a_jwt_the_receiving_surface_verified_is_the_fabric_tokens_principal_wit
     assert_eq!(Value::Object(token.caller_context_fields), json!({ "email": "user-123@partner.example" }));
 }
 
-/// The token's `sub` is the caller only when it is a DID; it is
-/// `fabric-presentation` only when a connection issuer's presentation carried
-/// it.
+/// A token issued on Fabric receive carries a caller DID only when a
+/// presentation from one of the peer's connection issuers carried it
+/// (`fabric-presentation`): never one the peer only named, one this gateway
+/// computed from fields the peer sent, or a payload pseudonym.
 #[test]
-fn a_fabric_token_names_only_a_did_and_says_how_it_was_established() {
+fn a_fabric_token_carries_only_a_did_the_peers_presentation_proved() {
     for (identity, verification, expected) in [
         (
             Some("did:web:agent.example"),
             IdentityVerification::Vp,
             (Some("did:web:agent.example"), IdentitySource::FabricPresentation),
         ),
+        (Some("did:web:agent.example"), IdentityVerification::Unverified, (None, IdentitySource::FabricAsserted)),
         (
-            Some("did:web:agent.example"),
+            Some("did:web:this-gateway.example:computed:0f3a"),
             IdentityVerification::Unverified,
-            (Some("did:web:agent.example"), IdentitySource::FabricAsserted),
+            (None, IdentitySource::FabricAsserted),
         ),
-        (Some("sha256:0f3a"), IdentityVerification::Unverified, (None, IdentitySource::FabricAsserted)),
+        (Some("did:web:agent.example"), IdentityVerification::VpUnanchored, (None, IdentitySource::FabricAsserted)),
+        (Some("sha256:0f3a"), IdentityVerification::Vp, (None, IdentitySource::FabricAsserted)),
         (None, IdentityVerification::Unverified, (None, IdentitySource::FabricAsserted)),
     ] {
         assert_eq!(fabric_caller_did_and_source(identity, verification), expected, "{identity:?} {verification:?}");
     }
 }
 
+/// The presentation this gateway signs for its agent's response names the
+/// caller as the user the agent acted for only when a presentation from one of
+/// the connection's issuers proved the caller's DID, the same caller a transit
+/// token carries: never a pseudonym, a DID this gateway computed from fields
+/// the peer sent, or one the peer only named.
+#[test]
+fn a_fabric_response_presentation_names_only_a_caller_the_peers_presentation_proved() {
+    let identity_fields = std::collections::HashMap::from([("model".to_string(), json!("gpt-4"))]);
+    let proved = fabric_response_workload_binding(
+        &identity_fields,
+        Some("did:web:agent.example"),
+        IdentityVerification::Vp,
+        Some("trace-1".to_string()),
+    );
+    assert_eq!(
+        proved,
+        json!({
+            "agentIdentity": { "model": "gpt-4" },
+            "userIdentity": { "id": "did:web:agent.example" },
+            "delegated": true,
+            "traceId": "trace-1"
+        })
+    );
+    for (identity, verification) in [
+        ("did:web:victim.example", IdentityVerification::Unverified),
+        ("did:web:this-gateway.example:computed:0f3a", IdentityVerification::Unverified),
+        ("did:web:victim.example", IdentityVerification::VpUnanchored),
+        ("sha256:0f3a", IdentityVerification::Vp),
+        ("0f3a-victim-pseudonym", IdentityVerification::Unverified),
+    ] {
+        let binding = fabric_response_workload_binding(&identity_fields, Some(identity), verification, None);
+        assert_eq!(binding, json!({ "agentIdentity": { "model": "gpt-4" } }), "{identity} {verification:?}");
+    }
+}
+
 /// A token is issued only for a surface with Transit Points whose Target is
-/// the agent itself, by HTTP or HTTPS; never for a Target the gateway runs,
-/// and never without an issuer.
+/// the agent itself, by HTTP or HTTPS, never for a Target the gateway runs;
+/// one that should be issued without an issuer is an error, so the request is
+/// refused.
 #[test]
 fn a_fabric_token_is_issued_only_for_an_agent_behind_an_http_target() {
     let issuer = test_issuer();
@@ -934,17 +983,95 @@ fn a_fabric_token_is_issued_only_for_an_agent_behind_an_http_target() {
         issue(issuer, surface, target_url, false)
     };
     for target_url in ["https://agent.example/rpc", "http://agent.example/rpc", "HTTPS://agent.example/rpc"] {
-        assert!(issued(Some(&issuer), &with_points, target_url).is_some(), "{target_url}");
+        assert!(matches!(issued(Some(&issuer), &with_points, target_url), Ok(Some(_))), "{target_url}");
     }
     assert!(
-        issue(Some(&issuer), &with_points, "https://agent.example/.well-known/agent-card.json", true).is_none(),
+        matches!(
+            issue(Some(&issuer), &with_points, "https://agent.example/.well-known/agent-card.json", true),
+            Ok(None)
+        ),
         "an agent card fetch is no request of the agent's own"
     );
     for target_url in ["proxy://tools", "a2a-proxy://direct-line", "fabric://peer/surface"] {
-        assert!(issued(Some(&issuer), &with_points, target_url).is_none(), "{target_url}");
+        assert!(matches!(issued(Some(&issuer), &with_points, target_url), Ok(None)), "{target_url}");
     }
-    assert!(issued(None, &with_points, "https://agent.example/rpc").is_none());
-    assert!(
-        issued(Some(&issuer), &surface("a2a", "https://agent.example", &[]), "https://agent.example/rpc").is_none()
+    assert_eq!(issued(None, &with_points, "https://agent.example/rpc"), Err(()));
+    assert!(matches!(
+        issued(Some(&issuer), &surface("a2a", "https://agent.example", &[]), "https://agent.example/rpc"),
+        Ok(None)
+    ));
+}
+
+/// The token opens only the Transit Points that set `allow_fabric_callers`,
+/// and none is issued when no Transit Point sets it.
+#[test]
+fn a_fabric_token_opens_only_the_transit_points_that_allow_fabric_callers() {
+    let issuer = test_issuer();
+    let issue = |surface: &AgentSurface| {
+        fabric_receive_transit_token(
+            Some(&issuer),
+            Some(300),
+            surface,
+            "https://agent.example/rpc",
+            false,
+            &caller(None, IdentityVerification::Unverified),
+            Some("trace"),
+        )
+    };
+    let mut mixed = surface("a2a", "https://agent.example", &["crm", "billing"]);
+    mixed
+        .transit
+        .as_mut()
+        .unwrap()
+        .points[1]
+        .allow_fabric_callers = false;
+    let (token, _) = issue(&mixed)
+        .unwrap()
+        .expect("a token for the Transit Point that allows Fabric callers");
+    let claims = issuer
+        .validate(&token, 300)
+        .unwrap();
+    assert_eq!(claims.allowed_transit_points, vec!["crm".to_string()]);
+
+    let mut none = mixed.clone();
+    none.transit
+        .as_mut()
+        .unwrap()
+        .points[0]
+        .allow_fabric_callers = false;
+    assert_eq!(issue(&none), Ok(None), "no Transit Point allows Fabric callers");
+}
+
+/// A Fabric request whose managed agent should get a transit token that cannot
+/// be issued is refused with `503`, never forwarded, and recorded once as a
+/// `request_rejected` at the `forward` stage.
+#[tokio::test]
+async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
+    let surface = surface("a2a", "https://agent.example", &["crm"]);
+    let (result, events) = crate::audit::producer::capture(async {
+        transit_token_unavailable_refusal(&surface, Some("trace-from-the-peer"))
+    })
+    .await;
+    let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(response_body["status"], 503);
+    let rejected: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected { stage, reason, .. } => {
+                Some((*stage, *reason, event.via_fabric, event.trace_id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejected,
+        [(
+            RejectionStage::Forward,
+            RejectionReason::TransitTokenUnavailable,
+            true,
+            Some("trace-from-the-peer".to_string())
+        )]
     );
 }

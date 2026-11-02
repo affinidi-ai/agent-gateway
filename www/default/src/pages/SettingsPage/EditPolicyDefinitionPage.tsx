@@ -237,9 +237,13 @@ const EditPolicyDefinitionPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-policy-definition-editor">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={discard}>
+        <button
+          className="btn btn-sm btn-secondary"
+          onClick={discard}
+          data-testid="policy-definition-editor-back-button"
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
@@ -252,6 +256,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
           <div className="d-flex align-items-center">
             <button
               className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
+              data-testid="policy-definition-editor-save-button"
               onClick={handleSave}
               disabled={saving || !policyValid || !!packageMismatch}
             >

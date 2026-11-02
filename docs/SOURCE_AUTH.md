@@ -284,10 +284,30 @@ enforced. The admin API refuses a surface that sets it, on the surface or in a v
 overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
 its Transit Points refuse every request with `503` in the same way.
 
-The Surface Builder shows none of a Transit Point's `source_auth`,
-`allow_unauthenticated_callers` and `delegated_credentials_for_fabric_callers`. These rules hold for a `PUT` of the surface and for a `PUT`
+The Surface Builder's Transit Point panel has a **Who can call this Transit Point** section
+with the transit token switch, a **Caller authentication** choice (an API key from the secret
+store or from the provider, or a JWT bearer with its strategy, audiences, token header and
+scheme), and an **Open to any caller** switch that asks for confirmation. The switch shows
+while the Transit Point has no transit token, `source_auth` or `mcp_http.authorization`, and
+while it is already marked open; choosing the token or a method turns the marking off. An
+empty token scheme is allowed: the gateway then reads the token as the raw header value. The
+API key provider validates the surface's own keys, the same keys an Access Point using the
+provider accepts, so the panel warns that the Access Point's callers can call the Transit Point
+too; an API key from the secret store keeps a separate set of callers. A dashboard save writes
+the provider's `agent_id` from the surface being saved, so a Transit Point copied from a
+template accepts the new surface's keys, not the original's. A `source_auth` set through the API with
+mTLS shows as such and is kept; the panel does not edit it, nor DID Auth, which a Transit
+Point does not support. The panel applies the rules above before the save: a Transit Point that
+authenticates no caller and is not open, one that is open beside the token or a method, and a
+method that is missing its secret, header, strategy or audience cannot be saved, and the panel
+says why. A refusal from the admin API shows in the same section in plain words. Turning
+caller authentication off sends `"source_auth": null`. The panel shows neither
+`allow_fabric_callers` nor `delegated_credentials_for_fabric_callers`; a dashboard save keeps
+both, the second while the Transit Point still requires the transit token.
+
+These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
-overrides list. An omitted `source_auth` in a `PUT`, as in a dashboard save, keeps the stored
+overrides list. An omitted `source_auth` in a `PUT` keeps the stored
 one; `"source_auth": null` removes it, and so does a merge `PATCH` of the surface or the
 variant whose `transit.points` leave it out, since a merge patch replaces the whole list. The
 save rules above then apply, so a Transit Point left with no caller authentication is refused
@@ -300,7 +320,7 @@ saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Trans
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
-back.
+back. A write's `transit_point_source_auth` is ignored (see below), so the dashboard never sends it.
 
 ### Upgrading and rolling back
 
@@ -384,8 +404,9 @@ certificate: that route never passes on the forwarded-client-cert header, becaus
 outbound listener sees the gateway itself as the peer. A Transit Point with `mtls`
 `source_auth` is called on its outbound listener directly, or through a trusted proxy.
 
-The verified caller is in the Transit Point's policy input as `input.transit.caller`, with
-`verification: "source_auth"` (see
+The verified caller is in the Transit Point's policy input as `input.transit.client`, with
+`verification: "source_auth"`, apart from `input.transit.caller`, the end user a transit token
+names (see
 [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and `input.source_auth`
 carries the identity with a JWT's claims. The caller's principal, and so its identity hash,
 is:
@@ -395,10 +416,16 @@ is:
 | `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
-| `mtls` | The principal the `identity_binding` derives | One caller per trusted certificate (the CA certificate its chain ends at, or the pinned certificate) and bound principal |
+| `mtls` | The principal the `identity_binding` derives | One caller per trusted CA (its subject and key, or the pinned certificate) and bound principal |
+
+A Workload Binding on the Transit Point with `caller_source: authorization_bearer_jwt` binds the
+claims of the JWT the Transit Point verified (its `source_auth` or `mcp_http.authorization`),
+whichever header carried it. A caller verified another way (API key, mTLS) binds no claims. A
+Transit Point that authenticated no caller reads the `Authorization` header as sent, which the
+gateway has not verified, so give such a Transit Point `source_auth` before binding its claims.
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
-the fingerprint of the certificate an mTLS client certificate was verified against), the
+a hash of the subject and public key of the CA an mTLS client certificate was verified against), the
 surface's tenant and the principal (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)). It is the
 value an Access Point puts in the transit token for a caller it authenticated the same way, so
@@ -425,7 +452,17 @@ answered with a `Warning` header naming those URLs and bind addresses:
 Warning: 299 - "Transit Point 'crm' serves callers it does not authenticate and is reachable from other hosts: 0.0.0.0:8080, https://gateway.example.com"
 ```
 
-The dashboard does not show this header; read it from the admin API's answer or the log.
+This warning, and the shared-audience and shared-issuer warnings above, name a Transit Point
+that a variant's overrides define as `Transit Point 'crm' in variant 'beta'`. A Transit Point a
+variant inherits from the surface is named as the surface's own, once.
+
+The dashboard shows each such header on the Transit Point it names, in its **Who can call
+this Transit Point** section and in a toast, and keeps it there until that Transit Point's
+token, caller authentication, open marking or listener changes. Before the save it shows the
+same text when an open Transit Point's listener URL is one other hosts reach; that check sees
+only external URLs, so the header, which also counts bind addresses and shared-domain inbound
+listeners, is the complete answer. The same headers carry the shared audience and shared
+issuer warnings, shown the same way.
 
 When the outbound listener mounts the surface it logs the same text at `WARN`, and logs
 every other Transit Point that serves callers it does not authenticate at `WARN` too.
@@ -447,7 +484,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with a Transit Point that sets `allow_fabric_callers`, but not for a public discovery `GET` such as an agent card fetch. The token lists only those Transit Points. When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 
@@ -463,12 +500,13 @@ so its agent gets exactly one. It differs from an Access Point token:
 
 | Claim | Fabric receive |
 | --- | --- |
-| `sub` | The caller DID the peer's request names, only when it is a DID; a payload pseudonym (`sha256:...`) is left out |
-| `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the DID, `fabric-asserted` otherwise |
+| `sub` | Never present, so a release that predates the `fabric` claim never reads the peer's caller as one this gateway verified |
+| `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the caller DID, `fabric-asserted` otherwise |
+| `allowed_transit_points` | Only the surface's Transit Points that set `allow_fabric_callers` |
 | `user_identity_hash`, `caller_dna_uai` | Never present. `user_identity_hash` names a caller an Access Point verified; a Fabric token's principal is `fabric.principal_hash` |
 | `caller_context_fields` | The claims the surface's Transit Points allowlist (their enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`), taken from the JWT the receiving surface's own `source_auth` or resource token verified on the request. Never anything the peer's presentation or payload says |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
-| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)), and `principal_hash` (below) |
+| `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)), `caller_did`, only when a presentation from one of the connection's issuers carried it: never a DID the peer only named, one this gateway computed from fields the peer sent, or a payload pseudonym, and `principal_hash` (below) |
 | `fabric.principal_hash` | The [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) of the caller the receiving surface's own `source_auth` or resource token verified on this request, the value an Access Point would put in `user_identity_hash` for the same credential. Absent when the surface verified no caller: it has no caller authentication, or a caller-attributable failure was left to policy. Never derived from the caller DID, presentation or payload the peer sent |
 
 The peer gateway is always verified, by the Fabric handshake. Its caller is verified only when
@@ -477,8 +515,8 @@ the receiving surface checked a credential itself on the request, normally the o
 
 A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
 caller as `verification: fabric_peer`, verified only with a `fabric.principal_hash` (see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and with the DID unverified
-(`did_verified: false`) even when a presentation carried it. Static `target_auth`
+[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and its DID never verified,
+even when a presentation carried it. Static `target_auth`
 credentials are added as for any caller. Delegated per-user credentials are released for it
 only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, and only
 for the caller in `fabric.principal_hash` (see
@@ -486,25 +524,22 @@ for the caller in `fabric.principal_hash` (see
 A Transit Point's audit records name a caller in `fabric.principal_hash` with
 `auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a
 caller verified by an API key, and the allowlisted `sub`, `email` and `name` the receiving
-surface verified, with no `iss`: the peer issued none of them. They rank it ahead of a caller
-the Transit Point verified itself, as a verified Access Point token is. Without one they name
-the DID with `auth_method: fabric_asserted` and the peer as `iss`, below a caller the Transit
-Point verified itself. Both name the peer (its issuer DID, else its Remote gateway record id) as
-`peer_gateway`. Policy sees both as `verification: fabric_peer`; in audit records,
-`fabric_verified` is a Fabric caller the receiving surface verified and `fabric_asserted` one it
-did not, so a search for every request from paired gateways matches both labels, or
-`peer_gateway`. The identity presentation a Transit Point with a `workload_binding` signs for
-its agent never names that DID as the user it acts for (`userIdentity`), as it does the DID of
-an Access Point token.
-A release that predates the `fabric` claim reads such a token as one naming an unverified DID,
-with no principal, and one that predates `fabric.principal_hash` reads it as a `fabric_peer`
-caller with no principal, so neither releases a delegated credential for it. During a rolling
-upgrade, a Transit Point served by a node that predates the `fabric` claim still names that DID
-as the user its agent acts for (`userIdentity`) in the identity presentation it signs, and
-audits it with `auth_method: transit_token`, until every node is upgraded. A release that
-predates the hop count neither reads nor sends `X-Gateway-Fabric-Hops`, so a chain through such
-a gateway starts counting again at 1 after it (see
-[`FABRIC.md`](FABRIC.md#chains-across-gateways)).
+surface verified, with no `iss`: the peer issued none of them. Without one they name
+`fabric.caller_did` as `sub` with `auth_method: fabric_asserted` and the peer as `iss`. Either
+is named even when the Transit Point verified a client itself, and both name the peer (its
+issuer DID, else its Remote gateway record id) as `peer_gateway`. Policy sees both as
+`verification: fabric_peer`; in audit records, `fabric_verified` is a Fabric caller the
+receiving surface verified and `fabric_asserted` one it did not, so a search for every request
+from paired gateways matches both labels, or `peer_gateway`. The identity presentation a
+Transit Point with a `workload_binding` signs for its agent never names that DID as the user it
+acts for (`userIdentity`), as it does the DID of an Access Point token.
+A release that predates the `fabric` claim reads such a token as one with no principal and no
+caller DID, so during a rolling upgrade a Transit Point served by such a node treats its caller
+as anonymous: it never names a DID as the user its agent acts for or keys a grant by one. One
+that predates `fabric.principal_hash` reads it as a `fabric_peer` caller with no principal, so
+it releases no delegated credential for it either. A release that predates the hop count
+neither reads nor sends `X-Gateway-Fabric-Hops`, so a chain through such a gateway starts
+counting again at 1 after it (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)).
 
 A Transit Point refuses the call with `401` unless the token:
 
@@ -521,8 +556,8 @@ logged. A `GET` of a public discovery path, such as an agent card, is forwarded 
 transit token check, and so without any credential (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
 
-Transit Point policies see the caller the token carries, and a caller verified another way,
-in `input.transit.caller`; see
+Transit Point policies see the caller the token carries in `input.transit.caller`, and a
+client the Transit Point verified itself apart from it, in `input.transit.client`; see
 [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
 
 The signing key is 32 random bytes the gateway creates on its first start, in
@@ -542,13 +577,12 @@ every instance, delete the file, and start them again; every token issued before
 #### Transit token lifetime
 
 A surface sets how long its transit tokens live in `transit.transit_token_lifetime_secs`,
-from the appliance's shortest lifetime (30 seconds unless `gateway.json` sets
-`transit_token_min_lifetime_secs`) to 900 seconds. Unset means 300 seconds, or the shortest
-lifetime when that is above 300. Set a longer one when a managed agent's turn, such
-as a long tool call, needs its Transit Points for longer than 300 seconds. For that whole
-time the managed agent, or anyone who obtains the token, can call the surface's Transit
-Points as that caller, with the credentials they inject, so keep it no longer than a turn
-needs.
+from 30 seconds to the appliance's longest lifetime (300 seconds unless `gateway.json` sets
+`transit_token_max_lifetime_secs`, up to 900). Unset means 300 seconds, or the longest
+lifetime when that is below 300. Set a longer one when a managed agent's turn, such as a long
+tool call, needs its Transit Points for longer than 300 seconds. For that whole time the
+managed agent, or anyone who obtains the token, can call the surface's Transit Points as that
+caller, with the credentials they inject, so keep it no longer than a turn needs.
 
 ```json
 { "transit": { "transit_token_lifetime_secs": 600, "points": [ … ] } }
@@ -557,34 +591,39 @@ needs.
 The lifetime belongs to the surface: a variant takes its surface's, and cannot set its own.
 A surface whose Transit Points exist only in a variant needs a base `transit` block, with
 empty `points`, to carry the lifetime; without one its tokens live as an unset lifetime does.
-The admin API refuses a new lifetime outside the shortest lifetime to 900 seconds with `400`,
-naming `transit_token_min_lifetime_secs`, and one in a variant's overrides with `422`. A save
-that keeps the value already stored is accepted even when that value is outside the bounds,
-so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
+The admin API refuses a new lifetime below 30 seconds or above the longest lifetime with
+`400`, naming `transit_token_max_lifetime_secs`, and one in a variant's overrides with `422`.
+A save that keeps the value already stored is accepted even when that value is outside the
+bounds, so a dashboard save, or a `GET` followed by a `PUT`, of such a surface still works.
 
 A stored lifetime outside the bounds never stops the gateway. At startup, for every stored
-surface, disabled ones included, and on every reload, one below the shortest is raised to the
-shortest and one above 900 seconds is lowered to 900, with one `WARN` per surface naming the
-surface, the stored value and the lifetime its tokens get; the surface keeps its stored value.
-A value below the shortest arrives when the shortest is raised, when surfaces are restored
-from a backup taken on an appliance with a lower shortest lifetime, or when they are saved
-through another instance with a lower one; set the same value on every instance that shares
-surfaces. A value above 900 arrives from a hand edit, or after a rollback from a release that
-allows longer lifetimes (see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md)). The token
-issuer itself also refuses a lifetime outside the bounds.
+surface, disabled ones included, and on every reload, the Access Point issues tokens living 30
+seconds for one below 30, and tokens living the longest lifetime for one above it, with one
+`WARN` per surface naming the surface, the stored value and the lifetime its tokens get; the
+surface keeps its stored value. A value above the longest arrives when the longest is
+lowered, when surfaces are restored from a backup taken on an appliance with a higher one, or
+when they are saved through another instance with a higher one. A value below 30 arrives from
+a hand edit. The token issuer itself also refuses a lifetime outside 30 to 900 seconds.
 
-The shortest lifetime is a setting of the appliance, `transit_token_min_lifetime_secs` in
-`gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 30 seconds
-unless set, from 1 to 900. The gateway reads it once, when it starts: a value outside 1 to 900
-stops it from starting, and a change takes a restart. A reload, including the one a surface
-save triggers, keeps the value the gateway started with, whatever `gateway.json` says by then,
-so the admin API, the Access Point and the Transit Point always agree. Raise it to make every
-surface's tokens live at least that long; surfaces stored with a shorter lifetime are raised
-with it, as above. Lower it, for example to 10, when a deployment needs tokens that expire
-sooner. Near the floor, a Transit Point accepts a token on a legacy request until 5 seconds
-past its `exp`, the clock leeway between gateways, so a lifetime of 1 to 5 seconds lasts its
-lifetime plus 5 seconds there, while a `2026-07-28` MCP request checks `exp` with no leeway
-and leaves almost no usable time at that size. The longest, 900 seconds, is fixed.
+The longest lifetime is a setting of the appliance, `transit_token_max_lifetime_secs` in
+`gateway.json` (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): 300 seconds
+unless set, from 30 to 900. It caps how long the tokens this gateway issues live, whatever a
+surface stores, so it is how an operator bounds the window in which a leaked token can be
+used; surface writers cannot exceed it. The gateway reads it once, when it starts: anything
+but a whole number from 30 to 900 stops it from starting, and a change takes a restart. A
+reload, including the one a surface save triggers, keeps the value the gateway started with,
+whatever `gateway.json` says by then, and logs a `WARN` while the file says otherwise. The
+shortest, 30 seconds, and the highest the setting may take, 900 seconds, are fixed.
+
+A Transit Point never reads the longest lifetime: it checks a token against its surface's
+own lifetime, held to 30 to 900 seconds. Instances that share surfaces therefore accept each
+other's tokens even when their longest lifetimes differ, and lowering the longest lifetime
+does not refuse the longer tokens already issued; they stay valid until their own expiry.
+Upgrade every instance that shares surface storage, a Standby included, to this release or
+later before setting any surface's lifetime or raising the longest lifetime above 300. An
+earlier release refuses any token living longer than 300 seconds, so a request it serves
+gets an intermittent `401`, and it does not know the lifetime, so the next time it saves the
+surface it drops the stored value, which sets the lifetime back to 300 seconds.
 
 A Transit Point checks a token against the lifetime its surface sets when the token is
 presented, so a change applies to tokens already issued:
@@ -600,7 +639,9 @@ Shortening the lifetime is therefore not revocation. To revoke the tokens alread
 rotate the transit token key as described above.
 
 The Surface Builder does not show the lifetime. A `PUT` that omits
-`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value;
+`transit.transit_token_lifetime_secs`, as a dashboard save does, keeps the stored value. A
+`PUT` with no `transit` at all, as a dashboard save of a surface whose base has no Transit
+Points sends, keeps a stored base block with empty `points` holding only its lifetime;
 a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
 to 300 seconds.
 

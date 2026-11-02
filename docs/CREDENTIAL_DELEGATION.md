@@ -22,17 +22,76 @@ for the operator procedure. This page documents the implementation in
 ## Credential providers
 
 `CredentialProvider` ([`src/credential_providers/mod.rs`](../src/credential_providers/mod.rs))
-has three types, set by `provider_type`.
+has five types, set by `provider_type`.
 
 | Type | Flow | Consent |
 | --- | --- | --- |
 | `oauth2_authorization_code` | Three-legged OAuth. The user signs in to the provider and approves the scopes. | Required, per user |
-| `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client. | None |
+| `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client with a client secret. | None |
+| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`; no client ID or secret. A Google service account for Vertex AI Agent Engine works this way. | None |
+| `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret. An Entra certificate credential (key named by certificate thumbprint) and an Ory `private_key_jwt` client (key named by `kid`) work this way. | None |
 | `api_key` | A static key resolved from the secrets store. No OAuth. | None |
 
 A provider carries its authorization and token endpoints and its default scopes. Its
-client ID and client secret are **references** into the secrets store, such as
-`GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
+client ID, client secret, signing key and certificate are **references** into the secrets
+store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
+
+### Providers that sign a JWT
+
+The two JWT types share the settings in `JwtAssertionSettings`; create and update refuse a
+record that misses a required one.
+
+| Field | `oauth2_jwt_bearer` | `oauth2_client_credentials_jwt_auth` |
+| --- | --- | --- |
+| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) | Required |
+| `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
+| `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
+| `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
+| `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
+| `client_id_secret_ref` | Not used | Required, sent as `client_id` |
+| `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
+| `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
+| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
+
+Create and update resolve the referenced key and certificate after checking the caller may
+use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that
+is not PEM, so a wrong format fails the save rather than the first token request.
+`POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
+credential provider edit permission, applies the caller's tenant to the secrets it names, and
+answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
+accepted. The provider API never returns the key or certificate; the list leaves out
+their references too.
+
+Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, and for a
+client assertion `nbf` and a random `jti`); only the issued access token is cached. A JWT
+Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
+`common`. An update that sends a reference or JWT field as an empty string clears it, which
+is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
+reads an empty reference as none.
+
+### Service tokens
+
+`oauth2_client_credentials`, `oauth2_jwt_bearer`, `oauth2_client_credentials_jwt_auth` and
+`api_key` give the gateway a credential of its own, with no user.
+[`service_token::acquire`](../src/delegation_vault/service_token.rs) obtains it for every path
+that needs one: legacy and `2026-07-28` delegation bindings, and target authentication.
+
+- An API key is read from the secrets store on every use and never cached.
+- An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
+  then a new one is requested. A token response without `expires_in`, with an empty token, or
+  with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
+  than 30 seconds; only the response's OAuth `error` fields are logged.
+- When scopes were requested, the issued `scope` must name the same set, or the token is
+  refused; when none were requested, the issued scopes are kept.
+- The provider is read again after the token request, and a provider changed meanwhile
+  refuses the token.
+- `resource` is sent only when the provider sets it, on every path including legacy bindings.
+  The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
+  in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
+  list when an Entra v2.0 provider sets `resource`.
+
+Concurrent requests that all miss the cache each request a token; the last one stored wins.
 
 ## Binding a provider to a surface
 
@@ -81,11 +140,13 @@ send both.
 ### The caller on a Transit Point
 
 A Transit Point looks a grant up by the caller's identity hash and the managed agent's DID.
-The caller is the transit token's when the request carries a valid transit token with a
-`user_identity_hash`. Otherwise, when the Transit Point's own `source_auth` verified the
-caller (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is
-that caller's [identity hash](#the-callers-identity-hash), the value the Access Point computes
-for a caller it authenticated the same way. So:
+The caller is the transit token's when the request carries a valid transit token, and it has
+no caller when that token carries no `user_identity_hash`: the request is refused with `403`,
+and the client the Transit Point authenticated is not used instead. When the request carries
+no valid transit token and the Transit Point's own `source_auth` verified the caller (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), it is that caller's
+[identity hash](#the-callers-identity-hash), the value the Access Point computes for a caller
+it authenticated the same way. So:
 
 - an agent that calls the Transit Point with a JWT from the same issuer, for the same `sub`,
   as a user who consented through the Access Point is given that user's grant; a JWT from
@@ -95,7 +156,15 @@ for a caller it authenticated the same way. So:
 - a JWT without a `sub` names no caller and is given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
-a `2026-07-28` MCP request. The agent half of the key is the Transit Point's
+a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way. A
+Transit Point cannot have both a resource access token and `source_auth`, so when the
+surface has an outbound credential binding for every request (`required_for: all`), every
+`2026-07-28` MCP request to a Transit Point whose caller `source_auth` verified, or that a
+transit token alone names, is refused with `403` and JSON-RPC error `-32001`, whatever its
+method, `tools/list` included, and never reaches the target; a save of such a Transit Point
+answers with a `Warning` header. Bindings scoped to tools never apply on a Transit Point, so a
+surface with only those sends the request on without delegated credentials. Such a caller
+uses delegated credentials on legacy MCP, A2A and HTTP requests. The agent half of the key is the Transit Point's
 [managed identity](SOURCE_AUTH.md#managed-identity), else the caller DID the transit token
 carries, so a `source_auth` caller without a transit token needs a managed identity for the
 Transit Point.
@@ -111,7 +180,8 @@ either, so such a call needs the Transit Point's managed identity: its own `mana
 or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
 one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
 Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
-header saying so.
+header saying so. The switch has an effect only on a Transit Point that also sets
+`allow_fabric_callers`, since a token issued for a partner's request opens no other.
 
 Set the switch only when the receiving surface verifies a per-user credential on each Fabric
 request: a JWT whose `sub` is the end user, with an audience naming this gateway. The receiving
@@ -124,21 +194,61 @@ Without the switch, or when the receiving surface verified no caller, a binding 
 refuses the call with `403` and the target is not called. The log says delegated credentials
 are not released for requests that arrived over Fabric
 (`reason=delegated_credentials_for_fabric_callers=false`), or that the receiving surface
-verified no caller of the request (`reason=no_fabric_caller_verified`). The grant follows the
-caller the Transit Point's policy input ranks first: a caller the Transit Point's own
-`source_auth` verified on the same call keys its own grant only when the token names no caller
-the receiving surface verified. When the token names one, that caller outranks it, so without
-the switch the call is refused, never served with the grant of the Transit Point's caller.
-Static `target_auth` credentials are added as for any caller. A release that predates the
-switch, or `fabric.principal_hash`, keys no grant by a Fabric-issued token; a caller its own
-`source_auth` verified still keys its own grant there, and its policy input and audit records
-name that caller first. During a rolling upgrade, a `PUT` of the surface through a node that
-predates the switch saves it without the switch, which turns it off.
+verified no caller of the request (`reason=no_fabric_caller_verified`). The token decides the
+caller half of the key, as any transit token does, so a client the Transit Point's own
+`source_auth` verified on the same call keys no grant either: without the switch the call is
+refused, never served with the grant of the Transit Point's client. Static `target_auth`
+credentials are added as for any caller. A release that predates the switch, or
+`fabric.principal_hash`, keys no grant by a Fabric-issued token. During a rolling upgrade, a
+`PUT` of the surface through a node that predates the switch saves it without the switch, which
+turns it off.
 
 On a `fabric://` Transit Point the two switches are independent:
 `delegated_credentials_for_fabric_callers` decides whether a Fabric caller's grant is looked up
 at all, and `fabric_delegated_credentials` whether a resolved credential crosses to the next
 peer (see [Across Fabric](#across-fabric)).
+
+## Target authentication from a credential provider
+
+A Target's `target.auth` or a Transit Point's `target_auth` can take its credential from a
+credential provider instead of a static secret:
+
+```json
+{
+  "method": {
+    "credential_provider": {
+      "provider_id": "<credential provider id>",
+      "header_name": "Authorization",
+      "header_format": "Bearer {value}",
+      "scopes": ["https://www.googleapis.com/auth/cloud-platform"]
+    }
+  },
+  "fallback": "reject"
+}
+```
+
+`header_name` defaults to `Authorization`, `header_format` to `Bearer {value}`, and `scopes`
+to the provider's default scopes. The provider can be any type but
+`oauth2_authorization_code`, which needs a user's consent; a surface save refuses that type, a
+provider the surface's tenant cannot reference, and the never-implemented `credential_lookup`
+method, which still loads from storage. The provider is a reference of the surface, so it
+cannot be deleted while a surface uses it.
+
+The token is a service token (see above), cached in the vault under the agent half
+`surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
+the scope hash is the SHA-256 (hex) of the sorted, deduplicated scopes joined by spaces.
+Changing the provider changes the digest, so a token issued under the old settings is never
+reused; a Target and a Transit Point that use one provider with different scopes each keep
+their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
+request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
+unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
+cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
+`passthrough` forwards without the credential, and the cause is logged only. A `401` from the
+target does not evict the cached token.
+
+`POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
+only `static_secret` target authentication, so listing the tools of an MCP server behind an
+OAuth-protected endpoint needs a static secret for now.
 
 ## When a token is missing
 
@@ -174,7 +284,9 @@ A binding that applies but whose credential cannot be resolved refuses the reque
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
 error, and consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`. An Access Point and
+built, for example when the provider has no `authorization_endpoint`. A failed token request
+records `client_credentials_failed`, `jwt_bearer_failed` or `client_credentials_jwt_auth_failed`
+by provider type. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
@@ -182,9 +294,11 @@ provider that cannot be used.
 
 A Transit Point refuses such a request with `503`, and also refuses with `403` one that names
 no caller, because neither a transit token with a caller identity nor the Transit Point's
-`source_auth` identifies one, as on every request to a Transit Point that serves callers it
-does not authenticate, or for which neither its managed identity nor the transit token's
-caller DID gives the agent half of the vault key. It also refuses when its delegation
+`source_auth` identifies one. That includes every request to a Transit Point that serves callers it
+does not authenticate and every request to one that sets `require_transit_token: false` without
+`source_auth` (a valid transit token sent there names the caller to policy only, not to
+delegation), or for which neither its managed identity nor the transit token's caller DID gives
+the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
 `application/problem+json` body. A missing token still gets the consent answer above. A
@@ -290,13 +404,14 @@ certificate identity therefore shares one set of delegated tokens.
 | `api_key` | `api_key` | `""` | The `secret_id` |
 | `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
 | `did_auth` | `did_auth` | `""` | The DID |
-| `mtls` | `mtls` | The lowercase hex SHA-256 of the certificate the client certificate was verified against: the configured CA certificate its chain ends at, or with pinned trust the pinned certificate | The principal the `identity_binding` derives |
+| `mtls` | `mtls` | The lowercase hex SHA-256 of the subject and public key of the CA certificate its chain ends at, or with pinned trust of the pinned certificate | The principal the `identity_binding` derives |
 
 `tenant` is the surface's `tenant_id`, or `null` on a surface with none. The same subject named
 by another method, issuer, API Key Provider agent or tenant is therefore another caller, with
-grants of its own. An mTLS caller is keyed by the certificate the gateway trusted, not by the
-issuer name its certificate states, so replacing a trusted CA certificate, or a pinned
-certificate, gives its callers new identity hashes. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+grants of its own. An mTLS caller is keyed by the subject and key of the CA the gateway trusted, not by the
+issuer name its certificate states, so renewing a CA with the same subject and key keeps its callers' identity
+hashes, and a CA with another key gives them new ones. With pinned trust, replacing a pinned
+certificate gives its caller a new hash. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
 no identity hash, so it is given no delegated credential: an Access Point answers `403`
 `identity-required`, and a Transit Point `403`.
 
@@ -313,12 +428,14 @@ Delegated credentials stored by a release that keyed them by an earlier form of 
 hash are never looked up again, but their access and refresh tokens stay in the vault until
 they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
 Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
-the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except those under
-`__client_credentials__`, which are unchanged. Users connect their accounts again the next time
+the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except service tokens (those under
+`__client_credentials__`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
 a credential is needed.
 
-Client-credentials tokens have no user, so they are cached under the fixed user hash
-`__client_credentials__`.
+Service tokens have no user, so a legacy binding caches them under the fixed user hash
+`__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
+digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
+the agent half `surface:<surface_id>`.
 
 A lookup has four outcomes.
 
@@ -329,8 +446,8 @@ A lookup has four outcomes.
 | Expired, no refresh token | Treats it as missing and applies the consent mode |
 | Not found | Applies the consent mode |
 
-For client-credentials providers an expired token is deleted and a fresh one fetched,
-since no user is involved.
+For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
+fresh one, since no user is involved.
 
 ### Storage
 
@@ -352,6 +469,27 @@ at rest on any appliance that holds real user tokens. See
 | `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
 | `GET /api/v1/delegation-audit` | The delegation audit log |
+
+### Removing grants keyed by the old identity hash
+
+Before the [identity hash](#the-callers-identity-hash) took the method, issuer and tenant, it
+was the lowercase hex SHA-256 of the subject alone. A grant stored under that hash is never
+found again: the user connects the account again, and the old entry stays in the vault, with
+its refresh token, until it is revoked. Both hashes are 64 hex characters, so the vault list
+does not show which entries are old. Entries under `__client_credentials__` are not affected.
+
+For each user who connected an account before the upgrade, compute the old hash from the
+subject (the JWT `sub`, the API key `secret_id` or key id, the DID, or the mTLS principal) and
+revoke it:
+
+```sh
+OLD_HASH=$(printf '%s' 'alice' | shasum -a 256 | cut -d' ' -f1)
+curl -X DELETE "$GATEWAY/api/v1/delegation-vault/by-user/$OLD_HASH" -H "Authorization: Bearer $TOKEN"
+```
+
+When the subjects are not known, list the vault and revoke by `id` every entry, other than
+`__client_credentials__`, whose `created_at` is before the upgrade. Do this after every
+instance runs the new release, as an instance still on the old one writes the old hash.
 
 Credential providers have their own management routes in
 [`src/credential_providers/router.rs`](../src/credential_providers/router.rs), gated on

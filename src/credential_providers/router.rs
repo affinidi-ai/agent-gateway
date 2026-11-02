@@ -25,7 +25,10 @@ pub fn create_credential_providers_router(
     };
     let gate = guard.as_ref();
     Router::new()
-        .route("/api/v1/credential-providers/validate", post(handlers::validate_provider))
+        .route(
+            "/api/v1/credential-providers/validate",
+            maybe_gate(gate, post(handlers::validate_provider), Feature::CredentialProvidersEdit),
+        )
         .route(
             "/api/v1/credential-providers",
             maybe_gate(gate, post(handlers::create_provider), Feature::CredentialProvidersEdit),

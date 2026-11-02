@@ -201,10 +201,11 @@ const EditTrustRegistryPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-trust-registry-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="trust-registry-editor-back-button"
           onClick={() => navigate('/connections?tab=trust-registries')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -329,6 +330,7 @@ const EditTrustRegistryPage: React.FC = () => {
                     registry.connection_status === 'disconnected') && (
                     <button
                       className="btn btn-sm btn-warning ms-2"
+                      data-testid="trust-registry-editor-reconnect-button"
                       onClick={handleReconnect}
                       disabled={reconnecting}
                       title="Attempts to restore the existing connection. If that fails, re-establishes it using the stored OOB URL."
@@ -352,6 +354,7 @@ const EditTrustRegistryPage: React.FC = () => {
                     <button
                       title="Sends a test query to confirm the connection is live and reports the round-trip time"
                       className="btn btn-sm btn-outline-primary ms-2"
+                      data-testid="trust-registry-editor-ping-button"
                       onClick={handleListRecords}
                       disabled={listingRecords}
                     >
@@ -395,7 +398,12 @@ const EditTrustRegistryPage: React.FC = () => {
               />
             </div>
             <div className="d-flex gap-2">
-              <button type="submit" className="btn btn-primary" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="trust-registry-editor-save-button"
+                className="btn btn-primary"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span
@@ -417,6 +425,7 @@ const EditTrustRegistryPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary"
+                data-testid="trust-registry-editor-cancel-button"
                 onClick={() => navigate('/connections?tab=trust-registries')}
                 disabled={saving}
               >

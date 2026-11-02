@@ -215,6 +215,38 @@ allow if {{
     assert_eq!(requests_seen(&h), before, "a refused caller's call must not reach the target");
 }
 
+/// A Transit Point that does not require a transit token still verifies one the
+/// agent sends, so a policy that names Alice admits her call. A token that does
+/// not verify is ignored: the caller is anonymous and the call is refused, not
+/// rejected for its token.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_optional_transit_token_still_names_the_caller() {
+    let rego = |issuer: &str| {
+        format!(
+            r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "{}"
+}}
+"#,
+            jwt_caller_hash(issuer, "alice")
+        )
+    };
+    let (h, fixture) = start_gateway(rego, false).await;
+    let alice = transit_token_for(&h, &fixture, "alice").await;
+
+    let before = requests_seen(&h);
+    assert_eq!(call_transit_point(&h, Some(&alice)).await, 200);
+    assert_eq!(requests_seen(&h), before + 1, "the verified caller's call must reach the target");
+
+    let before = requests_seen(&h);
+    assert_eq!(call_transit_point(&h, Some("not-a-transit-token")).await, 403);
+    assert_eq!(requests_seen(&h), before, "a call with a token that does not verify is anonymous");
+}
+
 /// A Transit Point that does not require a transit token sees an anonymous
 /// caller: `verified` is false and `verification` says `anonymous`, so a policy
 /// that needs a verified caller refuses the call and one that names the

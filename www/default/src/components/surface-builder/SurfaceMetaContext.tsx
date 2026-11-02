@@ -50,6 +50,11 @@ export interface SurfaceMetaValue {
   activeVariantIsDefault?: boolean;
   /** Message of the last failed save, so a panel can show it next to the field it names. */
   saveError?: string | null;
+  /**
+   * Messages of the `Warning` headers the last successful save answered with.
+   * A new array on every save, so a panel can tell one save from the next.
+   */
+  saveWarnings?: readonly string[] | null;
   setName: (v: string) => void;
   setDescription: (v: string) => void;
   setTagsCsv: (v: string) => void;

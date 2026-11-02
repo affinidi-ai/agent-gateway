@@ -57,7 +57,12 @@ pub struct PolicyInput {
 /// `input.transit`: what the gateway knows about a Transit Point call.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitContext {
+    /// The end user the transit token names.
     pub caller: TransitCallerContext,
+    /// The client the Transit Point authenticated itself on this request,
+    /// kept apart from `caller`. Absent when it authenticated none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<TransitClientContext>,
 }
 
 /// What established the caller of a Transit Point call. Serialized as
@@ -68,12 +73,6 @@ pub enum TransitCallerVerification {
     /// The gateway-signed transit token carries a principal that source
     /// authentication verified on the Access Point.
     TransitToken,
-    /// The Transit Point verified the caller's resource-server token
-    /// (`mcp_http.authorization`) on this request.
-    ResourceToken,
-    /// The Transit Point's own `source_auth` verified the caller's credential
-    /// on this request.
-    SourceAuth,
     /// A valid transit token names a caller DID, but nothing it carries was
     /// verified by credential: the DID was asserted or derived from request
     /// fields on the Access Point.
@@ -111,51 +110,33 @@ impl From<&crate::proxy::transit_token::FabricTransitClaims> for TransitFabricPe
 /// gateway came to know it.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitCallerContext {
-    /// `true` when a credential the gateway verified established the caller
-    /// (`transit_token`, `resource_token` and `source_auth`, and `fabric_peer`
-    /// when the receiving surface verified the caller of the Fabric request);
-    /// `false` for `unverified`, any other `fabric_peer` and `anonymous`.
+    /// `true` for a `transit_token` caller, and for a `fabric_peer` when the
+    /// receiving surface verified the caller of the Fabric request; `false` for
+    /// `unverified`, any other `fabric_peer` and `anonymous`.
     pub verified: bool,
     pub verification: TransitCallerVerification,
-    /// How the identity was established: the transit token's `identity_source`
-    /// (`gateway-computed`, `self-presented`, `verified-presentation`, or
-    /// `fabric-presentation` and `fabric-asserted` for a token issued on Fabric
-    /// receive), or the source-auth method of a caller the Transit Point
-    /// verified (`jwt_bearer` for a resource token; `api_key`, `jwt_bearer` or
-    /// `mtls` for `source_auth`).
+    /// How the caller DID was established: the transit token's
+    /// `identity_source` (`gateway-computed`, `self-presented`,
+    /// `verified-presentation`, or `fabric-presentation` and `fabric-asserted`
+    /// for a token issued on Fabric receive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
     /// The caller's identity hash
-    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)):
-    /// the same value whichever mechanism carried a caller verified the same
-    /// way. Present only when `verified`, and absent for a credential that
-    /// names no subject.
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash))
+    /// the Access Point computed. Present only when `verified`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
-    /// The verified principal itself. Only a caller the Transit Point verified
-    /// (`resource_token` or `source_auth`) has one: a transit token carries the
-    /// hash, and the principal only as an allowlisted field. Absent with the
-    /// hash.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    /// The caller DID the transit token carries (`sub`). Asserted by the caller
-    /// unless `did_verified`.
+    /// The caller DID the transit token carries (`sub`). Always asserted:
+    /// nothing on the Access Point verifies a DID presentation yet, so there
+    /// is no `did_verified` and no Agent DNA UAI here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
-    /// `true` only when this gateway verified the DID's presentation
-    /// (`identity_source` `verified-presentation`). Always `false` for a token
-    /// issued for a peer gateway's request: a `fabric-presentation` DID is one
-    /// the peer vouched for, and any peer can vouch for any DID.
-    pub did_verified: bool,
-    /// The caller's Agent DNA UAI the transit token carries, when resolved.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caller_dna_uai: Option<String>,
     /// The operator-allowlisted `caller_context_fields` the transit token
     /// carries, verbatim. Empty unless the caller is `verified`.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     pub fields: serde_json::Map<String, serde_json::Value>,
-    /// The peer gateway, when the call carries a valid transit token issued for
-    /// a request that arrived over Fabric, whichever caller this context names.
+    /// The peer gateway, when the transit token was issued for a request that
+    /// arrived over Fabric.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fabric: Option<TransitFabricPeer>,
 }
@@ -167,10 +148,7 @@ impl TransitCallerContext {
             verification: TransitCallerVerification::Anonymous,
             identity_source: None,
             user_identity_hash: None,
-            subject: None,
             did: None,
-            did_verified: false,
-            caller_dna_uai: None,
             fields: serde_json::Map::new(),
             fabric: None,
         }
@@ -196,10 +174,7 @@ impl TransitCallerContext {
                 verification: TransitCallerVerification::FabricPeer,
                 identity_source: claims.identity_source.clone(),
                 user_identity_hash: fabric.principal_hash.clone(),
-                subject: None,
-                did_verified: false,
-                did: claims.sub.clone(),
-                caller_dna_uai: None,
+                did: fabric.caller_did.clone(),
                 fields: if verified {
                     claims
                         .caller_context_fields
@@ -228,14 +203,7 @@ impl TransitCallerContext {
             user_identity_hash: claims
                 .user_identity_hash
                 .clone(),
-            subject: None,
-            did_verified: did.is_some()
-                && claims
-                    .identity_source
-                    .as_deref()
-                    == Some("verified-presentation"),
             did,
-            caller_dna_uai: claims.caller_dna_uai.clone(),
             fields: if verified {
                 claims
                     .caller_context_fields
@@ -246,20 +214,50 @@ impl TransitCallerContext {
             fabric: None,
         }
     }
+}
 
-    /// A caller the Transit Point itself authenticated on this request, on a
-    /// surface of `tenant_id`. A credential that names no subject has neither
-    /// a hash nor a subject.
-    pub fn from_authenticated(
+/// What authenticated the client of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitClientVerification {
+    /// The Transit Point verified the client's resource-server token
+    /// (`mcp_http.authorization`) on this request.
+    ResourceToken,
+    /// The Transit Point's own `source_auth` verified the client's credential
+    /// on this request.
+    SourceAuth,
+}
+
+/// `input.transit.client`: the principal the Transit Point authenticated
+/// itself, and how.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitClientContext {
+    pub verification: TransitClientVerification,
+    /// The source-auth method that verified the credential (`jwt_bearer`,
+    /// `api_key`, `did_auth`, `mtls`).
+    pub method: String,
+    /// The client's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)).
+    /// Absent for a credential that names no subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The verified principal itself. Absent with the hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl TransitClientContext {
+    /// A client `verification` authenticated on a surface of `tenant_id`.
+    pub fn new(
         identity: &crate::source_auth::AuthenticatedIdentity,
-        verification: TransitCallerVerification,
+        verification: TransitClientVerification,
         tenant_id: Option<&str>,
     ) -> Self {
         let user_identity_hash = identity.principal_hash(tenant_id);
         Self {
-            verified: true,
             verification,
-            identity_source: Some(identity.method().to_string()),
+            method: identity.method().to_string(),
             subject: user_identity_hash
                 .as_ref()
                 .map(|_| {
@@ -268,11 +266,6 @@ impl TransitCallerContext {
                         .to_string()
                 }),
             user_identity_hash,
-            did: None,
-            did_verified: false,
-            caller_dna_uai: None,
-            fields: serde_json::Map::new(),
-            fabric: None,
         }
     }
 }

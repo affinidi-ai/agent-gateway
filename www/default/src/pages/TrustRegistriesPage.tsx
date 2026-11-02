@@ -157,6 +157,7 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
         variant="primary"
         size="md"
         className="shadow-sm"
+        data-testid="trust-registries-add-button"
         onClick={e =>
           guard('connections.trustregistries', () => navigate('/trust-registries/wizard'), e)
         }
@@ -283,6 +284,7 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
                   <tbody>
                     {filteredTrustRegistries.map(registry => (
                       <tr
+                        data-testid={`trust-registries-row-${registry.id}`}
                         key={registry.id}
                         style={{ cursor: 'pointer' }}
                         onClick={() => navigate(`/trust-registries/${registry.id}`)}
@@ -308,6 +310,7 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
                               className="me-2"
                               onClick={e => handleListRecords(e, registry.id)}
                               disabled={listingRecordsId === registry.id}
+                              data-testid={`trust-registries-ping-button-${registry.id}`}
                               aria-label={`Ping ${registry.name} to check connectivity`}
                             >
                               {listingRecordsId === registry.id ? (
@@ -326,6 +329,7 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
                               size="sm"
                               title="Edit Trust Registry"
                               className="me-2"
+                              data-testid={`trust-registries-edit-button-${registry.id}`}
                               aria-label={`Edit trust registry ${registry.name}`}
                               onClick={() => navigate(`/trust-registries/${registry.id}`)}
                             >
@@ -334,6 +338,7 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
                           )}
                           {hasPermission('trust_registries.delete') && (
                             <DeleteButton
+                              data-testid={`trust-registries-delete-button-${registry.id}`}
                               onDelete={() => handleDelete(registry.id)}
                               className="btn-sm"
                               title="Delete Trust Registry"

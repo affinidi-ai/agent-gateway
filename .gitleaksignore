@@ -33,4 +33,4 @@ src/didauth/sessions.rs:generic-api-key:506
 src/encryption/migration.rs:generic-api-key:209
 src/mpp/types.rs:generic-api-key:614
 src/observability/log_redact.rs:generic-api-key:1159
-src/server/websocket.rs:generic-api-key:720
+src/server/websocket.rs:generic-api-key:721

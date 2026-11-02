@@ -11,12 +11,14 @@ use crate::credential_providers::CredentialProvider;
 use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
+use crate::delegation_vault::service_token::{
+    self, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
+};
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::secrets::SecretsStore;
 use chrono::Utc;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, info, warn};
 
 pub mod modern;
 
@@ -165,6 +167,10 @@ pub enum DelegationActionOutcome {
     ApiKeyResolutionFailed,
     /// OAuth2 client-credentials token fetch failed.
     ClientCredentialsFailed,
+    /// OAuth2 JWT Bearer grant failed.
+    JwtBearerFailed,
+    /// OAuth2 client-credentials token fetch with a JWT client assertion failed.
+    ClientCredentialsJwtAuthFailed,
 }
 
 /// Audit-grade per-binding record produced by the resolver.
@@ -229,6 +235,23 @@ impl DelegationResolution {
                 detail,
             },
             result,
+        }
+    }
+}
+
+/// The grant name used in audit details, and the outcome recorded when it fails.
+fn service_grant(provider_type: &CredentialProviderType) -> (&'static str, DelegationActionOutcome) {
+    match provider_type {
+        CredentialProviderType::OAuth2ClientCredentials => {
+            ("client_credentials", DelegationActionOutcome::ClientCredentialsFailed)
+        }
+        CredentialProviderType::OAuth2JwtBearer => ("jwt_bearer", DelegationActionOutcome::JwtBearerFailed),
+        CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
+            ("client_credentials_jwt_auth", DelegationActionOutcome::ClientCredentialsJwtAuthFailed)
+        }
+        CredentialProviderType::ApiKey => ("api_key", DelegationActionOutcome::ApiKeyResolutionFailed),
+        CredentialProviderType::OAuth2AuthorizationCode => {
+            ("authorization_code", DelegationActionOutcome::ProviderUnavailable)
         }
     }
 }
@@ -419,32 +442,62 @@ pub async fn resolve_delegation_credentials(
                 }
                 continue;
             }
-            CredentialProviderType::OAuth2ClientCredentials => {
-                // M2M flow: check vault first (for caching), then fetch fresh if needed
+            CredentialProviderType::OAuth2ClientCredentials
+            | CredentialProviderType::OAuth2JwtBearer
+            | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
                 let m2m_user_hash = "__client_credentials__";
-                let lookup_result = vault_store
-                    .lookup(agent_did, m2m_user_hash, &binding.credential_provider_id)
-                    .await;
-
-                match lookup_result {
-                    Ok(VaultLookupResult::Found(token)) => {
+                let (grant, failure) = service_grant(&provider.provider_type);
+                let effective_scopes = if binding.scopes.is_empty() {
+                    &provider.default_scopes
+                } else {
+                    &binding.scopes
+                };
+                let context = ServiceTokenContext {
+                    secrets: secrets_store,
+                    providers: provider_store.as_ref(),
+                    vault: vault_store.as_ref(),
+                    http: None,
+                };
+                let key = ServiceTokenKey {
+                    agent_did,
+                    identity: m2m_user_hash,
+                };
+                let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
+                    .await
+                    .and_then(|mut token| match token.issued.take() {
+                        Some(IssuedToken { id, cached }) => Ok((id, cached, token)),
+                        // Unreachable: acquire issues a vault token for each of these OAuth types.
+                        None => Err(ServiceTokenError::Unsupported),
+                    });
+                match acquired {
+                    Ok((token_id, cached, token)) => {
+                        let detail = format!(
+                            "{grant}_{}",
+                            if cached {
+                                "cached"
+                            } else {
+                                "fresh"
+                            }
+                        );
                         debug!(
                             target: "credential_delegation",
                             surface_variant,
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
-                            "Client credentials token found in vault — injecting"
+                            detail = %detail,
+                            "Service token resolved — injecting into upstream request"
                         );
-                        if let Err(e) = vault_store
-                            .mark_used(&token.id)
-                            .await
+                        if cached
+                            && let Err(e) = vault_store
+                                .mark_used(&token_id)
+                                .await
                         {
                             warn!(
                                 target: "credential_delegation",
                                 surface_variant,
-                                token_id = %token.id,
+                                token_id = %token_id,
                                 error = %e,
-                                "Failed to mark client_credentials token as used"
+                                "Failed to mark service token as used"
                             );
                         }
                         audit::emit("token_injected", || {
@@ -455,134 +508,32 @@ pub async fn resolve_delegation_credentials(
                                 Some(&binding.credential_provider_id),
                                 Some(channel_id),
                             );
-                            evt.token_id = Some(token.id.clone());
+                            evt.token_id = Some(token_id.clone());
                             evt.via_fabric = via_fabric;
-                            evt.detail = Some("client_credentials_cached".to_string());
+                            evt.detail = Some(detail.clone());
                             enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                             evt
                         });
-                        let headers = build_injection_headers(&binding.inject_as, &token.access_token);
+                        let headers = build_injection_headers(&binding.inject_as, token.value());
                         results.push(DelegationResolution::new(
                             binding,
                             Some(&provider.name),
                             DelegationActionOutcome::TokenInjected,
-                            Some("client_credentials_cached".to_string()),
-                            DelegationLookupResult::Inject(headers),
-                        ));
-                        continue;
-                    }
-                    Ok(VaultLookupResult::ExpiredRefreshable(token) | VaultLookupResult::ExpiredNoRefresh(token)) => {
-                        debug!(
-                            target: "credential_delegation",
-                            surface_variant,
-                            token_id = %token.id,
-                            "Expired client credentials will be replaced atomically"
-                        );
-                    }
-                    _ => {
-                        // Not found or error — proceed to fetch fresh token
-                    }
-                }
-
-                let effective_scopes = if binding.scopes.is_empty() {
-                    &provider.default_scopes
-                } else {
-                    &binding.scopes
-                };
-
-                match oauth::fetch_client_credentials_token(&provider, effective_scopes, secrets_store).await {
-                    Ok(token_response) => {
-                        info!(
-                            target: "credential_delegation",
-                            surface_variant,
-                            surface_id = %channel_id,
-                            provider_id = %binding.credential_provider_id,
-                            "Client credentials token fetched — caching in vault"
-                        );
-                        let expires_at = token_response
-                            .expires_in
-                            .map(|secs| Utc::now() + chrono::Duration::seconds(secs));
-                        let now = Utc::now();
-                        let delegation_token = DelegationToken {
-                            id: Uuid::new_v4().to_string(),
-                            agent_did: agent_did.to_string(),
-                            user_identity_hash: m2m_user_hash.to_string(),
-                            credential_provider_id: binding
-                                .credential_provider_id
-                                .clone(),
-                            provider_id: provider.provider_id.clone(),
-                            access_token: token_response
-                                .access_token
-                                .clone(),
-                            refresh_token: token_response.refresh_token,
-                            token_type: token_response.token_type,
-                            scopes: effective_scopes.to_vec(),
-                            expires_at,
-                            delegation_vc: None,
-                            consent_identity: None,
-                            consent_granted_at: now,
-                            last_used_at: Some(now),
-                            created_at: now,
-                            updated_at: now,
-                        };
-                        let stored = match vault_store
-                            .store(delegation_token)
-                            .await
-                        {
-                            Ok(stored) => stored,
-                            Err(error) => {
-                                error!(
-                                    target: "credential_delegation",
-                                    surface_variant,
-                                    surface_id = %channel_id,
-                                    provider_id = %binding.credential_provider_id,
-                                    error = %error,
-                                    "Failed to store fresh client_credentials token in vault"
-                                );
-                                results.push(DelegationResolution::new(
-                                    binding,
-                                    Some(&provider.name),
-                                    DelegationActionOutcome::ClientCredentialsFailed,
-                                    Some("vault_store_rejected".to_string()),
-                                    DelegationLookupResult::Unavailable,
-                                ));
-                                continue;
-                            }
-                        };
-
-                        audit::emit("token_injected", || {
-                            let mut evt = audit::audit_event(
-                                DelegationAuditAction::TokenInjected,
-                                Some(agent_did),
-                                Some(m2m_user_hash),
-                                Some(&binding.credential_provider_id),
-                                Some(channel_id),
-                            );
-                            evt.token_id = Some(stored.id);
-                            evt.via_fabric = via_fabric;
-                            evt.detail = Some("client_credentials_fresh".to_string());
-                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                            evt
-                        });
-
-                        let headers = build_injection_headers(&binding.inject_as, &stored.access_token);
-                        results.push(DelegationResolution::new(
-                            binding,
-                            Some(&provider.name),
-                            DelegationActionOutcome::TokenInjected,
-                            Some("client_credentials_fresh".to_string()),
+                            Some(detail),
                             DelegationLookupResult::Inject(headers),
                         ));
                     }
-                    Err(e) => {
+                    Err(error) => {
                         warn!(
                             target: "credential_delegation",
                             surface_variant,
                             surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
-                            error = %e,
-                            "Client credentials token fetch failed"
+                            grant = %grant,
+                            %error,
+                            "Service token unavailable - refusing the request"
                         );
+                        let detail = error.to_string();
                         audit::emit("token_not_found", || {
                             let mut evt = audit::audit_event(
                                 DelegationAuditAction::TokenNotFound,
@@ -592,15 +543,15 @@ pub async fn resolve_delegation_credentials(
                                 Some(channel_id),
                             );
                             evt.via_fabric = via_fabric;
-                            evt.detail = Some(e.to_string());
+                            evt.detail = Some(detail.clone());
                             enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                             evt
                         });
                         results.push(DelegationResolution::new(
                             binding,
                             Some(&provider.name),
-                            DelegationActionOutcome::ClientCredentialsFailed,
-                            Some(e.to_string()),
+                            failure,
+                            Some(detail),
                             DelegationLookupResult::Unavailable,
                         ));
                     }
@@ -1810,6 +1761,7 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: HashMap::new(),
             api_key_secret_ref: None,
+            jwt: Default::default(),
             description: None,
             created_at: now,
             updated_at: now,
@@ -2174,10 +2126,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cached_client_credentials_token_is_injected_without_a_token_request() {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let providers = MockProviderStore::with_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0].result {
+            DelegationLookupResult::Inject(injections) => assert_eq!(
+                injections,
+                &vec![ResolvedCredentialInjection::Header {
+                    name: "Authorization".to_string(),
+                    value: "Bearer cached-service-token".to_string(),
+                }]
+            ),
+            _ => panic!("Expected Inject, got {:?}", result_tag(&results[0].result)),
+        }
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached")
+        );
+    }
+
+    #[tokio::test]
     async fn api_key_and_client_credentials_failures_are_unavailable() {
         for (provider_type, outcome) in [
             (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
             (CredentialProviderType::OAuth2ClientCredentials, DelegationActionOutcome::ClientCredentialsFailed),
+            (CredentialProviderType::OAuth2JwtBearer, DelegationActionOutcome::JwtBearerFailed),
+            (
+                CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+                DelegationActionOutcome::ClientCredentialsJwtAuthFailed,
+            ),
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
             let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());
@@ -2202,6 +2205,21 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(result_tag(&results[0].result), "Unavailable", "{provider_type:?}");
             assert_eq!(results[0].action.outcome, outcome, "{provider_type:?}");
+            // The audit detail is the typed service-token error, never the issuer's response.
+            if provider_type != CredentialProviderType::ApiKey {
+                assert_eq!(
+                    results[0]
+                        .action
+                        .detail
+                        .as_deref(),
+                    Some(
+                        ServiceTokenError::TokenRequestFailed
+                            .to_string()
+                            .as_str()
+                    ),
+                    "{provider_type:?}"
+                );
+            }
         }
     }
 
@@ -2778,6 +2796,8 @@ mod tests {
             (DelegationActionOutcome::LookupError, "lookup_error"),
             (DelegationActionOutcome::ApiKeyResolutionFailed, "api_key_resolution_failed"),
             (DelegationActionOutcome::ClientCredentialsFailed, "client_credentials_failed"),
+            (DelegationActionOutcome::JwtBearerFailed, "jwt_bearer_failed"),
+            (DelegationActionOutcome::ClientCredentialsJwtAuthFailed, "client_credentials_jwt_auth_failed"),
         ];
         for (outcome, expected) in outcomes_and_strs {
             let v = serde_json::to_value(outcome).unwrap();

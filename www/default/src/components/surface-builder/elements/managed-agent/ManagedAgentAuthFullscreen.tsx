@@ -3,6 +3,7 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { ConfigPanelProps } from '../types';
+import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
 
 interface SecretOption {
   id: string;
@@ -22,8 +23,8 @@ const AUTH_TYPE_DEFAULTS: Record<AuthType, { headerName: string; headerFormat: s
 /**
  * Fullpage editor for Target Authentication on the Managed Agent (target)
  * element. The wire shape is the
- * `TargetAuthConfig` from the backend (`method: static_secret`, `header_name`,
- * `header_format`, `fallback`).
+ * `TargetAuthConfig` from the backend (`method: static_secret` or
+ * `credential_provider`, `header_name`, `header_format`, `fallback`).
  *
  * Selection of the auth type is shared with the sidebar via
  * `config.target_auth_type` so changes here propagate back when the tab closes.
@@ -34,6 +35,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   updateFields,
 }) => {
   const authType: AuthType = (config.target_auth_type as AuthType) || 'bearer';
+  const source = config.target_auth_source === 'provider' ? 'provider' : 'secret';
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
 
@@ -86,39 +88,75 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
         </small>
 
         <div className="mb-3">
-          <label htmlFor="target-auth-secret" className="form-label fw-bold">
-            Secret <span className="text-danger">*</span>
+          <label htmlFor="target-auth-source" className="form-label fw-bold">
+            Credential Source
           </label>
           <select
             className="form-control dropdown-styling"
-            id="target-auth-secret"
-            value={config.target_auth_secret_id || ''}
-            onChange={e => updateField('target_auth_secret_id', e.target.value)}
-            disabled={loadingSecrets}
+            id="target-auth-source"
+            data-testid="managed-agent-target-auth-source"
+            value={source}
+            onChange={e => updateField('target_auth_source', e.target.value)}
           >
-            <option value="">
-              {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
-            </option>
-            {secrets.map(s => (
-              <option key={s.id} value={s.secret_id}>
-                {s.name} ({s.secret_id})
-              </option>
-            ))}
+            <option value="secret">Static secret</option>
+            <option value="provider">Credential provider</option>
           </select>
           <small className="form-text text-muted">
-            Select a secret containing the credentials for the target endpoint
+            A credential provider issues a token (Client Credentials, JWT Bearer, Client Credentials
+            JWT) or reads an API key; issued tokens are cached and renewed before they expire.
           </small>
-          {!loadingSecrets && (
-            <div className="form-text">
-              {secrets.length === 0
-                ? 'No secrets configured yet. '
-                : "Don't see the one you need? "}
-              <AddResourceLink to={deepLinks.secret} testid="managed-agent-auth-add-secret-link">
-                Add secret
-              </AddResourceLink>
-            </div>
-          )}
         </div>
+
+        {source === 'provider' && (
+          <div className="mb-3">
+            <label htmlFor="target-auth-provider" className="form-label fw-bold">
+              Credential Provider <span className="text-danger">*</span>
+            </label>
+            <TargetAuthProviderSelect
+              id="target-auth-provider"
+              testId="managed-agent-target-auth-provider"
+              value={config.target_auth_provider_id || ''}
+              onChange={providerId => updateField('target_auth_provider_id', providerId)}
+            />
+          </div>
+        )}
+
+        {source === 'secret' && (
+          <div className="mb-3">
+            <label htmlFor="target-auth-secret" className="form-label fw-bold">
+              Secret <span className="text-danger">*</span>
+            </label>
+            <select
+              className="form-control dropdown-styling"
+              id="target-auth-secret"
+              value={config.target_auth_secret_id || ''}
+              onChange={e => updateField('target_auth_secret_id', e.target.value)}
+              disabled={loadingSecrets}
+            >
+              <option value="">
+                {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
+              </option>
+              {secrets.map(s => (
+                <option key={s.id} value={s.secret_id}>
+                  {s.name} ({s.secret_id})
+                </option>
+              ))}
+            </select>
+            <small className="form-text text-muted">
+              Select a secret containing the credentials for the target endpoint
+            </small>
+            {!loadingSecrets && (
+              <div className="form-text">
+                {secrets.length === 0
+                  ? 'No secrets configured yet. '
+                  : "Don't see the one you need? "}
+                <AddResourceLink to={deepLinks.secret} testid="managed-agent-auth-add-secret-link">
+                  Add secret
+                </AddResourceLink>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="mb-3">
           <label htmlFor="target-auth-type" className="form-label fw-bold">
@@ -192,7 +230,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             <option value="passthrough">Pass through without credentials</option>
           </select>
           <small className="form-text text-muted">
-            What to do if the secret cannot be resolved
+            What to do if the secret or provider token cannot be resolved
           </small>
         </div>
       </div>

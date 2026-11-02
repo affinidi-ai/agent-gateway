@@ -124,11 +124,49 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
   says the embedded token is signed and readable by the agent, not encrypted.
-- The Transit Point panel has no control for a Transit Point's `source_auth` or
-  `allow_unauthenticated_callers`, and the factory does not send them; a `PUT` that omits
-  them keeps the stored values (see `docs/SOURCE_AUTH.md`, _Transit Point callers_). Turning
-  **Require transit token** off on a Transit Point with neither is refused by the API on
-  save.
+- The Transit Point panel's **Who can call this Transit Point** section
+  (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
+  (`transit-point-require-transit-token-switch`), the **Caller authentication** select
+  (`transit-point-caller-auth-method`: None, API key from the secret store, API key from the
+  provider, JWT bearer; mTLS only shows, and keeps, one set through the API) with its fields
+  (`transit-point-caller-auth-header`, `-secret`, `-strategy`, `-audience-input`,
+  `-token-header`, `-token-scheme`), and the **Open to any caller** switch
+  (`transit-point-allow-unauthenticated-callers-switch`), shown only while the Transit Point
+  has no transit token, `source_auth` or `mcp_http.authorization`, and set only through a
+  confirmation (`transit-point-open-confirm`). The node config holds `source_auth` in its wire
+  shape, so a stored one round-trips; the factory writes it with `callerAuthToWire`. Turning
+  caller authentication off sends `"source_auth": null`, which a `PUT` honours as removal (an
+  omitted `source_auth` keeps the stored one). The open marking is sent only while nothing
+  else authenticates the Transit Point, and as an explicit `false` after the operator turned
+  it off. The save rules the API enforces apply before the save, through the element's
+  `validate`, which faults the node and blocks Save: no way to authenticate and not open,
+  open beside the token or a method, `source_auth` beside `mcp_http.authorization`, and an API
+  key with no secret or header, a JWT with no strategy, token header or audience (or one that
+  forwards the token); an empty token scheme is allowed, as the gateway reads the raw header
+  value then. Each shows as `transit-point-caller-auth-problem`. Choosing the API Key Provider
+  shows `transit-point-caller-auth-provider-scope`: its keys are the surface's own, the same an
+  Access Point using the provider accepts. Its `agent_id` is written from the surface being
+  saved (`callerAuthToWire(config, surfaceId)`), as the Access Point's is, so a Transit Point
+  copied from a template or another surface does not keep that surface's. The strategy and API key secret lists load through
+  `useJwtStrategies` and `useApiKeySecrets` (`elements/caller-auth/useCallerAuthOptions.ts`),
+  shared with the Access Point's caller authentication editor.
+- The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`
+  and `updateSurface` pass their messages to an `onWarnings` option, the pages toast them and
+  `SurfaceMetaContext.saveWarnings` hands them to the Transit Point whose alias they name, in
+  the base view, or in the variant view a warning's `in variant '<alias>'` names
+  (`transit-point-save-warning`), where each stays until that Transit Point's token, caller
+  authentication, open marking or listener changes. Before the save, the panel predicts the
+  exposure from the Transit Point's listener URL (`transit-point-exposure-warning`) with the
+  gateway's own rule; the gateway also counts bind addresses and shared-domain inbound
+  listeners, which the dashboard does not see, so only the header is complete. A create that
+  drew warnings opens the new surface's page with them in the route state, which that page
+  reads once and then clears, keeping the query string and hash, so a refresh or a Back return
+  does not show them again. The page keeps save warnings with the surface they came from, so
+  they do not show on another surface the page moves to. A refused
+  save shows the API's reason in plain words on the Transit Point it names, in the base view
+  for `transit.points[i]: ...` and in that variant's view for `variant '<alias>' transit.points[i]: ...`
+  (`transit-point-save-error`). A write never carries `transit_point_source_auth`: the gateway
+  derives it from the stored Transit Points.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
   than the existing surfaces of that protocol, skipping names already taken. The name follows
   the protocol until the user types a different name, from the Name field or the Config tab
@@ -157,6 +195,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
+
+- **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
+  takes its credential from a static secret or from a credential provider. The Managed Agent
+  editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,
+  Credential provider); the Transit Point's auth type select (`transit-point-target-auth-type`)
+  has a **Credential Provider** option with header name and format inputs defaulting to
+  `Authorization` and `Bearer {value}`. Both use the shared `TargetAuthProviderSelect`
+  (`_shared/TargetAuthProviderSelect.tsx`), which lists only Client Credentials, JWT Bearer,
+  Client Credentials JWT and API Key providers, since the gateway refuses an Authorization Code
+  provider here. `_shared/providerTargetAuth.ts` maps the form to and from the wire
+  `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
+  Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
+  `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
 
 | Element                                                        | Test id                                                                                                                                                                                            |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -371,6 +422,32 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 - Do not add a PAT-only tenant field or tenant picker.
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
+
+## Credential provider editor
+
+`/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
+show the inputs of the chosen Provider Type (`credential-provider-type-select`).
+`EditCredentialProviderPage/credentialProviderForm.ts` decides which inputs a type uses
+(`providerTypeFields`), the first missing required field, and the request fields.
+
+- **JWT Bearer** asks for Token Endpoint, Issuer, Signing Key, and optionally Key ID, Audience
+  and Subject, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
+  Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
+  secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
+  `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
+  (`credential-provider-jwt-key-unidentified-warning`, from `jwtKeyUnidentified`) shows when
+  neither names the key, and the algorithm select lists the type's algorithms, default first.
+- Key material is never typed into this form. Signing key and certificate are secret pickers
+  (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
+  the Secrets page and pastes the PEM there. The gateway checks the PEM on save.
+- Save sends a field the type does not use as empty, which the gateway reads as cleared, so
+  switching a provider to Client Credentials JWT drops its client secret.
+- `resource` has no input (it is set through the API or YAML) and is never sent on save. When
+  `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
+  rejects it (AADSTS901002), the form warns under Token Endpoint
+  (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
+  (`credential-provider-entra-resource-badge`).
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
 
 ## Secret editor
 
@@ -749,6 +826,75 @@ identities: an integration receives every event of its event set, from every res
 - The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says each integration with an
   event set holding audit events receives them independently of the log, at least once, so
   receivers deduplicate on `event_id`.
+
+## Laptop layouts
+
+Pages must stay usable at the common laptop viewports, 1280x720 to 1920x1080 with the
+sidebar expanded; `ui-tests/specs/laptop-layout.spec.ts` checks each page at five of them.
+
+### Audit Log
+
+The Audit Log is a list of entries and a detail panel (`pages/AuditPage/`, rules under
+_Viewport-filling master/detail_ in `dashboard.css`).
+
+- **Side by side** from 1440px wide: the page fills the viewport between the topbar and
+  the footer, so the document does not scroll, and the list and the evidence body scroll
+  inside their panels. The card body is a two-column grid (`.audit-shell` is
+  `display: contents`): the "About the Audit Log" banner sits above the list in the left
+  column and the detail panel takes the full height of the right one, so at 1536x864 the
+  list and the evidence body are each still at least 300px tall.
+- **Stacked** below 1440px wide (`@media (max-width: 1439.98px)`): there the two panels
+  are too narrow to read (about 510px each at 1366px, each entry over 230px tall). The
+  list sits above the detail and the page scrolls as one: no scroll box inside the page
+  and no overlay drawer.
+- **Pinned filters** while stacked: `.audit-filters` (search and filters) and
+  `.audit-card-header` (title, Forward records, Refresh) are `position: sticky` under the
+  70px topbar. `AuditPage` publishes their heights as `--audit-filters-height` and
+  `--audit-header-height` with a `ResizeObserver`, since the filters wrap; the header's
+  `top` and the scroll margins below use them. Sticky needs every ancestor up to the
+  document to leave overflow visible or `clip`: `#content-wrapper` hides its sideways
+  overflow on every page, so the stacked rule switches it to `overflow-x: clip` on the
+  Audit Log, and `.audit-card` clips instead of hiding.
+- **Scroll on select**: while stacked, selecting an entry smooth-scrolls the page so the
+  detail panel starts just below the pinned filters and header (`scroll-margin-top`). `AuditPage`
+  decides "stacked" from the computed `flex-direction` of `.audit-shell` at click time,
+  so the breakpoint lives only in CSS. The default selection on load, a page change and a
+  filter change do not scroll, and side by side selecting never scrolls. Clicking the
+  detail title scrolls back to the entry, which lands fully below the pinned area.
+
+### List tables
+
+List pages show their rows in a `.table-responsive` table (Surfaces, MCP Proxies, Secrets,
+Certificates). No list table scrolls sideways at a laptop viewport, so every column keeps
+room for its text.
+
+- Badges in table cells wrap. Bootstrap sets `white-space: nowrap` on `.badge`, so one long
+  tag or owner name fixes a column at its full length and squeezes or pushes out the
+  others. Add `text-wrap text-break` to a badge that shows a user-supplied value (tags,
+  owner names) so it wraps inside its cell and the full value stays readable. Short badges
+  still sit on one line.
+- Do not truncate such a value to make it fit; wrap it.
+
+### Page headers and charts
+
+- **Tasks header**: the shared `.card-header.py-3` is a centred flex row, which would put the
+  tag filter row beside the title. The Tasks header adds `flex-column align-items-stretch`,
+  so the filter row sits under the title row and Refresh stays at the header's right end.
+  The shared rule is unchanged.
+- **Metrics flow chart labels**: node labels are at most 25 characters. A source, identity
+  or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
+  `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
+  chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
+- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+  Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
+  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
+  inside it; the DID keeps its title and copy button.
+- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
+  buttons per line) with no left margins, so the Actions column stays near 120px and the
+  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Credential Audit columns**: only Time, Event and the chevron column keep a fixed width.
+  Intent takes what its content needs, and its badge wraps (`text-wrap text-break`), so
+  Downstream Provider and Agent Surface keep room for their linked names.
 
 ## Validation
 

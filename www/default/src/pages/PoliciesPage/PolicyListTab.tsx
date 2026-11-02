@@ -208,6 +208,7 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
             variant="primary"
             size="md"
             className="shadow-sm"
+            data-testid={`policies-${policyType}-add-button`}
             onClick={e =>
               guard(
                 policyType === 'gateway' ? 'policies.fabric' : 'policies.agent-surface',
@@ -284,6 +285,7 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
               <tbody>
                 {filtered.map(p => (
                   <tr
+                    data-testid={`policies-${policyType}-row-${p.id}`}
                     key={p.id}
                     onClick={() => navigate(`/policy-definitions/${p.id}`)}
                     style={{ cursor: 'pointer' }}
@@ -310,6 +312,7 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
                         <input
                           className="form-check-input"
                           type="checkbox"
+                          data-testid={`policies-${policyType}-global-toggle-${p.id}`}
                           role="switch"
                           checked={
                             globalAssignments.isEnforced(policyType, p.id) ||
@@ -378,6 +381,7 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
                         variant="outline-danger"
                         size="sm"
                         title="Delete"
+                        data-testid={`policies-${policyType}-delete-button-${p.id}`}
                         aria-label={`Delete policy ${p.name}`}
                         disabled={deletingId === p.id}
                         onClick={e => {

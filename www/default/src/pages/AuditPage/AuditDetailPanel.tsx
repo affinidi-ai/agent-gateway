@@ -43,6 +43,7 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
       role="region"
       aria-label="Event details"
       aria-hidden={!open}
+      tabIndex={-1}
       data-testid="audit-detail-panel"
       data-open={open}
     >

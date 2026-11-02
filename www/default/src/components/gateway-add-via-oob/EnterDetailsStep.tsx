@@ -191,12 +191,14 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               type="button"
               variant="secondary"
               size="md"
+              data-testid="wizard-cancel"
               onClick={onCancel}
               iconStart={<i className="fas fa-times"></i>}
             >
               Cancel
             </AppButton>
             <AppButton
+              data-testid="wizard-next"
               type="submit"
               variant="primary"
               size="md"

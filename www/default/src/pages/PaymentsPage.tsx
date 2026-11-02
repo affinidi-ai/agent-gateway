@@ -469,10 +469,11 @@ const PaymentsPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-payments">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
+            data-testid="payments-search-input"
             value={filterText}
             onChange={setFilterText}
             placeholder="Filter Payments..."
@@ -482,6 +483,7 @@ const PaymentsPage: React.FC = () => {
           variant="primary"
           size="md"
           className="shadow-sm"
+          data-testid="payments-refresh-button"
           onClick={fetchData}
           loading={refreshing}
           loadingLabel="Refreshing..."
@@ -525,6 +527,7 @@ const PaymentsPage: React.FC = () => {
           <select
             className="form-control form-control-sm dropdown-styling"
             style={{ width: 'auto' }}
+            data-testid="payments-bucket-select"
             value={bucketSeconds}
             onChange={e => setBucketSeconds(parseInt(e.target.value))}
             title="Time bucket size"
@@ -712,7 +715,10 @@ const PaymentsPage: React.FC = () => {
                         : 'text-bg-warning';
 
                     return (
-                      <tr key={txn.tx_hash || txn.correlation_id}>
+                      <tr
+                        key={txn.tx_hash || txn.correlation_id}
+                        data-testid={`payments-row-${txn.tx_hash || txn.correlation_id}`}
+                      >
                         <td>
                           <div className="d-flex flex-column" style={{ gap: '4px' }}>
                             <span className="badge text-bg-info" style={{ fontSize: '11px' }}>
@@ -829,6 +835,7 @@ const PaymentsPage: React.FC = () => {
                                 <AppButton
                                   variant="link"
                                   size="sm"
+                                  data-testid={`payments-details-button-${txn.tx_hash || txn.correlation_id}`}
                                   onClick={() =>
                                     handleViewDetails(transactionId || '', txn.protocol || 'x402')
                                   }
@@ -908,6 +915,7 @@ const PaymentsPage: React.FC = () => {
                         <td style={{ textAlign: 'right' }}>
                           {canDeleteTransactions && transactionId && txn.protocol !== 'mpp' && (
                             <DeleteButton
+                              data-testid={`payments-delete-button-${txn.tx_hash || txn.correlation_id}`}
                               onDelete={() => handleDeleteTransaction(transactionId)}
                               size="sm"
                               title="Delete Transaction"

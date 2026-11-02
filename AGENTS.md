@@ -75,6 +75,8 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+Laptop viewport rules (the Audit Log stacking breakpoint and scroll on select, wrapping badges in list tables, and the page header and chart rules for Tasks, Metrics, Identities and Connection Points) live under _Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Surface Builder's **Send delegated credentials over Fabric** switch is per route
 (Managed Agent or Transit Point), off by default, and shown only for a `fabric://` route on
 a surface with credential bindings; see _Surface Builder_ in
@@ -82,9 +84,10 @@ a surface with credential bindings; see _Surface Builder_ in
 
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
-Transit Point element shows neither a Transit Point's own `source_auth` nor its
-`allow_unauthenticated_callers`; a dashboard save omits them and the admin API keeps the
-stored values. See _Surface Builder_ in
+Transit Point element's **Who can call this Transit Point** section sets the transit token, a
+Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the API is kept) and
+`allow_unauthenticated_callers`, and shows the exposure `Warning` headers a save answers with.
+See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
@@ -95,6 +98,11 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
+and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+Point can take its credential from a credential provider; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
