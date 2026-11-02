@@ -510,6 +510,11 @@ pub async fn run_axum_proxy(
     for adjustment in config.transit_token_lifetime_adjustments(transit_token_max_lifetime_secs) {
         warn!("{adjustment}");
     }
+    // Provider create and surface save keep the origins they start with, so
+    // every later load of gateway.json keeps them too.
+    bootstrap_config
+        .pin_external_consent_resource_origins()
+        .context("Configuration validation failed")?;
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
 
