@@ -2236,6 +2236,7 @@ mod tests {
                     extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                     fabric_delegated_credentials: false,
                     allow_fabric_callers: false,
+                    delegated_credentials_for_fabric_callers: false,
                     trust_check_list: Vec::new(),
                     trust_check_migrated: false,
                 }],

@@ -1405,6 +1405,22 @@ pub struct TransitPoint {
     /// that request opens only the Transit Points that set it. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_fabric_callers: bool,
+    /// Releases delegated per-user credentials for a call whose transit token
+    /// this gateway issued for a request a paired gateway sent over Fabric,
+    /// keyed by the caller the receiving surface's own `source_auth` or
+    /// resource token verified on that request. Off by default, when such a
+    /// call gets none. Only a Transit Point that requires the transit token
+    /// may set it, and it has an effect only beside `allow_fabric_callers`.
+    /// The admin API refuses it on a surface whose caller authentication
+    /// cannot tell a partner's users apart
+    /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
+    /// key, where every request from that partner, and every direct caller
+    /// with a key in the same secret, has the same key. A surface stored with
+    /// it otherwise releases nothing to partners: the receiving surface puts
+    /// no principal in the token, and the Transit Point checks its own view
+    /// again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated_credentials_for_fabric_callers: bool,
 
     /// Target-leg Trust Checks run on requests the managed agent sends
     /// through this Transit Point, whatever its protocol.
@@ -1486,8 +1502,11 @@ impl TransitPoint {
     }
 
     /// Refuses a Transit Point whose caller authentication cannot be enforced
-    /// ([`Self::unenforceable_caller_authentication`]), or that sets
-    /// `allow_unauthenticated_callers` while it authenticates its callers.
+    /// ([`Self::unenforceable_caller_authentication`]), that sets
+    /// `allow_unauthenticated_callers` while it authenticates its callers, or
+    /// that sets `delegated_credentials_for_fabric_callers` without requiring
+    /// the transit token, the only carrier of a Fabric caller, so the switch
+    /// would do nothing.
     pub fn validate_caller_authentication(&self) -> Result<(), String> {
         if let Some(reason) = self.unenforceable_caller_authentication() {
             return Err(reason);
@@ -1495,6 +1514,13 @@ impl TransitPoint {
         if self.allow_unauthenticated_callers && self.authenticates_callers() {
             return Err(format!(
                 "Transit Point '{}' sets allow_unauthenticated_callers but authenticates its callers; remove it",
+                self.alias
+            ));
+        }
+        if self.delegated_credentials_for_fabric_callers && !self.require_transit_token {
+            return Err(format!(
+                "Transit Point '{}' sets delegated_credentials_for_fabric_callers but does not require the transit \
+                 token that names a Fabric caller; remove it or require the transit token",
                 self.alias
             ));
         }
@@ -4993,6 +5019,7 @@ mod tests {
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
                         allow_fabric_callers: false,
+                        delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
                     },
@@ -5025,6 +5052,7 @@ mod tests {
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
                         allow_fabric_callers: false,
+                        delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
                     },
@@ -7212,6 +7240,45 @@ mod transit_point_caller_authentication_tests {
         })))
         .unwrap();
         assert_eq!(stored["allow_unauthenticated_callers"], true);
+    }
+
+    /// A Fabric caller reaches a Transit Point only in the transit token its
+    /// gateway issued, so only a Transit Point that requires one may release
+    /// delegated credentials to such callers. The switch is off unless set,
+    /// and stored only when set.
+    #[test]
+    fn only_a_transit_point_that_requires_the_transit_token_releases_delegated_credentials_to_fabric_callers() {
+        let off = point(json!({}));
+        assert!(!off.delegated_credentials_for_fabric_callers);
+        assert!(
+            serde_json::to_value(&off)
+                .unwrap()
+                .get("delegated_credentials_for_fabric_callers")
+                .is_none()
+        );
+
+        for fields in [
+            json!({ "delegated_credentials_for_fabric_callers": true }),
+            json!({ "delegated_credentials_for_fabric_callers": true, "source_auth": api_key() }),
+        ] {
+            let on = point(fields);
+            assert!(on.delegated_credentials_for_fabric_callers);
+            assert_eq!(on.validate_caller_authentication(), Ok(()));
+            assert_eq!(serde_json::to_value(&on).unwrap()["delegated_credentials_for_fabric_callers"], true);
+        }
+
+        let refusal = "Transit Point 'partner' sets delegated_credentials_for_fabric_callers but does not require \
+                       the transit token that names a Fabric caller; remove it or require the transit token";
+        for fields in [
+            json!({ "require_transit_token": false, "source_auth": api_key(),
+                "delegated_credentials_for_fabric_callers": true }),
+            json!({ "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "delegated_credentials_for_fabric_callers": true }),
+        ] {
+            let point = point(fields);
+            assert_eq!(point.unenforceable_caller_authentication(), None, "its caller authentication is enforceable");
+            assert_eq!(point.validate_caller_authentication(), Err(refusal.to_string()));
+        }
     }
 
     /// A stored surface whose Transit Point uses `source_auth`, on the base or
