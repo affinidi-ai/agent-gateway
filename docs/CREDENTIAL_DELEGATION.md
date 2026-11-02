@@ -633,7 +633,9 @@ does, and the outcome depends on the path:
 | Transit Point request, A2A or MCP | `500` (`MetadataInjectionFailed`) |
 | MCP request a gateway forwards over Fabric | Forwarded without the metadata, and logged |
 | MCP response, direct, Fabric or gateway-to-gateway | `502` "MCP response metadata injection failed" |
-| A2A request, direct or over Fabric, A2A response, A2A stream event | Forwarded without the metadata, and logged |
+| A2A request, direct or over Fabric | Forwarded without the metadata, and logged |
+| A2A response, direct or gateway-to-gateway, and A2A stream event | Forwarded without the metadata, and logged |
+| A2A response received over Fabric | Payload added as configured, with `$SECRET:` helpers left unresolved: the caller receives the helper string, no secret value is sent, and nothing is logged |
 
 - A secret or provider of another tenant is always refused.
 - An appliance-wide secret or provider is refused according to the bootstrap
