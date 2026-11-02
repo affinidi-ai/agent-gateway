@@ -2083,6 +2083,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_request_slower_than_the_configured_timeout_fails_and_starts_the_backoff() {
+        let mut fixture = Fixture::new().await;
+        fixture.egress.timeout = std::time::Duration::from_secs(1);
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture
+            .endpoint
+            .delay_millis
+            .store(2_500, Ordering::SeqCst);
+        let now = Utc::now();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            fixture
+                .acquire(&provider, &["read"], now)
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(2_400));
+        assert_eq!(
+            fixture
+                .acquire(&provider, &["read"], after(now, 500))
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed)
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_backoff_doubles_after_each_failure_and_a_success_clears_it() {
         let fixture = Fixture::new().await;
         let provider = fixture

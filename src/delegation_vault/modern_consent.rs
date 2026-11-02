@@ -657,7 +657,7 @@ pub async fn exchange_code(
             client_id,
         })
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), operation)
+    tokio::time::timeout(egress.timeout, operation)
         .await
         .map_err(|_| ContinuationError::Unavailable)?
 }

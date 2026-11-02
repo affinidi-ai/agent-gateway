@@ -25,7 +25,10 @@ impl RuleMode {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub const DEFAULT_TOKEN_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const MAX_TOKEN_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CredentialPolicyConfig {
     /// Whether a credential provider's token endpoint must use https.
@@ -34,9 +37,33 @@ pub struct CredentialPolicyConfig {
     pub tenant_credential_isolation: RuleMode,
     /// Exact token endpoint URLs that may use http deliberately.
     pub insecure_token_endpoints: Vec<String>,
+    /// Seconds a credential provider token request may take, 1 to 120.
+    pub token_request_timeout_secs: u64,
+}
+
+impl Default for CredentialPolicyConfig {
+    fn default() -> Self {
+        Self {
+            token_endpoint_https: RuleMode::default(),
+            tenant_credential_isolation: RuleMode::default(),
+            insecure_token_endpoints: Vec::new(),
+            token_request_timeout_secs: DEFAULT_TOKEN_REQUEST_TIMEOUT_SECS,
+        }
+    }
 }
 
 impl CredentialPolicyConfig {
+    /// Refuses a `token_request_timeout_secs` of 0 or above 120.
+    pub fn validate(&self) -> Result<(), String> {
+        if (1..=MAX_TOKEN_REQUEST_TIMEOUT_SECS).contains(&self.token_request_timeout_secs) {
+            return Ok(());
+        }
+        Err(format!(
+            "token_request_timeout_secs must be from 1 to {MAX_TOKEN_REQUEST_TIMEOUT_SECS}, got {}",
+            self.token_request_timeout_secs
+        ))
+    }
+
     /// Whether `insecure_token_endpoints` names `url` exactly, compared as parsed URLs.
     pub fn allows_insecure_token_endpoint(
         &self,
@@ -129,6 +156,34 @@ mod tests {
         let config: CredentialPolicyConfig = toml::from_str("tenant_credential_isolation = \"enforce\"").unwrap();
         assert_eq!(config.token_endpoint_https, RuleMode::Warn);
         assert_eq!(config.tenant_credential_isolation, RuleMode::Enforce);
+    }
+
+    #[test]
+    fn token_request_timeout_defaults_to_thirty_and_takes_a_configured_value() {
+        assert_eq!(CredentialPolicyConfig::default().token_request_timeout_secs, 30);
+        let absent: CredentialPolicyConfig = toml::from_str("token_endpoint_https = \"enforce\"").unwrap();
+        assert_eq!(absent.token_request_timeout_secs, 30);
+        let set: CredentialPolicyConfig = toml::from_str("token_request_timeout_secs = 45").unwrap();
+        assert_eq!(set.token_request_timeout_secs, 45);
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn token_request_timeout_outside_one_to_one_twenty_is_refused() {
+        for (secs, valid) in [(0, false), (1, true), (120, true), (121, false)] {
+            let config: CredentialPolicyConfig =
+                toml::from_str(&format!("token_request_timeout_secs = {secs}")).unwrap();
+            assert_eq!(config.validate().is_ok(), valid, "{secs}");
+        }
+        assert_eq!(
+            CredentialPolicyConfig {
+                token_request_timeout_secs: 0,
+                ..Default::default()
+            }
+            .validate(),
+            Err("token_request_timeout_secs must be from 1 to 120, got 0".to_string())
+        );
+        assert!(toml::from_str::<CredentialPolicyConfig>("token_request_timeout_secs = -1").is_err());
     }
 
     #[test]

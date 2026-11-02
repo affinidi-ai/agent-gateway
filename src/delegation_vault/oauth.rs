@@ -661,10 +661,11 @@ pub struct TokenEndpointNotHttps;
 
 impl TokenEgress {
     pub fn from_environment() -> Self {
+        let policy = crate::config::credential_policy::credential_policy().clone();
         Self {
-            timeout: std::time::Duration::from_secs(crate::http_client::EXTERNAL_TIMEOUT_SECS),
+            timeout: std::time::Duration::from_secs(policy.token_request_timeout_secs),
             exact_allowlist: crate::url_validation::bdd_oauth_endpoint_allowlist(),
-            policy: crate::config::credential_policy::credential_policy().clone(),
+            policy,
         }
     }
 
@@ -750,7 +751,7 @@ impl TokenEgress {
     }
 }
 
-/// POST a token request and read its JSON response, at most 64 KiB within 30 seconds.
+/// POST a token request and read its JSON response, at most 64 KiB within the egress timeout.
 /// The access token must be a non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
 /// an error, and only its OAuth `error` fields are logged.
@@ -827,7 +828,7 @@ async fn request_token(
         );
         Ok(Some(response))
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), operation)
+    tokio::time::timeout(egress.timeout, operation)
         .await
         .context("Provider token request timed out")?
 }

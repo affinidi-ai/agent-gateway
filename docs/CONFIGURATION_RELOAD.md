@@ -243,6 +243,7 @@ needs a restart.
 | `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
 | `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider may only use secrets of its own tenant; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant). |
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. |
+| `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants, refreshes, the legacy code exchange and the modern consent exchange. The 64 KiB response limit and the no-redirect rule are unchanged. |
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
 configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. For

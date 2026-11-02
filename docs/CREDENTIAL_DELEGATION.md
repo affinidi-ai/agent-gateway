@@ -155,7 +155,7 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   Unexpired tokens, user grants, pending consents and refresh claims are kept. A failure to
   remove them is logged as a warning only. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
-  than 30 seconds; only the response's OAuth `error` fields are logged.
+  than `credential_policy.token_request_timeout_secs` (30 by default); only the response's OAuth `error` fields are logged.
 - When scopes were requested, the issued `scope` must name the same set, or the token is
   refused; when none were requested, the issued scopes are kept.
 - The provider is read again after the token request, and a provider changed meanwhile

@@ -30,6 +30,14 @@ changes:
         card, and is limited to 10 a minute per user and per surface; past the limit a read
         answers with the last preview and a refresh gets 429. A failed fetch keeps showing
         the last good card of the same running surface for up to 10 minutes.
+    - timestamp: '2026-11-02T06:56:00Z'
+      title: Let operators set the credential provider token request timeout
+      description: >-
+        The bootstrap [credential_policy] section accepts token_request_timeout_secs, from 1
+        to 120 seconds and 30 by default; 0 or a larger value fails startup. It bounds every
+        token request to a credential provider: service grants, refreshes, the code exchange
+        and the modern consent exchange. A request that runs past it fails and starts the
+        retry backoff. Changing it needs a restart.
   changed:
     - timestamp: '2026-10-30T21:30:00Z'
       title: Refuse new http token endpoints and cross-tenant credential references on save
