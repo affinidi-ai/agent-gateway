@@ -8,6 +8,7 @@ import {
   policyChange,
   policyChangeTitle,
   policyDecision,
+  isTargetAuthPassthrough,
   requestRejected,
   scopeLabel,
   slotLabel,
@@ -93,7 +94,8 @@ export function eventTone(entry: AuditEntry): EventTone {
   if (pd) return isAllowDecision(pd.decision) ? 'allow' : 'deny';
   const tc = trustCheck(entry);
   if (tc) return tc.ok ? 'allow' : 'deny';
-  if (requestRejected(entry)) return 'deny';
+  const rejected = requestRejected(entry);
+  if (rejected) return isTargetAuthPassthrough(rejected) ? 'warn' : 'deny';
   const name = eventTypeName(entry);
   if (name === 'consent_required' || name === 'consent_expired' || name === 'consent_limited')
     return 'warn';
@@ -301,6 +303,13 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         : entry.via_fabric
           ? 'Refused over Fabric, so no HTTP status was recorded.'
           : undefined;
+    if (isTargetAuthPassthrough(rejected)) {
+      return {
+        title: 'Forwarded without Target credential',
+        tone,
+        summary: `Forwarded on ${where} without the Target credential: target auth failed, and the fallback is passthrough.`,
+      };
+    }
     return {
       title: 'Request refused',
       tone,

@@ -168,6 +168,8 @@ export function fieldGroups(
     add(refusal, 'HTTP status', fieldStr(rejected.http_status));
     add(refusal, 'JSON-RPC error', fieldStr(rejected.rpc_error_code));
     add(refusal, 'Requested variant', fieldStr(rejected.requested_variant), { mono: true });
+    add(refusal, 'Credential outcome', fieldStr(rejected.target_auth?.outcome));
+    add(refusal, 'OAuth error', fieldStr(rejected.target_auth?.oauth_error), { mono: true });
   }
 
   return [

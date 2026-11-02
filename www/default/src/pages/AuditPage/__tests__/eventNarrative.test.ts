@@ -189,6 +189,43 @@ describe('eventNarrative', () => {
       expect(n.detail).toBe('The caller got HTTP 404.');
     });
 
+    it('describes a Target credential failure that was refused or forwarded without it', () => {
+      const refused = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              http_status: 502,
+              target_auth: { outcome: 'rejected', oauth_error: 'invalid_client' },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(refused.tone).toBe('deny');
+      expect(refused.title).toBe('Request refused');
+      expect(refused.summary).toBe('Refused at forward on Orders: target auth failed.');
+
+      const forwarded = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              target_auth: { outcome: 'passthrough' },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(forwarded.tone).toBe('warn');
+      expect(forwarded.title).toBe('Forwarded without Target credential');
+      expect(forwarded.summary).toBe(
+        'Forwarded on Orders without the Target credential: target auth failed, and the fallback is passthrough.'
+      );
+    });
+
     it('describes a disabled variant, a modern MCP refusal and a Fabric refusal', () => {
       const disabled = describeEntry(
         at(
