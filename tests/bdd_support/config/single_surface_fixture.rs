@@ -67,6 +67,9 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// The gateway logs its `audit` target events at info level and keeps its log for the
+    /// scenario to read.
+    pub logs_audit_events: bool,
     /// The tenant that owns the surface; appliance-wide when absent.
     pub tenant_id: Option<String>,
     /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
@@ -126,6 +129,7 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            logs_audit_events: false,
             tenant_id: None,
             enforced_credential_rules: Vec::new(),
             token_request_timeout_secs: None,

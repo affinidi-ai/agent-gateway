@@ -538,9 +538,19 @@ fn write_single_surface_config_inner(
         &surface_config.enforced_credential_rules,
         surface_config.token_request_timeout_secs,
     );
-    if surface_config.keeps_gateway_log {
+    if surface_config.logs_audit_events {
+        log_info(base_dir);
+    } else if surface_config.keeps_gateway_log {
         log_warnings(base_dir);
     }
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `info`.
+fn log_info(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"info\"", 1)).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `warn`.

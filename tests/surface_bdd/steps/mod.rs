@@ -1,3 +1,4 @@
+pub mod agent_card_preview;
 pub mod given;
 pub mod identities;
 pub mod names;
