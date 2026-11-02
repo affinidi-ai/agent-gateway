@@ -129,6 +129,138 @@ fn validate_identity_extraction(
     Ok(())
 }
 
+pub(crate) const INBOUND_API_KEY_NEEDS_API_KEY_CALLER: &str =
+    "Identity 'From API Key' needs an API Key or API Key Provider as the first Caller Context method";
+pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From API Key' cannot be used with \
+     mcp_http.authorization, which identifies callers by their resource token; remove one of them";
+pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
+    "Identity 'From API Key' is not supported on a proxy:// MCP Proxy target; choose another inbound Identity mode";
+pub(crate) const INBOUND_API_KEY_RESERVED_SECRET_ID: &str = "The API Key Caller Context secret id starts with the \
+     reserved 'atgk_' prefix, so Identity 'From API Key' cannot identify its callers; use a secret id without it";
+pub(crate) const API_KEY_IDENTITY_NEEDS_ID: &str = "Identity 'From API Key' needs a non-empty api_key_id";
+pub(crate) const API_KEY_IDENTIFIES_BOTH_ROLES: &str = "one API key cannot identify both a Managed Agent and a caller";
+
+/// The inbound slot identifies each caller by the key it presents, so a stored
+/// `api_key_id` there is never read. Variants replace `identity_slots`
+/// wholesale, so every variant override is cleared too, enabled or not.
+pub(crate) fn drop_inbound_api_key_ids(surface: &mut AgentSurface) {
+    let variant_slots = surface
+        .variants
+        .iter_mut()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .identity_slots
+                .as_mut()
+        });
+    for slots in std::iter::once(&mut surface.identity_slots).chain(variant_slots) {
+        if let Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id }) = slots.inbound.as_mut() {
+            *api_key_id = None;
+        }
+    }
+}
+
+fn configured_api_key_id<'a>(
+    identity: Option<&'a crate::source_auth::ManagedIdentityConfig>,
+    slot: &str,
+) -> Result<Option<&'a str>, String> {
+    match identity {
+        Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id }) => api_key_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| format!("{slot}: {API_KEY_IDENTITY_NEEDS_ID}")),
+        _ => Ok(None),
+    }
+}
+
+/// Refuse `from_api_key` identities the request path cannot resolve: an
+/// inbound slot whose callers do not authenticate with an API key, a stored
+/// slot without a key, and one key serving as both a Managed Agent identity
+/// and a caller identity.
+fn validate_api_key_identities(
+    surface: &AgentSurface,
+    label: &str,
+) -> Result<(), SurfaceApiError> {
+    use crate::source_auth::SourceAuthConfig;
+
+    let refuse = |message: &str| {
+        let prefix = if label.is_empty() {
+            String::new()
+        } else {
+            format!("{label}: ")
+        };
+        SurfaceApiError::BadRequest(format!("{prefix}{message}"))
+    };
+    let inbound_from_api_key = crate::proxy::handler::inbound_identity_from_api_key(surface);
+    if inbound_from_api_key {
+        match surface.source_auth() {
+            Some(SourceAuthConfig::ApiKey(config))
+                if config
+                    .secret_id
+                    .starts_with(crate::api_keys::KEY_ID_PREFIX) =>
+            {
+                return Err(refuse(INBOUND_API_KEY_RESERVED_SECRET_ID));
+            }
+            Some(SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)) => {}
+            _ => return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER)),
+        }
+        if surface
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some())
+        {
+            return Err(refuse(INBOUND_API_KEY_WITH_RESOURCE_TOKENS));
+        }
+        if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp
+            && surface
+                .target
+                .endpoint
+                .starts_with("proxy://")
+        {
+            return Err(refuse(INBOUND_API_KEY_ON_MCP_PROXY));
+        }
+    }
+
+    let protected = surface.managed_identity();
+    let mut managed_keys: Vec<&str> = configured_api_key_id(protected.as_ref(), "identity_slots.protected")
+        .map_err(|message| refuse(&message))?
+        .into_iter()
+        .collect();
+    for point in surface
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+    {
+        let slot = format!("transit.points['{}'].managed_identity", point.alias);
+        managed_keys.extend(
+            configured_api_key_id(
+                point
+                    .managed_identity
+                    .as_ref(),
+                &slot,
+            )
+            .map_err(|message| refuse(&message))?,
+        );
+    }
+    let mut caller_keys: Vec<&str> = configured_api_key_id(surface.external_identity(), "identity_slots.external")
+        .map_err(|message| refuse(&message))?
+        .into_iter()
+        .collect();
+    if inbound_from_api_key && let Some(SourceAuthConfig::ApiKey(config)) = surface.source_auth() {
+        caller_keys.push(&config.secret_id);
+    }
+    if let Some(key) = managed_keys
+        .iter()
+        .find(|key| caller_keys.contains(key))
+    {
+        return Err(refuse(&format!(
+            "API key '{key}' is set as both a Managed Agent and a caller identity; {API_KEY_IDENTIFIES_BOTH_ROLES}"
+        )));
+    }
+    Ok(())
+}
+
 /// Structural shape check for the always-required surface fields.
 ///
 /// `label` is prefixed on every error so callers can distinguish a base
@@ -232,6 +364,7 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
         let label = format!("Variant '{}'", variant.alias);
         validate_required_fields(&resolved, &label)?;
         validate_identity_extraction(&resolved, &label)?;
+        validate_api_key_identities(&resolved, &label)?;
 
         // Block cloud-metadata URLs on variant target endpoints (SSRF protection)
         if (resolved
@@ -2161,6 +2294,7 @@ pub async fn create_surface(
         .ok_or_else(|| SurfaceApiError::InternalError("Agent surface store not initialized".to_string()))?;
     refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     convert_old_shape_body(&mut surface)?;
+    drop_inbound_api_key_ids(&mut surface);
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -2194,6 +2328,7 @@ pub async fn create_surface(
     // Required-field shape check on the base surface.
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
+    validate_api_key_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
     surface.access_point.public = Some(
         surface
@@ -3194,6 +3329,7 @@ async fn validate_and_save_surface(
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<AgentSurface, SurfaceApiError> {
+    drop_inbound_api_key_ids(&mut surface);
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
     if !surface
@@ -3210,6 +3346,7 @@ async fn validate_and_save_surface(
 
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
+    validate_api_key_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
     if surface
         .access_point
@@ -6901,6 +7038,269 @@ mod validation_tests {
                 },
             });
         validate_resolved_variants(&s).expect("disabled variant is skipped");
+    }
+
+    fn api_key_caller(secret_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "api_key",
+            "extraction": { "source": "http_header", "field": "X-API-Key" },
+            "secret_id": secret_id
+        })
+    }
+
+    fn provider_caller() -> serde_json::Value {
+        serde_json::json!({
+            "type": "api_key_provider",
+            "extraction": { "source": "http_header", "field": "X-API-Key" },
+            "agent_id": "agent-1"
+        })
+    }
+
+    fn jwt_caller() -> serde_json::Value {
+        serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] })
+    }
+
+    fn caller_methods(methods: &[serde_json::Value]) -> Option<crate::config::agent_surface::CallerAuthentication> {
+        Some(serde_json::from_value(serde_json::json!({ "methods": methods })).expect("valid caller authentication"))
+    }
+
+    fn from_api_key(id: Option<&str>) -> Option<crate::source_auth::ManagedIdentityConfig> {
+        Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: id.map(str::to_string),
+        })
+    }
+
+    fn inbound_api_key_surface(caller: &[serde_json::Value]) -> AgentSurface {
+        let mut s = base_surface();
+        s.access_point
+            .caller_authentication = caller_methods(caller);
+        s.identity_slots.inbound = from_api_key(None);
+        s
+    }
+
+    fn refusal(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(message)) => message,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_from_api_key_is_accepted_behind_an_api_key_or_provider_caller_method() {
+        for caller in [api_key_caller("caller-keys"), provider_caller()] {
+            let s = inbound_api_key_surface(&[caller.clone(), jwt_caller()]);
+            validate_api_key_identities(&s, "").unwrap_or_else(|e| panic!("{caller}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn inbound_from_api_key_is_refused_unless_the_first_caller_method_is_an_api_key() {
+        for (case, caller) in [
+            ("no caller authentication", vec![]),
+            ("jwt only", vec![jwt_caller()]),
+            ("api key second", vec![jwt_caller(), provider_caller()]),
+        ] {
+            let s = inbound_api_key_surface(&caller);
+            assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+        }
+
+        let mut other_mode = inbound_api_key_surface(&[jwt_caller()]);
+        other_mode
+            .identity_slots
+            .inbound = None;
+        validate_api_key_identities(&other_mode, "").expect("another inbound mode");
+    }
+
+    #[test]
+    fn inbound_from_api_key_is_refused_beside_mcp_resource_tokens() {
+        let mut s = inbound_api_key_surface(&[provider_caller()]);
+        s.access_point.protocol = SurfaceProtocol::Mcp;
+        s.mcp_http = Some(Default::default());
+        validate_api_key_identities(&s, "").expect("mcp_http without authorization");
+
+        s.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({ "authorization": { "resource": "https://mcp.example/mcp" } }))
+                .unwrap(),
+        );
+        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_WITH_RESOURCE_TOKENS);
+    }
+
+    #[test]
+    fn inbound_from_api_key_is_refused_on_an_mcp_proxy_target() {
+        let mut s = inbound_api_key_surface(&[provider_caller()]);
+        s.access_point.protocol = SurfaceProtocol::Mcp;
+        s.target.endpoint = "proxy://mcp-proxy-1".to_string();
+        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_ON_MCP_PROXY);
+
+        s.identity_slots.inbound = None;
+        validate_api_key_identities(&s, "").expect("another inbound mode");
+
+        let mut a2a = inbound_api_key_surface(&[provider_caller()]);
+        a2a.target.endpoint = "a2a-proxy://worker".to_string();
+        validate_api_key_identities(&a2a, "").expect("a2a-proxy target");
+    }
+
+    #[test]
+    fn inbound_from_api_key_is_refused_behind_a_reserved_plain_secret_id() {
+        let s = inbound_api_key_surface(&[api_key_caller("atgk_aliased")]);
+        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_RESERVED_SECRET_ID);
+
+        let mut other_mode = s.clone();
+        other_mode
+            .identity_slots
+            .inbound = None;
+        validate_api_key_identities(&other_mode, "").expect("another inbound mode");
+    }
+
+    #[test]
+    fn stored_from_api_key_slots_need_a_non_empty_key_id() {
+        for id in [None, Some(""), Some("  ")] {
+            let mut protected = base_surface();
+            protected
+                .identity_slots
+                .protected = from_api_key(id);
+            assert_eq!(
+                refusal(validate_api_key_identities(&protected, "")),
+                format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
+                "{id:?}"
+            );
+
+            let mut external = base_surface();
+            external
+                .identity_slots
+                .external = from_api_key(id);
+            assert_eq!(
+                refusal(validate_api_key_identities(&external, "")),
+                format!("identity_slots.external: {API_KEY_IDENTITY_NEEDS_ID}"),
+                "{id:?}"
+            );
+        }
+
+        let transit = with_transit(
+            base_surface(),
+            serde_json::json!({ "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example",
+                "managed_identity": { "type": "from_api_key", "api_key_id": "" }
+            }] }),
+        );
+        assert_eq!(
+            refusal(validate_api_key_identities(&transit, "")),
+            format!("transit.points['partner'].managed_identity: {API_KEY_IDENTITY_NEEDS_ID}")
+        );
+
+        let mut keyed = base_surface();
+        keyed.identity_slots.protected = from_api_key(Some("managed-key"));
+        keyed.identity_slots.external = from_api_key(Some("external-key"));
+        validate_api_key_identities(&keyed, "").expect("both slots keyed");
+    }
+
+    #[test]
+    fn one_key_cannot_identify_both_a_managed_agent_and_a_caller() {
+        let clash = format!(
+            "API key 'shared' is set as both a Managed Agent and a caller identity; {API_KEY_IDENTIFIES_BOTH_ROLES}"
+        );
+
+        let mut slots = base_surface();
+        slots.identity_slots.protected = from_api_key(Some("shared"));
+        slots.identity_slots.external = from_api_key(Some("shared"));
+        assert_eq!(refusal(validate_api_key_identities(&slots, "")), clash);
+
+        let mut plain_caller = inbound_api_key_surface(&[api_key_caller("shared")]);
+        plain_caller
+            .identity_slots
+            .protected = from_api_key(Some("shared"));
+        assert_eq!(refusal(validate_api_key_identities(&plain_caller, "")), clash);
+        plain_caller
+            .identity_slots
+            .protected = from_api_key(Some("managed-key"));
+        validate_api_key_identities(&plain_caller, "").expect("distinct keys");
+
+        let mut transit = with_transit(
+            base_surface(),
+            serde_json::json!({ "points": [{
+                "alias": "partner", "target_endpoint": "https://partner.example",
+                "managed_identity": { "type": "from_api_key", "api_key_id": "shared" }
+            }] }),
+        );
+        transit
+            .identity_slots
+            .external = from_api_key(Some("shared"));
+        assert_eq!(refusal(validate_api_key_identities(&transit, "")), clash);
+
+        transit
+            .identity_slots
+            .external = None;
+        transit
+            .identity_slots
+            .protected = from_api_key(Some("shared"));
+        validate_api_key_identities(&transit, "").expect("a Transit Point may share the Managed Agent key");
+    }
+
+    fn variant_with_caller(
+        alias: &str,
+        enabled: bool,
+        caller: &[serde_json::Value],
+    ) -> SurfaceVariant {
+        SurfaceVariant {
+            id: format!("v-{alias}"),
+            alias: alias.to_string(),
+            name: alias.to_string(),
+            description: String::new(),
+            enabled,
+            overrides: SurfaceOverrides {
+                access_point: Some(
+                    serde_json::from_value(serde_json::json!({ "caller_authentication": { "methods": caller } }))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_variant_switching_inbound_from_api_key_callers_to_jwt_is_refused() {
+        let mut s = inbound_api_key_surface(&[provider_caller()]);
+        s.variants
+            .push(variant_with_caller("jwt", true, &[jwt_caller()]));
+        assert_eq!(
+            refusal(validate_resolved_variants(&s)),
+            format!("Variant 'jwt': {INBOUND_API_KEY_NEEDS_API_KEY_CALLER}")
+        );
+
+        s.variants[0].enabled = false;
+        validate_resolved_variants(&s).expect("a disabled variant is not resolved");
+    }
+
+    #[test]
+    fn inbound_api_key_ids_are_dropped_from_the_base_and_every_variant() {
+        let mut s = base_surface();
+        s.identity_slots.inbound = from_api_key(Some("stale-inbound"));
+        s.identity_slots.protected = from_api_key(Some("managed-key"));
+        for (alias, enabled) in [("on", true), ("off", false)] {
+            let mut variant = variant_with_caller(alias, enabled, &[provider_caller()]);
+            variant
+                .overrides
+                .identity_slots = Some(crate::config::agent_surface::SurfaceIdentitySlots {
+                inbound: from_api_key(Some("stale-variant")),
+                protected: from_api_key(Some("variant-managed-key")),
+                external: None,
+            });
+            s.variants.push(variant);
+        }
+
+        drop_inbound_api_key_ids(&mut s);
+
+        assert_eq!(s.identity_slots.inbound, from_api_key(None));
+        assert_eq!(s.identity_slots.protected, from_api_key(Some("managed-key")));
+        for variant in &s.variants {
+            let slots = variant
+                .overrides
+                .identity_slots
+                .as_ref()
+                .unwrap();
+            assert_eq!(slots.inbound, from_api_key(None), "{}", variant.alias);
+            assert_eq!(slots.protected, from_api_key(Some("variant-managed-key")), "{}", variant.alias);
+        }
     }
 
     /// Attach a transit config (parsed from JSON for brevity) to a surface.

@@ -2681,3 +2681,245 @@ async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
         1
     );
 }
+
+const STORED_INBOUND_API_KEY_SURFACE: &str = "stored-inbound-api-key";
+
+fn provider_caller_authentication(agent_id: &str) -> serde_json::Value {
+    json!({ "methods": [{
+        "type": "api_key_provider",
+        "extraction": { "source": "http_header", "field": "X-API-Key" },
+        "agent_id": agent_id
+    }] })
+}
+
+/// Store an inbound `from_api_key` surface as an older build saved it: with a
+/// key id on the inbound slot, in the base and in a disabled variant whose
+/// callers do not authenticate at all. Neither id names a secret.
+fn store_inbound_api_key_surface_with_stale_key_ids(
+    bootstrap: &crate::config::BootstrapConfig,
+    target: &str,
+) {
+    let gateway: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
+    let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+        "surface_id": STORED_INBOUND_API_KEY_SURFACE,
+        "name": "stored-inbound-api-key",
+        "access_point": {
+            "listen_address": gateway["listeners"][0]["external_urls"][0],
+            "route": "/stored",
+            "protocol": "a2a",
+            "caller_authentication": provider_caller_authentication(STORED_INBOUND_API_KEY_SURFACE)
+        },
+        "target": { "endpoint": target },
+        "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-inbound-secret" } },
+        "variants": [{
+            "id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false,
+            "overrides": {
+                "access_point": { "caller_authentication": { "methods": [] } },
+                "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-variant-secret" } }
+            }
+        }]
+    }))
+    .expect("stored inbound from_api_key surface JSON");
+    let directory = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .agent_surfaces,
+    );
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{STORED_INBOUND_API_KEY_SURFACE}.json")),
+        serde_json::to_vec_pretty(&surface).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn refusal_details(response: reqwest::Response) -> String {
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["details"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The admin API keeps an inbound `from_api_key` identity only behind an API
+/// key caller method, saves a stored surface carrying an inbound key id
+/// without it, and refuses a Managed Agent `from_api_key` slot with no key.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_saves_inbound_from_api_key_only_behind_an_api_key_caller() {
+    use crate::identity::handlers::surfaces::{API_KEY_IDENTITY_NEEDS_ID, INBOUND_API_KEY_NEEDS_API_KEY_CALLER};
+
+    let mock = MockServer::start().await;
+    let target = mock.url();
+    let mut admin = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        store_inbound_api_key_surface_with_stale_key_ids(bootstrap, &target);
+    })
+    .await;
+    let admin = admin.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let stored_url = format!("{collection}/{STORED_INBOUND_API_KEY_SURFACE}");
+    let inbound_key_ids = |surface: &serde_json::Value| {
+        (
+            surface["identity_slots"]["inbound"]["api_key_id"].clone(),
+            surface["variants"][0]["overrides"]["identity_slots"]["inbound"]["api_key_id"].clone(),
+        )
+    };
+
+    let stored: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbound_key_ids(&stored), (json!("stale-inbound-secret"), json!("stale-variant-secret")), "{stored}");
+
+    let saved = admin
+        .put(&stored_url)
+        .json(&stored)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200);
+    let reloaded: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbound_key_ids(&reloaded), (serde_json::Value::Null, serde_json::Value::Null));
+    assert_eq!(reloaded["identity_slots"]["inbound"]["type"], "from_api_key");
+
+    let posted_id = "posted-inbound-api-key";
+    let mut posted = json!({
+        "surface_id": posted_id,
+        "name": posted_id,
+        "access_point": { "listen_address": h.gateway_base, "route": "/posted", "protocol": "a2a" },
+        "target": { "endpoint": h.mock.url() },
+        "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-posted-secret" } }
+    });
+    let without_caller = admin
+        .post(&collection)
+        .json(&posted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(without_caller).await, INBOUND_API_KEY_NEEDS_API_KEY_CALLER);
+    posted["access_point"]["caller_authentication"] = provider_caller_authentication(posted_id);
+    let created = admin
+        .post(&collection)
+        .json(&posted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(created["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+
+    let mut without_caller = reloaded.clone();
+    without_caller["access_point"]
+        .as_object_mut()
+        .unwrap()
+        .remove("caller_authentication");
+    let put = admin
+        .put(&stored_url)
+        .json(&without_caller)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(put).await, INBOUND_API_KEY_NEEDS_API_KEY_CALLER);
+
+    let mut enabled_variant = reloaded.clone();
+    enabled_variant["variants"][0]["enabled"] = json!(true);
+    let put = admin
+        .put(&stored_url)
+        .json(&enabled_variant)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(put).await, format!("Variant 'candidate': {INBOUND_API_KEY_NEEDS_API_KEY_CALLER}"));
+
+    for (patch, expected) in [
+        (
+            json!({ "access_point": { "caller_authentication": null } }),
+            INBOUND_API_KEY_NEEDS_API_KEY_CALLER.to_string(),
+        ),
+        (
+            json!({ "identity_slots": { "protected": { "type": "from_api_key", "api_key_id": "" } } }),
+            format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
+        ),
+    ] {
+        let response = admin
+            .patch(&stored_url)
+            .header("content-type", "application/merge-patch+json")
+            .body(patch.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refusal_details(response).await, expected, "{patch}");
+    }
+
+    let unchanged: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged["access_point"]["caller_authentication"],
+        provider_caller_authentication(STORED_INBOUND_API_KEY_SURFACE)
+    );
+    assert_eq!(unchanged["variants"][0]["enabled"], false);
+}
+
+/// Reassigning a surface stored with an inbound key id naming no secret moves
+/// it and saves it without that id.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_reassign_drops_a_stale_inbound_api_key_id() {
+    let mock = MockServer::start().await;
+    let target = mock.url();
+    let mut admin = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        store_inbound_api_key_surface_with_stale_key_ids(bootstrap, &target);
+    })
+    .await;
+    let admin = admin.unwrap();
+
+    let reassigned = admin
+        .put(format!("{}/api/v1/tenant-ownership/surfaces/{STORED_INBOUND_API_KEY_SURFACE}", h.gateway_base))
+        .json(&json!({ "tenant_id": "tenant-a" }))
+        .send()
+        .await
+        .unwrap();
+    let status = reassigned.status();
+    assert_eq!(
+        status,
+        200,
+        "{}",
+        reassigned
+            .text()
+            .await
+            .unwrap()
+    );
+
+    let stored: serde_json::Value = admin
+        .get(format!("{}/api/v1/surfaces/{STORED_INBOUND_API_KEY_SURFACE}", h.gateway_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored["tenant_id"], "tenant-a");
+    assert_eq!(stored["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+    assert_eq!(stored["variants"][0]["overrides"]["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+}

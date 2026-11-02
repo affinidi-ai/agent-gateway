@@ -10325,7 +10325,7 @@ async fn resolve_configured_caller_identity(
 
 const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
 
-fn inbound_identity_from_api_key(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+pub(crate) fn inbound_identity_from_api_key(surface: &crate::config::agent_surface::AgentSurface) -> bool {
     matches!(surface.inbound_identity(), Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
 }
 
