@@ -144,7 +144,17 @@ changes:
         may be left out while the surface binds one there. It answers removed, grant_ids and
         purged. Each removal deletes only the connection it read, refreshed since or not, never a
         grant the person connected again in between.
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-02T22:00:00Z'
+      title: Document the direct vendor calls and limits of external consent
+      description: >-
+        The deployment requirements now name the code exchange and token refresh among the
+        external consent calls that ignore a proxy, so an operator on a proxy-only network opens
+        direct egress to each provider's token endpoint host. The credential delegation guide now
+        says that a variant listing no Transit Points of its own releases the surface's grants
+        under its own transit settings and Access Point, with a Warning on save; that a provider
+        delete answers 503 while the surface store is unavailable; and that surface writes of
+        every tenant wait while a deleted provider's grants are read and deleted.
   removed: []
   security: []
   breaking: []

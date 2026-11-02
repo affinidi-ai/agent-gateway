@@ -527,7 +527,7 @@ The Transit Point itself must send the grant only where it belongs:
 | Field | Rule |
 | --- | --- |
 | `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
-| `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
+| `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. The exception is a variant that lists no Transit Points of its own: it serves the surface's under the same ids, and so releases the same grants, even when it overrides `transit.shared` (transit policy, rate limit, OPA policy, source auth) or the Access Point. Only a surface editor can set this up, and could weaken the surface itself just as well, so it is allowed: a save answers with a `Warning` header for each Transit Point with `consent_mode: external` that an enabled variant, with transit on, keeps this way. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
 
 A variant that does not list its own Transit Points (`overrides.transit.points`) keeps the
 surface's, and so uses their grants under its own shared transit settings (`transit_policy`,
@@ -1247,12 +1247,17 @@ reference the provider are read: those of its own tenant, or every surface for a
 provider. Bindings are read from the surface's stored lists, its own and each variant's, so a
 surface whose variants cannot be resolved still counts by the providers it names. The answer
 names the binding `surface_id` when the caller may see that surface. Remove the bindings first.
+While the surface store is unavailable the bindings cannot be checked, so every provider
+delete, of any type, answers `503` and keeps the provider.
 
 A permitted delete of a provider with an `issuer` deletes every grant made with it, then the
 provider, and answers; the grants are revoked afterwards, on a task of their own, reading only
-that provider's grants. The provider lock is held only while the bindings are checked and the
-grants and the provider deleted, never while a vendor is called, so a vendor that is slow or
-hangs keeps no surface write waiting, of any tenant. A delete dropped part way puts the grants
+that provider's grants. The provider lock is held while the bindings are checked and the grants
+and the provider deleted, never while a vendor is called, so a vendor that is slow or hangs
+keeps no surface write waiting. Surface creates, updates and deletes of every tenant do wait
+while the provider's grants are read, deleted and kept for revocation; with KMS envelope
+encryption each grant read and each kept is a round trip to the key service, so deleting a
+provider with many grants holds up surface writes for that long. A delete dropped part way puts the grants
 back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
 vault cannot list or delete the grants, when the grants stored were written under another
 identity hash pepper, and when one of its grants cannot be read, for example because at-rest
