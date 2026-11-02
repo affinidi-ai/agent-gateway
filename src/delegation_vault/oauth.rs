@@ -1098,21 +1098,19 @@ pub enum ProviderSecretError {
     Store,
 }
 
-/// Resolve a provider's secret value by secret_id. The secret must belong to the provider's own
-/// tenant; under `mode` `warn` a secret outside it is still read, with a warning.
+/// Resolve a provider's secret value by secret_id, with one lookup by that id. The secret must
+/// belong to the provider's own tenant; under `mode` `warn` a secret outside it is still read,
+/// with a warning.
 pub(super) async fn resolve_secret(
     provider: &CredentialProvider,
     secrets_store: &Arc<dyn SecretsStore>,
     secret_ref: &str,
     mode: RuleMode,
 ) -> Result<String, ProviderSecretError> {
-    let secrets = secrets_store
-        .list_all()
+    let secret = secrets_store
+        .get_by_secret_id(secret_ref)
         .await
-        .map_err(|_| ProviderSecretError::Store)?;
-    let secret = secrets
-        .iter()
-        .find(|s| s.secret_id == secret_ref)
+        .map_err(|_| ProviderSecretError::Store)?
         .ok_or(ProviderSecretError::NotFound)?;
     if provider.secret_is_outside_tenant(secret.tenant_id.as_deref()) {
         if mode.is_enforced() {
@@ -1121,12 +1119,7 @@ pub(super) async fn resolve_secret(
         }
         warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Using a credential provider secret outside the provider's tenant");
     }
-    let full_secret = secrets_store
-        .get(&secret.id)
-        .await
-        .map_err(|_| ProviderSecretError::Store)?
-        .ok_or(ProviderSecretError::NotFound)?;
-    Ok(full_secret.value)
+    Ok(secret.value)
 }
 
 /// The tenant isolation mode of the running process.

@@ -1778,11 +1778,20 @@ mod tests {
 
     // ── Mock secrets store ────────────────────────────────────────────────
 
-    /// Lists the `CLIENT_ID` and `CLIENT_SECRET` references of `make_credential_provider`
-    /// in `tenant_id`, and holds no values.
+    /// Lists the `CLIENT_ID` and `CLIENT_SECRET` references of `make_credential_provider` in
+    /// `tenant_id` and answers a lookup of either with an empty value, or holds no secret at
+    /// all when `empty`.
     #[derive(Default)]
     struct MockSecretsStore {
         tenant_id: Option<String>,
+        empty: bool,
+    }
+
+    fn empty_secrets() -> Arc<dyn SecretsStore> {
+        Arc::new(MockSecretsStore {
+            empty: true,
+            ..Default::default()
+        })
     }
 
     #[async_trait]
@@ -1822,6 +1831,9 @@ mod tests {
                 }))
         }
         async fn list_all(&self) -> Result<Vec<SecretListItem>> {
+            if self.empty {
+                return Ok(Vec::new());
+            }
             let at = chrono::DateTime::<Utc>::UNIX_EPOCH;
             Ok(["CLIENT_ID", "CLIENT_SECRET"]
                 .into_iter()
@@ -2518,7 +2530,7 @@ mod tests {
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
             let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());
-            let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+            let secrets = empty_secrets();
 
             let results = resolve_delegation_credentials(
                 &[make_binding("cp-1")],
@@ -2747,6 +2759,7 @@ mod tests {
         let providers = MockProviderStore::with_stored(provider);
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore {
             tenant_id: provider_tenant.map(String::from),
+            empty: false,
         });
         resolve_delegation_credentials(
             &[make_binding("cp-1")],
@@ -3253,11 +3266,11 @@ mod tests {
     async fn test_elicit_without_session_id_falls_through_to_consent_required() {
         // ConsentMode::Elicit + NO audit_ctx.mcp_session_id → try_elicit_flow
         // returns None and the caller invokes build_consent_required.
-        // MockSecretsStore cannot resolve the OAuth client_id secret, so no
+        // An empty MockSecretsStore cannot resolve the OAuth client_id secret, so no
         // authorization URL can be built and the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let results = resolve_delegation_credentials(
@@ -3330,7 +3343,7 @@ mod tests {
         // OnDemand → falls through to consent_required.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let ctx = DelegationAuditContext {
@@ -3357,7 +3370,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         // As above: fallthrough → build_consent_required → secret resolution
-        // fails on MockSecretsStore → no authorization URL → Unavailable.
+        // fails on an empty MockSecretsStore → no authorization URL → Unavailable.
         assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
@@ -3381,7 +3394,7 @@ mod tests {
 
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::Fail)];
 
         let ctx = DelegationAuditContext {
@@ -3407,7 +3420,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        // With MockSecretsStore the authorization-URL build fails before we
+        // With an empty MockSecretsStore the authorization-URL build fails before we
         // ever attempt SSE delivery, so try_elicit_flow returns None and the
         // caller falls through to build_consent_required, which also fails
         // on secrets → Unavailable. The no-SSE-stream branch itself is

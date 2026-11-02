@@ -557,16 +557,16 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    /// The fixture's secrets store, counting value reads and able to fail its listing or
-    /// lose its values.
+    /// The fixture's secrets store, recording its lookups by secret id and counting its
+    /// listings, able to fail either or to answer a lookup with no secret after
+    /// `lookups_before_missing` more lookups.
     struct ObservedSecrets {
         inner: crate::secrets::FilesystemSecretsStore,
-        value_reads: AtomicUsize,
         lookups: Mutex<Vec<String>>,
         listing_calls: AtomicUsize,
         listing_fails: AtomicBool,
         lookup_fails: AtomicBool,
-        values_missing: AtomicBool,
+        lookups_before_missing: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -583,14 +583,6 @@ mod tests {
             &self,
             id: &str,
         ) -> anyhow::Result<Option<crate::secrets::Secret>> {
-            self.value_reads
-                .fetch_add(1, Ordering::SeqCst);
-            if self
-                .values_missing
-                .load(Ordering::SeqCst)
-            {
-                return Ok(None);
-            }
             self.inner.get(id).await
         }
         async fn get_by_secret_id(
@@ -607,6 +599,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(secret_id.to_string());
+            if self
+                .lookups_before_missing
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_err()
+            {
+                return Ok(None);
+            }
             self.inner
                 .get_by_secret_id(secret_id)
                 .await
@@ -743,12 +742,11 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap(),
-                value_reads: AtomicUsize::new(0),
                 lookups: Mutex::new(Vec::new()),
                 listing_calls: AtomicUsize::new(0),
                 listing_fails: AtomicBool::new(false),
                 lookup_fails: AtomicBool::new(false),
-                values_missing: AtomicBool::new(false),
+                lookups_before_missing: AtomicUsize::new(usize::MAX),
             });
             let secrets: Arc<dyn SecretsStore> = observed.clone();
             for (secret_id, value) in [
@@ -945,6 +943,20 @@ mod tests {
             after(retry_at, 100)
         }
 
+        fn lookups(&self) -> Vec<String> {
+            self.observed
+                .lookups
+                .lock()
+                .unwrap()
+                .clone()
+        }
+
+        fn listings(&self) -> usize {
+            self.observed
+                .listing_calls
+                .load(Ordering::SeqCst)
+        }
+
         fn requests(&self) -> Vec<HashMap<String, String>> {
             self.endpoint
                 .forms
@@ -1057,6 +1069,8 @@ mod tests {
             assert!(token.issued.is_none());
             assert_eq!(token.value(), "static-key");
         }
+        assert_eq!(fixture.lookups(), ["API_KEY", "API_KEY"]);
+        assert_eq!(fixture.listings(), 0);
         assert!(fixture.requests().is_empty());
         assert!(
             fixture
@@ -1286,8 +1300,8 @@ mod tests {
                 }
                 ServiceTokenError::SecretUnavailable => fixture
                     .observed
-                    .values_missing
-                    .store(true, Ordering::SeqCst),
+                    .lookups_before_missing
+                    .store(2, Ordering::SeqCst),
                 _ => fixture.egress.exact_allowlist = None,
             }
             assert_eq!(
@@ -1647,37 +1661,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cached_token_is_served_without_reading_a_secret_value() {
-        let fixture = Fixture::new().await;
-        let provider = fixture
-            .provider(client_credentials())
-            .await;
-        let now = Utc::now();
-        issued(
-            fixture
-                .acquire(&provider, &["read"], now)
-                .await,
-        );
-        let reads = fixture
-            .observed
-            .value_reads
-            .load(Ordering::SeqCst);
-        assert!(reads > 0, "a token request reads the client credentials");
-        assert_eq!(
-            issued(
-                fixture
-                    .acquire(&provider, &["read"], now)
-                    .await
+    async fn a_token_grant_looks_up_each_secret_by_id_and_never_lists_the_store() {
+        for (settings, secret_refs) in [
+            (client_credentials(), vec!["CLIENT_ID", "CLIENT_SECRET"]),
+            (
+                json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY", "jwt_certificate_secret_ref": "CERTIFICATE"}),
+                vec!["SIGNING_KEY", "CERTIFICATE"],
             ),
-            ("issued".into(), Freshness::Cached)
-        );
-        assert_eq!(
-            fixture
-                .observed
-                .value_reads
-                .load(Ordering::SeqCst),
-            reads
-        );
+            (
+                json!({"provider_type": "oauth2_client_credentials_jwt_auth", "client_id_secret_ref": "CLIENT_ID",
+                       "jwt_signing_key_secret_ref": "SIGNING_KEY", "jwt_certificate_secret_ref": "CERTIFICATE"}),
+                vec!["CLIENT_ID", "SIGNING_KEY", "CERTIFICATE"],
+            ),
+        ] {
+            let fixture = Fixture::new().await;
+            let provider = fixture
+                .provider(settings)
+                .await;
+            let now = Utc::now();
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &["read"], now)
+                        .await
+                ),
+                ("issued".into(), Freshness::Fresh)
+            );
+            assert_eq!(fixture.listings(), 0, "{secret_refs:?}");
+            assert_eq!(fixture.lookups(), [secret_refs.clone(), secret_refs.clone()].concat());
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &["read"], now)
+                        .await
+                ),
+                ("issued".into(), Freshness::Cached)
+            );
+            assert_eq!(fixture.listings(), 0, "{secret_refs:?}");
+            assert_eq!(fixture.lookups(), [secret_refs.clone(), secret_refs.clone(), secret_refs].concat());
+            assert_eq!(fixture.requests().len(), 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2464,14 +2488,7 @@ mod tests {
                     .err(),
                 Some(ServiceTokenError::ProviderMisconfigured)
             );
-            assert_eq!(
-                fixture
-                    .observed
-                    .value_reads
-                    .load(Ordering::SeqCst),
-                attempt,
-                "attempt {attempt} reached the grant"
-            );
+            assert_eq!(fixture.lookups(), vec!["MALFORMED_KEY"; 2 * attempt], "attempt {attempt} reached the grant");
         }
         assert!(fixture.requests().is_empty());
     }
@@ -2495,13 +2512,7 @@ mod tests {
             );
         }
         assert_eq!(fixture.requests().len(), 1);
-        assert_eq!(
-            fixture
-                .observed
-                .value_reads
-                .load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(fixture.lookups(), vec!["SIGNING_KEY"; 4], "only the first attempt reached the grant");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2511,11 +2522,11 @@ mod tests {
             .provider(client_credentials())
             .await;
         let now = Utc::now();
-        fixture
-            .observed
-            .values_missing
-            .store(true, Ordering::SeqCst);
         for _ in 0..2 {
+            fixture
+                .observed
+                .lookups_before_missing
+                .store(2, Ordering::SeqCst);
             assert_eq!(
                 fixture
                     .acquire(&provider, &["read"], now)
@@ -2524,10 +2535,11 @@ mod tests {
                 Some(ServiceTokenError::SecretUnavailable)
             );
         }
+        assert_eq!(fixture.lookups(), ["CLIENT_ID", "CLIENT_SECRET", "CLIENT_ID"].repeat(2));
         fixture
             .observed
-            .values_missing
-            .store(false, Ordering::SeqCst);
+            .lookups_before_missing
+            .store(usize::MAX, Ordering::SeqCst);
         let allowlist = fixture
             .egress
             .exact_allowlist
