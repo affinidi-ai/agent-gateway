@@ -67,10 +67,12 @@ changes:
       title: Offer tenant surfaces only their own providers and secrets in the dashboard
       description: >-
         The Surface Builder and the credential provider editor list only the credential
-        providers and secrets of the surface's or provider's own tenant. A stored choice
-        outside that tenant stays visible, labelled as stopping to work once tenant isolation
-        is enforced. The Token Endpoint field shows an inline error for an http URL and
-        points to the bootstrap credential_policy.insecure_token_endpoints list.
+        providers and secrets of the surface's or provider's own tenant, plus the
+        appliance-wide authorization code providers a tenant surface may keep using. A stored
+        choice outside that tenant stays visible: an appliance-wide one is labelled as
+        stopping to work once tenant isolation is enforced, and one of another tenant as
+        already refused by the gateway. The Token Endpoint field shows an inline error for an
+        http URL and points to the bootstrap credential_policy.insecure_token_endpoints list.
   fixed:
     - timestamp: '2026-10-30T23:00:04Z'
       title: Stop reusing a service token after its provider or a referenced secret changes

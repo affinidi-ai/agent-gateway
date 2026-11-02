@@ -1,4 +1,9 @@
-import { inOwnerTenant, outOfTenantLabel, splitByTenant } from './tenantScope';
+import {
+  inOwnerTenant,
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from './tenantScope';
 
 const items = [
   { id: 'wide' },
@@ -6,6 +11,15 @@ const items = [
   { id: 'null', tenant_id: null },
   { id: 'other', tenant_id: 'other' },
 ];
+
+const providers = [
+  { id: 'wide-code', provider_type: 'oauth2_authorization_code' },
+  { id: 'wide-cc', provider_type: 'oauth2_client_credentials' },
+  { id: 'other-code', provider_type: 'oauth2_authorization_code', tenant_id: 'other' },
+  { id: 'acme-cc', provider_type: 'oauth2_client_credentials', tenant_id: 'acme' },
+];
+
+const userTokenProvider = (p: { provider_type?: string }) => !sendsGatewayCredential(p);
 
 describe('tenantScope', () => {
   it('offers a tenant only its own items', () => {
@@ -25,10 +39,29 @@ describe('tenantScope', () => {
     expect(inOwnerTenant({ tenant_id: 'x' }, undefined)).toBe(true);
   });
 
-  it('labels out-of-tenant items', () => {
+  it('offers a tenant the appliance-wide items the gateway still accepts', () => {
+    const { offered, outside } = splitByTenant(providers, 'acme', userTokenProvider);
+    expect(offered.map(p => p.id)).toEqual(['wide-code', 'acme-cc']);
+    expect(outside.map(p => p.id)).toEqual(['wide-cc', 'other-code']);
+  });
+
+  it('never offers another tenant an item through the appliance-wide allowance', () => {
+    expect(inOwnerTenant(providers[2], 'acme', userTokenProvider)).toBe(false);
+    expect(inOwnerTenant(providers[1], 'acme', userTokenProvider)).toBe(false);
+  });
+
+  it('tells user-token providers from those that send the gateway credential', () => {
+    expect(sendsGatewayCredential({ provider_type: 'oauth2_authorization_code' })).toBe(false);
+    expect(sendsGatewayCredential({ provider_type: 'oauth2_client_credentials' })).toBe(true);
+    expect(sendsGatewayCredential({ provider_type: 'oauth2_jwt_bearer' })).toBe(true);
+    expect(sendsGatewayCredential({ provider_type: 'api_key' })).toBe(true);
+  });
+
+  it('labels out-of-tenant items by what the gateway does with them', () => {
     expect(outOfTenantLabel({})).toBe('appliance-wide, stops working when enforced');
-    expect(outOfTenantLabel({ tenant_id: 'other' })).toBe(
-      'another tenant, stops working when enforced'
+    expect(outOfTenantLabel({ tenant_id: null })).toBe(
+      'appliance-wide, stops working when enforced'
     );
+    expect(outOfTenantLabel({ tenant_id: 'other' })).toBe('another tenant, refused by the gateway');
   });
 });

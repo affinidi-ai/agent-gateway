@@ -4,7 +4,11 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import FieldHelp from '../../../shared/FieldHelp';
-import { splitByTenant, outOfTenantLabel } from '../../../../utils/tenantScope';
+import {
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
@@ -142,7 +146,11 @@ interface Props {
 const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
-  const { offered, outside } = splitByTenant(providers, useSurfaceTenant());
+  const { offered, outside } = splitByTenant(
+    providers,
+    useSurfaceTenant(),
+    provider => !sendsGatewayCredential(provider)
+  );
 
   useEffect(() => {
     let alive = true;

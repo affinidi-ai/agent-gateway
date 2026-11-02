@@ -2,7 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
-import { splitByTenant, outOfTenantLabel } from '../../../../utils/tenantScope';
+import {
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
@@ -120,7 +124,11 @@ interface Props {
 const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
-  const { offered, outside } = splitByTenant(providers, useSurfaceTenant());
+  const { offered, outside } = splitByTenant(
+    providers,
+    useSurfaceTenant(),
+    provider => !sendsGatewayCredential(provider)
+  );
 
   useEffect(() => {
     let alive = true;

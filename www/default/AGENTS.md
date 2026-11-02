@@ -212,11 +212,15 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
   `OutboundCredentialsListSection`) and the Custom Metadata secret menu offer: only items with the
-  same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). A provider or secret already stored on
-  the surface that lies outside its tenant stays selectable and is labelled
-  "appliance-wide, stops working when enforced" (or "another tenant, ..."), so it can be replaced
-  before the gateway enforces tenant isolation. While creating, every visible item is offered and the
-  gateway refuses a cross-tenant reference on save.
+  same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). The delegation pickers
+  (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
+  appliance-wide authorization code providers, which send the user's own token and which the gateway
+  keeps accepting (`sendsGatewayCredential`). A provider or secret already stored on the surface that
+  lies outside its tenant stays selectable and is labelled by what the gateway does with it:
+  "appliance-wide, stops working when enforced" for an appliance-wide one, so it can be replaced
+  before the gateway enforces tenant isolation, and "another tenant, refused by the gateway" for one
+  of another tenant, which the gateway already refuses. While creating, every visible item is offered
+  and the gateway refuses a cross-tenant reference on save.
 
 | Element                                                        | Test id                                                                                                                                                                                            |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -579,8 +583,8 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-entra-resource-badge`).
 - The secret pickers offer only secrets of the provider's own tenant (`SecretOptions` in
   `SecretSelect.tsx`; the tenant is the loaded provider's `tenant_id`, unknown while creating). A
-  stored secret outside that tenant stays selectable with the same "stops working when enforced"
-  label.
+  stored secret outside that tenant stays selectable with the same labels: "appliance-wide, stops
+  working when enforced" or "another tenant, refused by the gateway".
 - A Token Endpoint starting with `http://` shows an inline error
   (`credential-provider-token-endpoint-https-error`, field marked invalid) that names the bootstrap
   `credential_policy.insecure_token_endpoints` list for a deliberate http identity provider. It does
