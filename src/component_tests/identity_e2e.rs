@@ -2144,6 +2144,10 @@ const UNVERIFIED_CALLER_POLICY_ID: &str = "unverified-caller-policy";
 const VERIFIED_CALLER_POLICY_ID: &str = "verified-caller-policy";
 const UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID: &str = "unverified-extension-identity-policy";
 const SOURCE_AUTH_CALLER_POLICY_ID: &str = "source-auth-caller-policy";
+const AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID: &str = "agent-did-is-resolved-caller-policy";
+const AGENT_DID_IS_ASSERTED_POLICY_ID: &str = "agent-did-is-asserted-policy";
+const AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID: &str = "agent-did-absent-on-failed-auth-policy";
+const ASSERTED_CALLER_DID: &str = "did:web:asserted.example";
 
 fn write_caller_verification_policies(temp_dir: &std::path::Path) {
     let policies = [
@@ -2195,6 +2199,45 @@ allow if {
     input.agent.did_verified == true
     input.agent.did_verification == "source_auth"
     input.extension_identity.verification == "source_auth"
+}
+"#,
+        ),
+        (
+            AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    startswith(input.agent.did, "did:webvh:")
+    input.agent.did == input.extension_identity.did
+    input.agent.did_verification == input.extension_identity.verification
+}
+"#,
+        ),
+        (
+            AGENT_DID_IS_ASSERTED_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.agent.did == "did:web:asserted.example"
+    input.agent.did != input.extension_identity.did
+}
+"#,
+        ),
+        (
+            AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.method == "failed"
+    input.agent.did_verified == false
+    not input.agent.did
+    not input.extension_identity
 }
 "#,
         ),
@@ -2372,6 +2415,186 @@ async fn inbound_from_api_key_identity_wins_over_a_body_presentation() {
     let (status, forwarded) = send_api_key_identity_body(VERIFIED_CALLER_POLICY_ID, body).await;
     assert_eq!(status, 403, "the verified presentation must not supply the caller identity");
     assert_eq!(forwarded, 0);
+}
+
+fn asserted_caller_did_body() -> serde_json::Value {
+    let tr_uri = crate::config::TRUST_REGISTRY_EXTENSION;
+    let mut body = a2a_request();
+    body["params"]["message"]["extensions"] = json!([tr_uri]);
+    body["params"]["message"]["metadata"] = json!({ tr_uri: { "agent_did": ASSERTED_CALLER_DID } });
+    body
+}
+
+async fn send_asserted_caller_did(
+    surface: crate::config::agent_surface::AgentSurface,
+    api_key: &'static str,
+) -> (reqwest::StatusCode, usize) {
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let status = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("x-api-key", api_key)
+        .json(&asserted_caller_did_body())
+        .send()
+        .await
+        .expect("inbound request failed")
+        .status();
+    let forwarded = h
+        .mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    (status, forwarded)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_agent_did_is_the_key_did_not_a_body_asserted_one() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_api_key_identity_surface(AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID),
+        INBOUND_CALLER_KEY,
+    )
+    .await;
+    assert_eq!(status, 200, "surface policy must see the key's DID as input.agent.did");
+    assert_eq!(forwarded, 1);
+
+    let mut surface = inbound_api_key_identity_surface(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID);
+    surface
+        .access_point
+        .inbound_policy = Some(crate::config::agent_surface::PolicyRef {
+        policy_definition_id: AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID.to_string(),
+        require_agent_context: false,
+    });
+    let (status, forwarded) = send_asserted_caller_did(surface, INBOUND_CALLER_KEY).await;
+    assert_eq!(status, 200, "access point policy must see the key's DID as input.agent.did");
+    assert_eq!(forwarded, 1);
+
+    let (status, forwarded) =
+        send_asserted_caller_did(inbound_api_key_identity_surface(AGENT_DID_IS_ASSERTED_POLICY_ID), INBOUND_CALLER_KEY)
+            .await;
+    assert_eq!(status, 403, "the body-asserted DID must not reach policy");
+    assert_eq!(forwarded, 0);
+}
+
+/// A self gateway whose enforced policy denies a request whose
+/// `input.agent.did` is [`ASSERTED_CALLER_DID`].
+fn write_self_gateway_denying_asserted_did(gateways_dir: &str) {
+    use crate::gateways::types::{Gateway, GatewayCreationType, GatewayOpaPolicyConfig, GatewayStatus, GatewayType};
+    let gateway = Gateway {
+        id: "self".into(),
+        tenant_id: None,
+        name: "self".into(),
+        description: String::new(),
+        did: "did:example:self".into(),
+        issuer_did: None,
+        issuer_did_source: None,
+        trusted_issuer_dids: Vec::new(),
+        gateway_type: GatewayType::SelfGateway,
+        status: GatewayStatus::Active,
+        creation_type: GatewayCreationType::User,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        exposed_channels: Vec::new(),
+        exposure_mode: None,
+        opa_policy_config: Some(GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: format!(
+                "package gateway.policy\n\ndefault allow := false\n\nallow if not asserted\n\nasserted if input.agent.did == \"{ASSERTED_CALLER_DID}\"\n"
+            ),
+            policy_definition_id: None,
+            ..Default::default()
+        }),
+    };
+    std::fs::create_dir_all(gateways_dir).expect("create gateways dir");
+    std::fs::write(
+        std::path::Path::new(gateways_dir).join("self.json"),
+        serde_json::to_string_pretty(&gateway).expect("serialize self gateway"),
+    )
+    .expect("write self gateway fixture");
+}
+
+async fn send_asserted_caller_did_under_gateway_policy(
+    surface: crate::config::agent_surface::AgentSurface
+) -> reqwest::StatusCode {
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        write_self_gateway_denying_asserted_did(
+            &bootstrap
+                .storage_paths
+                .gateways,
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("x-api-key", INBOUND_CALLER_KEY)
+        .json(&asserted_caller_did_body())
+        .send()
+        .await
+        .expect("inbound request failed")
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_gateway_policy_never_sees_a_body_asserted_did() {
+    assert_eq!(
+        send_asserted_caller_did_under_gateway_policy(inbound_api_key_identity_surface(
+            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID
+        ))
+        .await,
+        200,
+        "gateway policy must not see the body-asserted DID on an API key surface"
+    );
+    assert_eq!(
+        send_asserted_caller_did_under_gateway_policy(inbound_identity_surface(
+            json!({ "type": "static", "did": STATIC_CALLER_DID }),
+            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID,
+        ))
+        .await,
+        403,
+        "the gateway policy denies the asserted DID where the body DID is kept"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_static_identity_keeps_a_body_asserted_agent_did() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_identity_surface(
+            json!({ "type": "static", "did": STATIC_CALLER_DID }),
+            AGENT_DID_IS_ASSERTED_POLICY_ID,
+        ),
+        INBOUND_CALLER_KEY,
+    )
+    .await;
+    assert_eq!(status, 200, "a surface not identified by API key keeps the body-asserted DID");
+    assert_eq!(forwarded, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_failed_auth_leaves_no_agent_did() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_api_key_identity_surface(AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID),
+        "not-the-caller-key",
+    )
+    .await;
+    assert_eq!(status, 200, "a failed key must leave input.agent.did absent, not the body-asserted DID");
+    assert_eq!(forwarded, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

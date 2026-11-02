@@ -2712,6 +2712,8 @@ async fn proxy_handler_with_mcp_runtime(
         } else {
             None
         };
+    let mut pre_identity_agent_context = agent_context.clone();
+    bind_api_key_caller_did(&state.surface, method.as_str(), uri.path(), pre_identity_agent_context.as_mut(), None);
 
     // ── Trust Check stage placeholder ───────────────────────────────────────
     // The caller-leg Trust Check stage runs at the single post-identity seam
@@ -2744,7 +2746,7 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         g_input.source_auth = source_auth_context.clone();
-        g_input.agent = agent_context.clone();
+        g_input.agent = pre_identity_agent_context.clone();
         g_input.mcp = mcp_context.clone();
         g_input.a2a = a2a_context.clone();
         g_input.trust_check_results = trust_check_results.clone();
@@ -2798,7 +2800,7 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         gw_input.source_auth = source_auth_context.clone();
-        gw_input.agent = agent_context.clone();
+        gw_input.agent = pre_identity_agent_context;
         gw_input.mcp = mcp_context.clone();
         gw_input.a2a = a2a_context.clone();
         gw_input.trust_check_results = trust_check_results.clone();
@@ -5045,6 +5047,13 @@ async fn proxy_handler_with_mcp_runtime(
             did: Some(result.did.clone()),
             identity_hash: Some(result.hash.clone()),
         });
+    bind_api_key_caller_did(
+        &state.surface,
+        method.as_str(),
+        uri.path(),
+        agent_context.as_mut(),
+        extension_identity.as_ref(),
+    );
 
     // Surface the cryptographically-verified issuer DID of the caller's
     // `agent-identity-credential/v1` VP as `input.agent.identity_issuer_did`,
@@ -10279,6 +10288,10 @@ async fn resolve_configured_caller_identity(
                     );
                     return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
                 }
+                Err(e) if e.is::<crate::identity::IdentityOriginUnavailable>() => {
+                    warn!(channel = channel_name, leg, error = %e, "API key identity role could not be recorded — refused");
+                    return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, CALLER_IDENTITY_UNRESOLVED));
+                }
                 Err(e) => {
                     warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for inbound credential-based identity");
                     return Ok(None);
@@ -10328,6 +10341,24 @@ fn configured_caller_identity_applies(
 ) -> bool {
     !body_identity_resolved
         || (inbound_identity_from_api_key(surface) && !crate::proxy::paths::is_public_request(method, path))
+}
+
+/// On an inbound `from_api_key` surface the caller is the presented key, so
+/// `input.agent.did` is the key's DID (or absent when none was resolved), never
+/// a DID the request body asserts. Other surfaces keep the body DID.
+fn bind_api_key_caller_did(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    path: &str,
+    agent: Option<&mut crate::surface_context::AgentContext>,
+    extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
+) {
+    if inbound_identity_from_api_key(surface)
+        && !crate::proxy::paths::is_public_request(method, path)
+        && let Some(agent) = agent
+    {
+        agent.bind_caller_did(extension_identity);
+    }
 }
 
 /// The caller identity of an inbound `from_api_key` slot: the DID of the API
@@ -11059,7 +11090,7 @@ async fn handle_fabric_request(
             None
         };
 
-        let agent_ctx = if !state
+        let mut agent_ctx = if !state
             .surface
             .access_point
             .trust_check_list
@@ -11080,6 +11111,13 @@ async fn handle_fabric_request(
         } else {
             None
         };
+        bind_api_key_caller_did(
+            &state.surface,
+            method.as_str(),
+            uri.path(),
+            agent_ctx.as_mut(),
+            extension_identity.as_ref(),
+        );
 
         let mut policy_input = crate::surface_context::PolicyInput::new(
             method.as_ref(),
@@ -14975,6 +15013,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
+    bind_api_key_caller_did(&state.surface, method, uri.path(), policy_input.agent.as_mut(), None);
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -21852,6 +21891,74 @@ allow if {
             assert_eq!(resolve_count("pak-plain-clash", "role_clash"), 1);
         }
 
+        async fn issuer_that_cannot_record_origins() -> (crate::identity::VCIssuer, tempfile::TempDir) {
+            crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
+                crate::identity::test_helpers::OriginFailingIdentityStore(
+                    crate::identity::test_helpers::MockIdentityStore::new(),
+                ),
+            ))
+            .await
+        }
+
+        #[tokio::test]
+        async fn caller_key_whose_role_cannot_be_recorded_is_refused() {
+            let (issuer, _dir) = issuer_that_cannot_record_origins().await;
+            let (fields, hash) = crate::identity::credential_identity::global_resolver()
+                .resolve_presented_api_key("atgk_pak_origin_caller", true, None)
+                .await
+                .unwrap();
+            issuer
+                .issue_or_get_credential(fields, Some(hash), Some("pak-origin-caller".into()), None)
+                .await
+                .unwrap();
+            let state = state_with(inbound_from_api_key("pak-origin-caller"), Some(issuer));
+
+            let response = resolve(&state, Some(&provider_key("atgk_pak_origin_caller")), false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(
+                body_text(response)
+                    .await
+                    .contains("Caller identity could not be issued")
+            );
+            assert_eq!(resolve_count("pak-origin-caller", "vc_issuer_error"), 1);
+        }
+
+        #[tokio::test]
+        async fn managed_key_whose_role_cannot_be_recorded_is_refused() {
+            let (issuer, _dir) = issuer_that_cannot_record_origins().await;
+            let config = ManagedIdentityConfig::FromApiKey {
+                api_key_id: Some("atgk_pak_origin_managed".into()),
+            };
+            let Some(crate::identity::credential_identity::CredentialIdentity::Derived {
+                identity_fields,
+                identity_hash,
+            }) = crate::identity::credential_identity::derive_credential_identity(&config, None, None)
+                .await
+                .unwrap()
+            else {
+                panic!("API key identity is derived");
+            };
+            issuer
+                .issue_or_get_credential(identity_fields, Some(identity_hash), Some("pak-origin-managed".into()), None)
+                .await
+                .unwrap();
+            let state = state_with(surface_with("pak-origin-managed", None, Some(config)), Some(issuer));
+
+            let response = resolve(&state, None, false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                body_text(response)
+                    .await
+                    .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
+            );
+        }
+
         #[tokio::test]
         async fn managed_key_of_a_caller_is_refused() {
             let (issuer, _dir) = test_vc_issuer().await;
@@ -21932,6 +22039,132 @@ allow if {
             ));
             assert!(!super::super::configured_caller_identity_applies(&mtls, true, "POST", "/mcp"));
             assert!(super::super::configured_caller_identity_applies(&mtls, false, "POST", "/mcp"));
+        }
+
+        fn asserted_agent() -> crate::surface_context::AgentContext {
+            crate::surface_context::AgentContext {
+                trust_verification: None,
+                source_trust_verification: None,
+                target_trust_verification: None,
+                did: Some("did:web:asserted.example".into()),
+                did_verified: false,
+                did_verification: None,
+                agent_dna: None,
+                trust_registry_did: None,
+                provider_did: None,
+                authority_did: None,
+                identity_issuer_did: None,
+                tr_identity_mismatch: false,
+            }
+        }
+
+        #[test]
+        fn presented_key_did_replaces_a_body_asserted_agent_did_off_public_paths() {
+            let api_key = inbound_from_api_key("pak-agent-did");
+            let key = crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:webvh:key".into()),
+                identity_hash: Some("hash-key".into()),
+                verification: IdentityVerification::SourceAuth,
+            };
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), Some(&key));
+            assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
+            assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            assert_eq!(agent.did, None);
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(
+                &api_key,
+                "GET",
+                "/.well-known/agent-card.json",
+                Some(&mut agent),
+                Some(&key),
+            );
+            assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+        }
+
+        async fn mcp_proxy_policy_agent(
+            inbound: Option<ManagedIdentityConfig>
+        ) -> Option<crate::surface_context::AgentContext> {
+            let mut surface = mcp_surface("pak-mcp-proxy", "proxy://pak-mcp-proxy", None);
+            surface.identity_slots.inbound = inbound;
+            let state = bare_proxy_state(surface, None);
+            let body = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": { "_meta": { crate::config::MCP_TRUST_REGISTRY_KEY: {
+                    "agent_did": "did:web:asserted.example",
+                    "trust_registry_did": "did:web:registry.example",
+                    "provider_did": "did:web:provider.example"
+                } } }
+            }))
+            .unwrap();
+            let uri: axum::http::Uri = "/mcp".parse().unwrap();
+            super::super::evaluate_mcp_proxy_opa_policies(
+                &state,
+                "POST",
+                &uri,
+                &axum::http::HeaderMap::new(),
+                &body,
+                None,
+                None,
+                None,
+                None,
+                "trace-mcp-proxy",
+            )
+            .await
+            .unwrap()
+            .agent
+        }
+
+        #[tokio::test]
+        async fn mcp_proxy_policy_input_has_no_body_asserted_did_on_an_api_key_surface() {
+            let agent = mcp_proxy_policy_agent(Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }))
+                .await
+                .unwrap();
+
+            assert_eq!(agent.did, None);
+            assert_eq!(agent.provider_did, None);
+        }
+
+        #[tokio::test]
+        async fn mcp_proxy_policy_input_keeps_the_body_asserted_did_on_other_surfaces() {
+            let agent = mcp_proxy_policy_agent(None)
+                .await
+                .unwrap();
+
+            assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+            assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
+        }
+
+        #[test]
+        fn other_caller_identities_keep_a_body_asserted_agent_did() {
+            let key = crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:webvh:other".into()),
+                identity_hash: None,
+                verification: IdentityVerification::Unverified,
+            };
+            let surfaces = [
+                surface_with(
+                    "pak-agent-did-mtls",
+                    Some(ManagedIdentityConfig::FromMtls {
+                        certificate_id: "cert-1".into(),
+                    }),
+                    None,
+                ),
+                surface_with("pak-agent-did-none", None, None),
+            ];
+            for surface in &surfaces {
+                let mut agent = asserted_agent();
+                super::super::bind_api_key_caller_did(surface, "POST", "/mcp", Some(&mut agent), Some(&key));
+                assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+                assert_eq!(agent.did_verification, None);
+            }
         }
     }
 

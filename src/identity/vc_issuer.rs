@@ -101,6 +101,12 @@ struct SavedIssuerConfig {
 #[error("identity record belongs to another role")]
 pub struct IdentityRoleClash;
 
+/// An API key's identity record has no role and the store could not record
+/// one, so the record's role cannot be checked.
+#[derive(Debug, thiserror::Error)]
+#[error("identity origin could not be recorded")]
+pub struct IdentityOriginUnavailable;
+
 /// Response containing agent DID and credential
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentIdentityResponse {
@@ -839,6 +845,10 @@ impl VCIssuer {
             .await?
         {
             info!("[TR-TRACE] Identity ALREADY EXISTS for hash={}, did={}", identity_hash, record.did);
+            let api_key_identity = identity_fields
+                .get("credential_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("api_key");
             let effective_origin = match (record.origin, origin) {
                 (None, Some(requested)) => match self
                     .identity_store
@@ -846,6 +856,10 @@ impl VCIssuer {
                     .await
                 {
                     Ok(stored) => stored.or(Some(requested)),
+                    Err(e) if api_key_identity => {
+                        warn!(identity_hash = %identity_hash, error = %e, "Failed to record API key identity origin — refused");
+                        return Err(e.context(IdentityOriginUnavailable));
+                    }
                     Err(e) => {
                         warn!(identity_hash = %identity_hash, error = %e, "Failed to record identity origin (non-fatal)");
                         Some(requested)
@@ -855,10 +869,7 @@ impl VCIssuer {
             };
             if let (Some(existing), Some(requested)) = (effective_origin, origin)
                 && existing != requested
-                && identity_fields
-                    .get("credential_type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("api_key")
+                && api_key_identity
             {
                 warn!(did = %record.did, ?existing, ?requested, "API key identity requested in another role — refused");
                 return Err(IdentityRoleClash.into());
@@ -2854,6 +2865,43 @@ mod tests {
                     .set_origin(identity_hash, origin)
                     .await
             }
+        }
+
+        async fn existing_identity_with_failing_origin_store(
+            fields: HashMap<String, serde_json::Value>,
+            hash: &str,
+        ) -> (Result<AgentIdentityResponse>, String) {
+            let store = Arc::new(crate::identity::test_helpers::OriginFailingIdentityStore(
+                crate::identity::test_helpers::MockIdentityStore::new(),
+            ));
+            let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(store).await;
+            let legacy = issuer
+                .issue_or_get_credential(fields.clone(), Some(hash.to_string()), Some("vc-origin-fail".into()), None)
+                .await
+                .unwrap();
+            let result = issuer
+                .issue_or_get_caller_credential(fields, Some(hash.to_string()), Some("vc-origin-fail".into()), None)
+                .await;
+            (result, legacy.did)
+        }
+
+        #[tokio::test]
+        async fn api_key_identity_is_refused_when_its_origin_cannot_be_recorded() {
+            let (result, _) =
+                existing_identity_with_failing_origin_store(api_key_fields("atgk_f"), "hash-atgk_f").await;
+
+            let err = result.unwrap_err();
+            assert!(!err.is::<IdentityRoleClash>());
+            assert!(err.is::<IdentityOriginUnavailable>());
+            assert_eq!(err.root_cause().to_string(), crate::identity::test_helpers::OriginFailingIdentityStore::DETAIL);
+        }
+
+        #[tokio::test]
+        async fn other_identity_resolves_when_its_origin_cannot_be_recorded() {
+            let (result, legacy_did) =
+                existing_identity_with_failing_origin_store(fields("payload"), "hash-payload").await;
+
+            assert_eq!(result.unwrap().did, legacy_did);
         }
 
         #[tokio::test]

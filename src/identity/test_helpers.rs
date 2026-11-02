@@ -179,6 +179,73 @@ impl IdentityStore for MockIdentityStore {
     }
 }
 
+/// A [`MockIdentityStore`] that cannot record an identity origin.
+pub struct OriginFailingIdentityStore(pub MockIdentityStore);
+
+impl OriginFailingIdentityStore {
+    pub const DETAIL: &'static str = "origin store unavailable";
+}
+
+#[async_trait]
+impl IdentityStore for OriginFailingIdentityStore {
+    async fn create(
+        &self,
+        record: AgentIdentityRecord,
+    ) -> Result<()> {
+        self.0.create(record).await
+    }
+
+    async fn find_by_hash(
+        &self,
+        identity_hash: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        self.0
+            .find_by_hash(identity_hash)
+            .await
+    }
+
+    async fn find_by_did(
+        &self,
+        did: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        self.0.find_by_did(did).await
+    }
+
+    async fn list_all(&self) -> Result<Vec<AgentIdentityRecord>> {
+        self.0.list_all().await
+    }
+
+    async fn update_usage(
+        &self,
+        identity_hash: &str,
+        channel_config_id: Option<String>,
+    ) -> Result<()> {
+        self.0
+            .update_usage(identity_hash, channel_config_id)
+            .await
+    }
+
+    async fn store_external_did(
+        &self,
+        did: &str,
+        identity_fields: HashMap<String, serde_json::Value>,
+        channel_config_id: Option<String>,
+        verified: bool,
+    ) -> Result<()> {
+        self.0
+            .store_external_did(did, identity_fields, channel_config_id, verified)
+            .await
+    }
+
+    async fn set_origin(
+        &self,
+        _identity_hash: &str,
+        _origin: IdentityOrigin,
+    ) -> Result<Option<IdentityOrigin>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+}
+
 /// An identity store whose every lookup and write fails with
 /// [`FailingIdentityStore::DETAIL`].
 pub struct FailingIdentityStore;

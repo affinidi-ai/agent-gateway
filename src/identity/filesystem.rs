@@ -271,6 +271,7 @@ impl IdentityStore for FilesystemIdentityStore {
         identity_hash: &str,
         channel_config_id: Option<String>,
     ) -> Result<()> {
+        let _guard = self.origin_lock.lock().await;
         if let Some(mut record) = self
             .storage
             .get(identity_hash)
@@ -358,6 +359,7 @@ impl IdentityStore for FilesystemIdentityStore {
         channel_config_id: Option<String>,
         verified: bool,
     ) -> Result<()> {
+        let _guard = self.origin_lock.lock().await;
         // Check if we already have this DID
         if let Some(mut existing) = self.find_by_did(did).await? {
             let now = chrono::Utc::now();
@@ -788,6 +790,73 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    /// Races `write` against `set_origin(Managed)` on fresh origin-less local
+    /// records and returns the records whose origin did not survive.
+    async fn origins_lost_to_concurrent<F, Fut>(write: F) -> Vec<String>
+    where
+        F: Fn(Arc<FilesystemIdentityStore>, AgentIdentityRecord) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FilesystemIdentityStore::new(temp_dir.path())
+                .await
+                .unwrap(),
+        );
+        let mut lost = Vec::new();
+        for round in 0..200 {
+            let record = local_record(&format!("race-{round}"));
+            let hash = record.identity_hash.clone();
+            store
+                .create(record.clone())
+                .await
+                .unwrap();
+            let write = tokio::spawn(write(store.clone(), record));
+            let origin = tokio::spawn({
+                let store = store.clone();
+                let hash = hash.clone();
+                async move {
+                    store
+                        .set_origin(&hash, IdentityOrigin::Managed)
+                        .await
+                }
+            });
+            write.await.unwrap().unwrap();
+            origin.await.unwrap().unwrap();
+            let stored = store
+                .find_by_hash(&hash)
+                .await
+                .unwrap()
+                .unwrap();
+            if stored.origin != Some(IdentityOrigin::Managed) {
+                lost.push(hash);
+            }
+        }
+        lost
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_update_usage_never_drops_a_concurrent_origin() {
+        let lost = origins_lost_to_concurrent(|store, record| async move {
+            store
+                .update_usage(&record.identity_hash, Some("surface-a".into()))
+                .await
+        })
+        .await;
+        assert!(lost.is_empty(), "origin overwritten by a usage update: {lost:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_external_did_never_drops_a_concurrent_origin() {
+        let lost = origins_lost_to_concurrent(|store, record| async move {
+            store
+                .store_external_did(&record.did, std::collections::HashMap::new(), Some("surface-a".into()), true)
+                .await
+        })
+        .await;
+        assert!(lost.is_empty(), "origin overwritten by an external DID update: {lost:?}");
     }
 
     #[tokio::test]
