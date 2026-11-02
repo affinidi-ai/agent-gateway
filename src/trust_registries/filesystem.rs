@@ -87,28 +87,6 @@ impl TrustRegistryStore for FileSystemTrustRegistryStore {
         self.storage.delete(id).await
     }
 
-    async fn update_if_exists(
-        &self,
-        trust_registry: &TrustRegistry,
-    ) -> Result<bool> {
-        let _guard = self
-            .id_locks
-            .lock(&trust_registry.id)
-            .await;
-        if self
-            .storage
-            .get(&trust_registry.id)
-            .await?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        self.storage
-            .save(trust_registry)
-            .await?;
-        Ok(true)
-    }
-
     async fn modify(
         &self,
         id: &str,
@@ -191,24 +169,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_if_exists_writes_an_existing_record() {
+    async fn modify_writes_an_existing_record() {
         let dir = TempDir::new().unwrap();
         let store = FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
             .await
             .unwrap();
-        let mut tr = sample_registry();
+        let tr = sample_registry();
         store
             .create(&tr)
             .await
             .unwrap();
-        tr.name = "renamed".to_string();
 
-        assert!(
-            store
-                .update_if_exists(&tr)
-                .await
-                .unwrap()
-        );
+        let written = store
+            .modify(&tr.id, Box::new(|tr| tr.name = "renamed".to_string()))
+            .await
+            .unwrap()
+            .expect("the record exists");
+
+        assert_eq!(written.name, "renamed");
         assert_eq!(
             store
                 .get(&tr.id)
@@ -221,50 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_if_exists_after_a_delete_does_not_resurrect_the_record() {
-        let dir = TempDir::new().unwrap();
-        let store = FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
-            .await
-            .unwrap();
-        let tr = sample_registry();
-        store
-            .create(&tr)
-            .await
-            .unwrap();
-        store
-            .delete(&tr.id)
-            .await
-            .unwrap();
-
-        assert!(
-            !store
-                .update_if_exists(&tr)
-                .await
-                .unwrap(),
-            "nothing is written for a deleted record"
-        );
-        assert!(
-            store
-                .get(&tr.id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let reloaded = FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
-            .await
-            .unwrap();
-        assert!(
-            reloaded
-                .get(&tr.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "nothing was written to disk"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_conditional_updates_and_a_delete_leave_the_record_gone() {
+    async fn concurrent_modifies_and_a_delete_leave_the_record_gone() {
         let dir = TempDir::new().unwrap();
         let store = std::sync::Arc::new(
             FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
@@ -279,11 +214,11 @@ mod tests {
         let mut updaters = Vec::new();
         for _ in 0..8 {
             let store = store.clone();
-            let tr = tr.clone();
+            let id = tr.id.clone();
             updaters.push(tokio::spawn(async move {
                 for _ in 0..20 {
                     let _ = store
-                        .update_if_exists(&tr)
+                        .modify(&id, Box::new(|tr| tr.name = "renamed".to_string()))
                         .await;
                     tokio::task::yield_now().await;
                 }

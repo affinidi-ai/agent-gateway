@@ -18,7 +18,8 @@ changes:
         waits for the registry to approve it, and keeps any other status, so a registry is
         no longer shown as Connected before the registry approves it. A registry marked
         Failed before this change by a dropped connection stays Connecting after it is
-        reconnected until the registry approves it again.
+        reconnected, because reconnecting does not ask the registry to approve the gateway
+        again, so delete it and add it again.
     - timestamp: '2026-10-28T16:11:17Z'
       title: Refuse to create or reconnect trust registries on a Standby node
       description: >-
@@ -52,7 +53,9 @@ changes:
         answering a query that already timed out no longer marks a registry Failed.
         Failed registries are neither retried nor queried automatically, so a registry
         marked Failed before this change by a dropped connection fails its Trust Checks,
-        Trust Recorders and issuer registration until it is reconnected from the dashboard.
+        Trust Recorders and issuer registration until it is deleted and added again. A
+        build that cannot read the trust registry store or the registry's keys is retried
+        too.
     - timestamp: '2026-10-28T16:11:17Z'
       title: Keep a deleted trust registry deleted
       description: >-
@@ -62,7 +65,8 @@ changes:
         on it, waiting up to 90 seconds for a build still running, and every write except
         create skips a registry that no longer exists. An update of a registry deleted at
         the same time returns 404. A delete whose record cannot be removed returns 500 and
-        keeps the registry and its keys usable.
+        keeps the registry and its keys usable, and a delete finishes even when its request
+        is dropped while it waits.
   removed: []
   security: []
   breaking: []

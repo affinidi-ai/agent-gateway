@@ -234,6 +234,43 @@ async fn save_oob_connection<S: TrustRegistryStore + 'static>(
     save_announced(store, trust_registry_id, change, announcement, saved).await
 }
 
+/// The response to a create whose OOB invitation could not be accepted. The
+/// registry is marked Failed, unless the node went to Standby during the build,
+/// which leaves it to the Active node.
+async fn refuse_failed_setup<S: TrustRegistryStore + ?Sized>(
+    store: &S,
+    listener_mgr: &TrustRegistryListenerManager,
+    trust_registry_id: &str,
+    error: super::communication::TrustRegistryError,
+) -> (StatusCode, String) {
+    if !listener_mgr.is_active() {
+        tracing::warn!("Trust registry '{}' was not connected: the node went to Standby", trust_registry_id);
+        return standby_refusal();
+    }
+    tracing::error!("OOB connection failed for trust registry '{}': {}", trust_registry_id, error);
+    mark_setup_failed(store, trust_registry_id).await;
+    (StatusCode::BAD_GATEWAY, "OOB connection failed".to_string())
+}
+
+/// Mark a registry whose setup did not connect Failed, keeping any change made to
+/// its record meanwhile, and return the record as written.
+async fn mark_setup_failed<S: TrustRegistryStore + ?Sized>(
+    store: &S,
+    trust_registry_id: &str,
+) -> Option<TrustRegistry> {
+    let change: RegistryChange = Box::new(|trust_registry| {
+        trust_registry.connection_status = TrustRegistryConnectionStatus::Failed;
+        trust_registry.updated_at = chrono::Utc::now();
+    });
+    store
+        .modify(trust_registry_id, change)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Marking trust registry '{}' Failed did not save: {}", trust_registry_id, e);
+            None
+        })
+}
+
 /// The status a successful reconnect stores, when it changes one: rebuilding the
 /// transport says nothing about the registry's approval, so a Failed registry
 /// waits as Connecting for the registry to approve it.
@@ -302,14 +339,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
                 }
             }
             Err(OobSetupFailure::Connect(e)) => {
-                tracing::error!("OOB connection failed for trust registry '{}': {}", trust_registry.id, e);
-                // Update status to Failed
-                trust_registry.connection_status = TrustRegistryConnectionStatus::Failed;
-                trust_registry.updated_at = chrono::Utc::now();
-                let _ = store
-                    .update_if_exists(&trust_registry)
-                    .await;
-                return Err((StatusCode::BAD_GATEWAY, "OOB connection failed".to_string()));
+                return Err(refuse_failed_setup(store.as_ref(), &listener_mgr, &trust_registry.id, e).await);
             }
             Err(OobSetupFailure::Save(e)) => {
                 tracing::error!("Saving the OOB connection of trust registry '{}' failed: {}", trust_registry.id, e);
@@ -321,11 +351,9 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
             "Trust registry '{}' created without connection (listener manager not available)",
             trust_registry.name
         );
-        trust_registry.connection_status = TrustRegistryConnectionStatus::Failed;
-        trust_registry.updated_at = chrono::Utc::now();
-        let _ = store
-            .update_if_exists(&trust_registry)
-            .await;
+        if let Some(marked) = mark_setup_failed(store.as_ref(), &trust_registry.id).await {
+            trust_registry = marked;
+        }
     }
 
     // Trigger integration event
@@ -348,7 +376,7 @@ pub async fn update_trust_registry<S: TrustRegistryStore>(
     scope: Option<Extension<PatResourceScope>>,
     Json(req): Json<UpdateTrustRegistryRequest>,
 ) -> Result<Json<TrustRegistry>, (StatusCode, String)> {
-    let mut trust_registry = store
+    let trust_registry = store
         .get(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
@@ -364,28 +392,26 @@ pub async fn update_trust_registry<S: TrustRegistryStore>(
     let old_status = trust_registry.status.clone();
     let old_registry = build_trigger_registry(&trust_registry);
 
-    if let Some(name) = req.name {
-        trust_registry.name = name;
-    }
-    if let Some(description) = req.description {
-        trust_registry.description = description;
-    }
-    if let Some(status) = req.status {
-        trust_registry.status = status;
-    }
-    if let Some(main_did) = req.main_did {
-        trust_registry.main_did = Some(main_did);
-    }
-
-    trust_registry.updated_at = chrono::Utc::now();
-
-    let written = store
-        .update_if_exists(&trust_registry)
+    let change: RegistryChange = Box::new(move |trust_registry| {
+        if let Some(name) = req.name {
+            trust_registry.name = name;
+        }
+        if let Some(description) = req.description {
+            trust_registry.description = description;
+        }
+        if let Some(status) = req.status {
+            trust_registry.status = status;
+        }
+        if let Some(main_did) = req.main_did {
+            trust_registry.main_did = Some(main_did);
+        }
+        trust_registry.updated_at = chrono::Utc::now();
+    });
+    let trust_registry = store
+        .modify(&id, change)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?;
-    if !written {
-        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
 
     // Trigger integration events
     let new_registry = build_trigger_registry(&trust_registry);
@@ -402,7 +428,7 @@ pub async fn update_trust_registry<S: TrustRegistryStore>(
 }
 
 /// Delete a trust registry
-pub async fn delete_trust_registry<S: TrustRegistryStore>(
+pub async fn delete_trust_registry<S: TrustRegistryStore + 'static>(
     Extension(store): Extension<std::sync::Arc<S>>,
     listener_manager: Option<Extension<Arc<TrustRegistryListenerManager>>>,
     worker: Option<Extension<Arc<super::TrustRegistryWorker>>>,
@@ -430,45 +456,53 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         w.stop_listener(&id).await;
     }
 
-    // Stop owning the registry: no build for it can install a client from here on
-    if let Some(Extension(listener_mgr)) = &listener_manager {
-        listener_mgr
-            .delete_registry(&id)
-            .await;
-    }
-
-    // A record that survives keeps its keys and can be built again
-    if let Err(e) = store.delete(&id).await {
-        if let Some(Extension(listener_mgr)) = &listener_manager {
-            listener_mgr
-                .restore_registry(&id)
-                .await;
-        }
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)));
-    }
-
-    // Clean up per-registry DID keys from disk
+    let listener_mgr = listener_manager.map(|Extension(listener_mgr)| listener_mgr);
     let keys_path = std::path::PathBuf::from(
         &config
             .storage_paths
             .trust_registries,
     )
     .join(&id);
-    if keys_path.exists()
-        && let Err(e) = tokio::fs::remove_dir_all(&keys_path).await
-    {
-        tracing::warn!("Failed to clean up trust registry keys at {:?}: {}", keys_path, e);
-    }
+    // Runs on its own task, so a dropped request cannot leave the registry
+    // refused as deleted while its record is still stored.
+    tokio::spawn(async move {
+        // Stop owning the registry: no build for it can install a client from here on
+        if let Some(listener_mgr) = &listener_mgr {
+            listener_mgr
+                .delete_registry(&id)
+                .await;
+        }
 
-    if let Some(Extension(listener_mgr)) = &listener_manager {
-        listener_mgr.announce_deleted(&trust_registry);
-    }
+        // A record that survives keeps its keys and can be built again
+        if let Err(e) = store.delete(&id).await {
+            if let Some(listener_mgr) = &listener_mgr {
+                listener_mgr
+                    .restore_registry(&id)
+                    .await;
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)));
+        }
 
-    // Trigger integration event
-    let trigger_registry = build_trigger_registry(&trust_registry);
-    if let Some(store) = notification_store {
-        crate::integrations::trigger_trust_registry_deleted(&store, &trigger_registry).await;
-    }
+        // Clean up per-registry DID keys from disk
+        if keys_path.exists()
+            && let Err(e) = tokio::fs::remove_dir_all(&keys_path).await
+        {
+            tracing::warn!("Failed to clean up trust registry keys at {:?}: {}", keys_path, e);
+        }
+
+        if let Some(listener_mgr) = &listener_mgr {
+            listener_mgr.announce_deleted(&trust_registry);
+        }
+
+        // Trigger integration event
+        let trigger_registry = build_trigger_registry(&trust_registry);
+        if let Some(store) = notification_store {
+            crate::integrations::trigger_trust_registry_deleted(&store, &trigger_registry).await;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the delete task failed: {e}")))??;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1189,8 +1223,7 @@ mod tests {
         let (store, mut registry, dir) = stored_registry(None).await;
         registry.connection_status = TrustRegistryConnectionStatus::Failed;
         assert!(
-            store
-                .update_if_exists(&registry)
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
                 .await
                 .unwrap()
         );
@@ -1229,8 +1262,7 @@ mod tests {
         registry.mediator_did = Some("did:example:mediator".into());
         registry.connection_status = TrustRegistryConnectionStatus::Connected;
         assert!(
-            store
-                .update_if_exists(&registry)
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
                 .await
                 .unwrap()
         );
@@ -1324,8 +1356,7 @@ mod tests {
         let (store, mut registry, dir) = stored_registry(None).await;
         registry.connection_status = TrustRegistryConnectionStatus::Failed;
         assert!(
-            store
-                .update_if_exists(&registry)
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
                 .await
                 .unwrap()
         );
@@ -1380,14 +1411,6 @@ mod tests {
             Err(anyhow::anyhow!("the disk is read-only"))
         }
 
-        async fn update_if_exists(
-            &self,
-            trust_registry: &TrustRegistry,
-        ) -> anyhow::Result<bool> {
-            self.0
-                .update_if_exists(trust_registry)
-                .await
-        }
         async fn modify(
             &self,
             id: &str,
@@ -1500,8 +1523,7 @@ mod tests {
             .unwrap();
         renamed.name = "Renamed during the build".into();
         assert!(
-            store
-                .update_if_exists(&renamed)
+            crate::trust_registries::store::overwrite(store.as_ref(), &renamed)
                 .await
                 .unwrap()
         );
@@ -1590,5 +1612,114 @@ mod tests {
             .unwrap();
         assert_eq!(stored.connection_status, TrustRegistryConnectionStatus::Failed);
         assert_eq!(stored.our_did, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_setup_marks_the_registry_failed_and_keeps_edits_made_during_the_build() {
+        let (store, mut registry, dir) = stored_registry(None).await;
+        registry.name = "Renamed during the build".into();
+        assert!(
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
+                .await
+                .unwrap()
+        );
+        let manager = TrustRegistryListenerManager::with_retry_policy(
+            "example.com".into(),
+            dir.path().join("keys"),
+            None,
+            crate::comm::connection_health::ReconnectPolicy::default(),
+        );
+
+        let (status, message) = refuse_failed_setup(
+            store.as_ref(),
+            &manager,
+            &registry.id,
+            super::super::communication::TrustRegistryError::ConnectionError("mediator unreachable".into()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "OOB connection failed");
+        let stored = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.connection_status, TrustRegistryConnectionStatus::Failed);
+        assert_eq!(stored.name, "Renamed during the build");
+    }
+
+    #[tokio::test]
+    async fn a_setup_refused_because_the_node_went_to_standby_returns_503_and_writes_nothing() {
+        let (store, registry, dir) = stored_registry(None).await;
+
+        let (status, _) = refuse_failed_setup(
+            store.as_ref(),
+            &standby_manager(&dir),
+            &registry.id,
+            super::super::communication::TrustRegistryError::NoConnection("standby".into()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .connection_status,
+            registry.connection_status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_dropped_while_it_waits_for_a_build_still_deletes_the_registry() {
+        let (store, registry, manager, dir) = never_connected_registry().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        crate::trust_registries::test_builds::install(
+            &registry.id,
+            vec![crate::trust_registries::test_builds::Outcome::Hold(gate.clone())],
+        );
+        let reconnect = tokio::spawn(reconnect_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(manager.clone())),
+            Path(registry.id.clone()),
+            None,
+            None,
+        ));
+        while crate::trust_registries::test_builds::calls(&registry.id) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let delete = tokio::spawn(delete_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(manager)),
+            None,
+            Extension(None),
+            Extension(bootstrap(&dir)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        delete.abort();
+        gate.notify_one();
+        let _ = reconnect.await;
+
+        let mut deleted = false;
+        for _ in 0..200 {
+            if store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(deleted, "the delete completes although the request was dropped");
     }
 }

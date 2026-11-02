@@ -625,6 +625,9 @@ pub struct TrustRegistryListenerManager {
     /// Background retries keyed by trust registry ID.
     retries: Mutex<HashMap<String, Retry>>,
     retry_policy: ReconnectPolicy,
+    /// The timed-out query threads of each registry, shared by every connection
+    /// built for it.
+    timed_out_queries: std::sync::Mutex<HashMap<BuildKey, TimedOutQueries>>,
     self_ref: Weak<Self>,
 }
 
@@ -655,6 +658,7 @@ impl TrustRegistryListenerManager {
             ownership: Mutex::new(Ownership::default()),
             retries: Mutex::new(HashMap::new()),
             retry_policy,
+            timed_out_queries: std::sync::Mutex::new(HashMap::new()),
             self_ref: self_ref.clone(),
         })
     }
@@ -1272,7 +1276,7 @@ impl TrustRegistryListenerManager {
         let (secrets, did_doc_to_cache) = self
             .load_stored_secrets(&registry.id, our_did, mediator_did)
             .await
-            .map_err(BuildFailure::fatal)?;
+            .map_err(BuildFailure::retry)?;
 
         self.remove_connection(&registry.id)
             .await;
@@ -1448,6 +1452,10 @@ impl TrustRegistryListenerManager {
             .await;
         self.remove_connection(trust_registry_id)
             .await;
+        self.timed_out_queries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&BuildKey::Stored(trust_registry_id.to_string()));
         if let Some(running) = running {
             let _ = Self::await_build(Pending::Building(running), Some(Instant::now() + BUILD_TIMEOUT)).await;
         }
@@ -1475,7 +1483,7 @@ impl TrustRegistryListenerManager {
     /// while the node is Standby or the registry is deleted.
     async fn install_connection(
         &self,
-        connection: TrustRegistryConnection,
+        mut connection: TrustRegistryConnection,
     ) -> Result<TrustRegistryConnection, TrustRegistryError> {
         let ownership = self.ownership.lock().await;
         if connection.is_temporary
@@ -1507,6 +1515,7 @@ impl TrustRegistryListenerManager {
             connection.close().await;
             return Err(refusal);
         }
+        connection.timed_out_queries = self.timed_out_queries_for(&connection);
 
         let displaced = {
             let mut connections = self.connections.write().await;
@@ -1541,6 +1550,33 @@ impl TrustRegistryListenerManager {
             debug!("Closed replaced connection for trust registry '{}'", replaced.trust_registry_id);
         }
         Ok(connection)
+    }
+
+    /// The timed-out query threads of the registry `connection` serves, so a late
+    /// reply to a query that a replaced connection sent is still recognised.
+    fn timed_out_queries_for(
+        &self,
+        connection: &TrustRegistryConnection,
+    ) -> TimedOutQueries {
+        let key = if connection.is_temporary {
+            BuildKey::Temporary(
+                connection
+                    .registry_did
+                    .clone(),
+            )
+        } else {
+            BuildKey::Stored(
+                connection
+                    .trust_registry_id
+                    .clone(),
+            )
+        };
+        self.timed_out_queries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .clone()
     }
 
     /// Look up a stored trust registry by DID (checks main_did, registry_did, did).
@@ -1628,6 +1664,27 @@ impl TrustRegistryListenerManager {
                 ))
             })?
             .ok_or_else(|| TrustRegistryError::NotFound(format!("trust registry '{}' not found", trust_registry_id)))
+    }
+
+    /// Whether the stored record of `trust_registry_id` is Failed, so its live
+    /// connection must not be queried. Without a store, or without a record, it is not.
+    async fn is_marked_failed(
+        &self,
+        trust_registry_id: &str,
+    ) -> Result<bool, TrustRegistryError> {
+        let Some(store) = self.store().await else {
+            return Ok(false);
+        };
+        let registry = store
+            .get(trust_registry_id)
+            .await
+            .map_err(|e| {
+                TrustRegistryError::ConnectionError(format!(
+                    "failed to read trust registry '{}': {}",
+                    trust_registry_id, e
+                ))
+            })?;
+        Ok(registry.is_some_and(|registry| registry.connection_status == TrustRegistryConnectionStatus::Failed))
     }
 
     /// Get active connection count
@@ -2119,12 +2176,12 @@ impl TrustRegistryListenerManager {
         let registry = self
             .stored_registry(trust_registry_id)
             .await
-            .map_err(BuildFailure::fatal)?;
+            .map_err(|e| match e {
+                TrustRegistryError::ConnectionError(_) => BuildFailure::retry(e),
+                e => BuildFailure::fatal(e),
+            })?;
         if registry.connection_status == TrustRegistryConnectionStatus::Failed && !allow_failed {
-            return Err(BuildFailure::fatal(TrustRegistryError::NoConnection(format!(
-                "trust registry '{}' is marked Failed; reconnect it to retry",
-                trust_registry_id
-            ))));
+            return Err(BuildFailure::fatal(marked_failed(trust_registry_id)));
         }
         Ok(registry)
     }
@@ -2209,24 +2266,28 @@ impl TrustRegistryListenerManager {
         trust_registry_did: &str,
         deadline: Instant,
     ) -> BuildOutcome {
-        if let Some(connection) = self
+        let live = self
             .connections
             .read()
             .await
             .values()
             .find(|c| !c.is_temporary && c.serves(trust_registry_did))
-        {
-            return Ok(connection.clone());
+            .cloned();
+        if let Some(connection) = live {
+            if self
+                .is_marked_failed(&connection.trust_registry_id)
+                .await?
+            {
+                return Err(marked_failed(&connection.trust_registry_id));
+            }
+            return Ok(connection);
         }
         let pending = match self
             .find_stored_trust_registry(trust_registry_did)
             .await?
         {
             Some(registry) if registry.connection_status == TrustRegistryConnectionStatus::Failed => {
-                return Err(TrustRegistryError::NoConnection(format!(
-                    "trust registry '{}' is marked Failed; reconnect it to retry",
-                    registry.id
-                )));
+                return Err(marked_failed(&registry.id));
             }
             Some(registry) => {
                 self.request_build(BuildKey::Stored(registry.id), BuildPlan::Stored { allow_failed: false }, None)
@@ -2504,6 +2565,14 @@ impl TrustRegistryListenerManager {
 // =============================================================================
 // OOB Invitation Parsing
 // =============================================================================
+
+/// The refusal to query or rebuild a registry marked Failed.
+fn marked_failed(trust_registry_id: &str) -> TrustRegistryError {
+    TrustRegistryError::NoConnection(format!(
+        "trust registry '{}' is marked Failed; reconnect it to retry",
+        trust_registry_id
+    ))
+}
 
 /// Dev/test escape hatch: when `AG_ALLOW_LOCAL_OOB` is set to `1`/`true`/`yes`
 /// (case-insensitive), OOB-invitation URLs bypass the SSRF check so BDD and
@@ -3528,12 +3597,6 @@ mod tests {
             Err(anyhow::anyhow!("the disk is unreadable"))
         }
 
-        async fn update_if_exists(
-            &self,
-            _trust_registry: &super::super::types::TrustRegistry,
-        ) -> anyhow::Result<bool> {
-            Err(anyhow::anyhow!("the disk is unreadable"))
-        }
         async fn modify(
             &self,
             _id: &str,
@@ -3679,6 +3742,33 @@ mod tests {
         assert!(matches!(result, Err(TrustRegistryError::NoConnection(_))), "got {:?}", result.err());
         assert_eq!(super::super::test_builds::calls(&registry.id), 0);
         assert_eq!(super::super::test_builds::calls(&did), 0);
+    }
+
+    #[tokio::test]
+    async fn a_registry_marked_failed_is_not_queried_over_its_live_connection() {
+        let (mgr, store, _dir) = owned_manager(60).await;
+        let mut registry = stored_with_identity(&store, TrustRegistryConnectionStatus::Connected).await;
+        let did = registry_did_of(&registry);
+        mgr.install_connection(connection_to(&registry.id, &did).await)
+            .await
+            .expect("installed");
+        assert!(
+            mgr.connection_for_did(&did, soon())
+                .await
+                .is_ok()
+        );
+
+        registry.connection_status = TrustRegistryConnectionStatus::Failed;
+        assert!(
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
+                .await
+                .unwrap()
+        );
+        let result = mgr
+            .connection_for_did(&did, soon())
+            .await;
+
+        assert!(matches!(result, Err(TrustRegistryError::NoConnection(_))), "got {:?}", result.err());
     }
 
     #[tokio::test]
@@ -4113,8 +4203,7 @@ mod tests {
 
         registry.connection_status = TrustRegistryConnectionStatus::Failed;
         assert!(
-            store
-                .update_if_exists(&registry)
+            crate::trust_registries::store::overwrite(store.as_ref(), &registry)
                 .await
                 .expect("update")
         );
@@ -4177,6 +4266,28 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_build_that_cannot_read_the_store_is_retried() {
+        let mgr = test_manager();
+        mgr.set_store(Arc::new(UnreadableStore))
+            .await;
+
+        let result = mgr
+            .reconnect("tr-unreadable")
+            .await;
+
+        assert!(matches!(result, Err(TrustRegistryError::ConnectionError(_))), "got {:?}", result.err());
+        assert!(
+            mgr.retries
+                .lock()
+                .await
+                .contains_key("tr-unreadable"),
+            "a transient store error keeps the retries going"
+        );
+        mgr.delete_registry("tr-unreadable")
+            .await;
     }
 
     #[tokio::test]
@@ -4350,6 +4461,33 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the waiter was never removed");
+    }
+
+    #[tokio::test]
+    async fn a_query_that_timed_out_on_a_replaced_connection_is_recognised_on_its_replacement() {
+        let mgr = test_manager();
+        let id = format!("tr-{}", uuid::Uuid::new_v4());
+        let first = mgr
+            .install_connection(test_connection(&id).await)
+            .await
+            .expect("installed");
+        first
+            .timed_out_queries
+            .record("thid-old");
+
+        let replacement = mgr
+            .install_connection(test_connection(&id).await)
+            .await
+            .expect("installed");
+
+        assert!(
+            replacement
+                .timed_out_queries
+                .contains("thid-old")
+        );
+        mgr.delete_registry(&id).await;
+        let recreated = mgr.timed_out_queries_for(&test_connection(&id).await);
+        assert!(!recreated.contains("thid-old"), "a deleted registry's threads are forgotten");
     }
 
     #[tokio::test]

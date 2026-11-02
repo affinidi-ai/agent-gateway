@@ -39,15 +39,6 @@ pub trait TrustRegistryStore: Send + Sync {
         id: &str,
     ) -> Result<()>;
 
-    /// Update a trust registry only when its record still exists, returning
-    /// whether it was written. A record deleted in the meantime is not recreated,
-    /// so implementations must make the existence check and the write atomic
-    /// with respect to `delete` for the same id.
-    async fn update_if_exists(
-        &self,
-        trust_registry: &TrustRegistry,
-    ) -> Result<bool>;
-
     /// Apply `change` to the current record of `id` and write it, returning the
     /// written record, or `None` when the record does not exist. Implementations
     /// must make the read, the change and the write atomic with respect to every
@@ -58,4 +49,17 @@ pub trait TrustRegistryStore: Send + Sync {
         id: &str,
         change: RegistryChange,
     ) -> Result<Option<TrustRegistry>>;
+}
+
+/// Write `trust_registry` over its current record, only while that record exists.
+#[cfg(test)]
+pub(crate) async fn overwrite(
+    store: &dyn TrustRegistryStore,
+    trust_registry: &TrustRegistry,
+) -> Result<bool> {
+    let replacement = trust_registry.clone();
+    Ok(store
+        .modify(&trust_registry.id, Box::new(move |current| *current = replacement))
+        .await?
+        .is_some())
 }
