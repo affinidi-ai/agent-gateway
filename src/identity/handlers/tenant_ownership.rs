@@ -989,6 +989,9 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            // Held until the provider is saved, so no surface write binds it
+            // after the check below found it unbound.
+            let _bindings = super::surface_grants::hold_provider_bindings_exclusively().await;
             if resource.tenant_id != tenant_id {
                 let surfaces = state
                     .agent_surface_store
@@ -998,6 +1001,7 @@ async fn persist_tenant_id(
                     .await
                     .map_err(internal)?;
                 refuse_moving_a_bound_provider(&surfaces, &resource.id)?;
+                refuse_a_taken_slug(store.as_ref(), tenant_id.as_deref(), &resource).await?;
             }
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
@@ -1185,6 +1189,27 @@ fn refuse_moving_a_bound_provider(
     Ok(())
 }
 
+/// A provider's slug is unique within its tenant, so a provider cannot move
+/// into a tenant that already has another provider with its slug: both would
+/// answer the same callback path.
+async fn refuse_a_taken_slug(
+    store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+    tenant_id: Option<&str>,
+    provider: &crate::credential_providers::CredentialProvider,
+) -> Result<(), OwnershipApiError> {
+    match store
+        .find_by_provider_id(tenant_id, &provider.provider_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(other) if other.id != provider.id => Err(OwnershipApiError::Refused(format!(
+            "The tenant already has a credential provider with provider_id '{}', so this one cannot move to it",
+            provider.provider_id
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn refuse_provided_mediator(mediator: &crate::mediators::types::Mediator) -> Result<(), OwnershipApiError> {
     if mediator.provided {
         return Err(OwnershipApiError::Refused(
@@ -1297,6 +1322,58 @@ mod tests {
         }
         assert!(refuse_moving_a_bound_provider(&[surface("tenant-a", other)], "provider").is_ok());
         assert!(refuse_moving_a_bound_provider(&[], "provider").is_ok());
+    }
+
+    /// Slugs are unique per tenant, so a provider moves only into a tenant
+    /// with no other provider of its slug.
+    #[tokio::test]
+    async fn a_provider_cannot_move_into_a_tenant_that_has_its_slug() {
+        use crate::credential_providers::storage::CredentialProviderStorage;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let provider = |id: &str, tenant: &str| -> crate::credential_providers::CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "tenant_id": tenant, "name": "GitHub", "provider_id": "github",
+                "provider_type": "oauth2_client_credentials", "token_endpoint": "https://github.example/token",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let moving = provider("moving", "tenant-a");
+        for stored in [moving.clone(), provider("taken", "tenant-b")] {
+            store
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let refused = refuse_a_taken_slug(&store, Some("tenant-b"), &moving)
+            .await
+            .unwrap_err();
+        assert!(matches!(&refused, OwnershipApiError::Refused(message) if message.contains("github")));
+        assert_eq!(
+            refused
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(
+            refuse_a_taken_slug(&store, Some("tenant-c"), &moving)
+                .await
+                .is_ok(),
+            "a tenant without the slug takes it"
+        );
+        assert!(
+            refuse_a_taken_slug(&store, Some("tenant-a"), &moving)
+                .await
+                .is_ok(),
+            "the provider's own slug does not count against it"
+        );
     }
 
     #[test]

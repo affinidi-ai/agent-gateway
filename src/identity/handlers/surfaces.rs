@@ -5347,6 +5347,7 @@ mod validation_tests {
                 &no_vault,
                 Some(&existing),
                 Some(&surface),
+                None,
                 None
             )
             .await

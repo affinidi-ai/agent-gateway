@@ -198,10 +198,12 @@ fn record_revocation(
     });
 }
 
-/// Revoke at its authorization server, then delete, each of `grants`, at most
-/// [`REVOCATION_CONCURRENCY`] at a time. Each grant's provider is looked up in
-/// `providers` by its record id; a grant whose provider is not there is deleted
-/// without revocation. A grant is deleted whatever its revocation came to.
+/// Delete each of `grants`, then revoke at its authorization server what was
+/// deleted, at most [`REVOCATION_CONCURRENCY`] at a time, through
+/// [`delete_then_revoke`], waiting for the revocations. Each grant's provider
+/// is looked up in `providers` by its record id; a grant whose provider is not
+/// there is deleted without revocation. Dropping the caller stops neither the
+/// deletions nor the revocations, so no grant is left revoked but stored.
 /// Every grant is tried; the call fails if any could not be deleted.
 pub async fn remove_grants(
     vault: &Arc<dyn DelegationVaultStorage>,
@@ -211,33 +213,19 @@ pub async fn remove_grants(
     exact_allowlist: Option<&str>,
     actor: Option<&AuditCallerContext>,
 ) -> anyhow::Result<()> {
-    let failures = futures::stream::iter(grants)
-        .map(|grant| async move {
-            match providers.get(&grant.credential_provider_id) {
-                Some(provider) => {
-                    revoke_grant(provider, &grant, Some(secrets), exact_allowlist, actor).await;
-                }
-                None => record_revocation(
-                    &grant.credential_provider_id,
-                    None,
-                    &grant,
-                    GrantRevocation::skipped(SKIPPED_PROVIDER_MISSING),
-                    actor,
-                ),
-            }
-            vault
-                .delete_grant(&grant.id)
-                .await
-                .err()
-        })
-        .buffer_unordered(REVOCATION_CONCURRENCY)
-        .filter_map(std::future::ready)
-        .collect::<Vec<_>>()
-        .await;
-    match failures.into_iter().next() {
-        Some(error) => Err(error.context("Failed to delete a delegated grant")),
-        None => Ok(()),
-    }
+    let revoker = Revoker {
+        providers: providers.clone(),
+        secrets: Some(Arc::clone(secrets)),
+        exact_allowlist: exact_allowlist.map(str::to_string),
+        actor: actor.cloned(),
+    };
+    let ids = grants
+        .into_iter()
+        .map(|grant| grant.id)
+        .collect();
+    let revocations = delete_then_revoke(vault, ids, revoker, (), None).await?;
+    let _ = revocations.await;
+    Ok(())
 }
 
 /// What revoking removed grants on a task of their own needs: each grant's
@@ -261,17 +249,22 @@ pub struct Revoker {
 ///
 /// The deletions and the revocations run on one task of their own. The caller
 /// waits only until every deletion has ended, never on a vendor, and dropping
-/// the caller, as a request whose client disconnects is dropped, stops neither:
-/// every grant deleted is still revoked and audited. `hold` is dropped once
-/// every deletion has ended, so a lock it carries covers the deletions even
-/// when the caller is gone. Every grant is tried; the call fails if any could
-/// not be deleted, and the ones that were are revoked all the same. The
-/// returned task ends when every revocation has.
+/// the caller, as a request whose client disconnects is dropped, stops
+/// nothing. With `saved`, the outcome of the change that removes the grants,
+/// the task then waits for it: the grants are revoked once the change was
+/// saved, and put back, unrevoked, when it was not or its caller was dropped
+/// first, so a change that fails never costs a grant. Without it they are
+/// revoked at once. `hold` is dropped once every deletion has ended, or with
+/// `saved` once every grant is put back, so a lock it carries covers them
+/// even when the caller is gone. Every grant is tried; the call fails if any
+/// could not be deleted, and the change is then refused, which puts back the
+/// ones that were. The returned task ends when every revocation has.
 pub async fn delete_then_revoke<Hold: Send + 'static>(
     vault: &Arc<dyn DelegationVaultStorage>,
     grant_ids: Vec<String>,
     revoker: Revoker,
     hold: Hold,
+    saved: Option<tokio::sync::oneshot::Receiver<bool>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let vault = Arc::clone(vault);
     let (report, deletions) = tokio::sync::oneshot::channel();
@@ -287,15 +280,46 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
                 }
             }
         }
-        drop(hold);
-        // The caller may be gone; the revocations go ahead all the same.
+        let refused = failure.is_some();
+        // The caller may be gone; what follows goes ahead all the same.
         let _ = report.send(failure);
+        let revoke = match saved {
+            Some(_) if refused => false,
+            Some(saved) => saved.await.unwrap_or(false),
+            None => true,
+        };
+        if !revoke {
+            put_back(&vault, deleted).await;
+            drop(hold);
+            return;
+        }
+        drop(hold);
         revoke_removed(deleted, revoker).await;
     });
     match deletions.await {
         Ok(None) => Ok(task),
         Ok(Some(error)) => Err(error.context("Failed to delete a delegated grant")),
         Err(_) => Err(anyhow::anyhow!("The task deleting delegated grants ended before it reported")),
+    }
+}
+
+/// Store again grants deleted for a change that was not saved. One that cannot
+/// be stored is lost, unrevoked, and logged.
+async fn put_back(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    grants: Vec<DelegatedGrant>,
+) {
+    for grant in grants {
+        let id = grant.id.clone();
+        if let Err(error) = vault.store_grant(grant).await {
+            tracing::error!(
+                target: "credential_delegation",
+                grant_id = %id,
+                error = ?format!("{error:#}"),
+                "A delegated grant deleted for a surface change that was not saved could not be put back; its \
+                 person must connect again, and it stays valid at the vendor until it expires"
+            );
+        }
     }
 }
 
@@ -1239,7 +1263,7 @@ pub(crate) mod tests {
             .map(|grant| grant.id)
             .collect();
         let started = std::time::Instant::now();
-        let revocations = delete_then_revoke(&vault, ids, revoker, ())
+        let revocations = delete_then_revoke(&vault, ids, revoker, (), None)
             .await
             .unwrap();
         assert!(started.elapsed() < delay / 2, "the removal waited on the vendor: {:?}", started.elapsed());
@@ -1285,7 +1309,7 @@ pub(crate) mod tests {
             .into_iter()
             .map(|grant| grant.id)
             .collect();
-        let revocations = delete_then_revoke(&vault, ids, revoker, ())
+        let revocations = delete_then_revoke(&vault, ids, revoker, (), None)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), revocations)

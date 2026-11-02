@@ -252,9 +252,12 @@ pub(crate) fn transit_point_lists(
     lists
 }
 
-/// Every credential provider the surface binds, in its base or any variant,
-/// read from the stored lists without resolving the variants, so a surface
-/// whose variants cannot be resolved still names the providers it binds.
+/// Every credential provider the surface binds or authenticates its targets
+/// with, in its base or any variant: its credential bindings, and the
+/// `credential_provider` target authentication of its Target and Transit
+/// Points. Read from the stored lists without resolving the variants, so a
+/// surface whose variants cannot be resolved still names the providers it
+/// uses.
 pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&str> {
     let outbound = surface
         .outbound_credentials
@@ -276,9 +279,12 @@ pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&
                 .credential_provider_id
                 .as_str()
         });
-    let transit = transit_point_lists(surface)
+    let points: Vec<&crate::config::agent_surface::TransitPoint> = transit_point_lists(surface)
         .into_iter()
         .flat_map(|(_, points)| points.iter())
+        .collect();
+    let transit = points
+        .iter()
         .filter_map(|point| {
             point
                 .transit_credentials
@@ -289,8 +295,34 @@ pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&
                 .credential_provider_id
                 .as_str()
         });
+    let target_auth = surface
+        .target
+        .auth
+        .iter()
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter_map(|variant| {
+                    variant
+                        .overrides
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.auth.as_ref())
+                }),
+        )
+        .chain(
+            points
+                .iter()
+                .filter_map(|point| point.target_auth.as_ref()),
+        )
+        .filter_map(|authentication| match &authentication.method {
+            TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
+            _ => None,
+        });
     outbound
         .chain(transit)
+        .chain(target_auth)
         .collect()
 }
 

@@ -3,10 +3,11 @@
 //! A surface change that removes a `consent_mode: external` binding (a surface
 //! deleted, a Transit Point removed, its binding removed, its `subject` or
 //! provider changed, the surface moved to another tenant, or the only variant
-//! that holds it disabled) deletes that binding's grants before the change is
-//! saved, then revokes at the vendor what it deleted. Both run on one task of
-//! their own, so a write dropped part way, as when its client disconnects,
-//! still deletes, revokes and audits every one of them. A change that
+//! that holds it disabled) deletes that binding's grants while the change is
+//! saved, then, once it is saved, revokes at the vendor what it deleted; a
+//! change that is not saved puts them back. Both run on one task of their
+//! own, so a write dropped part way, as when its client disconnects, still
+//! settles, and audits, every one of them. A change that
 //! adds a binding deletes any grant already stored under it, left from an
 //! earlier binding of the same surface, Transit Point id and provider, so
 //! re-adding a binding never re-arms an old grant: it needs a new consent.
@@ -21,9 +22,8 @@
 //! Every surface write takes the surface's lock, reads the stored surface
 //! under it, and removes the grants of what the write changes from that
 //! stored surface, so a write built from a stale read still removes the
-//! grants of a binding it drops. A grant is stored only under the same lock,
-//! after checking that its binding is saved, so no grant is stored for a
-//! binding a concurrent write is removing.
+//! grants of a binding it drops. The grants are revoked only once the write
+//! is saved: a write that fails, or is dropped, puts them back.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Weak};
@@ -34,9 +34,7 @@ use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::{AgentSurface, GrantSubject, TransitPoint};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::AuditCallerContext;
-use crate::delegation_vault::grants::{
-    DelegatedGrant, GrantBinding, OWNER_PRINCIPAL, PepperMismatch, Principals, StoredGrant, UnreadableGrant,
-};
+use crate::delegation_vault::grants::{DelegatedGrant, GrantBinding, PepperMismatch, Principals, UnreadableGrant};
 use crate::delegation_vault::storage::DelegationVaultStorage;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
@@ -84,19 +82,6 @@ struct ExternalBinding {
 }
 
 impl ExternalBinding {
-    fn holds(
-        &self,
-        grant: &DelegatedGrant,
-    ) -> bool {
-        grant.tenant_id == self.tenant_id
-            && grant.surface_id == self.surface_id
-            && grant.hop == self.hop
-            && grant.credential_provider_id == self.credential_provider_id
-            && self
-                .subject
-                .is_none_or(|owner| (grant.principal == OWNER_PRINCIPAL) == owner)
-    }
-
     fn grant_binding(&self) -> GrantBinding {
         GrantBinding::new(self.tenant_id.as_deref(), &self.surface_id, &self.hop, &self.credential_provider_id)
     }
@@ -204,18 +189,23 @@ pub(crate) type SharedSurfaceLock = Arc<tokio::sync::OwnedMutexGuard<()>>;
 /// Remove the grants of every external consent binding that only one of
 /// `before` and `after` has, before the change from one to the other is saved:
 /// `before` is `None` for a surface being created, `after` for one being
-/// deleted. Only those bindings' grants are read. The grants are deleted, and
-/// then revoked at their authorization servers, on one task of their own: this
-/// returns once every deletion has ended, and the task returned, which the
-/// caller need not wait for, ends with the revocations. Dropping the caller
-/// part way stops neither. `surface_lock` is held until every deletion has
-/// ended, even when the caller is dropped first. Fails, so the change is
-/// refused, when a grant of those bindings cannot be read or deleted.
+/// deleted. Only those bindings' grants are read. The grants are deleted on
+/// one task of their own, which this returns once every deletion has ended;
+/// the task then waits for `saved`, the outcome of the save, and revokes them
+/// at their authorization servers once the save succeeded, or puts them back,
+/// unrevoked, when it failed or its caller was dropped first. With no `saved`
+/// they are revoked at once. The task returned, which the caller need not
+/// wait for, ends with the revocations. Dropping the caller part way stops
+/// none of this. `surface_lock` is held until the grants are deleted and,
+/// with `saved`, until the outcome is known and they are put back, even when
+/// the caller is dropped first. Fails, so the change is refused, when a grant
+/// of those bindings cannot be read or deleted.
 pub(crate) async fn remove_changed_binding_grants(
     removal: &GrantRemoval<'_>,
     before: Option<&AgentSurface>,
     after: Option<&AgentSurface>,
     surface_lock: Option<SharedSurfaceLock>,
+    saved: Option<tokio::sync::oneshot::Receiver<bool>>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, SurfaceApiError> {
     let before = before
         .map(external_bindings)
@@ -278,6 +268,7 @@ pub(crate) async fn remove_changed_binding_grants(
         affected.into_keys().collect(),
         revoker,
         surface_lock,
+        saved,
     )
     .await
     .map(Some)
@@ -285,6 +276,56 @@ pub(crate) async fn remove_changed_binding_grants(
         warn!(target: "credential_delegation", error = %error, "Failed to delete a grant for a surface change");
         unavailable()
     })
+}
+
+/// Serialises the writes that bind credential providers with the deletes and
+/// tenant moves of providers: a surface write holds it shared, a provider
+/// delete or move exclusively, for the whole of its check and change, so no
+/// write binds a provider that a delete has checked is unbound.
+static PROVIDER_BINDINGS: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(Default::default);
+
+/// Hold [`PROVIDER_BINDINGS`] shared, as a surface write does.
+pub(crate) async fn hold_provider_bindings() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    PROVIDER_BINDINGS.read().await
+}
+
+/// Hold [`PROVIDER_BINDINGS`] exclusively, as a provider delete or tenant
+/// move does.
+pub(crate) async fn hold_provider_bindings_exclusively() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    PROVIDER_BINDINGS
+        .write()
+        .await
+}
+
+/// Refuse `after` when it binds a credential provider that no longer exists,
+/// one the surface stored now, `current`, does not bind already: its
+/// references were checked before the write took the provider lock, so a
+/// provider deleted in between is caught here.
+async fn refuse_deleted_providers(
+    removal: &GrantRemoval<'_>,
+    current: Option<&AgentSurface>,
+    after: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    let Some(store) = removal.providers else {
+        return Ok(());
+    };
+    let kept = current
+        .map(super::surface_tenancy::bound_credential_provider_ids)
+        .unwrap_or_default();
+    for id in super::surface_tenancy::bound_credential_provider_ids(after) {
+        if kept.contains(id) {
+            continue;
+        }
+        if store
+            .get(id)
+            .await
+            .map_err(|_| unavailable())?
+            .is_none()
+        {
+            return Err(SurfaceApiError::BadRequest(format!("Credential provider '{id}' does not exist")));
+        }
+    }
+    Ok(())
 }
 
 /// One async mutex per surface id, held only while some task holds or awaits
@@ -325,12 +366,14 @@ pub(crate) enum Stored {
 }
 
 /// Run `write`, which saves `after` under `surface_id`, or deletes the surface
-/// when `after` is `None`, under the surface's lock, after removing the grants
-/// of every external consent binding that differs between the surface stored
-/// now, read under the lock, and `after`. A write built from an earlier read
-/// therefore still removes the grants of a binding that a concurrent write
-/// added and this one drops. A write dropped while it deletes grants releases
-/// the lock only once they are all deleted.
+/// when `after` is `None`, under the provider lock held shared and the
+/// surface's lock, removing the grants of every external consent binding that
+/// differs between the surface stored now, read under the lock, and `after`.
+/// A write built from an earlier read therefore still removes the grants of a
+/// binding that a concurrent write added and this one drops. The grants are
+/// revoked only once `write` succeeds; when it fails, or is dropped, they are
+/// put back before the lock is released. A write that binds a provider
+/// deleted since its references were checked is refused.
 pub(crate) async fn write_surface<T, Write, Pending>(
     removal: &GrantRemoval<'_>,
     surfaces: &dyn AgentSurfaceStore,
@@ -343,6 +386,7 @@ where
     Write: FnOnce() -> Pending,
     Pending: std::future::Future<Output = Result<T, SurfaceApiError>>,
 {
+    let _bindings = hold_provider_bindings().await;
     let lock = Arc::new(lock_surface(surface_id).await);
     let current = surfaces
         .get(surface_id)
@@ -351,51 +395,21 @@ where
     if stored == Stored::Absent && current.is_some() {
         return Err(SurfaceApiError::BadRequest(format!("Surface with ID '{surface_id}' already exists")));
     }
-    remove_changed_binding_grants(removal, current.as_ref(), after, Some(Arc::clone(&lock))).await?;
+    if let Some(after) = after {
+        refuse_deleted_providers(removal, current.as_ref(), after).await?;
+    }
+    let (saved, outcome) = tokio::sync::oneshot::channel();
+    remove_changed_binding_grants(removal, current.as_ref(), after, Some(Arc::clone(&lock)), Some(outcome)).await?;
     let written = write().await;
+    let _ = saved.send(written.is_ok());
     drop(lock);
     written
-}
-
-/// Store `grant` only while its binding is saved: under the surface's lock,
-/// the stored surface must serve the binding, with the grant's tenant,
-/// Transit Point, provider and subject. Otherwise it is refused with
-/// [`SurfaceApiError::NotFound`] and nothing is stored, so no grant outlives a
-/// binding a concurrent write removed.
-#[allow(dead_code)] // the consent completion of external consent stores grants through it
-pub(crate) async fn store_grant_while_bound(
-    vault: &Arc<dyn DelegationVaultStorage>,
-    surfaces: &dyn AgentSurfaceStore,
-    grant: DelegatedGrant,
-) -> Result<StoredGrant, SurfaceApiError> {
-    let _lock = lock_surface(&grant.surface_id).await;
-    let surface = surfaces
-        .get(&grant.surface_id)
-        .await
-        .map_err(|error| SurfaceApiError::InternalError(format!("Failed to get surface: {error}")))?;
-    let bound = surface.is_some_and(|surface| {
-        external_bindings(&surface)
-            .iter()
-            .any(|binding| binding.holds(&grant))
-    });
-    if !bound {
-        return Err(SurfaceApiError::NotFound(
-            "The binding this grant was given for is no longer saved, so the grant is not stored".to_string(),
-        ));
-    }
-    vault
-        .store_grant(grant)
-        .await
-        .map_err(|error| {
-            warn!(target: "credential_delegation", error = %error, "Failed to store a delegated grant");
-            unavailable()
-        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation_vault::grants::GrantKey;
+    use crate::delegation_vault::grants::{GrantKey, StoredGrant};
     use crate::delegation_vault::revocation::tests::RecordingServer;
     use serde_json::json;
 
@@ -487,7 +501,7 @@ mod tests {
                 exact_allowlist: Some(&origin),
                 ..self.removal()
             };
-            if let Some(revocations) = remove_changed_binding_grants(&removal, before, after, None).await? {
+            if let Some(revocations) = remove_changed_binding_grants(&removal, before, after, None, None).await? {
                 revocations.await.unwrap();
             }
             Ok(())
@@ -786,11 +800,11 @@ mod tests {
             ..fixture.removal()
         };
         assert!(matches!(
-            remove_changed_binding_grants(&no_vault, Some(&bound()), None, None).await,
+            remove_changed_binding_grants(&no_vault, Some(&bound()), None, None, None).await,
             Err(SurfaceApiError::Unavailable(_))
         ));
         assert!(
-            remove_changed_binding_grants(&no_vault, Some(&bound()), Some(&bound()), None)
+            remove_changed_binding_grants(&no_vault, Some(&bound()), Some(&bound()), None, None)
                 .await
                 .is_ok(),
             "a change that removes no binding needs no vault"
@@ -812,7 +826,7 @@ mod tests {
             ..fixture.removal()
         };
         assert!(matches!(
-            remove_changed_binding_grants(&unreadable, Some(&bound()), None, None).await,
+            remove_changed_binding_grants(&unreadable, Some(&bound()), None, None, None).await,
             Err(SurfaceApiError::Unavailable(message)) if message.contains("at-rest encryption is off")
         ));
         assert!(
@@ -885,14 +899,14 @@ mod tests {
             point("unused-hop", external("vendor", "owner"))
         ]));
         assert!(
-            remove_changed_binding_grants(&removal, Some(&with_unused), Some(&bound()), None)
+            remove_changed_binding_grants(&removal, Some(&with_unused), Some(&bound()), None, None)
                 .await
                 .is_ok(),
             "no grant of the removed binding is stored"
         );
         let caller_only = surface(json!([point("caller-hop", external("vendor", "caller"))]));
         assert!(matches!(
-            remove_changed_binding_grants(&removal, Some(&bound()), Some(&caller_only), None).await,
+            remove_changed_binding_grants(&removal, Some(&bound()), Some(&caller_only), None, None).await,
             Err(SurfaceApiError::Unavailable(message)) if message.contains("at-rest encryption is off")
         ));
     }
@@ -969,7 +983,7 @@ mod tests {
             ..fixture.removal()
         };
         let started = std::time::Instant::now();
-        let revocations = remove_changed_binding_grants(&removal, Some(&bound()), None, None)
+        let revocations = remove_changed_binding_grants(&removal, Some(&bound()), None, None, None)
             .await
             .unwrap()
             .expect("grants were removed");
@@ -999,7 +1013,7 @@ mod tests {
             ..fixture.removal()
         };
         assert!(
-            remove_changed_binding_grants(&removal, Some(&bound()), None, None)
+            remove_changed_binding_grants(&removal, Some(&bound()), None, None, None)
                 .await
                 .is_ok()
         );
@@ -1060,60 +1074,97 @@ mod tests {
         );
     }
 
-    /// A grant is stored only under the surface's lock and only while its
-    /// binding is saved, so a write that is removing the binding cannot leave
-    /// a grant behind.
+    /// A save that fails leaves the grants of the bindings it would have
+    /// removed, unrevoked: they are deleted only while the save runs, and put
+    /// back when it fails, before the surface's lock is released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_grant_is_stored_only_while_its_binding_is_saved() {
-        use crate::delegation_vault::grants::tests::grant;
-        let fixture = Fixture::new().await;
-        let surfaces = Arc::new(fixture.surfaces().await);
+    async fn a_save_that_fails_keeps_the_grants_of_the_bindings_it_would_remove() {
+        let fixture = with_grants().await;
+        let surfaces = fixture.surfaces().await;
         surfaces
             .save(&bound())
             .await
             .unwrap();
-        store_grant_while_bound(&fixture.vault, &*surfaces, grant(&owner_key("owner-hop"), "owner-access"))
-            .await
-            .expect("the binding is saved");
+        let origin = fixture.server.origin();
+        let removal = GrantRemoval {
+            exact_allowlist: Some(&origin),
+            ..fixture.removal()
+        };
+        let unbound = surface(json!([point("caller-hop", external("vendor", "caller"))]));
+        let failed = write_surface(&removal, &surfaces, "surface", Stored::Any, Some(&unbound), || async {
+            Err::<(), _>(SurfaceApiError::InternalError("the disk is full".into()))
+        })
+        .await;
+        assert!(matches!(failed, Err(SurfaceApiError::InternalError(_))), "{failed:?}");
+        drop(lock_surface("surface").await);
         assert!(
             fixture
                 .kept(&owner_key("owner-hop"))
-                .await
+                .await,
+            "the grant of the binding the failed save would have removed is kept"
         );
-        for (case, key) in [
-            ("another Transit Point", owner_key("other-hop")),
-            ("the binding's other subject", caller_key("owner-hop")),
-        ] {
-            let refused = store_grant_while_bound(&fixture.vault, &*surfaces, grant(&key, "access")).await;
-            assert!(matches!(refused, Err(SurfaceApiError::NotFound(_))), "{case}");
-            assert!(!fixture.kept(&key).await, "{case}");
-        }
+        assert!(
+            fixture
+                .server
+                .revoked_tokens()
+                .is_empty(),
+            "and never revoked"
+        );
+    }
 
-        let unbound = surface(json!([point("caller-hop", external("vendor", "caller"))]));
-        let held = lock_surface("surface").await;
-        let late = tokio::spawn({
+    /// A write binds a provider only while it exists: one deleted since the
+    /// write's references were checked is refused under the provider lock,
+    /// which a provider delete holds for its whole check and delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_binding_a_provider_deleted_since_it_was_checked_is_refused() {
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        let saved = std::sync::atomic::AtomicBool::new(false);
+        let gone = surface(json!([point("owner-hop", external("deleted-vendor", "owner"))]));
+        let refused = write_surface(&removal, &surfaces, "surface", Stored::Absent, Some(&gone), || async {
+            saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await;
+        assert!(
+            matches!(refused, Err(SurfaceApiError::BadRequest(ref message)) if message.contains("deleted-vendor")),
+            "{refused:?}"
+        );
+        assert!(!saved.load(std::sync::atomic::Ordering::SeqCst), "nothing is saved");
+
+        write_surface(&removal, &surfaces, "surface", Stored::Absent, Some(&bound()), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .expect("a provider that exists is bound");
+
+        let exclusive = hold_provider_bindings_exclusively().await;
+        let write = tokio::spawn({
+            let surfaces = fixture.surfaces().await;
             let vault = fixture.vault.clone();
-            let surfaces = surfaces.clone();
-            async move { store_grant_while_bound(&vault, &*surfaces, grant(&owner_key("owner-hop"), "late-access")).await }
+            let providers = fixture.providers.clone();
+            async move {
+                let removal = GrantRemoval {
+                    vault: Some(&vault),
+                    providers: Some(&providers),
+                    secrets: None,
+                    exact_allowlist: None,
+                    actor: None,
+                };
+                write_surface(&removal, &surfaces, "surface", Stored::Any, Some(&bound()), || async {
+                    Ok::<(), SurfaceApiError>(())
+                })
+                .await
+            }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!late.is_finished(), "a grant waits for the write that holds the surface's lock");
-        fixture
-            .change(Some(&bound()), Some(&unbound))
+        assert!(!write.is_finished(), "a surface write waits for a provider delete in progress");
+        drop(exclusive);
+        write
             .await
-            .unwrap();
-        surfaces
-            .save(&unbound)
-            .await
-            .unwrap();
-        drop(held);
-        assert!(matches!(late.await.unwrap(), Err(SurfaceApiError::NotFound(_))));
-        assert!(
-            !fixture
-                .kept(&owner_key("owner-hop"))
-                .await,
-            "no grant outlives the binding the write removed"
-        );
+            .unwrap()
+            .expect("and goes on once it ends");
     }
 
     /// A vault that pauses after its first grant deletion until `resume` has a
@@ -1234,13 +1285,22 @@ mod tests {
             self.deleted().await;
             purged
         }
+
+        async fn store_grant(
+            &self,
+            grant: DelegatedGrant,
+        ) -> anyhow::Result<StoredGrant> {
+            self.inner
+                .store_grant(grant)
+                .await
+        }
     }
 
     /// A write dropped part way through deleting a binding's grants, as when
-    /// its client disconnects, still deletes and revokes every one of them,
-    /// and holds the surface's lock until they are deleted.
+    /// its client disconnects, saves nothing, so every grant it deleted is put
+    /// back, unrevoked, and the surface's lock is held until they all are.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_write_dropped_while_deleting_grants_still_deletes_and_revokes_them_all() {
+    async fn a_write_dropped_while_deleting_grants_puts_every_one_back() {
         const SURFACE: &str = "dropped-write";
         let fixture = Fixture::new().await;
         let keys: Vec<GrantKey> = (0..4)
@@ -1292,31 +1352,22 @@ mod tests {
             .is_err();
         pausing.resume.add_permits(1);
 
-        let mut expected: Vec<String> = (0..4)
-            .flat_map(|index| [format!("caller-{index}"), format!("caller-{index}-refresh")])
-            .collect();
-        expected.sort();
-        let revoked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while fixture
-                .server
-                .revoked_tokens()
-                != expected
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(10), lock_surface(SURFACE))
+                .await
+                .expect("the lock is released once every grant is back"),
+        );
+        for key in &keys {
+            assert!(fixture.kept(key).await, "{key:?} is put back");
+        }
         assert!(
-            revoked.is_ok(),
-            "every grant the dropped write deleted is revoked: {:?}",
             fixture
                 .server
                 .revoked_tokens()
+                .is_empty(),
+            "no grant of a binding still saved is revoked"
         );
-        for key in &keys {
-            assert!(!fixture.kept(key).await, "{key:?} is deleted");
-        }
-        assert!(held_while_deleting, "the surface's lock is held until every grant is deleted");
+        assert!(held_while_deleting, "the surface's lock is held until every grant is back");
         let stored = surfaces
             .get(SURFACE)
             .await

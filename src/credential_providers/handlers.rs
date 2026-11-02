@@ -877,6 +877,9 @@ pub async fn delete_provider(
         )
             .into_response();
     }
+    // Held until the provider is deleted, so no surface write binds it after
+    // the check below found it unbound.
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
     if let Err(response) =
         refuse_bound_provider(&state, &existing, tenant_context(&context), resource_scope(&scope)).await
     {
@@ -2292,6 +2295,17 @@ mod external_provider_tests {
                 Some("surface") => {
                     surface.outbound_credentials = vec![serde_json::from_value(binding["binding"].clone()).unwrap()];
                 }
+                Some("target_auth") => {
+                    surface.target.auth = Some(serde_json::from_value(binding["binding"].clone()).unwrap());
+                }
+                Some("transit_point_target_auth") => {
+                    surface
+                        .transit
+                        .as_mut()
+                        .unwrap()
+                        .points[0]
+                        .target_auth = Some(serde_json::from_value(binding["binding"].clone()).unwrap());
+                }
                 _ => {
                     surface.variants = vec![
                         serde_json::from_value(json!({"id": "v-1", "alias": "candidate",
@@ -2377,6 +2391,16 @@ mod external_provider_tests {
                 "a variant only",
                 json!({"where": "variant", "binding": {"credential_provider_id": "provider",
                     "consent_mode": "external", "subject": "owner"}}),
+            ),
+            (
+                "the Target's authentication",
+                json!({"where": "target_auth", "binding": {"method": {"credential_provider":
+                    {"provider_id": "provider"}}}}),
+            ),
+            (
+                "a Transit Point's target authentication",
+                json!({"where": "transit_point_target_auth", "binding": {"method": {"credential_provider":
+                    {"provider_id": "provider"}}}}),
             ),
         ] {
             state
