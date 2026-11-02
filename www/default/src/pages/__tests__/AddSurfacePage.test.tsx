@@ -399,7 +399,7 @@ describe('AddSurfacePage create warnings', () => {
       expect.stringContaining(`created, with warnings:\n${warning}`),
       expect.objectContaining({ autoRemove: true })
     );
-    expect(screen.getByTestId('location')).toHaveTextContent(
+    expect(await screen.findByTestId('location')).toHaveTextContent(
       `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
     );
   });
@@ -413,6 +413,6 @@ describe('AddSurfacePage create warnings', () => {
       expect.stringContaining('Transit Point'),
       expect.anything()
     );
-    expect(screen.getByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
+    expect(await screen.findByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 });

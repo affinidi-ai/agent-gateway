@@ -701,6 +701,48 @@ impl RbacGuard {
     {
         mr.layer(require_feature(self.storage.clone(), self.rbac_config.clone(), feature))
     }
+
+    /// Whether `user_id` holds `feature` under its role and, for a request
+    /// made with an access token, under the token's scopes. An unknown user
+    /// or a failed lookup counts as no.
+    pub async fn allows(
+        &self,
+        user_id: &str,
+        pat: Option<&crate::auth_manager::pat::PatContext>,
+        feature: &crate::rbac::Feature,
+    ) -> bool {
+        match self
+            .storage
+            .load_user_by_id(user_id)
+            .await
+        {
+            Ok(Some(user)) => {
+                self.rbac_config
+                    .has_permission(&user.role, feature)
+                    && pat_scope_allows(pat, feature)
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!(user_id = %user_id, feature = ?feature, error = %e, "RbacGuard::allows: failed to load user");
+                false
+            }
+        }
+    }
+}
+
+/// Whether the caller holds `feature`. A missing guard or caller counts as no.
+pub(crate) async fn caller_allows(
+    guard: Option<&RbacGuard>,
+    user_id: Option<&str>,
+    pat: Option<&crate::auth_manager::pat::PatContext>,
+    feature: &crate::rbac::Feature,
+) -> bool {
+    let (Some(guard), Some(user_id)) = (guard, user_id) else {
+        return false;
+    };
+    guard
+        .allows(user_id, pat, feature)
+        .await
 }
 
 /// Refuses every request to a protected route that was mounted without an RBAC

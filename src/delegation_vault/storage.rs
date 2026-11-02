@@ -2408,12 +2408,9 @@ mod tests {
 
     /// Grants by binding are kept only while at-rest encryption is active.
     fn with_at_rest_encryption() {
-        unsafe {
-            std::env::set_var("DELEGATED_GRANTS_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "DELEGATED_GRANTS_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();

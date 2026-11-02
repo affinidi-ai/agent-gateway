@@ -1202,12 +1202,9 @@ mod tests {
         /// from its issuer.
         async fn answering(answers: impl FnOnce(&str) -> Vec<Answer>) -> Self {
             let directory = tempfile::tempdir().unwrap();
-            unsafe {
-                std::env::set_var("CONNECT_API_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-            }
             crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
                 enabled: true,
-                key_env_var: "CONNECT_API_TEST_MASTER_KEY".to_string(),
+                key_env_var: "AG_TEST_MASTER_KEY".to_string(),
                 ..Default::default()
             })
             .unwrap();

@@ -15640,12 +15640,9 @@ mod tests {
     ) -> OutboundProxyState {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         if encrypted {
-            unsafe {
-                std::env::set_var("EXTERNAL_GRANT_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-            }
             crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
                 enabled: true,
-                key_env_var: "EXTERNAL_GRANT_TEST_MASTER_KEY".to_string(),
+                key_env_var: "AG_TEST_MASTER_KEY".to_string(),
                 ..Default::default()
             })
             .unwrap();

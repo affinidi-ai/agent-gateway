@@ -2150,6 +2150,12 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
+    let dashboard_router = match passkey_storage_for_manager.as_ref() {
+        Some(storage) => dashboard_router
+            .layer(Extension(crate::auth_manager::middleware::RbacGuard::new(storage.clone(), rbac_config.clone()))),
+        None => dashboard_router,
+    };
+
     let mut app = Router::new()
         .merge(cli_login_router)
         .merge(didwebvh_router)

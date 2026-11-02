@@ -574,10 +574,25 @@ rust-local: ## Run Rust checks locally with autofix (fmt + clippy --fix + audit 
 	@$(MAKE) test
 	@echo "$(GREEN)✅ Local Rust checks passed!$(NC)"
 
-local: ## Run all local checks with autofix (node-local + rust-local)
-	@$(MAKE) node-local
-	@$(MAKE) rust-local
-	@echo "$(GREEN)✅ All local checks passed!$(NC)"
+# When this make started, for the run's total on local's last line.
+LOCAL_STARTED := $(shell date +%s)
+
+# `make local`: formatting first, alone, since everything after it reads the
+# files it rewrites. Then the checks as groups side by side, then the tests
+# (scripts/local/parallel.sh; each run's logs and summary in
+# tmp/local/<date>_<time>/, tmp/local/latest the newest). The frontend and
+# backend groups touch different folders, so nothing writes what another reads.
+# No `make check`: clippy compiles everything it would, and more. PARALLEL=0
+# runs every group one after another, for a machine short of memory.
+PARALLEL ?= 1
+LOCAL_CHECKS := "frontend=node-local" "backend=clippy audit cargo-build"
+LOCAL_TESTS := "backend-tests=test"
+local: ## Run all local checks with autofix: fmt, then the frontend and backend checks side by side, then the tests (PARALLEL=0: one at a time); ends with the time taken
+	@$(MAKE) fmt
+	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Checks" $(LOCAL_CHECKS)
+	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Tests" $(LOCAL_TESTS)
+	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
+	  echo "$(GREEN)✅ All local checks passed in $$((secs / 60))m $$((secs % 60))s.$(NC)"
 
 # Fail if any tracked files were modified by an autofix step.
 # Call this after all fmt/fix passes so the error lists all changed files at once.

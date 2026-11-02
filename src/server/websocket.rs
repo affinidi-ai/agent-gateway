@@ -130,11 +130,13 @@ impl WsSubscription {
 }
 
 /// Filter a pre-serialized dashboard_delta JSON to only include the
-/// sections the client subscribed to.  Returns `None` if the filtered
-/// delta would have zero change sections (nothing to send).
+/// sections the client subscribed to and may read: the `logs` section needs
+/// `logs.view` (`logs_allowed`).  Returns `None` if the filtered delta would
+/// have zero change sections (nothing to send).
 fn filter_delta_json(
     json: &str,
     sub: &WsSubscription,
+    logs_allowed: bool,
 ) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
     let changes = value
@@ -142,13 +144,57 @@ fn filter_delta_json(
         .get_mut("changes")?
         .as_object_mut()?;
 
-    changes.retain(|key, _| sub.wants(key));
+    changes.retain(|key, _| sub.wants(key) && (logs_allowed || key != "logs"));
 
     if changes.is_empty() {
         return None; // Nothing left after filtering
     }
 
     serde_json::to_string(&value).ok()
+}
+
+/// The dashboard delta to send one connection: the broadcast unchanged when
+/// the connection wants every section and may read log lines, otherwise
+/// [`filter_delta_json`]'s result.
+fn delta_for_connection(
+    json: &str,
+    sub: &WsSubscription,
+    logs_allowed: bool,
+) -> Option<String> {
+    if sub.wants_all() && logs_allowed {
+        return Some(json.to_owned());
+    }
+    filter_delta_json(json, sub, logs_allowed)
+}
+
+/// Whether a connection may receive `update`: log lines need `logs.view`.
+fn admits(
+    update: &WsUpdate,
+    logs_allowed: bool,
+) -> bool {
+    logs_allowed || !matches!(update, WsUpdate::LogEntry { .. })
+}
+
+/// The user a connection serves and the guard that decides what it may
+/// read. Its permissions are checked when it connects and again on each
+/// keep-alive ping, so a role change reaches an open socket.
+struct WsCaller {
+    guard: crate::auth_manager::middleware::RbacGuard,
+    user_id: String,
+}
+
+impl WsCaller {
+    /// Whether `caller` may receive log lines. A connection without a known
+    /// user or an RBAC guard may not.
+    async fn logs_allowed(caller: Option<&Self>) -> bool {
+        let Some(caller) = caller else {
+            return false;
+        };
+        caller
+            .guard
+            .allows(&caller.user_id, None, &crate::rbac::Feature::LogsView)
+            .await
+    }
 }
 
 /// Message sent by a client to configure its subscription.
@@ -199,13 +245,14 @@ impl std::fmt::Debug for SessionToken {
     }
 }
 
-/// WebSocket handler (unauthenticated - for backward compatibility)
+/// WebSocket handler (unauthenticated - for backward compatibility). Its
+/// clients know no user, so they never receive log lines.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<crate::observability::DashboardState>,
 ) -> impl IntoResponse {
     let ws_state = state.ws_state.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, ws_state, None))
+    ws.on_upgrade(move |socket| handle_socket(socket, ws_state, None, None))
 }
 
 /// Authenticated WebSocket handler - requires valid session
@@ -217,6 +264,7 @@ pub async fn ws_handler_authenticated(
     Query(params): Query<HashMap<String, String>>,
     Extension(session_mgr): Extension<Arc<crate::auth::SessionManager>>,
     Extension(terms_manager): Extension<Arc<crate::terms::TermsManager>>,
+    rbac_guard: Option<Extension<crate::auth_manager::middleware::RbacGuard>>,
 ) -> Result<Response, Response> {
     debug!("WebSocket connection attempt received");
 
@@ -249,10 +297,15 @@ pub async fn ws_handler_authenticated(
 
     info!("WebSocket connection authenticated for user_id: {} via {}", user_id, session_token.source.as_str());
 
+    let caller = rbac_guard.map(|Extension(guard)| WsCaller {
+        guard,
+        user_id: user_id.clone(),
+    });
+
     // Upgrade connection
     let ws_state = state.ws_state.clone();
     Ok(ws
-        .on_upgrade(move |socket| handle_socket(socket, ws_state, Some(user_id)))
+        .on_upgrade(move |socket| handle_socket(socket, ws_state, Some(user_id), caller))
         .into_response())
 }
 
@@ -399,6 +452,7 @@ async fn handle_socket(
     socket: WebSocket,
     state: Arc<WsState>,
     user_id: Option<String>,
+    caller: Option<WsCaller>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.subscribe();
@@ -433,6 +487,7 @@ async fn handle_socket(
     let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
 
         loop {
             tokio::select! {
@@ -440,20 +495,17 @@ async fn handle_socket(
                 update_result = rx.recv() => {
                     match update_result {
                         Ok(update) => {
+                            if !admits(&update, logs_allowed) {
+                                continue;
+                            }
                             // DashboardDelta is already serialized; apply per-client
                             // section filtering before forwarding.
                             let msg = match &update {
                                 WsUpdate::DashboardDelta { json } => {
                                     let sub = send_sub.read().await;
-                                    if sub.wants_all() {
-                                        // Fast path – no filtering needed
-                                        Message::Text(json.as_str().into())
-                                    } else {
-                                        // Filter to only subscribed sections
-                                        match filter_delta_json(json, &sub) {
-                                            Some(filtered) => Message::Text(filtered.into()),
-                                            None => continue, // Nothing left after filtering
-                                        }
+                                    match delta_for_connection(json, &sub, logs_allowed) {
+                                        Some(delta) => Message::Text(delta.into()),
+                                        None => continue, // Nothing left after filtering
                                     }
                                 }
                                 other => match serde_json::to_string(other) {
@@ -474,6 +526,7 @@ async fn handle_socket(
                 }
                 // Send periodic pings to keep connection alive
                 _ = ping_interval.tick() => {
+                    logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
                     if sender.send(Message::Ping("ping".into())).await.is_err() {
                         break;
                     }
@@ -803,5 +856,137 @@ mod tests {
         assert!(origins.contains("https://dashboard.example.com"));
         assert!(origins.contains("https://ops.example.com"));
         assert!(origins.contains("https://gateway.example.com"));
+    }
+
+    const DELTA_WITH_LOGS: &str = r#"{"type":"dashboard_delta","delta":{"timestamp":1,"changes":{"metrics":{"x":1},"logs":{"new_entries":[{"message":"secret line"}]}}}}"#;
+
+    fn changes_of(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(json).unwrap()["delta"]["changes"]
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn subscribed_to(sections: &[&str]) -> super::WsSubscription {
+        let mut sub = super::WsSubscription::new();
+        sub.sections = sections
+            .iter()
+            .map(|section| section.to_string())
+            .collect();
+        sub
+    }
+
+    #[test]
+    fn a_client_without_logs_view_never_gets_the_log_section() {
+        let filtered = super::delta_for_connection(DELTA_WITH_LOGS, &subscribed_to(&[]), false).unwrap();
+
+        let changes = changes_of(&filtered);
+        assert_eq!(
+            changes
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["metrics"]
+        );
+        assert!(!filtered.contains("secret line"), "{filtered}");
+    }
+
+    #[test]
+    fn a_client_with_logs_view_gets_the_delta_unchanged() {
+        let delta = super::delta_for_connection(DELTA_WITH_LOGS, &subscribed_to(&[]), true).unwrap();
+
+        assert_eq!(delta, DELTA_WITH_LOGS);
+    }
+
+    #[test]
+    fn a_delta_holding_only_logs_is_sent_only_to_a_client_with_logs_view() {
+        let logs_only = subscribed_to(&["logs"]);
+
+        assert_eq!(super::delta_for_connection(DELTA_WITH_LOGS, &logs_only, false), None);
+        let allowed = super::delta_for_connection(DELTA_WITH_LOGS, &logs_only, true).unwrap();
+        assert_eq!(
+            changes_of(&allowed)
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["logs"]
+        );
+    }
+
+    #[test]
+    fn log_entry_updates_reach_only_clients_with_logs_view() {
+        let entry = super::WsUpdate::LogEntry {
+            entry: "secret line".to_string(),
+        };
+
+        assert!(!super::admits(&entry, false));
+        assert!(super::admits(&entry, true));
+        assert!(super::admits(&super::WsUpdate::RefreshDashboard, false));
+    }
+
+    async fn guard_with_user(
+        dir: &TempDir,
+        role: crate::auth::types::UserRole,
+    ) -> crate::auth_manager::middleware::RbacGuard {
+        let storage = crate::auth::storage::PasskeyStorage::new(
+            dir.path()
+                .join("users")
+                .to_string_lossy()
+                .into_owned(),
+            dir.path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        storage
+            .save_user(&crate::auth::storage::UserData {
+                user_id: "user-1".to_string(),
+                username: "user".to_string(),
+                passkeys: Vec::new(),
+                role,
+                status: crate::auth::types::UserStatus::Approved,
+                is_primary: false,
+                first_name: None,
+                last_name: None,
+                email: None,
+                department: None,
+                job_title: None,
+                avatar_path: None,
+                created_at: now,
+                updated_at: now,
+                last_logged_in: None,
+                saml_id: None,
+            })
+            .await
+            .unwrap();
+        let mut rbac = crate::rbac::RbacConfig::default();
+        rbac.permissions
+            .insert("logs.view".to_string(), "poweruser".to_string());
+        crate::auth_manager::middleware::RbacGuard::new(std::sync::Arc::new(storage), std::sync::Arc::new(rbac))
+    }
+
+    #[tokio::test]
+    async fn a_connection_may_read_logs_only_when_its_user_holds_logs_view() {
+        let dir = TempDir::new().unwrap();
+        let power_user = super::WsCaller {
+            guard: guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await,
+            user_id: "user-1".to_string(),
+        };
+        assert!(super::WsCaller::logs_allowed(Some(&power_user)).await);
+
+        let dir = TempDir::new().unwrap();
+        let user = super::WsCaller {
+            guard: guard_with_user(&dir, crate::auth::types::UserRole::User).await,
+            user_id: "user-1".to_string(),
+        };
+        assert!(!super::WsCaller::logs_allowed(Some(&user)).await);
+
+        let unknown = super::WsCaller {
+            guard: power_user.guard.clone(),
+            user_id: "someone-else".to_string(),
+        };
+        assert!(!super::WsCaller::logs_allowed(Some(&unknown)).await);
+        assert!(!super::WsCaller::logs_allowed(None).await);
     }
 }

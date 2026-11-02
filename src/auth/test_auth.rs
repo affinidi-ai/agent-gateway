@@ -113,7 +113,13 @@ impl Default for TestAuthConfig {
 impl TestAuthConfig {
     /// Create configuration from environment variables
     pub fn from_env() -> Self {
-        let mut enabled = std::env::var("AG_TEST_MODE")
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Create configuration from variables read through `lookup`, so tests can
+    /// supply them without changing the process environment.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mut enabled = lookup("AG_TEST_MODE")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
 
@@ -121,7 +127,7 @@ impl TestAuthConfig {
             warn!("⚠️  TEST MODE ENABLED - Test authentication endpoint is active. Do NOT use in production!");
         }
 
-        let test_token = std::env::var("AG_TEST_TOKEN").unwrap_or_default();
+        let test_token = lookup("AG_TEST_TOKEN").unwrap_or_default();
         if enabled && !is_strong_test_token(&test_token) {
             warn!(
                 "⚠️  TEST MODE DISABLED - AG_TEST_TOKEN must be explicitly set to a non-default token with at least {} characters",
@@ -133,17 +139,13 @@ impl TestAuthConfig {
         Self {
             enabled,
             test_token,
-            allow_role_override: parse_env_bool("AG_TEST_ALLOW_ROLE_OVERRIDE"),
-            test_username: std::env::var("AG_TEST_USERNAME").unwrap_or_else(|_| "test-user".to_string()),
-            test_user_id: std::env::var("AG_TEST_USER_ID").unwrap_or_else(|_| "test-user-001".to_string()),
+            allow_role_override: lookup("AG_TEST_ALLOW_ROLE_OVERRIDE")
+                .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+                .unwrap_or(false),
+            test_username: lookup("AG_TEST_USERNAME").unwrap_or_else(|| "test-user".to_string()),
+            test_user_id: lookup("AG_TEST_USER_ID").unwrap_or_else(|| "test-user-001".to_string()),
         }
     }
-}
-
-fn parse_env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false)
 }
 
 fn is_strong_test_token(token: &str) -> bool {
