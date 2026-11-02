@@ -94,6 +94,7 @@ Feature: Transit tokens for requests that arrive over Fabric
     And gateway 3 has an A2A surface "echo" forwarding over fabric to gateway 2 surface "alpha"
     And surface "alpha" has A2A Transit Point "to-delta" over Fabric to gateway 1 surface "delta"
     And Transit Point "to-delta" requires a transit token
+    And Transit Point "to-delta" allows Fabric callers
     And Transit Point "to-delta" admits only requests that gateway 1 sent
     And the caller has sent a Fabric A2A request through gateway 3 surface "echo"
     When managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
@@ -108,6 +109,7 @@ Feature: Transit tokens for requests that arrive over Fabric
     And gateway 3 has an A2A surface "echo" forwarding over fabric to gateway 2 surface "alpha"
     And surface "alpha" has A2A Transit Point "to-delta" over Fabric to gateway 1 surface "delta"
     And Transit Point "to-delta" requires a transit token
+    And Transit Point "to-delta" allows Fabric callers
     And Transit Point "to-delta" admits only requests that gateway 1 sent
     And the caller has sent a Fabric A2A request through gateway 1 surface "charlie"
     When managed agent "bravo" calls Transit Point "to-delta" with the transit token it received
