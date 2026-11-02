@@ -5702,7 +5702,9 @@ async fn process_forward_request_in_request_scope(
     }
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
-    if !outbound_creds.is_empty() {
+    // A discovery read is no request of the agent's own, so, as on the direct
+    // path and a Transit Point, no credential is released or refused for it.
+    if !outbound_creds.is_empty() && !is_agent_card_request {
         let delegation_user_hash = authenticated_identity
             .as_ref()
             .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()));

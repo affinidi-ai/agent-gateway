@@ -60,7 +60,8 @@ changes:
         could name another caller and have that caller's stored grant sent to the Target. A
         partner's claim about who it acts for no longer selects stored credentials: the grant is
         keyed only by the caller the receiving surface verified, a request it verified no caller
-        for is refused with `403` when a binding applies, and on a `2026-07-28` MCP request the
+        for is refused with `403` when a binding applies (an agent card or discovery read, which
+        releases no credential, is served as before), and on a `2026-07-28` MCP request the
         agent half of the key is a caller DID only a connection issuer's presentation proved.
         Grants stored under a caller the peer named are no longer looked up.
     - timestamp: '2026-11-02T03:00:00.000Z'

@@ -493,7 +493,9 @@ async fn a_surface_without_transit_points_passes_its_agent_no_transit_token() {
 }
 
 /// A peer fetching the agent card makes no request of the agent's own, so the
-/// agent gets no transit token with it, as with a card fetched directly.
+/// agent gets no transit token with it, as with a card fetched directly, and
+/// no delegated credential: a binding that applies to every request neither
+/// refuses the card nor releases a grant for it.
 #[tokio::test]
 async fn an_agent_card_fetch_over_fabric_passes_the_agent_no_transit_token() {
     if ran_in_child("ATG_FABRIC_AGENT_CARD_CHILD").await {
@@ -501,7 +503,10 @@ async fn an_agent_card_fetch_over_fabric_passes_the_agent_no_transit_token() {
     }
     let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
     let root = tempfile::tempdir().unwrap();
-    let _receiver = receiver(root.path(), &surface("a2a", &target.url, &["crm"])).await;
+    let mut delegating = surface("a2a", &target.url, &["crm"]);
+    delegating.outbound_credentials =
+        vec![serde_json::from_value(json!({ "credential_provider_id": "provider", "scopes": ["read"] })).unwrap()];
+    let _receiver = receiver(root.path(), &delegating).await;
 
     let mut message = forward_request(
         root.path(),
@@ -514,13 +519,15 @@ async fn an_agent_card_fetch_over_fabric_passes_the_agent_no_transit_token() {
     assert_eq!(response["status"], 200, "{response}");
     let received = target.received();
     assert_eq!(received.len(), 1, "the card request reaches the agent");
-    assert!(
-        received[0]
-            .get("x-transit-token")
-            .is_none(),
-        "{:?}",
-        received[0]
-    );
+    for header in ["x-transit-token", "authorization"] {
+        assert!(
+            received[0]
+                .get(header)
+                .is_none(),
+            "{header}: {:?}",
+            received[0]
+        );
+    }
 }
 
 /// A framed stream whose Open carries a hop count past the limit, or one that
