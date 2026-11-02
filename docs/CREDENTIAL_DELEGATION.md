@@ -153,8 +153,8 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   of every secret the provider references (client ID, client secret, signing key,
   certificate). Editing the provider, rotating one of its secrets or moving a secret to another
   tenant therefore requests a new token instead of reusing one issued under the old settings.
-  Each use reads the secrets' metadata listing, never their values, so a cached token is served
-  without decrypting a secret. A referenced secret that no longer exists reports
+  Each use looks up only the secrets the provider references, one read each (decrypted when
+  encryption at rest is on), and never lists the secrets store. A referenced secret that no longer exists reports
   `SecretUnavailable` and a secrets store error `StoreUnavailable`; neither serves the cached
   token nor sends a request.
 - After a new token is stored, the expired tokens of the same agent, provider and purpose

@@ -437,7 +437,8 @@ fn backoff_delay(failures: u32) -> chrono::Duration {
 
 /// The vault user identity of the provider's token for `scopes`: `<purpose>:` and the hex
 /// SHA-256 of the provider digest, the sorted scopes and each referenced secret's id, tenant
-/// and `updated_at`. Secrets are read from the store's metadata listing, never decrypted.
+/// and `updated_at`. Only the referenced secrets are read, one lookup each per request (and
+/// decrypted when encryption at rest is on); the store is never listed.
 /// A missing secret, or one outside the provider's tenant while `isolation` is enforced, is
 /// refused here, so a cached token stops being served at once. Under `warn` the grant itself
 /// logs the out-of-tenant secret, once per token request.
@@ -448,15 +449,12 @@ async fn cache_identity(
     purpose: &str,
     isolation: RuleMode,
 ) -> Result<String, ServiceTokenError> {
-    let listed = secrets
-        .list_all()
-        .await
-        .map_err(|_| ServiceTokenError::StoreUnavailable)?;
     let mut versions = Vec::new();
     for secret_ref in provider.secret_refs() {
-        let secret = listed
-            .iter()
-            .find(|secret| secret.secret_id == secret_ref)
+        let secret = secrets
+            .get_by_secret_id(secret_ref)
+            .await
+            .map_err(|_| ServiceTokenError::StoreUnavailable)?
             .ok_or_else(|| {
                 warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Credential provider secret not found");
                 ServiceTokenError::SecretUnavailable
@@ -564,7 +562,10 @@ mod tests {
     struct ObservedSecrets {
         inner: crate::secrets::FilesystemSecretsStore,
         value_reads: AtomicUsize,
+        lookups: Mutex<Vec<String>>,
+        listing_calls: AtomicUsize,
         listing_fails: AtomicBool,
+        lookup_fails: AtomicBool,
         values_missing: AtomicBool,
     }
 
@@ -592,7 +593,27 @@ mod tests {
             }
             self.inner.get(id).await
         }
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            anyhow::ensure!(
+                !self
+                    .lookup_fails
+                    .load(Ordering::SeqCst),
+                "secrets store unavailable"
+            );
+            self.lookups
+                .lock()
+                .unwrap()
+                .push(secret_id.to_string());
+            self.inner
+                .get_by_secret_id(secret_id)
+                .await
+        }
         async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            self.listing_calls
+                .fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 !self
                     .listing_fails
@@ -723,7 +744,10 @@ mod tests {
                 )
                 .unwrap(),
                 value_reads: AtomicUsize::new(0),
+                lookups: Mutex::new(Vec::new()),
+                listing_calls: AtomicUsize::new(0),
                 listing_fails: AtomicBool::new(false),
+                lookup_fails: AtomicBool::new(false),
                 values_missing: AtomicBool::new(false),
             });
             let secrets: Arc<dyn SecretsStore> = observed.clone();
@@ -1858,7 +1882,7 @@ mod tests {
         );
         fixture
             .observed
-            .listing_fails
+            .lookup_fails
             .store(true, Ordering::SeqCst);
         assert_eq!(
             fixture
@@ -1866,6 +1890,58 @@ mod tests {
                 .await
                 .err(),
             Some(ServiceTokenError::StoreUnavailable)
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_hit_reads_only_the_referenced_secrets_and_never_lists_the_store() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        issued(
+            fixture
+                .acquire(&provider, &["read"], now)
+                .await,
+        );
+        fixture
+            .observed
+            .lookups
+            .lock()
+            .unwrap()
+            .clear();
+        fixture
+            .observed
+            .listing_calls
+            .store(0, Ordering::SeqCst);
+        fixture
+            .observed
+            .listing_fails
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Cached)
+        );
+        assert_eq!(
+            fixture
+                .observed
+                .listing_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            *fixture
+                .observed
+                .lookups
+                .lock()
+                .unwrap(),
+            vec!["CLIENT_ID".to_string(), "CLIENT_SECRET".to_string()]
         );
         assert_eq!(fixture.requests().len(), 1);
     }
