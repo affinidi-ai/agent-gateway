@@ -801,9 +801,10 @@ API, the grants report and their removal take `"hop": "target"`.
 | In place of every other credential | The Target has no `target.auth`, and the Access Point does not forward the caller's JWT (`forward_header`). The caller's own `Authorization`, and the header its credential came in, never reach the vendor |
 | Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
 | No presentation of the agent | No identity VP (`target.identity_injection.inject_vp`, or `identity_slots.inbound`), no enabled `target.workload_binding`, and the surface's DID, if it has one, injected in a header rather than `protocol_native`. A presentation of the managed agent, minted without an audience or a nonce, would describe the agent to the vendor, which could present it elsewhere |
+| No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |
 | No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |
 | `target.endpoint` | A public `https` URL with the origin of the provider's `resource`, as a Transit Point's `target_endpoint`; never `fabric://`, `proxy://` or `a2a-proxy://`. On an A2A or AP2 Access Point, whose requests carry the grant at or under the endpoint path, not the root of its origin (`/` or no path), where that would be every path of the vendor's: the A2A operation paths (`/tasks`, `/v1/...`) are ones a vendor's other APIs use too |
-| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
+| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it, and is created disabled, with a `Warning` header (`299`) saying so, since it keeps the copied Target and would send it requests without the grant. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
 
 A save that breaks a rule, or the rules every binding with external consent keeps (encryption
 at rest, the identity hash pepper, a permitted resource and issuer), is refused with `400` on
@@ -823,8 +824,9 @@ At run time a request to the Target:
 - goes only to the origin of the provider's `resource`, checked again on every request, through
   pinned Strict egress, as a Transit Point's request carrying a grant does; the legacy SSE
   fallback, which would send the body by another client, is not used;
-- goes to the Target's endpoint path on MCP, and at or under it on A2A and AP2, never with the
-  caller's query string. The vendor must read every request's path after the route as the
+- goes to the Target's endpoint path on MCP, and at or under it on A2A and AP2, and has no
+  query string: one with a query is refused `400`, so a parameter the caller sent, a page
+  token among them, is never dropped unseen. The vendor must read every request's path after the route as the
   gateway does, so a path with a dot segment, plain or percent-encoded (`..`, `%2e%2e`), a
   segment made only of dots and spaces, which servers that trim them read as one (`...`,
   `..%20`), anything not ASCII once decoded (an overlong `%c0%ae`, a fullwidth dot
@@ -865,8 +867,9 @@ At run time a request to the Target:
   ([`OBSERVABILITY.md`](OBSERVABILITY.md));
 - never passes the Target's `Set-Cookie` or `WWW-Authenticate` to the caller.
 
-A public discovery read (an agent card, `/.well-known/ucp`, `/discovery`) carries no caller and
-no grant, and of the caller's headers only those a request carrying the grant would; an agent
+A public discovery read (an agent card, `/.well-known/ucp`, `/discovery`) carries no caller,
+no grant and no query string, and of the caller's headers only those a request carrying the
+grant would; an agent
 card is fetched from the Target's own card URL, whatever path the caller named. A `2026-07-28`
 MCP request is refused with `-32022`: the vendor is reached over a
 session revision. A request that arrived over Fabric is refused `403` as one whose caller the
@@ -1056,7 +1059,7 @@ and revocation stay on the sending gateway. See
 
 A grant by binding never crosses Fabric: a Target or Transit Point bound by external consent must
 be a public `https` URL, and a surface whose Target is bound by external consent refuses every
-request that arrives over Fabric, other than a public discovery read, with `403`: its caller is
+request that arrives over Fabric, public discovery reads included, with `403`: its caller is
 the one the peer gateway asserts, which never keys a grant.
 
 ## Consent flow

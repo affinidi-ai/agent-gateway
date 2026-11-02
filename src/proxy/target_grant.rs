@@ -30,6 +30,9 @@ pub(crate) struct TargetRequest<'a> {
     pub method: &'a str,
     /// The request path after the Access Point's route.
     pub path: &'a str,
+    /// The request's query string, which a request carrying the grant never
+    /// has.
+    pub query: Option<&'a str>,
     pub headers: &'a axum::http::HeaderMap,
     /// A `2026-07-28` MCP request.
     pub modern: bool,
@@ -106,8 +109,8 @@ pub(crate) fn sends_the_grant_across_the_origin(surface: &AgentSurface) -> bool 
         })
 }
 
-/// The URL a request carrying the grant is sent to: the Target's endpoint,
-/// its path followed by `segments`, and never the caller's query string.
+/// The URL a request carrying the grant is sent to: the Target's endpoint and
+/// its path followed by `segments`. Such a request has no query string.
 fn forwarded_url(
     endpoint: &str,
     segments: &[&str],
@@ -127,12 +130,13 @@ fn forwarded_url(
 }
 
 /// The `400` answer to a request whose path is not at or under the Target's
-/// endpoint path as a request carrying the grant must be.
+/// endpoint path as a request carrying the grant must be, or that has a query
+/// string, which such a request is never sent with.
 fn path_refused(
     mcp: bool,
     body: &[u8],
 ) -> Response {
-    const MESSAGE: &str = "The request path is not one the Access Point's Target is sent";
+    const MESSAGE: &str = "The request path or query is not one the Access Point's Target is sent";
     let mut response = if mcp {
         crate::mcp::request_validation::McpRequestValidationError {
             status: StatusCode::BAD_REQUEST,
@@ -472,6 +476,13 @@ async fn route_unaudited(
         log_refusal(surface, "method_not_sent_the_grant");
         return Err(method_refused(mcp));
     }
+    if request
+        .query
+        .is_some_and(|query| !query.is_empty())
+    {
+        log_refusal(surface, "query_not_sent");
+        return Err(path_refused(mcp, body));
+    }
     let Some(target_url) = forwarded_url(&surface.target.endpoint, &segments) else {
         return Err(unavailable(surface, mcp, body, "target_not_a_url"));
     };
@@ -486,6 +497,9 @@ async fn route_unaudited(
     }
     if surface.presents_the_agent_to_the_target() {
         return Err(unavailable(surface, mcp, body, "presentation_of_the_agent"));
+    }
+    if surface.injects_custom_metadata() {
+        return Err(unavailable(surface, mcp, body, "custom_metadata_beside_the_grant"));
     }
     if surface.charges_callers() {
         return Err(unavailable(surface, mcp, body, "callers_charged"));

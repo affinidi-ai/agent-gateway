@@ -19,14 +19,17 @@ changes:
         identity VP (inject_vp or identity_slots.inbound), an enabled workload binding and the
         surface's DID injected protocol_native are refused with it, and it charges callers
         nothing, so an enabled x402 or MPP payment policy is refused too: a payment is settled
-        before the grant is released, which can still be refused. A variant that keeps an owner
+        before the grant is released, which can still be refused. Enabled target.custom_metadata
+        is refused as well, since it would send the vendor values of the gateway's beside the
+        grant. A variant that keeps an owner
         binding keeps the surface's caller authentication, Access Point inbound_policy and
         trust_check_list and Target policy, since every caller they let through acts as the
         owner. The connect API, the grants report and removal take hop target; the Target's
         grants are removed and revoked when its binding goes or narrows, as a Transit Point's
         are, and the daily sweep keeps them only while it is served. A save warns of an enabled
         variant that keeps the binding under its own Access Point or Target settings, and a
-        variant created from one that holds it does not copy it. No agent-keyed path, legacy or
+        variant created from one that holds it does not copy it and is created disabled, with a
+        warning, since it would send the copied Target requests without the grant. No agent-keyed path, legacy or
         2026-07-28, ever serves such a binding. The Surface Builder's Credential Delegation
         element keeps such a binding, and its subject, when the surface is saved, shows it
         read-only, offering only its removal, which revokes its grants, and asks for an agent
@@ -39,8 +42,8 @@ changes:
         and never the caller's credential. The request goes only to the origin of the
         provider's resource, through Strict egress pinned to the vetted addresses, with
         redirects refused and the destination checked again on every request, and only to the
-        Target's endpoint path on MCP, or at or under it on A2A, without the caller's query
-        string: a path the vendor might read otherwise than the gateway, with a dot segment
+        Target's endpoint path on MCP, or at or under it on A2A, with no query string, so a
+        request with one is refused 400 rather than sent without it: a path the vendor might read otherwise than the gateway, with a dot segment
         plain or percent-encoded, a segment of dots and spaces alone, a byte that is not ASCII
         once decoded, an encoded separator, an empty segment, a path parameter or a second
         encoding, is refused 400, and a method the protocol does not send the grant
@@ -51,7 +54,7 @@ changes:
         caller's; the gateway adds no caller-info or DID header, asks for an
         uncompressed answer and refuses a compressed one. A caller the Access Point did not
         identify is refused 403, so it never acts as the owner or as another caller; a public
-        discovery read carries no grant. The grant is released, refreshed and answered by the
+        discovery read carries no grant and no query string. The grant is released, refreshed and answered by the
         same code as a Transit Point's: a grant due a refresh is refreshed first,
         single-flight; the Target's 401 whose challenge says invalid_token gets one refresh and
         one retry for bodies within 1 MiB, audited under the same caller and marked used, and
@@ -109,6 +112,7 @@ changes:
         refused at once rather than when the session expires, and a session minted on a variant
         is not taken at the base surface or another variant. session_ttl_seconds is capped at
         86400, the default, and no session authenticates more than 86400 seconds after it was
-        minted, whatever it was stored with. A save above 86400 is refused; a stored surface
-        above it still loads, with a startup warning, so an upgrade never stops the gateway.
+        minted, whatever it was stored with. A save that sets a value above 86400 is refused; a
+        stored surface above it still loads, with a startup warning, so an upgrade never stops
+        the gateway, and can still be saved while it keeps that value.
   breaking: []

@@ -687,6 +687,13 @@ impl AgentSurface {
                 .is_some_and(|did| did.injection_mode == super::agent_surface::DidInjectionMode::ProtocolNative)
     }
 
+    /// Whether the Target is sent operator-configured custom metadata, in the
+    /// request body or in `X-Gateway-*` headers.
+    pub fn injects_custom_metadata(&self) -> bool {
+        self.custom_metadata()
+            .is_some_and(|metadata| metadata.enabled)
+    }
+
     // ── Transit shorthands ──────────────────────────────────────────────────
 
     /// Returns the set of transit points reachable from this surface.

@@ -759,7 +759,12 @@ async fn a_discovery_read_carries_no_grant() {
             .body(axum::body::Body::empty())
             .unwrap()
     };
-    for path in ["/vendor/.well-known/agent-card.json", "/vendor/discovery", "/vendor/../.well-known/agent-card.json"] {
+    for path in [
+        "/vendor/.well-known/agent-card.json",
+        "/vendor/discovery",
+        "/vendor/../.well-known/agent-card.json",
+        "/vendor/discovery?access_token=smuggled&x=1",
+    ] {
         let (status, _, body) = fixture.send(read(path)).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{path}: {body}");
     }
@@ -767,7 +772,7 @@ async fn a_discovery_read_carries_no_grant() {
         .send(read("/vendor/%2e%2e/discovery"))
         .await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(fixture.vendor_saw(), [(None, false), (None, false), (None, false)]);
+    assert_eq!(fixture.vendor_saw(), [(None, false), (None, false), (None, false), (None, false)]);
     let heads = fixture.vendor_heads();
     let lines: Vec<_> = heads
         .iter()
@@ -778,7 +783,8 @@ async fn a_discovery_read_carries_no_grant() {
         [
             "GET /mcp/.well-known/agent-card.json HTTP/1.1",
             "GET /mcp/discovery HTTP/1.1",
-            "GET /mcp/.well-known/agent-card.json HTTP/1.1"
+            "GET /mcp/.well-known/agent-card.json HTTP/1.1",
+            "GET /mcp/discovery HTTP/1.1"
         ]
     );
     for (line, headers) in &heads {
@@ -1000,8 +1006,14 @@ async fn the_grant_goes_only_to_the_targets_endpoint_path() {
         ("spaces alone", "/vendor/v1/%20%20/tasks"),
     ];
 
-    let (status, _, body) = fixture
+    let (status, headers, body) = fixture
         .send(call_to("POST", "/vendor?access_token=smuggled&x=1", Some(tools.clone())))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "a request with a query string: {body}");
+    assert_eq!(body["id"], 7, "a request with a query string");
+    assert_eq!(headers["cache-control"], "no-store", "a request with a query string");
+    let (status, _, body) = fixture
+        .send(call_to("POST", "/vendor", Some(tools.clone())))
         .await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     for (case, uri) in climbing
@@ -1047,6 +1059,19 @@ async fn the_grant_goes_only_to_the_targets_endpoint_path() {
         ("POST", "/vendor?x=1", Some(send.clone())),
         ("POST", "/vendor/v1/message:send?x=1", Some(send.clone())),
         ("GET", "/vendor/v1/tasks/task-1?historyLength=2", None),
+        ("GET", "/vendor/v1/tasks?pageToken=abc", None),
+        ("DELETE", "/vendor/v1/tasks/task-1/pushNotificationConfigs/config-1?x=1", None),
+    ] {
+        let (status, headers, answer) = fixture
+            .send(call_to(method, uri, body))
+            .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "A2A {method} {uri}, with a query string: {answer}");
+        assert_eq!(headers["content-type"], "application/problem+json", "A2A {method} {uri}");
+    }
+    for (method, uri, body) in [
+        ("POST", "/vendor", Some(send.clone())),
+        ("POST", "/vendor/v1/message:send", Some(send.clone())),
+        ("GET", "/vendor/v1/tasks/task-1", None),
         ("DELETE", "/vendor/v1/tasks/task-1/pushNotificationConfigs/config-1", None),
     ] {
         let (status, _, answer) = fixture
@@ -1150,9 +1175,9 @@ async fn no_grant_goes_to_callers_who_name_themselves() {
 }
 
 /// A surface that would send the vendor a presentation of the agent, as an
-/// identity VP, a workload binding or its DID in the body, never releases the
-/// Target's grant, as one edited by hand might: it answers
-/// `connector_unavailable` and reads no grant.
+/// identity VP, a workload binding or its DID in the body, or custom metadata
+/// of the gateway's, never releases the Target's grant, as one edited by hand
+/// might: it answers `connector_unavailable` and reads no grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_grant_goes_with_a_presentation_of_the_agent() {
     let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
@@ -1168,6 +1193,7 @@ async fn no_grant_goes_with_a_presentation_of_the_agent() {
             "/access_point/didwebvh_identity",
             json!({"injection_mode": "protocol_native"}),
         ),
+        ("custom metadata", "/target/custom_metadata", json!({"enabled": true, "payload": {"tenant": "acme"}})),
     ] {
         let mut surface = serde_json::to_value(vendor_surface("mcp", &target, "owner")).unwrap();
         let (parent, name) = field

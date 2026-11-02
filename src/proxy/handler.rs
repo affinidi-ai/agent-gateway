@@ -3154,6 +3154,7 @@ async fn proxy_handler_with_mcp_runtime(
         crate::proxy::target_grant::TargetRequest {
             method: method.as_str(),
             path: uri.path(),
+            query: uri.query(),
             headers: &headers,
             modern: modern_request.is_some(),
             body: &body_bytes,
@@ -3830,12 +3831,30 @@ async fn proxy_handler_with_mcp_runtime(
     // Build target URL (or get direct response for special protocols like DID).
     // A2A Proxy targets are internal adapter references, not network URLs; keep
     // them in the normal policy/trust pipeline, then dispatch after OPA.
+    // A discovery read is the only request a Target bound by external consent
+    // is sent without the grant, and it is sent without the caller's query.
+    let uri_without_query;
+    let forwarded_uri = match uri.path_and_query() {
+        Some(path_and_query)
+            if path_and_query
+                .query()
+                .is_some()
+                && crate::proxy::target_grant::binds_the_target(&state.surface) =>
+        {
+            uri_without_query = path_and_query
+                .path()
+                .parse()
+                .unwrap_or_else(|_| uri.clone());
+            &uri_without_query
+        }
+        _ => &uri,
+    };
     let target_url = if is_a2a_proxy_target {
         String::new()
     } else {
         match build_target_url(
             &state.surface.target.endpoint,
-            &uri,
+            forwarded_uri,
             &method,
             &headers,
             state

@@ -410,23 +410,39 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 ///
 /// Enforces the mTLS trust rules the runtime relies on, every
 /// `DidAuthAuthConfig` invariant boot also checks (see
-/// [`validate_did_auth_config`]), and the DID Auth session TTL bound.
-pub fn validate_source_auth_config(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
+/// [`validate_did_auth_config`]), and the DID Auth session TTL bound, unless
+/// `stored`, the surface as stored, has the same TTL.
+pub fn validate_source_auth_config(
+    surface: &crate::config::agent_surface::AgentSurface,
+    stored: Option<&crate::config::agent_surface::AgentSurface>,
+) -> anyhow::Result<()> {
     match surface.source_auth() {
-        Some(src) => validate_source_auth_method(src, &surface.name),
+        Some(src) => validate_source_auth_method(src, stored.and_then(|stored| stored.source_auth()), &surface.name),
         None => Ok(()),
     }
 }
 
 /// Validate one source authentication method being saved, set on the Access
-/// Point or a Transit Point of the surface named `surface_name`.
+/// Point or a Transit Point of the surface named `surface_name`. The DID Auth
+/// session TTL bound applies only to a TTL that `stored`, the method stored in
+/// its place, does not already have: a surface stored above it loads, and its
+/// sessions are held to the bound, so a save that keeps the TTL is accepted.
 pub(crate) fn validate_source_auth_method(
     src: &crate::source_auth::SourceAuthConfig,
+    stored: Option<&crate::source_auth::SourceAuthConfig>,
     surface_name: &str,
 ) -> anyhow::Result<()> {
+    use crate::source_auth::SourceAuthConfig;
+
     validate_stored_source_auth_method(src, surface_name)?;
-    if let crate::source_auth::SourceAuthConfig::DidAuth(cfg) = src {
-        validate_session_ttl_bound(cfg.session_ttl_seconds, surface_name)?;
+    if let SourceAuthConfig::DidAuth(cfg) = src {
+        let kept = matches!(
+            stored,
+            Some(SourceAuthConfig::DidAuth(stored)) if stored.session_ttl_seconds == cfg.session_ttl_seconds
+        );
+        if !kept {
+            validate_session_ttl_bound(cfg.session_ttl_seconds, surface_name)?;
+        }
     }
     Ok(())
 }
@@ -723,9 +739,19 @@ mod tests {
             ["Surface 'too-long' (too-long): did_auth.session_ttl_seconds is 172800, above the longest, 86400 \
               seconds; its sessions last 86400 seconds"]
         );
-        let error = validate_source_auth_config(&config.surfaces[0]).expect_err("a save above the longest is refused");
+        let error =
+            validate_source_auth_config(&config.surfaces[0], None).expect_err("a save above the longest is refused");
         assert_eq!(error.to_string(), "Channel 'too-long': did_auth.session_ttl_seconds 172800 exceeds max 86400");
-        validate_source_auth_config(&config.surfaces[1]).expect("a save of the longest passes");
+        validate_source_auth_config(&config.surfaces[1], None).expect("a save of the longest passes");
+        validate_source_auth_config(&config.surfaces[0], Some(&config.surfaces[0]))
+            .expect("a save that keeps a stored TTL above the longest passes");
+        let longer = surface_with_session_ttl("too-long", Some(172_801));
+        validate_source_auth_config(&longer, Some(&config.surfaces[0]))
+            .expect_err("a save that changes a stored TTL above the longest to another is refused");
+        validate_source_auth_config(&config.surfaces[0], Some(&config.surfaces[1]))
+            .expect_err("a save that raises a stored TTL above the longest is refused");
+        validate_source_auth_config(&config.surfaces[0], Some(&config.surfaces[2]))
+            .expect_err("a save that sets a TTL above the longest where none was is refused");
 
         assert!(
             validate_source_auth_surface(&surface_with_session_ttl("zero", Some(0))).is_err(),

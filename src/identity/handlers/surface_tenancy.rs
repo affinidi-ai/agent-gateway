@@ -480,6 +480,10 @@ fn check_access_point_target_binding(
                     target.identity_injection.inject_vp and target.workload_binding, remove \
                     identity_slots.inbound, and inject the surface's DID in a header, not protocol_native");
     }
+    if view.injects_custom_metadata() {
+        return Err("consent_mode external sends the vendor nothing of the gateway's beside the grant: turn \
+                    target.custom_metadata off");
+    }
     Ok(())
 }
 
@@ -3232,6 +3236,24 @@ mod tests {
                     variant(serde_json::json!({"target": {"payment_policy": {"type": "x402", "enabled": true}}})),
                 ),
                 format!("variant 'candidate' {binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "custom metadata for the vendor",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "custom_metadata": {"enabled": true, "payload": {"tenant": "acme"}}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor nothing of the gateway's"),
+            ),
+            (
+                "a variant that keeps it and adds custom metadata",
+                target_surface(
+                    only.clone(),
+                    variant(serde_json::json!({"target": {"custom_metadata": {"enabled": true,
+                        "payload": {"tenant": "acme"}}}})),
+                ),
+                format!("variant 'candidate' {binding}consent_mode external sends the vendor nothing of the gateway's"),
             ),
             (
                 "a subject on another consent mode",
