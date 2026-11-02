@@ -140,10 +140,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
   ready: it saves, and callers get 503 until a save adds a Caller Context or turns Public access
   on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
-  (`access-point/readiness.ts`) is the one copy of that rule, and the notice uses it;
-  `validateSurfacePayload` uses only its `hasCallerAuthentication` check, for the legacy
-  no-Caller-Context warning. Every surface response carries a read-only `access_point_status`, which
-  `toBackendSurface` (`src/api.ts`) leaves out of writes.
+  (`access-point/readiness.ts`) is the one copy of that rule, and the notice uses it. Every
+  surface response carries a read-only `access_point_status`, which `toBackendSurface`
+  (`src/api.ts`) leaves out of writes.
   - The notice sits under the canvas Entry point URL, which keeps its copy button
     (`surface-access-point-readiness`), rendered by `AccessPointReadinessNotice` through
     `RouteListenerBanner`'s `footer`, in the warning yellow. The Access Point panel doesn't
@@ -160,16 +159,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     can't open the Caller Context slot itself.
   - Saved not ready but the unsaved canvas would be ready: "Not ready for external access. Save
     to activate.", with no button.
-  The save prompts:
-  - Not ready: the gateway's save response `warnings` carry "This Access Point is not ready for
-    external access. …", shown as "Warning: …" after the save.
-  - Public access on: the gateway's save response `warnings` carry "This Access Point is
-    public. …", shown as "Warning: …" after every successful save.
-  - Stored without `public` and no Caller Context: the save goes ahead, then a `warning` toast,
-    "Warning: This Access Point has no Caller Context. …".
-  Post-save warnings go through `showSurfaceSaveWarnings` (`elements/saveWarnings.ts`) as
-  `warning` toasts, at most three: the response's `warnings` first, then the dashboard's own,
-  each message once.
+  The save prompts come from the gateway, as `Warning` headers on the save response, so API
+  clients get them too; the dashboard adds no caller access warning of its own:
+  - Not ready: "This Access Point is not ready for external access. …", and one per enabled
+    variant that is not ready, prefixed `variant '<alias>': `.
+  - Public access on: "This Access Point is public. …", on every successful save.
+  - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
+    public, and it admits callers without credentials. …".
+  `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
+  toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
+  and one line per warning as a `warning` toast, the `Warning` headers first, then the
+  dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
+  headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
+  surface's page so the banner lists them.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so

@@ -417,7 +417,7 @@ const AddSurfacePage: React.FC = () => {
     // surface after a successful POST.
     try {
       const draft = buildSurfacePayload();
-      const issues = validateSurfacePayload(draft, { isNew: true });
+      const issues = validateSurfacePayload(draft);
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };
@@ -466,11 +466,7 @@ const AddSurfacePage: React.FC = () => {
       justCreatedRef.current = true;
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, {
-        isNew: true,
-        headerWarnings,
-        warnings: created?.warnings,
-      });
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, { headerWarnings });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
       if (headerWarnings.length > 0 && created?.surface_id) {

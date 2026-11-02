@@ -626,19 +626,6 @@ fn get_current_admin_surface_body(
         .clone()
 }
 
-/// The surface from the last admin save, without the save's `warnings`.
-fn get_saved_surface_without_warnings(
-    world: &SurfaceWorld,
-    action: &str,
-) -> serde_json::Value {
-    let mut surface = get_current_admin_surface_body(world, action);
-    surface
-        .as_object_mut()
-        .expect("surface body must be an object")
-        .remove("warnings");
-    surface
-}
-
 async fn update_created_surface(
     world: &mut SurfaceWorld,
     payload: serde_json::Value,
@@ -1628,7 +1615,7 @@ async fn valid_surface_create_request_submitted(
 }
 
 pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
-    let mut payload = get_saved_surface_without_warnings(world, "marking the surface public");
+    let mut payload = get_current_admin_surface_body(world, "marking the surface public");
     payload["access_point"]["public"] = serde_json::json!(true);
 
     update_created_surface(world, payload, "marking the surface public").await;
@@ -1636,7 +1623,7 @@ pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
 
 /// Save the scenario's source authentication on the created surface.
 pub(crate) async fn add_source_authentication(world: &mut SurfaceWorld) {
-    let mut payload = get_saved_surface_without_warnings(world, "adding source authentication");
+    let mut payload = get_current_admin_surface_body(world, "adding source authentication");
     let auth = world
         .surface_config
         .source_auth
@@ -1649,7 +1636,7 @@ pub(crate) async fn add_source_authentication(world: &mut SurfaceWorld) {
 }
 
 pub(crate) async fn remove_source_authentication(world: &mut SurfaceWorld) {
-    let mut payload = get_saved_surface_without_warnings(world, "removing source authentication");
+    let mut payload = get_current_admin_surface_body(world, "removing source authentication");
     payload["access_point"]
         .as_object_mut()
         .expect("surface body must have an access_point object")
@@ -1662,7 +1649,7 @@ pub(crate) async fn add_complete_variant_without_source_authentication(
     world: &mut SurfaceWorld,
     alias: &str,
 ) {
-    let mut payload = get_saved_surface_without_warnings(world, "adding a variant");
+    let mut payload = get_current_admin_surface_body(world, "adding a variant");
     let target_endpoint = payload["target"]["endpoint"].clone();
     payload["variants"] = serde_json::json!([{
         "id": format!("variant-{alias}"),

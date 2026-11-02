@@ -1272,7 +1272,7 @@ const SurfaceDetailPage: React.FC = () => {
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
       payload = withCallerAccessSettled(payload);
       let headerWarnings: string[] = [];
-      const { warnings, ...updated } = await apiClient.updateSurface(surfaceId, payload, {
+      const updated = await apiClient.updateSurface(surfaceId, payload, {
         onWarnings: received => {
           headerWarnings = received;
         },
@@ -1367,10 +1367,7 @@ const SurfaceDetailPage: React.FC = () => {
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving.
-      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
-        headerWarnings,
-        warnings,
-      });
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1623,7 +1620,7 @@ const SurfaceDetailPage: React.FC = () => {
   // to save.
   const accessPointNotice = chooseAccessPointNotice(
     savedAccessPointStatus(surface, variantSnapshots.activeVariantId),
-    accessPointStatus(withCallerAccessSettled(livePayload as Partial<AgentSurface>))
+    accessPointStatus(livePayload as Partial<AgentSurface>)
   );
   // Stored without `public`: Public access shows a legacy state, which the
   // operator can close.

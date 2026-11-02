@@ -63,12 +63,12 @@ admits callers without a valid credential
 | --- | --- |
 | absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. It keeps the behaviour its stored fields describe: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
 | `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. A failed caller is refused whatever `on_failure` stores, including on a surface edited by hand. |
-| `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save response carries a warning. |
+| `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save answers with a `Warning` header. |
 
 On a closed surface the admin API, on create and on every update:
 
 - saves a surface, or an enabled variant, whose Access Point has no `caller_authentication`
-  method, and adds a `warnings` entry saying it is not ready for external access. An MCP
+  method, and answers with a `Warning` header saying it is not ready for external access. An MCP
   Access Point protected by `mcp_http.authorization` counts as authenticating its callers;
 - sets `caller_authentication.on_failure` to `reject`, on the base and on every variant
   override that sets `caller_authentication`;
@@ -88,11 +88,12 @@ target, on direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets and Fa
 MCP callers get a JSON-RPC error carrying the request id; other callers get
 `application/problem+json`. The body says only that the Access Point is not available; the
 reason is logged, and each refusal is recorded in the Audit Log as `request_rejected` with the
-reason `access_point_not_ready`. Onboarding surfaces are unaffected. Legacy and public Access Points are
-always ready.
+reason `access_point_not_ready`. Legacy and public Access Points are always ready, and so are
+onboarding surfaces, which capture a request and never forward it.
 
 Surface responses carry a read-only top-level `access_point_status`, `ready` or
-`not_ready`, for the base surface; variant responses carry it for the resolved variant.
+`not_ready`, for the surface the Access Point URL serves: the default variant when the surface
+has one, otherwise the base. Variant responses carry it for that variant.
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -104,14 +105,16 @@ and limit requests per client upstream of the gateway if credential guessing is 
 is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
-Create and update responses are the saved surface plus `access_point_status`, and
-`"warnings": [...]` when there is something to warn about. A write request that sends a save
-response back unchanged has its top-level `warnings` and `access_point_status` dropped before
-parsing.
+Create and update responses are the saved surface plus `access_point_status`. A save warns
+in `Warning` headers (code 299), before the Transit Point warnings described below, when the
+Access Point is public, when it or an enabled variant is not ready (a variant's warning is
+prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
+admits every caller. A write request that sends a response back unchanged has its top-level
+`access_point_status` dropped before parsing.
 
-A gateway rolled back to a version without these fields cannot load surfaces that store them
-(`access_point` and `caller_authentication` reject unknown fields). It logs and skips them, and
-they load again after the upgrade is reapplied.
+A gateway rolled back to a release without these fields cannot load the surfaces that store
+them, which is every surface created after the upgrade; see
+[Upgrading and rolling back](#upgrading-and-rolling-back).
 
 ### Failed credentials with `on_failure: continue`
 
@@ -442,6 +445,15 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
   rolling back, also remove `source_auth` from such templates, or back up
   `_storage/agent_surface_templates/` before upgrading and restore it on rollback. Templates
   are always stored as plain JSON.
+- A release that predates closed Access Points rejects `access_point.public` and
+  `caller_authentication.on_failure` (both reject unknown fields), so it skips, with a logged
+  error, every surface that stores either one. That is every surface the admin API or the
+  dashboard created after the upgrade, and every surface an operator closed or opened since.
+  Their routes answer `404` and they leave the dashboard and Fabric discovery: they are down,
+  not open. The records stay on disk and load again once the upgrade is reapplied. Removing
+  the fields to load such a surface on the older release opens it: one without source
+  authentication then admits every caller, and one with it hands a failed caller to policy.
+  Back up `_storage/agent_surfaces/` before upgrading.
 
 ### Transit Point source authentication
 

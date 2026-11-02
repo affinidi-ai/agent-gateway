@@ -113,14 +113,17 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .await
         .unwrap();
     assert_eq!(ignored.status(), 200);
-    let mut ignored: serde_json::Value = ignored.json().await.unwrap();
-    assert_eq!(
+    assert!(
         ignored
-            .as_object_mut()
-            .unwrap()
-            .remove("warnings"),
-        Some(json!([crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING]))
+            .headers()
+            .get_all("warning")
+            .iter()
+            .any(|value| value
+                .to_str()
+                .is_ok_and(|value| value.contains(crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING))),
+        "a save of a public Access Point says so in a Warning header"
     );
+    let ignored: serde_json::Value = ignored.json().await.unwrap();
     assert!(
         ignored
             .get("mcp_protocol_mode")
@@ -141,10 +144,6 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .send().await.unwrap();
     assert_eq!(response.status(), 200);
     let mut removed: serde_json::Value = response.json().await.unwrap();
-    removed
-        .as_object_mut()
-        .unwrap()
-        .remove("warnings");
     assert_eq!(
         removed
             .as_object_mut()

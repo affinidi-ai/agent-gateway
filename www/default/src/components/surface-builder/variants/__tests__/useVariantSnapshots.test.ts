@@ -869,6 +869,40 @@ describe('syncAccessPointIdentifiers', () => {
     expect('protocol' in out.__base__.access_point).toBe(true);
   });
 
+  it('clears public from every snapshot when the source has none (legacy switch off)', () => {
+    const canvas = (config: Record<string, unknown>) => ({
+      nodes: [{ id: 'access-point', config }],
+    });
+    // Public access was turned on in base and mirrored, then turned off again
+    // in variant v2 on a surface stored without `public`.
+    const source = {
+      access_point: { route: '/r' },
+      canvas: canvas({ route: '/r' }),
+    };
+    const snapshots = {
+      __base__: {
+        access_point: { route: '/r', public: true },
+        canvas: canvas({ route: '/r', public: true }),
+      },
+      v2: {
+        access_point: { route: '/r', public: true },
+        canvas: canvas({ route: '/r', public: true }),
+      },
+    };
+    const out = syncAccessPointIdentifiers(snapshots, source);
+    for (const id of ['__base__', 'v2'] as const) {
+      expect('public' in out[id].access_point).toBe(false);
+      expect('public' in out[id].canvas.nodes[0].config).toBe(false);
+    }
+  });
+
+  it('mirrors a closed public from the source into every snapshot', () => {
+    const source = { access_point: { route: '/r', public: false } };
+    const snapshots = { __base__: { access_point: { route: '/r', public: true } } };
+    const out = syncAccessPointIdentifiers(snapshots, source);
+    expect(out.__base__.access_point.public).toBe(false);
+  });
+
   it('syncs the canvas identifier fields (incl. route_prefix/route_suffix) into every snapshot blob', () => {
     const canvasNode = (route: string, suffix: string) => ({
       version: 1,

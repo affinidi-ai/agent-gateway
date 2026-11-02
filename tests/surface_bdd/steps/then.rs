@@ -942,13 +942,8 @@ fn fetching_surface_by_id_returns_stored_configuration(world: &mut SurfaceWorld)
     assert_status_with_body(lookup.status, 200, &lookup.body, "surface lookup");
 
     let fetched = &lookup.body;
-    let mut stored = get_admin_response(world)
-        .body
-        .clone();
-    if let Some(saved) = stored.as_object_mut() {
-        saved.remove("warnings");
-    }
-    assert_json_bodies_equal(fetched, &stored, "fetched surface should match the stored disabled configuration");
+    let stored = &get_admin_response(world).body;
+    assert_json_bodies_equal(fetched, stored, "fetched surface should match the stored disabled configuration");
 }
 
 #[then("the stored surface keeps the existing surface id")]

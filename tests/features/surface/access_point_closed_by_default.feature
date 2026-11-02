@@ -56,6 +56,13 @@ Feature: New Access Points are closed by default
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
 
+  Scenario: A stored surface never marked closed or public hands a failed caller to policy
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "API Key" source authentication
+    When the caller sends a request to the surface without an API key
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+
   Scenario Outline: A new surface refuses a caller whose API key is missing or invalid
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "API Key" source authentication

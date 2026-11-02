@@ -31,8 +31,6 @@ const toast = showToast as jest.Mock;
 
 const PUBLIC_MESSAGE =
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
-const NO_CALLER_CONTEXT_WARNING =
-  'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
 
 function makeCtx(nodes: any[]): PayloadContext {
   return {
@@ -269,9 +267,9 @@ describe('withCallerAccessSettled', () => {
 describe('showSurfaceSaveToast', () => {
   beforeEach(() => toast.mockReset());
 
-  it("shows the save response's warnings, each once", () => {
+  it("shows the save response's Warning headers, each once", () => {
     const saved = storedSurface({ public: true, caller_authentication: API_KEY_AUTH });
-    showSurfaceSaveToast('Saved', saved, { warnings: [PUBLIC_MESSAGE, PUBLIC_MESSAGE, 7] });
+    showSurfaceSaveToast('Saved', saved, { headerWarnings: [PUBLIC_MESSAGE, PUBLIC_MESSAGE] });
 
     expect(toast.mock.calls).toEqual([
       ['warning', `Saved, with warnings:\n${PUBLIC_MESSAGE}`, expect.anything()],
@@ -283,22 +281,17 @@ describe('showSurfaceSaveToast', () => {
     expect(toast.mock.calls).toEqual([['success', 'Saved']]);
   });
 
-  it('warns about a stored surface with no Caller Context', () => {
+  it('leaves the warning about a stored surface with no Caller Context to the gateway', () => {
     showSurfaceSaveToast('Saved', storedSurface({}));
-    expect(toast).toHaveBeenCalledWith(
-      'warning',
-      `Saved, with warnings:\n${NO_CALLER_CONTEXT_WARNING}`,
-      expect.anything()
-    );
+    expect(toast.mock.calls).toEqual([['success', 'Saved']]);
   });
 
-  it('shows one toast, the header warnings first', () => {
+  it('shows every Warning header in one toast, in order', () => {
     showSurfaceSaveToast(
       'Saved',
       storedSurface({ public: true, caller_authentication: API_KEY_AUTH }),
       {
-        headerWarnings: ['from the gateway'],
-        warnings: [PUBLIC_MESSAGE],
+        headerWarnings: ['from the gateway', PUBLIC_MESSAGE],
       }
     );
     expect(toast).toHaveBeenCalledTimes(1);
@@ -312,10 +305,7 @@ describe('showSurfaceSaveToast', () => {
   it('shows success alone for a closed surface with a Caller Context', () => {
     showSurfaceSaveToast(
       'Saved',
-      storedSurface({ public: false, caller_authentication: API_KEY_AUTH }),
-      {
-        isNew: true,
-      }
+      storedSurface({ public: false, caller_authentication: API_KEY_AUTH })
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith('success', 'Saved');

@@ -2,11 +2,7 @@
  * `validateSurfacePayload` unit tests.
  */
 
-import {
-  ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
-  validateSurfacePayload,
-  hasBlockingIssues,
-} from '../validateSurface';
+import { validateSurfacePayload, hasBlockingIssues } from '../validateSurface';
 // Side-effect import: registers every element definition so the
 // validator's registry-aware checks (e.g. parent-type classification
 // for the chain-leak watchdog) can resolve types.
@@ -31,8 +27,8 @@ describe('validateSurfacePayload', () => {
       access_point: { route: '/a', ...extra },
     });
 
-    it('lets a new surface with no Caller Context save, leaving the not-ready warning to the gateway', () => {
-      const issues = validateSurfacePayload(open(), { isNew: true });
+    it('lets a surface with no Caller Context save, leaving its warning to the gateway', () => {
+      const issues = validateSurfacePayload(open());
       expect(hasBlockingIssues(issues)).toBe(false);
       expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
     });
@@ -54,26 +50,8 @@ describe('validateSurfacePayload', () => {
     });
 
     it('raises no access issue when Public access is on, leaving its warning to the gateway', () => {
-      for (const isNew of [true, false]) {
-        const issues = validateSurfacePayload(open({ public: true }), { isNew });
-        expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
-      }
-    });
-
-    it('warns, without blocking, on a surface stored without public and no Caller Context', () => {
-      const issues = validateSurfacePayload(open());
-      expect(hasBlockingIssues(issues)).toBe(false);
-      expect(issues).toContainEqual(
-        expect.objectContaining({
-          severity: 'warning',
-          message: ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
-        })
-      );
-    });
-
-    it('lists the access warning before the other warnings', () => {
-      const issues = validateSurfacePayload({ ...open(), target: { endpoint: '' } });
-      expect(issues[0].message).toBe(ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE);
+      const issues = validateSurfacePayload(open({ public: true }));
+      expect(issues.find(i => i.path?.startsWith('access_point.'))).toBeUndefined();
     });
   });
 

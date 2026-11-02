@@ -279,10 +279,16 @@ describe('AddSurfacePage caller access on create', () => {
     fireEvent.click(button);
   };
 
+  const answeringWith = (warnings: string[]) =>
+    createSurface.mockImplementation(async (_payload, options) => {
+      options?.onWarnings?.(warnings);
+      return {} as AgentSurface;
+    });
+
   it("creates a surface with no Caller Context and shows the response's not-ready warning", async () => {
     const notReady =
       'This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.';
-    createSurface.mockResolvedValue({ warnings: [notReady] } as unknown as AgentSurface);
+    answeringWith([notReady]);
     renderPage();
     await routeSeeded();
 
@@ -312,7 +318,7 @@ describe('AddSurfacePage caller access on create', () => {
   it("creates a public surface and shows the response's public warning once", async () => {
     const publicMessage =
       'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
-    createSurface.mockResolvedValue({ warnings: [publicMessage] } as unknown as AgentSurface);
+    answeringWith([publicMessage]);
     renderPage();
     await routeSeeded();
     fireEvent.click(screen.getByText('Turn on Public access'));

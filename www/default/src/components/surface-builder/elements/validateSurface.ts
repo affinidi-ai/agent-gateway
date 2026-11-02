@@ -13,7 +13,6 @@
  */
 
 import { registry } from './registry';
-import { hasCallerAuthentication, type CallerAccessPayload } from './access-point/readiness';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -32,40 +31,13 @@ export interface ValidationIssue {
   path?: string;
 }
 
-export interface ValidateSurfaceOptions {
-  /** The payload is for a surface that does not exist yet. */
-  isNew?: boolean;
-}
-
-export const ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE =
-  'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
-
 /**
- * Caller access rules. Nothing blocks the save: a closed Access Point with no
- * caller authentication saves as not ready, and the gateway's save response
- * warns about it, as it does for a public one. A surface stored without
- * `public` keeps admitting anonymous callers, so it warns here.
+ * Validate the built payload. Cheap, side-effect-free, no async. Caller
+ * access never blocks a save and raises no issue here: the gateway's save
+ * answers with a `Warning` header for a public, a not-ready, and a legacy
+ * Access Point that admits every caller.
  */
-function accessPointAccessIssues(payload: CallerAccessPayload, isNew: boolean): ValidationIssue[] {
-  if (isNew || typeof payload?.access_point?.public === 'boolean') return [];
-  if (hasCallerAuthentication(payload)) return [];
-  return [
-    {
-      severity: 'warning',
-      message: ACCESS_POINT_NO_CALLER_CONTEXT_MESSAGE,
-      nodeId: 'access-point',
-      path: 'access_point.caller_authentication',
-    },
-  ];
-}
-
-/**
- * Validate the built payload. Cheap, side-effect-free, no async.
- */
-export function validateSurfacePayload(
-  payload: any,
-  options: ValidateSurfaceOptions = {}
-): ValidationIssue[] {
+export function validateSurfacePayload(payload: any): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!payload || typeof payload !== 'object') {
     issues.push({ severity: 'error', message: 'Surface payload is missing or malformed.' });
@@ -82,7 +54,6 @@ export function validateSurfacePayload(
   }
 
   // Listed before the other warnings, which the save toasts cap at three.
-  issues.push(...accessPointAccessIssues(payload, options.isNew === true));
 
   // Target endpoint — required for any surface that proxies to an
   // upstream. Surfaces wired exclusively to NPCs (managed agents) may

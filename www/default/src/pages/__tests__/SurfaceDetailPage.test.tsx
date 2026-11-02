@@ -175,8 +175,8 @@ const PUBLIC_MESSAGE =
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
 const NOT_READY_MESSAGE =
   'This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.';
-const NO_CALLER_CONTEXT_MESSAGE =
-  'This Access Point has no Caller Context. Anyone who can reach it can call your agent without credentials.';
+const LEGACY_OPEN_MESSAGE =
+  'This Access Point is neither closed nor public, and it admits callers without credentials. Add source authentication, or set access_point.public to false to close it or to true to keep it open.';
 const SAVED_WITH_WARNINGS = 'Agent Surface "orders" saved, with warnings:';
 
 const API_KEY_AUTH = {
@@ -212,11 +212,16 @@ describe('SurfaceDetailPage save', () => {
 
   const renderPage = async (surface: AgentSurface, warnings: string[] = []) => {
     jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
-    updateSurface.mockImplementation(async (_id: string, payload: Partial<AgentSurface>) => ({
-      ...surface,
-      ...payload,
-      warnings,
-    }));
+    updateSurface.mockImplementation(
+      async (
+        _id: string,
+        payload: Partial<AgentSurface>,
+        options?: { onWarnings?: (warnings: string[]) => void }
+      ) => {
+        options?.onWarnings?.(warnings);
+        return { ...surface, ...payload };
+      }
+    );
     render(
       <MemoryRouter initialEntries={['/surfaces/srf-1']}>
         <Routes>
@@ -257,14 +262,14 @@ describe('SurfaceDetailPage save', () => {
     expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${PUBLIC_MESSAGE}`]);
   });
 
-  it('saves a surface stored without public and no Caller Context, then warns', async () => {
-    await renderPage(stored({}));
+  it("saves a surface stored without public and no Caller Context, then shows the gateway's warning", async () => {
+    await renderPage(stored({}), [LEGACY_OPEN_MESSAGE]);
     expect(screen.getByTestId('legacy-access-point')).toHaveTextContent('true');
 
     const sent = await save();
 
     expect(sent.access_point).not.toHaveProperty('public');
-    expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${NO_CALLER_CONTEXT_MESSAGE}`]);
+    expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${LEGACY_OPEN_MESSAGE}`]);
     expect(toast.mock.calls.some(c => c[0] === 'error')).toBe(false);
   });
 
@@ -336,7 +341,6 @@ describe('SurfaceDetailPage Access Point readiness notice', () => {
         ...closed,
         ...payload,
         access_point_status: 'ready',
-        warnings: [],
       }));
     fireEvent.click(screen.getByTestId('surface-save-button'));
 

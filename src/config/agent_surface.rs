@@ -504,9 +504,9 @@ impl OnFailure {
     }
 }
 
-/// The warning on every admin API save of a closed Access Point (`public:
-/// false`) without source authentication, which refuses every caller until it
-/// gets one. A variant's warning is prefixed `variant '<alias>': `.
+/// The `Warning` header on every admin API save of a closed Access Point
+/// (`public: false`) without source authentication, which refuses every caller
+/// until it gets one. A variant's warning is prefixed `variant '<alias>': `.
 pub const ACCESS_POINT_NOT_READY_WARNING: &str = "This Access Point is not ready for external access. Add source \
      authentication (a caller_authentication method), or set access_point.public to true to allow callers without \
      credentials.";
@@ -524,9 +524,17 @@ pub enum AccessPointStatus {
     NotReady,
 }
 
-/// The warning on every admin API save of a surface whose Access Point is public.
+/// The `Warning` header on every admin API save of a surface whose Access
+/// Point is public.
 pub const PUBLIC_ACCESS_POINT_WARNING: &str =
     "This Access Point is public. Anyone who can reach it can call your agent without credentials.";
+
+/// The `Warning` header on every admin API save of a surface stored before
+/// Access Points were closed by default (no `public`) that authenticates no
+/// caller, so it admits every caller.
+pub const LEGACY_OPEN_ACCESS_POINT_WARNING: &str = "This Access Point is neither closed nor public, and it admits \
+     callers without credentials. Add source authentication, or set access_point.public to false to close it or to \
+     true to keep it open.";
 
 /// What the Gateway needs to know about the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -3321,21 +3329,51 @@ impl AgentSurface {
     /// Whether this Access Point serves callers, on the surface as it is
     /// served (the base, or a resolved variant). A closed Access Point
     /// (`public: false`) is ready only once it authenticates callers; a public
-    /// or legacy one always is.
+    /// or legacy one always is, and so is an onboarding surface, which
+    /// captures a request and never forwards it.
     pub fn access_point_status(&self) -> AccessPointStatus {
-        if self.access_point.public == Some(false) && !self.authenticates_callers() {
+        if self.access_point.public == Some(false) && !self.authenticates_callers() && !self.is_onboarding() {
             AccessPointStatus::NotReady
         } else {
             AccessPointStatus::Ready
         }
     }
 
+    /// The [`Self::access_point_status`] of the surface a request without a
+    /// variant alias is served from: the default variant, when
+    /// [`Self::select_variant`] selects one, else the base.
+    pub fn served_access_point_status(&self) -> AccessPointStatus {
+        match self.select_variant(None) {
+            Ok(Some(variant)) => self
+                .serve_selected(Some(variant))
+                .surface
+                .access_point_status(),
+            _ => self.access_point_status(),
+        }
+    }
+
     /// Whether every request to this Access Point is refused with `503`
     /// before source authentication, policy and the Target, on the direct
-    /// path and over Fabric: it is not ready, and it isn't an onboarding
-    /// surface.
+    /// path and over Fabric: it is not ready.
     pub fn refuses_every_request(&self) -> bool {
-        !self.is_onboarding() && self.access_point_status() == AccessPointStatus::NotReady
+        self.access_point_status() == AccessPointStatus::NotReady
+    }
+
+    /// The warnings every admin API save of this surface answers with: that
+    /// its Access Point is public, that it is legacy and admits every caller
+    /// ([`LEGACY_OPEN_ACCESS_POINT_WARNING`]), and that it or an enabled
+    /// variant is not ready ([`Self::access_point_not_ready_warnings`]).
+    pub fn access_point_warnings(&self) -> Vec<String> {
+        let exposure = match self.access_point.public {
+            Some(true) => Some(PUBLIC_ACCESS_POINT_WARNING),
+            None if !self.authenticates_callers() && !self.is_onboarding() => Some(LEGACY_OPEN_ACCESS_POINT_WARNING),
+            _ => None,
+        };
+        exposure
+            .map(str::to_string)
+            .into_iter()
+            .chain(self.access_point_not_ready_warnings())
+            .collect()
     }
 
     /// The [`ACCESS_POINT_NOT_READY_WARNING`]s for the surface and each
@@ -4011,6 +4049,73 @@ mod tests {
         assert!(resolved.rejects_failed_caller_authentication());
         assert!(surface.rejects_failed_caller_authentication());
         assert_eq!(resolved.access_point_status(), super::AccessPointStatus::Ready);
+    }
+
+    #[test]
+    fn test_access_point_warnings_name_a_public_a_legacy_open_and_a_not_ready_access_point() {
+        let warnings = |access_point: serde_json::Value| {
+            let mut surface: super::AgentSurface =
+                serde_json::from_value(surface_with_access_point(access_point)).unwrap();
+            surface.apply_public_access();
+            surface.access_point_warnings()
+        };
+
+        assert_eq!(warnings(serde_json::json!({"public": true})), [super::PUBLIC_ACCESS_POINT_WARNING]);
+        assert_eq!(
+            warnings(serde_json::json!({"public": true, "caller_authentication": api_key_caller_authentication()})),
+            [super::PUBLIC_ACCESS_POINT_WARNING]
+        );
+        assert_eq!(warnings(serde_json::json!({"public": false})), [super::ACCESS_POINT_NOT_READY_WARNING]);
+        assert_eq!(warnings(serde_json::json!({})), [super::LEGACY_OPEN_ACCESS_POINT_WARNING]);
+        for quiet in [
+            serde_json::json!({"public": false, "caller_authentication": api_key_caller_authentication()}),
+            serde_json::json!({"caller_authentication": api_key_caller_authentication()}),
+        ] {
+            assert_eq!(warnings(quiet.clone()), Vec::<String>::new(), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn test_onboarding_surface_without_caller_authentication_is_ready_and_unwarned() {
+        let mut stored = surface_with_access_point(serde_json::json!({"public": false}));
+        stored["tags"] = serde_json::json!(["system:onboarding"]);
+        let surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(
+            surface.access_point_status(),
+            super::AccessPointStatus::Ready,
+            "an onboarding surface captures a request and never forwards it"
+        );
+        assert!(!surface.refuses_every_request());
+        assert_eq!(surface.access_point_warnings(), Vec::<String>::new());
+
+        let mut legacy = surface_with_access_point(serde_json::json!({}));
+        legacy["tags"] = serde_json::json!(["system:onboarding"]);
+        let legacy: super::AgentSurface = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.access_point_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_served_access_point_status_follows_the_default_variant() {
+        let mut stored = surface_with_access_point(
+            serde_json::json!({"public": false, "caller_authentication": api_key_caller_authentication()}),
+        );
+        stored["variants"] = serde_json::json!([{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+            "overrides": {"complete": true, "access_point": {}}}]);
+        let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+        surface.apply_public_access();
+        assert_eq!(surface.served_access_point_status(), super::AccessPointStatus::Ready);
+
+        surface.default_variant_id = Some("beta".to_string());
+        assert_eq!(surface.access_point_status(), super::AccessPointStatus::Ready, "the base stays ready");
+        assert_eq!(surface.served_access_point_status(), super::AccessPointStatus::NotReady);
+
+        surface.variants[0].enabled = false;
+        assert_eq!(
+            surface.served_access_point_status(),
+            super::AccessPointStatus::Ready,
+            "a disabled default variant serves nothing, so the base status stands"
+        );
     }
 
     #[test]

@@ -549,8 +549,8 @@ class APIClient {
   async createSurface(
     surface: Partial<AgentSurface>,
     options?: { onWarnings?: (warnings: string[]) => void }
-  ): Promise<SavedSurface> {
-    const s = await this.request<SavedSurface>('/surfaces', {
+  ): Promise<AgentSurface> {
+    const s = await this.request<AgentSurface>('/surfaces', {
       method: 'POST',
       body: JSON.stringify(toBackendSurface(surface)),
       onResponse: warningsReader(options?.onWarnings),
@@ -562,8 +562,8 @@ class APIClient {
     surfaceId: string,
     surface: Partial<AgentSurface>,
     options?: { onWarnings?: (warnings: string[]) => void }
-  ): Promise<SavedSurface> {
-    const s = await this.request<SavedSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
+  ): Promise<AgentSurface> {
+    const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
       onResponse: warningsReader(options?.onWarnings),
@@ -1373,9 +1373,6 @@ export interface AgentSurface {
 }
 
 export type AccessPointStatus = 'ready' | 'not_ready';
-
-/** A surface create or update response: the stored surface plus the gateway's `warnings`. */
-export type SavedSurface = AgentSurface & { warnings?: string[] };
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
