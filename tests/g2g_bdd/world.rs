@@ -83,9 +83,6 @@ pub struct TopologyBuilder {
     /// `(gw_index, surface_id)` whose `fabric://` Target receives delegated
     /// credentials. Applied once the fabric routes are ready.
     pub fabric_delegated_credentials: Vec<(usize, String)>,
-    /// `from_gw`'s `from_surface` delegates its payment to `to_gw`'s
-    /// `to_surface`, which `to_gw` exposes to `from_gw`.
-    pub payment_delegation_links: Vec<FabricLink>,
 }
 
 impl TopologyBuilder {
@@ -107,11 +104,7 @@ impl TopologyBuilder {
     ) -> Vec<(usize, usize)> {
         let mut pairs = BTreeSet::new();
 
-        for link in self
-            .fabric_links
-            .iter()
-            .chain(&self.payment_delegation_links)
-        {
+        for link in &self.fabric_links {
             pairs.insert(normalize_pair(link.from_gw, link.to_gw));
         }
         for link in &self.transit_point_fabric_links {
@@ -460,15 +453,6 @@ impl G2gWorld {
                 )
                 .await
                 .expect("wire Transit Point fabric link");
-        }
-        for link in &self
-            .topology
-            .payment_delegation_links
-        {
-            harness
-                .delegate_payment_to_peer(link.from_gw, &link.from_surface, link.to_gw, &link.to_surface)
-                .await
-                .expect("wire delegated payment link");
         }
 
         self.exchange_caller_identity_tokens(&harness)
