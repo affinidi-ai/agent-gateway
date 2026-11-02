@@ -1,7 +1,9 @@
 //! A request a Fabric peer sends reaches the managed agent with a transit token
 //! this gateway issued for it, naming the peer and the Fabric crossings, never
 //! with a token the peer sent; a request past the hop limit is refused before
-//! anything is forwarded.
+//! anything is forwarded. An agent card fetch reaches a protected Target as the
+//! gateway's own credentialed request, and no other public path carries the
+//! Target credential.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1423,4 +1425,310 @@ async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
             Some("trace-from-the-peer".to_string())
         )]
     );
+}
+
+const TARGET_KEY_HEADER: &str = "x-target-key";
+const TARGET_KEY: &str = "target-key-value";
+
+/// One request the protected Target received.
+#[derive(Clone, Debug)]
+struct TargetRequest {
+    method: axum::http::Method,
+    path: String,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+}
+
+/// A Target that records every request and serves an agent card only to a
+/// request carrying its key; any other request gets `401`.
+struct ProtectedTarget {
+    url: String,
+    received: Arc<std::sync::Mutex<Vec<TargetRequest>>>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl ProtectedTarget {
+    async fn start() -> Self {
+        use axum::response::IntoResponse;
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = received.clone();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorded = recorded.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap();
+                let keyed = parts
+                    .headers
+                    .get(TARGET_KEY_HEADER)
+                    .is_some_and(|value| value == TARGET_KEY);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(TargetRequest {
+                        method: parts.method,
+                        path: parts.uri.path().to_string(),
+                        headers: parts.headers,
+                        body,
+                    });
+                if keyed {
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "application/json")],
+                        r#"{"name":"protected-agent"}"#,
+                    )
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED.into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        Self { url, received, _server: server }
+    }
+
+    fn received(&self) -> Vec<TargetRequest> {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
+    }
+}
+
+/// [`surface`] for an A2A Target that requires the key in `secret_id`, served
+/// with its card at `card_location` when one is configured.
+fn protected_surface(
+    target: &str,
+    secret_id: &str,
+    card_location: Option<&str>,
+) -> AgentSurface {
+    let mut value = serde_json::to_value(surface("a2a", target, &[])).unwrap();
+    value["target"]["auth"] =
+        json!({ "method": { "static_secret": { "secret_id": secret_id, "header_name": TARGET_KEY_HEADER } } });
+    if let Some(location) = card_location {
+        value["access_point"]["agent_card_path"] = json!(location);
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+async fn store_target_key(secrets: &std::path::Path) {
+    use crate::secrets::SecretsStore;
+    crate::secrets::FilesystemSecretsStore::new_async(secrets.to_str().unwrap())
+        .await
+        .unwrap()
+        .create(crate::secrets::CreateSecretRequest {
+            tenant_id: None,
+            name: "Target key".to_string(),
+            secret_id: "target-key".to_string(),
+            description: None,
+            value: TARGET_KEY.to_string(),
+            secret_type: "ApiKey".to_string(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+}
+
+/// A peer's `method` request for `path`, carrying credentials, a cookie, content
+/// negotiation and a body of its own.
+fn peer_request(
+    root: &std::path::Path,
+    method: &str,
+    path: &str,
+) -> ReceivedMessage {
+    let mut message = forward_request(
+        root,
+        json!({ "Authorization": "Bearer peer-token", "Cookie": "session=peer", "Accept": "application/json",
+            "Accept-Language": "en-GB", "User-Agent": "peer-agent", "X-Custom": "peer", "Content-Type": "application/json" }),
+        json!({ "peer": "body" }),
+    )
+    .with_context("secrets_storage_path", json!(root.join("secrets")));
+    message.message_body["method"] = json!(method);
+    message.message_body["path"] = json!(path);
+    message
+}
+
+/// A peer's agent card fetch reaches a protected Target as the gateway's own
+/// request, as on the direct path: a bodiless `GET` of the normalised card path
+/// with the Target credential and only the peer's `Accept`, `Accept-Language`
+/// and `User-Agent`.
+#[tokio::test]
+async fn an_agent_card_fetch_over_fabric_is_a_credentialed_get_of_the_exact_card_path() {
+    if ran_in_child("ATG_FABRIC_CREDENTIALED_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", None)).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    for (method, path, card_path) in [
+        ("GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json"),
+        ("HEAD", "/.well-known/agent.json", "/.well-known/agent.json"),
+        ("GET", "/x/%2e%2e/.well-known/agent-card.json?view=full", "/.well-known/agent-card.json"),
+    ] {
+        let response = forward_response(&peer_request(root.path(), method, path)).await;
+        assert_eq!(response["status"], 200, "{method} {path}: {response}");
+        let request = target
+            .received()
+            .pop()
+            .unwrap();
+        assert_eq!(request.method, axum::http::Method::GET, "{method} {path}");
+        assert_eq!(request.path, card_path, "{method} {path}");
+        assert!(request.body.is_empty(), "{method} {path}: the peer's body was forwarded");
+        assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY], "{method} {path}");
+        assert_eq!(header_values(&request.headers, "accept"), ["application/json"], "{method} {path}");
+        assert_eq!(header_values(&request.headers, "accept-language"), ["en-GB"], "{method} {path}");
+        assert_eq!(header_values(&request.headers, "user-agent"), ["peer-agent"], "{method} {path}");
+        for withheld in ["authorization", "cookie", "x-custom", "content-type"] {
+            assert!(
+                request
+                    .headers
+                    .get(withheld)
+                    .is_none(),
+                "{method} {path}: {withheld} was forwarded"
+            );
+        }
+    }
+}
+
+/// The surface's configured card location is a card fetch too, and a well-known
+/// card request is fetched from it.
+#[tokio::test]
+async fn an_agent_card_fetch_over_fabric_uses_the_configured_card_location() {
+    if ran_in_child("ATG_FABRIC_CARD_LOCATION_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", Some("/cards/me"))).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    for path in ["/cards/me", "/.well-known/agent-card.json"] {
+        let response = forward_response(&peer_request(root.path(), "GET", path)).await;
+        assert_eq!(response["status"], 200, "{path}: {response}");
+        let request = target
+            .received()
+            .pop()
+            .unwrap();
+        assert_eq!(request.path, "/cards/me", "{path}");
+        assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY], "{path}");
+        assert!(
+            request
+                .headers
+                .get("authorization")
+                .is_none(),
+            "{path}"
+        );
+    }
+}
+
+/// Other public paths, including a dot-segment spelling of one, skip caller
+/// authentication and so reach the Target without its credential; a request
+/// from an authenticated caller still carries it.
+#[tokio::test]
+async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_without_its_credential() {
+    if ran_in_child("ATG_FABRIC_PUBLIC_PATH_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", None)).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    for path in ["/discovery", "/.well-known/ucp", "/x/%2e%2e/discovery", "/agent/agent-card.json"] {
+        let response = forward_response(&peer_request(root.path(), "GET", path)).await;
+        assert_eq!(response["status"], 401, "{path}: {response}");
+        let request = target
+            .received()
+            .pop()
+            .unwrap();
+        assert!(
+            request
+                .headers
+                .get(TARGET_KEY_HEADER)
+                .is_none(),
+            "{path}: the Target credential was sent"
+        );
+    }
+
+    let mut authenticated = peer_request(root.path(), "POST", "/rpc");
+    authenticated.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
+    let response = forward_response(&authenticated).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+}
+
+/// A Target credential that cannot be resolved fails the card fetch and any
+/// other request with the direct path's `502` text, before the Target is called.
+#[tokio::test]
+async fn an_unresolvable_target_credential_over_fabric_answers_target_authentication_failed() {
+    if ran_in_child("ATG_FABRIC_TARGET_AUTH_FAILED_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "absent-key", None)).await;
+
+    for (method, path) in [("GET", "/.well-known/agent-card.json"), ("POST", "/rpc")] {
+        let mut message = peer_request(root.path(), method, path);
+        message.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
+        let response = forward_response(&message).await;
+        assert_eq!(response["status"], 502, "{method} {path}: {response}");
+        assert_eq!(response["error"], "Target authentication failed", "{method} {path}");
+        let body: Value = serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["detail"], "Target authentication failed", "{method} {path}");
+    }
+    assert!(target.received().is_empty(), "the Target was called");
+}
+
+/// The card read for the policy input authenticates to the Target as the
+/// gateway, so a protected Target's card reaches policy; a credential that
+/// cannot be resolved leaves the policy input without a card.
+#[tokio::test]
+async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_without_it() {
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let secrets = root.path().join("secrets");
+    store_target_key(&secrets).await;
+    let secrets = secrets.to_str();
+
+    let protected = protected_surface(&target.url, "target-key", None);
+    assert_eq!(
+        super::policy_agent_card(&protected, SURFACE_ID, secrets).await,
+        Some(json!({ "name": "protected-agent" }))
+    );
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/.well-known/agent.json");
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+
+    let called = target.received().len();
+    assert_eq!(super::policy_agent_card(&protected, SURFACE_ID, None).await, None, "no secrets store");
+    let unresolvable = protected_surface(&target.url, "absent-key", None);
+    assert_eq!(super::policy_agent_card(&unresolvable, SURFACE_ID, secrets).await, None, "absent secret");
+    assert_eq!(target.received().len(), called, "the Target was asked without the credential");
+
+    let unprotected = surface("a2a", &target.url, &[]);
+    assert_eq!(super::policy_agent_card(&unprotected, SURFACE_ID, secrets).await, None, "a 401 is no card");
 }

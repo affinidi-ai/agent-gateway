@@ -4575,7 +4575,7 @@ async fn unresolvable_mcp_proxy_credential_flow() {
     assert_eq!(
         problem,
         json!({"type": "about:blank", "title": "Bad Gateway", "status": 502,
-            "detail": "Target authentication configuration error"}),
+            "detail": "Target authentication failed"}),
         "{response_body}"
     );
 }

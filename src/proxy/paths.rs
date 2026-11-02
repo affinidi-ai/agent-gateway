@@ -388,6 +388,41 @@ pub fn is_public_request(
     (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) && is_public_path(path)
 }
 
+/// The card path when a request is the gateway's own agent card fetch, which may
+/// carry the Target credential: a `GET` or `HEAD` whose path is exactly
+/// `/.well-known/agent-card.json`, `/.well-known/agent.json` or
+/// `configured_location`, after percent-encoded unreserved characters are decoded
+/// and dot segments removed. The query is ignored and case is kept, so
+/// `/discovery`, `/.well-known/ucp` and `/x/%2e%2e/discovery` are not card
+/// fetches, and `%2F` stays encoded.
+pub fn credentialed_agent_card_path(
+    method: &str,
+    path: &str,
+    configured_location: Option<&str>,
+) -> Option<String> {
+    if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
+        return None;
+    }
+    let path = normalized_request_path(path);
+    let configured = configured_location.map(normalized_request_path);
+    let is_card = path == "/.well-known/agent-card.json"
+        || path == "/.well-known/agent.json"
+        || configured.as_deref() == Some(path.as_str());
+    is_card.then_some(path)
+}
+
+fn normalized_request_path(path: &str) -> String {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    if path.starts_with('/') {
+        normalize_path(path)
+    } else {
+        normalize_path(&format!("/{path}"))
+    }
+}
+
 /// Top-level paths owned by the dashboard SPA (www/default).
 /// A channel, MCP proxy, proxy or redirect prefix under any of these would
 /// break the dashboard, since those routes take precedence over the SPA
@@ -555,6 +590,51 @@ mod tests {
         ] {
             assert!(!is_transit_discovery_request("GET", path), "{path}");
         }
+    }
+
+    #[test]
+    fn credentialed_agent_card_path_is_the_exact_card_path_after_normalisation() {
+        let card = |method: &str, path: &str| credentialed_agent_card_path(method, path, Some("/cards/me"));
+        for (method, path, expected) in [
+            ("GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json"),
+            ("HEAD", "/.well-known/agent-card.json", "/.well-known/agent-card.json"),
+            ("get", "/.well-known/agent.json", "/.well-known/agent.json"),
+            ("GET", "/.well-known/agent-card.json?x=1#f", "/.well-known/agent-card.json"),
+            ("GET", "/x/../.well-known/agent-card.json", "/.well-known/agent-card.json"),
+            ("GET", "/x/%2e%2E/.well-known/agent-card.json", "/.well-known/agent-card.json"),
+            ("GET", "/../../.well-known/./agent.json", "/.well-known/agent.json"),
+            ("GET", "/%2Ewell-known/agent%2Dcard.json", "/.well-known/agent-card.json"),
+            ("GET", "/cards/me", "/cards/me"),
+            ("GET", "/cards/x/../me?y", "/cards/me"),
+        ] {
+            assert_eq!(card(method, path).as_deref(), Some(expected), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn credentialed_agent_card_path_refuses_other_paths_methods_and_spellings() {
+        for (method, path) in [
+            ("POST", "/.well-known/agent-card.json"),
+            ("PUT", "/.well-known/agent.json"),
+            ("OPTIONS", "/.well-known/agent-card.json"),
+            ("GET", "/discovery"),
+            ("GET", "/.well-known/ucp"),
+            ("GET", "/.well-known/agent-card"),
+            ("GET", "/x/%2e%2e/discovery"),
+            ("GET", "/surface/.well-known/agent-card.json"),
+            ("GET", "/x/agent-card.json"),
+            ("GET", "/.well-known/agent-card.json/"),
+            ("GET", "/.well-known/agent-card.json/."),
+            ("GET", "/.WELL-KNOWN/agent-card.json"),
+            ("GET", "/.well-known%2Fagent-card.json"),
+            ("GET", "//.well-known/agent-card.json"),
+            ("GET", "/cards/me/"),
+            ("GET", "/cards/ME"),
+        ] {
+            assert_eq!(credentialed_agent_card_path(method, path, Some("/cards/me")), None, "{method} {path}");
+        }
+        assert_eq!(credentialed_agent_card_path("GET", "/cards/me", None), None);
+        assert_eq!(credentialed_agent_card_path("GET", "/cards/me", Some("cards/./me")).as_deref(), Some("/cards/me"));
     }
 
     const ROOT_TARGET: &str = "http://target.example";

@@ -437,9 +437,8 @@ request received by the destination gateway:
    Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
    an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
    HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
-   vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
-   card location, the sending gateway's own card fetch; any other discovery read, the
-   `/.well-known/agent.json` fallback included, gets none (see
+   vetted, and with the gateway's own agent card fetch, which follows the
+   [direct path's rules](#agent-card-fetch-over-fabric); any other discovery read gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
    The Target's answer travels back as text, so the request, a framed stream's included, asks
    for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
@@ -458,6 +457,27 @@ only over Fabric, or used only for its Transit Points, still needs a route a sur
 the admin API refuses to save a new or changed route that none serves (see `channels` in
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)). Moving the route changes nothing a peer
 calls, but it moves the default paths of the surface's Transit Points, which follow the route.
+
+### Agent card fetch over Fabric
+
+The receiving gateway fetches the local Target's agent card the way the
+[direct path](PROTOCOLS.md#agent-card-fetch) does. Only a `GET` or `HEAD` whose path is exactly
+`/.well-known/agent-card.json`, `/.well-known/agent.json` or the surface's configured card location
+is a card fetch, matched after percent-encoded unreserved characters are decoded and dot segments
+removed, ignoring the query and keeping case
+([`credentialed_agent_card_path`](../src/proxy/paths.rs)). On a surface with `target.auth`, that
+fetch is the gateway's own request: a `GET` with no body, sent to the normalised card path (or the
+configured location on the Target's origin), carrying `target.auth` and only the peer's `Accept`,
+`Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers and body are
+dropped.
+
+Every other public path, such as `/discovery`, `/.well-known/ucp` or `/x/%2e%2e/discovery`, skips
+caller authentication and is forwarded without the credential. A credential that cannot be resolved
+under `target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as
+the direct path and the MCP proxy path.
+
+The card read for the GW2 policy input also presents `target.auth` as the gateway; see
+[`POLICY.md`](POLICY.md#other-pinned-egress-sinks).
 
 ### Modern MCP activation
 

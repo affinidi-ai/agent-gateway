@@ -714,7 +714,12 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  and does not follow redirects, and reads the card within `a2a.max_body_size`.
+  It presents the surface's `target.auth` as the gateway's own request, so the
+  policy input sees the card of a protected Target. A blocked target, a
+  redirect, a non-success answer or a `target.auth` credential that cannot be
+  resolved yields no card in the policy input; the failure is logged as a
+  warning without the credential.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
