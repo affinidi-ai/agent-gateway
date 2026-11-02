@@ -234,6 +234,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
+- **Identity → From API Key** on the inbound Identity has no key field: in place of the picker
+  the panel shows the one line "Each caller is identified by the API key it presents."
+  (`identity-panel-inbound-api-key-note`);
+  `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
+  the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
+  Save unless the first Caller Context method is API Key or API Key Provider, with the gateway's
+  own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`, an
+  `atgk_` secret id, one key as both Managed Agent and caller) and rules on inactive variants show
+  as the save-error banner.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener

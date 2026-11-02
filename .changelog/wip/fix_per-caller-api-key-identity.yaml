@@ -1,0 +1,96 @@
+branch: fix/per-caller-api-key-identity
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: ⭐ Identify each caller by the API key it presents
+      description: >-
+        An inbound Identity set to From API Key derived every caller's DID from one
+        operator-picked key, so all callers on a surface shared a DID. The caller DID now
+        comes from the API key each request presents. An API Key Provider gives one DID per
+        key, reported to policy as `source_auth`; a plain API Key gives one DID per secret,
+        shared by everyone holding it and reported as `unverified`. A failed or revoked key
+        resolves no caller identity. The inbound slot stores no key id; a stored one is
+        ignored and dropped on save.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Stop asking for an API key on the inbound Identity in the Surface Builder
+      description: >-
+        The inbound Identity's From API Key option shows "Each caller is identified by the API
+        key it presents." instead of a key picker, and Save never sends an inbound key id. Save
+        is blocked unless the first Caller Context method is API Key or API Key Provider. The
+        protected and external Identities keep the key picker.
+  removed: []
+  security:
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Stop a body-asserted DID or presentation overriding the API key identity
+      description: >-
+        On a direct request to a surface whose inbound Identity is From API Key, the presented
+        key's DID replaces any identity the request body asserts, so a key holder cannot choose
+        another DID. `input.agent.did` and its verification are the key's DID, and
+        trust-registry claims the body made about another DID are dropped. Fabric receive does
+        not read this mode; the request body sets the caller there.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Refuse plain API Key secret ids that start with the reserved atgk_ prefix
+      description: >-
+        A plain API Key secret id starting `atgk_` would derive the same caller DID as the API
+        Key Provider key with that id. Saving such a surface with an inbound From API Key
+        Identity is refused with 400, and a stored one is refused at request time with 500.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Refuse one API key identifying both a Managed Agent and a caller
+      description: >-
+        A caller could otherwise share a Managed Agent's DID and the trust attached to it. Save
+        refuses a surface that names one key in both roles, and a key used in the other role
+        on any surface is refused at request time with 500 (metric `role_clash`). An API key's
+        identity record keeps the role it was first issued for.
+  breaking:
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Fail closed when an inbound From API Key caller does not use an API key
+      description: >-
+        An inbound From API Key Identity behind caller authentication that is not API Key or
+        API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
+        it, on the surface or an enabled variant, is refused with 400, as is combining it with
+        `mcp_http.authorization`. A missing VC issuer returns 500 and an issuance failure 502.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Give each API key its own DID, so rules tied to the shared DID stop matching
+      description: >-
+        Callers on an API Key Provider surface no longer share the configured key's DID. Policies,
+        Trust Check entries and Transit Point OAuth grants tied to that DID now match only the
+        key it belongs to, and the Transit token `sub` and Workload Binding `userIdentity.id`
+        are per key. On a plain API Key surface whose stored inbound key id differed from the
+        Caller Context secret id, callers now get that secret's DID instead of the stored
+        key's, and the stored id is dropped on save. Re-grant or update rules for the affected
+        keys.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Refuse surfaces that use one API key as both Managed Agent and caller
+      description: >-
+        An existing surface whose Managed Agent `api_key_id` equals a caller key (the external
+        Identity's key or the plain API Key secret id) is refused with 400 on its next save.
+        At request time, whichever role resolves the key second gets 500 (metric
+        `role_clash`), on the caller path and on the Managed Agent path alike.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Stop a body presentation setting the caller DID on From API Key surfaces
+      description: >-
+        On a surface whose inbound Identity is From API Key, a presentation or credential
+        extension in the request body no longer sets the caller DID, so policies naming the
+        presentation's DID stop matching.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Drop body trust-registry claims about another DID on From API Key surfaces
+      description: >-
+        `provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
+        `agent_dna` and trust verifications the body asserts about a DID other than the key's
+        are dropped. Trust Check presets that read `input.agent.provider_did` deny unless the
+        body asserts the key's own DID. Gateway and global policy see no `input.agent.did` on
+        these surfaces.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Refuse From API Key on an MCP proxy:// surface when it is saved again
+      description: >-
+        The MCP Proxy request path never resolves the caller's key, so saving an MCP surface
+        with a `proxy://` target and an inbound From API Key Identity is refused with 400. A
+        stored surface keeps loading but cannot be saved until its inbound Identity changes.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Drop downgrade support for surfaces saved without an inbound key id
+      description: >-
+        A surface saved with an inbound From API Key Identity has no stored key id, which
+        older binaries require, so they skip it at load. Downgrading after re-saving such a
+        surface is not supported.

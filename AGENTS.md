@@ -94,6 +94,11 @@ The Surface Builder labels an Access Point's URL **Entry point URL**, with a cop
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
+identified by the API key it presents, and blocks Save unless the first Caller Context method is
+API Key or API Key Provider; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The secret editor has one save button and never shows a stored secret value; see

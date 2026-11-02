@@ -787,16 +787,76 @@ slot on the surface, and a Transit Point may override it for its own outbound le
 | Mode | Derives the DID from | Counts in policy as |
 | --- | --- | --- |
 | `payload_extraction` | A field in the request payload metadata. Also accepted on the wire as `from_payload`. | `unverified` |
-| `from_api_key` | A stored API key named by `api_key_id` | `unverified` |
+| `from_api_key` | On the other slots, a stored API key named by `api_key_id`. On the inbound slot, the API key the caller presents; see [below](#from_api_key-on-the-inbound-slot). | `unverified`, except an API Key Provider key on the inbound slot: `source_auth` |
 | `from_mtls` | A stored certificate named by `certificate_id` | `unverified` |
 | `static` | A fixed `did`, for test fixtures and stub agents | `unverified` |
 | `from_jwt_claim` | A claim on a JWT already verified by source auth | `source_auth` |
 
-Only `from_jwt_claim` is request-bound. The other four read a stored credential or the
-request body and are independent of the credential authenticated on this request, which
-is why they do not count as verified. An identity presentation reports `vp` or
-`vp_unanchored` regardless of the configured mode; see
+`from_jwt_claim` and inbound `from_api_key` are request-bound. The other modes read a stored
+credential or the request body and are independent of the credential authenticated on this
+request, which is why they do not count as verified. A plain API Key on the inbound slot is
+request-bound but still `unverified`, because every holder of the secret shares its DID. An
+identity presentation reports `vp` or `vp_unanchored` regardless of the configured mode, except
+on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
+
+### `from_api_key` on the inbound slot
+
+The inbound slot stores no key. Each request's caller DID comes from the API key that request
+presents to the surface's caller authentication:
+
+| Caller authentication | Caller DID | Counts in policy as |
+| --- | --- | --- |
+| API Key Provider | One DID per key, derived from its key id | `source_auth` |
+| API Key | One DID per secret, shared by every caller holding a value of that secret | `unverified` |
+
+Per-key caller identity therefore needs an API Key Provider.
+
+- A missing, invalid or revoked key resolves no caller identity. Policy sees
+  `input.source_auth.method == "failed"` and decides; see
+  [`POLICY.md`](POLICY.md#failed-caller-authentication).
+- On a direct request, the key's DID replaces any identity the request body asserts, such as
+  an identity presentation or a credential extension. [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)
+  describes what that does to `input.agent`.
+- The Transit token `sub`, the Workload Binding `userIdentity.id`, and the Transit Point OAuth
+  grants looked up by that `sub` are therefore per presented key.
+- A write drops a stored inbound `api_key_id` from the surface and every variant, and the
+  request path ignores one still on disk. A gateway binary that requires `api_key_id` on every
+  slot skips a surface saved without it, so a re-saved surface does not load on an older binary.
+- Fabric receive does not use this mode; the request body sets the caller there (see
+  [`FABRIC.md`](FABRIC.md)).
+
+A save (`POST`, `PUT`, `PATCH`, and each enabled variant) refuses an inbound `from_api_key`
+with `400` when:
+
+- the first Caller Context method is not API Key or API Key Provider;
+- `mcp_http.authorization` is set, because resource tokens identify those callers;
+- the target is an MCP `proxy://` MCP Proxy;
+- the API Key secret id starts with `atgk_`, the prefix of API Key Provider key ids, so its
+  DID would equal that provider key's;
+- the API Key secret id is also the `api_key_id` of the protected slot or a Transit Point's
+  `managed_identity`.
+
+`from_api_key` on the protected, external and Transit Point slots needs a non-empty
+`api_key_id`, and the external key cannot be a protected or Transit Point key on the same
+surface. One API key cannot identify both a Managed Agent and a caller: an API key's identity
+record keeps the role it was first issued for, and a key used in the other role, on any
+surface, is refused at request time. A surface with no inbound identity whose protected slot
+is `from_api_key`, `from_mtls` or `static` identifies its callers with the Managed Agent's DID,
+but only when the request body carries no identity, and never on public discovery paths.
+
+Request-time refusals return a fixed body and log the cause server-side. Each counts in
+`agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`:
+
+| Condition | Status | `result` |
+| --- | --- | --- |
+| Caller authentication is not API Key or API Key Provider | `500` | `api_key_unavailable` |
+| An API Key secret id starts with `atgk_` | `500` | `api_key_secret_id_reserved` |
+| A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
+| The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
+| No VC issuer is configured | `500` | `vc_issuer_missing` |
+| DID issuance fails | `502` | `vc_issuer_error` |
+| The key already identifies a Managed Agent | `500` | `role_clash` |
 
 ### `from_jwt_claim`
 

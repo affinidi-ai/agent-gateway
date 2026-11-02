@@ -326,7 +326,9 @@ impl PolicyInput {
     /// `agent.did_verified` / `did_verification`; a payload-asserted
     /// `agent.did` equal to the resolved extension DID is marked verified when
     /// the extension identity is. No-op when `agent.did` is already set to a
-    /// different DID or `extension_identity.did` is missing.
+    /// different DID or `extension_identity.did` is missing. On inbound
+    /// `from_api_key` surfaces the direct path binds `agent.did` to the
+    /// presented key's DID with [`AgentContext::bind_caller_did`] first.
     pub fn normalize_caller_did(&mut self) {
         let Some((ext_did, verification)) = self
             .extension_identity
@@ -679,11 +681,13 @@ pub enum IdentityVerification {
     /// `input.agent.identity_issuer_did`.
     VpUnanchored,
     /// The DID is bound to the source credential this gateway authenticated on
-    /// this request (`from_jwt_claim`).
+    /// this request: `from_jwt_claim`, or an API Key Provider key on an inbound
+    /// `from_api_key` slot.
     SourceAuth,
     /// Nothing in this request proves the DID: `x-identity` payload
-    /// pseudonyms and identities configured on the surface (`static`,
-    /// `from_mtls`, `from_api_key`).
+    /// pseudonyms, identities configured on the surface (`static`,
+    /// `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an
+    /// inbound `from_api_key` slot, shared by every holder of the secret.
     Unverified,
 }
 
