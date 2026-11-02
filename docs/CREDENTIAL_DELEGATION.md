@@ -868,7 +868,8 @@ grants of every binding that differs between that stored surface and the one bei
 write built from an earlier read still removes the grants of a binding a concurrent write added
 and this one drops. Surface writes also hold a provider lock shared, which a provider delete or
 tenant move holds exclusively for its whole check and change, and a write that binds a provider
-deleted since its references were checked is refused with `400`. The locks serialise the writes
+deleted, or moved to a tenant the surface may not reference, since its references were checked
+is refused with `400`. The locks serialise the writes
 of the node that serves the admin API.
 
 Only the grants of the bindings a change removes or adds are read. When one of them cannot be

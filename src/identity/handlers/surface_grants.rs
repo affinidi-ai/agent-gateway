@@ -300,10 +300,12 @@ pub(crate) async fn hold_provider_bindings_exclusively() -> tokio::sync::RwLockW
 }
 
 /// Refuse `after` when it binds a credential provider that no longer exists,
-/// one the surface stored now, `current`, does not bind already: its
-/// references were checked before the write took the provider lock, so a
-/// provider deleted in between is caught here.
-async fn refuse_deleted_providers(
+/// or that its tenant may no longer reference, one the surface stored now,
+/// `current`, does not bind already: its references were checked before the
+/// write took the provider lock, so a provider deleted or moved to another
+/// tenant in between is caught here. Both answer alike, so the refusal never
+/// says another tenant has the provider.
+async fn refuse_gone_providers(
     removal: &GrantRemoval<'_>,
     current: Option<&AgentSurface>,
     after: &AgentSurface,
@@ -318,12 +320,14 @@ async fn refuse_deleted_providers(
         if kept.contains(id) {
             continue;
         }
-        if store
+        let referenceable = store
             .get(id)
             .await
             .map_err(|_| unavailable())?
-            .is_none()
-        {
+            .is_some_and(|provider| {
+                crate::tenancy::can_reference(after.tenant_id.as_deref(), provider.tenant_id.as_deref())
+            });
+        if !referenceable {
             return Err(SurfaceApiError::BadRequest(format!("Credential provider '{id}' does not exist")));
         }
     }
@@ -377,7 +381,8 @@ pub(crate) enum Stored {
 /// the lock is released. When the write is dropped, the surface stored is
 /// read again under the lock ([`written`]): the grants are revoked when the
 /// write was saved all the same, and put back otherwise. A write that binds a
-/// provider deleted since its references were checked is refused.
+/// provider deleted, or moved to a tenant the surface may not reference,
+/// since its references were checked is refused.
 pub(crate) async fn write_surface<T, Write, Pending>(
     removal: &GrantRemoval<'_>,
     surfaces: Arc<dyn AgentSurfaceStore>,
@@ -400,7 +405,7 @@ where
         return Err(SurfaceApiError::BadRequest(format!("Surface with ID '{surface_id}' already exists")));
     }
     if let Some(after) = after {
-        refuse_deleted_providers(removal, current.as_ref(), after).await?;
+        refuse_gone_providers(removal, current.as_ref(), after).await?;
     }
     let (saved, outcome) = tokio::sync::oneshot::channel();
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
@@ -1210,6 +1215,44 @@ mod tests {
                 .revoked_tokens(),
             ["owner-access", "owner-access-refresh"]
         );
+    }
+
+    /// A write binds a provider only while the surface may reference it: one
+    /// moved to another tenant since the write's references were checked is
+    /// refused under the provider lock, which a provider move holds for its
+    /// whole check and move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_binding_a_provider_moved_to_another_tenant_since_it_was_checked_is_refused() {
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        let mut moved = fixture
+            .providers
+            .get("vendor-2")
+            .await
+            .unwrap()
+            .unwrap();
+        moved.tenant_id = Some("tenant-b".into());
+        fixture
+            .providers
+            .update(moved)
+            .await
+            .unwrap();
+        let binds_moved = surface(json!([point("owner-hop", external("vendor-2", "owner"))]));
+        let refused =
+            write_surface(&removal, surfaces.clone(), "surface", Stored::Absent, Some(&binds_moved), || async {
+                Ok::<(), SurfaceApiError>(())
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(SurfaceApiError::BadRequest(ref message)) if message.contains("vendor-2")),
+            "{refused:?}"
+        );
+        write_surface(&removal, surfaces.clone(), "surface", Stored::Absent, Some(&bound()), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .expect("a provider of the surface's tenant is bound");
     }
 
     /// A write binds a provider only while it exists: one deleted since the
