@@ -196,16 +196,12 @@ pub async fn acquire(
     };
     let mut backoff = match cached_token(provider, scopes, context, key.agent_did, &identity, now).await? {
         CachedToken::Fresh(token) => return Ok(served(token, Freshness::Cached)),
-        CachedToken::RenewalDue(token) => match grant_slot(key.agent_did, &identity, &provider.id)
-            .await
-            .try_lock_owned()
-        {
+        CachedToken::RenewalDue(token) => match grant_slot(key.agent_did, &identity, &provider.id).try_lock_owned() {
             Ok(backoff) => backoff,
             Err(_) => return Ok(served(token, Freshness::Cached)),
         },
         CachedToken::None => {
             grant_slot(key.agent_did, &identity, &provider.id)
-                .await
                 .lock_owned()
                 .await
         }
@@ -357,39 +353,68 @@ async fn token_grant(
     Ok((response, granted))
 }
 
-const GRANT_SLOT_ENTRIES: u64 = 16_384;
-const GRANT_SLOT_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const GRANT_SLOT_ENTRIES: usize = 16_384;
+const BACKOFF_MEMORY_SECS: i64 = 10 * 60;
 
 const BACKOFF_INITIAL_SECS: i64 = 1;
 const BACKOFF_MAX_SECS: i64 = 60;
 
 type GrantSlotKey = (String, String, String);
 type GrantSlot = Arc<tokio::sync::Mutex<Backoff>>;
+type GrantSlots = dashmap::DashMap<GrantSlotKey, GrantSlot>;
 
 /// One lock per vault row key on this replica, held while its token is requested and
 /// stored, so concurrent misses send one token request and the others then read its token
-/// from the vault. It guards the key's retry backoff and holds no token values.
-static GRANT_SLOTS: std::sync::LazyLock<moka::future::Cache<GrantSlotKey, GrantSlot>> =
-    std::sync::LazyLock::new(|| {
-        moka::future::Cache::builder()
-            .max_capacity(GRANT_SLOT_ENTRIES)
-            .time_to_idle(GRANT_SLOT_IDLE)
-            .build()
-    });
+/// from the vault. It guards the key's retry backoff and holds no token values. A slot is
+/// kept while any caller holds it or its backoff remembers a failure; once
+/// [`GRANT_SLOT_ENTRIES`] slots exist, a new key first releases the others.
+static GRANT_SLOTS: std::sync::LazyLock<GrantSlots> = std::sync::LazyLock::new(GrantSlots::new);
 
-async fn grant_slot(
+fn grant_slot(
     agent_did: &str,
     identity: &str,
     credential_provider_id: &str,
 ) -> GrantSlot {
-    GRANT_SLOTS
-        .get_with((agent_did.into(), identity.into(), credential_provider_id.into()), async { Arc::default() })
-        .await
+    slot_for(&GRANT_SLOTS, GRANT_SLOT_ENTRIES, (agent_did.into(), identity.into(), credential_provider_id.into()))
+}
+
+/// The slot of `key` in `slots`, added when missing; once `capacity` slots exist, adding one
+/// first releases the idle ones.
+fn slot_for(
+    slots: &GrantSlots,
+    capacity: usize,
+    key: GrantSlotKey,
+) -> GrantSlot {
+    if let Some(slot) = slots.get(&key) {
+        return slot.clone();
+    }
+    if slots.len() >= capacity {
+        release_idle_slots(slots, Utc::now());
+    }
+    slots
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+/// Removes the slots no caller holds whose backoff remembers no failure at `now`. A slot is
+/// copied only under its map shard's lock, which `retain` holds, so a slot with no other
+/// copy cannot gain one meanwhile.
+fn release_idle_slots(
+    slots: &GrantSlots,
+    now: DateTime<Utc>,
+) {
+    slots.retain(|_, slot| {
+        Arc::strong_count(slot) > 1
+            || slot
+                .try_lock()
+                .map_or(true, |backoff| backoff.remembers(now))
+    });
 }
 
 /// The token requests to one key that failed in a row, and the time before which the next
 /// one is not sent: 1 s after the first failed request ends, doubling up to 60 s. A success
-/// clears it.
+/// clears it, and the failures are forgotten [`BACKOFF_MEMORY_SECS`] after the retry time.
 #[derive(Debug, Default)]
 struct Backoff {
     failures: u32,
@@ -405,6 +430,14 @@ impl Backoff {
             .is_some_and(|retry_at| now < retry_at)
     }
 
+    fn remembers(
+        &self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.retry_at
+            .is_some_and(|retry_at| now < retry_at + chrono::Duration::seconds(BACKOFF_MEMORY_SECS))
+    }
+
     fn record<T>(
         &mut self,
         outcome: Result<T, ServiceTokenError>,
@@ -413,6 +446,9 @@ impl Backoff {
         match &outcome {
             Ok(_) => *self = Self::default(),
             Err(error) if error.backs_off() => {
+                if !self.remembers(now) {
+                    self.failures = 0;
+                }
                 self.failures = self
                     .failures
                     .saturating_add(1);
@@ -909,10 +945,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let slot = grant_slot(KEY.agent_did, &identity, &provider.id).await;
-            GRANT_SLOTS
-                .run_pending_tasks()
-                .await;
+            let slot = grant_slot(KEY.agent_did, &identity, &provider.id);
             (identity, slot)
         }
 
@@ -2152,8 +2185,8 @@ mod tests {
     }
 
     /// Waits until `waiters` callers besides the `holders` counted before they started hold
-    /// `slot`, that is, have missed the cache and are queued for its lock. The slot cache's
-    /// pending tasks run before `holders` is counted, so it holds one copy only.
+    /// `slot`, that is, have missed the cache and are queued for its lock. The slot map holds
+    /// one copy, counted in `holders`.
     async fn until_waiting(
         slot: &GrantSlot,
         holders: usize,
@@ -2205,6 +2238,35 @@ mod tests {
         );
         assert_eq!(fixture.requests().len(), 1);
         fixture.only_stored().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slot_held_by_a_token_request_is_not_reclaimed_so_a_later_miss_waits_for_it() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        fixture
+            .endpoint
+            .delay_millis
+            .store(300, Ordering::SeqCst);
+        let (first, second) = tokio::join!(fixture.acquire(&provider, &["read"], now), async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while fixture.requests().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the first token request was not sent");
+            release_idle_slots(&GRANT_SLOTS, Utc::now());
+            fixture
+                .acquire(&provider, &["read"], now)
+                .await
+        });
+        assert_eq!(issued(first), ("issued".into(), Freshness::Fresh));
+        assert_eq!(issued(second), ("issued".into(), Freshness::Cached));
+        assert_eq!(fixture.requests().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2475,6 +2537,100 @@ mod tests {
             assert!(!backoff.holds_back(now), "{error}");
             assert_eq!(backoff.failures, 0, "{error}");
         }
+    }
+
+    #[test]
+    fn a_failure_run_is_forgotten_ten_minutes_after_its_retry_time() {
+        let failed = Err::<(), _>(ServiceTokenError::TokenRequestFailed);
+        let start = Utc::now();
+        let mut backoff = Backoff::default();
+        assert!(!backoff.remembers(start));
+        let _ = backoff.record(failed, start);
+        let _ = backoff.record(failed, seconds(start, 2));
+        assert_eq!((backoff.failures, backoff.retry_at), (2, Some(seconds(start, 4))));
+        assert!(backoff.remembers(seconds(start, 4 + 599)));
+        assert!(!backoff.remembers(seconds(start, 4 + 600)));
+
+        let mut remembered = Backoff {
+            failures: 2,
+            retry_at: Some(seconds(start, 4)),
+        };
+        let _ = remembered.record(failed, seconds(start, 4 + 599));
+        assert_eq!((remembered.failures, remembered.retry_at), (3, Some(seconds(start, 4 + 599 + 4))));
+
+        let _ = backoff.record(failed, seconds(start, 4 + 600));
+        assert_eq!((backoff.failures, backoff.retry_at), (1, Some(seconds(start, 4 + 600 + 1))));
+    }
+
+    fn slot_key(name: &str) -> GrantSlotKey {
+        (format!("surface:{name}"), "identity".into(), "provider".into())
+    }
+
+    fn insert_slot(
+        slots: &GrantSlots,
+        name: &str,
+        backoff: Backoff,
+    ) -> GrantSlot {
+        let slot = Arc::new(tokio::sync::Mutex::new(backoff));
+        slots.insert(slot_key(name), slot.clone());
+        slot
+    }
+
+    fn slot_names(slots: &GrantSlots) -> Vec<String> {
+        let mut names: Vec<String> = slots
+            .iter()
+            .map(|entry| {
+                entry
+                    .key()
+                    .0
+                    .trim_start_matches("surface:")
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn releasing_idle_slots_keeps_held_slots_and_remembered_failures() {
+        let now = Utc::now();
+        let slots = GrantSlots::new();
+        let held = insert_slot(&slots, "held", Backoff::default());
+        let locked = insert_slot(&slots, "locked", Backoff::default())
+            .try_lock_owned()
+            .unwrap();
+        let remembered = Backoff {
+            failures: 1,
+            retry_at: Some(seconds(now, -599)),
+        };
+        drop(insert_slot(&slots, "remembered", remembered));
+        drop(insert_slot(&slots, "idle", Backoff::default()));
+        let forgotten = Backoff {
+            failures: 3,
+            retry_at: Some(seconds(now, -600)),
+        };
+        drop(insert_slot(&slots, "forgotten", forgotten));
+        release_idle_slots(&slots, now);
+        assert_eq!(slot_names(&slots), ["held", "locked", "remembered"]);
+        assert!(Arc::ptr_eq(&slot_for(&slots, 16, slot_key("held")), &held));
+        drop((held, locked));
+        release_idle_slots(&slots, now);
+        assert_eq!(slot_names(&slots), ["remembered"]);
+    }
+
+    #[test]
+    fn a_new_key_releases_idle_slots_once_the_map_is_full() {
+        let slots = GrantSlots::new();
+        let held = insert_slot(&slots, "held", Backoff::default());
+        drop(insert_slot(&slots, "idle", Backoff::default()));
+        let second = slot_for(&slots, 3, slot_key("second"));
+        assert_eq!(slot_names(&slots), ["held", "idle", "second"]);
+        let third = slot_for(&slots, 3, slot_key("third"));
+        assert_eq!(slot_names(&slots), ["held", "second", "third"]);
+        assert!(Arc::ptr_eq(&slot_for(&slots, 3, slot_key("held")), &held));
+        assert!(Arc::ptr_eq(&slot_for(&slots, 3, slot_key("second")), &second));
+        assert!(Arc::ptr_eq(&slot_for(&slots, 3, slot_key("third")), &third));
+        assert_eq!(slot_names(&slots), ["held", "second", "third"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

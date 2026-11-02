@@ -184,7 +184,8 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
 Each replica sends one token request per cache key at a time. Requests that miss the cache
 meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
 another replica stored, instead of requesting their own. Requests for other scopes, providers or
-surfaces do not wait. Replicas do not coordinate, so each may request one token for the same key.
+surfaces do not wait. A key's place in this queue is kept while any request holds or waits for it,
+however many keys are in use. Replicas do not coordinate, so each may request one token for the same key.
 
 After a token request fails, or its issued scopes do not match (`TokenRequestFailed`,
 `ScopeMismatch`), the next request for the same cache key (surface, provider, scopes and secret
@@ -195,7 +196,8 @@ rotating a secret the provider's type sends starts a new key with no wait. Failu
 missing or refused secret (`SecretUnavailable`), a secrets store or vault error
 (`StoreUnavailable`), a token endpoint the egress or https rule refuses (`TokenEndpointRefused`,
 `TokenEndpointNotHttps`), a provider changed during the request (`ProviderChanged`) or an
-unsupported provider type. The wait is kept in memory on each replica and resets on restart.
+unsupported provider type. The wait is kept in memory on each replica and resets on restart, and the
+count of failures is forgotten 10 minutes after the retry time, so the next failure waits 1 second again.
 
 ### Logging token endpoint errors
 
