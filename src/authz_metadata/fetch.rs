@@ -4,7 +4,7 @@ use bytes::Bytes;
 use url::Url;
 
 use super::{DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
-use crate::egress::{EgressError, pinned_forward_client, pinned_strict_client};
+use crate::egress::{EgressError, pinned_forward_client, pinned_metadata_client, pinned_strict_client};
 use crate::proxy::upstream_body::{UpstreamBodyError, UpstreamBodyLimits, read_bounded};
 
 /// `raw` parsed as an absolute URL with a host and no credentials, whose scheme
@@ -34,16 +34,17 @@ pub(super) fn parse_fetch_url(
     }
 }
 
-async fn pinned_client(
+pub(crate) async fn pinned_client(
     url: &str,
     posture: EgressPosture,
     options: DiscoveryOptions,
 ) -> Result<reqwest::Client, DiscoveryError> {
     let raw = url.to_string();
     let timeout = options.timeout;
-    let pinned = resolve_within(timeout, move || match posture {
-        EgressPosture::CloudMetadataOnly => pinned_forward_client(&raw, timeout),
-        EgressPosture::Strict => pinned_strict_client(&raw, timeout),
+    let pinned = resolve_within(timeout, move || match (options.direct, posture) {
+        (true, posture) => pinned_metadata_client(&raw, posture == EgressPosture::Strict, timeout),
+        (false, EgressPosture::CloudMetadataOnly) => pinned_forward_client(&raw, timeout),
+        (false, EgressPosture::Strict) => pinned_strict_client(&raw, timeout),
     })
     .await?;
     pinned
@@ -102,11 +103,12 @@ fn read_deadline_secs(options: DiscoveryOptions) -> u64 {
 /// call can take up to twice the timeout. The body is bounded by `options.max_bytes`
 /// (`too_large`). The request asks for `application/json`.
 ///
-/// The vetting and pinning do not hold when a proxy is configured, through the environment
-/// variables `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (also in lower case) or the system
-/// proxy settings of macOS and Windows: the shared pinned egress clients do not disable
-/// proxies, so the request then goes to the proxy, which resolves the host again and
-/// connects to an address nobody vetted.
+/// With `options.direct`, as when it reads the authorization server metadata of a credential
+/// provider for external consent, the pinned client ignores proxy settings (`HTTPS_PROXY`,
+/// `HTTP_PROXY`, `ALL_PROXY` and the system proxy), which would resolve the host again and
+/// connect to an address nobody vetted, so the request connects directly. Otherwise, as for
+/// inbound and MCP authorization server discovery, a configured proxy is used, and the
+/// vetting and pinning do not hold through it: the proxy resolves the host again.
 ///
 /// Failure codes: `invalid_url`, `blocked`, `unreachable`, `http_status`, `too_large`.
 pub async fn get_bounded(
@@ -280,7 +282,11 @@ mod tests {
 
     #[test]
     fn the_read_deadline_rounds_up_to_whole_seconds() {
-        let with = |timeout| DiscoveryOptions { max_bytes: 1, timeout };
+        let with = |timeout| DiscoveryOptions {
+            max_bytes: 1,
+            timeout,
+            direct: false,
+        };
         assert_eq!(read_deadline_secs(with(Duration::from_millis(1))), 1);
         assert_eq!(read_deadline_secs(with(Duration::ZERO)), 1);
         assert_eq!(read_deadline_secs(with(Duration::from_millis(2500))), 3);

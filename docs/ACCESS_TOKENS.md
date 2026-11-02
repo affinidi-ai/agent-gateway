@@ -161,6 +161,11 @@ Agent Surfaces and appliance-wide ones over Fabric, whatever its exposure mode s
 API keys and Connection Points take their ownership from their Agent Surface or Gateway
 parent, and every child ID is checked against the PAT pattern independently.
 
+A Credential Provider's `provider_id` slug is unique per tenant, and among the global
+providers. A provider with an `issuer` keeps its endpoints and client fields for
+life, so a PAT that may edit it can rename it but not repoint it; see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+
 MCP Proxy creation accepts an optional caller-chosen `id`, so a PAT's resource pattern can
 confine it to a prefix such as `mcp-proxies:boris-.*`. The value is 1 to 128 letters,
 digits, `-`, or `_`, starting with a letter or digit; a UUID is assigned when it is
@@ -223,7 +228,9 @@ Ownership changes are administrator-only: `GET
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
 reference would become incompatible. The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
-child API keys and Connection Points move with their parent.
+child API keys and Connection Points move with their parent. A credential provider that any
+surface binds, of any tenant, cannot move to another tenant (`409`); remove the bindings first
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#deleting-a-provider)).
 
 ## Dashboard
 

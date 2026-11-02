@@ -138,6 +138,17 @@ describe('transitCredentialsToApi', () => {
     expect(transitCredentialsToApi(transitCredentialsApiToForm(elicit))).toEqual(elicit);
   });
 
+  it('keeps an external consent binding and its subject in either shape', () => {
+    for (const subject of ['owner', 'caller']) {
+      const external = { ...api, consent_mode: 'external', subject };
+      const form = transitCredentialsApiToForm(external)!;
+      expect(form.consent_mode).toBe('external');
+      expect(form.subject).toBe(subject);
+      expect(transitCredentialsFormToApi(form)).toEqual(external);
+      expect(transitCredentialsToApi(form)).toEqual(external);
+    }
+  });
+
   it('returns undefined for missing, non-object or provider-less values', () => {
     expect(transitCredentialsToApi(undefined)).toBeUndefined();
     expect(transitCredentialsToApi(null)).toBeUndefined();

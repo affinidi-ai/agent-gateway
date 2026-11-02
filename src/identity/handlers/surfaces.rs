@@ -9,6 +9,7 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
+use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::{AgentSurface, SharedTransitConfig, TransitConfig};
 use crate::identity::state::IdentityApiState;
@@ -33,6 +34,22 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
 /// Whether the caller's token carries a resource scope of any kind, including
 /// one made of required headers alone, which yields neither a tenant nor a
 /// [`PatResourceScope`].
+/// The management caller a surface change is audited under: the console user,
+/// and the access token when the request came with one.
+fn management_actor(
+    caller: &Option<Extension<AuthGuardOk>>,
+    delegation: &Option<Extension<PatDelegationContext>>,
+) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
+    crate::delegation_vault::audit::management_caller_context(
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        delegation
+            .as_ref()
+            .map(|Extension(delegation)| delegation.token_id.as_str()),
+    )
+}
+
 fn resource_scoped(delegation: &Option<Extension<PatDelegationContext>>) -> bool {
     delegation
         .as_ref()
@@ -761,6 +778,16 @@ fn validate_transit_points(
     }
     refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface, stored)?;
+    for variant in &mut surface.variants {
+        if let Some(points) = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut())
+        {
+            identify_transit_points(points, &format!("variant '{}' ", variant.alias))?;
+        }
+    }
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
@@ -774,22 +801,29 @@ fn validate_transit_points(
             .validate_transit_token_lifetime(max_lifetime_secs)
             .map_err(SurfaceApiError::BadRequest)?;
     }
-    let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
-    for (idx, tp) in transit
-        .points
-        .iter_mut()
-        .enumerate()
-    {
+    identify_transit_points(&mut transit.points, "")
+}
+
+/// Give each Transit Point of one list, the surface's or a variant's (named by
+/// `place`), an id when it has none, and refuse an alias that is not URL-safe
+/// or that another point of the list has.
+fn identify_transit_points(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    place: &str,
+) -> Result<(), SurfaceApiError> {
+    let mut seen = std::collections::HashSet::with_capacity(points.len());
+    for (idx, tp) in points.iter_mut().enumerate() {
         if tp.id.is_empty() {
             tp.id = uuid::Uuid::new_v4().to_string();
         }
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
-            return Err(SurfaceApiError::BadRequest(format!("transit.points[{}]: {}", idx, msg)));
+            return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
         if !seen.insert(tp.alias.clone()) {
             return Err(SurfaceApiError::BadRequest(format!(
-                "transit.points[{}]: duplicate alias '{}'. Each transit point alias must be unique within the surface.",
-                idx, tp.alias
+                "{place}transit.points[{idx}]: duplicate alias '{}'. Each transit point alias must be unique within \
+                 the surface.",
+                tp.alias
             )));
         }
     }
@@ -899,9 +933,11 @@ type SavedSurface = (axum::http::HeaderMap, Json<AgentSurface>);
 /// accepts through another ([`shared_issuer_warnings`]), each to a peer
 /// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]),
 /// each that opts Fabric callers in to delegated credentials without a
-/// managed identity ([`fabric_delegation_identity_warnings`]), and each that
+/// managed identity ([`fabric_delegation_identity_warnings`]), each that
 /// does so where the surface cannot tell a partner's users apart
-/// ([`fabric_caller_delegation_warnings`]).
+/// ([`fabric_caller_delegation_warnings`]), and each with external consent
+/// that a variant keeps under its own settings
+/// ([`inherited_external_point_warnings`]).
 async fn transit_point_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -917,6 +953,7 @@ async fn transit_point_warnings(
         .chain(fabric_hop_limit_warnings(surface))
         .chain(fabric_delegation_identity_warnings(surface))
         .chain(fabric_caller_delegation_warnings(surface, &issuers))
+        .chain(inherited_external_point_warnings(surface))
     {
         let quoted = warning
             .replace('\\', "\\\\")
@@ -1250,6 +1287,56 @@ fn fabric_caller_delegation_warnings(
     warnings
 }
 
+/// Each Transit Point with `consent_mode: external` that an enabled variant
+/// keeps from the surface, rather than listing its own points, while it
+/// overrides the shared transit settings or the Access Point. A grant by
+/// binding is kept under the Transit Point's id, so calls through the variant
+/// use the surface's grants under the variant's own transit policy, rate limit
+/// and Access Point.
+fn inherited_external_point_warnings(surface: &AgentSurface) -> Vec<String> {
+    let external: Vec<&str> = surface
+        .transit_points()
+        .iter()
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+        .map(|point| point.alias.as_str())
+        .collect();
+    let mut warnings = Vec::new();
+    for variant in surface
+        .variants
+        .iter()
+        .filter(|variant| variant.enabled)
+    {
+        let transit = variant
+            .overrides
+            .transit
+            .as_ref();
+        let keeps_the_points = transit.is_none_or(|transit| transit.disabled != Some(true) && transit.points.is_none());
+        let overrides_access = transit.is_some_and(|transit| transit.shared.is_some())
+            || variant
+                .overrides
+                .access_point
+                .is_some();
+        if !keeps_the_points || !overrides_access {
+            continue;
+        }
+        for alias in &external {
+            warnings.push(format!(
+                "Variant '{}' keeps Transit Point '{alias}', which has consent_mode external, and overrides its \
+                 transit settings or its Access Point: calls through the variant use the Transit Point's grants under \
+                 the variant's own transit policy, rate limit and Access Point; to keep them apart, give the variant \
+                 its own Transit Points in overrides.transit.points, with new ids",
+                variant.alias
+            ));
+        }
+    }
+    warnings
+}
+
 /// Each Transit Point, on the surface or in an enabled variant, whose
 /// `jwt_bearer` accepts tokens issued for the Access Point, base or enabled
 /// variant: the same JWT verification strategy and an audience both name. An
@@ -1573,6 +1660,7 @@ pub enum SurfaceApiError {
     NotFound(String),
     UnsupportedMediaType(String),
     InternalError(String),
+    Unavailable(String),
 }
 
 impl IntoResponse for SurfaceApiError {
@@ -1597,6 +1685,10 @@ impl IntoResponse for SurfaceApiError {
             SurfaceApiError::InternalError(msg) => {
                 error!("Surface API Internal Error: {}", msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error", Some(msg.clone()))
+            }
+            SurfaceApiError::Unavailable(msg) => {
+                warn!("Surface API Service Unavailable: {}", msg);
+                (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable", Some(msg.clone()))
             }
         };
 
@@ -1868,6 +1960,7 @@ pub async fn create_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     Json(mut surface): Json<AgentSurface>,
 ) -> Result<(StatusCode, axum::http::HeaderMap, Json<AgentSurface>), SurfaceApiError> {
     let store = state
@@ -1945,6 +2038,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    super::surface_tenancy::validate_external_consent_bindings(&state, &surface).await?;
 
     // Reject overlapping outbound listener routes before they can reach
     // the Axum router and panic the gateway on rebuild.
@@ -2002,13 +2096,24 @@ pub async fn create_surface(
     crate::config::enforce_add("surfaces.agent")
         .await
         .map_err(|e| SurfaceApiError::Forbidden(e.message()))?;
-
+    let allowlist = crate::egress::bdd_egress_allowlist();
+    let actor = management_actor(&caller, &delegation);
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    store
-        .save(&surface)
-        .await
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))?;
+    super::surface_grants::write_surface(
+        &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
+        store.clone(),
+        &surface.surface_id,
+        super::surface_grants::Stored::Absent,
+        Some(&surface),
+        || async {
+            store
+                .save(&surface)
+                .await
+                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))
+        },
+    )
+    .await?;
 
     info!("Created agent surface '{}' (surface_id={})", surface.name, surface.surface_id);
 
@@ -2062,6 +2167,7 @@ pub async fn update_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let store = state
@@ -2088,6 +2194,7 @@ pub async fn update_surface(
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
     settle_undeclared_put(&mut surface, &existing, &sent)?;
+    carry_transit_point_ids(&mut surface, &existing, &sent);
     surface.tenant_id = existing.tenant_id.clone();
     if surface
         .mcp_legacy_metadata_output
@@ -2108,6 +2215,7 @@ pub async fn update_surface(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -2495,6 +2603,123 @@ fn variant_stored_points<'a>(
         })
 }
 
+/// The Transit Points a stored variant's own overrides define, without the
+/// surface's that a variant without its own list inherits.
+fn variant_own_points<'a>(
+    existing: &'a AgentSurface,
+    variant_id: &str,
+) -> Option<&'a [crate::config::agent_surface::TransitPoint]> {
+    existing
+        .variants
+        .iter()
+        .find(|stored| stored.id == variant_id)
+        .and_then(|stored| {
+            stored
+                .overrides
+                .transit
+                .as_ref()
+        })
+        .and_then(|transit| transit.points.as_deref())
+}
+
+/// The Transit Points a variant PUT sends, `points`, with what the save keeps
+/// of the stored ones, `sent_points` being their JSON: the ids of external
+/// consent Transit Points from the variant's own stored list only
+/// ([`carry_point_ids`]), so the copy of an inherited one is a Transit Point
+/// of its own, and the caller authentication they leave out from the
+/// variant's list or, for a variant that inherits, the surface's
+/// ([`variant_stored_points`]).
+fn settle_variant_put_points(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    existing: &AgentSurface,
+    variant_id: &str,
+    sent_points: Option<&serde_json::Value>,
+) {
+    if let Some(own_points) = variant_own_points(existing, variant_id) {
+        carry_point_ids(points, own_points, sent_points);
+    }
+    if let Some(stored_points) = variant_stored_points(existing, variant_id) {
+        retain_transit_points_caller_authentication(points, stored_points, sent_points);
+    }
+}
+
+/// A save that leaves out the `id` of a Transit Point with a
+/// `consent_mode: external` binding keeps the id stored for the Transit Point
+/// with its alias in the same place, the surface's own list or the variant's
+/// of the same id. Without this, every such save would give the Transit Point
+/// a new id, and with it a new binding, so its grants by binding would be
+/// revoked. Other Transit Points are left as sent: one sent without its id is
+/// a new Transit Point, which keeps none of the stored one's settings. `sent`
+/// is the JSON the request sent: a PUT's whole body or a merge PATCH's. A list
+/// the request did not send keeps its stored ids already.
+fn carry_transit_point_ids(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    if let Some(transit) = surface.transit.as_mut() {
+        carry_point_ids(&mut transit.points, existing.transit_points(), sent.pointer("/transit/points"));
+    }
+    for (index, variant) in surface
+        .variants
+        .iter_mut()
+        .enumerate()
+    {
+        let stored = variant_own_points(existing, &variant.id);
+        let points = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut());
+        if let (Some(points), Some(stored)) = (points, stored) {
+            carry_point_ids(points, stored, sent.pointer(&format!("/variants/{index}/overrides/transit/points")));
+        }
+    }
+}
+
+/// [`carry_transit_point_ids`] for one list: each point with an external
+/// consent binding whose JSON in `sent_points` has no `id`, or an empty one,
+/// takes the stored id of the point with its alias, unless another point of the
+/// list already has that id.
+fn carry_point_ids(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    stored: &[crate::config::agent_surface::TransitPoint],
+    sent_points: Option<&serde_json::Value>,
+) {
+    let Some(sent_points) = sent_points.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let sends_id = |index: usize| {
+        sent_points
+            .get(index)
+            .and_then(|point| point.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    };
+    let mut taken: std::collections::HashSet<String> = points
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| sends_id(*index))
+        .map(|(_, point)| point.id.clone())
+        .collect();
+    for (index, point) in points.iter_mut().enumerate() {
+        let external = point
+            .transit_credentials
+            .as_ref()
+            .is_some_and(|binding| binding.is_external());
+        if sends_id(index) || !external {
+            continue;
+        }
+        if let Some(previous) = stored
+            .iter()
+            .find(|previous| previous.alias == point.alias)
+            && taken.insert(previous.id.clone())
+        {
+            point.id = previous.id.clone();
+        }
+    }
+}
+
 /// Keeps each Transit Point's stored `source_auth`,
 /// `allow_unauthenticated_callers`, `allow_fabric_callers` and
 /// `delegated_credentials_for_fabric_callers` that `sent_points`, the JSON the
@@ -2767,6 +2992,7 @@ async fn validate_and_save_surface(
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<AgentSurface, SurfaceApiError> {
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -2808,6 +3034,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
+    super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     validate_surface_payment_policies(&mut surface).await?;
@@ -2832,13 +3059,23 @@ async fn validate_and_save_surface(
     refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
     validate_protected_resource_issuers(state, &surface).await?;
     validate_mcp_resource_declarations(state, &surface).await?;
-
+    let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    store
-        .save(&surface)
-        .await
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))?;
+    super::surface_grants::write_surface(
+        &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
+        store.clone(),
+        &surface.surface_id,
+        super::surface_grants::Stored::Any,
+        Some(&surface),
+        || async {
+            store
+                .save(&surface)
+                .await
+                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to save surface: {}", e)))
+        },
+    )
+    .await?;
 
     info!("Updated agent surface '{}' (surface_id={})", surface.name, surface.surface_id);
 
@@ -2913,6 +3150,7 @@ pub async fn patch_surface(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -2950,6 +3188,7 @@ pub async fn patch_surface(
     let mut surface: AgentSurface = serde_json::from_value(merged)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged surface failed to deserialise: {}", e)))?;
     surface.surface_id = surface_id.clone();
+    carry_transit_point_ids(&mut surface, &existing, &patch);
     if patch_sets_a2a_settings(&patch) {
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
@@ -2962,6 +3201,7 @@ pub async fn patch_surface(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -2982,6 +3222,7 @@ pub async fn patch_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -3027,8 +3268,22 @@ pub async fn patch_variant(
         obj.insert("id".to_string(), serde_json::Value::String(variant_id.clone()));
     }
 
-    let new_variant: crate::config::agent_surface_variants::SurfaceVariant = serde_json::from_value(merged_variant)
+    let mut new_variant: crate::config::agent_surface_variants::SurfaceVariant = serde_json::from_value(merged_variant)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged variant failed to deserialise: {}", e)))?;
+    if let (Some(points), Some(stored)) = (
+        new_variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut()),
+        existing.variants[variant_index]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_deref()),
+    ) {
+        carry_point_ids(points, stored, patch.pointer("/overrides/transit/points"));
+    }
 
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
@@ -3041,6 +3296,7 @@ pub async fn patch_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     Ok((transit_point_warnings(&state, &saved).await, Json(saved)))
@@ -3052,6 +3308,8 @@ pub async fn delete_surface(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let store = state
         .agent_surface_store
@@ -3072,10 +3330,22 @@ pub async fn delete_surface(
                 resource_scope(&scope),
             ) =>
         {
-            store
-                .delete(&surface_id)
-                .await
-                .map_err(|e| SurfaceApiError::InternalError(format!("Failed to delete surface: {}", e)))?;
+            let allowlist = crate::egress::bdd_egress_allowlist();
+            let actor = management_actor(&caller, &delegation);
+            super::surface_grants::write_surface(
+                &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
+                store.clone(),
+                &surface_id,
+                super::surface_grants::Stored::Any,
+                None,
+                || async {
+                    store
+                        .delete(&surface_id)
+                        .await
+                        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to delete surface: {}", e)))
+                },
+            )
+            .await?;
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
 
@@ -3523,6 +3793,7 @@ pub async fn create_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     Json(body): Json<CreateVariantRequest>,
 ) -> Result<(StatusCode, axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -3576,6 +3847,23 @@ pub async fn create_variant(
     } else {
         SurfaceOverrides::default()
     };
+    // A Transit Point with external consent is kept in one place, so the copy
+    // gets ids of its own for those, and its own grants once consented.
+    let mut seed_overrides = seed_overrides;
+    for point in seed_overrides
+        .transit
+        .iter_mut()
+        .filter_map(|transit| transit.points.as_mut())
+        .flatten()
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+    {
+        point.id = uuid::Uuid::new_v4().to_string();
+    }
 
     let new_variant = SurfaceVariant {
         id: uuid::Uuid::new_v4().to_string(),
@@ -3598,6 +3886,7 @@ pub async fn create_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
     let new_variant = saved
@@ -3624,6 +3913,7 @@ pub async fn update_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -3729,18 +4019,12 @@ pub async fn update_variant(
         {
             retained.push(variant.alias.clone());
         }
-        if let (Some(points), Some(stored_points)) = (
-            overrides
-                .transit
-                .as_mut()
-                .and_then(|transit| transit.points.as_mut()),
-            variant_stored_points(&existing, &variant_id),
-        ) {
-            retain_transit_points_caller_authentication(
-                points,
-                stored_points,
-                sent.pointer("/overrides/transit/points"),
-            );
+        if let Some(points) = overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut())
+        {
+            settle_variant_put_points(points, &existing, &variant_id, sent.pointer("/overrides/transit/points"));
         }
         variant.overrides = overrides;
     }
@@ -3754,6 +4038,7 @@ pub async fn update_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 
@@ -3785,6 +4070,7 @@ pub async fn delete_variant(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -3830,6 +4116,7 @@ pub async fn delete_variant(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 
@@ -3855,6 +4142,7 @@ pub async fn promote_variant_to_default(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    caller: Option<Extension<AuthGuardOk>>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -3892,6 +4180,7 @@ pub async fn promote_variant_to_default(
         tenant_context(&context),
         resource_scope(&scope),
         resource_scoped(&delegation),
+        management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
 
@@ -4841,6 +5130,80 @@ mod validation_tests {
         }
     }
 
+    /// A variant that keeps the surface's Transit Points uses their grants by
+    /// binding under its own transit settings and Access Point: a save says so
+    /// when the variant overrides either.
+    #[test]
+    fn a_save_warns_of_a_variant_that_uses_inherited_grants_under_its_own_settings() {
+        let surface_with = |enabled: bool, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "tools",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp" },
+                "target": { "endpoint": "https://tools.internal/mcp" },
+                "transit": { "points": [
+                    { "id": "crm-id", "alias": "crm", "target_endpoint": "https://crm.example/mcp",
+                        "require_transit_token": true, "transit_credentials": {
+                            "credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner" } },
+                    { "id": "docs-id", "alias": "docs", "target_endpoint": "https://docs.example/mcp",
+                        "require_transit_token": true }
+                ] },
+                "variants": [{ "id": "dev", "alias": "dev", "name": "Dev", "enabled": enabled,
+                    "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let warning = vec![
+            "Variant 'dev' keeps Transit Point 'crm', which has consent_mode external, and overrides its transit \
+             settings or its Access Point: calls through the variant use the Transit Point's grants under the \
+             variant's own transit policy, rate limit and Access Point; to keep them apart, give the variant its own \
+             Transit Points in overrides.transit.points, with new ids"
+                .to_string(),
+        ];
+        for (case, overrides) in [
+            (
+                "its own transit policy",
+                serde_json::json!({ "transit": { "shared": { "opa_policy_definition_id": "dev" } } }),
+            ),
+            (
+                "its own Access Point",
+                serde_json::json!({ "access_point": { "caller_authentication": { "methods": [caller_key()] } } }),
+            ),
+        ] {
+            assert_eq!(inherited_external_point_warnings(&surface_with(true, overrides)), warning, "{case}");
+        }
+        for (case, surface) in [
+            ("no overrides", surface_with(true, serde_json::json!({}))),
+            (
+                "its own target",
+                surface_with(true, serde_json::json!({ "target": { "endpoint": "https://dev.internal" } })),
+            ),
+            (
+                "its own Transit Points",
+                surface_with(
+                    true,
+                    serde_json::json!({ "transit": { "points": [], "shared": { "opa_policy_definition_id": "dev" } } }),
+                ),
+            ),
+            (
+                "transit turned off",
+                surface_with(
+                    true,
+                    serde_json::json!({ "transit": { "disabled": true }, "access_point": { "caller_authentication": {
+                        "methods": [caller_key()] } } }),
+                ),
+            ),
+            (
+                "a disabled variant",
+                surface_with(
+                    false,
+                    serde_json::json!({ "transit": { "shared": { "opa_policy_definition_id": "dev" } } }),
+                ),
+            ),
+        ] {
+            assert!(inherited_external_point_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
     #[test]
     fn a_put_that_omits_a_transit_points_caller_authentication_keeps_it_while_it_applies() {
         let stored_points = serde_json::json!([
@@ -4923,6 +5286,151 @@ mod validation_tests {
     /// strategy `idp`.
     fn per_user_jwt() -> serde_json::Value {
         serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] })
+    }
+
+    /// A save that leaves out the ids of Transit Points with external consent
+    /// keeps the stored ones, matched by alias in the same place, so each
+    /// binding keeps its id, and with it its grants. An id the request sends is
+    /// kept as sent, and a Transit Point without external consent sent without
+    /// its id is a new one, as before.
+    #[tokio::test]
+    async fn a_save_that_leaves_transit_point_ids_out_keeps_them_and_their_grants() {
+        let binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner"});
+        let stored_points = serde_json::json!([
+            { "id": "hop-vendor", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-other", "alias": "other", "target_endpoint": "https://203.0.113.31/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-plain", "alias": "plain", "target_endpoint": "https://203.0.113.33/mcp",
+                "require_transit_token": true }
+        ]);
+        let mut existing = surface_with_transit_points(stored_points.clone(), stored_points);
+        existing.surface_id = "surface".into();
+        let sent_points = serde_json::json!([
+            { "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp", "require_transit_token": true,
+                "transit_credentials": binding },
+            { "id": "", "alias": "other", "target_endpoint": "https://203.0.113.31/mcp",
+                "require_transit_token": true, "transit_credentials": binding },
+            { "id": "hop-new", "alias": "added", "target_endpoint": "https://203.0.113.32/mcp",
+                "require_transit_token": true },
+            { "alias": "plain", "target_endpoint": "https://203.0.113.33/mcp", "require_transit_token": true }
+        ]);
+        let sent = serde_json::json!({
+            "transit": { "points": sent_points },
+            "variants": [{ "id": "candidate", "overrides": { "transit": { "points": sent_points } } }]
+        });
+        let mut surface = surface_with_transit_points(sent_points.clone(), sent_points);
+        surface.surface_id = "surface".into();
+
+        carry_transit_point_ids(&mut surface, &existing, &sent);
+
+        let variant_points = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.clone())
+            .unwrap();
+        for points in [
+            &surface
+                .transit
+                .as_ref()
+                .unwrap()
+                .points,
+            &variant_points,
+        ] {
+            let ids: Vec<&str> = points
+                .iter()
+                .map(|point| point.id.as_str())
+                .collect();
+            assert_eq!(ids[..3], ["hop-vendor", "hop-other", "hop-new"]);
+            assert_ne!(ids[3], "hop-plain", "a Transit Point without external consent is new");
+        }
+        let no_vault = super::super::surface_grants::GrantRemoval {
+            vault: None,
+            providers: None,
+            secrets: None,
+            exact_allowlist: None,
+            actor: None,
+        };
+        assert!(
+            super::super::surface_grants::remove_changed_binding_grants(
+                &no_vault,
+                Some(&existing),
+                Some(&surface),
+                None,
+                None
+            )
+            .await
+            .is_ok(),
+            "no binding changed, so no grant is revoked"
+        );
+
+        let mut renamed = surface_with_transit_points(
+            serde_json::json!([{ "id": "hop-vendor", "alias": "renamed", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }]),
+            serde_json::json!([]),
+        );
+        let sent = serde_json::json!({ "transit": { "points": [{ "id": "hop-vendor", "alias": "renamed" }] } });
+        carry_transit_point_ids(&mut renamed, &existing, &sent);
+        assert_eq!(
+            renamed
+                .transit
+                .as_ref()
+                .unwrap()
+                .points[0]
+                .id,
+            "hop-vendor",
+            "a sent id is kept"
+        );
+    }
+
+    /// A variant PUT carries a Transit Point's id only from the variant's own
+    /// stored list, as a surface PUT does: a variant that inherits the
+    /// surface's points and is sent its own copy of an external one, without
+    /// an id, as the Surface Builder sends it, gets a new Transit Point, and is
+    /// saved, instead of taking the surface's id and being refused for using
+    /// it in two places. A variant with its own list keeps its own ids.
+    #[test]
+    fn a_variant_put_carries_transit_point_ids_from_the_variants_own_list_only() {
+        let binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner"});
+        let base_points = serde_json::json!([
+            { "id": "hop-vendor", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }
+        ]);
+        let sent_points = serde_json::json!([
+            { "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp", "require_transit_token": true,
+                "transit_credentials": binding }
+        ]);
+        let mut inheriting = surface_with_transit_points(base_points.clone(), serde_json::json!([]));
+        inheriting.variants[0]
+            .overrides
+            .transit = None;
+        let mut points: Vec<crate::config::agent_surface::TransitPoint> =
+            serde_json::from_value(sent_points.clone()).unwrap();
+
+        settle_variant_put_points(&mut points, &inheriting, "candidate", Some(&sent_points));
+        assert_ne!(points[0].id, "hop-vendor", "the surface's id is not carried into the variant's copy");
+        identify_transit_points(&mut points, "variant 'candidate' ").unwrap();
+        let mut saved = inheriting.clone();
+        saved.variants[0]
+            .overrides
+            .transit = Some(serde_json::from_value(serde_json::json!({ "points": points })).unwrap());
+        assert!(
+            super::super::surface_tenancy::check_external_transit_point_ids(&saved).is_ok(),
+            "the variant's copy is a Transit Point of its own"
+        );
+
+        let own = surface_with_transit_points(
+            base_points,
+            serde_json::json!([{ "id": "hop-variant", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                "require_transit_token": true, "transit_credentials": binding }]),
+        );
+        let mut points: Vec<crate::config::agent_surface::TransitPoint> =
+            serde_json::from_value(sent_points.clone()).unwrap();
+        settle_variant_put_points(&mut points, &own, "candidate", Some(&sent_points));
+        assert_eq!(points[0].id, "hop-variant", "a variant with its own list keeps its own id");
     }
 
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,
@@ -5143,6 +5651,60 @@ mod validation_tests {
                 "require_transit_token": false, "source_auth": caller_key() }]),
         );
         assert!(validate_transit_points(&mut open, 30, None).is_ok());
+    }
+
+    /// A variant's own Transit Points get an id when sent without one, as the
+    /// surface's do, so a grant by binding never sits under an empty id, and
+    /// their aliases follow the same rules within the variant's list.
+    #[test]
+    fn a_variants_transit_points_get_ids_and_checked_aliases() {
+        let point = |alias: &str| {
+            serde_json::json!({ "id": "", "alias": alias, "target_endpoint": "https://partner.example",
+                "require_transit_token": true })
+        };
+        let mut surface = surface_with_transit_points(
+            serde_json::json!([point("partner")]),
+            serde_json::json!([point("partner"), point("vendor")]),
+        );
+        validate_transit_points(&mut surface, 30, None).unwrap();
+        let ids: Vec<&str> = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect();
+        assert!(
+            ids.iter()
+                .all(|id| !id.is_empty()),
+            "{ids:?}"
+        );
+        assert_ne!(ids[0], ids[1]);
+
+        for (case, variant_points, expected) in [
+            (
+                "a duplicate alias",
+                serde_json::json!([point("vendor"), point("vendor")]),
+                "variant 'candidate' transit.points[1]: duplicate alias 'vendor'",
+            ),
+            (
+                "an alias that is not URL-safe",
+                serde_json::json!([point("no spaces")]),
+                "variant 'candidate' transit.points[0]: ",
+            ),
+        ] {
+            let mut surface = surface_with_transit_points(serde_json::json!([]), variant_points);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.starts_with(expected), "{case}: {message}")
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+        }
     }
 
     /// A save refuses `transit_token_mode: reference`, on the surface or in a

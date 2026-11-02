@@ -402,6 +402,36 @@ mod tests {
         );
     }
 
+    /// Grants by binding hold refresh tokens, so an export leaves their
+    /// directory out of the vault.
+    #[test]
+    fn an_export_leaves_out_the_vaults_grants() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let grants = storage_root
+            .join("delegation_vault")
+            .join(crate::delegation_vault::grants::GRANTS_DIRECTORY);
+        fs::create_dir_all(&grants).unwrap();
+        fs::write(grants.join("grant-1.json"), r#"{"refresh_token":"vendor-refresh-token"}"#).unwrap();
+
+        let mut stats = ExportStats::default();
+        let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        for index in 0..archive.len() {
+            let mut file = archive
+                .by_index(index)
+                .unwrap();
+            let name = file
+                .name()
+                .unwrap()
+                .into_owned();
+            assert!(!name.contains("delegated_grants"), "{name}");
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut file, &mut content).unwrap();
+            assert!(!content.contains("vendor-refresh-token"), "{name}");
+        }
+    }
+
     #[test]
     fn test_build_redacted_zip_redacts_json() {
         let dir = create_test_storage();

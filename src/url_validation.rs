@@ -193,6 +193,18 @@ pub(crate) fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many hosts [`validate_resolved_url`] and
+/// [`validate_resolved_cloud_metadata_url`] have resolved on this thread.
+#[cfg(test)]
+pub(crate) fn resolutions_on_this_thread() -> usize {
+    RESOLUTIONS.with(std::cell::Cell::get)
+}
+
 /// Shared implementation for DNS-aware URL validation.
 ///
 /// When `block_loopback` is `true` the behaviour matches [`validate_resolved_url`]:
@@ -243,6 +255,8 @@ fn validate_resolved_url_inner(
         .port_or_known_default()
         .unwrap_or(80);
 
+    #[cfg(test)]
+    RESOLUTIONS.with(|count| count.set(count.get() + 1));
     use std::net::ToSocketAddrs;
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
