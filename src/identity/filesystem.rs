@@ -81,6 +81,60 @@ pub enum IdentityOrigin {
     ExternalCaller,
 }
 
+/// The surface slot whose identity setting created a managed identity: the protected slot
+/// (or the legacy surface `managed_identity`), or a Transit Point's own `managed_identity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManagedSlot {
+    Protected,
+    TransitPoint { alias: String },
+}
+
+/// A change of the stored credential behind a credential-derived identity that kept its DID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CredentialRotation {
+    /// The credential's `updated_at` after the change; `None` when the change happened before
+    /// the gateway recorded rotations.
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// The identity fields the change replaced, with their earlier values. Empty for a
+    /// credential whose identity fields don't describe its value, such as an API key.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub previous: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Where a managed identity comes from, as seen when it is issued or reused.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagedIdentitySource {
+    pub slot: ManagedSlot,
+    /// `updated_at` of the stored certificate or secret the identity is derived from.
+    pub credential_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ManagedIdentitySource {
+    pub fn protected() -> Self {
+        Self {
+            slot: ManagedSlot::Protected,
+            credential_updated_at: None,
+        }
+    }
+
+    pub fn transit_point(alias: impl Into<String>) -> Self {
+        Self {
+            slot: ManagedSlot::TransitPoint { alias: alias.into() },
+            credential_updated_at: None,
+        }
+    }
+
+    pub fn with_credential_updated_at(
+        mut self,
+        updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        self.credential_updated_at = updated_at;
+        self
+    }
+}
+
 /// Represents a stored agent identity record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentityRecord {
@@ -129,6 +183,19 @@ pub struct AgentIdentityRecord {
     /// Origin of this identity; `None` for records written before origin tracking
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<IdentityOrigin>,
+
+    /// Slot that created this managed identity; `None` for other identities and for managed
+    /// records not used since slot tracking began
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<ManagedSlot>,
+
+    /// `updated_at` of the credential this identity was last seen derived from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Rotations of that credential, oldest first
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotations: Vec<CredentialRotation>,
 }
 
 fn default_is_local() -> bool {
@@ -143,6 +210,54 @@ impl AgentIdentityRecord {
             None if !self.is_local => Some(IdentityOrigin::ExternalCaller),
             None => None,
         }
+    }
+
+    /// Records `source` on this managed identity, now derived with `identity_fields`, and
+    /// returns whether anything changed.
+    ///
+    /// The slot is kept once known. A credential's first `updated_at` is stored as the
+    /// baseline. After that, an mTLS certificate rotates when its identity fields change, and
+    /// any other credential, whose fields don't describe its value, whenever its `updated_at`
+    /// changes. A field change seen when the baseline is stored is a rotation of unknown time.
+    pub fn apply_managed_source(
+        &mut self,
+        source: &ManagedIdentitySource,
+        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        let mut changed = false;
+        if self.slot.is_none() {
+            self.slot = Some(source.slot.clone());
+            changed = true;
+        }
+        let Some(updated_at) = source.credential_updated_at else {
+            return changed;
+        };
+        if self.credential_updated_at == Some(updated_at) {
+            return changed;
+        }
+        let fields_changed = self.identity_fields != *identity_fields;
+        let rotated = match self.credential_updated_at {
+            None => fields_changed,
+            Some(_) => fields_changed || identity_fields.get("credential_type") != Some(&serde_json::json!("mtls")),
+        };
+        if rotated {
+            let previous = self
+                .identity_fields
+                .iter()
+                .filter(|(key, value)| identity_fields.get(*key) != Some(*value))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            self.rotations
+                .push(CredentialRotation {
+                    rotated_at: self
+                        .credential_updated_at
+                        .map(|_| updated_at),
+                    previous,
+                });
+        }
+        self.identity_fields = identity_fields.clone();
+        self.credential_updated_at = Some(updated_at);
+        true
     }
 }
 
@@ -497,6 +612,9 @@ impl IdentityStore for FilesystemIdentityStore {
             is_local: false,   // External DID is remote
             verified,          // Track whether VP/VC signature was verified
             origin: Some(IdentityOrigin::ExternalCaller),
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
         };
 
         self.save_record(record, true)
@@ -527,6 +645,33 @@ impl IdentityStore for FilesystemIdentityStore {
             .save(&record)
             .await?;
         Ok(Some(origin))
+    }
+
+    async fn apply_managed_source(
+        &self,
+        identity_hash: &str,
+        source: &ManagedIdentitySource,
+        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let Some(mut record) = self
+            .storage
+            .get(identity_hash)
+            .await?
+        else {
+            anyhow::bail!("identity record not found: {}", identity_hash);
+        };
+        if !record.apply_managed_source(source, identity_fields) {
+            return Ok(());
+        }
+        self.storage
+            .save(&record)
+            .await?;
+        if let Some(ws) = &self.ws_state
+            && let Ok(identity_json) = serde_json::to_value(&record)
+        {
+            ws.broadcast(crate::server::WsUpdate::IdentityUpdated { identity: identity_json });
+        }
+        Ok(())
     }
 
     fn base_path(&self) -> Option<std::path::PathBuf> {
@@ -564,6 +709,9 @@ mod tests {
             is_local,
             verified: false,
             origin,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
         }
     }
 
@@ -605,6 +753,9 @@ mod tests {
             is_local: true,
             verified: true,
             origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
         };
 
         store
@@ -687,6 +838,9 @@ mod tests {
             is_local: true,
             verified: true,
             origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
         }
     }
 
@@ -973,5 +1127,192 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_767_225_600 + seconds, 0).unwrap()
+    }
+
+    fn mtls_fields(fingerprint: &str) -> std::collections::HashMap<String, JsonValue> {
+        std::collections::HashMap::from([
+            ("credential_type".to_string(), serde_json::json!("mtls")),
+            ("certificate_id".to_string(), serde_json::json!("cert-1")),
+            ("fingerprint_sha256".to_string(), serde_json::json!(fingerprint)),
+            ("subject_dn".to_string(), serde_json::json!("CN=agent")),
+        ])
+    }
+
+    fn api_key_fields() -> std::collections::HashMap<String, JsonValue> {
+        std::collections::HashMap::from([
+            ("credential_type".to_string(), serde_json::json!("api_key")),
+            ("api_key_id".to_string(), serde_json::json!("key-1")),
+        ])
+    }
+
+    fn credential_record(
+        fields: std::collections::HashMap<String, JsonValue>,
+        updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AgentIdentityRecord {
+        let mut record = local_record("h");
+        record.identity_fields = fields;
+        record.credential_updated_at = updated_at;
+        record
+    }
+
+    fn observed(updated_at: i64) -> ManagedIdentitySource {
+        ManagedIdentitySource::protected().with_credential_updated_at(Some(at(updated_at)))
+    }
+
+    #[test]
+    fn apply_managed_source_sets_the_slot_once() {
+        let mut record = local_record("h");
+
+        assert!(
+            record.apply_managed_source(&ManagedIdentitySource::transit_point("tp-1"), &record.identity_fields.clone())
+        );
+        assert!(!record.apply_managed_source(&ManagedIdentitySource::protected(), &record.identity_fields.clone()));
+
+        assert_eq!(record.slot, Some(ManagedSlot::TransitPoint { alias: "tp-1".into() }));
+        assert_eq!(record.credential_updated_at, None);
+        assert!(record.rotations.is_empty());
+    }
+
+    #[test]
+    fn apply_managed_source_stores_the_first_updated_at_as_a_baseline() {
+        let mut record = credential_record(mtls_fields("aa"), None);
+
+        assert!(record.apply_managed_source(&observed(0), &mtls_fields("aa")));
+
+        assert_eq!(record.credential_updated_at, Some(at(0)));
+        assert!(record.rotations.is_empty());
+    }
+
+    #[test]
+    fn apply_managed_source_records_a_changed_certificate_with_its_previous_fields() {
+        let mut record = credential_record(mtls_fields("aa"), Some(at(0)));
+
+        assert!(record.apply_managed_source(&observed(60), &mtls_fields("bb")));
+
+        assert_eq!(
+            record.rotations,
+            vec![CredentialRotation {
+                rotated_at: Some(at(60)),
+                previous: std::collections::HashMap::from([(
+                    "fingerprint_sha256".to_string(),
+                    serde_json::json!("aa")
+                )]),
+            }]
+        );
+        assert_eq!(record.identity_fields, mtls_fields("bb"));
+        assert_eq!(record.credential_updated_at, Some(at(60)));
+    }
+
+    #[test]
+    fn apply_managed_source_ignores_a_certificate_edit_that_keeps_the_certificate() {
+        let mut record = credential_record(mtls_fields("aa"), Some(at(0)));
+
+        assert!(record.apply_managed_source(&observed(60), &mtls_fields("aa")));
+
+        assert!(record.rotations.is_empty());
+        assert_eq!(record.credential_updated_at, Some(at(60)));
+    }
+
+    #[test]
+    fn apply_managed_source_records_every_api_key_update_without_fields() {
+        let mut record = credential_record(api_key_fields(), Some(at(0)));
+
+        assert!(record.apply_managed_source(&observed(60), &api_key_fields()));
+
+        assert_eq!(
+            record.rotations,
+            vec![CredentialRotation {
+                rotated_at: Some(at(60)),
+                previous: std::collections::HashMap::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_managed_source_records_a_change_before_the_baseline_without_a_time() {
+        let mut record = credential_record(mtls_fields("aa"), None);
+
+        assert!(record.apply_managed_source(&observed(60), &mtls_fields("bb")));
+
+        assert_eq!(record.rotations.len(), 1);
+        assert_eq!(record.rotations[0].rotated_at, None);
+        assert_eq!(record.credential_updated_at, Some(at(60)));
+    }
+
+    #[test]
+    fn apply_managed_source_changes_nothing_for_the_same_credential() {
+        let mut record = credential_record(api_key_fields(), Some(at(0)));
+        record.slot = Some(ManagedSlot::Protected);
+
+        assert!(!record.apply_managed_source(&observed(0), &api_key_fields()));
+
+        assert!(record.rotations.is_empty());
+    }
+
+    #[test]
+    fn rotations_and_slot_serialize_only_when_present() {
+        let mut record = local_record("h");
+        let empty = serde_json::to_value(&record).unwrap();
+        for absent in ["slot", "credential_updated_at", "rotations"] {
+            assert!(empty.get(absent).is_none(), "{absent} should be omitted");
+        }
+
+        record.slot = Some(ManagedSlot::TransitPoint { alias: "tp-1".into() });
+        record
+            .rotations
+            .push(CredentialRotation {
+                rotated_at: None,
+                previous: std::collections::HashMap::new(),
+            });
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["slot"], serde_json::json!({ "kind": "transit_point", "alias": "tp-1" }));
+        assert_eq!(value["rotations"], serde_json::json!([{ "rotated_at": null }]));
+    }
+
+    #[tokio::test]
+    async fn test_apply_managed_source_persists_a_rotation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(mtls_fields("aa"), Some(at(0))))
+            .await
+            .unwrap();
+
+        store
+            .apply_managed_source("h", &observed(60), &mtls_fields("bb"))
+            .await
+            .unwrap();
+
+        let reopened = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let record = reopened
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.slot, Some(ManagedSlot::Protected));
+        assert_eq!(record.rotations.len(), 1);
+        assert_eq!(record.identity_fields, mtls_fields("bb"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_managed_source_unknown_hash_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+
+        let result = store
+            .apply_managed_source("missing", &observed(0), &api_key_fields())
+            .await;
+
+        assert!(result.is_err());
     }
 }

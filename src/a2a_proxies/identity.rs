@@ -104,6 +104,7 @@ pub async fn resolve_synthetic_identity(
             Some(identity_hash(proxy)),
             Some(surface.surface_id.clone()),
             surface.issuer_id.clone(),
+            crate::identity::filesystem::ManagedIdentitySource::protected(),
         )
         .await?;
 

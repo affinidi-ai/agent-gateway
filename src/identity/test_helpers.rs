@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::filesystem::{AgentIdentityRecord, IdentityOrigin};
+use super::filesystem::{AgentIdentityRecord, IdentityOrigin, ManagedIdentitySource};
 use super::store::IdentityStore;
 use super::vc_issuer::VCIssuer;
 use super::vp_challenge_store::{VpChallengeRecord, VpChallengeStore};
@@ -38,6 +38,32 @@ pub async fn test_vc_issuer_with(identity_store: Arc<dyn IdentityStore>) -> (VCI
     (issuer, temp_dir)
 }
 
+/// Compares `actual` with a backend response fixture in `www/default/src/__fixtures__/backend/`,
+/// which the dashboard's tests render, so the two sides cannot drift apart silently. With
+/// `UPDATE_WEB_FIXTURES=1` set, rewrites the fixture instead.
+pub fn assert_web_fixture(
+    name: &str,
+    actual: &serde_json::Value,
+) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("www/default/src/__fixtures__/backend")
+        .join(name);
+    if std::env::var_os("UPDATE_WEB_FIXTURES").is_some() {
+        std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(actual).unwrap())).unwrap();
+        return;
+    }
+    let expected: serde_json::Value = std::fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|content| serde_json::from_str(&content).map_err(Into::into))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    assert_eq!(
+        actual,
+        &expected,
+        "{} no longer matches the backend; rerun with UPDATE_WEB_FIXTURES=1 and commit the fixture",
+        path.display()
+    );
+}
+
 pub fn test_surface_identity_record(
     did: &str,
     surface_id: &str,
@@ -60,6 +86,9 @@ pub fn test_surface_identity_record(
         is_local: true,
         verified: true,
         origin: None,
+        slot: None,
+        credential_updated_at: None,
+        rotations: Vec::new(),
     }
 }
 
@@ -155,6 +184,9 @@ impl IdentityStore for MockIdentityStore {
             is_local: false,
             verified,
             origin: Some(IdentityOrigin::ExternalCaller),
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
         };
 
         let mut records = self.records.write().await;
@@ -176,6 +208,20 @@ impl IdentityStore for MockIdentityStore {
                 .origin
                 .get_or_insert(origin),
         ))
+    }
+
+    async fn apply_managed_source(
+        &self,
+        identity_hash: &str,
+        source: &ManagedIdentitySource,
+        identity_fields: &HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(identity_hash)
+            .ok_or_else(|| anyhow::anyhow!("identity record not found: {identity_hash}"))?;
+        record.apply_managed_source(source, identity_fields);
+        Ok(())
     }
 }
 

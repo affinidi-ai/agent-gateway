@@ -17,7 +17,7 @@ use crate::identity::ssi::verifier::{LocalVerifier, Verifier};
 use crate::identity::ssi::vp_issuer::{Credentials, LocalVpIssuer, LocalVpSigner, VpIssuer, VpIssuerPayload};
 
 use super::display_name::{DisplayName, ManagedDisplayName, SurfacesByDidCache, resolve_managed_display_name_in};
-use super::filesystem::{AgentIdentityRecord, IdentityOrigin};
+use super::filesystem::{AgentIdentityRecord, IdentityOrigin, ManagedIdentitySource};
 use super::{IdentityStore, VpChallengeStore};
 
 const IS_VP_CHALLENGE_REQUIRED_DEFAULT: bool = false;
@@ -763,19 +763,28 @@ impl VCIssuer {
         channel_config_id: Option<String>,
         issuer_id: Option<String>,
     ) -> Result<AgentIdentityResponse> {
-        self.issue_or_get_credential_with_origin(identity_fields, identity_hash, channel_config_id, issuer_id, None)
-            .await
+        self.issue_or_get_credential_with_origin(
+            identity_fields,
+            identity_hash,
+            channel_config_id,
+            issuer_id,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`Self::issue_or_get_credential`] for the managed agent of `channel_config_id`:
-    /// records the identity as managed unless the record already has an origin. The VC
-    /// follows the record's origin: a managed one is named with its managed display name.
+    /// records the identity as managed unless the record already has an origin, and a managed
+    /// record takes the slot and credential state in `source`. The VC follows the record's
+    /// origin: a managed one is named with its managed display name.
     pub async fn issue_or_get_managed_credential(
         &self,
         identity_fields: std::collections::HashMap<String, serde_json::Value>,
         identity_hash: Option<String>,
         channel_config_id: Option<String>,
         issuer_id: Option<String>,
+        source: ManagedIdentitySource,
     ) -> Result<AgentIdentityResponse> {
         self.issue_or_get_credential_with_origin(
             identity_fields,
@@ -783,6 +792,7 @@ impl VCIssuer {
             channel_config_id,
             issuer_id,
             Some(IdentityOrigin::Managed),
+            Some(&source),
         )
         .await
     }
@@ -803,6 +813,7 @@ impl VCIssuer {
             channel_config_id,
             issuer_id,
             Some(IdentityOrigin::ExternalCaller),
+            None,
         )
         .await
     }
@@ -814,6 +825,7 @@ impl VCIssuer {
         channel_config_id: Option<String>,
         issuer_id: Option<String>,
         origin: Option<IdentityOrigin>,
+        managed_source: Option<&ManagedIdentitySource>,
     ) -> Result<AgentIdentityResponse> {
         info!(
             "[TR-TRACE] issue_or_get_credential called: channel_config_id={:?}, issuer_id={:?}, identity_hash={:?}, field_count={}",
@@ -834,7 +846,7 @@ impl VCIssuer {
             .await?
         {
             return self
-                .existing_identity_response(record, identity_fields, channel_config_id, origin)
+                .existing_identity_response(record, identity_fields, channel_config_id, origin, managed_source)
                 .await;
         }
 
@@ -862,6 +874,9 @@ impl VCIssuer {
         record.identity_fields = identity_fields.clone();
         record.channel_config_id = channel_config_id.clone();
         record.origin = origin;
+        if let Some(source) = managed_source {
+            record.apply_managed_source(source, &identity_fields);
+        }
         let created_at = record.created_at;
         let _ = issuer_id; // no-op: agent-in-TR writes are owned by Trust Recorder now
 
@@ -874,7 +889,7 @@ impl VCIssuer {
             self.discard_birth_log(&birth_log_dir)
                 .await;
             return self
-                .existing_identity_response(winner, identity_fields, channel_config_id, origin)
+                .existing_identity_response(winner, identity_fields, channel_config_id, origin, managed_source)
                 .await;
         }
 
@@ -910,6 +925,7 @@ impl VCIssuer {
         identity_fields: std::collections::HashMap<String, serde_json::Value>,
         channel_config_id: Option<String>,
         origin: Option<IdentityOrigin>,
+        managed_source: Option<&ManagedIdentitySource>,
     ) -> Result<AgentIdentityResponse> {
         let identity_hash = &record.identity_hash;
         info!("[TR-TRACE] Identity ALREADY EXISTS for hash={}, did={}", identity_hash, record.did);
@@ -927,6 +943,18 @@ impl VCIssuer {
             },
             (existing, _) => existing,
         };
+        if let Some(source) = managed_source
+            && effective_origin == Some(IdentityOrigin::Managed)
+            && record
+                .clone()
+                .apply_managed_source(source, &identity_fields)
+            && let Err(e) = self
+                .identity_store
+                .apply_managed_source(identity_hash, source, &identity_fields)
+                .await
+        {
+            warn!(identity_hash = %identity_hash, error = %e, "Failed to record managed identity source (non-fatal)");
+        }
         self.identity_store
             .update_usage(identity_hash, channel_config_id.clone())
             .await?;
@@ -2640,6 +2668,10 @@ mod tests {
             HashMap::from([("agent".to_string(), json!(value))])
         }
 
+        fn protected() -> ManagedIdentitySource {
+            ManagedIdentitySource::protected()
+        }
+
         async fn origin_of(
             issuer: &VCIssuer,
             did: &str,
@@ -2661,7 +2693,7 @@ mod tests {
             let issuer = &f.issuer;
 
             let response = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-managed".into()), None)
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-managed".into()), None, protected())
                 .await
                 .unwrap();
 
@@ -2716,14 +2748,14 @@ mod tests {
                 .await;
             let issuer = &f.issuer;
             let first = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None)
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None, protected())
                 .await
                 .unwrap();
 
             f.save_surface("vc-name-rename", "HELIUM")
                 .await;
             let second = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None)
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None, protected())
                 .await
                 .unwrap();
 
@@ -2741,7 +2773,13 @@ mod tests {
                 .await;
             let issuer = &f.issuer;
             let first = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .issue_or_get_managed_credential(
+                    fields("a"),
+                    None,
+                    Some("vc-name-conflict-a".into()),
+                    None,
+                    protected(),
+                )
                 .await
                 .unwrap();
 
@@ -2756,7 +2794,13 @@ mod tests {
                 .unwrap();
 
             let second = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .issue_or_get_managed_credential(
+                    fields("a"),
+                    None,
+                    Some("vc-name-conflict-a".into()),
+                    None,
+                    protected(),
+                )
                 .await
                 .unwrap();
 
@@ -2784,11 +2828,23 @@ mod tests {
                 .unwrap();
 
             let backfilled = issuer
-                .issue_or_get_managed_credential(fields("legacy"), None, Some("vc-name-backfill".into()), None)
+                .issue_or_get_managed_credential(
+                    fields("legacy"),
+                    None,
+                    Some("vc-name-backfill".into()),
+                    None,
+                    protected(),
+                )
                 .await
                 .unwrap();
             let still_caller = issuer
-                .issue_or_get_managed_credential(fields("caller"), None, Some("vc-name-backfill".into()), None)
+                .issue_or_get_managed_credential(
+                    fields("caller"),
+                    None,
+                    Some("vc-name-backfill".into()),
+                    None,
+                    protected(),
+                )
                 .await
                 .unwrap();
 
@@ -2796,6 +2852,17 @@ mod tests {
             assert_eq!(origin_of(issuer, &legacy.did).await, Some(IdentityOrigin::Managed));
             assert_eq!(jwt_subject(&backfilled.credential)["name"], json!("OXYGEN"));
             assert_eq!(origin_of(issuer, &caller.did).await, Some(IdentityOrigin::ExternalCaller));
+            let slot_of = |did: String| async move {
+                issuer
+                    .get_identity_store()
+                    .find_by_did(&did)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .slot
+            };
+            assert_eq!(slot_of(legacy.did.clone()).await, Some(crate::identity::filesystem::ManagedSlot::Protected));
+            assert_eq!(slot_of(caller.did.clone()).await, None, "a caller record never takes a managed slot");
             assert!(
                 jwt_subject(&still_caller.credential)
                     .get("name")
@@ -2920,6 +2987,7 @@ mod tests {
                     api_key_hash("atgk_r"),
                     Some("vc-shared-r".into()),
                     None,
+                    ManagedIdentitySource::protected(),
                 )
                 .await
                 .unwrap();
@@ -2954,6 +3022,7 @@ mod tests {
                     api_key_hash("atgk_m"),
                     Some("vc-shared-m".into()),
                     None,
+                    ManagedIdentitySource::protected(),
                 )
                 .await
                 .unwrap();
@@ -2993,6 +3062,7 @@ mod tests {
                     api_key_hash("atgk_c"),
                     Some("vc-shared-c".into()),
                     None,
+                    ManagedIdentitySource::protected(),
                 )
                 .await
                 .unwrap();
@@ -3036,7 +3106,7 @@ mod tests {
                 .await;
             let issuer = &f.issuer;
             let managed = issuer
-                .issue_or_get_managed_credential(fields("m"), None, Some("vc-name-vp".into()), None)
+                .issue_or_get_managed_credential(fields("m"), None, Some("vc-name-vp".into()), None, protected())
                 .await
                 .unwrap();
             let caller = issuer
@@ -3065,12 +3135,81 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn managed_credential_records_its_slot_and_credential_rotations() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+            let key = |updated_at: i64| {
+                ManagedIdentitySource::transit_point("tp-1")
+                    .with_credential_updated_at(chrono::DateTime::from_timestamp(1_767_225_600 + updated_at, 0))
+            };
+            let mtls = |fingerprint: &str| {
+                HashMap::from([
+                    ("credential_type".to_string(), json!("mtls")),
+                    ("fingerprint_sha256".to_string(), json!(fingerprint)),
+                ])
+            };
+
+            let first = issuer
+                .issue_or_get_managed_credential(mtls("aa"), Some("cred".into()), None, None, key(0))
+                .await
+                .unwrap();
+            let rotated = issuer
+                .issue_or_get_managed_credential(mtls("bb"), Some("cred".into()), None, None, key(60))
+                .await
+                .unwrap();
+            issuer
+                .issue_or_get_managed_credential(mtls("bb"), Some("cred".into()), None, None, protected())
+                .await
+                .unwrap();
+
+            assert_eq!(rotated.did, first.did);
+            let record = issuer
+                .get_identity_store()
+                .find_by_did(&first.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.slot,
+                Some(crate::identity::filesystem::ManagedSlot::TransitPoint { alias: "tp-1".into() })
+            );
+            assert_eq!(record.identity_fields, mtls("bb"));
+            assert_eq!(record.rotations.len(), 1);
+            assert_eq!(record.rotations[0].previous, HashMap::from([("fingerprint_sha256".to_string(), json!("aa"))]));
+        }
+
+        #[tokio::test]
+        async fn caller_credential_records_no_slot() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+
+            let response = issuer
+                .issue_or_get_caller_credential(fields("c"), None, None, None)
+                .await
+                .unwrap();
+
+            let record = issuer
+                .get_identity_store()
+                .find_by_did(&response.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.slot, None);
+        }
+
+        #[tokio::test]
         async fn unknown_surface_issues_without_name() {
             let f = fixture().await;
             let issuer = &f.issuer;
 
             let response = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-missing-surface".into()), None)
+                .issue_or_get_managed_credential(
+                    fields("a"),
+                    None,
+                    Some("vc-name-missing-surface".into()),
+                    None,
+                    protected(),
+                )
                 .await
                 .unwrap();
 
@@ -3129,7 +3268,7 @@ mod tests {
             match origin {
                 IdentityOrigin::Managed => {
                     issuer
-                        .issue_or_get_managed_credential(api_key_fields(&key_id), hash, surface, None)
+                        .issue_or_get_managed_credential(api_key_fields(&key_id), hash, surface, None, ManagedIdentitySource::protected())
                         .await
                 }
                 IdentityOrigin::ExternalCaller => {

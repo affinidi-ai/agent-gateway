@@ -1080,6 +1080,39 @@ the same credential-derived DID for the same agent must share the pepper. See
 
 Credential-derived modes skip body parsing entirely.
 
+### Identity versions
+
+A managed agent's DID changes when what it is derived from changes: a payload-extraction
+`x-identity` value, the set of `x-identity` fields, or the stored certificate or API key the
+surface points at. The old DID's record stays, and nothing links it to the new one. Rotating
+the value of the same stored certificate or API key keeps the DID.
+
+Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) also stores:
+
+| Field | Holds |
+| --- | --- |
+| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
+| `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
+| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. |
+
+On each use of a credential-derived managed identity, the gateway compares the credential
+with the record. A certificate counts as rotated when its fingerprint, subject or issuer
+changed; editing only its name or tags does not. A secret-store API key counts as rotated
+whenever its `updated_at` changes, because its value is never stored; its rotations have
+no `previous` fields. `atgk_` API keys are never rotated in place: a new key is a new id, so
+it mints a new DID. The record's `identity_fields` then hold the current certificate's
+values.
+
+Rotations before this tracking began were not recorded. The first use afterwards stores the
+credential's `updated_at` as a baseline; if a certificate's fields differ from the stored
+ones at that point, that is recorded as one rotation with `rotated_at: null`.
+
+The Identities page groups a surface's managed DIDs of the same source (payload, mTLS or API
+key) and slot under one entry, with the most recently used DID as primary. A record without
+a slot joins the only slot of its surface and source. `from_jwt_claim` DIDs, one per claim
+value and all current at once, are never grouped. Without `AG_IDENTITY_HASH_PEPPER`, every
+restart mints new credential-derived DIDs, which show as versions with no field changes.
+
 ## Trust Recorder
 
 The only writer of agent-in-trust-registry records

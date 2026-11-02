@@ -1,0 +1,29 @@
+{
+  "did": "did:webvh:zQmScid:gateway.example.com:surface:alpha",
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "identity_hash": "did:webvh:zQmScid:gateway.example.com:surface:alpha",
+  "agent_identity": {
+    "agentIdentity.llmInfo.model": "gpt-4.1"
+  },
+  "usage_count": 1,
+  "last_used_at": "2026-01-01T00:00:00+00:00",
+  "channel_config_id": "alpha",
+  "channel_name": "ALPHA",
+  "is_local": true,
+  "verified": true,
+  "channel_usage": [
+    {
+      "channel_config_id": "alpha",
+      "usage_count": 1,
+      "last_used_at": "2026-01-01T00:00:00+00:00"
+    }
+  ],
+  "origin": "managed",
+  "display_name": "ALPHA",
+  "display_name_source": "surface_name",
+  "surface_id": "alpha",
+  "surface_name": "ALPHA",
+  "slot": {
+    "kind": "protected"
+  }
+}

@@ -14,7 +14,8 @@
 //!   keyed off the stable identifier only, *not* the underlying secret /
 //!   PEM bytes. Rotating the cert or the secret value keeps the DID stable.
 //!   Re-pointing the channel at a different stored credential produces a
-//!   different DID.
+//!   different DID. A `Derived` outcome carries the credential's `updated_at`,
+//!   from which the issuer records rotations on the managed identity record.
 //! - **Independent of source auth on the Managed Agent slot.** The DID is
 //!   derived from the *stored* credential the slot names, not from what the
 //!   caller presents.
@@ -243,8 +244,14 @@ impl CredentialIdentityError {
 
 #[derive(Debug, Clone)]
 pub enum CredentialIdentity {
-    /// Hash + fields suitable for `VCIssuer::issue_or_get_credential`.
-    Derived { identity_fields: HashMap<String, JsonValue>, identity_hash: String },
+    /// Hash + fields suitable for `VCIssuer::issue_or_get_credential`, plus the
+    /// `updated_at` of the stored certificate or secret they come from (`None` for
+    /// `atgk_` API keys and JWT claims, which have no stored credential to rotate).
+    Derived {
+        identity_fields: HashMap<String, JsonValue>,
+        identity_hash: String,
+        credential_updated_at: Option<DateTime<Utc>>,
+    },
     /// Bound DID — skip issuance entirely. Returned for `Static { did }`
     /// and for certificates with `Certificate.identity_did = Some(_)`.
     Bound { did: String, identity_fields: HashMap<String, JsonValue> },
@@ -379,6 +386,7 @@ impl CredentialIdentityResolver {
             return Ok(CredentialIdentity::Derived {
                 identity_fields: entry.fields.clone(),
                 identity_hash: entry.hash.clone(),
+                credential_updated_at: Some(cert.updated_at),
             });
         }
 
@@ -404,6 +412,7 @@ impl CredentialIdentityResolver {
         Ok(CredentialIdentity::Derived {
             identity_fields: fields,
             identity_hash: hash,
+            credential_updated_at: Some(cert.updated_at),
         })
     }
 
@@ -416,13 +425,21 @@ impl CredentialIdentityResolver {
         // Those IDs live in a separate subsystem (ApiKeyStore), not in SecretsStore,
         // so a secrets-store lookup would always fail. The hash is keyed on
         // `api_key_id` alone, so we derive identity directly — no store lookup needed.
-        let (identity_fields, identity_hash) = if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
-            self.derive_api_key_id_direct(api_key_id)
-        } else {
-            self.resolve_secret_api_key(api_key_id, store)
-                .await?
-        };
-        Ok(CredentialIdentity::Derived { identity_fields, identity_hash })
+        let (identity_fields, identity_hash, credential_updated_at) =
+            if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
+                let (fields, hash) = self.derive_api_key_id_direct(api_key_id);
+                (fields, hash, None)
+            } else {
+                let (fields, hash, updated_at) = self
+                    .resolve_secret_api_key(api_key_id, store)
+                    .await?;
+                (fields, hash, Some(updated_at))
+            };
+        Ok(CredentialIdentity::Derived {
+            identity_fields,
+            identity_hash,
+            credential_updated_at,
+        })
     }
 
     /// The caller identity of the API key a request presented: an API Key
@@ -441,14 +458,17 @@ impl CredentialIdentityResolver {
         } else {
             self.resolve_secret_api_key(key_name, store)
                 .await
+                .map(|(fields, hash, _)| (fields, hash))
         }
     }
 
+    /// The identity fields and hash of a secrets-store API key, with the
+    /// secret's `updated_at` from which the issuer records rotations.
     async fn resolve_secret_api_key(
         &self,
         api_key_id: &str,
         store: Option<&Arc<dyn SecretsStore>>,
-    ) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
+    ) -> Result<(HashMap<String, JsonValue>, String, DateTime<Utc>), CredentialIdentityError> {
         let store = store.ok_or(CredentialIdentityError::SecretsStoreUnavailable)?;
         let secret = store
             .get_by_secret_id(api_key_id)
@@ -461,7 +481,7 @@ impl CredentialIdentityResolver {
             .get(api_key_id)
             && entry.updated_at == secret.updated_at
         {
-            return Ok((entry.fields.clone(), entry.hash.clone()));
+            return Ok((entry.fields.clone(), entry.hash.clone(), secret.updated_at));
         }
 
         let fields = build_api_key_identity_fields(api_key_id, &secret);
@@ -476,7 +496,7 @@ impl CredentialIdentityResolver {
             },
         );
 
-        Ok((fields, hash))
+        Ok((fields, hash, secret.updated_at))
     }
 
     /// Derive the identity fields and hash of an `atgk_`-prefixed API key ID
@@ -612,7 +632,11 @@ pub fn resolve_jwt_claim_identity(
         .map(|(k, v)| (k.clone(), json!(v)))
         .collect::<HashMap<String, JsonValue>>();
 
-    Ok(CredentialIdentity::Derived { identity_fields, identity_hash })
+    Ok(CredentialIdentity::Derived {
+        identity_fields,
+        identity_hash,
+        credential_updated_at: None,
+    })
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -765,9 +789,9 @@ mod tests {
     /// Destructure a `Derived` outcome into `(hash, fields)`; panics otherwise.
     fn derived_parts(r: &CredentialIdentity) -> (String, HashMap<String, JsonValue>) {
         match r {
-            CredentialIdentity::Derived { identity_hash, identity_fields } => {
-                (identity_hash.clone(), identity_fields.clone())
-            }
+            CredentialIdentity::Derived {
+                identity_hash, identity_fields, ..
+            } => (identity_hash.clone(), identity_fields.clone()),
             _ => panic!("expected Derived, got {r:?}"),
         }
     }
@@ -1016,6 +1040,32 @@ mod tests {
         let (h2, fp2) = unwrap_derived(&r2);
         assert_eq!(h1, h2, "rotation under same certificate_id MUST keep hash stable");
         assert_ne!(fp1, fp2, "fingerprint MUST change with PEM rotation");
+        assert_ne!(updated_at(&r1), updated_at(&r2), "each derivation carries its certificate's updated_at");
+    }
+
+    #[tokio::test]
+    async fn from_api_key_carries_the_secret_updated_at_from_cache_and_store() {
+        let secret = make_secret("v1");
+        let expected = secret.updated_at;
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
+        let resolver = CredentialIdentityResolver::new();
+        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: Some("demo-key".into()) };
+
+        for _ in 0..2 {
+            let r = resolver
+                .resolve(&mi, None, Some(&store))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated_at(&r), Some(expected));
+        }
+    }
+
+    fn updated_at(r: &CredentialIdentity) -> Option<DateTime<Utc>> {
+        match r {
+            CredentialIdentity::Derived { credential_updated_at, .. } => *credential_updated_at,
+            _ => panic!("expected Derived, got {r:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1270,7 +1320,9 @@ mod tests {
 
     fn unwrap_derived(r: &CredentialIdentity) -> (String, String) {
         match r {
-            CredentialIdentity::Derived { identity_fields, identity_hash } => (
+            CredentialIdentity::Derived {
+                identity_fields, identity_hash, ..
+            } => (
                 identity_hash.clone(),
                 identity_fields
                     .get("fingerprint_sha256")
@@ -1393,7 +1445,12 @@ mod tests {
             .expect("should succeed without a secrets store")
             .expect("should return Some");
         match r {
-            CredentialIdentity::Derived { identity_fields, identity_hash } => {
+            CredentialIdentity::Derived {
+                identity_fields,
+                identity_hash,
+                credential_updated_at,
+            } => {
+                assert_eq!(credential_updated_at, None, "an atgk_ key has no stored credential to rotate");
                 assert_eq!(
                     identity_fields
                         .get("api_key_id")
