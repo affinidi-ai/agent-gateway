@@ -23,7 +23,11 @@ async fn a_surface_stored_with_reference_transit_tokens_accepts_every_admin_writ
     let mut admin = None;
     let mut surface_file = None;
     let h = GatewayHarness::start(|_, _, bootstrap| {
-        let directory = std::path::PathBuf::from(&bootstrap.storage_paths.agent_surfaces);
+        let directory = std::path::PathBuf::from(
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+        );
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{SURFACE_ID}.json"));
         std::fs::write(&path, serde_json::to_vec_pretty(&stored_surface()).unwrap()).unwrap();
@@ -73,7 +77,15 @@ async fn a_surface_stored_with_reference_transit_tokens_accepts_every_admin_writ
         .send()
         .await
         .unwrap();
-    assert_eq!(variant_put.status(), 200, "variant PUT: {}", variant_put.text().await.unwrap());
+    assert_eq!(
+        variant_put.status(),
+        200,
+        "variant PUT: {}",
+        variant_put
+            .text()
+            .await
+            .unwrap()
+    );
 
     let created = admin
         .post(format!("{url}/variants"))

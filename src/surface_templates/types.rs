@@ -283,7 +283,10 @@ impl CreateSurfaceTemplate {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
+    /// A stored `transit_token_mode: reference` in a template's surface, on the base and in a variant's
+    /// overrides, is rewritten to `embedded` and reported as a change.
     #[test]
     fn migrate_rewrites_a_stored_reference_transit_token_mode() {
         let mut json = serde_json::json!({ "surface": {
@@ -293,12 +296,8 @@ mod tests {
         } });
         assert!(SurfaceTemplate::migrate_raw_json(&mut json).unwrap());
         assert_eq!(json["surface"]["transit"]["transit_token_mode"], "embedded");
-        assert_eq!(
-            json["surface"]["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"],
-            "embedded"
-        );
+        assert_eq!(json["surface"]["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
     }
-    use super::*;
 
     #[test]
     fn known_scope_roundtrip() {
