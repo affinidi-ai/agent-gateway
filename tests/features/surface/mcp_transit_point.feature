@@ -193,3 +193,12 @@ Feature: MCP Transit Point forwarding
     When the operator sets the surface's transit token mode to "reference"
     Then the admin API response status is 400
     And the admin API error response mentions "transit.transit_token_mode 'reference' is not supported"
+
+  Scenario: A variant that asks for reference transit tokens is refused
+    When the operator adds variant "dev" that sets its transit token mode to "reference"
+    Then the admin API response status is 400
+    And the admin API error response mentions "variant 'dev' transit.transit_token_mode 'reference' is not supported"
+
+  Scenario: A variant that asks for embedded transit tokens is accepted
+    When the operator adds variant "dev" that sets its transit token mode to "embedded"
+    Then the admin API response status is 200

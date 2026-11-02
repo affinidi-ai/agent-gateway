@@ -1944,7 +1944,7 @@ pub(crate) fn reference_transit_token_refusal(value: &serde_json::Value) -> Opti
 /// (it changes nothing; a VP follows each Transit Point's `managed_identity` and
 /// `identity_injection.inject_vp`). It changes nothing itself; a stored `reference`
 /// is then rewritten to `embedded` by [`rewrite_reference_transit_tokens`].
-fn warn_inert_transit_settings(value: &serde_json::Value) {
+pub(crate) fn warn_inert_transit_settings(value: &serde_json::Value) {
     let surface_id = value
         .get("surface_id")
         .and_then(serde_json::Value::as_str)
@@ -1959,7 +1959,7 @@ fn warn_inert_transit_settings(value: &serde_json::Value) {
                 variant = %variant,
                 setting = "transit_token_mode",
                 "transit_token_mode 'reference' is not supported; the transit tokens are embedded, so the caller \
-                 context is readable by the managed agent; set it to 'embedded'"
+                 context is readable by the managed agent; it is rewritten to 'embedded'"
             );
         }
         if shared.get("sign_requests") == Some(&serde_json::Value::Bool(false)) {

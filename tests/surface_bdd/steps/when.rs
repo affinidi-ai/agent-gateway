@@ -1423,6 +1423,41 @@ async fn operator_sets_the_transit_token_mode(
     set_surface_transit_field(world, "transit_token_mode", serde_json::json!(mode)).await;
 }
 
+#[when(expr = "the operator adds variant {string} that sets its transit token mode to {string}")]
+async fn operator_adds_a_variant_with_a_transit_token_mode(
+    world: &mut SurfaceWorld,
+    alias: String,
+    mode: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "adding a variant");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before adding variant '{alias}': {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before adding variant '{alias}' should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["variants"] = serde_json::json!([{
+        "id": format!("variant-{alias}"), "alias": alias, "name": alias, "enabled": true,
+        "overrides": { "transit": { "shared": { "transit_token_mode": mode } } }
+    }]);
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("save variant '{alias}' through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
 /// Save the surface with `transit.<field>` set to `value` through the admin
 /// API, and record its answer.
 async fn set_surface_transit_field(
