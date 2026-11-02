@@ -529,7 +529,9 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
   or without `target.auth`, and records nothing; a blocked target reports
   `blocked_by_egress` (`403`), and a host that does not resolve reports `unreachable`
-  (`502`).
+  (`502`). The served card route reports such a host as unreachable only when it fetches
+  without `target.auth`; a served fetch with `target.auth` (`pinned_target_client`) and the
+  proxy forward still answer `403` "Request blocked by egress policy" for it.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned

@@ -157,7 +157,7 @@ changes:
     - timestamp: '2026-11-02T13:20:00Z'
       title: Report a preview target that does not resolve as unreachable
       description: >-
-        An agent card preview of a host that does not resolve now reports unreachable (502) instead of blocked_by_egress (403), as the served card route does. The event hook retry reason now says the host name could not be resolved.
+        An agent card preview of a host that does not resolve now reports unreachable (502) instead of blocked_by_egress (403), as the served card route does when it fetches without Target authentication. A served card fetched with Target authentication and the proxy forward still answer 403 blocked by egress for such a host. The event hook and mediator directory reasons, JWKS fetch errors and x402 facilitator construction errors now name a failed host lookup as such.
   removed: []
   security:
     - timestamp: '2026-10-30T23:00:04Z'
