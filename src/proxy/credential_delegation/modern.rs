@@ -390,17 +390,20 @@ impl ModernDelegationContext<'_> {
             } else {
                 None
             };
-            if !crate::tenancy::can_reference(
-                self.surface
-                    .tenant_id
-                    .as_deref(),
-                provider.tenant_id.as_deref(),
-            ) || strategy
-                .as_ref()
-                .is_some_and(|strategy| {
-                    !crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
-                        || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
-                })
+            // A provider with an issuer keeps its grants by binding only.
+            if provider.is_external_consent()
+                || !crate::tenancy::can_reference(
+                    self.surface
+                        .tenant_id
+                        .as_deref(),
+                    provider.tenant_id.as_deref(),
+                )
+                || strategy
+                    .as_ref()
+                    .is_some_and(|strategy| {
+                        !crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
+                            || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
+                    })
                 || (provider.provider_type != CredentialProviderType::ApiKey
                     && provider
                         .resource
@@ -1873,6 +1876,88 @@ mod tests {
             ),
             "the same caller connecting directly is asked for consent"
         );
+    }
+
+    /// A provider with an `issuer` keeps its grants by binding only, so a
+    /// modern binding that names one, as a surface stored outside the API may,
+    /// is refused, as the legacy path refuses it.
+    #[tokio::test]
+    async fn a_modern_binding_refuses_a_provider_with_an_issuer() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        providers.create(serde_json::from_value(json!({
+            "id": "provider", "name": "Provider", "provider_id": "provider", "provider_type": "oauth2_client_credentials",
+            "resource": "https://provider.example/api", "token_endpoint": "https://provider.example/token",
+            "issuer": "https://provider.example",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        })).unwrap()).await.unwrap();
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface", "name": "Surface", "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://provider.example/api"}, "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]
+        })).unwrap();
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let context = ModernDelegationContext {
+            service: &service,
+            deployment: "deployment",
+            ttl_secs: 100,
+            surface: &surface,
+            variant_id: None,
+            route: ContinuationRoute::AccessPoint,
+            authorization: &authorization,
+            identity: &caller,
+            agent_did: "did:web:agent.example",
+            profile: &profile,
+            vault: &vault,
+            providers: &providers,
+            strategies: &strategies,
+            secrets: None,
+            provider_http: None,
+        };
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {}})),
+        };
+        assert!(matches!(context.select(&request).await, Err(ContinuationError::BindingMismatch)));
     }
 
     #[tokio::test]
