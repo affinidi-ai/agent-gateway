@@ -71,6 +71,7 @@ pub struct SurfaceConfigBuilder {
     pub tenant_id: Option<String>,
     /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
     pub enforced_credential_rules: Vec<String>,
+    pub token_request_timeout_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
 }
@@ -127,6 +128,7 @@ impl Default for SurfaceConfigBuilder {
             audit_log_keeps_every_event: false,
             tenant_id: None,
             enforced_credential_rules: Vec::new(),
+            token_request_timeout_secs: None,
             keeps_gateway_log: false,
         }
     }
@@ -350,6 +352,9 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// The surface's own Target authenticates with this provider; `false` when only a
     /// Transit Point or a delegated credential binding uses it.
     pub authenticates_surface_target: bool,
+    /// A JWT Bearer provider's signing-key secret holds a whole service account JSON key
+    /// file whose `private_key_id` names the key, and the provider sets no key id itself.
+    pub signing_key_is_service_account_file: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +373,7 @@ impl SurfaceTargetAuthProviderConfig {
             token_endpoint: None,
             insecure_token_endpoint: false,
             authenticates_surface_target: true,
+            signing_key_is_service_account_file: false,
         }
     }
 }

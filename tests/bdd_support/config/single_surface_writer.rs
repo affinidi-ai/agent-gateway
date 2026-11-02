@@ -18,7 +18,8 @@ use crate::bdd_support::config::single_surface_fixture::{
 use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
     TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET,
-    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_signing_key,
+    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_service_account_key_file,
+    target_auth_signing_key,
 };
 
 struct SingleSurfaceOptions<'a> {
@@ -532,7 +533,11 @@ fn write_single_surface_config_inner(
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
-    enforce_credential_rules(base_dir, &surface_config.enforced_credential_rules);
+    write_credential_policy(
+        base_dir,
+        &surface_config.enforced_credential_rules,
+        surface_config.token_request_timeout_secs,
+    );
     if surface_config.keeps_gateway_log {
         log_warnings(base_dir);
     }
@@ -546,12 +551,14 @@ fn log_warnings(base_dir: &Path) {
     std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
 }
 
-/// Appends a `[credential_policy]` table setting each of `rules` to `enforce`.
-fn enforce_credential_rules(
+/// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when
+/// given, the token request timeout.
+fn write_credential_policy(
     base_dir: &Path,
     rules: &[String],
+    token_request_timeout_secs: Option<u64>,
 ) {
-    if rules.is_empty() {
+    if rules.is_empty() && token_request_timeout_secs.is_none() {
         return;
     }
     let path = base_dir.join("config.toml");
@@ -559,6 +566,9 @@ fn enforce_credential_rules(
     config.push_str("\n[credential_policy]\n");
     for rule in rules {
         config.push_str(&format!("{rule} = \"enforce\"\n"));
+    }
+    if let Some(secs) = token_request_timeout_secs {
+        config.push_str(&format!("token_request_timeout_secs = {secs}\n"));
     }
     std::fs::write(&path, config).unwrap();
 }
@@ -646,14 +656,20 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     match surface_config
         .target_auth_provider
         .as_ref()
-        .map(|provider| provider.grant)
     {
-        Some(TargetAuthProviderGrant::ClientCredentials) => {
+        Some(provider) if provider.grant == TargetAuthProviderGrant::ClientCredentials => {
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
         }
-        Some(TargetAuthProviderGrant::JwtBearer) => {
-            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &target_auth_signing_key().private_pem));
+        Some(provider) => {
+            let signing_key = if provider.signing_key_is_service_account_file {
+                target_auth_service_account_key_file()
+            } else {
+                target_auth_signing_key()
+                    .private_pem
+                    .clone()
+            };
+            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
         }
         None => {}
     }
@@ -730,7 +746,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
-                "jwt_key_id": "bdd-target-key-id",
+                "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
             })
         }),
         created_at: now,

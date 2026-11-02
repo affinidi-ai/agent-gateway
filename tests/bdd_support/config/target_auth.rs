@@ -8,6 +8,7 @@ pub const TARGET_AUTH_CLIENT_ID_SECRET: &str = "bdd-target-client-id";
 pub const TARGET_AUTH_CLIENT_SECRET_SECRET: &str = "bdd-target-client-secret";
 pub const TARGET_AUTH_CLIENT_SECRET_VALUE: &str = "bdd-target-client-secret-value";
 pub const TARGET_AUTH_SIGNING_KEY_SECRET: &str = "bdd-target-signing-key";
+pub const TARGET_AUTH_SERVICE_ACCOUNT_KEY_ID: &str = "bdd-service-account-key-id";
 
 /// The RSA key a JWT Bearer provider signs its grant with: the private PEM goes into
 /// the provider's secret, the public PEM verifies the grant the token endpoint receives.
@@ -33,6 +34,18 @@ pub fn target_auth_signing_key() -> &'static TargetAuthSigningKey {
         }
     });
     &KEY
+}
+
+/// A Google service account JSON key file holding the provider's signing key.
+pub fn target_auth_service_account_key_file() -> String {
+    json!({
+        "type": "service_account",
+        "project_id": "bdd-project",
+        "private_key_id": TARGET_AUTH_SERVICE_ACCOUNT_KEY_ID,
+        "private_key": target_auth_signing_key().private_pem,
+        "client_email": TARGET_AUTH_JWT_ISSUER,
+    })
+    .to_string()
 }
 
 pub fn credential_provider_target_auth_json(
