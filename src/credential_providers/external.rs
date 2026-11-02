@@ -240,9 +240,11 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
             .is_some()
     {
         return Err(Invalid(
-            "client_secret_secret_ref is required for client_secret_basic and client_secret_post, and refused for none",
+            "client_secret_secret_ref is required for client_secret_basic and client_secret_post, and refused for \
+             none and private_key_jwt",
         ));
     }
+    validate_client_assertion(provider, method)?;
     if !provider
         .callback_url
         .as_deref()
@@ -273,6 +275,56 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
         return Err(Invalid(
             "a provider with an issuer takes no additional_params, consent_identity_strategy_id or api_key_secret_ref",
         ));
+    }
+    Ok(())
+}
+
+/// The signed-JWT settings of an external consent provider: only a client
+/// that authenticates with `private_key_jwt` has them, and then it needs a
+/// signing key, signs with RS256 or PS256, names an `https` audience if any,
+/// and is itself the issuer and subject of its assertion.
+fn validate_client_assertion(
+    provider: &CredentialProvider,
+    method: crate::credential_providers::TokenEndpointAuthMethod,
+) -> Result<(), ExternalProviderError> {
+    use crate::credential_providers::{CredentialProviderType, JwtAssertionSettings, TokenEndpointAuthMethod};
+    use ExternalProviderError::Invalid;
+
+    let jwt = &provider.jwt;
+    if method != TokenEndpointAuthMethod::PrivateKeyJwt {
+        if *jwt != JwtAssertionSettings::default() {
+            return Err(Invalid(
+                "a provider with an issuer signs no JWT unless its token_endpoint_auth_method is private_key_jwt",
+            ));
+        }
+        return Ok(());
+    }
+    if jwt
+        .jwt_signing_key_secret_ref
+        .is_none()
+    {
+        return Err(Invalid("private_key_jwt needs jwt_signing_key_secret_ref"));
+    }
+    if jwt.jwt_issuer.is_some() || jwt.jwt_subject.is_some() {
+        return Err(Invalid(
+            "a private_key_jwt client is the issuer and subject of its assertion, so jwt_issuer and jwt_subject are \
+             refused",
+        ));
+    }
+    if jwt
+        .jwt_signing_algorithm
+        .is_some_and(|algorithm| {
+            !CredentialProviderType::OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(algorithm)
+        })
+    {
+        return Err(Invalid("private_key_jwt signs with RS256 or PS256"));
+    }
+    if jwt
+        .jwt_audience
+        .as_deref()
+        .is_some_and(|audience| !is_strict_https_url(audience))
+    {
+        return Err(Invalid("jwt_audience must be a public https URL"));
     }
     Ok(())
 }
@@ -382,7 +434,9 @@ pub fn refuse_changes(
         }
         return Ok(());
     }
-    let fields: [(&'static str, bool); 15] = [
+    let jwt = &request.jwt;
+    let stored = &existing.jwt;
+    let fields: [(&'static str, bool); 22] = [
         ("issuer", changes(request.issuer.as_ref(), existing.issuer.as_ref())),
         ("provider_type", changes(request.provider_type.as_ref(), Some(&existing.provider_type))),
         (
@@ -494,6 +548,40 @@ pub fn refuse_changes(
                 Some(&existing.allow_unadvertised_pkce),
             ),
         ),
+        (
+            "jwt_signing_key_secret_ref",
+            changes(
+                jwt.jwt_signing_key_secret_ref
+                    .as_ref(),
+                stored
+                    .jwt_signing_key_secret_ref
+                    .as_ref(),
+            ),
+        ),
+        (
+            "jwt_certificate_secret_ref",
+            changes(
+                jwt.jwt_certificate_secret_ref
+                    .as_ref(),
+                stored
+                    .jwt_certificate_secret_ref
+                    .as_ref(),
+            ),
+        ),
+        (
+            "jwt_signing_algorithm",
+            changes(
+                jwt.jwt_signing_algorithm
+                    .as_ref(),
+                stored
+                    .jwt_signing_algorithm
+                    .as_ref(),
+            ),
+        ),
+        ("jwt_audience", changes(jwt.jwt_audience.as_ref(), stored.jwt_audience.as_ref())),
+        ("jwt_key_id", changes(jwt.jwt_key_id.as_ref(), stored.jwt_key_id.as_ref())),
+        ("jwt_issuer", changes(jwt.jwt_issuer.as_ref(), stored.jwt_issuer.as_ref())),
+        ("jwt_subject", changes(jwt.jwt_subject.as_ref(), stored.jwt_subject.as_ref())),
     ];
     match fields
         .into_iter()
@@ -919,6 +1007,76 @@ pub(crate) mod tests {
         assert_eq!(validate(&confidential), Ok(()));
         confidential.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::ClientSecretBasic);
         assert_eq!(validate(&confidential), Ok(()));
+    }
+
+    /// A client that authenticates with `private_key_jwt` names a signing key
+    /// and no secret; no other client signs a JWT, and none acts as another
+    /// issuer or subject.
+    #[test]
+    fn a_private_key_jwt_client_names_its_signing_key_and_no_other_does() {
+        use crate::credential_providers::JwtSigningAlgorithm;
+        let mut signing = external_provider();
+        signing.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::PrivateKeyJwt);
+        signing
+            .jwt
+            .jwt_signing_key_secret_ref = Some("signing-key".into());
+        signing.jwt.jwt_key_id = Some("key-1".into());
+        assert_eq!(validate(&signing), Ok(()));
+        assert_eq!(signing.jwt_signing_algorithm(), Some(JwtSigningAlgorithm::PS256));
+        signing
+            .jwt
+            .jwt_signing_algorithm = Some(JwtSigningAlgorithm::RS256);
+        assert_eq!(validate(&signing), Ok(()));
+
+        type Change = fn(&mut CredentialProvider);
+        let cases: Vec<(&str, Change)> = vec![
+            ("no signing key", |p| {
+                p.jwt
+                    .jwt_signing_key_secret_ref = None
+            }),
+            ("a client secret", |p| p.client_secret_secret_ref = Some("secret".into())),
+            ("an ES256 key", |p| p.jwt.jwt_signing_algorithm = Some(JwtSigningAlgorithm::ES256)),
+            ("another issuer", |p| p.jwt.jwt_issuer = Some("someone@example.com".into())),
+            ("another subject", |p| p.jwt.jwt_subject = Some("someone".into())),
+            ("an http audience", |p| p.jwt.jwt_audience = Some("http://203.0.113.10/token".into())),
+        ];
+        for (case, change) in cases {
+            let mut provider = signing.clone();
+            change(&mut provider);
+            assert!(invalid(&provider), "{case} must be refused");
+        }
+        let mut public = external_provider();
+        public
+            .jwt
+            .jwt_signing_key_secret_ref = Some("signing-key".into());
+        assert!(invalid(&public), "a public client signs nothing");
+        assert_eq!(public.jwt_signing_algorithm(), None);
+
+        let mut metadata = metadata();
+        signing
+            .jwt
+            .jwt_signing_algorithm = None;
+        assert_eq!(
+            check_metadata(&signing, &metadata),
+            Err(ExternalProviderError::MetadataMismatch("token_endpoint_auth_method"))
+        );
+        metadata
+            .token_endpoint_auth_methods_supported
+            .as_mut()
+            .unwrap()
+            .push("private_key_jwt".into());
+        assert_eq!(check_metadata(&signing, &metadata), Ok(()));
+        for (field, value) in [
+            ("jwt_signing_key_secret_ref", json!("another-key")),
+            ("jwt_key_id", json!("key-2")),
+            ("jwt_audience", json!("https://203.0.113.66/token")),
+        ] {
+            assert_eq!(
+                refuse_changes(&signing, &update(json!({ field: value }))),
+                Err(ExternalProviderError::Immutable(field)),
+                "{field}"
+            );
+        }
     }
 
     #[test]

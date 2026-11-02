@@ -416,9 +416,8 @@ async fn revoke(
 /// connection policy for every token of a grant.
 struct RevocationClient<'a> {
     endpoint: &'a str,
-    client_id: &'a str,
-    method: TokenEndpointAuthMethod,
-    secret: Option<zeroize::Zeroizing<String>>,
+    provider: &'a CredentialProvider,
+    credential: ClientCredential,
     http: reqwest::Client,
 }
 
@@ -432,21 +431,12 @@ impl<'a> RevocationClient<'a> {
             .revocation_endpoint
             .as_deref()
             .ok_or(GrantRevocation::failed(RevocationOutcome::NotSupported))?;
-        let (Some(client_id), Some(method)) = (provider.client_id.as_deref(), provider.token_endpoint_auth_method)
-        else {
-            return Err(GrantRevocation::failed(RevocationOutcome::ClientUnavailable));
-        };
-        let secret = if method.uses_secret() {
-            let Some(secrets) = secrets else {
-                return Err(GrantRevocation::skipped(SKIPPED_NO_SECRETS_STORE));
-            };
-            Some(
-                client_secret(provider, secrets)
-                    .await
-                    .ok_or(GrantRevocation::failed(RevocationOutcome::ClientUnavailable))?,
-            )
-        } else {
-            None
+        let credential = match ClientCredential::resolve(provider, secrets).await {
+            Ok(credential) => credential,
+            Err(ClientUnresolved::NoSecretsStore) => return Err(GrantRevocation::skipped(SKIPPED_NO_SECRETS_STORE)),
+            Err(ClientUnresolved::Unavailable) => {
+                return Err(GrantRevocation::failed(RevocationOutcome::ClientUnavailable));
+            }
         };
         let http = crate::egress::pinned_vendor_client(endpoint, REVOCATION_TIMEOUT, exact_allowlist)
             .await
@@ -460,9 +450,8 @@ impl<'a> RevocationClient<'a> {
             })?;
         Ok(Self {
             endpoint,
-            client_id,
-            method,
-            secret,
+            provider,
+            credential,
             http,
         })
     }
@@ -472,19 +461,20 @@ impl<'a> RevocationClient<'a> {
         token: &str,
         hint: &str,
     ) -> RevocationOutcome {
+        let Some(authentication) = self
+            .credential
+            .authenticate(self.provider)
+        else {
+            return RevocationOutcome::ClientUnavailable;
+        };
         let mut form: Vec<(&str, &str)> = vec![("token", token), ("token_type_hint", hint)];
-        let mut authorization = None;
-        match (self.method, self.secret.as_deref()) {
-            (TokenEndpointAuthMethod::None, _) => form.push(("client_id", self.client_id)),
-            (TokenEndpointAuthMethod::ClientSecretPost, Some(secret)) => {
-                form.push(("client_id", self.client_id));
-                form.push(("client_secret", secret.as_str()));
-            }
-            (TokenEndpointAuthMethod::ClientSecretBasic, Some(secret)) => {
-                authorization = Some(basic_authorization(self.client_id, secret));
-            }
-            _ => return RevocationOutcome::ClientUnavailable,
-        }
+        form.extend(
+            authentication
+                .form
+                .iter()
+                .map(|(name, value)| (*name, value.as_str())),
+        );
+        let authorization = authentication.authorization;
         let mut request = self
             .http
             .post(self.endpoint)
@@ -501,14 +491,158 @@ impl<'a> RevocationClient<'a> {
     }
 }
 
-/// The client secret, from the provider's own tenant or an untenanted secret.
-async fn client_secret(
+/// What an external consent provider's client authenticates with at its token
+/// and revocation endpoints, as its `token_endpoint_auth_method` says.
+pub(super) enum ClientCredential {
+    /// A public client: `client_id` in the body.
+    Public,
+    /// The client secret of `client_secret_basic` or `client_secret_post`.
+    Secret(zeroize::Zeroizing<String>),
+    /// The PEM signing key, and certificate if any, of a `private_key_jwt`
+    /// client, which signs a fresh assertion for each request.
+    SigningKey { key: zeroize::Zeroizing<String>, certificate: Option<zeroize::Zeroizing<String>> },
+}
+
+/// Why a client's credential could not be resolved.
+pub(super) enum ClientUnresolved {
+    /// The method needs a secret, and there is no secrets store.
+    NoSecretsStore,
+    /// The provider names no client, or a secret it names is missing or of
+    /// another tenant.
+    Unavailable,
+}
+
+/// The form fields and `Authorization` header that authenticate a client on
+/// one request.
+pub(super) struct ClientAuthentication {
+    pub form: Vec<(&'static str, zeroize::Zeroizing<String>)>,
+    pub authorization: Option<zeroize::Zeroizing<String>>,
+}
+
+impl ClientCredential {
+    /// The credential `provider`'s method needs, each secret from the
+    /// provider's own tenant or an untenanted one.
+    pub(super) async fn resolve(
+        provider: &CredentialProvider,
+        secrets: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<Self, ClientUnresolved> {
+        let (Some(_), Some(method)) = (provider.client_id.as_deref(), provider.token_endpoint_auth_method) else {
+            return Err(ClientUnresolved::Unavailable);
+        };
+        if method == TokenEndpointAuthMethod::None {
+            return Ok(Self::Public);
+        }
+        let secrets = secrets.ok_or(ClientUnresolved::NoSecretsStore)?;
+        let resolve = |reference: Option<&str>| {
+            let reference = reference.map(str::to_string);
+            async move {
+                match reference {
+                    Some(reference) => provider_secret(provider, secrets, &reference)
+                        .await
+                        .map(Some)
+                        .ok_or(ClientUnresolved::Unavailable),
+                    None => Ok(None),
+                }
+            }
+        };
+        match method {
+            TokenEndpointAuthMethod::None => Ok(Self::Public),
+            TokenEndpointAuthMethod::ClientSecretBasic | TokenEndpointAuthMethod::ClientSecretPost => resolve(
+                provider
+                    .client_secret_secret_ref
+                    .as_deref(),
+            )
+            .await?
+            .map(Self::Secret)
+            .ok_or(ClientUnresolved::Unavailable),
+            TokenEndpointAuthMethod::PrivateKeyJwt => Ok(Self::SigningKey {
+                key: resolve(
+                    provider
+                        .jwt
+                        .jwt_signing_key_secret_ref
+                        .as_deref(),
+                )
+                .await?
+                .ok_or(ClientUnresolved::Unavailable)?,
+                certificate: resolve(
+                    provider
+                        .jwt
+                        .jwt_certificate_secret_ref
+                        .as_deref(),
+                )
+                .await?,
+            }),
+        }
+    }
+
+    /// The authentication of `provider`'s client on one request. A
+    /// `private_key_jwt` client signs a new assertion
+    /// ([`super::jwt_assertion::client_auth_assertion_claims`]), so each
+    /// request has its own `jti`. `None` when the credential does not fit the
+    /// method or the assertion cannot be signed.
+    pub(super) fn authenticate(
+        &self,
+        provider: &CredentialProvider,
+    ) -> Option<ClientAuthentication> {
+        let client_id = provider
+            .client_id
+            .as_deref()?;
+        let owned = |value: &str| zeroize::Zeroizing::new(value.to_string());
+        let (form, authorization) = match (provider.token_endpoint_auth_method?, self) {
+            (TokenEndpointAuthMethod::None, Self::Public) => (vec![("client_id", owned(client_id))], None),
+            (TokenEndpointAuthMethod::ClientSecretPost, Self::Secret(secret)) => {
+                (vec![("client_id", owned(client_id)), ("client_secret", secret.clone())], None)
+            }
+            (TokenEndpointAuthMethod::ClientSecretBasic, Self::Secret(secret)) => {
+                (Vec::new(), Some(basic_authorization(client_id, secret)))
+            }
+            (TokenEndpointAuthMethod::PrivateKeyJwt, Self::SigningKey { key, certificate }) => {
+                let claims = super::jwt_assertion::client_auth_assertion_claims(
+                    provider,
+                    client_id,
+                    chrono::Utc::now().timestamp(),
+                )
+                .ok()?;
+                let assertion = super::jwt_assertion::sign_assertion(
+                    key,
+                    provider.jwt_signing_algorithm()?,
+                    super::jwt_assertion::AssertionHeader {
+                        key_id: provider
+                            .jwt
+                            .jwt_key_id
+                            .as_deref(),
+                        certificate_pem: certificate
+                            .as_ref()
+                            .map(|certificate| certificate.as_str()),
+                    },
+                    &claims,
+                )
+                .ok()?;
+                (
+                    vec![
+                        ("client_id", owned(client_id)),
+                        ("client_assertion_type", owned(CLIENT_ASSERTION_TYPE)),
+                        ("client_assertion", zeroize::Zeroizing::new(assertion)),
+                    ],
+                    None,
+                )
+            }
+            _ => return None,
+        };
+        Some(ClientAuthentication { form, authorization })
+    }
+}
+
+/// The `client_assertion_type` of a JWT client assertion (RFC 7523 section 2.2).
+const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/// The value of the secret `reference`, from `provider`'s own tenant or an
+/// untenanted secret.
+async fn provider_secret(
     provider: &CredentialProvider,
     secrets: &Arc<dyn SecretsStore>,
+    reference: &str,
 ) -> Option<zeroize::Zeroizing<String>> {
-    let reference = provider
-        .client_secret_secret_ref
-        .as_deref()?;
     let secret = secrets
         .get_by_secret_id(reference)
         .await
@@ -798,6 +932,95 @@ pub(crate) mod tests {
             "{}",
             requests[1].0
         );
+    }
+
+    /// A `private_key_jwt` client signs a new assertion for each request with
+    /// the shared assertion code: issuer and subject its client id, audience
+    /// its token endpoint, and a `jti` of its own, its key read only from the
+    /// provider's tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_key_jwt_client_signs_a_new_assertion_for_each_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let key = crate::delegation_vault::jwt_assertion::test_keys::rsa_pkcs8();
+        for (secret_id, tenant) in [("signing-key", Some("tenant-a")), ("other-tenant-key", Some("tenant-b"))] {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant.map(str::to_string),
+                    name: secret_id.to_string(),
+                    secret_id: secret_id.to_string(),
+                    description: None,
+                    value: key.private_pem.clone(),
+                    secret_type: "General".to_string(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let server = RecordingServer::start(200).await;
+        let mut signing = provider(Some(&server.url), "private_key_jwt", None);
+        signing.token_endpoint = Some("https://203.0.113.10/token".to_string());
+        signing
+            .jwt
+            .jwt_signing_key_secret_ref = Some("signing-key".to_string());
+        assert_eq!(
+            revoke(&signing, &grant(true), Some(&secrets), Some(&server.origin()))
+                .await
+                .outcome,
+            RevocationOutcome::Revoked
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let mut ids = std::collections::HashSet::new();
+        for (head, body) in &requests {
+            assert!(
+                !head
+                    .to_ascii_lowercase()
+                    .contains("authorization:"),
+                "{head}"
+            );
+            let fields = form(body);
+            assert!(fields.contains(&("client_id".to_string(), "client id".to_string())), "{body}");
+            assert!(fields.contains(&(
+                "client_assertion_type".to_string(),
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string()
+            )));
+            let assertion = fields
+                .iter()
+                .find(|(name, _)| name == "client_assertion")
+                .map(|(_, value)| value.clone())
+                .expect("a client assertion");
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::PS256);
+            validation.set_audience(&["https://203.0.113.10/token"]);
+            let claims = jsonwebtoken::decode::<serde_json::Value>(
+                &assertion,
+                &jsonwebtoken::DecodingKey::from_rsa_pem(key.public_pem.as_bytes()).unwrap(),
+                &validation,
+            )
+            .expect("signed with the provider's key")
+            .claims;
+            assert_eq!(claims["iss"], "client id");
+            assert_eq!(claims["sub"], "client id");
+            ids.insert(
+                claims["jti"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(ids.len(), 2, "each request has an assertion of its own");
+
+        signing
+            .jwt
+            .jwt_signing_key_secret_ref = Some("other-tenant-key".to_string());
+        assert_eq!(
+            revoke(&signing, &grant(false), Some(&secrets), Some(&server.origin()))
+                .await
+                .outcome,
+            RevocationOutcome::ClientUnavailable,
+            "another tenant's key is never used"
+        );
+        assert_eq!(server.requests().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

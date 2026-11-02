@@ -179,6 +179,9 @@ pub enum TokenEndpointAuthMethod {
     ClientSecretBasic,
     /// The client id and secret in the form body.
     ClientSecretPost,
+    /// A JWT the client signs with its private key (RFC 7523 section 2.2), as
+    /// an `oauth2_client_credentials_jwt_auth` provider authenticates.
+    PrivateKeyJwt,
 }
 
 impl TokenEndpointAuthMethod {
@@ -188,12 +191,13 @@ impl TokenEndpointAuthMethod {
             Self::None => "none",
             Self::ClientSecretBasic => "client_secret_basic",
             Self::ClientSecretPost => "client_secret_post",
+            Self::PrivateKeyJwt => "private_key_jwt",
         }
     }
 
     /// Whether the client authenticates with a secret.
     pub fn uses_secret(self) -> bool {
-        !matches!(self, Self::None)
+        matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
     }
 }
 
@@ -320,8 +324,14 @@ impl StorableEntity for CredentialProvider {
 
 impl CredentialProvider {
     /// The algorithm this provider signs its JWT with: the configured one, or its
-    /// type's default. `None` for types that sign nothing.
+    /// type's default, or for an external consent provider whose client
+    /// authenticates with `private_key_jwt` the default of
+    /// `oauth2_client_credentials_jwt_auth`. `None` for providers that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        if self.token_endpoint_auth_method == Some(TokenEndpointAuthMethod::PrivateKeyJwt) {
+            return CredentialProviderType::OAuth2ClientCredentialsJwtAuth
+                .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm);
+        }
         self.provider_type
             .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm)
     }
