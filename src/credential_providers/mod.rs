@@ -163,6 +163,19 @@ impl JwtAssertionSettings {
         }
     }
 
+    /// Does a provider of `provider_type` need a `jwt_subject` these settings leave blank?
+    /// Only a JWT Bearer grant does: its assertion names the subject the token is for.
+    pub fn lacks_subject_for(
+        &self,
+        provider_type: &CredentialProviderType,
+    ) -> bool {
+        *provider_type == CredentialProviderType::OAuth2JwtBearer
+            && self
+                .jwt_subject
+                .as_deref()
+                .is_none_or(|subject| subject.trim().is_empty())
+    }
+
     /// The same settings with blank values removed and the rest trimmed, so a field
     /// sent empty clears it.
     pub fn normalized(self) -> Self {
@@ -491,6 +504,13 @@ impl CredentialProvider {
         } else {
             crate::tenancy::can_reference(surface_tenancy.tenant_id, self.tenant_id.as_deref())
         }
+    }
+
+    /// Is this a JWT Bearer provider without a `jwt_subject`? A save refuses one; a stored
+    /// one still signs its grant without `sub`.
+    pub fn lacks_jwt_subject(&self) -> bool {
+        self.jwt
+            .lacks_subject_for(&self.provider_type)
     }
 
     /// The algorithm this provider signs its JWT with: the configured one, or its

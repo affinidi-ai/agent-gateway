@@ -1686,6 +1686,7 @@ mod tests {
                 json!({
                 "provider_type": "oauth2_jwt_bearer",
                 "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                "jwt_subject": "admin@example.com",
                 "jwt_key_id": "google-key-id"
                 }),
             );
@@ -1716,6 +1717,13 @@ mod tests {
             );
             let claims = claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url);
             assert_eq!(claims["iss"], "agent@project.iam.gserviceaccount.com");
+            assert_eq!(claims["sub"], "admin@example.com");
+            assert!(
+                claims["jti"]
+                    .as_str()
+                    .is_some_and(|jti| uuid::Uuid::parse_str(jti).is_ok()),
+                "{claims}"
+            );
             assert_eq!(claims["scope"], "https://www.googleapis.com/auth/cloud-platform");
             assert_eq!(
                 claims["exp"]
