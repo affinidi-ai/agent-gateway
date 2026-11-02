@@ -281,7 +281,7 @@ endpoint URL.
 | `subject` | `credential_provider` or `surface` |
 | `id` | The provider's `id` or the surface's `surface_id` |
 | `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
-| `rule` | `token_endpoint_https` or `tenant_credential_isolation` |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
@@ -291,6 +291,10 @@ secret outside its own tenant: a tenant provider holding an appliance-wide or an
 appliance-wide provider holding a tenant's secret. A surface breaks `tenant_credential_isolation` when it
 belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
 or provider that no longer exists is not reported.
+
+An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
+signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
+for this rule.
 
 ## Governance audit forwarding
 

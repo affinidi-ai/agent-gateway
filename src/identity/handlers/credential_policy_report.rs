@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use super::surface_tenancy::collect_surface_reference_keys;
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
-use crate::config::credential_policy::CredentialPolicyConfig;
+use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::state::IdentityApiState;
@@ -17,6 +17,7 @@ use crate::tenancy::ResourceKind;
 
 const RULE_TOKEN_ENDPOINT_HTTPS: &str = "token_endpoint_https";
 const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
+const RULE_JWT_SUBJECT: &str = "jwt_subject";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -110,6 +111,9 @@ pub(crate) fn find_breaches(
         if provider.uses_secret_outside_tenant(secret_tenants) {
             breach(RULE_TENANT_CREDENTIAL_ISOLATION);
         }
+        if provider.lacks_jwt_subject() {
+            breach(RULE_JWT_SUBJECT);
+        }
     }
     for surface in surfaces {
         match surface_breaks_isolation(surface, secret_tenants, &by_id) {
@@ -181,10 +185,10 @@ fn log_findings(
     policy: &CredentialPolicyConfig,
 ) {
     for breach in &findings.breaches {
-        let mode = if breach.rule == RULE_TOKEN_ENDPOINT_HTTPS {
-            policy.token_endpoint_https
-        } else {
-            policy.tenant_credential_isolation
+        let mode = match breach.rule {
+            RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
+            RULE_JWT_SUBJECT => RuleMode::Warn,
+            _ => policy.tenant_credential_isolation,
         };
         warn!(
             subject = breach.subject,
@@ -288,6 +292,28 @@ mod tests {
         assert_eq!(
             breaches_of(&providers, &[], policy),
             vec![("plain".to_string(), RULE_TOKEN_ENDPOINT_HTTPS), ("garbled".to_string(), RULE_TOKEN_ENDPOINT_HTTPS),]
+        );
+    }
+
+    #[test]
+    fn a_jwt_bearer_provider_without_a_subject_is_reported() {
+        let jwt_bearer = |id: &str, subject: Option<&str>| {
+            let mut provider = CredentialProvider {
+                provider_type: CredentialProviderType::OAuth2JwtBearer,
+                ..provider(id, None, Some("https://idp.example/token"), None)
+            };
+            provider.jwt.jwt_subject = subject.map(str::to_string);
+            provider
+        };
+        let providers = [
+            jwt_bearer("no-subject", None),
+            jwt_bearer("blank-subject", Some("  ")),
+            jwt_bearer("with-subject", Some("svc@example")),
+            provider("client-credentials", None, Some("https://idp.example/token"), None),
+        ];
+        assert_eq!(
+            breaches_of(&providers, &[], CredentialPolicyConfig::default()),
+            vec![("no-subject".to_string(), RULE_JWT_SUBJECT), ("blank-subject".to_string(), RULE_JWT_SUBJECT)]
         );
     }
 
