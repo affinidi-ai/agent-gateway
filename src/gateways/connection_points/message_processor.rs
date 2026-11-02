@@ -2491,7 +2491,6 @@ async fn enrich_and_evaluate_surface_policies(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
-    secrets_storage_path: Option<&str>,
 ) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
@@ -2803,7 +2802,7 @@ async fn enrich_and_evaluate_surface_policies(
             .flatten()
             .map(|prepared| prepared.card)
         } else {
-            policy_agent_card(surface, config_id, secrets_storage_path).await
+            policy_agent_card(surface, config_id).await
         };
         channel_info!(config_id, "GW2: Agent card obtained: {}", card_json.is_some());
         let agent_ctx =
@@ -3531,11 +3530,11 @@ fn fabric_body_limits(
 /// The local Target's agent card for the GW2 policy context: the configured card
 /// location on the Target's origin, or `/.well-known/agent.json` under the Target
 /// endpoint, fetched as the gateway itself with the surface's Target
-/// authentication. A credential that cannot be resolved yields no card.
+/// authentication, resolved from the gateway's secrets store. A credential that
+/// cannot be resolved yields no card.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
-    secrets_storage_path: Option<&str>,
 ) -> Option<serde_json::Value> {
     let card_url = match surface.agent_card_location_path() {
         Some(_) => crate::proxy::handler::agent_card::card_target_url(surface),
@@ -3548,13 +3547,7 @@ async fn policy_agent_card(
     };
     let credential = match surface.target_auth() {
         Some(target_auth) => {
-            let secrets = match secrets_storage_path {
-                Some(path) => crate::secrets::FilesystemSecretsStore::new_async(path)
-                    .await
-                    .ok()
-                    .map(|store| Arc::new(store) as Arc<dyn crate::secrets::SecretsStore>),
-                None => None,
-            };
+            let secrets = get_secrets_store();
             let providers = get_credential_provider_store();
             let vault = get_delegation_vault_store();
             let context = crate::proxy::handler::TargetAuthContext::of_surface(
@@ -5491,10 +5484,6 @@ async fn process_charged_forward_request(
         mcp_verified_binding.as_ref(),
         &peer_issuers,
         policy_mcp_context.as_ref(),
-        message
-            .context
-            .get("secrets_storage_path")
-            .and_then(Value::as_str),
     ))
     .await
     {
@@ -5776,12 +5765,15 @@ async fn process_charged_forward_request(
 
     // A card fetch on a surface with Target authentication is the gateway's own
     // request, as on the direct path: a bodiless GET of the normalised card path
-    // that keeps only content-negotiation headers from the peer.
+    // that keeps only content-negotiation headers from the peer, and carries no
+    // caller's delegated credential or transit token.
     let card_fetch_path =
         crate::proxy::paths::credentialed_agent_card_path(method, path, surface.agent_card_location_path());
     let credentialed_card_fetch = card_fetch_path.is_some() && surface.target_auth().is_some();
     if credentialed_card_fetch {
         body_bytes = Default::default();
+        outbound_creds.clear();
+        modern_delegation = None;
     }
     let forward_path = card_fetch_path
         .as_deref()
@@ -6340,7 +6332,7 @@ async fn process_charged_forward_request(
             .map(|network| network.transit_token_max_lifetime_secs),
         &surface,
         &target_url,
-        is_agent_card_request,
+        is_agent_card_request || credentialed_card_fetch,
         &FabricReceiveCaller {
             peer_gateway_id: &sender.id,
             peer_issuer_did: sender.issuer_did.as_deref(),
@@ -9768,7 +9760,6 @@ mod tests {
             None,
             None,
             &peer_issuers,
-            None,
             None,
         )))
         .await;

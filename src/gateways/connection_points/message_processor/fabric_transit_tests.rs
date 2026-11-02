@@ -1632,6 +1632,54 @@ async fn an_agent_card_fetch_over_fabric_uses_the_configured_card_location() {
     }
 }
 
+/// The gateway's own card fetch at a configured card location is not a caller's
+/// request, so the managed agent gets no transit token with it, even on a
+/// surface with a Transit Point; a caller's request still gets one.
+#[tokio::test]
+async fn a_card_fetch_at_a_configured_location_carries_no_transit_token() {
+    if ran_in_child("ATG_FABRIC_CARD_TRANSIT_TOKEN_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(protected_surface(&target.url, "target-key", Some("/cards/me"))).unwrap();
+    value["transit"] = json!({ "outbound_listen_address": "http://127.0.0.1:9111",
+        "points": [{ "alias": "crm", "target_endpoint": "https://crm.example" }] });
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    let response = forward_response(&peer_request(root.path(), "GET", "/cards/me")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+    assert!(
+        request
+            .headers
+            .get("x-transit-token")
+            .is_none(),
+        "the card fetch carried a transit token"
+    );
+
+    let mut authenticated = peer_request(root.path(), "POST", "/rpc");
+    authenticated.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
+    let response = forward_response(&authenticated).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert!(
+        request
+            .headers
+            .get("x-transit-token")
+            .is_some(),
+        "a caller's request carries a transit token"
+    );
+}
+
 /// Other public paths, including a dot-segment spelling of one, skip caller
 /// authentication and so reach the Target without its credential; a request
 /// from an authenticated caller still carries it.
@@ -1701,21 +1749,27 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
 }
 
 /// The card read for the policy input authenticates to the Target as the
-/// gateway, so a protected Target's card reaches policy; a credential that
-/// cannot be resolved leaves the policy input without a card.
+/// gateway, with a credential from the gateway's secrets store, so a protected
+/// Target's card reaches policy; a credential that cannot be resolved leaves the
+/// policy input without a card.
 #[tokio::test]
 async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_without_it() {
     let target = ProtectedTarget::start().await;
     let root = tempfile::tempdir().unwrap();
     let secrets = root.path().join("secrets");
     store_target_key(&secrets).await;
-    let secrets = secrets.to_str();
+    let store: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(secrets.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let card = |surface: crate::config::agent_surface::AgentSurface| {
+        super::TEST_SECRETS_STORE
+            .scope(store.clone(), async move { super::policy_agent_card(&surface, SURFACE_ID).await })
+    };
 
     let protected = protected_surface(&target.url, "target-key", None);
-    assert_eq!(
-        super::policy_agent_card(&protected, SURFACE_ID, secrets).await,
-        Some(json!({ "name": "protected-agent" }))
-    );
+    assert_eq!(card(protected).await, Some(json!({ "name": "protected-agent" })));
     let request = target
         .received()
         .pop()
@@ -1724,11 +1778,10 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
     assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
 
     let called = target.received().len();
-    assert_eq!(super::policy_agent_card(&protected, SURFACE_ID, None).await, None, "no secrets store");
     let unresolvable = protected_surface(&target.url, "absent-key", None);
-    assert_eq!(super::policy_agent_card(&unresolvable, SURFACE_ID, secrets).await, None, "absent secret");
+    assert_eq!(card(unresolvable).await, None, "absent secret");
     assert_eq!(target.received().len(), called, "the Target was asked without the credential");
 
     let unprotected = surface("a2a", &target.url, &[]);
-    assert_eq!(super::policy_agent_card(&unprotected, SURFACE_ID, secrets).await, None, "a 401 is no card");
+    assert_eq!(card(unprotected).await, None, "a 401 is no card");
 }
