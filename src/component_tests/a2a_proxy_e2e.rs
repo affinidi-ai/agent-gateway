@@ -31,12 +31,7 @@ allow if {
 "#;
 
 fn enable_local_a2a_dial_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: set exactly once, before any A2A dial runs; only the A2A-proxy
-        // egress path reads this var and every test in this module wants it on.
-        unsafe { std::env::set_var("AG_ALLOW_LOCAL_A2A_PROXY", "1") };
-    });
+    crate::a2a_proxies::runtime::ALLOW_LOCAL_A2A_DIAL_IN_TESTS.store(true, Ordering::SeqCst);
 }
 
 struct FakeDirectLine {

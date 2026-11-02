@@ -752,7 +752,14 @@ mod tests {
     /// process-wide.
     #[test]
     fn only_the_vendor_clients_of_external_consent_ignore_a_proxy() {
-        if !crate::a2a::version::run_isolated_from_other_tests() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let proxy_url = format!("http://{reserved}");
+        let proxy_env = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+            .map(|name| (name, proxy_url.as_str()));
+        if !crate::a2a::version::run_isolated_from_other_tests_with_env(&proxy_env, &["NO_PROXY", "no_proxy"]) {
             return;
         }
         tokio::runtime::Builder::new_multi_thread()
@@ -762,10 +769,16 @@ mod tests {
             .block_on(async {
                 let proxy = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
                 let proxied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let listener = TcpListener::bind("127.0.0.1:0")
+                // The child starts with the proxy variables naming the port the
+                // parent reserved, so the recording proxy listens there.
+                let recording_proxy: std::net::SocketAddr = std::env::var("HTTP_PROXY")
+                    .unwrap()
+                    .trim_start_matches("http://")
+                    .parse()
+                    .unwrap();
+                let listener = TcpListener::bind(recording_proxy)
                     .await
                     .unwrap();
-                let recording_proxy = listener.local_addr().unwrap();
                 let seen = proxied.clone();
                 tokio::spawn(async move {
                     while let Ok((mut sock, _)) = listener.accept().await {
@@ -788,12 +801,6 @@ mod tests {
                             .await;
                     }
                 });
-                for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-                    unsafe { std::env::set_var(name, format!("http://{recording_proxy}")) };
-                }
-                for name in ["NO_PROXY", "no_proxy"] {
-                    unsafe { std::env::remove_var(name) };
-                }
 
                 let target = spawn_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
                 let url = format!("http://{target}/direct");

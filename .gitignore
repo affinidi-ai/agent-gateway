@@ -13,6 +13,8 @@ graphify-out
 
 # Configuration files with sensitive data
 config.toml
+# Except the cargo config, which holds only test-only values.
+!.cargo/config.toml
 saml.json
 pipes.json
 .env

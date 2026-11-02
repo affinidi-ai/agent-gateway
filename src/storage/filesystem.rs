@@ -3146,7 +3146,6 @@ pub async fn rwlock_storage_with_config<T: StorableEntity>(
 mod tests {
     use super::*;
     use crate::encryption::{KeyManager, KeySource};
-    use base64::Engine;
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
