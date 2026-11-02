@@ -90,6 +90,23 @@ with `method_era` showing which method names they send. Requests later refused b
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
 
+## Credential provider token request metric
+
+`agent_gateway_credential_provider_token_requests_total{provider_type,outcome}` is a Prometheus
+counter incremented once for each service token request the gateway sends to a credential
+provider's token endpoint: a client credentials, JWT Bearer or Client Credentials JWT grant for
+[target authentication](CREDENTIAL_DELEGATION.md). A cached token served without a request, a
+request held back by the retry backoff, and a request refused before it is sent (a missing
+secret, an endpoint the egress policy or the https rule refuses) are not counted. Refreshes and
+code exchanges of delegated user tokens are not counted either.
+
+| Label | Value |
+| --- | --- |
+| `provider_type` | `oauth2_client_credentials`, `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` |
+| `outcome` | `success`; `refused` (the endpoint answered with an error status or OAuth error, or refused the connection); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (an answer that is not valid JSON, is over 64 KiB, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
+
+No label carries a URL, provider id, secret or tenant.
+
 ## Logging initialization
 
 Logging is initialized after the encryption service so secret-backed OTLP headers can be resolved.
