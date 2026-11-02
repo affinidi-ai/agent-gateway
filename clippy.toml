@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "changing the process environment can crash other threads; set test values in .cargo/config.toml [env] or a child process" },
+    { path = "std::env::remove_var", reason = "changing the process environment can crash other threads; set test values in .cargo/config.toml [env] or a child process" },
+]

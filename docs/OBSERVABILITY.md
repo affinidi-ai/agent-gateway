@@ -57,11 +57,11 @@ example, sets both intermediate fields to `None` because it does not forward the
 
 For each dashboard connection, the handler subscribes to the broadcast channel and multiplexes
 outbound updates with periodic ping frames. An incoming JSON `subscribe` command replaces the set
-of dashboard sections included in subsequent `DashboardDelta` events. A connection whose user
-lacks `logs.view` also loses the `logs` section and every `LogEntry` update; it checks the user's
-role on connect and on each keep-alive ping, and an unauthenticated connection never gets log
-lines (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast receive error, including lag,
-ends the connection; socket closure does likewise.
+of dashboard sections included in subsequent `DashboardDelta` events. A connection whose session
+has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
+every `LogEntry` update; it checks the session and the user's role and status on connect and on
+each keep-alive ping, and an unauthenticated connection never gets log lines (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
+receive error, including lag, ends the connection; socket closure does likewise.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.

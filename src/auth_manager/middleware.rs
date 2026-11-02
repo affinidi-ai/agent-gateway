@@ -703,8 +703,8 @@ impl RbacGuard {
     }
 
     /// Whether `user_id` holds `feature` under its role and, for a request
-    /// made with an access token, under the token's scopes. An unknown user
-    /// or a failed lookup counts as no.
+    /// made with an access token, under the token's scopes. An unknown user,
+    /// a user who is not Approved, or a failed lookup counts as no.
     pub async fn allows(
         &self,
         user_id: &str,
@@ -717,8 +717,10 @@ impl RbacGuard {
             .await
         {
             Ok(Some(user)) => {
-                self.rbac_config
-                    .has_permission(&user.role, feature)
+                user.status == UserStatus::Approved
+                    && self
+                        .rbac_config
+                        .has_permission(&user.role, feature)
                     && pat_scope_allows(pat, feature)
             }
             Ok(None) => false,
@@ -1336,6 +1338,25 @@ mod tests {
         let app = test_app_with_storage(sess_mgr, storage);
         let status = get_status_with_bearer(&app, "/v1/settings", &token).await;
         assert_eq!(status, 200, "Approved user with valid session must pass");
+    }
+
+    #[tokio::test]
+    async fn rbac_guard_allows_only_an_approved_user() {
+        for (status, expected) in [
+            (UserStatus::Approved, true),
+            (UserStatus::New, false),
+            (UserStatus::Disabled, false),
+        ] {
+            let (storage, _tmp) = make_storage_with_user(mk_user_data("user-1", "alice", status)).await;
+            let guard = RbacGuard::new(storage, Arc::new(crate::rbac::RbacConfig::default()));
+
+            assert_eq!(
+                guard
+                    .allows("user-1", None, &crate::rbac::Feature::LogsView)
+                    .await,
+                expected
+            );
+        }
     }
 
     async fn audit_context_handler() -> axum::Json<serde_json::Value> {

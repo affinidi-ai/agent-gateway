@@ -175,25 +175,33 @@ fn admits(
     logs_allowed || !matches!(update, WsUpdate::LogEntry { .. })
 }
 
-/// The user a connection serves and the guard that decides what it may
-/// read. Its permissions are checked when it connects and again on each
-/// keep-alive ping, so a role change reaches an open socket.
+/// The user and session a connection serves and the guard that decides what
+/// it may read. Its permissions are checked when it connects and again on
+/// each keep-alive ping, so a role change or an ended session reaches an open
+/// socket.
 struct WsCaller {
     guard: crate::auth_manager::middleware::RbacGuard,
     user_id: String,
+    sessions: Arc<crate::auth::SessionManager>,
+    session_token: String,
 }
 
 impl WsCaller {
-    /// Whether `caller` may receive log lines. A connection without a known
-    /// user or an RBAC guard may not.
+    /// Whether `caller` may receive log lines: its session is still live and
+    /// its user holds `logs.view`. A connection without a known user or an
+    /// RBAC guard may not.
     async fn logs_allowed(caller: Option<&Self>) -> bool {
         let Some(caller) = caller else {
             return false;
         };
         caller
-            .guard
-            .allows(&caller.user_id, None, &crate::rbac::Feature::LogsView)
+            .sessions
+            .is_live(&caller.session_token)
             .await
+            && caller
+                .guard
+                .allows(&caller.user_id, None, &crate::rbac::Feature::LogsView)
+                .await
     }
 }
 
@@ -300,6 +308,8 @@ pub async fn ws_handler_authenticated(
     let caller = rbac_guard.map(|Extension(guard)| WsCaller {
         guard,
         user_id: user_id.clone(),
+        sessions: session_mgr.clone(),
+        session_token: session_token.token.clone(),
     });
 
     // Upgrade connection
@@ -938,26 +948,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let now = Utc::now();
         storage
-            .save_user(&crate::auth::storage::UserData {
-                user_id: "user-1".to_string(),
-                username: "user".to_string(),
-                passkeys: Vec::new(),
-                role,
-                status: crate::auth::types::UserStatus::Approved,
-                is_primary: false,
-                first_name: None,
-                last_name: None,
-                email: None,
-                department: None,
-                job_title: None,
-                avatar_path: None,
-                created_at: now,
-                updated_at: now,
-                last_logged_in: None,
-                saml_id: None,
-            })
+            .save_user(&user_data(role, crate::auth::types::UserStatus::Approved))
             .await
             .unwrap();
         let mut rbac = crate::rbac::RbacConfig::default();
@@ -966,27 +958,93 @@ mod tests {
         crate::auth_manager::middleware::RbacGuard::new(std::sync::Arc::new(storage), std::sync::Arc::new(rbac))
     }
 
+    fn user_data(
+        role: crate::auth::types::UserRole,
+        status: crate::auth::types::UserStatus,
+    ) -> crate::auth::storage::UserData {
+        let now = Utc::now();
+        crate::auth::storage::UserData {
+            user_id: "user-1".to_string(),
+            username: "user".to_string(),
+            passkeys: Vec::new(),
+            role,
+            status,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+        }
+    }
+
+    async fn caller_for(
+        guard: crate::auth_manager::middleware::RbacGuard,
+        user_id: &str,
+    ) -> super::WsCaller {
+        let sessions = std::sync::Arc::new(crate::auth::SessionManager::new());
+        let session_token = sessions
+            .create_session("user".to_string(), user_id.to_string())
+            .await;
+        super::WsCaller {
+            guard,
+            user_id: user_id.to_string(),
+            sessions,
+            session_token,
+        }
+    }
+
     #[tokio::test]
     async fn a_connection_may_read_logs_only_when_its_user_holds_logs_view() {
         let dir = TempDir::new().unwrap();
-        let power_user = super::WsCaller {
-            guard: guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await,
-            user_id: "user-1".to_string(),
-        };
+        let power_user = caller_for(guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await, "user-1").await;
         assert!(super::WsCaller::logs_allowed(Some(&power_user)).await);
 
         let dir = TempDir::new().unwrap();
-        let user = super::WsCaller {
-            guard: guard_with_user(&dir, crate::auth::types::UserRole::User).await,
-            user_id: "user-1".to_string(),
-        };
+        let user = caller_for(guard_with_user(&dir, crate::auth::types::UserRole::User).await, "user-1").await;
         assert!(!super::WsCaller::logs_allowed(Some(&user)).await);
 
-        let unknown = super::WsCaller {
-            guard: power_user.guard.clone(),
-            user_id: "someone-else".to_string(),
-        };
+        let unknown = caller_for(power_user.guard.clone(), "someone-else").await;
         assert!(!super::WsCaller::logs_allowed(Some(&unknown)).await);
         assert!(!super::WsCaller::logs_allowed(None).await);
+    }
+
+    #[tokio::test]
+    async fn a_later_check_refuses_logs_after_the_user_loses_logs_view_or_approval() {
+        use crate::auth::types::{UserRole, UserStatus};
+
+        for (role, status) in [(UserRole::User, UserStatus::Approved), (UserRole::PowerUser, UserStatus::Disabled)] {
+            let dir = TempDir::new().unwrap();
+            let caller = caller_for(guard_with_user(&dir, UserRole::PowerUser).await, "user-1").await;
+            assert!(super::WsCaller::logs_allowed(Some(&caller)).await);
+
+            caller
+                .guard
+                .storage
+                .save_user(&user_data(role, status))
+                .await
+                .unwrap();
+
+            assert!(!super::WsCaller::logs_allowed(Some(&caller)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_check_refuses_logs_after_the_session_ends() {
+        let dir = TempDir::new().unwrap();
+        let caller = caller_for(guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await, "user-1").await;
+        assert!(super::WsCaller::logs_allowed(Some(&caller)).await);
+
+        caller
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+
+        assert!(!super::WsCaller::logs_allowed(Some(&caller)).await);
     }
 }

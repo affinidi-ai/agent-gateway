@@ -2512,9 +2512,16 @@ fn read_log_entries_since(
     }
 
     let lower = after_position.max(file_len.saturating_sub(LOG_TAIL_MAX_BYTES));
+    // Below the byte cap, start one byte early so a line beginning exactly at
+    // `lower` is kept; at `after_position`, skip the line the caller has.
+    let fallback_start = if lower > after_position {
+        lower - 1
+    } else {
+        lower
+    };
     let lines = match log_tail_line_start(&mut file, file_len, lower, max_lines).ok()? {
         Some(start) => read_log_lines_from(&mut file, start, false),
-        None => read_log_lines_from(&mut file, lower, true),
+        None => read_log_lines_from(&mut file, fallback_start, true),
     }
     .ok()?;
 
@@ -3487,6 +3494,31 @@ mod tests {
         }
 
         #[test]
+        fn a_line_starting_exactly_at_the_byte_cap_is_kept() {
+            let line_bytes: u64 = 1024 * 1024;
+            let (dir, len) = write_log(10, &"x".repeat(line_bytes as usize - 49));
+            assert_eq!(len - LOG_TAIL_MAX_BYTES, 2 * line_bytes, "the cap must fall on a line start");
+
+            let entries = read_log_entries_since(&log_dir(&dir), 0, 10).expect("tail entries");
+            assert_eq!(entries.len(), 8);
+            assert_eq!(entries[0].file_position, 2 * line_bytes);
+            assert!(
+                entries[0]
+                    .message
+                    .starts_with("line 00000002 ")
+            );
+
+            let lines = read_log_file(&log_dir(&dir), 10);
+            assert_eq!(lines.len(), 8);
+            assert_eq!(lines[0].0, 2 * line_bytes);
+            assert!(
+                lines[0]
+                    .1
+                    .contains("line 00000002 ")
+            );
+        }
+
+        #[test]
         fn a_recent_position_returns_every_line_after_it_when_lines_are_long() {
             let (dir, _) = write_log(20, &"x".repeat(1_000));
             let all = read_log_entries_since(&log_dir(&dir), 0, 100).expect("all entries");
@@ -3596,7 +3628,7 @@ fn read_log_file(
             let lower = file_len.saturating_sub(LOG_TAIL_MAX_BYTES);
             let lines = log_tail_line_start(&mut file, file_len, lower, max_lines).and_then(|start| match start {
                 Some(start) => read_log_lines_from(&mut file, start, false),
-                None => read_log_lines_from(&mut file, lower, lower > 0),
+                None => read_log_lines_from(&mut file, lower.saturating_sub(1), lower > 0),
             });
 
             match lines {

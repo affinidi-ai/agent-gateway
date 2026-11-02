@@ -28,6 +28,8 @@ changes:
         were too small. The next update then sent the newest line again under its real position, so
         the log view showed it twice and could bring back lines hidden by Clear. Positions are now
         the real byte offsets of the lines.
+  removed: []
+  security:
     - timestamp: '2026-11-02T23:45:00Z'
       title: Show dashboard log lines only to callers with the logs.view permission
       description: >-
@@ -35,9 +37,7 @@ changes:
         lines to every signed-in caller, including roles and access tokens without `logs.view`.
         The endpoints now leave log lines out, without reading the log file, unless the caller's
         role and access-token scopes grant `logs.view`, and each WebSocket connection drops log
-        updates unless its user holds `logs.view`, checked on connect and on every keep-alive
-        ping. Unauthenticated WebSocket connections and gateways without an auth backend get no
-        log lines.
-  removed: []
-  security: []
+        updates unless its session is still live and its user is Approved and holds `logs.view`,
+        checked on connect and on every keep-alive ping. Unauthenticated WebSocket connections and
+        gateways without an auth backend get no log lines.
   breaking: []
