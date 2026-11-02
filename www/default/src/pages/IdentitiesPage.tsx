@@ -6,7 +6,6 @@ import { usePermissions } from '../context/PermissionsContext';
 import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
 import { formatDateTime, timeAgo } from '../utils/stringUtils';
 import TrustScoreModal from '../components/didwebvh/TrustScoreModal';
-import VersionHistoryModal from '../components/didwebvh/VersionHistoryModal';
 import PolicyConfigModal from '../components/didwebvh/PolicyConfigModal';
 import { apiClient } from '../api';
 import SearchInput from '../components/shared/SearchInput';
@@ -20,6 +19,8 @@ import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
 import { IdentitySurfaceCell, SurfaceLinkButton } from './IdentitiesPage/IdentitySurfaceCell';
 import { isSharedManagedDid } from './IdentitiesPage/sharedManagedDid';
+import { IdentityVersionHistory } from './IdentitiesPage/IdentityVersionHistory';
+import { recordsRotations } from './IdentitiesPage/identityVersions';
 import {
   RECORDER_FILTER_OPTIONS,
   isRecorderFilter,
@@ -83,7 +84,6 @@ const IdentitiesPage: React.FC = () => {
 
   // DID:webvh modals
   const [showTrustScoreModal, setShowTrustScoreModal] = useState(false);
-  const [showVersionHistoryModal, setShowVersionHistoryModal] = useState(false);
   const [showPolicyConfigModal, setShowPolicyConfigModal] = useState(false);
   const [selectedIdentity, setSelectedIdentity] = useState<any>(null);
   const canViewIssuers = hasPermission('issuers.view');
@@ -162,11 +162,14 @@ const IdentitiesPage: React.FC = () => {
 
   const {
     filteredIdentities,
+    entryCount,
     hasNamingMetadata,
     hasRecorderStatus,
     liveSurfaceNames,
     surfaceLinkFor,
     surfaceLinksFor,
+    versionsFor,
+    primaryDidFor,
   } = useIdentityRows({
     identities,
     channels: stats?.channels,
@@ -174,26 +177,29 @@ const IdentitiesPage: React.FC = () => {
     recorderFilter,
   });
 
-  // Handle deep linking to a specific identity
+  const linkedDid = didParam ? decodeURIComponent(didParam) : undefined;
+  const linkedPrimaryDid = linkedDid ? primaryDidFor(linkedDid) : undefined;
+
+  // Handle deep linking to a specific identity: an earlier DID opens its surface entry's versions
   useEffect(() => {
-    if (didParam) {
-      const decodedDid = decodeURIComponent(didParam);
+    if (linkedDid && linkedPrimaryDid) {
+      const sections = linkedDid === linkedPrimaryDid ? ['summary'] : ['summary', 'versions'];
       setExpandedIdentityDids(prev =>
-        prev.has(decodedDid) ? prev : new Set(prev).add(decodedDid)
+        prev.has(linkedPrimaryDid) ? prev : new Set(prev).add(linkedPrimaryDid)
       );
       setExpandedSections(prev =>
-        prev[decodedDid] ? prev : { ...prev, [decodedDid]: new Set(['summary']) }
+        prev[linkedPrimaryDid] ? prev : { ...prev, [linkedPrimaryDid]: new Set(sections) }
       );
 
       // Scroll to the identity after a short delay to ensure rendering
       setTimeout(() => {
-        const element = identityRefs.current[decodedDid];
+        const element = identityRefs.current[linkedPrimaryDid];
         if (element) {
           element.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }, 100);
     }
-  }, [didParam]);
+  }, [linkedDid, linkedPrimaryDid]);
 
   const toggleIdentityDetails = (did: string) => {
     const isOpen = expandedIdentityDids.has(did);
@@ -320,12 +326,6 @@ const IdentitiesPage: React.FC = () => {
     e.stopPropagation();
     setSelectedIdentity(identity);
     setShowTrustScoreModal(true);
-  };
-
-  const openVersionHistoryModal = (identity: any, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedIdentity(identity);
-    setShowVersionHistoryModal(true);
   };
 
   const openPolicyConfigModal = (identity: any, e: React.MouseEvent) => {
@@ -477,7 +477,7 @@ const IdentitiesPage: React.FC = () => {
                         ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
                           searchTerm || (hasRecorderStatus && recorderFilter !== 'all')
-                            ? ` of ${identities.length}`
+                            ? ` of ${entryCount}`
                             : undefined
                         }
                       />
@@ -512,6 +512,7 @@ const IdentitiesPage: React.FC = () => {
                               const isExpanded = expandedIdentityDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
                               const sharedManagedDid = isSharedManagedDid(identity);
+                              const versions = versionsFor(identity.did);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -552,6 +553,15 @@ const IdentitiesPage: React.FC = () => {
                                             v{identity.version}
                                           </span>
                                         )}
+                                      {versions.length > 0 && (
+                                        <span
+                                          className="badge text-bg-light ms-2"
+                                          title="Earlier DIDs and credential rotations of this surface identity"
+                                          data-testid="identities-version-count"
+                                        >
+                                          {versions.length} versions
+                                        </span>
+                                      )}
                                       {identity.scid && (
                                         <small className="text-muted ml-2" title={identity.scid}>
                                           SCID {identity.scid.slice(0, 10)}...
@@ -725,16 +735,6 @@ const IdentitiesPage: React.FC = () => {
                                             <i className="fas fa-chart-line"></i>
                                           </button>
                                         )}
-                                        {identity.uuid && (
-                                          <button
-                                            className="btn btn-outline-secondary"
-                                            data-testid={`identities-history-button-${identity.did}`}
-                                            onClick={e => openVersionHistoryModal(identity, e)}
-                                            title="View version history"
-                                          >
-                                            <i className="fas fa-history"></i>
-                                          </button>
-                                        )}
                                         <button
                                           className="btn btn-outline-info"
                                           data-testid={`identities-policy-button-${identity.did}`}
@@ -906,6 +906,41 @@ const IdentitiesPage: React.FC = () => {
                                                 </div>
                                               )}
                                             </div>
+
+                                            {(versions.length > 0 ||
+                                              recordsRotations(identity)) && (
+                                              <div className="card mb-2">
+                                                <div
+                                                  className="card-header py-1 bg-light"
+                                                  style={{ cursor: 'pointer' }}
+                                                  onClick={() =>
+                                                    toggleSection(identity.did, 'versions')
+                                                  }
+                                                  data-testid="identities-version-history-toggle"
+                                                >
+                                                  <small className="mb-0 text-muted">
+                                                    <i
+                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'versions') ? 'down' : 'right'} me-2`}
+                                                    ></i>
+                                                    <i className="fas fa-history"></i> Version
+                                                    History
+                                                  </small>
+                                                </div>
+                                                {isSectionExpanded(identity.did, 'versions') && (
+                                                  <div className="card-body py-2 px-3">
+                                                    <IdentityVersionHistory
+                                                      versions={versions}
+                                                      highlightedDid={
+                                                        linkedPrimaryDid === identity.did &&
+                                                        linkedDid !== identity.did
+                                                          ? linkedDid
+                                                          : undefined
+                                                      }
+                                                    />
+                                                  </div>
+                                                )}
+                                              </div>
+                                            )}
 
                                             {/* Identity Field Values */}
                                             {identity.agent_identity && (
@@ -1452,15 +1487,6 @@ const IdentitiesPage: React.FC = () => {
               setSelectedIdentity(null);
             }}
             agentDna={selectedIdentity?.metadata?.agentDNA}
-          />
-          <VersionHistoryModal
-            identityId={selectedIdentity.uuid || selectedIdentity.did}
-            did={selectedIdentity.did}
-            show={showVersionHistoryModal}
-            onHide={() => {
-              setShowVersionHistoryModal(false);
-              setSelectedIdentity(null);
-            }}
           />
           <PolicyConfigModal
             identity={selectedIdentity}

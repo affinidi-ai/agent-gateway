@@ -1054,11 +1054,6 @@ class APIClient {
     return response.data;
   }
 
-  async getIdentityVersionHistory(id: string): Promise<any> {
-    const response = await this.get<any>(`/identities/${encodeURIComponent(id)}/history`);
-    return response.data;
-  }
-
   async rotateIdentityKeys(id: string, params?: { pre_rotation_seconds?: number }): Promise<any> {
     const response = await this.post<any>(
       `/identities/${encodeURIComponent(id)}/rotate-keys`,

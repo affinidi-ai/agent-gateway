@@ -128,7 +128,13 @@ impl IdentitySelector {
         let response = match origin {
             IdentityOrigin::Managed => {
                 self.vc_issuer
-                    .issue_or_get_managed_credential(fields, hash_arg, channel_config_id, issuer_id)
+                    .issue_or_get_managed_credential(
+                        fields,
+                        hash_arg,
+                        channel_config_id,
+                        issuer_id,
+                        crate::identity::filesystem::ManagedIdentitySource::protected(),
+                    )
                     .await
             }
             IdentityOrigin::ExternalCaller => {

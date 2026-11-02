@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
+import { groupIdentityVersions, type IdentityVersion } from './identityVersions';
 import { matchesRecorderFilter, type RecorderFilter } from './recorderFilter';
 import { isSharedManagedDid } from './sharedManagedDid';
 
@@ -12,6 +13,8 @@ type SurfaceRef = Pick<
   | 'channel_config_id'
   | 'origin'
 >;
+
+const NO_VERSIONS: IdentityVersion[] = [];
 
 export interface SurfaceLink {
   id: string;
@@ -27,12 +30,19 @@ interface UseIdentityRowsOptions<T extends Identity> {
 }
 
 export interface IdentityRowsView<T extends Identity> {
+  /** One row per entry: the primary DID of a surface identity, or a lone identity. */
   filteredIdentities: T[];
+  /** Number of entries before filtering. */
+  entryCount: number;
   hasNamingMetadata: boolean;
   hasRecorderStatus: boolean;
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
   surfaceLinksFor: (identity: SurfaceRef & Pick<Identity, 'managed_surfaces'>) => SurfaceLink[];
+  /** The versions of the entry whose primary DID is `did`, newest first. */
+  versionsFor: (did: string) => IdentityVersion[];
+  /** The primary DID of the entry holding `did`, or `did` itself when no entry holds it. */
+  primaryDidFor: (did: string) => string;
 }
 
 export function useIdentityRows<T extends Identity>({
@@ -103,30 +113,54 @@ export function useIdentityRows<T extends Identity>({
     [liveSurfaceNames, surfaceLinkFor]
   );
 
+  const entries = useMemo(() => groupIdentityVersions(identities), [identities]);
+
+  const { versionsByPrimary, primaryByDid } = useMemo(() => {
+    const versions = new Map<string, IdentityVersion[]>();
+    const primaries = new Map<string, string>();
+    entries.forEach(entry => {
+      versions.set(entry.primary.did, entry.versions);
+      entry.dids.forEach(did => primaries.set(did, entry.primary.did));
+    });
+    return { versionsByPrimary: versions, primaryByDid: primaries };
+  }, [entries]);
+
+  const versionsFor = useCallback(
+    (did: string) => versionsByPrimary.get(did) ?? NO_VERSIONS,
+    [versionsByPrimary]
+  );
+
+  const primaryDidFor = useCallback((did: string) => primaryByDid.get(did) ?? did, [primaryByDid]);
+
   const filteredIdentities = useMemo(() => {
     const searchLower = searchTerm.trim().toLowerCase();
-    return identities.filter(identity => {
-      if (hasRecorderStatus && !matchesRecorderFilter(identity, recorderFilter)) return false;
-      if (!searchLower) return true;
-      return [
-        identity.name,
-        identity.did,
-        identity.origin === 'managed' ? undefined : identity.channel_name,
-        identity.identity_hash,
-        identity.display_name,
-        identity.surface_name,
-        identity.credential_principal?.name,
-        ...(identity.managed_surfaces ?? []).map(surface => surface.surface_name),
-      ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
-    });
-  }, [identities, searchTerm, hasRecorderStatus, recorderFilter]);
+    return entries
+      .filter(({ primary, dids }) => {
+        if (hasRecorderStatus && !matchesRecorderFilter(primary, recorderFilter)) return false;
+        if (!searchLower) return true;
+        return [
+          primary.name,
+          ...dids,
+          primary.origin === 'managed' ? undefined : primary.channel_name,
+          primary.identity_hash,
+          primary.display_name,
+          primary.surface_name,
+          primary.credential_principal?.name,
+          ...(primary.managed_surfaces ?? []).map(surface => surface.surface_name),
+        ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
+      })
+      .map(entry => entry.primary);
+  }, [entries, searchTerm, hasRecorderStatus, recorderFilter]);
 
   return {
     filteredIdentities,
+    entryCount: entries.length,
     hasNamingMetadata,
     hasRecorderStatus,
     liveSurfaceNames,
     surfaceLinkFor,
     surfaceLinksFor,
+    versionsFor,
+    primaryDidFor,
   };
 }

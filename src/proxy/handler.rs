@@ -5109,6 +5109,7 @@ async fn proxy_charged_request(
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                ..
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -10465,7 +10466,11 @@ async fn resolve_configured_caller_identity(
                 issuer_did: None,
             }
         }
-        Ok(Some(CredentialIdentity::Derived { identity_fields, identity_hash })) => {
+        Ok(Some(CredentialIdentity::Derived {
+            identity_fields,
+            identity_hash,
+            credential_updated_at,
+        })) => {
             let Some(issuer) = state
                 .identity_selector
                 .as_ref()
@@ -10493,6 +10498,8 @@ async fn resolve_configured_caller_identity(
                         Some(identity_hash.clone()),
                         surface_id,
                         issuer_id,
+                        crate::identity::filesystem::ManagedIdentitySource::protected()
+                            .with_credential_updated_at(credential_updated_at),
                     )
                     .await
             } else {
@@ -11152,6 +11159,7 @@ async fn handle_fabric_request_inner(
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                ..
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -22758,7 +22766,7 @@ allow if {
             .await
             .unwrap()
             .unwrap();
-            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
+            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash, .. } =
                 configured
             else {
                 panic!("API key identity is derived");
@@ -22941,7 +22949,7 @@ allow if {
                 .await
                 .unwrap();
             let managed = issuer
-                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-shared".into()), None)
+                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-shared".into()), None, crate::identity::filesystem::ManagedIdentitySource::protected())
                 .await
                 .unwrap();
             let state = state_with(inbound_from_api_key("pak-shared"), Some(issuer));
@@ -22973,7 +22981,7 @@ allow if {
             .await
             .unwrap()
             .unwrap();
-            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
+            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash, .. } =
                 managed
             else {
                 panic!("API key identity is derived");
@@ -22984,6 +22992,7 @@ allow if {
                     Some(identity_hash.clone()),
                     Some("pak-plain-shared".into()),
                     None,
+                    crate::identity::filesystem::ManagedIdentitySource::protected(),
                 )
                 .await
                 .unwrap();

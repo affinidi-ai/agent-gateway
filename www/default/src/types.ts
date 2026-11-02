@@ -212,11 +212,24 @@ export interface Identity {
   managed_surfaces?: ManagedSurfaceRef[];
   trust_recorder?: TrustRecorderStatus;
   trust_recorder_surface?: ManagedSurfaceRef;
+  slot?: ManagedSlot;
+  rotations?: CredentialRotation[];
 }
 
 export interface ManagedSurfaceRef {
   surface_id: string;
   surface_name: string;
+}
+
+/** The surface slot whose identity setting created a managed identity. */
+export type ManagedSlot = { kind: 'protected' } | { kind: 'transit_point'; alias: string };
+
+/** A change of the stored certificate or API key behind an identity that kept its DID. */
+export interface CredentialRotation {
+  /** `null` when the change happened before the gateway recorded rotations. */
+  rotated_at: string | null;
+  /** The identity fields the change replaced, with their earlier values. */
+  previous?: Record<string, unknown>;
 }
 
 export type TrustRecorderState = 'recorded' | 'partial' | 'failed' | 'skipped' | 'not_attempted';
@@ -358,16 +371,6 @@ export interface DidWebVhIdentity {
     [key: string]: any;
   };
   trust_score?: TrustScoreResponse;
-}
-
-export interface VersionHistoryEntry {
-  version: number;
-  timestamp: string;
-  operation: 'birth' | 'update' | 'key_rotation' | 'transfer';
-  signer: string;
-  hash: string;
-  changes?: string[];
-  metadata?: Record<string, any>;
 }
 
 export interface PolicyConfig {

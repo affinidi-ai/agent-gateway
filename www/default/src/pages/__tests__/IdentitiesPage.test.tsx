@@ -6,12 +6,14 @@ import { AppContext } from '../../context/AppContext';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
+import managedFixture from '../../__fixtures__/backend/identity-row-managed.json';
+import managedRotatedFixture from '../../__fixtures__/backend/identity-row-managed-rotated.json';
+import externalCallerFixture from '../../__fixtures__/backend/identity-row-external-caller.json';
 
 // Mock the API client
 jest.mock('../../api', () => ({
   apiClient: {
     getIdentityTrustScore: jest.fn(),
-    getIdentityVersionHistory: jest.fn(),
     createDidWebVhIdentity: jest.fn(),
     listDidWebVhIdentities: jest.fn().mockResolvedValue({ identities: [] }),
   },
@@ -294,38 +296,6 @@ describe('IdentitiesPage', () => {
     });
   });
 
-  it('opens version history modal when button clicked', async () => {
-    (apiClient.getIdentityVersionHistory as jest.Mock).mockResolvedValue([
-      {
-        version: 1,
-        timestamp: '2026-02-01T10:00:00Z',
-        operation: 'birth',
-        signer: 'did:web:example.com:admin',
-        hash: 'abc123',
-        changes: ['Initial creation'],
-      },
-    ]);
-
-    render(
-      <MemoryRouter>
-        <AppContext.Provider value={mockAppContext}>
-          <IdentitiesPage />
-        </AppContext.Provider>
-      </MemoryRouter>
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/did:webvh:zScid1:example\.com:agents:gpt4/i)).toBeInTheDocument();
-    });
-
-    const historyButtons = screen.getAllByTitle(/View version history/i);
-    fireEvent.click(historyButtons[0]);
-
-    await waitFor(() => {
-      expect(screen.getByText('Version History')).toBeInTheDocument();
-    });
-  });
-
   it('displays correct trust score color for high score', async () => {
     render(
       <MemoryRouter>
@@ -484,37 +454,6 @@ describe('IdentitiesPage', () => {
     });
   });
 
-  it('does not show history button for identity without uuid', async () => {
-    const identitiesWithoutUuid = [
-      {
-        ...mockIdentities[0],
-        uuid: undefined as any,
-      },
-    ];
-    const contextWithoutUuid = {
-      ...mockAppContext,
-      getCurrentStats: jest.fn(() => ({
-        identities: identitiesWithoutUuid,
-        channels: [] as any[],
-        gateways: [] as any[],
-        pipes: [] as any[],
-      })),
-    };
-
-    render(
-      <MemoryRouter>
-        <AppContext.Provider value={contextWithoutUuid}>
-          <IdentitiesPage />
-        </AppContext.Provider>
-      </MemoryRouter>
-    );
-
-    await waitFor(() => {
-      const historyButtons = screen.queryAllByTitle(/View version history/i);
-      expect(historyButtons.length).toBe(0);
-    });
-  });
-
   // === Identity Page Migration Display Tests ===
   // did:web identity must render without SCID and without trust score button.
   it('did_web_identity_rendered_without_scid_and_trust_score', async () => {
@@ -567,7 +506,6 @@ describe('IdentitiesPage', () => {
     });
 
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(0);
-    expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(0);
   });
 
   // did:webvh identity must render with SCID, version badge, and action buttons.
@@ -634,7 +572,6 @@ describe('IdentitiesPage', () => {
 
     expect(screen.getByText('v5')).toBeInTheDocument();
     expect(screen.queryAllByTitle(/View trust score/i).length).toBeGreaterThan(0);
-    expect(screen.queryAllByTitle(/View version history/i).length).toBeGreaterThan(0);
   });
 
   // mixed list of did:web and did:webvh must render correctly without cross-contamination.
@@ -712,7 +649,6 @@ describe('IdentitiesPage', () => {
     ).toBeInTheDocument();
 
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(1);
-    expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(1);
     expect(screen.getByText('v2')).toBeInTheDocument();
   });
 
@@ -791,6 +727,7 @@ describe('IdentitiesPage', () => {
       did: 'did:key:jwt-claim-a',
       identity_hash: 'hash-jwt-a',
       trust_score: 0.9,
+      agent_identity: { credential_type: 'jwt_claim', claim: 'sub', value: 'sub-a' },
       credential_principal: { kind: 'jwt_claim', id: 'sub-a', name: 'alice' },
     };
     const jwtClaimB = {
@@ -798,28 +735,121 @@ describe('IdentitiesPage', () => {
       did: 'did:key:jwt-claim-b',
       identity_hash: 'hash-jwt-b',
       trust_score: 0.4,
+      agent_identity: { credential_type: 'jwt_claim', claim: 'sub', value: 'sub-b' },
       credential_principal: { kind: 'jwt_claim', id: 'sub-b', name: 'bob' },
     };
 
-    it('renders one row per identity, including managed identities on one surface', async () => {
+    const payloadVersion = (did: string, model: string, createdAt: string, usedAt: string) => ({
+      ...managedFixture,
+      did,
+      identity_hash: `hash-${model}`,
+      created_at: createdAt,
+      last_used_at: usedAt,
+      usage_count: 2,
+      agent_identity: { 'agentIdentity.llmInfo.model': model },
+    });
+    const gpt4o = payloadVersion(
+      'did:webvh:zQmOld:gateway.example.com:surface:alpha',
+      'gpt-4o',
+      '2026-01-01T00:00:00Z',
+      '2026-01-03T00:00:00Z'
+    );
+    const gpt41 = payloadVersion(
+      'did:webvh:zQmNew:gateway.example.com:surface:alpha',
+      'gpt-4.1',
+      '2026-01-02T00:00:00Z',
+      '2026-01-04T00:00:00Z'
+    );
+
+    it('groups the managed identities of one surface under its most recently used DID', async () => {
       renderWithStats([managedOld, managedNew, callerNamed]);
 
-      const oldRow = await screen.findByTestId('identities-row-did:key:managed-old');
-      const newRow = screen.getByTestId('identities-row-did:key:managed-new');
-      expect(within(oldRow).getByTitle('did:key:managed-old')).toBeInTheDocument();
+      const newRow = await screen.findByTestId('identities-row-did:key:managed-new');
+      expect(screen.queryByTestId('identities-row-did:key:managed-old')).not.toBeInTheDocument();
       expect(within(newRow).getByTitle('did:key:managed-new')).toBeInTheDocument();
+      expect(within(newRow).getByTestId('identities-version-count')).toHaveTextContent(
+        '2 versions'
+      );
       expect(within(newRow).getByTestId('identities-origin-managed')).toHaveTextContent(
         'Managed Agent'
       );
       expect(within(newRow).getByTestId('identities-credential-principal')).toHaveTextContent(
         'NITROGEN'
       );
-      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(3);
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
       expect(
         within(screen.getByTestId('identities-row-did:web:caller.example')).getByTestId(
           'identities-origin-external_caller'
         )
       ).toBeInTheDocument();
+    });
+
+    it('lists earlier DIDs as versions with what changed, and sums their usage', async () => {
+      renderWithStats([gpt4o, gpt41]);
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      fireEvent.click(row);
+      expect(screen.getByText('4')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      const newest = screen.getByTestId('identities-version-2');
+      expect(newest).toHaveTextContent('Current');
+      expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
+        'agentIdentity.llmInfo.model: gpt-4o → gpt-4.1'
+      );
+      expect(screen.getByTestId('identities-version-1-changes')).toHaveTextContent(
+        'agentIdentity.llmInfo.model: gpt-4o'
+      );
+      expect(screen.getByTestId('identities-version-1')).not.toHaveTextContent('Current');
+    });
+
+    it('lists a credential rotation inside the DID that kept it', async () => {
+      renderWithStats([managedRotatedFixture]);
+
+      const row = await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`);
+      fireEvent.click(row);
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-2')).toHaveTextContent('Credential rotated');
+      expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
+        'fingerprint_sha256: aa → bb'
+      );
+      expect(screen.getByTestId('identities-version-1-changes')).toHaveTextContent(
+        'fingerprint_sha256: aa'
+      );
+    });
+
+    it('says no rotations are recorded yet for a certificate identity, and nothing for a payload one', async () => {
+      renderWithStats([{ ...managedRotatedFixture, rotations: [] }, managedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+      expect(screen.getByTestId('identities-version-history-empty')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId(`identities-row-${managedFixture.did}`));
+      expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
+    });
+
+    it('opens the surface entry and marks the version for a deep link to an earlier DID', async () => {
+      renderWithStats([gpt4o, gpt41], [], `/identities/${encodeURIComponent(gpt4o.did)}`);
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
+      expect(screen.getByTestId('identities-version-2')).not.toHaveAttribute('data-highlighted');
+    });
+
+    it('keeps an external caller row without versions', async () => {
+      renderWithStats([externalCallerFixture]);
+
+      const row = await screen.findByTestId(`identities-row-${externalCallerFixture.did}`);
+      expect(within(row).queryByTestId('identities-version-count')).not.toBeInTheDocument();
+      fireEvent.click(row);
+      expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
     });
 
     it('gives each parallel managed identity on a surface its own actions', async () => {
@@ -869,7 +899,8 @@ describe('IdentitiesPage', () => {
     });
 
     it('shows a red Revoked badge for an identity whose API key was revoked or deleted', async () => {
-      const revoked = { ...managedOld, revoked: true };
+      // Its own surface, so it is not grouped as a version of managedNew.
+      const revoked = { ...managedOld, surface_id: 'surface-2', revoked: true };
       renderWithStats([revoked, managedNew], [{ config_id: 'surface-1', name: 'OXYGEN' }]);
 
       const revokedRow = await screen.findByTestId('identities-row-did:key:managed-old');
