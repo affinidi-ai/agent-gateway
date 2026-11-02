@@ -1164,9 +1164,9 @@ compares them ([Granted scopes](#granted-scopes)), so a grant the person consent
 narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
 provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
 (a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
-the scopes the grant held. The request is sent and read by the token request every
-credential provider shares, the service tokens' included, with a 30-second timeout and a 64 KiB
-cap on the answer, which must be a `Bearer` token. The rotated tokens are written
+the scopes the grant held. The request is sent and read by `post_token_request`, with a fixed
+30-second timeout and a 64 KiB cap on the answer, which must be a `Bearer` token. The service
+token requests use the same routine, but within `credential_policy.token_request_timeout_secs`. The rotated tokens are written
 under the lock, for the version the claim was made for, before the new access token is sent,
 however late the answer comes, as long as no other call took the claim over. Once the grant is
 written the refresh is done, even if its claim cannot be cleared afterwards. A refresh that

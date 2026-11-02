@@ -34,10 +34,11 @@ changes:
       title: Let operators set the credential provider token request timeout
       description: >-
         The bootstrap [credential_policy] section accepts token_request_timeout_secs, from 1
-        to 120 seconds and 30 by default; 0 or a larger value fails startup. It bounds every
-        token request to a credential provider: service grants, refreshes, the code exchange
-        and the modern consent exchange. A request that runs past it fails and starts the
-        retry backoff. Changing it needs a restart.
+        to 120 seconds and 30 by default; 0 or a larger value fails startup. It bounds the
+        token requests of service grants and their refreshes, the legacy delegated refresh,
+        the legacy code exchange and the modern consent exchange; a grant's connect code
+        exchange and refresh keep a fixed 30 seconds. A service token request that runs past
+        it fails and starts the retry backoff. Changing it needs a restart.
   changed:
     - timestamp: '2026-10-30T22:45:00Z'
       title: Report providers and surfaces that break the credential rules at startup
