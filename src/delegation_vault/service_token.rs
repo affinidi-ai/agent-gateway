@@ -108,12 +108,15 @@ pub enum ServiceTokenError {
     ProviderChanged,
     #[error("credential store unavailable")]
     StoreUnavailable,
+    #[error("credential provider token request failed")]
+    ProviderMisconfigured,
 }
 
 impl ServiceTokenError {
     /// Whether the token endpoint's answer caused it, so the next request for the same key
     /// waits for the retry backoff and a cached token due for renewal is served stale. Local
-    /// failures never do either.
+    /// failures (a missing secret, an unusable signing key or provider setting, a refused
+    /// endpoint, a store error) never do either.
     fn backs_off(self) -> bool {
         matches!(self, Self::TokenRequestFailed | Self::ScopeMismatch)
     }
@@ -315,6 +318,11 @@ async fn token_grant(
             .is_some()
         {
             ServiceTokenError::TokenEndpointRefused
+        } else if error
+            .downcast_ref::<oauth::ProviderMisconfigured>()
+            .is_some()
+        {
+            ServiceTokenError::ProviderMisconfigured
         } else if let Some(error) = error.downcast_ref::<oauth::ProviderSecretError>() {
             match error {
                 oauth::ProviderSecretError::NotFound | oauth::ProviderSecretError::OutsideTenant => {
@@ -2275,12 +2283,82 @@ mod tests {
             ServiceTokenError::TokenEndpointNotHttps,
             ServiceTokenError::ProviderChanged,
             ServiceTokenError::StoreUnavailable,
+            ServiceTokenError::ProviderMisconfigured,
         ] {
             let mut backoff = Backoff::default();
             assert_eq!(backoff.record::<()>(Err(error), now), Err(error));
             assert!(!backoff.holds_back(now), "{error}");
             assert_eq!(backoff.failures, 0, "{error}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_cannot_sign_never_holds_back_the_next_request() {
+        let fixture = Fixture::new().await;
+        fixture
+            .secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "MALFORMED_KEY".into(),
+                secret_id: "MALFORMED_KEY".into(),
+                description: None,
+                value: "not a pem key".into(),
+                secret_type: "General".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                             "jwt_signing_key_secret_ref": "MALFORMED_KEY"}))
+            .await;
+        let now = Utc::now();
+        for attempt in 1..=3 {
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::ProviderMisconfigured)
+            );
+            assert_eq!(
+                fixture
+                    .observed
+                    .value_reads
+                    .load(Ordering::SeqCst),
+                attempt,
+                "attempt {attempt} reached the grant"
+            );
+        }
+        assert!(fixture.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_endpoint_answer_still_holds_back_the_next_request() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                             "jwt_signing_key_secret_ref": "SIGNING_KEY"}))
+            .await;
+        fixture.fail(true);
+        let now = Utc::now();
+        for _ in 0..3 {
+            assert_eq!(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+                    .err(),
+                Some(ServiceTokenError::TokenRequestFailed)
+            );
+        }
+        assert_eq!(fixture.requests().len(), 1);
+        assert_eq!(
+            fixture
+                .observed
+                .value_reads
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

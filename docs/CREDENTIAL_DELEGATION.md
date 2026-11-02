@@ -146,7 +146,8 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   A legacy binding's audit detail then reads `<grant>_stale` (for example
   `client_credentials_stale`) in place of `<grant>_cached` or `<grant>_fresh`, and each use
   logs a warning.
-  A changed provider, a missing secret, a secrets store or vault error, or a token endpoint the
+  A changed provider, a missing secret, a provider setting or signing key the grant cannot use
+  (`ProviderMisconfigured`, reported as a failed token request), a secrets store or vault error, or a token endpoint the
   egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
   of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
   of every secret the provider references (client ID, client secret, signing key,

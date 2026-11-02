@@ -450,10 +450,11 @@ async fn scoped_token_grant(
     let endpoint = validated_token_endpoint(provider, egress)?;
     let resource = match provider.resource.as_deref() {
         Some(resource) => {
-            crate::sts::mcp_profile::canonical_https_url(resource).map_err(|_| anyhow!("Invalid provider resource"))?;
+            crate::sts::mcp_profile::canonical_https_url(resource)
+                .map_err(|_| misconfigured("Invalid provider resource"))?;
             Some(resource)
         }
-        None if refresh_token.is_some() => return Err(anyhow!("Missing refresh resource")),
+        None if refresh_token.is_some() => return Err(misconfigured("Missing refresh resource")),
         None => None,
     };
     let client_id = resolve_secret(
@@ -462,7 +463,7 @@ async fn scoped_token_grant(
         provider
             .client_id_secret_ref
             .as_deref()
-            .ok_or_else(|| anyhow!("Missing provider client"))?,
+            .ok_or_else(|| misconfigured("Missing provider client"))?,
         egress
             .policy
             .tenant_credential_isolation,
@@ -475,7 +476,7 @@ async fn scoped_token_grant(
             provider
                 .client_secret_secret_ref
                 .as_deref()
-                .ok_or_else(|| anyhow!("Missing provider client secret"))?,
+                .ok_or_else(|| misconfigured("Missing provider client secret"))?,
             egress
                 .policy
                 .tenant_credential_isolation,
@@ -520,7 +521,7 @@ pub async fn fetch_jwt_bearer_token(
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
-        .map_err(|e| anyhow!(e))?;
+        .map_err(|e| misconfigured(e.to_string()))?;
     let assertion = signed_assertion(
         provider,
         &claims,
@@ -554,14 +555,14 @@ pub async fn fetch_client_credentials_jwt_auth_token(
         provider
             .client_id_secret_ref
             .as_deref()
-            .ok_or_else(|| anyhow!("Missing provider client"))?,
+            .ok_or_else(|| misconfigured("Missing provider client"))?,
         egress
             .policy
             .tenant_credential_isolation,
     )
     .await?;
     let claims = super::jwt_assertion::client_auth_assertion_claims(provider, &client_id, Utc::now().timestamp())
-        .map_err(|e| anyhow!(e))?;
+        .map_err(|e| misconfigured(e.to_string()))?;
     let assertion = signed_assertion(
         provider,
         &claims,
@@ -599,7 +600,7 @@ async fn signed_assertion(
 ) -> Result<zeroize::Zeroizing<String>> {
     let algorithm = provider
         .jwt_signing_algorithm()
-        .ok_or_else(|| anyhow!("Provider does not sign assertions"))?;
+        .ok_or_else(|| misconfigured("Provider does not sign assertions"))?;
     let key = zeroize::Zeroizing::new(
         resolve_secret(
             provider,
@@ -608,7 +609,7 @@ async fn signed_assertion(
                 .jwt
                 .jwt_signing_key_secret_ref
                 .as_deref()
-                .ok_or_else(|| anyhow!("Missing provider signing key"))?,
+                .ok_or_else(|| misconfigured("Missing provider signing key"))?,
             mode,
         )
         .await?,
@@ -636,7 +637,7 @@ async fn signed_assertion(
         claims,
     )
     .map(zeroize::Zeroizing::new)
-    .map_err(|e| anyhow!(e))
+    .map_err(|e| misconfigured(e.to_string()))
 }
 
 fn validated_token_endpoint<'provider>(
@@ -646,7 +647,7 @@ fn validated_token_endpoint<'provider>(
     let endpoint = provider
         .token_endpoint
         .as_deref()
-        .ok_or_else(|| anyhow!("Missing provider token endpoint"))?;
+        .ok_or_else(|| misconfigured("Missing provider token endpoint"))?;
     egress.check_token_endpoint(&provider.provider_id, endpoint)?;
     Ok(endpoint)
 }
@@ -659,6 +660,16 @@ pub struct TokenEgress {
     pub exact_allowlist: Option<String>,
     /// The bootstrap `[credential_policy]` the token endpoint is held to.
     pub policy: crate::config::credential_policy::CredentialPolicyConfig,
+}
+
+/// A local provider setting or key that the token request cannot use, so the request never
+/// reached the token endpoint.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ProviderMisconfigured(String);
+
+fn misconfigured(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ProviderMisconfigured(reason.into()))
 }
 
 /// The token endpoint resolved to an address the egress policy blocks.

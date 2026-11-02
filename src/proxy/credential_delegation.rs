@@ -2312,7 +2312,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_renewal_injects_the_cached_client_credentials_token_as_stale() {
         let now = Utc::now();
         let mut token = make_token(false, false);
@@ -2320,29 +2320,70 @@ mod tests {
         token.access_token = "cached-service-token".to_string();
         token.created_at = now - Duration::seconds(3400);
         token.expires_at = Some(now + Duration::seconds(200));
-        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::Found(token));
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
         let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
-        // Without a token endpoint the renewal fails without contacting a provider.
-        provider.token_endpoint = None;
-        let providers = MockProviderStore::with_stored(provider);
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        provider.token_endpoint = Some(token_endpoint.clone());
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint),
+            policy: Default::default(),
+        };
 
-        let results = resolve_delegation_credentials(
-            &[make_binding("cp-1")],
-            "sha256:user1",
-            "did:web:agent.example",
-            "ch-1",
-            crate::tenancy::SurfaceTenancy::configured(None),
-            None,
-            &(vault as Arc<dyn DelegationVaultStorage>),
-            &(providers as Arc<dyn CredentialProviderStorage>),
-            &secrets,
-            "https://gw.example.com",
-            false,
-            None,
-            None,
-        )
-        .await;
+        let results = egress
+            .scope(resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
+            ))
+            .await;
 
         assert_eq!(results.len(), 1);
         match &results[0].result {
