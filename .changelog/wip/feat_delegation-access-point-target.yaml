@@ -27,7 +27,10 @@ changes:
         are, and the daily sweep keeps them only while it is served. A save warns of an enabled
         variant that keeps the binding under its own Access Point or Target settings, and a
         variant created from one that holds it does not copy it. No agent-keyed path, legacy or
-        2026-07-28, ever serves such a binding.
+        2026-07-28, ever serves such a binding. The Surface Builder's Credential Delegation
+        element keeps such a binding, and its subject, when the surface is saved, shows it
+        read-only, and asks for an agent identity only beside a binding without external
+        consent.
     - timestamp: '2026-10-30T19:00:00Z'
       title: Send the Access Point's Target its grant in place of the caller's credentials
       description: >-
