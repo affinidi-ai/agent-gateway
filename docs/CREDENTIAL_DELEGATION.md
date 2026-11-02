@@ -625,7 +625,15 @@ of the payload. Response custom metadata is returned to the caller, so it follow
 The gateway does not inject the Access Point's `response_custom_metadata`, but a save still checks
 it as response metadata sent to the caller.
 A custom metadata secret that cannot be sent fails its injection as a secret that does not exist
-does: an MCP request is refused, and an A2A request or response is forwarded without the metadata.
+does, and the outcome depends on the path:
+
+| Path | Outcome |
+| --- | --- |
+| Direct MCP request, and an MCP request a gateway receives over Fabric | `500` "MCP metadata injection failed" |
+| Transit Point request, A2A or MCP | `500` (`MetadataInjectionFailed`) |
+| MCP request a gateway forwards over Fabric | Forwarded without the metadata, and logged |
+| MCP response, direct, Fabric or gateway-to-gateway | `502` "MCP response metadata injection failed" |
+| A2A request, direct or over Fabric, A2A response, A2A stream event | Forwarded without the metadata, and logged |
 
 - A secret or provider of another tenant is always refused.
 - An appliance-wide secret or provider is refused according to the bootstrap
