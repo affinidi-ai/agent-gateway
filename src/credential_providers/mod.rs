@@ -274,6 +274,14 @@ impl StorableEntity for CredentialProvider {
 impl CredentialProvider {
     /// The secret ids this provider reads: client, API key, signing key and certificate.
     pub fn secret_refs(&self) -> Vec<&str> {
+        self.secret_ref_fields()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The secret reference of each field, in the order of [`Self::secret_refs`].
+    fn secret_ref_fields(&self) -> [Option<&str>; 5] {
         [
             self.client_id_secret_ref
                 .as_deref(),
@@ -288,9 +296,34 @@ impl CredentialProvider {
                 .jwt_certificate_secret_ref
                 .as_deref(),
         ]
-        .into_iter()
-        .flatten()
-        .collect()
+    }
+
+    /// Each secret reference, paired with whether `previous` held it in the same field while
+    /// this provider keeps the type and sends it to the same place: the token and
+    /// authorization endpoints, resource, additional parameters and JWT issuer, subject and
+    /// audience.
+    fn secret_refs_kept_from(
+        &self,
+        previous: Option<&Self>,
+    ) -> Vec<(&str, bool)> {
+        let stored = previous
+            .filter(|previous| {
+                self.provider_type == previous.provider_type
+                    && self.token_endpoint == previous.token_endpoint
+                    && self.authorization_endpoint == previous.authorization_endpoint
+                    && self.resource == previous.resource
+                    && self.additional_params == previous.additional_params
+                    && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
+                    && self.jwt.jwt_subject == previous.jwt.jwt_subject
+                    && self.jwt.jwt_audience == previous.jwt.jwt_audience
+            })
+            .map(Self::secret_ref_fields)
+            .unwrap_or_default();
+        self.secret_ref_fields()
+            .into_iter()
+            .zip(stored)
+            .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
+            .collect()
     }
 
     /// Does the provider send the gateway's own credential on a tenant surface from an
@@ -491,6 +524,52 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_is_kept_only_in_its_own_field_while_the_destination_is_unchanged() {
+        let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://idp.example/token", "jwt_signing_key_secret_ref": "KEY",
+            "jwt_certificate_secret_ref": "CERT", "jwt_issuer": "iss", "jwt_subject": "sub",
+            "jwt_audience": "https://idp.example/token",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(stored.secret_refs_kept_from(None), vec![("KEY", false), ("CERT", false)]);
+        let mut renamed = stored.clone();
+        renamed.name = "renamed".into();
+        renamed.jwt.jwt_key_id = Some("kid".into());
+        assert_eq!(renamed.secret_refs_kept_from(Some(&stored)), vec![("KEY", true), ("CERT", true)]);
+
+        let mut swapped = stored.clone();
+        swapped
+            .jwt
+            .jwt_signing_key_secret_ref = Some("CERT".into());
+        swapped
+            .jwt
+            .jwt_certificate_secret_ref = Some("KEY".into());
+        assert_eq!(swapped.secret_refs_kept_from(Some(&stored)), vec![("CERT", false), ("KEY", false)]);
+
+        let redirected: [fn(&mut CredentialProvider); 8] = [
+            |p| p.provider_type = CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+            |p| p.token_endpoint = Some("https://tenant.example/token".into()),
+            |p| p.authorization_endpoint = Some("https://tenant.example/authorize".into()),
+            |p| p.resource = Some("https://tenant.example/".into()),
+            |p| {
+                p.additional_params
+                    .insert("audience".into(), "tenant".into());
+            },
+            |p| p.jwt.jwt_issuer = Some("tenant".into()),
+            |p| p.jwt.jwt_subject = None,
+            |p| p.jwt.jwt_audience = Some("https://tenant.example/token".into()),
+        ];
+        for change in redirected {
+            let mut changed = stored.clone();
+            change(&mut changed);
+            assert_eq!(changed.secret_refs_kept_from(Some(&stored)), vec![("KEY", false), ("CERT", false)]);
+        }
+    }
 
     #[test]
     fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {

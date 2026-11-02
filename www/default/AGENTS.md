@@ -584,7 +584,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 - The secret pickers offer only secrets of the provider's own tenant (`SecretOptions` in
   `SecretSelect.tsx`; the tenant is the loaded provider's `tenant_id`, unknown while creating). A
   stored secret outside that tenant stays selectable with the same labels: "appliance-wide, stops
-  working when enforced" or "another tenant, refused by the gateway".
+  working when enforced" or "another tenant, refused by the gateway". The gateway keeps such a
+  secret on save only in the field that holds it and while the provider's type and destination
+  are unchanged.
 - A Token Endpoint starting with `http://` shows an inline error
   (`credential-provider-token-endpoint-https-error`, field marked invalid) that names the bootstrap
   `credential_policy.insecure_token_endpoints` list for a deliberate http identity provider. It does

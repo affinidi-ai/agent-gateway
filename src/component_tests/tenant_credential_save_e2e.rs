@@ -1,7 +1,9 @@
-//! Saving a tenant surface and reassigning a tenant over the admin API: a new appliance-wide
-//! credential on a tenant surface is refused, one the stored surface already held is kept in
-//! `warn` mode and refused in `enforce` mode, and a reassignment that would give a tenant
-//! resource an appliance-wide credential or another tenant's resource is a conflict.
+//! Saving a tenant surface or credential provider and reassigning a tenant over the admin API:
+//! a new appliance-wide credential on a tenant surface or provider is refused, one the stored
+//! record already held is kept in `warn` mode (on a provider, only while it stays in the same
+//! field and goes to the same destination) and refused in `enforce` mode, and a reassignment
+//! that would give a tenant resource an appliance-wide credential or another tenant's resource
+//! is a conflict.
 
 use serde_json::{Value, json};
 
@@ -11,6 +13,10 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 const STORED_SECRET_SURFACE: &str = "stored-secret-surface";
 const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
+const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
+const STORED_TENANT_JWT_PROVIDER: &str = "stored-tenant-jwt-provider";
+const STORED_TOKEN_ENDPOINT: &str = "https://192.0.2.1/token";
+const TENANT_HOST: &str = "https://203.0.113.7/token";
 const NOT_ACCESSIBLE_SECRET: &str = "Secret reference is not accessible";
 const NOT_ACCESSIBLE_PROVIDER: &str = "Credential provider reference is not accessible";
 
@@ -47,12 +53,13 @@ impl Api {
         &self,
         secret_id: &str,
         tenant: Option<&str>,
+        value: &str,
     ) -> String {
         let (status, body) = self
             .send(
                 self.client
                     .post(self.url("secrets/new"))
-                    .json(&json!({"name": secret_id, "secret_id": secret_id, "value": "v", "tenant_id": tenant})),
+                    .json(&json!({"name": secret_id, "secret_id": secret_id, "value": value, "tenant_id": tenant})),
             )
             .await;
         assert_eq!(status, 201, "{body}");
@@ -176,6 +183,33 @@ impl Api {
         body
     }
 
+    async fn update_provider(
+        &self,
+        id: &str,
+        update: &Value,
+    ) -> (u16, Value) {
+        self.send(
+            self.client
+                .put(self.url(&format!("credential-providers/{id}")))
+                .json(update),
+        )
+        .await
+    }
+
+    async fn stored_provider(
+        &self,
+        id: &str,
+    ) -> Value {
+        let (status, body) = self
+            .send(
+                self.client
+                    .get(self.url(&format!("credential-providers/{id}"))),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
     async fn reassign(
         &self,
         kind: &str,
@@ -205,6 +239,11 @@ fn assert_refused(
 ) {
     assert_eq!(result.0, 400, "{}", result.1);
     assert_eq!(result.1["details"], details, "{}", result.1);
+}
+
+fn assert_provider_refused(result: (u16, Value)) {
+    assert_eq!(result.0, 400, "{}", result.1);
+    assert_eq!(result.1["error"], NOT_ACCESSIBLE_SECRET, "{}", result.1);
 }
 
 fn assert_saved(result: (u16, Value)) {
@@ -237,6 +276,21 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         "client_id_secret_ref": "appliance-client-id", "client_secret_secret_ref": "appliance-client-secret",
         "created_at": now, "updated_at": now
     });
+    let tenant_provider = json!({
+        "id": STORED_TENANT_PROVIDER, "name": STORED_TENANT_PROVIDER, "provider_id": STORED_TENANT_PROVIDER,
+        "tenant_id": "tenant-a", "provider_type": "oauth2_client_credentials",
+        "token_endpoint": STORED_TOKEN_ENDPOINT, "default_scopes": ["read"],
+        "client_id_secret_ref": "appliance-client-id", "client_secret_secret_ref": "appliance-client-secret",
+        "created_at": now, "updated_at": now
+    });
+    let tenant_jwt_provider = json!({
+        "id": STORED_TENANT_JWT_PROVIDER, "name": STORED_TENANT_JWT_PROVIDER,
+        "provider_id": STORED_TENANT_JWT_PROVIDER, "tenant_id": "tenant-a", "provider_type": "oauth2_jwt_bearer",
+        "token_endpoint": STORED_TOKEN_ENDPOINT, "jwt_signing_key_secret_ref": "appliance-signing-key",
+        "jwt_signing_algorithm": "RS256", "jwt_issuer": "gateway@appliance.example",
+        "jwt_subject": "admin@appliance.example", "jwt_audience": STORED_TOKEN_ENDPOINT,
+        "created_at": now, "updated_at": now
+    });
     for (directory, id, record) in [
         (
             &bootstrap
@@ -261,6 +315,20 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
                 .credential_providers,
             STORED_PROVIDER,
             provider,
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .credential_providers,
+            STORED_TENANT_PROVIDER,
+            tenant_provider,
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .credential_providers,
+            STORED_TENANT_JWT_PROVIDER,
+            tenant_jwt_provider,
         ),
     ] {
         std::fs::create_dir_all(directory).unwrap();
@@ -292,16 +360,18 @@ async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
             .replace("127.0.0.1", "localhost"),
         target: harness.mock.url(),
     };
-    for (secret_id, tenant) in [
-        ("appliance-key", None),
-        ("appliance-client-id", None),
-        ("appliance-client-secret", None),
-        ("tenant-key", Some("tenant-a")),
-        ("tenant-client-id", Some("tenant-a")),
-        ("tenant-client-secret", Some("tenant-a")),
+    let signing_key = crate::delegation_vault::jwt_assertion::test_keys::rsa_pkcs8().private_pem;
+    for (secret_id, tenant, value) in [
+        ("appliance-key", None, "v"),
+        ("appliance-client-id", None, "v"),
+        ("appliance-client-secret", None, "v"),
+        ("appliance-signing-key", None, signing_key.as_str()),
+        ("tenant-key", Some("tenant-a"), "v"),
+        ("tenant-client-id", Some("tenant-a"), "v"),
+        ("tenant-client-secret", Some("tenant-a"), "v"),
     ] {
         let uuid = api
-            .secret(secret_id, tenant)
+            .secret(secret_id, tenant, value)
             .await;
         api.secret_uuids
             .insert(secret_id.to_string(), uuid);
@@ -586,4 +656,115 @@ async fn a_reassignment_that_would_cross_tenants_or_give_a_tenant_an_appliance_w
         "tenant-a",
         "the surface stays with its tenant"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_kept_only_while_its_destination_is_unchanged() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+
+    for change in [
+        json!({"token_endpoint": TENANT_HOST}),
+        json!({"authorization_endpoint": "https://203.0.113.7/authorize"}),
+        json!({"resource": "https://203.0.113.7/api"}),
+        json!({"additional_params": {"audience": "https://203.0.113.7/"}}),
+        json!({"provider_type": "oauth2_authorization_code"}),
+        json!({"client_id_secret_ref": "appliance-client-secret", "client_secret_secret_ref": "appliance-client-id"}),
+    ] {
+        assert_provider_refused(
+            api.update_provider(STORED_TENANT_PROVIDER, &change)
+                .await,
+        );
+    }
+    let mut redirected = api
+        .stored_provider(STORED_TENANT_PROVIDER)
+        .await;
+    redirected["token_endpoint"] = json!(TENANT_HOST);
+    assert_provider_refused(
+        api.update_provider(STORED_TENANT_PROVIDER, &redirected)
+            .await,
+    );
+    let stored = api
+        .stored_provider(STORED_TENANT_PROVIDER)
+        .await;
+    assert_eq!(stored["token_endpoint"], STORED_TOKEN_ENDPOINT, "a refused save leaves the provider as it was");
+    assert_eq!(stored["client_secret_secret_ref"], "appliance-client-secret");
+
+    let mut renamed = stored.clone();
+    renamed["name"] = json!("Renamed");
+    renamed["default_scopes"] = json!(["read", "write"]);
+    let (status, body) = api
+        .update_provider(STORED_TENANT_PROVIDER, &renamed)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "Renamed");
+    assert_eq!(body["default_scopes"], json!(["read", "write"]));
+    assert_eq!(body["token_endpoint"], STORED_TOKEN_ENDPOINT);
+    assert_eq!(body["client_secret_secret_ref"], "appliance-client-secret");
+
+    let (status, body) = api
+        .update_provider(
+            STORED_TENANT_PROVIDER,
+            &json!({
+                "token_endpoint": TENANT_HOST,
+                "client_id_secret_ref": "tenant-client-id", "client_secret_secret_ref": "tenant-client-secret"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["token_endpoint"], TENANT_HOST);
+
+    for change in [
+        json!({"token_endpoint": TENANT_HOST}),
+        json!({"jwt_issuer": "tenant@tenant-a.example"}),
+        json!({"jwt_subject": "someone@appliance.example"}),
+        json!({"jwt_audience": TENANT_HOST}),
+    ] {
+        assert_provider_refused(
+            api.update_provider(STORED_TENANT_JWT_PROVIDER, &change)
+                .await,
+        );
+    }
+    let (status, body) = api
+        .update_provider(STORED_TENANT_JWT_PROVIDER, &json!({"name": "Renamed", "jwt_key_id": "key-1"}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "Renamed");
+    assert_eq!(body["jwt_issuer"], "gateway@appliance.example");
+    assert_eq!(body["jwt_signing_key_secret_ref"], "appliance-signing-key");
+
+    let (status, body) = api
+        .send(
+            api.client
+                .post(api.url("credential-providers/validate"))
+                .json(&json!({
+                    "tenant_id": "tenant-a", "provider_type": "oauth2_jwt_bearer",
+                    "token_endpoint": STORED_TOKEN_ENDPOINT, "jwt_signing_key_secret_ref": "appliance-signing-key"
+                })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], NOT_ACCESSIBLE_SECRET, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_refused_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    for provider in [STORED_TENANT_PROVIDER, STORED_TENANT_JWT_PROVIDER] {
+        assert_provider_refused(
+            api.update_provider(provider, &json!({"name": "Renamed"}))
+                .await,
+        );
+        assert_eq!(
+            api.stored_provider(provider)
+                .await["name"],
+            provider
+        );
+    }
+    let (status, body) = api
+        .update_provider(
+            STORED_TENANT_PROVIDER,
+            &json!({"client_id_secret_ref": "tenant-client-id", "client_secret_secret_ref": "tenant-client-secret"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
 }

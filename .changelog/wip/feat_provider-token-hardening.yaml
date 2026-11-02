@@ -54,8 +54,11 @@ changes:
         Creating a credential provider, or changing a secret reference, now answers 400
         "Secret reference is not accessible" unless the secret belongs to the provider's own
         tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
-        applies the same rule to a signing key or certificate. Stored references keep working
-        while credential_policy tenant_credential_isolation is warn.
+        applies the same rule to a signing key or certificate. While credential_policy
+        tenant_credential_isolation is warn, a stored reference is kept only in the field that
+        holds it and while the provider's type, token and authorization endpoints, resource,
+        additional parameters and JWT issuer, subject and audience are unchanged, so a tenant
+        cannot redirect an appliance-wide secret or signing key to its own endpoint.
     - timestamp: '2026-10-30T22:30:00Z'
       title: Refuse new appliance-wide credentials on tenant surfaces when saving
       description: >-

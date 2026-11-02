@@ -71,9 +71,15 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | | `warn` (default) | `enforce` |
 | --- | --- | --- |
 | Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
-| Update that keeps a stored reference | Saved | 400 |
+| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params` and JWT issuer, subject and audience unchanged | Saved | 400 |
 | `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate in another tenant, before the key is read | The same |
 | Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
+
+A stored reference is kept only while it goes where it went before. An update that changes one
+of those settings, or moves a stored reference to another field (a client secret becoming the
+signing key, say), treats every such reference as new and answers 400, so a tenant cannot send
+an appliance-wide secret, or an assertion signed with an appliance-wide key, to an endpoint or
+audience of its choosing.
 
 In `enforce` mode a service token or API key whose secret is outside the provider's tenant
 reports `SecretUnavailable`, and no token request is sent. A cached service token is checked

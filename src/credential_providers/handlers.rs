@@ -143,17 +143,17 @@ async fn validate_consent_strategy(
 }
 
 /// Every reference must name a secret of the provider's own tenant that the caller may use.
-/// A reference already stored on the provider is kept while `mode` is `warn`.
+/// A reference paired with `true`, one the stored provider held in the same field with the
+/// same destination, may still name an appliance-wide secret while `mode` is `warn`.
 async fn validate_secret_references(
     state: &CredentialProviderState,
     tenant_id: Option<&str>,
-    references: &[&str],
-    stored: &[&str],
+    references: &[(&str, bool)],
     mode: RuleMode,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
-    for &secret_id in references {
+    for &(secret_id, kept) in references {
         let secret = state
             .secrets_store
             .get_by_secret_id(secret_id)
@@ -164,10 +164,7 @@ async fn validate_secret_references(
             })?
             .ok_or(ProviderValidationError::SecretNotAccessible)?;
         let own_tenant = secret.tenant_id.as_deref() == tenant_id;
-        if !(own_tenant
-            || !mode.is_enforced()
-                && stored.contains(&secret_id)
-                && can_reference(tenant_id, secret.tenant_id.as_deref()))
+        if !(own_tenant || kept && !mode.is_enforced() && can_reference(tenant_id, secret.tenant_id.as_deref()))
             || !scope_allows_resource(
                 resource_scope(scope),
                 tenant_context(context),
@@ -359,15 +356,10 @@ async fn validate_provider_settings(
 ) -> Result<(), ProviderValidationError> {
     validate_token_endpoint_scheme(egress, previous, provider)?;
     validate_jwt_provider(provider)?;
-    let stored = match previous {
-        Some(previous) => previous.secret_refs(),
-        None => Vec::new(),
-    };
     validate_secret_references(
         state,
         provider.tenant_id.as_deref(),
-        &provider.secret_refs(),
-        &stored,
+        &provider.secret_refs_kept_from(previous),
         egress
             .policy
             .tenant_credential_isolation,
@@ -902,8 +894,8 @@ async fn validate_key_material_request(
         ]
         .into_iter()
         .flatten()
+        .map(|reference| (reference, false))
         .collect::<Vec<_>>(),
-        &[],
         egress
             .policy
             .tenant_credential_isolation,
