@@ -644,16 +644,6 @@ const CREATE_PAGES: LayoutPage[] = [
         ],
     },
     {
-        id: 'oidc-provider-new',
-        route: '/oidc-providers/new',
-        testIds: ['page-oidc-provider-editor'],
-        actions: [
-            'oidc-provider-editor-back-button',
-            'oidc-provider-editor-save-button',
-            'oidc-provider-editor-cancel-button',
-        ],
-    },
-    {
         id: 'notification-new',
         route: '/notifications/new',
         testIds: ['page-notification-editor'],
