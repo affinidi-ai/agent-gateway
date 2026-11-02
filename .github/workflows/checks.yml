@@ -71,11 +71,19 @@ jobs:
           command: check bans licenses sources
 
   fmt:
-    uses: affinidi/pipeline-rust/.github/workflows/fmt.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01
-    with:
-      toolchain: '1.95.0'
-      rustflags: '-D warnings --cfg tracing_unstable'
-      ubuntu-rust-deps: "build-essential libdbus-1-dev libssl-dev libsasl2-dev libsasl2-modules cmake libcurl4-openssl-dev libxml2-dev libxmlsec1-dev xmlsec1 libclang-dev pkg-config protobuf-compiler"
+    name: Rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Rustfmt check
+        run: cargo fmt --all -- --check
 
   rust-scan:
     uses: affinidi/pipeline-security/.github/workflows/rust-scanner.yml@3aeeb2ceac5c60e12ebddf3ae7bdf9cae56c78b5 # main 2026-09-23
