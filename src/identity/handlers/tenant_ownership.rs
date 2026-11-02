@@ -839,7 +839,7 @@ async fn persist_tenant_id(
             let allowlist = crate::egress::bdd_egress_allowlist();
             super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
-                &**store,
+                store.clone(),
                 id,
                 super::surface_grants::Stored::Any,
                 Some(&resource),

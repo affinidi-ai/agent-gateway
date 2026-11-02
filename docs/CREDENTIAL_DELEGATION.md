@@ -780,23 +780,29 @@ servers want the revocation endpoint as the audience of a revocation's assertion
 differ. The secret or key is resolved from the provider's own tenant, or an untenanted secret,
 and never another tenant's. The call goes
 through the pinned Strict egress client, `https` only, without redirects, ignoring any proxy,
-with a 10-second timeout, and its response body is never read or logged. When many grants are
+with a 10-second timeout per request, and its response body is never read or logged. One
+grant's revocation ends within 30 seconds wherever it waits, resolving its client's secret and
+the endpoint's address included; one that takes longer is `unreachable`. When many grants are
 removed at once, at most eight are revoked at a time.
 
 A surface change deletes the grants it removes from the vault while it is saved, which ends
 their release at once, and revokes at the vendor what the vault deleted only once the change is
 saved. When the save fails, or the change is refused because a deletion failed, the deleted
 grants are put back, unrevoked, before the surface's lock is released, so a change that fails
-never costs a person their grant. The deletions, the wait for the save and the revocations run
+never costs a person their grant. A grant that cannot be put back, because the vault refuses
+to store it, is revoked instead, and the log says so at `ERROR`: no copy of it is left, so it
+must not stay valid at the vendor. The deletions, the wait for the save and the revocations run
 on one task of their own. The request waits only for the deletions, never on a vendor, however
 slow or unreachable. A request dropped part way, as when its client disconnects or a proxy
-times it out, stops none of it: a change dropped before its save finished has its grants put
-back, since the gateway cannot tell whether it was saved, and the surface's lock is held until
-they are. Each grant is read and deleted in one step, under the vault's lock, and the copy
+times it out, stops none of it: when a change is dropped before it reported its save, the task
+reads the stored surface again, still under the surface's lock, and revokes the grants when the
+surface stored serves the bindings of the change, since a save can finish after its client is
+gone, and puts them back otherwise. A read that fails counts as saved, so the grants are
+revoked. Each grant is read and deleted in one step, under the vault's lock, and the copy
 deleted is the one revoked, so a grant whose tokens a refresh rotated after the change read it
-has its current tokens revoked. A provider delete deletes its grants, then revokes them within
-the request, since a provider cannot be deleted while bound and so has, at most, grants a
-binding left behind outside the admin API.
+has its current tokens revoked. A provider delete works the same way: it deletes its grants and
+the provider, then revokes the grants once the provider is deleted, and never waits on a
+vendor ([Deleting a provider](#deleting-a-provider)).
 
 Revocations run in the gateway process and are not recorded before they start: a gateway that
 stops while revocations are in flight, as in a deploy, abandons them, and those vendor tokens
@@ -883,8 +889,12 @@ provider. Bindings are read from the surface's stored lists, its own and each va
 surface whose variants cannot be resolved still counts by the providers it names. The answer
 names the binding `surface_id` when the caller may see that surface. Remove the bindings first.
 
-A permitted delete of a provider with an `issuer` deletes every grant made with it first, then
-revokes them, reading only that provider's grants. It answers `503` and keeps the provider when the
+A permitted delete of a provider with an `issuer` deletes every grant made with it, then the
+provider, and answers; the grants are revoked afterwards, on a task of their own, reading only
+that provider's grants. The provider lock is held only while the bindings are checked and the
+grants and the provider deleted, never while a vendor is called, so a vendor that is slow or
+hangs keeps no surface write waiting, of any tenant. A delete dropped part way puts the grants
+back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
 vault cannot list or delete the grants, when the grants stored were written under another
 identity hash pepper, and when one of its grants cannot be read, for example because at-rest
 encryption is now off: it could not be revoked. The answer names that grant. Make it readable
@@ -896,7 +906,8 @@ to another tenant either: the tenant reassignment answers `409`. Its bindings wo
 tenant's provider, and moving it back would serve their grants again. Remove the bindings first.
 Nor can a provider move into a tenant that already has a provider with its `provider_id`
 (`409`), since slugs are unique per tenant. A provider delete or move holds the provider lock
-for its whole check and change, so no surface write binds the provider in between.
+for its whole check and change, so no surface write binds the provider in between; a delete
+releases it before its grants are revoked.
 
 ### Purging grants that cannot be read
 

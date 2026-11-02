@@ -92,9 +92,12 @@ changes:
         subject or provider, moving the surface to another tenant, or disabling the only
         variant that holds the binding, or its transit, deletes the grants of each external
         consent binding the change removes while the change is saved, and revokes at the vendor
-        what it deleted once the change is saved, at most eight at a time, auditing each
-        outcome; a change that fails, is refused or is dropped before its save finished puts
-        them back, unrevoked. Both run on a task of their own, so the change never waits on a
+        what it deleted once the change is saved, at most eight at a time, each within 30
+        seconds, auditing each outcome; a change that fails or is refused puts them back,
+        unrevoked, and a grant that cannot be put back is revoked. A change dropped before it
+        reported its save, as when its client disconnects, is decided by the surface stored,
+        read again under the surface's lock: its grants are revoked when the change was saved,
+        and put back otherwise. Both run on a task of their own, so the change never waits on a
         vendor; a grant whose tokens were rotated meanwhile has its current tokens revoked.
         Revocations in flight when the gateway stops are abandoned. A change
         that adds a binding deletes any grant left under it,
@@ -160,12 +163,14 @@ changes:
         it is being deleted. The dashboard shows the reason and the surface. Only surfaces
         that may reference the provider are considered, and the answer names the surface when
         the caller may see it.
-        Deleting a provider with an issuer deletes each of its grants, then revokes it at the
-        authorization server's RFC 7009 revocation endpoint, the refresh token and then the
-        access token, at most eight grants at a time, through pinned Strict `https` egress, with
-        the client authenticating as its `token_endpoint_auth_method` says. Revocation is best
-        effort and audited as `token_revoked` with its outcome and the caller that deleted the
-        provider; the grant is deleted whatever the outcome.
+        Deleting a provider with an issuer deletes each of its grants and the provider, then
+        revokes each grant at the authorization server's RFC 7009 revocation endpoint, the
+        refresh token and then the access token, at most eight grants at a time, each within 30
+        seconds, through pinned Strict `https` egress, with the client authenticating as its
+        `token_endpoint_auth_method` says. The revocations run after the delete answers and
+        after the provider lock is released, so a slow vendor holds up no surface write.
+        Revocation is best effort and audited as `token_revoked` with its outcome and the caller
+        that deleted the provider; the grant is deleted whatever the outcome.
         Only that provider's grants are read: the provider is kept, with 503 naming the grant,
         while one of them cannot be read, for example because at-rest encryption is off, and
         another provider's unreadable grant never blocks the delete.

@@ -10,12 +10,12 @@
 //! `https`-only egress client, with a short timeout, and no response body is
 //! ever read, echoed or logged. Revocation is best effort: its outcome is
 //! returned, logged and audited with the actor that caused it, and a failed
-//! revocation never keeps a grant that is being removed. [`remove_grants`]
-//! revokes and deletes many grants at most [`REVOCATION_CONCURRENCY`] at a time;
-//! [`delete_then_revoke`] deletes them first, then revokes what the vault
-//! deleted, both on one task of its own, so the change that removed them never
-//! waits on a vendor, and a change dropped part way never leaves a deleted
-//! grant unrevoked.
+//! revocation never keeps a grant that is being removed. One grant's
+//! revocation ends within [`VENDOR_REVOCATION_TIMEOUT`].
+//! [`delete_then_revoke`] deletes many grants first, then revokes what the
+//! vault deleted, at most [`REVOCATION_CONCURRENCY`] at a time, both on one
+//! task of its own, so the change that removed them never waits on a vendor,
+//! and a change dropped part way never leaves a deleted grant unrevoked.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +32,12 @@ use crate::secrets::SecretsStore;
 
 const REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most grants [`remove_grants`] revokes at once.
+/// The longest the revocation of one grant at its vendor may take, its client
+/// credential, the endpoint's resolution and both requests included; one
+/// that takes longer is `unreachable`.
+const VENDOR_REVOCATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most grants [`revoke_removed`] revokes at once.
 pub const REVOCATION_CONCURRENCY: usize = 8;
 
 /// What became of one revocation request.
@@ -198,36 +203,6 @@ fn record_revocation(
     });
 }
 
-/// Delete each of `grants`, then revoke at its authorization server what was
-/// deleted, at most [`REVOCATION_CONCURRENCY`] at a time, through
-/// [`delete_then_revoke`], waiting for the revocations. Each grant's provider
-/// is looked up in `providers` by its record id; a grant whose provider is not
-/// there is deleted without revocation. Dropping the caller stops neither the
-/// deletions nor the revocations, so no grant is left revoked but stored.
-/// Every grant is tried; the call fails if any could not be deleted.
-pub async fn remove_grants(
-    vault: &Arc<dyn DelegationVaultStorage>,
-    grants: Vec<DelegatedGrant>,
-    providers: &HashMap<String, CredentialProvider>,
-    secrets: &Arc<dyn SecretsStore>,
-    exact_allowlist: Option<&str>,
-    actor: Option<&AuditCallerContext>,
-) -> anyhow::Result<()> {
-    let revoker = Revoker {
-        providers: providers.clone(),
-        secrets: Some(Arc::clone(secrets)),
-        exact_allowlist: exact_allowlist.map(str::to_string),
-        actor: actor.cloned(),
-    };
-    let ids = grants
-        .into_iter()
-        .map(|grant| grant.id)
-        .collect();
-    let revocations = delete_then_revoke(vault, ids, revoker, (), None).await?;
-    let _ = revocations.await;
-    Ok(())
-}
-
 /// What revoking removed grants on a task of their own needs: each grant's
 /// provider by its record id, the secrets store, the test allow-list of
 /// fixtures (`None` in production), and the management caller whose change
@@ -240,6 +215,18 @@ pub struct Revoker {
     pub actor: Option<AuditCallerContext>,
 }
 
+/// The outcome of the change that removes grants, as [`delete_then_revoke`]
+/// waits for it.
+pub struct ChangeOutcome {
+    /// Whether the change was saved, sent by its caller once it knows.
+    pub saved: tokio::sync::oneshot::Receiver<bool>,
+    /// Whether the change is stored, read again when the caller was dropped
+    /// before it sent `saved`: a save can finish after its caller is gone.
+    /// It runs while the task still holds its `hold`, so the lock that
+    /// serialises the change covers the read.
+    pub stored: futures::future::BoxFuture<'static, bool>,
+}
+
 /// Delete the grant with each of these record ids from the vault, which ends
 /// its release at once, then revoke what the vault deleted at its
 /// authorization server, at most [`REVOCATION_CONCURRENCY`] at a time,
@@ -250,13 +237,15 @@ pub struct Revoker {
 /// The deletions and the revocations run on one task of their own. The caller
 /// waits only until every deletion has ended, never on a vendor, and dropping
 /// the caller, as a request whose client disconnects is dropped, stops
-/// nothing. With `saved`, the outcome of the change that removes the grants,
-/// the task then waits for it: the grants are revoked once the change was
-/// saved, and put back, unrevoked, when it was not or its caller was dropped
-/// first, so a change that fails never costs a grant. Without it they are
-/// revoked at once. `hold` is dropped once every deletion has ended, or with
-/// `saved` once every grant is put back, so a lock it carries covers them
-/// even when the caller is gone. Every grant is tried; the call fails if any
+/// nothing. With `outcome`, that of the change that removes the grants, the
+/// task then waits for it: the grants are revoked once the change was saved,
+/// and put back, unrevoked, when it was not, so a change that fails never
+/// costs a grant. When the caller was dropped first, the task reads whether
+/// the change is stored ([`ChangeOutcome::stored`]) and decides by that.
+/// Without an outcome they are revoked at once. `hold` is dropped once every
+/// deletion has ended, or with `outcome` once it is known and every grant
+/// put back, so a lock it carries covers them even when the caller is gone,
+/// and never waits on a vendor. Every grant is tried; the call fails if any
 /// could not be deleted, and the change is then refused, which puts back the
 /// ones that were. The returned task ends when every revocation has.
 pub async fn delete_then_revoke<Hold: Send + 'static>(
@@ -264,7 +253,7 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
     grant_ids: Vec<String>,
     revoker: Revoker,
     hold: Hold,
-    saved: Option<tokio::sync::oneshot::Receiver<bool>>,
+    outcome: Option<ChangeOutcome>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let vault = Arc::clone(vault);
     let (report, deletions) = tokio::sync::oneshot::channel();
@@ -283,14 +272,18 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         let refused = failure.is_some();
         // The caller may be gone; what follows goes ahead all the same.
         let _ = report.send(failure);
-        let revoke = match saved {
+        let revoke = match outcome {
             Some(_) if refused => false,
-            Some(saved) => saved.await.unwrap_or(false),
+            Some(ChangeOutcome { saved, stored }) => match saved.await {
+                Ok(saved) => saved,
+                Err(_) => stored.await,
+            },
             None => true,
         };
         if !revoke {
-            put_back(&vault, deleted).await;
+            let lost = put_back(&vault, deleted).await;
             drop(hold);
+            revoke_removed(lost, revoker).await;
             return;
         }
         drop(hold);
@@ -303,24 +296,30 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
     }
 }
 
-/// Store again grants deleted for a change that was not saved. One that cannot
-/// be stored is lost, unrevoked, and logged.
+/// Store again grants deleted for a change that was not saved. Returns those
+/// that could not be stored, each logged, for the caller to revoke: no copy of
+/// them is kept, so they must not stay valid at the vendor.
 async fn put_back(
     vault: &Arc<dyn DelegationVaultStorage>,
     grants: Vec<DelegatedGrant>,
-) {
+) -> Vec<DelegatedGrant> {
+    let mut lost = Vec::new();
     for grant in grants {
-        let id = grant.id.clone();
-        if let Err(error) = vault.store_grant(grant).await {
+        if let Err(error) = vault
+            .store_grant(grant.clone())
+            .await
+        {
             tracing::error!(
                 target: "credential_delegation",
-                grant_id = %id,
+                grant_id = %grant.id,
                 error = ?format!("{error:#}"),
-                "A delegated grant deleted for a surface change that was not saved could not be put back; its \
-                 person must connect again, and it stays valid at the vendor until it expires"
+                "A delegated grant deleted for a change that was not saved could not be put back, so it is revoked; \
+                 its person must connect again"
             );
+            lost.push(grant);
         }
     }
+    lost
 }
 
 /// Revoke grants already removed from the vault, at most
@@ -406,7 +405,20 @@ pub fn record_purge(
     });
 }
 
+/// Revoke `grant` at `provider`'s revocation endpoint, giving up after
+/// [`VENDOR_REVOCATION_TIMEOUT`] wherever it waits.
 async fn revoke(
+    provider: &CredentialProvider,
+    grant: &DelegatedGrant,
+    secrets: Option<&Arc<dyn SecretsStore>>,
+    exact_allowlist: Option<&str>,
+) -> GrantRevocation {
+    tokio::time::timeout(VENDOR_REVOCATION_TIMEOUT, revoke_at_vendor(provider, grant, secrets, exact_allowlist))
+        .await
+        .unwrap_or(GrantRevocation::failed(RevocationOutcome::Unreachable))
+}
+
+async fn revoke_at_vendor(
     provider: &CredentialProvider,
     grant: &DelegatedGrant,
     secrets: Option<&Arc<dyn SecretsStore>>,
@@ -1119,6 +1131,74 @@ pub(crate) mod tests {
         );
     }
 
+    /// A secrets store whose reads never answer.
+    struct HangingSecrets;
+
+    #[async_trait::async_trait]
+    impl SecretsStore for HangingSecrets {
+        async fn create(
+            &self,
+            _request: crate::secrets::CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unreachable!("no secret is created")
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            std::future::pending().await
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            std::future::pending().await
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unreachable!("no secret is updated")
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!("no secret is deleted")
+        }
+
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unreachable!("no secret is searched")
+        }
+    }
+
+    /// A grant's revocation at its vendor ends within a fixed time wherever
+    /// it hangs, here before any request, and is audited as unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn a_revocation_that_hangs_ends_as_unreachable_after_a_fixed_time() {
+        let secrets: Arc<dyn SecretsStore> = Arc::new(HangingSecrets);
+        let confidential = provider(Some("https://203.0.113.10/revoke"), "client_secret_post", Some("client-secret"));
+        let started = tokio::time::Instant::now();
+        let (revocation, events) = crate::audit::producer::capture(async {
+            tokio::time::timeout(
+                Duration::from_secs(600),
+                revoke_grant(&confidential, &grant(true), Some(&secrets), None, None),
+            )
+            .await
+            .expect("the revocation ends")
+        })
+        .await;
+        assert_eq!(revocation, GrantRevocation::failed(RevocationOutcome::Unreachable));
+        assert!(started.elapsed() <= Duration::from_secs(60), "{:?}", started.elapsed());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:unreachable"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_revocation_is_audited_with_its_outcome_and_its_actor() {
         let directory = tempfile::tempdir().unwrap();
@@ -1222,10 +1302,21 @@ pub(crate) mod tests {
         let delay = Duration::from_millis(300);
         let server = RecordingServer::start_with_delay(200, delay).await;
         let (vault, grants) = vault_with(&directory, REVOCATION_CONCURRENCY).await;
-        let providers = HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]);
+        let revoker = Revoker {
+            providers: HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]),
+            secrets: Some(secrets),
+            exact_allowlist: Some(server.origin()),
+            actor: Some(actor()),
+        };
 
         let started = std::time::Instant::now();
-        remove_grants(&vault, grants.clone(), &providers, &secrets, Some(&server.origin()), Some(&actor()))
+        let ids = grants
+            .into_iter()
+            .map(|grant| grant.id)
+            .collect();
+        delete_then_revoke(&vault, ids, revoker, (), None)
+            .await
+            .unwrap()
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -1379,7 +1470,19 @@ pub(crate) mod tests {
         let secrets = secrets_with(&directory, Some("tenant-a")).await;
         let server = RecordingServer::start(200).await;
         let (vault, grants) = vault_with(&directory, 2).await;
-        remove_grants(&vault, grants, &HashMap::new(), &secrets, Some(&server.origin()), None)
+        let revoker = Revoker {
+            providers: HashMap::new(),
+            secrets: Some(secrets),
+            exact_allowlist: Some(server.origin()),
+            actor: None,
+        };
+        let ids = grants
+            .into_iter()
+            .map(|grant| grant.id)
+            .collect();
+        delete_then_revoke(&vault, ids, revoker, (), None)
+            .await
+            .unwrap()
             .await
             .unwrap();
         assert!(server.requests().is_empty());

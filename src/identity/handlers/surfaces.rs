@@ -2102,7 +2102,7 @@ pub async fn create_surface(
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
-        &**store,
+        store.clone(),
         &surface.surface_id,
         super::surface_grants::Stored::Absent,
         Some(&surface),
@@ -3034,7 +3034,7 @@ async fn validate_and_save_surface(
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
-        &**store,
+        store.clone(),
         &surface.surface_id,
         super::surface_grants::Stored::Any,
         Some(&surface),
@@ -3304,7 +3304,7 @@ pub async fn delete_surface(
             let actor = management_actor(&caller, &delegation);
             super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(&state, allowlist.as_deref(), actor.as_ref()),
-                &**store,
+                store.clone(),
                 &surface_id,
                 super::surface_grants::Stored::Any,
                 None,
