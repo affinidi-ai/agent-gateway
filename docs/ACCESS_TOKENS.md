@@ -156,13 +156,18 @@ may not send the appliance's own credential upstream. An appliance-wide secret u
 appliance-wide `api_key`, client-credentials or JWT bearer credential provider used for Target
 authentication or in `outbound_credentials` or `transit_credentials`, are refused with `400` when
 a save adds them, and a tenant credential provider may not reference an appliance-wide secret.
-Another tenant's secret is refused in custom metadata as everywhere else, and so is a new
-`$SECRET:<id>` that names no existing secret, with the same answer, so a tenant can neither
-claim an id before an operator creates it nor tell a missing secret from another tenant's. A
-reference the stored surface or provider already held is kept in the default `warn` mode (on a
-provider, only in the same field and while the provider's type and destination are unchanged;
-on a surface, only while every leg that sends it is one that already sent it and keeps its
-endpoint) and refused once `credential_policy.tenant_credential_isolation` is `enforce` (see
+Another tenant's secret is refused in custom metadata as everywhere else, and so is a
+`$SECRET:<id>` that names no existing secret, new or already stored, with the same answer, so a
+surface save never names an id before a secret with it exists and answers a missing secret and
+another tenant's alike. Deleting a secret does not check the surfaces that name it, so a surface
+stored before the deletion keeps the reference until its next save. Secret ids are one namespace
+across tenants, so
+`POST /v1/secrets/new` with an id that any tenant already uses answers that the secret already
+exists. An appliance-wide reference the stored surface or provider already held is kept in the
+default `warn` mode (on a provider, only in the same field and while the provider's type and
+destination are unchanged; on a surface, only while every destination that sends it already
+sent it: the endpoint of each Target and Transit Point, and the caller for response custom
+metadata) and refused once `credential_policy.tenant_credential_isolation` is `enforce` (see
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#credential-policy)). Appliance-wide
 secrets stay usable for caller authentication, and an appliance-wide
 `oauth2_authorization_code` provider stays usable. See

@@ -2,9 +2,10 @@
 //! a new appliance-wide credential on a tenant surface or provider is refused, one the stored
 //! record already held is kept in `warn` mode (on a provider, only while it stays in the same
 //! field and goes to the same destination; on a surface, only while each Target and Transit
-//! Point that sends it keeps its endpoint) and refused in `enforce` mode, and a reassignment
-//! that would give a tenant resource an appliance-wide credential or another tenant's resource
-//! is a conflict.
+//! Point that sends it keeps its endpoint, and response custom metadata keeps going to the
+//! caller) and refused in `enforce` mode, a custom metadata secret that does not exist is refused
+//! on a tenant surface even when stored, and a reassignment that would give a tenant resource an
+//! appliance-wide credential or another tenant's resource is a conflict.
 
 use serde_json::{Value, json};
 
@@ -14,6 +15,7 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 const STORED_SECRET_SURFACE: &str = "stored-secret-surface";
 const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
 const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
+const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface";
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
 const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
@@ -337,6 +339,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             surface(
                 STORED_METADATA_SURFACE,
                 json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": secret_metadata("appliance-key")}}),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_RESPONSE_METADATA_SURFACE,
+            surface(
+                STORED_RESPONSE_METADATA_SURFACE,
+                json!({"target": {"endpoint": "http://127.0.0.1:9/", "response_custom_metadata": secret_metadata("appliance-key")}}),
             ),
         ),
         (
@@ -996,15 +1008,41 @@ async fn a_custom_metadata_secret_follows_the_tenant_and_a_stored_appliance_wide
     );
     let mut moved = unchanged;
     moved["target"]["response_custom_metadata"] = moved["target"]["custom_metadata"].take();
-    assert_saved(
+    assert_refused(
         api.put(STORED_METADATA_SURFACE, &moved)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+
+    let mut authentication_to_caller = api
+        .stored(STORED_SECRET_SURFACE)
+        .await;
+    authentication_to_caller["target"]["response_custom_metadata"] = secret_metadata("appliance-key");
+    assert_refused(
+        api.put(STORED_SECRET_SURFACE, &authentication_to_caller)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    assert_eq!(
+        api.stored(STORED_SECRET_SURFACE)
+            .await["target"]["response_custom_metadata"],
+        Value::Null,
+        "a refused save leaves the surface as it was"
+    );
+
+    let mut described = api
+        .stored(STORED_RESPONSE_METADATA_SURFACE)
+        .await;
+    described["description"] = json!("an unrelated edit");
+    assert_saved(
+        api.put(STORED_RESPONSE_METADATA_SURFACE, &described)
             .await,
     );
     assert_eq!(
-        api.stored(STORED_METADATA_SURFACE)
+        api.stored(STORED_RESPONSE_METADATA_SURFACE)
             .await["target"]["response_custom_metadata"],
         secret_metadata("appliance-key"),
-        "the Target's request and response metadata are one leg"
+        "a stored response metadata secret is kept on its own destination"
     );
 }
 
@@ -1026,6 +1064,16 @@ async fn a_stored_appliance_wide_custom_metadata_secret_is_refused_when_enforced
     assert_saved(
         api.put(STORED_METADATA_SURFACE, &fixed)
             .await,
+    );
+
+    let mut described = api
+        .stored(STORED_RESPONSE_METADATA_SURFACE)
+        .await;
+    described["description"] = json!("an unrelated edit");
+    assert_refused(
+        api.put(STORED_RESPONSE_METADATA_SURFACE, &described)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
     );
 }
 
@@ -1089,20 +1137,19 @@ async fn a_surface_with_no_tenant_names_any_metadata_secret_until_it_is_given_a_
     assert_eq!(body["tenant_id"], "tenant-b", "{body}");
 }
 
-async fn assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(api: &Api) {
+async fn assert_a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused(api: &Api) {
     let unchanged = api
         .stored(STORED_DANGLING_METADATA_SURFACE)
         .await;
     let mut described = unchanged.clone();
     described["description"] = json!("an unrelated edit");
-    assert_saved(
+    assert_refused(
         api.put(STORED_DANGLING_METADATA_SURFACE, &described)
             .await,
+        NOT_ACCESSIBLE_SECRET,
     );
-    let mut redirected = unchanged;
-    redirected["target"]["endpoint"] = json!(api.target);
     assert_refused(
-        api.put(STORED_DANGLING_METADATA_SURFACE, &redirected)
+        api.put(STORED_DANGLING_METADATA_SURFACE, &unchanged)
             .await,
         NOT_ACCESSIBLE_SECRET,
     );
@@ -1124,15 +1171,15 @@ async fn assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(api: &A
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_missing_metadata_secret_is_kept_only_on_its_leg_in_warn_mode() {
+async fn a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused_in_warn_mode() {
     let (_harness, api) = harness(RuleMode::Warn).await;
-    assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(&api).await;
+    assert_a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused(&api).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_missing_metadata_secret_is_kept_only_on_its_leg_in_enforce_mode() {
+async fn a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused_in_enforce_mode() {
     let (_harness, api) = harness(RuleMode::Enforce).await;
-    assert_a_stored_missing_metadata_secret_is_kept_only_on_its_leg(&api).await;
+    assert_a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused(&api).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1151,4 +1198,37 @@ async fn a_tenant_surface_cannot_claim_a_metadata_secret_before_it_is_created_ap
     api.secret("stripe-live", None, "v")
         .await;
     assert_refused(api.create(&squatter).await, NOT_ACCESSIBLE_SECRET);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_surface_cannot_keep_a_metadata_secret_its_tenant_deleted() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let uuid = api
+        .secret("squatted-id", Some("tenant-a"), "v")
+        .await;
+    let squatter = with_metadata(&api, "/smoke/deleted-squatter", Some("tenant-a"), METADATA_PLACES[0], "squatted-id");
+    let surface_id = api
+        .created_id(&squatter)
+        .await;
+    let (status, body) = api
+        .send(
+            api.client
+                .delete(api.url(&format!("secrets/{uuid}"))),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+
+    let stored = api.stored(&surface_id).await;
+    assert_refused(
+        api.put(&surface_id, &stored)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    let mut described = stored;
+    described["description"] = json!("an unrelated edit");
+    assert_refused(
+        api.put(&surface_id, &described)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
 }

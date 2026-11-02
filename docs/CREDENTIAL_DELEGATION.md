@@ -623,7 +623,7 @@ in custom metadata: the Target's `custom_metadata` and `response_custom_metadata
 Point's `response_custom_metadata` and the Transit Points' shared `custom_metadata`, at any depth
 of the payload. Response custom metadata is returned to the caller, so it follows the same rule.
 The gateway does not inject the Access Point's `response_custom_metadata`, but a save still checks
-it as part of the Target's leg.
+it as response metadata sent to the caller.
 A custom metadata secret that cannot be sent fails its injection as a secret that does not exist
 does: an MCP request is refused, and an A2A request or response is forwarded without the metadata.
 
@@ -646,11 +646,19 @@ is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept
 legs that already sent it and only while each keeps its endpoint: the Target of the base
 surface or of a variant, or a Transit Point, identified by the variant's and the Transit Point's
 `id`, so renaming or reordering them keeps it. Surface `outbound_credentials` are sent on the
-Target and every Transit Point. A secret in the Target's custom metadata or in either response
-custom metadata belongs to the Target's leg, and one in the shared transit custom metadata to
-every Transit Point. On a tenant surface a new `$SECRET:` that names no existing secret is
-refused like another tenant's secret; one the stored surface already sent is kept on its leg
-under the same rule and fails when the metadata is injected. A save that changes such a leg's
+Target and every Transit Point. A secret in the Target's custom metadata belongs to the Target's
+leg, and one in the shared transit custom metadata to every Transit Point. A secret in either
+response custom metadata goes to the caller, a destination of its own for the base surface and
+for each variant, so a secret the Target leg already sent as Target authentication or request
+metadata is not kept when it is moved or copied into response metadata, while one already stored
+in response metadata is kept there when the Target's endpoint changes. Only enabled custom
+metadata counts as already sent, so enabling stored metadata is checked as a new reference; a
+save still checks every reference in disabled metadata. On a tenant surface a `$SECRET:` that
+names no existing secret is refused like another tenant's secret, whether it is new or already
+stored, in `warn` mode too, so a save never keeps a reference to a secret that was deleted.
+Deleting a secret does not check the surfaces that name it, so a surface stored before the
+deletion keeps the reference until its next save. A surface with no tenant may still name a
+missing secret. A save that changes such a leg's
 endpoint, moves the reference to another leg, or adds a leg that would send it is refused with
 `400` in `warn` mode too. A tenant reassignment that would create such a reference answers
 `409`, and so does giving a surface whose custom metadata names a missing secret a different
