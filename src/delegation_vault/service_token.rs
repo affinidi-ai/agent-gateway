@@ -436,9 +436,10 @@ fn backoff_delay(failures: u32) -> chrono::Duration {
 }
 
 /// The vault user identity of the provider's token for `scopes`: `<purpose>:` and the hex
-/// SHA-256 of the provider digest, the sorted scopes and each referenced secret's id, tenant
-/// and `updated_at`. Only the referenced secrets are read, one lookup each per request (and
-/// decrypted when encryption at rest is on); the store is never listed.
+/// SHA-256 of the provider digest, the sorted scopes and the id, tenant and `updated_at` of
+/// each secret its type uses ([`CredentialProvider::service_token_secret_refs`]). Only those
+/// secrets are read, one lookup each per request (and decrypted when encryption at rest is
+/// on); the store is never listed.
 /// A missing secret, or one outside the provider's tenant while `isolation` is enforced, is
 /// refused here, so a cached token stops being served at once. Under `warn` the grant itself
 /// logs the out-of-tenant secret, once per token request.
@@ -450,7 +451,7 @@ async fn cache_identity(
     isolation: RuleMode,
 ) -> Result<String, ServiceTokenError> {
     let mut versions = Vec::new();
-    for secret_ref in provider.secret_refs() {
+    for secret_ref in provider.service_token_secret_refs() {
         let secret = secrets
             .get_by_secret_id(secret_ref)
             .await
@@ -862,6 +863,30 @@ mod tests {
                 .find(|secret| secret.secret_id == secret_ref)
                 .unwrap()
                 .id
+        }
+
+        async fn rotate(
+            &self,
+            secret_ref: &str,
+            value: &str,
+        ) {
+            let id = self
+                .secret_id(secret_ref)
+                .await;
+            self.secrets
+                .update(
+                    &id,
+                    crate::secrets::UpdateSecretRequest {
+                        name: None,
+                        description: None,
+                        value: Some(value.into()),
+                        update_value: Some(true),
+                        secret_type: None,
+                        tags: None,
+                    },
+                )
+                .await
+                .unwrap();
         }
 
         async fn grant_slot(
@@ -1705,6 +1730,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reference_the_provider_type_does_not_use_is_neither_read_nor_part_of_the_key() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
+                             "client_secret_secret_ref": "CLIENT_SECRET", "api_key_secret_ref": "API_KEY",
+                             "jwt_signing_key_secret_ref": "SIGNING_KEY"}))
+            .await;
+        let now = Utc::now();
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        let key = fixture
+            .only_stored()
+            .await
+            .user_identity_hash;
+        fixture
+            .rotate("API_KEY", "rotated-key")
+            .await;
+        let api_key = fixture
+            .secret_id("API_KEY")
+            .await;
+        fixture
+            .secrets
+            .delete(&api_key)
+            .await
+            .unwrap();
+        fixture
+            .rotate("SIGNING_KEY", "rotated-signing-key")
+            .await;
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Cached)
+        );
+        assert_eq!(fixture.requests().len(), 1);
+        assert!(
+            fixture
+                .lookups()
+                .iter()
+                .all(|secret_ref| secret_ref == "CLIENT_ID" || secret_ref == "CLIENT_SECRET"),
+            "{:?}",
+            fixture.lookups()
+        );
+        fixture
+            .rotate("CLIENT_ID", "rotated-client")
+            .await;
+        fixture.respond(json!({"access_token": "after-rotation", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("after-rotation".into(), Freshness::Fresh)
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["client_id"], "rotated-client");
+        let mut keys: Vec<String> = fixture
+            .stored()
+            .await
+            .into_iter()
+            .map(|token| token.user_identity_hash)
+            .collect();
+        keys.retain(|stored| *stored != key);
+        assert_eq!(keys.len(), 1, "the used secret's rotation keys a new token");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotating_a_referenced_secret_requests_a_new_token() {
         let fixture = Fixture::new().await;
         let provider = fixture
@@ -1716,24 +1818,9 @@ mod tests {
                 .acquire(&provider, &["read"], now)
                 .await,
         );
-        let client_secret = fixture
-            .secret_id("CLIENT_SECRET")
-            .await;
         fixture
-            .secrets
-            .update(
-                &client_secret,
-                crate::secrets::UpdateSecretRequest {
-                    name: None,
-                    description: None,
-                    value: Some("rotated-secret".into()),
-                    update_value: Some(true),
-                    secret_type: None,
-                    tags: None,
-                },
-            )
-            .await
-            .unwrap();
+            .rotate("CLIENT_SECRET", "rotated-secret")
+            .await;
         fixture.respond(json!({"access_token": "after-rotation", "token_type": "Bearer", "expires_in": 3600}));
         assert_eq!(
             issued(

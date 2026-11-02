@@ -345,6 +345,25 @@ impl CredentialProvider {
             .collect()
     }
 
+    /// The secret ids a service token of this provider's type reads: the API key; the client
+    /// ID and secret; a JWT Bearer grant's signing key and certificate; or the client ID,
+    /// signing key and certificate of a client authenticating with a JWT. A reference left
+    /// from another type is not among them, and an authorization code provider issues no
+    /// service token.
+    pub fn service_token_secret_refs(&self) -> Vec<&str> {
+        let [client_id, client_secret, api_key, signing_key, certificate] = self.secret_ref_fields();
+        match self.provider_type {
+            CredentialProviderType::ApiKey => vec![api_key],
+            CredentialProviderType::OAuth2ClientCredentials => vec![client_id, client_secret],
+            CredentialProviderType::OAuth2JwtBearer => vec![signing_key, certificate],
+            CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![client_id, signing_key, certificate],
+            CredentialProviderType::OAuth2AuthorizationCode => Vec::new(),
+        }
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// The secret reference of each field, in the order of [`Self::secret_refs`].
     fn secret_ref_fields(&self) -> [Option<&str>; 5] {
         [
@@ -693,6 +712,31 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
+        let provider = |provider_type: &str, certificate: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET", "api_key_secret_ref": "KEY",
+                "jwt_signing_key_secret_ref": "SIGNING", "jwt_certificate_secret_ref": certificate,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for (provider_type, certificate, expected) in [
+            ("api_key", Some("CERT"), vec!["KEY"]),
+            ("oauth2_client_credentials", Some("CERT"), vec!["ID", "SECRET"]),
+            ("oauth2_jwt_bearer", Some("CERT"), vec!["SIGNING", "CERT"]),
+            ("oauth2_jwt_bearer", None, vec!["SIGNING"]),
+            ("oauth2_client_credentials_jwt_auth", Some("CERT"), vec!["ID", "SIGNING", "CERT"]),
+            ("oauth2_authorization_code", Some("CERT"), vec![]),
+        ] {
+            let provider = provider(provider_type, certificate);
+            assert_eq!(provider.service_token_secret_refs(), expected, "{provider_type}");
+            assert_eq!(provider.secret_refs().len(), 4 + usize::from(certificate.is_some()), "{provider_type}");
+        }
+    }
 
     #[test]
     fn an_external_provider_uses_its_own_tenants_secrets_only_and_any_other_may_also_use_untenanted_ones() {

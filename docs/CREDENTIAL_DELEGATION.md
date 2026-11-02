@@ -154,12 +154,16 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   (`ProviderMisconfigured`, reported as a failed token request), a secrets store or vault error, or a token endpoint the
   egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
   of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
-  of every secret the provider references (client ID, client secret, signing key,
-  certificate). Editing the provider, rotating one of its secrets or moving a secret to another
-  tenant therefore requests a new token instead of reusing one issued under the old settings.
-  Each use looks up only the secrets the provider references, one read each (decrypted when
+  of each secret the provider's type sends: the client ID and secret of `oauth2_client_credentials`,
+  the signing key and certificate of `oauth2_jwt_bearer`, and the client ID, signing key and
+  certificate of `oauth2_client_credentials_jwt_auth`. Editing the provider, rotating one of
+  those secrets or moving one to another tenant therefore requests a new token instead of
+  reusing one issued under the old settings. A reference the type does not send, such as an
+  `api_key_secret_ref` kept after a provider changed from `api_key`, is neither read nor part of
+  the key, so rotating or deleting its secret changes nothing.
+  Each use looks up only those secrets, one read each (decrypted when
   encryption at rest is on), and a token request reads each secret it sends once more by its
-  id; neither lists the secrets store. A referenced secret that no longer exists reports
+  id; neither lists the secrets store. A secret the type sends that no longer exists reports
   `SecretUnavailable` and a secrets store error `StoreUnavailable`; neither serves the cached
   token nor sends a request.
 - After a new token is stored, the expired tokens of the same agent, provider and purpose
@@ -187,7 +191,7 @@ After a token request fails, or its issued scopes do not match (`TokenRequestFai
 versions) waits 1 second from the end of the failed request, doubling after each further failure
 up to 60 seconds. A request arriving before then fails at once with `TokenRequestFailed`, without
 contacting the provider. A successful request clears the wait, and editing the provider or
-rotating a referenced secret starts a new key with no wait. Failures found before any request is sent never start a wait: a
+rotating a secret the provider's type sends starts a new key with no wait. Failures found before any request is sent never start a wait: a
 missing or refused secret (`SecretUnavailable`), a secrets store or vault error
 (`StoreUnavailable`), a token endpoint the egress or https rule refuses (`TokenEndpointRefused`,
 `TokenEndpointNotHttps`), a provider changed during the request (`ProviderChanged`) or an
