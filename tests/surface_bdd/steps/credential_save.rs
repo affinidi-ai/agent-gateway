@@ -29,7 +29,7 @@ async fn create_secret(
 ) {
     let body = json!({"name": secret_id, "secret_id": secret_id, "value": "bdd-secret-value", "tenant_id": tenant});
     let response = send(world, Method::POST, "/v1/secrets/new", Some(&body)).await;
-    assert_eq!(response.status, 201, "creating secret {secret_id}: {}", response.body);
+    assert_eq!(response.status, 201, "creating a secret for tenant {tenant:?}: {}", response.body);
 }
 
 async fn create_provider(
