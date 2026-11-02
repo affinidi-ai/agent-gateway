@@ -1759,6 +1759,7 @@ pub async fn run_outbound_port_server(
                 gateway_base_url: get_gateway_base_url(),
                 task_monitor: task_monitor.clone(),
                 max_response_bytes: config.a2a.max_body_size,
+                egress_allowlist: crate::egress::bdd_egress_allowlist(),
                 vc_alias_override: vc
                     .listen_path
                     .as_ref()

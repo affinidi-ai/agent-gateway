@@ -56,6 +56,16 @@ pub struct NetworkConfig {
     #[serde(default = "default_oauth_callback_route")]
     pub oauth_callback_route: String,
 
+    /// The resource origins permitted, beyond the issuer's own host and its
+    /// subdomains, for the credential providers of external consent of each
+    /// issuer: an issuer origin, such as `https://accounts.google.com`, maps to
+    /// the resource origins its providers may name, such as
+    /// `https://www.googleapis.com`. Only this file sets it; no tenant or API
+    /// caller can add to it. An entry that is not an `https` origin permits
+    /// nothing and is named at startup.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub external_consent_resource_origins: HashMap<String, Vec<String>>,
+
     /// Logging overrides (only redaction rules are used from gateway.json;
     /// level/json/log_directory come from config.toml)
     #[serde(default)]

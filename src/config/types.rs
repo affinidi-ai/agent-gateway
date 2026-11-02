@@ -3010,6 +3010,13 @@ pub struct BootstrapConfig {
     /// `gateway.json` takes this value instead of the file's.
     #[serde(skip)]
     pub pinned_transit_token_max_lifetime_secs: Option<u64>,
+
+    /// `gateway.json`'s `external_consent_resource_origins` as the gateway
+    /// started with it ([`Self::pin_external_consent_resource_origins`]).
+    /// Every later load of `gateway.json` takes this value instead of the
+    /// file's.
+    #[serde(skip)]
+    pub pinned_external_consent_resource_origins: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// DID document cache configuration

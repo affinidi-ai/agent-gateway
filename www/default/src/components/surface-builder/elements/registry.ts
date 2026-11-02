@@ -704,10 +704,10 @@ class ElementRegistry {
     // Auto-hydrate transit-config (`transit.shared.*`) when meaningful
     // fields are present on the payload (e.g. surface authored via the
     // JSON tab, an import, or another tool). The transit-config
-    // helper deliberately ignores the harmless `sign_requests` /
-    // `transit_token_mode` defaults that the TP factory writes
-    // unconditionally — otherwise every surface with a TP would
-    // sprout a "Transit Settings" node on its canvas. The canvas blob
+    // helper deliberately ignores the `transit_token_mode` default
+    // that the TP factory writes unconditionally; otherwise every
+    // surface with a TP would sprout a "Transit Settings" node on its
+    // canvas. The canvas blob
     // layer below still wins for round-trips that previously saved a
     // transit-config node (preserving its layout and any UI-only
     // fields).

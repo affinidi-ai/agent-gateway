@@ -534,7 +534,6 @@ impl AgentSurfaceFixture {
             if !transit.is_object() {
                 transit = serde_json::json!({});
             }
-            transit["sign_requests"] = serde_json::json!(true);
             transit["transit_token_mode"] = serde_json::json!("embedded");
             transit["points"] = serde_json::json!(transit_points_json);
             surface["transit"] = transit;

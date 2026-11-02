@@ -9,12 +9,31 @@ import { DeleteButton } from '../../components/shared/DeleteButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
+import { formatApiError } from '../../utils/apiError';
 import {
   CredentialProviderType,
   PROVIDER_TYPE_LABELS,
   entraRejectsResource,
   entraResourceMessage,
 } from '../EditCredentialProviderPage/credentialProviderForm';
+
+/**
+ * Why a delete failed, from the API's answer: its `error`, the surface a `409`
+ * names as binding the provider, and the status. `statusText` is empty over
+ * HTTP/2, so it is only the last resort.
+ */
+export function providerDeleteError(status: number, body: string, statusText: string): string {
+  let surfaceId: unknown;
+  try {
+    surfaceId = JSON.parse(body)?.surface_id;
+  } catch {
+    surfaceId = undefined;
+  }
+  const message = formatApiError(undefined, body, statusText);
+  const named =
+    typeof surfaceId === 'string' && surfaceId ? `${message} (surface ${surfaceId})` : message;
+  return `${named} (${status})`;
+}
 
 interface CredentialProviderListItem {
   id: string;
@@ -87,7 +106,8 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
         { method: 'DELETE' }
       );
       if (!response.ok) {
-        throw new Error(`Delete failed: ${response.statusText}`);
+        const body = await response.text();
+        throw new Error(providerDeleteError(response.status, body, response.statusText));
       }
       setProviders(prev => prev.filter(p => p.id !== provider.id));
     } catch (e: any) {

@@ -20,16 +20,8 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
     c.outbound_listen_address = t.outbound_listen_address;
     any = true;
   }
-  if (t.transit_token_mode) {
-    c.transit_token_mode = t.transit_token_mode;
-  } else {
-    c.transit_token_mode = 'embedded';
-  }
-  if (t.sign_requests !== undefined) {
-    c.sign_requests = !!t.sign_requests;
-  } else {
-    c.sign_requests = true;
-  }
+  // Only embedded tokens exist, so every save sends `embedded`.
+  c.transit_token_mode = 'embedded';
   if (t.transit_policy?.policy_definition_id) {
     c.transit_policy_definition_id = t.transit_policy.policy_definition_id;
     any = true;
@@ -60,8 +52,8 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
 
 /**
  * Transit Config — surface-wide settings shared by all transit points.
- * Owns the `transit.shared.*` fields (token mode, transit policy, signing,
- * workload binding, response extension rules). Each setting is written to
+ * Owns the `transit.shared.*` fields (token mode, transit policy, workload
+ * binding, response extension rules). Each setting is written to
  * its own dot-notation path so it deep-merges over the transit-point
  * coordinator's defaults.
  */
@@ -92,13 +84,11 @@ export const transitConfigDefinition: NodeDefinition = {
   ConfigPanel: TransitConfigPanel,
   defaultConfig: () => ({
     transit_token_mode: 'embedded',
-    sign_requests: true,
   }),
   summary: c => {
     if (!c) return null;
     const bits: string[] = [];
     if (c.transit_token_mode) bits.push(`token: ${c.transit_token_mode}`);
-    if (c.sign_requests === false) bits.push('unsigned');
     if (c.transit_policy_definition_id) bits.push('policy');
     return bits.length > 0 ? bits.join(' · ') : null;
   },
@@ -113,12 +103,7 @@ export const transitConfigDefinition: NodeDefinition = {
         value: c.outbound_listen_address.trim(),
       });
     }
-    if (c.transit_token_mode) {
-      slices.push({ path: 'transit.transit_token_mode', value: c.transit_token_mode });
-    }
-    if (c.sign_requests !== undefined) {
-      slices.push({ path: 'transit.sign_requests', value: !!c.sign_requests });
-    }
+    slices.push({ path: 'transit.transit_token_mode', value: 'embedded' });
     if (c.transit_policy_definition_id) {
       slices.push({
         path: 'transit.transit_policy',

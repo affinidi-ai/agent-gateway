@@ -34,7 +34,6 @@
       }
     },
     "transit": {
-      "sign_requests": true,
       "transit_token_mode": "embedded",
       "points": [
         {

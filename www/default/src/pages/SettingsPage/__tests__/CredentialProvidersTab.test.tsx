@@ -2,7 +2,7 @@ import React from 'react';
 import { render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
-import CredentialProvidersTab from '../CredentialProvidersTab';
+import CredentialProvidersTab, { providerDeleteError } from '../CredentialProvidersTab';
 import { apiClient } from '../../../api';
 
 jest.mock('../../../api', () => ({
@@ -51,5 +51,20 @@ describe('CredentialProvidersTab', () => {
     const badge = within(flagged).getByTestId('credential-provider-entra-resource-badge');
     expect(badge).toHaveAttribute('title', expect.stringContaining('AADSTS901002'));
     expect(screen.getAllByTestId('credential-provider-entra-resource-badge')).toHaveLength(1);
+  });
+
+  it('says why a delete was refused, naming the surface that binds the provider', () => {
+    const body = JSON.stringify({
+      error: 'The credential provider is bound by an agent surface; remove the binding first',
+      code: 'provider_in_use',
+      surface_id: 'billing-agent',
+    });
+    expect(providerDeleteError(409, body, '')).toBe(
+      'The credential provider is bound by an agent surface; remove the binding first (surface billing-agent) (409)'
+    );
+    expect(
+      providerDeleteError(503, JSON.stringify({ error: 'The vault is unavailable' }), '')
+    ).toBe('The vault is unavailable (503)');
+    expect(providerDeleteError(500, '', '')).toBe('Request failed (500)');
   });
 });

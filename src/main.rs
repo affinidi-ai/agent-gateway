@@ -1453,6 +1453,7 @@ fn render_default_bootstrap_toml(
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,
         pinned_transit_token_max_lifetime_secs: None,
+        pinned_external_consent_resource_origins: None,
     };
     let toml_str = toml::to_string_pretty(&config)?;
     Ok(toml_str)

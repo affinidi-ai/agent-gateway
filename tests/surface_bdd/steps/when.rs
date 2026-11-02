@@ -1423,8 +1423,26 @@ pub(crate) async fn set_transit_token_lifetime(
     world: &mut SurfaceWorld,
     lifetime_secs: u64,
 ) {
+    set_surface_transit_field(world, "transit_token_lifetime_secs", serde_json::json!(lifetime_secs)).await;
+}
+
+#[when(expr = "the operator sets the surface's transit token mode to {string}")]
+async fn operator_sets_the_transit_token_mode(
+    world: &mut SurfaceWorld,
+    mode: String,
+) {
+    set_surface_transit_field(world, "transit_token_mode", serde_json::json!(mode)).await;
+}
+
+/// Save the surface with `transit.<field>` set to `value` through the admin
+/// API, and record its answer.
+async fn set_surface_transit_field(
+    world: &mut SurfaceWorld,
+    field: &str,
+    value: serde_json::Value,
+) {
     ensure_admin_session(world).await;
-    let surface_id = get_tracked_surface_id(world, "setting the transit token lifetime");
+    let surface_id = get_tracked_surface_id(world, "setting a transit setting");
     let client = world
         .admin_client
         .as_ref()
@@ -1432,21 +1450,121 @@ pub(crate) async fn set_transit_token_lifetime(
     let current = client
         .get_surface_recorded(&surface_id)
         .await
-        .unwrap_or_else(|error| panic!("fetch surface before setting the transit token lifetime: {error}"));
+        .unwrap_or_else(|error| panic!("fetch surface before setting transit.{field}: {error}"));
     assert_eq!(
         current.status, 200,
-        "fetch surface before setting the transit token lifetime should succeed, got status {} body {}",
+        "fetch surface before setting transit.{field} should succeed, got status {} body {}",
         current.status, current.body
     );
 
     let mut payload = current.body;
-    payload["transit"]["transit_token_lifetime_secs"] = serde_json::json!(lifetime_secs);
+    payload["transit"][field] = value;
     let response = client
         .update_surface_recorded(&surface_id, &payload)
         .await
-        .unwrap_or_else(|error| panic!("set the transit token lifetime through admin API: {error}"));
+        .unwrap_or_else(|error| panic!("set transit.{field} through admin API: {error}"));
 
     record_admin_response(world, response);
+}
+
+#[when(
+    expr = "the operator asks Transit Point {string} for grants of credential provider {string} by external consent"
+)]
+async fn operator_asks_a_transit_point_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: String,
+    provider: String,
+) {
+    let (surface_id, payload) = surface_asking_for_external_consent(world, &alias, &provider).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("ask a Transit Point for external consent through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
+#[when(
+    expr = "the operator creates a copy of the surface whose Transit Point {string} asks credential provider {string} for grants by external consent"
+)]
+async fn operator_creates_a_surface_asking_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: String,
+    provider: String,
+) {
+    let (surface_id, mut payload) = surface_asking_for_external_consent(world, &alias, &provider).await;
+    payload["surface_id"] = serde_json::json!(format!("{surface_id}-external-consent"));
+    payload["name"] = serde_json::json!("external consent copy");
+    let route = payload["access_point"]["route"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    payload["access_point"]["route"] = serde_json::json!(format!("{route}-external-consent"));
+    for point in payload["transit"]["points"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(listen_path) = point["listen_path"]
+            .as_str()
+            .map(str::to_string)
+        {
+            point["listen_path"] = serde_json::json!(format!("{listen_path}-external-consent"));
+        }
+    }
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .create_surface_recorded(&payload)
+        .await
+        .unwrap_or_else(|error| panic!("create a surface asking for external consent through admin API: {error}"));
+
+    world.admin_response = Some(response);
+}
+
+/// The tracked surface, as the admin API returns it, with no surface-level
+/// `outbound_credentials` and Transit Point `alias` binding `provider` by
+/// external consent for its owner.
+async fn surface_asking_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: &str,
+    provider: &str,
+) -> (String, serde_json::Value) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "asking a Transit Point for external consent");
+    let current = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before asking for external consent: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before asking for external consent should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["outbound_credentials"] = serde_json::json!([]);
+    let point = payload["transit"]["points"]
+        .as_array_mut()
+        .and_then(|points| {
+            points
+                .iter_mut()
+                .find(|point| point["alias"] == alias)
+        })
+        .unwrap_or_else(|| panic!("Transit Point {alias} must exist"));
+    point["transit_credentials"] = serde_json::json!({
+        "credential_provider_id": provider,
+        "consent_mode": "external",
+        "subject": "owner"
+    });
+    (surface_id, payload)
 }
 
 pub(crate) async fn delete_surface(world: &mut SurfaceWorld) {

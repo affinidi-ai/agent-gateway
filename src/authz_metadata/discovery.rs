@@ -2,7 +2,9 @@ use serde_json::Value;
 use url::Url;
 
 use super::fetch::{get_bounded, parse_fetch_url};
-use super::{AuthzServerMetadata, DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
+use super::{
+    AuthzServerMetadata, ClientAuthzMetadata, DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture,
+};
 use crate::url_validation::{reject_cloud_metadata_url, validate_webhook_url};
 
 const MAX_ENDPOINT_URL_CHARS: usize = 2048;
@@ -103,11 +105,32 @@ pub async fn discover(
     posture: EgressPosture,
     options: DiscoveryOptions,
 ) -> Result<AuthzServerMetadata, DiscoveryError> {
+    discover_with(issuer, posture, options, parse_metadata).await
+}
+
+/// Discover the metadata of `issuer` for an OAuth client of the server: as
+/// [`discover`], each document validated with [`parse_client_metadata`] instead.
+pub async fn discover_client(
+    issuer: &str,
+    posture: EgressPosture,
+    options: DiscoveryOptions,
+) -> Result<ClientAuthzMetadata, DiscoveryError> {
+    discover_with(issuer, posture, options, parse_client_metadata).await
+}
+
+type ParseDocument<T> = fn(&[u8], &str, &str, EgressPosture) -> Result<T, DiscoveryError>;
+
+async fn discover_with<T>(
+    issuer: &str,
+    posture: EgressPosture,
+    options: DiscoveryOptions,
+    parse: ParseDocument<T>,
+) -> Result<T, DiscoveryError> {
     let mut worst: Option<DiscoveryError> = None;
     for metadata_url in metadata_urls(issuer)? {
         let attempt = get_bounded(&metadata_url, posture, options)
             .await
-            .and_then(|body| parse_metadata(&body, issuer, &metadata_url, posture));
+            .and_then(|body| parse(&body, issuer, &metadata_url, posture));
         match attempt {
             Ok(metadata) => return Ok(metadata),
             Err(error)
@@ -159,36 +182,160 @@ pub fn parse_metadata(
     metadata_url: &str,
     posture: EgressPosture,
 ) -> Result<AuthzServerMetadata, DiscoveryError> {
-    let requested = parse_issuer(issuer, posture)?;
-    let invalid =
-        |detail: &str| DiscoveryError::new(DiscoveryFailure::InvalidDocument, format!("{metadata_url}: {detail}"));
-    let document: Value = serde_json::from_slice(body).map_err(|_| invalid("not JSON"))?;
-    let document = document
-        .as_object()
-        .ok_or_else(|| invalid("not a JSON object"))?;
-    let discovered = document
-        .get("issuer")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("no issuer"))?;
-    if discovered != issuer {
-        return Err(DiscoveryError::new(
-            DiscoveryFailure::IssuerMismatch,
-            format!("{metadata_url}: issuer {} is not {issuer:?}", escaped_for_log(discovered)),
-        ));
-    }
-    let endpoint = |name: &str| -> Result<String, DiscoveryError> {
-        let value = document
-            .get(name)
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid(&format!("no {name}")))?;
-        endpoint_url(value, &requested, posture).map_err(|reason| invalid(&format!("{name} {reason}")))
-    };
+    let document = Document::parse(body, issuer, metadata_url, posture)?;
     Ok(AuthzServerMetadata {
         issuer: issuer.to_string(),
         metadata_url: metadata_url.to_string(),
-        token_endpoint: endpoint("token_endpoint")?,
-        jwks_uri: endpoint("jwks_uri")?,
+        token_endpoint: document.endpoint("token_endpoint")?,
+        jwks_uri: document.endpoint("jwks_uri")?,
     })
+}
+
+/// Validate a metadata document read from `metadata_url` for `issuer` under the
+/// client profile. Performs no I/O.
+///
+/// The `issuer` rules and every endpoint rule are those of [`parse_metadata`].
+/// `authorization_endpoint` and `token_endpoint` are required. `revocation_endpoint`,
+/// `registration_endpoint` and `jwks_uri` are optional, and checked as endpoints when
+/// present. `code_challenge_methods_supported` and `token_endpoint_auth_methods_supported`,
+/// when present, must be arrays of strings, and
+/// `authorization_response_iss_parameter_supported` a boolean. A member that is
+/// `null` counts as absent. Any other problem fails with `invalid_document`.
+pub fn parse_client_metadata(
+    body: &[u8],
+    issuer: &str,
+    metadata_url: &str,
+    posture: EgressPosture,
+) -> Result<ClientAuthzMetadata, DiscoveryError> {
+    let document = Document::parse(body, issuer, metadata_url, posture)?;
+    Ok(ClientAuthzMetadata {
+        issuer: issuer.to_string(),
+        metadata_url: metadata_url.to_string(),
+        authorization_endpoint: document.endpoint("authorization_endpoint")?,
+        token_endpoint: document.endpoint("token_endpoint")?,
+        revocation_endpoint: document.optional_endpoint("revocation_endpoint")?,
+        registration_endpoint: document.optional_endpoint("registration_endpoint")?,
+        jwks_uri: document.optional_endpoint("jwks_uri")?,
+        code_challenge_methods_supported: document.optional_strings("code_challenge_methods_supported")?,
+        token_endpoint_auth_methods_supported: document.optional_strings("token_endpoint_auth_methods_supported")?,
+        authorization_response_iss_parameter_supported: document
+            .optional_flag("authorization_response_iss_parameter_supported")?,
+    })
+}
+
+/// A metadata document whose `issuer` matched, with the issuer URL its endpoints
+/// are checked against.
+struct Document<'a> {
+    members: serde_json::Map<String, Value>,
+    requested: Url,
+    metadata_url: &'a str,
+    posture: EgressPosture,
+}
+
+impl<'a> Document<'a> {
+    fn parse(
+        body: &[u8],
+        issuer: &str,
+        metadata_url: &'a str,
+        posture: EgressPosture,
+    ) -> Result<Self, DiscoveryError> {
+        let requested = parse_issuer(issuer, posture)?;
+        let invalid =
+            |detail: &str| DiscoveryError::new(DiscoveryFailure::InvalidDocument, format!("{metadata_url}: {detail}"));
+        let document: Value = serde_json::from_slice(body).map_err(|_| invalid("not JSON"))?;
+        let Value::Object(members) = document else {
+            return Err(invalid("not a JSON object"));
+        };
+        let discovered = members
+            .get("issuer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("no issuer"))?;
+        if discovered != issuer {
+            return Err(DiscoveryError::new(
+                DiscoveryFailure::IssuerMismatch,
+                format!("{metadata_url}: issuer {} is not {issuer:?}", escaped_for_log(discovered)),
+            ));
+        }
+        Ok(Self {
+            members,
+            requested,
+            metadata_url,
+            posture,
+        })
+    }
+
+    fn invalid(
+        &self,
+        detail: &str,
+    ) -> DiscoveryError {
+        DiscoveryError::new(DiscoveryFailure::InvalidDocument, format!("{}: {detail}", self.metadata_url))
+    }
+
+    fn present(
+        &self,
+        name: &str,
+    ) -> Option<&Value> {
+        self.members
+            .get(name)
+            .filter(|value| !value.is_null())
+    }
+
+    fn endpoint(
+        &self,
+        name: &str,
+    ) -> Result<String, DiscoveryError> {
+        self.optional_endpoint(name)?
+            .ok_or_else(|| self.invalid(&format!("no {name}")))
+    }
+
+    fn optional_endpoint(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, DiscoveryError> {
+        let Some(value) = self.present(name) else {
+            return Ok(None);
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| self.invalid(&format!("{name} is not a string")))?;
+        endpoint_url(value, &self.requested, self.posture)
+            .map(Some)
+            .map_err(|reason| self.invalid(&format!("{name} {reason}")))
+    }
+
+    fn optional_strings(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<String>>, DiscoveryError> {
+        let Some(value) = self.present(name) else {
+            return Ok(None);
+        };
+        value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::to_string)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(Some)
+            .ok_or_else(|| self.invalid(&format!("{name} is not an array of strings")))
+    }
+
+    fn optional_flag(
+        &self,
+        name: &str,
+    ) -> Result<bool, DiscoveryError> {
+        match self.present(name) {
+            None => Ok(false),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| self.invalid(&format!("{name} is not a boolean"))),
+        }
+    }
 }
 
 fn endpoint_url(
@@ -1169,5 +1316,206 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), "invalid_url");
+    }
+
+    /// The shape of the RFC 8414 documents vendors' MCP servers publish: no
+    /// `jwks_uri`, the token endpoint doubling as the revocation endpoint.
+    fn client_document(issuer: &str) -> Value {
+        let base = issuer.trim_end_matches('/');
+        json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "revocation_endpoint": format!("{base}/token"),
+            "registration_endpoint": format!("{base}/register"),
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["plain", "S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+            "authorization_response_iss_parameter_supported": true
+        })
+    }
+
+    fn parse_client(
+        doc: &Value,
+        posture: EgressPosture,
+    ) -> Result<ClientAuthzMetadata, DiscoveryError> {
+        parse_client_metadata(doc.to_string().as_bytes(), ISSUER, METADATA_URL, posture)
+    }
+
+    #[test]
+    fn the_client_profile_reads_a_document_without_a_jwks_uri() {
+        let doc = client_document(ISSUER);
+        assert_eq!(
+            parse_client(&doc, STRICT).unwrap(),
+            ClientAuthzMetadata {
+                issuer: ISSUER.to_string(),
+                metadata_url: METADATA_URL.to_string(),
+                authorization_endpoint: "https://as.example.com/authorize".to_string(),
+                token_endpoint: "https://as.example.com/token".to_string(),
+                revocation_endpoint: Some("https://as.example.com/token".to_string()),
+                registration_endpoint: Some("https://as.example.com/register".to_string()),
+                jwks_uri: None,
+                code_challenge_methods_supported: Some(vec!["plain".to_string(), "S256".to_string()]),
+                token_endpoint_auth_methods_supported: Some(vec![
+                    "client_secret_basic".to_string(),
+                    "client_secret_post".to_string(),
+                    "none".to_string()
+                ]),
+                authorization_response_iss_parameter_supported: true,
+            }
+        );
+        assert_eq!(
+            parse(&doc, STRICT)
+                .unwrap_err()
+                .failure(),
+            DiscoveryFailure::InvalidDocument,
+            "the inbound profile still requires a jwks_uri"
+        );
+    }
+
+    #[test]
+    fn the_client_profile_leaves_absent_and_null_optional_members_unset() {
+        let mut doc = json!({
+            "issuer": ISSUER,
+            "authorization_endpoint": "https://as.example.com/authorize",
+            "token_endpoint": "https://as.example.com/token",
+        });
+        let bare = ClientAuthzMetadata {
+            issuer: ISSUER.to_string(),
+            metadata_url: METADATA_URL.to_string(),
+            authorization_endpoint: "https://as.example.com/authorize".to_string(),
+            token_endpoint: "https://as.example.com/token".to_string(),
+            revocation_endpoint: None,
+            registration_endpoint: None,
+            jwks_uri: None,
+            code_challenge_methods_supported: None,
+            token_endpoint_auth_methods_supported: None,
+            authorization_response_iss_parameter_supported: false,
+        };
+        assert_eq!(parse_client(&doc, STRICT).unwrap(), bare);
+        for member in [
+            "revocation_endpoint",
+            "registration_endpoint",
+            "jwks_uri",
+            "code_challenge_methods_supported",
+            "token_endpoint_auth_methods_supported",
+            "authorization_response_iss_parameter_supported",
+        ] {
+            doc[member] = Value::Null;
+        }
+        assert_eq!(parse_client(&doc, STRICT).unwrap(), bare);
+        doc["jwks_uri"] = json!("https://keys.example.net/jwks.json");
+        assert_eq!(
+            parse_client(&doc, STRICT)
+                .unwrap()
+                .jwks_uri
+                .as_deref(),
+            Some("https://keys.example.net/jwks.json")
+        );
+    }
+
+    #[test]
+    fn the_client_profile_requires_an_authorization_and_a_token_endpoint() {
+        for member in ["authorization_endpoint", "token_endpoint"] {
+            let mut doc = client_document(ISSUER);
+            doc.as_object_mut()
+                .unwrap()
+                .remove(member);
+            assert_eq!(
+                parse_client(&doc, OPERATOR)
+                    .unwrap_err()
+                    .failure(),
+                DiscoveryFailure::InvalidDocument,
+                "{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_profile_checks_every_endpoint_it_reads() {
+        for member in
+            ["authorization_endpoint", "token_endpoint", "revocation_endpoint", "registration_endpoint", "jwks_uri"]
+        {
+            for value in [
+                json!(42),
+                json!("http://as.example.com/x"),
+                json!("https://169.254.169.254/latest/meta-data/"),
+                json!("https://as.example.com/x#fragment"),
+            ] {
+                let mut doc = client_document(ISSUER);
+                doc[member] = value.clone();
+                assert_eq!(
+                    parse_client(&doc, OPERATOR)
+                        .unwrap_err()
+                        .failure(),
+                    DiscoveryFailure::InvalidDocument,
+                    "{member} = {value}"
+                );
+            }
+            let mut doc = client_document(ISSUER);
+            doc[member] = json!("https://10.0.0.5/x");
+            assert_eq!(
+                parse_client(&doc, STRICT)
+                    .unwrap_err()
+                    .failure(),
+                DiscoveryFailure::InvalidDocument,
+                "{member} names a private address"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_profile_refuses_malformed_method_lists_and_flags() {
+        for (member, value) in [
+            ("code_challenge_methods_supported", json!("S256")),
+            ("code_challenge_methods_supported", json!(["S256", 1])),
+            ("token_endpoint_auth_methods_supported", json!({"none": true})),
+            ("token_endpoint_auth_methods_supported", json!([null])),
+            ("authorization_response_iss_parameter_supported", json!("true")),
+            ("authorization_response_iss_parameter_supported", json!(1)),
+        ] {
+            let mut doc = client_document(ISSUER);
+            doc[member] = value.clone();
+            assert_eq!(
+                parse_client(&doc, OPERATOR)
+                    .unwrap_err()
+                    .failure(),
+                DiscoveryFailure::InvalidDocument,
+                "{member} = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_profile_requires_the_issuer_to_match() {
+        let doc = client_document("https://other.example.com");
+        assert_eq!(
+            parse_client(&doc, OPERATOR)
+                .unwrap_err()
+                .failure(),
+            DiscoveryFailure::IssuerMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_discovers_a_document_without_a_jwks_uri_falling_back_to_openid_connect() {
+        let server = TestServer::start().await;
+        let issuer = server.base().to_string();
+        server.reply(RFC8414, Reply::status(404));
+        server.reply(OIDC, Reply::json(&client_document(&issuer).to_string()));
+        let metadata = discover_client(&issuer, OPERATOR, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata.metadata_url, server.url(OIDC));
+        assert_eq!(metadata.authorization_endpoint, format!("{issuer}/authorize"));
+        assert_eq!(metadata.jwks_uri, None);
+        assert_eq!(server.requests(), [RFC8414, OIDC]);
+        assert_eq!(
+            discover(&issuer, OPERATOR, DiscoveryOptions::default())
+                .await
+                .unwrap_err()
+                .code(),
+            "invalid_document"
+        );
     }
 }

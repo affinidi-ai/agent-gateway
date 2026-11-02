@@ -1332,8 +1332,10 @@ export interface AgentSurface {
   };
   transit?: {
     points: TransitPoint[];
+    /** Deprecated and ignored by the gateway; the dashboard never sends it. */
     sign_requests?: boolean;
-    transit_token_mode?: 'embedded' | 'reference';
+    /** Only `embedded` exists; the gateway refuses `reference` on save. */
+    transit_token_mode?: 'embedded';
     rate_limit?: { requests: number; window_secs: number };
   };
   /**

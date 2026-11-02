@@ -8,7 +8,12 @@
 //!
 //! Client secrets are never stored directly; they reference the secrets store
 //! via secret_id (e.g. "GOOGLE_CLIENT_SECRET").
+//!
+//! A provider with an `issuer` is an external consent provider: checked against
+//! its issuer's metadata when it is created, its endpoints and client fields
+//! fixed for life, and bound only by `consent_mode: external` (see [`external`]).
 
+pub mod external;
 pub mod handlers;
 pub mod router;
 pub mod storage;
@@ -177,6 +182,39 @@ impl JwtAssertionSettings {
     }
 }
 
+/// How an external consent provider's client authenticates at the token and
+/// revocation endpoints (RFC 6749 section 2.3, RFC 8414).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// A public client: `client_id` in the body, no secret.
+    None,
+    /// HTTP Basic with the client id and secret.
+    ClientSecretBasic,
+    /// The client id and secret in the form body.
+    ClientSecretPost,
+    /// A JWT the client signs with its private key (RFC 7523 section 2.2), as
+    /// an `oauth2_client_credentials_jwt_auth` provider authenticates.
+    PrivateKeyJwt,
+}
+
+impl TokenEndpointAuthMethod {
+    /// The method's name in RFC 8414 `token_endpoint_auth_methods_supported`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+            Self::PrivateKeyJwt => "private_key_jwt",
+        }
+    }
+
+    /// Whether the client authenticates with a secret.
+    pub fn uses_secret(self) -> bool {
+        matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
+    }
+}
+
 /// A configured OAuth 2.0 credential provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialProvider {
@@ -256,6 +294,33 @@ pub struct CredentialProvider {
     /// Optional description
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// The authorization server's issuer. Makes this an external consent
+    /// provider, checked against the issuer's metadata at create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+
+    /// RFC 7009 revocation endpoint of an external consent provider: the one
+    /// its issuer's metadata names, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+
+    /// How an external consent provider's client authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+
+    /// An external consent provider's client id, a plain value: a client id is
+    /// not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+
+    /// Admit an issuer whose metadata does not list
+    /// `code_challenge_methods_supported`, which MCP clients refuse. Set only for
+    /// an authorization server known to enforce S256 PKCE without saying so,
+    /// such as Microsoft Entra ID. An external consent provider only, fixed for
+    /// its life.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -369,10 +434,38 @@ impl CredentialProvider {
     }
 
     /// The algorithm this provider signs its JWT with: the configured one, or its
-    /// type's default. `None` for types that sign nothing.
+    /// type's default, or for an external consent provider whose client
+    /// authenticates with `private_key_jwt` the default of
+    /// `oauth2_client_credentials_jwt_auth`. `None` for providers that sign nothing.
     pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        if self.token_endpoint_auth_method == Some(TokenEndpointAuthMethod::PrivateKeyJwt) {
+            return CredentialProviderType::OAuth2ClientCredentialsJwtAuth
+                .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm);
+        }
         self.provider_type
             .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm)
+    }
+
+    /// Whether this is an external consent provider: one with an `issuer`,
+    /// whose grants are made through external consent and kept in the
+    /// delegation vault by binding.
+    pub fn is_external_consent(&self) -> bool {
+        self.issuer.is_some()
+    }
+
+    /// Whether this provider may use a secret of `secret_tenant_id`. An
+    /// external consent provider uses its own tenant's secrets only, an
+    /// untenanted one untenanted secrets only, since its client authenticates
+    /// at endpoints its tenant chose; any other provider its own tenant's or
+    /// an untenanted one.
+    pub fn may_use_secret(
+        &self,
+        secret_tenant_id: Option<&str>,
+    ) -> bool {
+        if self.is_external_consent() {
+            return self.tenant_id.as_deref() == secret_tenant_id;
+        }
+        crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
     }
 }
 
@@ -412,6 +505,16 @@ pub struct CreateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub allow_unadvertised_pkce: bool,
 }
 
 /// Request to update an existing credential provider
@@ -448,6 +551,21 @@ pub struct UpdateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub allow_unadvertised_pkce: Option<bool>,
 }
 
 /// Request to check a provider before it is saved: the token endpoint's reachability and,
@@ -484,6 +602,10 @@ pub struct CredentialProviderListItem {
     pub callback_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// The origin of `resource`, for a provider with an issuer: the only origin
+    /// its grants are sent to, so a connect page can show the person where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +618,16 @@ pub struct CredentialProviderListItem {
     pub jwt_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -517,6 +649,10 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             description: p.description.clone(),
             callback_url: p.callback_url.clone(),
             resource: p.resource.clone(),
+            resource_origin: p
+                .is_external_consent()
+                .then(|| external::resource_origin(p))
+                .flatten(),
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),
@@ -525,6 +661,11 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             jwt_key_id: p.jwt.jwt_key_id.clone(),
             jwt_issuer: p.jwt.jwt_issuer.clone(),
             jwt_subject: p.jwt.jwt_subject.clone(),
+            issuer: p.issuer.clone(),
+            revocation_endpoint: p.revocation_endpoint.clone(),
+            token_endpoint_auth_method: p.token_endpoint_auth_method,
+            client_id: p.client_id.clone(),
+            allow_unadvertised_pkce: p.allow_unadvertised_pkce,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -664,6 +805,11 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
         }
     }
 
@@ -792,6 +938,11 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));

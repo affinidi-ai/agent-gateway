@@ -168,12 +168,24 @@ credentials or fragment, not a cloud-metadata address, and not a weaker scheme t
 issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
 The schemes are compared as parsed, so their case does not matter.
 
+The client profile (`discover_client`, `parse_client_metadata`) reads the same documents
+for an OAuth client of the server, such as a credential provider checked against its
+issuer (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers)).
+It requires `authorization_endpoint` and `token_endpoint`, and makes `jwks_uri` optional:
+many authorization servers publish none, and a client that never validates the server's JWTs
+does not need its keys. It also returns `revocation_endpoint`, `registration_endpoint`,
+`code_challenge_methods_supported`, `token_endpoint_auth_methods_supported` and
+`authorization_response_iss_parameter_supported` when the document has them. Every endpoint
+it reads passes the endpoint rules above, the method lists must be arrays of strings and the
+flag a boolean, and a member that is `null` counts as absent. The inbound profile
+(`discover`, `parse_metadata`) is unchanged and still requires `jwks_uri`.
+
 | Limit | Value |
 | --- | --- |
 | Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
 | Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make three fetches for a path issuer and two for an origin issuer, so up to six or four times the timeout in all |
 | Redirects | Refused |
-| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. Pinning does not hold when a proxy is configured: the HTTP client reads `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (also in lower case) and, on macOS and Windows, the system proxy settings. The request then goes to the proxy, which resolves the host again and connects to an address nobody vetted, so address vetting and pinning no longer apply. This is true of the shared pinned egress clients until they call `.no_proxy()` |
+| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked`. Pinning does not hold when a proxy is configured: inbound JWT and MCP discovery read `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (also in lower case) and, on macOS and Windows, the system proxy settings, and the proxy resolves the host again and connects to an address nobody vetted. Only a fetch with `DiscoveryOptions::direct`, which an external consent provider's issuer metadata uses, ignores every proxy and always connects directly |
 | Status | Only a 2xx response is read |
 
 The caller chooses an `EgressPosture`. `Strict` accepts `https` only: `get_bounded` and
@@ -219,6 +231,8 @@ all of them, from least to most specific: `http_status`,
 | Function | Use |
 | --- | --- |
 | `discover(issuer, posture, options)` | Fetches and validates, trying the URLs in order |
+| `discover_client(issuer, posture, options)` | As `discover`, under the client profile |
+| `parse_client_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand under the client profile |
 | `metadata_urls(issuer)` | Pure: the candidate URLs for an issuer, in order: two for an origin issuer, three for a path issuer |
 | `validate_issuer(issuer, posture)` | Pure: the issuer checks `discover` makes before any request; protected resource metadata uses it for the authorization servers it advertises |
 | `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
@@ -329,7 +343,11 @@ saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Trans
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
-back. A write's `transit_point_source_auth` is ignored (see below), so the dashboard never sends it.
+back. A Transit Point with a `consent_mode: external` binding is the exception: sent without
+its `id`, it keeps the stored id of the Transit Point with its alias in the same list, so it
+keeps these stored settings too
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-binding-is-removed)). A write's
+`transit_point_source_auth` is ignored (see below), so the dashboard never sends it.
 
 ### Upgrading and rolling back
 
@@ -487,6 +505,11 @@ trace, and expires its surface's [transit token lifetime](#transit-token-lifetim
 it is issued, 300 seconds unless the surface sets another. The agent may send the same
 token on any number of calls to that surface's Transit Points until then. The header is
 never forwarded to a Transit Point's target.
+
+Every token is embedded: `transit.transit_token_mode` has one working value, `embedded`, and the
+admin API refuses `reference` (see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-transit-settings-that-do-nothing)).
+Do not put in the caller context claims you would not show the agent.
 
 Which requests carry one:
 

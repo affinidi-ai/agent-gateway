@@ -122,8 +122,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
   `transit-point-listener-url`.
 - **Transit Settings** has no listener authentication control: the gateway does not support
-  `transit.source_auth` and refuses a save that sets it. The **Transit Token Mode** option
-  says the embedded token is signed and readable by the agent, not encrypted.
+  `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
+  chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so
+  the panel offers no `reference` option and every save sends `transit_token_mode: embedded`.
+  Neither the panel, its canvas summary, the
+  Transit Point factory nor a variant's overrides set `sign_requests`, which the gateway
+  ignores.
 - The Transit Point panel's **Who can call this Transit Point** section
   (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
   (`transit-point-require-transit-token-switch`), the **Caller authentication** select
@@ -196,6 +200,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
+- A Transit Point's **Inject outbound credential** binding (`_shared/TransitCredentialBindingSection.tsx`)
+  keeps what its controls do not set: `elicit_timeout_secs`, `elicit_fallback` and an external
+  consent binding's `subject` round-trip through the form, and the consent select
+  (`transit-point-consent-mode-select`) shows a stored `elicit` or `external` mode as a disabled
+  option. An `external` binding is read-only: its provider, scopes, consent mode and injection
+  inputs are disabled, and only the switch that removes it stays enabled, with a line saying
+  whose grant it uses and that changing or removing it revokes its grants
+  (`transit-point-binding-subject`): such a binding is changed through the API.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent
   editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,
@@ -229,6 +241,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Variant resource, default variant note, rules explainer toggle | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-default-variant-note`, `caller-auth-discovery-context-toggle`                                                                     |
 | Errors                                                         | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
 | Sidebar status and error                                       | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
+
 - **Switching views from content.** The Surface Builder views are Surface, Templates, Elements,
   Agent Cards, Monitoring and Config (see _Agent Cards tab_). A switch started from content (**View
   agent cards**, **Open the Surface view**) goes through `openViewFromContent` in
@@ -306,16 +319,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
   snapshot (it says how many are in other variants), hidden at zero.
 
-| Element                            | Test id                                                                              |
-| ---------------------------------- | ------------------------------------------------------------------------------------ |
-| Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
-| Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
-| Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
-| Read-only migrated copy line       | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                    |
-| Fullscreen query list             | `trust-check-fullscreen-queries`                                                     |
-| Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
-| Review summary                     | `surface-migrated-trust-checks-summary`                                              |
-| Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
+| Element                          | Test id                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Per-Transit-Point scope line     | `trust-check-panel-transit-point-scope`                                                            |
+| Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
+| Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
+| Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
+| Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
+| Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
+| Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
+| Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 
 ## Trust Recorder
 
@@ -592,7 +605,13 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
   `credential_policy.insecure_token_endpoints`, and that an unchanged stored one is still accepted
   while `token_endpoint_https` is `warn`. It does not block Save; the gateway decides on save.
-- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
+- A provider with an `issuer` (external consent) shows a notice naming the issuer
+  (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
+  additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
+  description, default scopes and token refresh (`externalProviderUpdate`).
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module. A
+  refused delete shows the API's reason and, for a `409`, the surface that binds the provider
+  (`providerDeleteError`).
 
 ## Secret editor
 
@@ -723,19 +742,19 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
     recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
     reload.
 
-| Element                                       | Test id                                                                                                                            |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Identity row                                  | `identities-row-<did>`                                                                                                             |
-| Name, pending, conflict, verified             | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                               |
-| Copy DID                                      | `identities-copy-did-button`                                                                                                       |
-| Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
-| Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
-| Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
-| Recorder filter                               | `identities-recorder-filter`                                                                                                       |
-| Recorder chip                                 | `identities-recorder-chip-<state>`                                                                                                 |
-| Recorder tooltip                              | `identities-recorder-tooltip`                                                                                                      |
-| Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
-| Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
+| Element                            | Test id                                                                                              |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Identity row                       | `identities-row-<did>`                                                                               |
+| Name, pending, conflict, verified  | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified` |
+| Copy DID                           | `identities-copy-did-button`                                                                         |
+| Origin badge                       | `identities-origin-<origin>`                                                                         |
+| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal`                                         |
+| Unnamed filter                     | `identities-unnamed-filter-button`                                                                   |
+| Recorder filter                    | `identities-recorder-filter`                                                                         |
+| Recorder chip                      | `identities-recorder-chip-<state>`                                                                   |
+| Recorder tooltip                   | `identities-recorder-tooltip`                                                                        |
+| Tooltip last attempt, reason       | `identities-recorder-last-attempt`, `identities-recorder-reason`                                     |
+| Tooltip registry entry             | `identities-recorder-entry-<registry id>`                                                            |
 
 ## Remote gateway Issuer DIDs
 

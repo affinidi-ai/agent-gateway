@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import EditCredentialProviderPage from '../EditCredentialProviderPage';
@@ -72,6 +72,60 @@ describe('EditCredentialProviderPage Entra resource warning', () => {
       target: { value: 'https://oauth2.googleapis.com/token' },
     });
     expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+});
+
+describe('EditCredentialProviderPage external consent provider', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('shows the fixed settings as read-only and saves only the editable fields', async () => {
+    const external = {
+      id: 'p1',
+      name: 'Linear',
+      provider_id: 'linear',
+      provider_type: 'oauth2_authorization_code',
+      issuer: 'https://linear.example',
+      authorization_endpoint: 'https://linear.example/authorize',
+      token_endpoint: 'https://linear.example/token',
+      token_endpoint_auth_method: 'none',
+      client_id: 'client-1',
+      callback_url: 'https://gateway.example/callback/linear',
+      resource: 'https://linear.example/mcp',
+      default_scopes: ['read'],
+      token_refresh_enabled: true,
+    };
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.startsWith('/api/v1/credential-providers/')
+          ? { ok: true, json: () => Promise.resolve(external), text: () => Promise.resolve('') }
+          : { ok: false, json: () => Promise.resolve([]) }
+      )
+    );
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(await screen.findByTestId('credential-provider-external-notice')).toHaveTextContent(
+      'https://linear.example'
+    );
+    expect(screen.queryByLabelText(/Provider Type/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue('read'), { target: { value: 'read, write' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/v1/credential-providers/p1',
+        expect.objectContaining({ method: 'PUT' })
+      )
+    );
+    const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
+    expect(JSON.parse(init.body)).toEqual({
+      name: 'Linear',
+      default_scopes: ['read', 'write'],
+      token_refresh_enabled: true,
+    });
   });
 });
 
