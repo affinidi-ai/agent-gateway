@@ -3865,13 +3865,16 @@ fn transit_token_unavailable_refusal(
 }
 
 /// Who sent a request over Fabric, for the transit token issued with it: the
-/// peer the handshake verified, and the caller the peer's request names.
+/// peer the handshake verified, the caller the peer's request names, and the
+/// caller the receiving surface's own `source_auth` or resource token verified
+/// on the request.
 pub(super) struct FabricReceiveCaller<'caller> {
     pub peer_gateway_id: &'caller str,
     pub peer_issuer_did: Option<&'caller str>,
     pub hops: u8,
     pub caller_identity: Option<&'caller str>,
     pub verification: crate::surface_context::IdentityVerification,
+    pub verified_identity: Option<&'caller crate::source_auth::AuthenticatedIdentity>,
 }
 
 /// The caller DID and `identity_source` of a transit token issued on Fabric
@@ -3889,6 +3892,167 @@ pub(super) fn fabric_caller_did_and_source(
     }) {
         Some(did) => (Some(did), IdentitySource::FabricPresentation),
         None => (None, IdentitySource::FabricAsserted),
+    }
+}
+
+/// Whether `binding`, of the receiving surface's Target, applies to a Fabric
+/// request calling `tool`.
+fn fabric_binding_applies(
+    binding: &crate::config::types::OutboundCredentialBinding,
+    tool: Option<&str>,
+) -> bool {
+    match &binding.required_for {
+        crate::config::types::CredentialRequirement::All => true,
+        crate::config::types::CredentialRequirement::Tools(tools) => tool.is_some_and(|tool| {
+            tools
+                .iter()
+                .any(|named| named == tool)
+        }),
+    }
+}
+
+/// Whether a delegated credential binding of the receiving surface's Target
+/// applies to a Fabric request calling `tool`, so the request needs a caller
+/// the surface verified to key it.
+fn fabric_delegation_applies(
+    bindings: &[crate::config::types::OutboundCredentialBinding],
+    tool: Option<&str>,
+) -> bool {
+    bindings
+        .iter()
+        .any(|binding| fabric_binding_applies(binding, tool))
+}
+
+/// Whether a binding that applies to a Fabric request calling `tool` releases
+/// a per-user grant (`oauth2_authorization_code`), rather than a service-level
+/// credential that keys no caller. A binding whose provider cannot be read
+/// counts as per-user, so a surface that keeps per-user grants from partners
+/// refuses the request rather than look it up.
+async fn fabric_per_user_binding_applies(
+    bindings: &[crate::config::types::OutboundCredentialBinding],
+    tool: Option<&str>,
+    providers: Option<&Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
+) -> bool {
+    for binding in bindings
+        .iter()
+        .filter(|binding| fabric_binding_applies(binding, tool))
+    {
+        let Some(providers) = providers else {
+            return true;
+        };
+        let service_level = providers
+            .get(&binding.credential_provider_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|provider| {
+                !matches!(
+                    provider.provider_type,
+                    crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode
+                )
+            });
+        if !service_level {
+            return true;
+        }
+    }
+    false
+}
+
+/// Why the receiving gateway refuses a Fabric request its Target's delegated
+/// credentials apply to. Each has a fixed reason, the only part of it the
+/// peer is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FabricDelegationRefusal {
+    /// The receiving surface verified no caller to key a grant by.
+    CallerNotVerified,
+    /// A per-user binding applies, and the surface does not release per-user
+    /// grants to partners (`delegated_credentials_for_fabric_callers`).
+    NotEnabledForPartners,
+    /// The caller has no grant yet, and consent is never started through a
+    /// partner, who would see the authorization URL.
+    ConsentNotAvailable,
+}
+
+impl FabricDelegationRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CallerNotVerified => "partner_caller_not_verified",
+            Self::NotEnabledForPartners => "delegation_not_enabled_for_partners",
+            Self::ConsentNotAvailable => crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON,
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::CallerNotVerified => "Delegated credentials need a caller this surface verified",
+            Self::NotEnabledForPartners => "This surface does not release per-user delegated credentials to partners",
+            Self::ConsentNotAvailable => crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE,
+        }
+    }
+
+    fn recorded_as(self) -> crate::audit::request_events::RejectionReason {
+        use crate::audit::request_events::RejectionReason;
+        match self {
+            Self::CallerNotVerified => RejectionReason::ConsentIdentityRequired,
+            Self::NotEnabledForPartners => RejectionReason::DelegationNotEnabledForPartners,
+            Self::ConsentNotAvailable => RejectionReason::ConsentNotAvailableForPartners,
+        }
+    }
+}
+
+/// The answer to a Fabric request whose Target's delegated credentials the
+/// receiving gateway will not release: `403` with the refusal's fixed reason,
+/// recorded as a `request_rejected` at the `admission` stage. An MCP request
+/// gets a JSON-RPC error answering its id with `-32001`, any other a problem
+/// JSON.
+pub(super) fn fabric_delegation_refusal(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    mcp: bool,
+    request_body: &[u8],
+    refusal: FabricDelegationRefusal,
+) -> ProcessingResult {
+    use crate::audit::request_events::{RejectionStage, request_rejected};
+    const FORBIDDEN_RPC_CODE: i32 = -32001;
+    request_rejected(
+        facts,
+        RejectionStage::Admission,
+        refusal.recorded_as(),
+        403,
+        mcp.then_some(i64::from(FORBIDDEN_RPC_CODE)),
+    );
+    let (content_type, body) = if mcp {
+        let id = serde_json::from_slice::<Value>(request_body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or(Value::Null);
+        (
+            "application/json",
+            crate::mcp::errors::create_mcp_error_envelope(
+                Some(id),
+                FORBIDDEN_RPC_CODE,
+                refusal.detail(),
+                Some(serde_json::json!({ "reason": refusal.reason() })),
+            ),
+        )
+    } else {
+        (
+            "application/problem+json",
+            serde_json::json!({
+                "type": "https://affinidi.com/atg/errors/delegated-credentials-refused",
+                "title": "Delegated Credentials Refused",
+                "status": 403,
+                "detail": refusal.detail(),
+                "reason": refusal.reason(),
+            }),
+        )
+    };
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: serde_json::json!({
+            "status": 403,
+            "headers": { "content-type": content_type, "cache-control": "no-store" },
+            "body": body.to_string(),
+        }),
     }
 }
 
@@ -3921,9 +4085,13 @@ pub(super) fn fabric_response_workload_binding(
 /// `allow_fabric_callers`. The token opens only those Transit Points. A Target
 /// the gateway runs has no agent to hold one, and an agent card fetch is no
 /// request of the agent's own. `max_lifetime_secs` is the appliance's
-/// `transit_token_max_lifetime_secs`. Returns the token and its `jti`, or
-/// `Err` when the agent should get one and it cannot be issued, so the
-/// request is refused rather than forwarded as one no peer sent.
+/// `transit_token_max_lifetime_secs`. Its only principal,
+/// `fabric.principal_hash`, and its caller context fields come from the caller
+/// the surface verified itself (`verified_identity`), exactly as the Access
+/// Point fills `user_identity_hash` and the fields; the caller the peer names
+/// never contributes either. Returns the token and its `jti`, or `Err` when
+/// the agent should get one and it cannot be issued, so the request is refused
+/// rather than forwarded as one no peer sent.
 pub(super) fn fabric_receive_transit_token(
     issuer: Option<&crate::proxy::transit_token::TransitTokenIssuer>,
     max_lifetime_secs: Option<u64>,
@@ -3954,6 +4122,10 @@ pub(super) fn fabric_receive_transit_token(
         identity_source: &identity_source,
         trace_id,
         allowed_transit_points,
+        caller_context_fields: crate::proxy::handler::compute_transit_token_caller_context(
+            surface,
+            caller.verified_identity,
+        ),
         fabric: crate::proxy::transit_token::FabricTransitClaims {
             peer_gateway_id: caller
                 .peer_gateway_id
@@ -3963,6 +4135,13 @@ pub(super) fn fabric_receive_transit_token(
                 .map(str::to_string),
             hops: caller.hops,
             caller_did: caller_did.map(str::to_string),
+            principal_hash: crate::proxy::handler::source_auth_user_hash(caller.verified_identity, surface).filter(
+                |_| {
+                    surface
+                        .fabric_caller_authentication_gap()
+                        .is_none()
+                },
+            ),
         },
     };
     match issuer.issue_for_fabric_request(request, surface.issued_transit_token_lifetime_secs(max_lifetime_secs)) {
@@ -5166,7 +5345,12 @@ async fn process_forward_request_in_request_scope(
                 route: ContinuationRoute::Fabric { peer_did: message.from_did.clone().ok_or(ContinuationError::BindingMismatch)? },
                 authorization: resource_authorization.as_ref().ok_or(ContinuationError::BindingMismatch)?,
                 identity: authenticated_identity.as_ref().ok_or(ContinuationError::BindingMismatch)?,
-                agent_did: caller_identity.as_deref().ok_or(ContinuationError::BindingMismatch)?,
+                // The agent half of the key is a caller DID only a connection
+                // issuer's presentation proved, as a transit token carries one;
+                // the user half is the resource-token caller this surface verified.
+                agent_did: fabric_caller_did_and_source(caller_identity.as_deref(), caller_identity_verification)
+                    .0
+                    .ok_or(ContinuationError::BindingMismatch)?,
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
                 secrets: secrets.as_ref(), provider_egress: None,
@@ -5667,14 +5851,41 @@ async fn process_forward_request_in_request_scope(
     }
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
-    if !outbound_creds.is_empty() {
-        // Derive user identity hash from caller_identity (already a DID or identity hash from VP)
-        // or fall back to the identity hash of the receiving surface's own source_auth
-        let delegation_user_hash: Option<String> = caller_identity.clone().or_else(|| {
-            authenticated_identity
-                .as_ref()
-                .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()))
-        });
+    // A discovery read is no request of the agent's own, so, as on the direct
+    // path and a Transit Point, no credential is released or refused for it.
+    if !outbound_creds.is_empty() && !is_agent_card_request {
+        let delegation_user_hash = authenticated_identity
+            .as_ref()
+            .and_then(|id| id.principal_hash(surface.tenant_id.as_deref()));
+        let called_tool = crate::mcp::tool_analyzer::called_tool_name(&body_bytes);
+        let refusal = if !fabric_delegation_applies(&outbound_creds, called_tool.as_deref()) {
+            None
+        } else if fabric_per_user_binding_applies(
+                &outbound_creds,
+                called_tool.as_deref(),
+                get_credential_provider_store().as_ref(),
+            )
+            .await
+        {
+            Some(FabricDelegationRefusal::NotEnabledForPartners)
+        } else if delegation_user_hash.is_none() {
+            Some(FabricDelegationRefusal::CallerNotVerified)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            channel_warn!(
+                config_id,
+                "GW2: Refusing a Fabric request its Target's delegated credentials apply to (reason={})",
+                refusal.reason()
+            );
+            return fabric_delegation_refusal(
+                &audit_facts,
+                surface_protocol == crate::config::ChannelProtocol::Mcp,
+                &body_bytes,
+                refusal,
+            );
+        }
 
         if let (
             Some(user_hash),
@@ -5742,46 +5953,24 @@ async fn process_forward_request_in_request_scope(
                 };
             }
 
-            // Check for consent_required — if any binding needs consent, return immediately as ForwardResponse
-            let mut consent_entries = Vec::new();
-            for resolution in &delegation_results {
-                if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-                    authorization_url,
-                    provider_name,
-                    scopes,
-                } = &resolution.result
-                {
-                    consent_entries.push(serde_json::json!({
-                        "provider_name": provider_name,
-                        "authorization_url": authorization_url,
-                        "scopes": scopes,
-                    }));
-                }
-            }
-
-            if !consent_entries.is_empty() {
-                channel_info!(
+            // Consent is never started through a partner: whoever completes the
+            // authorization URL binds their account, and the partner would see it.
+            if delegation_results.iter().any(|resolution| matches!(
+                &resolution.result,
+                crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired { .. }
+            )) {
+                let refusal = FabricDelegationRefusal::ConsentNotAvailable;
+                channel_warn!(
                     config_id,
-                    "GW2: Credential delegation requires consent for {} providers — returning consent_required via DIDComm",
-                    consent_entries.len()
+                    "GW2: Refusing a Fabric request whose delegated credentials need consent (reason={})",
+                    refusal.reason()
                 );
-                let consent_body = serde_json::json!({
-                    "type": "https://affinidi.com/atg/errors/consent-required",
-                    "title": "Credential Delegation Consent Required",
-                    "status": 401,
-                    "detail": "This channel requires delegated credentials. The user must authorize access via the provided URLs.",
-                    "consent_required": consent_entries,
-                });
-                return ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "status": 401,
-                        "headers": {
-                            "content-type": "application/problem+json",
-                        },
-                        "body": consent_body.to_string(),
-                    }),
-                };
+                return fabric_delegation_refusal(
+                    &audit_facts,
+                    surface_protocol == crate::config::ChannelProtocol::Mcp,
+                    &body_bytes,
+                    refusal,
+                );
             }
 
             for resolution in &delegation_results {
@@ -5922,6 +6111,7 @@ async fn process_forward_request_in_request_scope(
             hops: fabric_hops,
             caller_identity: caller_identity.as_deref(),
             verification: caller_identity_verification,
+            verified_identity: authenticated_identity.as_ref(),
         },
         onward_trace_id.as_deref(),
     ) {

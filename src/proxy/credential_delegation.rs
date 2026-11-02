@@ -71,6 +71,41 @@ fn consent_identity_permits(
 /// resolved; why is logged.
 pub(crate) const DELEGATION_UNAVAILABLE: &str = "Delegated credentials unavailable";
 
+/// What a request that arrived over Fabric is told when its caller has no grant
+/// yet: consent is never started through a partner, so the person connects to
+/// this gateway directly first.
+pub(crate) const PARTNER_CONSENT_UNAVAILABLE: &str =
+    "Delegated credentials need the user's consent, which cannot be given through a partner";
+
+/// The fixed reason [`PARTNER_CONSENT_UNAVAILABLE`] is answered with.
+pub(crate) const PARTNER_CONSENT_UNAVAILABLE_REASON: &str = "consent_not_available_for_partners";
+
+/// A problem JSON refusing a request's delegated credentials with `status`,
+/// `detail` and the fixed `reason` the caller is told.
+pub(crate) fn refusal_problem(
+    status: axum::http::StatusCode,
+    detail: &str,
+    reason: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/problem+json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::json!({
+            "type": "https://affinidi.com/atg/errors/delegated-credentials-refused",
+            "title": "Delegated Credentials Refused",
+            "status": status.as_u16(),
+            "detail": detail,
+            "reason": reason,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// The `503` body refusing a request whose delegated credential cannot be
 /// resolved, with its content type: on an MCP surface a JSON-RPC error answering
 /// the request's id, otherwise a problem JSON.

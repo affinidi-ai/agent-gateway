@@ -20,6 +20,7 @@ use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
 use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 
 const SENDER_DID: &str = "did:web:sender.example";
+const CALLER_KEY: &str = "tenant-a-caller-key";
 
 struct Receiver {
     target: RecordingTarget,
@@ -32,7 +33,9 @@ struct Receiver {
 impl Receiver {
     /// A receiving gateway with one appliance-wide paired sender and a
     /// `tenant-a` surface per credential: one sending each secret as Target
-    /// Authentication, one delegating each API key provider.
+    /// Authentication, one delegating each API key provider. Each surface
+    /// verifies its callers by an API key header, which a delegated credential
+    /// needs over Fabric.
     async fn new() -> Self {
         let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
         let root = tempfile::tempdir().unwrap();
@@ -77,6 +80,32 @@ impl Receiver {
                 .await
                 .unwrap();
         }
+        secrets
+            .create(CreateSecretRequest {
+                tenant_id: Some("tenant-a".into()),
+                name: "callers".into(),
+                secret_id: "callers".into(),
+                description: None,
+                value: CALLER_KEY.into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            Arc::new(
+                crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.path().join("strategies"))
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            Some(secrets.clone()),
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        )))
+        .await;
         super::init_secrets_store(secrets).await;
         super::init_credential_provider_store(Arc::new(providers) as Arc<dyn CredentialProviderStorage>).await;
         super::init_delegation_vault_store(Arc::new(
@@ -102,7 +131,9 @@ impl Receiver {
             ] {
                 let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                     "surface_id": surface_id, "name": surface_id, "tenant_id": "tenant-a",
-                    "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"), "protocol": "a2a"},
+                    "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"), "protocol": "a2a",
+                        "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
+                            "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
                     "target": {"endpoint": target.url, "auth": target_auth},
                     "outbound_credentials": outbound_credentials
                 }))
@@ -122,13 +153,17 @@ impl Receiver {
         }
     }
 
-    /// A legacy `ForwardRequest` for `surface_id` whose A2A message carries the
-    /// caller's raw identity, which keys a delegated credential.
+    /// A legacy `ForwardRequest` for `surface_id`. With a `caller_key` the
+    /// surface verifies the caller, which keys a delegated credential.
     fn forward_request(
         &self,
         surface_id: &str,
+        caller_key: Option<&str>,
     ) -> ReceivedMessage {
-        let identity = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+        let mut headers = json!({"content-type": "application/json"});
+        if let Some(key) = caller_key {
+            headers["x-api-key"] = json!(key);
+        }
         ReceivedMessage::new(
             "receiver-connection".to_string(),
             "receiver-gateway".to_string(),
@@ -141,11 +176,9 @@ impl Receiver {
             Some(super::super::envelope_replay::now_secs() + 60),
             json!({
                 "channel_id": surface_id, "method": "POST", "path": "/",
-                "headers": {"content-type": "application/json"},
+                "headers": headers,
                 "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
-                    "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}],
-                    "extensions": [identity],
-                    "metadata": {identity: {"agentIdentity": {"name": "caller-agent"}}}
+                    "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
                 }}}
             }),
             MessageMetadata {
@@ -167,12 +200,23 @@ impl Receiver {
         surface_id: &str,
         mode: RuleMode,
     ) -> (u64, Option<(Option<String>, Option<String>)>, Vec<String>) {
+        self.receive_from(surface_id, mode, Some(CALLER_KEY))
+            .await
+    }
+
+    /// [`Self::receive`] from a peer that presents `caller_key`, if any.
+    async fn receive_from(
+        &self,
+        surface_id: &str,
+        mode: RuleMode,
+        caller_key: Option<&str>,
+    ) -> (u64, Option<(Option<String>, Option<String>)>, Vec<String>) {
         let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
             tenant_credential_isolation: mode,
             ..CredentialPolicyConfig::default()
         }));
         let called_before = self.target.received().len();
-        let message = self.forward_request(surface_id);
+        let message = self.forward_request(surface_id, caller_key);
         let (result, events) = TEST_CREDENTIAL_POLICY
             .scope(
                 policy,
@@ -257,6 +301,20 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                     .await,
                 (503, None, none.clone()),
                 "{mode:?}"
+            );
+            assert_eq!(
+                receiver
+                    .receive_from("delegated-own", mode, None)
+                    .await,
+                (403, None, none.clone()),
+                "{mode:?}: no verified caller"
+            );
+            assert_eq!(
+                receiver
+                    .receive_from("delegated-own", mode, Some("a-key-the-surface-refuses"))
+                    .await,
+                (403, None, none.clone()),
+                "{mode:?}: a caller the surface did not verify"
             );
         }
 

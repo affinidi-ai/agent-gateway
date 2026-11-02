@@ -53,6 +53,12 @@ pub enum RejectionReason {
     /// A Fabric request whose managed agent should get a transit token, which
     /// could not be issued.
     TransitTokenUnavailable,
+    /// A Fabric request that a per-user delegated credential binding applies
+    /// to, on a surface that does not release them to partners.
+    DelegationNotEnabledForPartners,
+    /// A Fabric request whose per-user delegated credential needs consent,
+    /// which is never started through a partner.
+    ConsentNotAvailableForPartners,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

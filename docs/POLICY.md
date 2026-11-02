@@ -339,17 +339,17 @@ keep the rule in the Transit Point's own `response_policy`.
 
 | Field | Values | Meaning |
 | --- | --- | --- |
-| `input.transit.caller.verified` | `true` / `false` | `true` when `verification` is `transit_token`; never for `fabric_peer`. |
+| `input.transit.caller.verified` | `true` / `false` | `true` when `verification` is `transit_token`, or `fabric_peer` when the receiving surface verified the caller of the Fabric request itself. It covers the caller's `user_identity_hash` and `fields` only, never a DID. A `fabric_peer` caller's DID is the peer's word, so it is never `did` beside `verified`, only `fabric.caller_did`. Match a caller by `user_identity_hash`, never by a DID. |
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
-| | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`; the caller it sent the request for is not. A rule on `verification == "transit_token"` never matches it. |
+| | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
 | | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a public discovery `GET`. A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
-| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. Present only when `verified`, and absent for a JWT that names no `sub`. |
-| `input.transit.caller.did` | DID | The caller DID the transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. For a `fabric_peer` caller it is present only when a presentation from one of the connection's issuers carried it (`fabric-presentation`), and is still the peer's word: any paired gateway can vouch for any DID; to admit a DID one partner vouches for, match `identity_source == "fabric-presentation"` together with `fabric.peer_issuer_did`. Absent when the token has none. |
-| `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
-| `input.transit.caller.fabric` | object | Present when the transit token was issued for a request that arrived over Fabric: `peer_gateway_id` (the sending gateway's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it) and `hops` (the Fabric crossings the request made). The Fabric handshake verified the peer. |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT that names no `sub`. |
+| `input.transit.caller.did` | DID | The caller DID an Access Point's transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Never present for a `fabric_peer` caller, whose DID is in `fabric.caller_did`. Absent when the token has none. |
+| `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point, or, for a `fabric_peer` caller, on the receiving surface. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
+| `input.transit.caller.fabric` | object | Present for a `fabric_peer` caller, whose transit token was issued for a request that arrived over Fabric: `peer_gateway_id` (the sending gateway's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops` (the Fabric crossings the request made) and `caller_did`. The Fabric handshake verified the peer. `caller_did` is present only when a presentation from one of the connection's issuers carried it (`fabric-presentation`), and is still the peer's word, never verified, even beside `verified: true`: any paired gateway can vouch for any DID. To admit a DID one partner vouches for, match it together with `identity_source == "fabric-presentation"` and `fabric.peer_issuer_did`. |
 | `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
 | | `source_auth` | The Transit Point's own `source_auth` verified the client's API key, JWT or client certificate on this request (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)). `input.source_auth` carries the same identity, with a JWT's claims. |
 | `input.transit.client.method` | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | The source-auth method that verified the client (`api_key` also for `api_key_provider`). |
@@ -370,12 +370,22 @@ An anonymous call looks like this, and a policy that must refuse it denies on
 
 `input.transit.caller` has no `did_verified` and no Agent DNA UAI. Nothing on the Access Point
 verifies a DID presentation yet, so either would be a value the caller asserted. Match a caller
-by `user_identity_hash`, never by `did`.
+by `user_identity_hash`, never by `did` or `fabric.caller_did`.
+
+Audit records of a Transit Point call carrying a Fabric-issued token name the Fabric caller
+(`auth_method: fabric_verified` or `fabric_asserted`, with `peer_gateway`), as they name the
+caller of any transit token. A client the Transit Point verified itself on the same call, with
+its `source_auth` or a resource token, is in `input.transit.client` for policy but not in those
+audit records, which have no field for a second principal; the same holds for an Access Point's
+token that names a caller. Without such a token, the audit records name that client.
 
 To allow only one caller, compare the hash. For the JWT subject `alice` from
 `https://login.example.com` on a surface with no tenant, it is
 `printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256`. An API
-key named `alice`, or `alice` at another issuer, has another hash and is not admitted:
+key named `alice`, or `alice` at another issuer, has another hash and is not admitted. The rule
+also admits a request a paired gateway sent over Fabric whose caller the receiving surface
+verified with the same credential; add `not input.transit.caller.fabric` to keep Fabric
+requests out:
 
 ```rego
 package surface.policy
@@ -414,6 +424,14 @@ default allow := true
 
 allow := false if input.transit.caller.fabric
 ```
+
+`fabric` is present only when the call carries the transit token the gateway issued for the
+partner's request, so this rule, and `not input.transit.caller.fabric` in the hash rule above,
+hold only on a Transit Point that requires the transit token, for an agent that passes the
+token it was given with the request. A Transit Point that does not require the token reads one
+only when the agent sends it, so an agent can leave the rule unmatched by sending none, and an agent that still holds a live Access Point token from a direct request can
+present that instead (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)). The rule keeps out
+partner requests an agent handles as intended, not those of an agent that sends another token.
 
 ## Egress and SSRF controls
 

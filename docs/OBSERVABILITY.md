@@ -351,7 +351,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
-    `consent_identity_required` (credential delegation for an anonymous caller).
+    `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
+    receive for a request whose caller the receiving surface did not verify), and on Fabric
+    receive `delegation_not_enabled_for_partners` (a per-user delegated credential binding
+    applies, which a partner's request never gets); the peer is answered `403` with that reason (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
+    Transit Point records `consent_not_available_for_partners` too, against its surface with the
+    call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
+    and answers the agent `403` with that reason (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
   - `forward`: `ssrf_blocked` (egress policy refuses the target address),
     `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric

@@ -74,6 +74,9 @@ pub enum ModernDelegationError {
     Continuation(ContinuationError),
     Protocol(Box<McpRequestValidationError>),
     Unpaid,
+    /// The caller arrived over Fabric and has no grant yet; consent is never
+    /// started through a partner ([`ModernDelegationContext::prepare_existing_grants`]).
+    ConsentNotAvailableForPartners,
 }
 
 impl From<ContinuationError> for ModernDelegationError {
@@ -97,6 +100,14 @@ impl ModernDelegationError {
         match self {
             Self::Protocol(error) => (*error).into_response(),
             Self::Unpaid => Self::Continuation(ContinuationError::Unavailable).response(request),
+            Self::ConsentNotAvailableForPartners => McpRequestValidationError {
+                status: StatusCode::FORBIDDEN,
+                id: request.id.clone(),
+                code: -32001,
+                message: super::PARTNER_CONSENT_UNAVAILABLE.into(),
+                data: Some(json!({ "reason": super::PARTNER_CONSENT_UNAVAILABLE_REASON })),
+            }
+            .into_response(),
             Self::Continuation(error) => {
                 let (status, code, message) = match error {
                     ContinuationError::Unavailable
@@ -232,7 +243,11 @@ pub async fn prepare_transit(
     let variant_id = context
         .active_variant_id
         .clone();
-    ModernDelegationContext {
+    let fabric_caller = context
+        .transit_token_claims
+        .as_ref()
+        .is_some_and(|claims| claims.fabric.is_some());
+    let prepared = ModernDelegationContext {
         service: &runtime.service,
         deployment: &runtime.config.deployment,
         ttl_secs: runtime.config.ttl_secs,
@@ -271,9 +286,16 @@ pub async fn prepare_transit(
         secrets: state.secrets_store.as_ref(),
         provider_egress: None,
         isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+    };
+    if fabric_caller {
+        prepared
+            .prepare_existing_grants(request, now_secs()?)
+            .await
+    } else {
+        prepared
+            .prepare(request, now_secs()?)
+            .await
     }
-    .prepare(request, now_secs()?)
-    .await
 }
 
 pub fn now_secs() -> Result<u64, ContinuationError> {
@@ -449,11 +471,37 @@ impl ModernDelegationContext<'_> {
             .await
     }
 
+    /// [`Self::prepare`] for a caller that arrived over Fabric: it releases
+    /// only a grant already stored and never starts consent, which a person
+    /// gives by connecting to this gateway directly, so a caller with no grant
+    /// gets [`ModernDelegationError::ConsentNotAvailableForPartners`].
+    pub async fn prepare_existing_grants(
+        &self,
+        request: &ValidatedModernMessage,
+        now: u64,
+    ) -> Result<ModernDelegationResult, ModernDelegationError> {
+        self.prepare_releasing(request, now, false, false)
+            .await
+    }
+
     pub async fn prepare_with_payment(
         &self,
         request: &ValidatedModernMessage,
         now: u64,
         unpaid: bool,
+    ) -> Result<ModernDelegationResult, ModernDelegationError> {
+        self.prepare_releasing(request, now, unpaid, true)
+            .await
+    }
+
+    /// Prepares `request`'s delegated credentials; `starts_consent` is whether
+    /// a caller with no grant may be asked for consent.
+    async fn prepare_releasing(
+        &self,
+        request: &ValidatedModernMessage,
+        now: u64,
+        unpaid: bool,
+        starts_consent: bool,
     ) -> Result<ModernDelegationResult, ModernDelegationError> {
         let normalized = match self.route {
             ContinuationRoute::AccessPoint
@@ -555,6 +603,9 @@ impl ModernDelegationContext<'_> {
                     .claim_delegation(resumed, self.vault, now)
                     .await?
                 {
+                    DelegationClaim::Pending(_) if !starts_consent => {
+                        return Err(ModernDelegationError::ConsentNotAvailableForPartners);
+                    }
                     DelegationClaim::Pending(resumed) => {
                         let issued = self
                             .service
@@ -622,6 +673,9 @@ impl ModernDelegationContext<'_> {
             };
             let credential = credential.filter(|credential| verified_credential(credential, &provider, now));
             let Some(credential) = credential else {
+                if !starts_consent {
+                    return Err(ModernDelegationError::ConsentNotAvailableForPartners);
+                }
                 if !supports_mrtr {
                     return Err(ContinuationError::Denied.into());
                 }
@@ -1734,6 +1788,134 @@ mod tests {
         ));
         assert_eq!(calls(), 3);
         tasks.shutdown().await;
+    }
+
+    /// A Transit Point prepares a Fabric caller's credentials releasing only a
+    /// grant already stored: where a direct caller with no grant is asked for
+    /// consent, such a caller is refused with `403`, `-32001` and the fixed
+    /// reason `consent_not_available_for_partners`, and no consent is issued.
+    #[tokio::test]
+    async fn a_fabric_callers_preparation_never_starts_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let strategies = FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap();
+        let strategy = strategies
+            .create(
+                crate::sts::handlers::gateway_self_trust_strategy("https://identity.example/", &json!({"keys": []}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        providers
+            .create(
+                serde_json::from_value(json!({
+                    "id": "provider", "name": "Provider", "provider_id": "provider",
+                    "resource": "https://provider.example/api", "consent_identity_strategy_id": strategy.id,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface", "name": "Surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://provider.example/api"},
+            "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]
+        }))
+        .unwrap();
+        let authorization = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let caller = AuthenticatedIdentity::JwtBearer {
+            subject: "user".into(),
+            claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+        };
+        let service = ContinuationService::new(
+            ContinuationCipher::new(
+                "deployment".into(),
+                "key".into(),
+                vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+            )
+            .unwrap(),
+            Arc::new(EmbeddedContinuations::new(32).unwrap()),
+        );
+        let context = ModernDelegationContext {
+            service: &service,
+            deployment: "deployment",
+            ttl_secs: 100,
+            surface: &surface,
+            variant_id: None,
+            route: ContinuationRoute::TransitPoint { alias: "partner".into() },
+            authorization: &authorization,
+            identity: &caller,
+            agent_did: "did:web:agent.example",
+            profile: &profile,
+            vault: &vault,
+            providers: &providers,
+            strategies: &strategies,
+            secrets: None,
+            provider_egress: None,
+            isolation: crate::config::credential_policy::RuleMode::Warn,
+        };
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: Some(json!({"elicitation": {"url": {}}})),
+            client_info: None,
+            method: "tools/call".into(),
+            id: Some(json!(7)),
+            kind: McpMessageKind::Request,
+            params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+        };
+
+        let Err(refused) = context
+            .prepare_existing_grants(&request, 10)
+            .await
+        else {
+            panic!("a Fabric caller with no grant is refused");
+        };
+        assert!(matches!(refused, ModernDelegationError::ConsentNotAvailableForPartners));
+        let response = refused.response(&request);
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], 7, "{body}");
+        assert_eq!(body["error"]["code"], -32001, "{body}");
+        assert_eq!(body["error"]["data"]["reason"], "consent_not_available_for_partners", "{body}");
+        assert!(body.get("result").is_none(), "no consent request: {body}");
+
+        assert!(
+            matches!(
+                context
+                    .prepare(&request, 10)
+                    .await,
+                Ok(ModernDelegationResult::InputRequired(_))
+            ),
+            "the same caller connecting directly is asked for consent"
+        );
     }
 
     #[tokio::test]
