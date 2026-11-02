@@ -1746,7 +1746,7 @@ mod tests {
                 ),
                 ("issued".into(), Freshness::Fresh)
             );
-            assert_eq!(fixture.listings(), 0, "{secret_refs:?}");
+            assert_eq!(fixture.listings(), 0, "the secrets store is never listed");
             assert_eq!(fixture.lookups(), [secret_refs.clone(), secret_refs.clone()].concat());
             assert_eq!(
                 issued(
@@ -1756,7 +1756,7 @@ mod tests {
                 ),
                 ("issued".into(), Freshness::Cached)
             );
-            assert_eq!(fixture.listings(), 0, "{secret_refs:?}");
+            assert_eq!(fixture.listings(), 0, "the secrets store is never listed");
             assert_eq!(fixture.lookups(), [secret_refs.clone(), secret_refs.clone(), secret_refs].concat());
             assert_eq!(fixture.requests().len(), 1);
         }
