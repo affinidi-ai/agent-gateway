@@ -661,7 +661,8 @@ for each variant, so a secret the Target leg already sent as Target authenticati
 metadata is not kept when it is moved or copied into response metadata, while one already stored
 in response metadata is kept there when the Target's endpoint changes. Only enabled custom
 metadata counts as already sent, so enabling stored metadata is checked as a new reference; a
-save still checks every reference in disabled metadata. On a tenant surface a `$SECRET:` that
+save still checks every reference in disabled metadata, and keeps one named only there when the
+stored surface held it at the same destination, in enabled or disabled metadata. On a tenant surface a `$SECRET:` that
 names no existing secret is refused like another tenant's secret, whether it is new or already
 stored, in `warn` mode too, so a save never keeps a reference to a secret that was deleted.
 Deleting a secret does not check the surfaces that name it, so a surface stored before the

@@ -3,9 +3,10 @@
 //! record already held is kept in `warn` mode (on a provider, only while it stays in the same
 //! field and goes to the same destination; on a surface, only while each Target and Transit
 //! Point that sends it keeps its endpoint, and response custom metadata keeps going to the
-//! caller) and refused in `enforce` mode, a custom metadata secret that does not exist is refused
-//! on a tenant surface even when stored, and a reassignment that would give a tenant resource an
-//! appliance-wide credential or another tenant's resource is a conflict.
+//! caller, or while it stays in disabled custom metadata) and refused in `enforce` mode, a
+//! custom metadata secret that does not exist is refused on a tenant surface even when stored,
+//! and a reassignment that would give a tenant resource an appliance-wide credential or another
+//! tenant's resource is a conflict.
 
 use serde_json::{Value, json};
 
@@ -17,6 +18,7 @@ const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
 const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
 const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface";
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
+const STORED_DISABLED_METADATA_SURFACE: &str = "stored-disabled-metadata-surface";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
 const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
 const STORED_TENANT_JWT_PROVIDER: &str = "stored-tenant-jwt-provider";
@@ -238,6 +240,10 @@ fn secret_metadata(secret_id: &str) -> Value {
     json!({"enabled": true, "payload": {"outer": {"keys": [format!("$SECRET:{secret_id}")]}}})
 }
 
+fn disabled_secret_metadata(secret_id: &str) -> Value {
+    json!({"enabled": false, "payload": {"k": format!("$SECRET:{secret_id}")}})
+}
+
 fn binding(provider_id: &str) -> Value {
     json!([{"credential_provider_id": provider_id}])
 }
@@ -359,6 +365,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             surface(
                 STORED_DANGLING_METADATA_SURFACE,
                 json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": secret_metadata("no-such-secret")}}),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_DISABLED_METADATA_SURFACE,
+            surface(
+                STORED_DISABLED_METADATA_SURFACE,
+                json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": disabled_secret_metadata("appliance-key")}}),
             ),
         ),
         (
@@ -1180,6 +1196,35 @@ async fn a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused_in_warn
 async fn a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused_in_enforce_mode() {
     let (_harness, api) = harness(RuleMode::Enforce).await;
     assert_a_stored_missing_metadata_secret_on_a_tenant_surface_is_refused(&api).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_wide_secret_in_disabled_metadata_is_kept_in_warn_mode_until_it_is_enabled() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let (status, body) = api
+        .reassign("surfaces", STORED_DISABLED_METADATA_SURFACE, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], "tenant-b", "{body}");
+    let unchanged = api
+        .stored(STORED_DISABLED_METADATA_SURFACE)
+        .await;
+    assert_eq!(unchanged["tenant_id"], "tenant-b", "{unchanged}");
+    assert_eq!(unchanged["target"]["custom_metadata"], disabled_secret_metadata("appliance-key"), "{unchanged}");
+
+    let mut described = unchanged.clone();
+    described["description"] = json!("an unrelated edit");
+    assert_saved(
+        api.put(STORED_DISABLED_METADATA_SURFACE, &described)
+            .await,
+    );
+    let mut enabled = unchanged;
+    enabled["target"]["custom_metadata"]["enabled"] = json!(true);
+    assert_refused(
+        api.put(STORED_DISABLED_METADATA_SURFACE, &enabled)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
