@@ -388,13 +388,17 @@ const AddSurfacePage: React.FC = () => {
     );
     if (policyDefinitionsReason) return { message: policyDefinitionsReason };
     const firstIncomplete = builder.state.nodes.find(
-      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
     );
     if (firstIncomplete) {
       const def = registry.get(firstIncomplete.type);
       const reason =
-        getIncompleteReason(firstIncomplete.type, firstIncomplete.config, surfacePolicyIds) ||
-        'configuration is incomplete';
+        getIncompleteReason(
+          firstIncomplete.type,
+          firstIncomplete.config,
+          surfacePolicyIds,
+          firstIncomplete
+        ) || 'configuration is incomplete';
       return {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
