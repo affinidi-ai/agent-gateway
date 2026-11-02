@@ -1257,9 +1257,17 @@ every change that removes an external consent binding or deletes an external con
 with `503`: it cannot find their grants under its own ids. Restore the pepper the grants were
 written under, or [purge them](#removing-grants). A fingerprint with no grant
 beside it is replaced by the next gateway that stores one. When the fingerprint file is missing
-while grants are stored, the grants decide: unless one the gateway can read has the id its
-pepper derives, the gateway treats them as written under another pepper in every way above, and
-never records its own fingerprint over them.
+while grants are stored, the grants decide, and every one of them is read:
+
+- If any grant does not have the id the gateway's pepper derives, the gateway treats them all as
+  written under another pepper in every way above, and never records its own fingerprint over
+  them. It remembers this until a grant is removed, so a purge takes effect without a restart.
+- If every grant has that id, the gateway records its fingerprint, and later checks read the
+  fingerprint alone.
+- If no grant has another pepper's id but one cannot be read, which pepper they were written
+  under is not known. The startup `ERROR` names the unreadable grant, not the pepper, and a
+  release, removal or provider delete that finds no grant fails as the vault being unavailable
+  until that grant can be read or is purged.
 
 A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
 `ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant

@@ -19,6 +19,16 @@ changes:
         credential now answers it as it answers an anonymous `GET`. Which paths count as
         discovery documents is described in `docs/SOURCE_AUTH.md`.
   fixed:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Check every unfingerprinted delegated grant against the identity pepper
+      description: >-
+        With no pepper fingerprint recorded, the vault took the grants stored for its own as soon as
+        one had the id its identity hash pepper derives, so grants written under another pepper
+        beside it went unnoticed. Every grant is now read: one of another pepper makes them all a
+        mismatch, kept in memory until a grant is removed so a purge takes effect at once, and
+        grants all of this pepper get its fingerprint recorded, so later checks read the
+        fingerprint alone. When none can be read, the vault reports the unreadable grant as
+        unavailable rather than as a pepper mismatch.
     - timestamp: '2026-10-29T12:00:00Z'
       title: Send non-ASCII credential header values to a Transit Point's HTTP target
       description: >-
