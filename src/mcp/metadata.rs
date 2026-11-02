@@ -249,16 +249,16 @@ mod tests {
             injection_target: Some(MetadataInjectionTarget::Both),
         };
 
+        let surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "surface-456".into(),
+            ..Default::default()
+        };
         let result = inject_custom_metadata_mcp(
             &body,
             &cfg,
             "test-surface",
             &None,
-            crate::protocols::MetadataRuntimeContext {
-                request_id: Some("trace-123"),
-                surface_id: Some("surface-456"),
-                ..Default::default()
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(&surface, Some("trace-123")),
         )
         .await
         .unwrap();

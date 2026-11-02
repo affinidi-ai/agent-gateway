@@ -6,6 +6,7 @@ mod access_tokens_pat;
 mod agent_card_preview;
 mod channel_e2e;
 mod connection_point_integration_events_e2e;
+mod custom_metadata_tenancy_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
 mod event_hook_e2e;

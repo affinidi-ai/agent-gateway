@@ -2632,11 +2632,7 @@ async fn enrich_and_evaluate_surface_policies(
             custom_metadata,
             channel_id,
             &None,
-            crate::protocols::MetadataRuntimeContext {
-                request_id,
-                surface_id: Some(config_id),
-                tenancy: crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(surface, request_id),
         )
         .await
         {
@@ -5836,7 +5832,7 @@ async fn process_forward_request_in_request_scope(
     {
         let injected = match crate::mcp::metadata::inject_custom_metadata_with_context(
             &body_bytes, custom_metadata, config_id, &get_secrets_store(),
-            crate::protocols::MetadataRuntimeContext { request_id: audit_trace_id, surface_id: Some(config_id), tenancy: crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()) },
+            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
             mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Params,
         ).await {
             Ok(injected) => injected,
@@ -6621,11 +6617,7 @@ async fn process_forward_request_in_request_scope(
                             response_custom_metadata,
                             channel_id,
                             &None,
-                            crate::protocols::MetadataRuntimeContext {
-                                request_id: audit_trace_id,
-                                surface_id: Some(config_id),
-                                tenancy: crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
-                            },
+                            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
                         )
                         .await
                         {
@@ -6649,7 +6641,7 @@ async fn process_forward_request_in_request_scope(
                     crate::config::ChannelProtocol::Mcp => {
                         let injected = match crate::mcp::metadata::inject_custom_metadata_with_context(
                             &bytes::Bytes::from(response_body.clone()), response_custom_metadata, config_id, &get_secrets_store(),
-                            crate::protocols::MetadataRuntimeContext { request_id: audit_trace_id, surface_id: Some(config_id), tenancy: crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()) },
+                            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
                             mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Result,
                         ).await {
                             Ok(injected) => injected,

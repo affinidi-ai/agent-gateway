@@ -2781,15 +2781,7 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                    tenancy: crate::tenancy::SurfaceTenancy::configured(
-                        ctx.surface
-                            .tenant_id
-                            .as_deref(),
-                    ),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
             )
             .await
             .map_err(|e| {
@@ -2808,15 +2800,7 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                    tenancy: crate::tenancy::SurfaceTenancy::configured(
-                        ctx.surface
-                            .tenant_id
-                            .as_deref(),
-                    ),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
                 ctx.mcp_metadata_context,
                 crate::mcp::meta::McpMetaTarget::TopLevel,
             )
@@ -11482,6 +11466,99 @@ mod tests {
             Some("staging"),
             "default: X-Gateway-env header should be injected"
         );
+    }
+
+    /// Injects `{"credential": "$SECRET:<secret_id>"}` on a `tenant-a` surface under `mode` and
+    /// returns the injected value, read from the A2A metadata extension or the MCP `_meta`.
+    async fn inject_tenant_secret(
+        protocol: ChannelProtocol,
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Result<serde_json::Value, OutboundPipelineError> {
+        let (_dir, secrets_store) = crate::secrets::test_support::tenant_secrets().await;
+        let mut state = test_outbound_state();
+        state.secrets_store = secrets_store;
+        let is_mcp = protocol == ChannelProtocol::Mcp;
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".into());
+        ctx.protocol = Some(protocol);
+        ctx.body_bytes = Some(if is_mcp {
+            mcp_body()
+        } else {
+            Bytes::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {"parts": []}}})
+                    .to_string(),
+            )
+        });
+        ctx.outbound_shared
+            .custom_metadata = Some(crate::config::CustomMetadata {
+            enabled: true,
+            payload: Some(json!({ "credential": format!("$SECRET:{secret_id}") })),
+            injection_target: Some(crate::config::MetadataInjectionTarget::Meta),
+        });
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, step_inject_custom_metadata(&state, &mut ctx))
+            .await?;
+        let body: serde_json::Value = serde_json::from_slice(
+            ctx.body_bytes
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let pointer = if is_mcp {
+            "/_meta/credential".to_string()
+        } else {
+            format!(
+                "/params/message/metadata/{}/credential",
+                crate::config::AFFINIDI_AGENT_METADATA_EXTENSION.replace('/', "~1")
+            )
+        };
+        Ok(body
+            .pointer(&pointer)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {pointer} in {body}")))
+    }
+
+    #[tokio::test]
+    async fn test_step_inject_custom_metadata_holds_a_secret_to_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        for protocol in [ChannelProtocol::A2a, ChannelProtocol::Mcp] {
+            for mode in [RuleMode::Warn, RuleMode::Enforce] {
+                assert_eq!(
+                    inject_tenant_secret(protocol.clone(), mode, "own")
+                        .await
+                        .ok(),
+                    Some(json!("own-value")),
+                    "{protocol:?} {mode:?}"
+                );
+                assert!(
+                    matches!(
+                        inject_tenant_secret(protocol.clone(), mode, "other").await,
+                        Err(OutboundPipelineError::MetadataInjectionFailed)
+                    ),
+                    "{protocol:?} {mode:?}"
+                );
+            }
+            assert_eq!(
+                inject_tenant_secret(protocol.clone(), RuleMode::Warn, "wide")
+                    .await
+                    .ok(),
+                Some(json!("wide-value")),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(
+                    inject_tenant_secret(protocol.clone(), RuleMode::Enforce, "wide").await,
+                    Err(OutboundPipelineError::MetadataInjectionFailed)
+                ),
+                "{protocol:?}"
+            );
+        }
     }
 
     // ── step_inject_trusted_identity ──────────────────────────────────────

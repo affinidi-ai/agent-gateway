@@ -10,6 +10,8 @@ mod filesystem;
 pub mod handlers;
 pub mod router;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
