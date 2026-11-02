@@ -307,9 +307,7 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify), and on Fabric
     receive `delegation_not_enabled_for_partners` (a per-user delegated credential binding
-    applies and the surface does not set `delegated_credentials_for_fabric_callers`) and
-    `consent_not_available_for_partners` (the caller has no grant, and consent is never started
-    through a partner); the peer is answered `403` with that reason (see
+    applies, which a partner's request never gets); the peer is answered `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,

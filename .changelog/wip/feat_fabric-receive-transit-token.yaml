@@ -17,13 +17,10 @@ changes:
         gateway (its Remote gateway record and issuer DID) and the Fabric crossings the request
         made, and a caller DID only when a presentation from one of the connection's issuers
         carried it, in `fabric.caller_did`. It never sets `sub`, so a node that predates it
-        during a rolling upgrade sees an anonymous caller. It never carries a principal, so a
-        Transit Point releases no delegated per-user credential for it, and a Transit Point
-        policy sees the peer as the caller, with `verification` set to `fabric_peer`, the peer
-        in `input.transit.caller.fabric`, and the DID as the peer's assertion even when a
-        presentation from the peer carried it. Audit records name that DID with
-        `auth_method: fabric_asserted` and the peer as `iss`, and the identity presentation a
-        Transit Point signs for its agent never names it as the user the agent acts for. Static
+        during a rolling upgrade sees an anonymous caller. A Transit Point policy sees the
+        peer's caller with `verification` set to `fabric_peer` and the peer in
+        `input.transit.caller.fabric`, and the identity presentation a Transit Point signs for
+        its agent never names the DID as the user the agent acts for. Static
         `target_auth` credentials are added as for any caller. `proxy://` and `a2a-proxy://`
         Targets never get a token, nor does a public discovery `GET` such as an agent card fetch,
         nor a request relayed to an MCP Target over the legacy HTTP+SSE transport, on this path

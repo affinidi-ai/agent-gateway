@@ -483,13 +483,12 @@ whose `params.name` it lists, read after admission has refused batches and ambig
 the grant only by the caller its own source authentication verified on the request: a pseudonym,
 DID or presentation the peer's request names never selects stored credentials. That caller is
 usually the partner's own `target_auth` credential, which names all of the partner's users alike,
-so per-user grants reach a legacy Fabric request only on a surface that sets
-`delegated_credentials_for_fabric_callers: true`, which the admin API accepts only beside caller
-authentication that tells a partner's users apart. Service-level credentials need no switch. The
-receiving gateway never starts consent for a legacy Fabric request, so an opted-in caller with no
-grant is refused too. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
-`partner_caller_not_verified` or `consent_not_available_for_partners`), answered before the Target
-is called and recorded as a `request_rejected`; an agent card fetch is never refused for a binding
+so a per-user grant never reaches a legacy Fabric request; a partner's calls use one only through
+a Transit Point that opts in. Service-level credentials reach a request whose caller the surface
+verified. The receiving gateway never starts consent for a legacy Fabric request. Each refusal is
+a `403` with a fixed reason (`delegation_not_enabled_for_partners` or
+`partner_caller_not_verified`), answered before the Target is called and recorded as a
+`request_rejected`; an agent card fetch is never refused for a binding
 (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 
 The gateway that receives a request applies these rules; the sending gateway's release does not

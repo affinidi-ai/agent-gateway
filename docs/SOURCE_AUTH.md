@@ -267,13 +267,15 @@ that:
   audience, or one the Access Point's rules refuse, such as mTLS trust that names no
   certificate;
 - sets `delegated_credentials_for_fabric_callers` but does not require a transit token, the
-  only way a Fabric caller reaches it (see [Transit token](#transit-token));
-- sets `delegated_credentials_for_fabric_callers` on a surface, or in a variant, whose Access
-  Point caller authentication cannot tell a partner's users apart: anything but a resource
-  token, or a `jwt_bearer` method that names an audience through a JWT verification strategy
-  that names an issuer. With `api_key`, for example, every key in the secret, the partner's and
-  direct callers' alike, is one caller with one grant (see
-  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+  only way a Fabric caller reaches it (see [Transit token](#transit-token)).
+
+A Transit Point that sets `delegated_credentials_for_fabric_callers` on a surface, or in a
+variant, whose Access Point caller authentication cannot tell a partner's users apart (anything
+but a resource token, or a `jwt_bearer` method that names an audience through a JWT
+verification strategy that names an issuer) is saved with a `Warning` header saying so, and
+releases nothing to Fabric callers. With `api_key`, for example, every key in the secret, the
+partner's and direct callers' alike, would be one caller with one grant (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
 
 A surface stored with such a Transit Point still loads, with a warning in the log naming the
 Transit Point and, for one a variant defines, the variant, but the Transit Point refuses every
@@ -322,9 +324,8 @@ with `400` unless it requires a transit token or is marked `allow_unauthenticate
 `PUT` that omits `allow_unauthenticated_callers` keeps it while the Transit Point still
 authenticates no caller, and drops it once the Transit Point authenticates its callers. A
 `PUT` that omits `delegated_credentials_for_fabric_callers` keeps it while the Transit Point
-still requires a transit token and the surface's caller authentication, in the Transit Point's
-view, still tells a partner's users apart, and drops it once either does not; a value the `PUT`
-sends is saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
+still requires a transit token, and drops it once it does not; a value the `PUT` sends is
+saved. A `PUT` matches each Transit Point to the stored one by `id`, and a Transit Point sent without
 an `id` gets a new one, so a `PUT` that omits both the `id` and `source_auth` drops the stored
 `source_auth`: a Transit Point that still requires a transit token is saved, authenticated by
 the token alone, and one that does not is refused with `400`. Send each Transit Point's `id`
@@ -515,7 +516,7 @@ so its agent gets exactly one. It differs from an Access Point token:
 | `caller_context_fields` | The claims the surface's Transit Points allowlist (their enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`), taken from the JWT the receiving surface's own `source_auth` or resource token verified on the request. Never anything the peer's presentation or payload says |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
 | `fabric` | `peer_gateway_id` (the sender's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops`, the Fabric crossings the request made (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)), `caller_did`, only when a presentation from one of the connection's issuers carried it: never a DID the peer only named, one this gateway computed from fields the peer sent, or a payload pseudonym, and `principal_hash` (below) |
-| `fabric.principal_hash` | The [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) of the caller the receiving surface's own `source_auth` or resource token verified on this request, the value an Access Point would put in `user_identity_hash` for the same credential. Absent when the surface verified no caller (it has no caller authentication, or a caller-attributable failure was left to policy), or when its caller authentication cannot tell a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), such as an API key that names every key in its secret as one caller. Never derived from the caller DID, presentation or payload the peer sent |
+| `fabric.principal_hash` | The [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) of the caller the receiving surface's own `source_auth` or resource token verified on this request, the value an Access Point would put in `user_identity_hash` for the same credential. Absent when the surface verified no caller (it has no caller authentication, or a caller-attributable failure was left to policy), or when its caller authentication cannot tell a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)), such as an API key that names every key in its secret as one caller. Never derived from the caller DID, presentation or payload the peer sent |
 
 The peer gateway is always verified, by the Fabric handshake. Its caller is verified only when
 the receiving surface checked a credential itself on the request, normally the one the peer's
