@@ -3,7 +3,7 @@
  *
  * Covers the JWT Bearer provider form (Subject is required), the read-only editor shown to a
  * user who may view but not edit credential providers, and the redirect from the retired
- * OIDC Providers pages to the Credential providers tab.
+ * OIDC Providers pages to the Credential providers tab, and deleting a secret that is in use.
  *
  * The gateway API is mocked with `page.route`, so the tests need no stored providers or secrets.
  */
@@ -131,3 +131,76 @@ test.describe('Credential providers: retired OIDC Providers pages', () => {
         });
     }
 });
+
+test.describe('Secrets: delete a secret that is in use', () => {
+    const IN_USE = {
+        message: 'The secret is in use; remove its references first, or delete it with force=true',
+        references: [
+            {kind: 'surface', id: 'surf-1', name: 'Billing surface'},
+            {kind: 'credential_provider', id: 'prov-1', name: 'Calendar provider'},
+        ],
+        hidden_references: 2,
+    };
+
+    async function mockSecrets(page: Page, deletes: string[]) {
+        let gone = false;
+        await page.route(/\/api\/v1\/secrets\/?$/, route =>
+            route.fulfill({
+                json: gone
+                    ? []
+                    : [{...SECRETS[0], tags: [], created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z'}],
+            }),
+        );
+        await page.route(/\/api\/v1\/secrets\/sec-key(\?.*)?$/, async route => {
+            if (route.request().method() !== 'DELETE') {
+                await route.fallback();
+                return;
+            }
+            deletes.push(route.request().url());
+            if (route.request().url().includes('force=true')) {
+                gone = true;
+                await route.fulfill({status: 204});
+            } else {
+                await route.fulfill({status: 409, json: IN_USE});
+            }
+        });
+    }
+
+    async function clickDelete(page: Page) {
+        const remove = page.getByTestId('secrets-delete-button-sec-key');
+        await remove.click();
+        await remove.click();
+    }
+
+    test('names the references, and Cancel deletes nothing', async ({page}) => {
+        const deletes: string[] = [];
+        await mockSecrets(page, deletes);
+        await page.goto(`${BASE_URL}/secrets`);
+        await clickDelete(page);
+
+        const references = page.getByTestId('confirm-delete-secret-references');
+        await expect(references).toContainText('Surface: Billing surface');
+        await expect(references).toContainText('Credential provider: Calendar provider');
+        await expect(page.getByTestId('confirm-delete-secret-references-hidden')).toHaveText(
+            'and 2 more you cannot view',
+        );
+
+        await page.getByTestId('confirm-delete-secret-cancel').click();
+        await expect(page.getByTestId('confirm-delete-secret-modal')).toHaveCount(0);
+        expect(deletes).toHaveLength(1);
+        await expect(page.getByTestId('secrets-delete-button-sec-key')).toBeVisible();
+    });
+
+    test('Delete secret anyway sends force=true and removes the secret', async ({page}) => {
+        const deletes: string[] = [];
+        await mockSecrets(page, deletes);
+        await page.goto(`${BASE_URL}/secrets`);
+        await clickDelete(page);
+        await page.getByTestId('confirm-delete-secret-confirm').click();
+
+        await expect.poll(() => deletes.length).toBe(2);
+        expect(deletes[1]).toContain('force=true');
+        await expect(page.getByTestId('secrets-delete-button-sec-key')).toHaveCount(0);
+    });
+});
+

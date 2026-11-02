@@ -9,8 +9,7 @@
  * (the browser removes them), so the CR/LF rule is covered by a stored setting that already
  * carries one, which the dashboard keeps and warns about. The Jest suite covers typed values.
  *
- * Deleting a secret that credential providers use is covered by its own spec, added with the
- * secret delete guard.
+ * Deleting a secret that credential providers use is covered in `credential-providers.spec.ts`.
  */
 
 import type {Page, Request} from '@playwright/test';
