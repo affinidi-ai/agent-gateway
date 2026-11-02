@@ -460,11 +460,30 @@ mod tests {
         let token = manager
             .create_session("alice".into(), "user-a".into())
             .await;
-        let expires_at = |session: Option<Session>| session.expect("session").expires_at;
-        let before = expires_at(manager.storage.get(&token).await.unwrap());
+        let expires_at = |session: Option<Session>| {
+            session
+                .expect("session")
+                .expires_at
+        };
+        let before = expires_at(
+            manager
+                .storage
+                .get(&token)
+                .await
+                .unwrap(),
+        );
 
         assert!(manager.is_live(&token).await);
-        assert_eq!(expires_at(manager.storage.get(&token).await.unwrap()), before);
+        assert_eq!(
+            expires_at(
+                manager
+                    .storage
+                    .get(&token)
+                    .await
+                    .unwrap()
+            ),
+            before
+        );
 
         manager
             .storage
@@ -478,7 +497,9 @@ mod tests {
                 .await
         );
 
-        manager.remove_session(&token).await;
+        manager
+            .remove_session(&token)
+            .await;
         assert!(!manager.is_live(&token).await);
     }
 

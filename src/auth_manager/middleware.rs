@@ -1342,11 +1342,9 @@ mod tests {
 
     #[tokio::test]
     async fn rbac_guard_allows_only_an_approved_user() {
-        for (status, expected) in [
-            (UserStatus::Approved, true),
-            (UserStatus::New, false),
-            (UserStatus::Disabled, false),
-        ] {
+        for (status, expected) in
+            [(UserStatus::Approved, true), (UserStatus::New, false), (UserStatus::Disabled, false)]
+        {
             let (storage, _tmp) = make_storage_with_user(mk_user_data("user-1", "alice", status)).await;
             let guard = RbacGuard::new(storage, Arc::new(crate::rbac::RbacConfig::default()));
 

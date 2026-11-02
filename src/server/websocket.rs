@@ -1002,7 +1002,8 @@ mod tests {
     #[tokio::test]
     async fn a_connection_may_read_logs_only_when_its_user_holds_logs_view() {
         let dir = TempDir::new().unwrap();
-        let power_user = caller_for(guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await, "user-1").await;
+        let power_user =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::PowerUser).await, "user-1").await;
         assert!(super::WsCaller::logs_allowed(Some(&power_user)).await);
 
         let dir = TempDir::new().unwrap();
