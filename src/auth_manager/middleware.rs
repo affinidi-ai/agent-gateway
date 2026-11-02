@@ -426,6 +426,9 @@ async fn access_token_request(
                 };
             }
             PathScope::Unscoped if !is_read => return refused(StatusCode::FORBIDDEN),
+            PathScope::HandlerEnforcedForTenants if !is_read && tenant_context.is_none() => {
+                return refused(StatusCode::FORBIDDEN);
+            }
             PathScope::DenyScoped => {
                 return if is_read {
                     StatusCode::NOT_FOUND.into_response()
@@ -1425,6 +1428,94 @@ mod tests {
         assert_eq!(refused["policy_definition_id"], "deny-pii");
         assert_eq!(refused["actor"], serde_json::json!({"kind": "pat", "id": "scoped-token", "user_id": "user-1"}));
         assert_eq!(refused["reason"], "forbidden");
+    }
+
+    /// An access token whose scope names `pattern`, for `tenant` when one is
+    /// given (`x-tenant` must then name it).
+    struct PatternPat {
+        pattern: &'static str,
+        tenant: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for PatternPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            let headers = if self.tenant {
+                vec![crate::auth_manager::resource_scope::RequiredHeader {
+                    name: "x-tenant".to_string(),
+                    pattern: "tenant-a".to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let scope = if self.tenant {
+                crate::auth_manager::resource_scope::compile(Some(self.pattern), &headers).unwrap()
+            } else {
+                crate::auth_manager::resource_scope::CompiledResourceScope::untenanted_for_tests(self.pattern)
+            };
+            (token == "pattern-pat").then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "pattern-token".to_string(),
+                delegation_depth: 0,
+                resource_scope: Some(Arc::new(scope)),
+            })
+        }
+    }
+
+    /// A resource-scoped token without a tenant is no operator: it removes no
+    /// grant by binding, by id or by binding, as before the connect API, and
+    /// may still read. A tenant's token reaches the handler, which enforces
+    /// its tenant and pattern.
+    #[tokio::test]
+    async fn only_a_tenants_scoped_token_reaches_the_removal_of_grants_by_binding() {
+        let app = |pat: PatternPat| {
+            Router::new()
+                .route("/api/v1/delegation-vault/grants", axum::routing::get(ok_handler).delete(ok_handler))
+                .route("/api/v1/delegation-vault/grants/{grant_id}", axum::routing::delete(ok_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    AuthGuardState::new(
+                        Arc::new(SessionManager::new()),
+                        None,
+                        Arc::new(crate::terms::TermsManager::disabled()),
+                    )
+                    .with_pat_authenticator(Some(Arc::new(pat))),
+                    require_session_auth,
+                ))
+        };
+        let send = |app: Router, method: Method, uri: &'static str| async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(axum::http::header::AUTHORIZATION, "Bearer pattern-pat")
+                    .header("x-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        let untenanted = || PatternPat {
+            pattern: "^surface-a$",
+            tenant: false,
+        };
+        let tenanted = || PatternPat {
+            pattern: "TENANT:${x-tenant}:delegation-vault:surface-a",
+            tenant: true,
+        };
+        for uri in ["/api/v1/delegation-vault/grants/grant-1", "/api/v1/delegation-vault/grants?surface_id=surface-a"] {
+            assert_eq!(send(app(untenanted()), Method::DELETE, uri).await, StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(send(app(tenanted()), Method::DELETE, uri).await, StatusCode::OK, "{uri}");
+        }
+        assert_eq!(
+            send(app(untenanted()), Method::GET, "/api/v1/delegation-vault/grants?surface_id=surface-a").await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

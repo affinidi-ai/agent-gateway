@@ -91,6 +91,9 @@ pub enum ResourceKind {
     CredentialProviders,
     JwtVerificationStrategies,
     StsClients,
+    /// The delegation vault's grants by binding and their connects, named by
+    /// the surface they serve.
+    DelegationVault,
 }
 
 impl ResourceKind {
@@ -114,6 +117,7 @@ impl ResourceKind {
             "credential-providers" => Some(Self::CredentialProviders),
             "jwt-verification-strategies" => Some(Self::JwtVerificationStrategies),
             "sts-clients" => Some(Self::StsClients),
+            "delegation-vault" => Some(Self::DelegationVault),
             _ => None,
         }
     }
@@ -138,6 +142,7 @@ impl ResourceKind {
             Self::CredentialProviders => "credential-providers",
             Self::JwtVerificationStrategies => "jwt-verification-strategies",
             Self::StsClients => "sts-clients",
+            Self::DelegationVault => "delegation-vault",
         }
     }
 }

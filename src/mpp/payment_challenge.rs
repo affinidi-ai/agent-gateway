@@ -115,8 +115,9 @@ fn parse_single_challenge(segment: &str) -> Option<ParsedChallenge> {
     })
 }
 
-/// Parse auth-param pairs: `key="value", key2="value2"`
-fn parse_auth_params(s: &str) -> std::collections::HashMap<String, String> {
+/// Parse auth-param pairs: `key="value", key2="value2"`, keys lower-cased.
+/// Also reads the parameters of an RFC 6750 `Bearer` challenge.
+pub(crate) fn parse_auth_params(s: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let mut remaining = s.trim();
 

@@ -256,7 +256,7 @@ pub async fn reassign_ownership(
 fn parse_owned_kind(raw: &str) -> Result<ResourceKind, OwnershipApiError> {
     let kind = ResourceKind::from_path_family(raw)
         .ok_or_else(|| OwnershipApiError::BadRequest(format!("Unsupported resource kind: {}", raw)))?;
-    if matches!(kind, ResourceKind::ApiKeys | ResourceKind::ConnectionPoints) {
+    if matches!(kind, ResourceKind::ApiKeys | ResourceKind::ConnectionPoints | ResourceKind::DelegationVault) {
         return Err(OwnershipApiError::BadRequest(format!(
             "{} ownership is inherited from its parent and cannot be reassigned directly",
             kind
@@ -306,6 +306,7 @@ async fn load_owned_resource(
             .map_err(internal)?
             .map(|resource| owned(kind, resource.id, resource.name, resource.tenant_id)),
         ResourceKind::Integrations => return Err(appliance_wide(kind)),
+        ResourceKind::DelegationVault => return Err(inherited(kind)),
         ResourceKind::Mediators => state
             .mediator_store
             .as_ref()
@@ -994,6 +995,7 @@ async fn persist_tenant_id(
                 .map_err(internal)?;
         }
         ResourceKind::Integrations => return Err(appliance_wide(kind)),
+        ResourceKind::DelegationVault => return Err(inherited(kind)),
         ResourceKind::Mediators => {
             let store = state
                 .mediator_store
@@ -1017,17 +1019,17 @@ async fn persist_tenant_id(
                 .trust_registry_store
                 .as_ref()
                 .ok_or_else(|| unavailable(kind))?;
-            let mut resource = store
-                .get(id)
+            store
+                .modify(
+                    id,
+                    Box::new(move |resource| {
+                        resource.tenant_id = tenant_id;
+                        resource.updated_at = chrono::Utc::now();
+                    }),
+                )
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
-            resource.tenant_id = tenant_id;
-            resource.updated_at = chrono::Utc::now();
-            store
-                .update(&resource)
-                .await
-                .map_err(internal)?;
         }
         ResourceKind::Authorities => {
             let store = state
@@ -1280,6 +1282,13 @@ fn conflict_response(
 }
 
 /// Integrations, their endpoints and event sets belong to the whole appliance.
+/// Grants by binding belong to the surface they serve and move with it.
+fn inherited(kind: ResourceKind) -> OwnershipApiError {
+    OwnershipApiError::BadRequest(format!(
+        "{kind} ownership is inherited from its parent and cannot be reassigned directly"
+    ))
+}
+
 fn appliance_wide(kind: ResourceKind) -> OwnershipApiError {
     OwnershipApiError::BadRequest(format!("{kind} belong to the whole appliance and cannot be reassigned"))
 }

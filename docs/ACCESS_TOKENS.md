@@ -84,6 +84,20 @@ fails closed with `403` at auth time unless the deployment configures
 and overwrites/strips the header before it reaches the gateway. UUID-backed
 resources are matched as `TENANT:<tenant>:<resource-kind>:<resource-id>`.
 
+`delegation-vault` is a resource kind for the connect API and the grants by binding only:
+`POST /api/v1/delegation-vault/connects`, `POST .../connects/{id}/complete`, and `GET` and
+`DELETE /api/v1/delegation-vault/grants[/{id}]`. Their handlers enforce it, naming a binding's
+grants by the surface they serve (`TENANT:<tenant>:delegation-vault:<surface id>`), and a
+tenant's token reaches only its own tenant's surfaces. Starting and completing a connect, and
+the report of a surface's grants, need the `delegation_vault.connect` feature scope, so a PAT
+provisioned for the connect API needs no `delegation_vault.view`; removing grants needs
+`delegation_vault.delete`. The removal routes refuse a resource-scoped token that names no
+tenant, as the vault's other writes do: only an operator purges a grant it cannot read. The
+vault's other routes (the agent-keyed tokens, the mass revoke and the delegation audit) are not
+a resource-scoped family, and a PAT with a `resource_pattern` is still refused there for
+anything but a read. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
+
 Header validation patterns are fully anchored and must match the entire sample
 value (`\d` matches one digit; use `\d{4}` for four).
 

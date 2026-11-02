@@ -35,9 +35,22 @@ impl BootstrapConfig {
         Ok(origins)
     }
 
+    /// Reads `external_consent_issuers` from `gateway.json` when the gateway
+    /// starts and pins it, as [`Self::pin_external_consent_resource_origins`]
+    /// pins the resource origins: provider create, surface save and the
+    /// connect API keep the value they started with, so every later
+    /// [`Self::load_network_config`] takes it too. A change takes a restart.
+    pub fn pin_external_consent_issuers(
+        &mut self
+    ) -> anyhow::Result<Option<std::collections::HashMap<String, Vec<String>>>> {
+        let issuers = NetworkConfig::load_from_file(&self.config_files.gateway)?.external_consent_issuers;
+        self.pinned_external_consent_issuers = Some(issuers.clone());
+        Ok(issuers)
+    }
+
     /// Load network configuration from the configured path, with the
-    /// `transit_token_max_lifetime_secs` and `external_consent_resource_origins`
-    /// pinned at startup, once pinned. A `WARN` says when the file holds a
+    /// `transit_token_max_lifetime_secs`, `external_consent_resource_origins`
+    /// and `external_consent_issuers` pinned at startup, once pinned. A `WARN` says when the file holds a
     /// different value, which takes a restart.
     pub fn load_network_config(&self) -> anyhow::Result<NetworkConfig> {
         let network_path = &self.config_files.gateway;
@@ -58,6 +71,15 @@ impl BootstrapConfig {
                  which it keeps until it restarts"
             );
             network_config.external_consent_resource_origins = origins.clone();
+        }
+        if let Some(issuers) = &self.pinned_external_consent_issuers
+            && network_config.external_consent_issuers != *issuers
+        {
+            warn!(
+                "{network_path}: external_consent_issuers differs from the value the gateway started with, which it \
+                 keeps until it restarts"
+            );
+            network_config.external_consent_issuers = issuers.clone();
         }
 
         if let Some((old_domain, new_domain)) = network_config.normalize_localhost_did_domain() {
@@ -668,6 +690,69 @@ mod tests {
                 "{on_disk}"
             );
         }
+    }
+
+    /// `external_consent_issuers`, which provider create, surface save, the
+    /// connect API and every request check, is pinned at startup too: a later
+    /// load keeps it, whether the file adds, changes or removes it.
+    #[test]
+    fn the_external_consent_issuers_are_pinned_when_the_gateway_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let write = |issuers: Option<serde_json::Value>| {
+            let mut config = serde_json::json!({
+                "did": { "domain": "test.local" },
+                "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+                "integration": { "types": [], "categories": [] },
+                "listeners": [],
+                "routes": {}
+            });
+            if let Some(issuers) = issuers {
+                config["external_consent_issuers"] = issuers;
+            }
+            std::fs::write(&gateway_json, config.to_string()).unwrap();
+        };
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.gateway = gateway_json
+            .to_string_lossy()
+            .into_owned();
+        write(Some(serde_json::json!({ "https://accounts.example": [] })));
+        let pinned = bootstrap
+            .pin_external_consent_issuers()
+            .unwrap();
+        let expected = Some(std::collections::HashMap::from([("https://accounts.example".to_string(), Vec::new())]));
+        assert_eq!(pinned, expected);
+        for on_disk in [None, Some(serde_json::json!({})), Some(serde_json::json!({ "https://other.example": [] }))] {
+            write(on_disk.clone());
+            assert_eq!(
+                bootstrap
+                    .load_network_config()
+                    .unwrap()
+                    .external_consent_issuers,
+                expected,
+                "{on_disk:?}"
+            );
+        }
+
+        write(None);
+        assert_eq!(
+            bootstrap
+                .pin_external_consent_issuers()
+                .unwrap(),
+            None
+        );
+        write(Some(serde_json::json!({ "https://accounts.example": [] })));
+        assert_eq!(
+            bootstrap
+                .load_network_config()
+                .unwrap()
+                .external_consent_issuers,
+            None,
+            "a list added after startup takes a restart"
+        );
     }
 
     /// Provider create and surface save read `external_consent_resource_origins`

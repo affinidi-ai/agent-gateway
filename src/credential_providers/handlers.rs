@@ -54,6 +54,10 @@ pub struct CredentialProviderState {
     /// gateway.json's `external_consent_resource_origins`: the resource origins
     /// permitted, beyond the issuer's own host, for each issuer's providers.
     pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
+    /// gateway.json's `external_consent_issuers`: when set, the only issuers an
+    /// external consent provider may name, with the origins their endpoints may
+    /// use beyond the issuer's own host.
+    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// A provider as the API returns it, with `resource_origin`, the only origin
@@ -500,7 +504,7 @@ pub async fn create_provider(
     req.jwt = req.jwt.normalized();
     let now = Utc::now();
 
-    let provider = CredentialProvider {
+    let mut provider = CredentialProvider {
         id: id.clone(),
         tenant_id: req.tenant_id,
         name: req.name.trim().to_string(),
@@ -535,6 +539,9 @@ pub async fn create_provider(
         token_endpoint_auth_method: req.token_endpoint_auth_method,
         client_id: req.client_id,
         allow_unadvertised_pkce: req.allow_unadvertised_pkce,
+        authorization_response_iss_parameter_supported: None,
+        scope_comparison: req.scope_comparison,
+        revocation_ends_authorization: req.revocation_ends_authorization,
         created_at: now,
         updated_at: now,
     };
@@ -618,6 +625,14 @@ pub async fn create_provider(
         return error.into_response();
     }
 
+    if provider.is_external_consent() && tenant_context(&context).is_some() && state.issuers.is_none() {
+        warn!(
+            target: "credential_delegation",
+            provider_id = ?provider.provider_id,
+            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers"
+        );
+        return super::external::ExternalProviderError::IssuersRequired.into_response();
+    }
     if provider.is_external_consent() && !super::external::resource_permitted(&provider, &state.resource_origins) {
         warn!(
             target: "credential_delegation",
@@ -625,6 +640,23 @@ pub async fn create_provider(
             "Refused a credential provider whose resource is not permitted for its issuer"
         );
         return super::external::ExternalProviderError::ResourceNotPermitted.into_response();
+    }
+    if provider.is_external_consent()
+        && let Err(field) = super::external::issuer_permitted(
+            &provider,
+            state
+                .issuers
+                .as_ref()
+                .as_ref(),
+        )
+    {
+        warn!(
+            target: "credential_delegation",
+            provider_id = ?provider.provider_id,
+            field,
+            "Refused a credential provider that the gateway's external_consent_issuers does not permit"
+        );
+        return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
     }
 
     if let Some(issuer) = provider.issuer.clone() {
@@ -650,6 +682,24 @@ pub async fn create_provider(
             );
             return error.into_response();
         }
+        if let Err(field) = super::external::metadata_permitted(
+            &metadata,
+            state
+                .issuers
+                .as_ref()
+                .as_ref(),
+        ) {
+            warn!(
+                target: "credential_delegation",
+                provider_id = ?provider.provider_id,
+                field,
+                "Refused a credential provider whose issuer's metadata the gateway's external_consent_issuers does \
+                 not permit"
+            );
+            return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
+        }
+        provider.authorization_response_iss_parameter_supported =
+            Some(metadata.authorization_response_iss_parameter_supported);
     }
 
     match state
@@ -852,6 +902,9 @@ pub async fn update_provider(
         token_endpoint_auth_method: existing.token_endpoint_auth_method,
         client_id: existing.client_id,
         allow_unadvertised_pkce: existing.allow_unadvertised_pkce,
+        authorization_response_iss_parameter_supported: existing.authorization_response_iss_parameter_supported,
+        scope_comparison: existing.scope_comparison,
+        revocation_ends_authorization: existing.revocation_ends_authorization,
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
@@ -1120,12 +1173,9 @@ async fn remove_provider_grants(
         secrets: Some(Arc::clone(&state.secrets_store)),
         exact_allowlist: state.egress_allowlist.clone(),
         actor: actor.cloned(),
+        vault: Some(Arc::clone(vault)),
     };
-    let ids = grants
-        .into_iter()
-        .map(|grant| grant.id)
-        .collect();
-    crate::delegation_vault::revocation::delete_then_revoke(vault, ids, revoker, bindings, Some(outcome))
+    crate::delegation_vault::revocation::delete_then_revoke(vault, grants, revoker, bindings, Some(outcome))
         .await
         .map(Some)
         .map_err(|error| {
@@ -1300,6 +1350,7 @@ mod jwt_provider_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Arc::default(),
+            issuers: Arc::default(),
         }
     }
 
@@ -2320,6 +2371,7 @@ mod consent_strategy_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Default::default(),
+            issuers: Default::default(),
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -2465,6 +2517,7 @@ mod consent_strategy_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Default::default(),
+            issuers: Default::default(),
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
@@ -2627,7 +2680,96 @@ mod external_provider_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Default::default(),
+            issuers: Arc::new(Some(std::collections::HashMap::from([(
+                crate::credential_providers::external::tests::ISSUER.to_string(),
+                Vec::new(),
+            )]))),
         }
+    }
+
+    /// While the operator lists no `external_consent_issuers`, a tenant's
+    /// token cannot create an external consent provider, whose endpoints the
+    /// tenant would choose: the answer tells the operator to set the list. An
+    /// operator still can, and a tenant can once the list names the issuer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_creates_an_external_provider_only_once_the_operator_lists_its_issuers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(&directory, Ok(metadata())).await;
+        state.issuers = Arc::new(None);
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "external_consent_issuers_required");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("external_consent_issuers") && error.contains("gateway.json")),
+            "{body}"
+        );
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+
+        let operator = create_provider(State(state.clone()), None, None, None, create_request(|_| {}))
+            .await
+            .into_response();
+        assert_eq!(operator.status(), StatusCode::CREATED, "an operator's own provider needs no list");
+
+        state.issuers = Arc::new(Some(std::collections::HashMap::from([(
+            crate::credential_providers::external::tests::ISSUER.to_string(),
+            Vec::new(),
+        )])));
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// With `external_consent_issuers` set, a provider is created only for a
+    /// listed issuer whose endpoints and `jwks_uri` are on its host or listed
+    /// for it; an unlisted issuer's metadata is never fetched. The metadata's
+    /// RFC 9207 flag is recorded on the provider, never taken from the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_issuer_the_operator_lists_is_created_and_its_iss_support_is_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut state = state(&directory, Ok(metadata())).await;
+        let counted = Arc::clone(&fetched);
+        state.issuer_metadata = Arc::new(move |_issuer| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(metadata()) })
+        });
+        state.issuers =
+            Arc::new(Some(std::collections::HashMap::from([("https://issuer.example".to_string(), Vec::new())])));
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_issuer_not_permitted");
+        assert_eq!(body["field"], "issuer");
+        assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 0, "an unlisted issuer is never fetched");
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+
+        state.issuers =
+            Arc::new(Some(std::collections::HashMap::from([("https://203.0.113.10".to_string(), Vec::new())])));
+        let mut jwks_elsewhere = metadata();
+        jwks_elsewhere.jwks_uri = Some("https://203.0.113.66/jwks".into());
+        state.issuer_metadata = answering(Ok(jwks_elsewhere));
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_issuer_not_permitted");
+        assert_eq!(body["field"], "jwks_uri");
+
+        state.issuer_metadata = answering(Ok(metadata()));
+        let (status, body) = create(
+            &state,
+            "tenant-a",
+            create_request(|body| body["authorization_response_iss_parameter_supported"] = json!(false)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(stored(&state).await[0].authorization_response_iss_parameter_supported, Some(true));
     }
 
     fn tenant(tenant_id: &str) -> Option<Extension<PatTenantContext>> {
@@ -3198,7 +3340,8 @@ mod external_provider_tests {
     /// A provider delete holds the provider lock only while it checks the
     /// bindings and deletes the grants and the provider; the grants are
     /// revoked afterwards, on a task of their own, so a vendor that hangs keeps
-    /// neither the delete nor another tenant's surface write waiting.
+    /// neither the delete nor another tenant's surface write or connect
+    /// completion waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hung_vendor_never_holds_the_provider_lock_of_a_provider_delete() {
         use crate::delegation_vault::grants::GrantKey;
@@ -3276,6 +3419,29 @@ mod external_provider_tests {
         .await
         .expect("another tenant's surface write never waits on the vendor")
         .expect("and is saved");
+
+        let mut connected = bound_surface(json!({"where": "transit_point", "binding": {
+            "credential_provider_id": "provider-b", "consent_mode": "external", "subject": "owner"}}));
+        connected.surface_id = "tenant-b-connected".into();
+        connected.tenant_id = Some("tenant-b".into());
+        surfaces
+            .save(&connected)
+            .await
+            .unwrap();
+        let key = GrantKey::owner(Some("tenant-b"), "tenant-b-connected", "tp-1", "provider-b");
+        tokio::time::timeout(
+            quick,
+            crate::identity::handlers::surface_grants::store_grant_while_bound(
+                &vault,
+                surfaces.as_ref(),
+                crate::delegation_vault::grants::tests::grant(&key, "tenant-b-access"),
+                &["read".to_string()],
+            ),
+        )
+        .await
+        .expect("another tenant's connect completion never waits on the vendor")
+        .expect("and its grant is stored");
+
         let reached = async {
             while server.requests().is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;

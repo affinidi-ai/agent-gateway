@@ -123,6 +123,12 @@ in force, because it was evicted, as when its surface is deleted while the
 request is in flight, or never compiled, refuses every `tools/call` and answers
 `tools/list` with the fail-closed empty list below.
 
+An MCP Transit Point forwards with `Accept-Encoding: identity` in place of the managed agent's
+value, so its target answers uncompressed: the gateway does not decompress, and a `tools/list`
+filter or a response check reads the body as it is sent. An answer whose `Content-Encoding`
+names anything but `identity` all the same is refused with `502`, since none of it could be
+checked.
+
 Per-Transit-Point gating is compiled from the surface's own Transit Points only,
 so a variant's Transit Point is gated by the surface's Transit Point of the same
 alias, and gating set on a variant's Transit Point is not supported. A variant

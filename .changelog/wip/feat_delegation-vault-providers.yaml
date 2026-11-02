@@ -60,16 +60,15 @@ changes:
         stay where they are and are never moved into grants by binding, so people connect their
         accounts again through external consent.
     - timestamp: '2026-10-30T22:00:00Z'
-      title: Accept consent_mode external on a Transit Point, refusing calls without a grant
+      title: Release a vendor grant on a Transit Point with consent_mode external
       description: >-
         A Transit Point's `transit_credentials` can set `consent_mode: external` with a
         `subject` of `owner` (one grant every caller uses) or `caller` (one per caller's identity
         hash), for a credential provider with an issuer of the surface's own tenant. The Transit
-        Point then looks up the grant the vault keeps for that tenant, surface, Transit Point,
-        provider and principal, needs no managed agent identity, never builds an authorization
-        URL, and refuses the call with 503 before forwarding it when no live grant can be
-        released. This release has no route that obtains or stores such a grant, so every call
-        through such a binding is refused until one is stored. A call that names no caller is refused with 403, so an anonymous caller never
+        Point then injects the grant the vault keeps for that tenant, surface, Transit Point,
+        provider and principal, which another system obtains through the connect API, needs no
+        managed agent identity, never builds an authorization URL, and refuses the call before
+        forwarding it when no live grant can be released. A call that names no caller is refused with 403, so an anonymous caller never
         acts as the owner. The grant goes only to the origin of the provider's `resource`: the
         Transit Point must target it over public `https`, never over Fabric, its id must appear
         in one place only, the surface's Transit Points or one variant's, so the grant is used
@@ -102,7 +101,8 @@ changes:
         read again under the surface's lock: its grants are revoked when the change was saved,
         and put back otherwise. Both run on a task of their own, so the change never waits on a
         vendor; a grant whose tokens were rotated meanwhile has its current tokens revoked.
-        Revocations in flight when the gateway stops are abandoned. A change
+        Each removed grant is kept, encrypted, until its revocation reached the vendor, so
+        revocations in flight when the gateway stops are tried again when it starts. A change
         that adds a binding deletes any grant left under it,
         so re-adding the same surface, Transit Point id and provider, or enabling the variant
         again, needs a new consent. Only the grants of the bindings a change touches are read: a

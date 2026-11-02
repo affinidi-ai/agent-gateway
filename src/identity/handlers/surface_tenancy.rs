@@ -140,6 +140,10 @@ pub async fn validate_external_consent_bindings(
         &state
             .network_config
             .external_consent_resource_origins,
+        state
+            .network_config
+            .external_consent_issuers
+            .as_ref(),
     )
     .await
 }
@@ -158,6 +162,7 @@ async fn check_external_consent_bindings(
     surface: &AgentSurface,
     storage: GrantStorage,
     resource_origins: &std::collections::HashMap<String, Vec<String>>,
+    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
     let mut views = vec![(String::new(), surface.clone())];
@@ -248,6 +253,11 @@ async fn check_external_consent_bindings(
                     "the credential provider's resource is not permitted for its issuer: on the issuer's host or one \
                      of its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
                 ));
+            }
+            if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, issuers) {
+                return Err(refuse(&format!(
+                    "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
+                )));
             }
         }
     }
@@ -348,6 +358,11 @@ pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&
         .collect()
 }
 
+/// The hop that names the grants of a surface's Access Point Target, which no
+/// Transit Point with `consent_mode: external` may take as its id: its grants
+/// are kept under its id, and would share the Target's.
+pub(crate) const RESERVED_TARGET_HOP: &str = "target";
+
 /// A Transit Point id with a `consent_mode: external` binding anywhere in the
 /// surface names one Transit Point in one place: it appears once, in the
 /// surface's own list or in one variant's, and in no other list, whatever its
@@ -383,6 +398,12 @@ pub(super) fn check_external_transit_point_ids(surface: &AgentSurface) -> Result
             }
             if !external.contains(point.id.as_str()) {
                 continue;
+            }
+            if point.id == RESERVED_TARGET_HOP {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{index}]: the id `{RESERVED_TARGET_HOP}` is reserved for the grants of \
+                     the surface's Access Point Target; give the Transit Point with consent_mode external another id"
+                )));
             }
             if !seen.insert(point.id.as_str()) {
                 return Err(SurfaceApiError::BadRequest(format!(
@@ -2345,12 +2366,59 @@ mod tests {
         surface: AgentSurface,
         storage: GrantStorage,
     ) -> Result<(), String> {
-        check_external_consent_bindings(Some(providers), &surface, storage, &std::collections::HashMap::new())
+        check_external_consent_bindings(Some(providers), &surface, storage, &std::collections::HashMap::new(), None)
             .await
             .map_err(|error| match error {
                 SurfaceApiError::BadRequest(message) => message,
                 other => panic!("expected a 400, got {other:?}"),
             })
+    }
+
+    /// With `external_consent_issuers` set, a binding's provider must name a
+    /// listed issuer.
+    #[tokio::test]
+    async fn a_binding_whose_providers_issuer_the_operator_does_not_list_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let surface = surface_binding(external("external-a", Some("owner")), serde_json::json!([]), None);
+        let storage = GrantStorage {
+            encrypted: true,
+            stable_ids: true,
+        };
+        let check = |issuers: Option<std::collections::HashMap<String, Vec<String>>>| {
+            let providers = providers.clone();
+            let surface = surface.clone();
+            async move {
+                check_external_consent_bindings(
+                    Some(&providers),
+                    &surface,
+                    storage,
+                    &std::collections::HashMap::new(),
+                    issuers.as_ref(),
+                )
+                .await
+            }
+        };
+        let issuer = providers
+            .get("external-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .issuer
+            .unwrap();
+        assert!(check(None).await.is_ok());
+        assert!(
+            check(Some(std::collections::HashMap::from([(issuer, Vec::new())])))
+                .await
+                .is_ok()
+        );
+        match check(Some(std::collections::HashMap::new())).await {
+            Err(SurfaceApiError::BadRequest(message)) => assert!(
+                message.contains("issuer is not permitted by the gateway's external_consent_issuers"),
+                "{message}"
+            ),
+            other => panic!("expected a 400, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2471,6 +2539,8 @@ mod tests {
         };
         let mut second = at("https://203.0.113.66/mcp", &owner);
         second["alias"] = serde_json::json!("vendor-2");
+        let mut named_target = vendor_point(owner.clone());
+        named_target["id"] = serde_json::json!("target");
 
         let only_in_variant =
             surface_with_points(none.clone(), none.clone(), Some(serde_json::json!([vendor_point(owner.clone())])));
@@ -2575,6 +2645,11 @@ mod tests {
                         "target_endpoint": "https://203.0.113.66/mcp", "require_transit_token": true}])),
                 ),
                 elsewhere.to_string(),
+            ),
+            (
+                "a point that takes the id `target`, which names the Access Point Target's grants",
+                surface_with_points(serde_json::json!([named_target.clone()]), none.clone(), None),
+                "transit.points[0]: the id `target` is reserved".to_string(),
             ),
         ] {
             let message = checked(&providers, surface, true)

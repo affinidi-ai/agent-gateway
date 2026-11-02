@@ -93,7 +93,10 @@ impl KmsEnvelope {
     /// Decrypt a `version = 2` KMS envelope value.
     ///
     /// Fails closed on a non-KMS version, on any KMS error, and on AES failure;
-    /// the plaintext data key is zeroized on every path.
+    /// the plaintext data key is zeroized on every path. A KMS failure is
+    /// [`super::EncryptionUnavailable`] unless KMS rejected this value's wrapped
+    /// key ([`super::key_management::KmsKeyRejected`]): the value is then
+    /// unreadable, as it is when AES-GCM refuses it.
     pub(crate) fn decrypt(
         &self,
         encrypted: &EncryptedData,
@@ -122,7 +125,13 @@ impl KmsEnvelope {
         })
         .and_then(|inner| inner);
         record_kms_metric("decrypt", started, plaintext_key.is_ok());
-        let plaintext_key = plaintext_key?;
+        let plaintext_key = plaintext_key.map_err(|error| {
+            if error.is::<super::key_management::KmsKeyRejected>() {
+                error
+            } else {
+                anyhow::Error::new(super::EncryptionUnavailable(format!("{error:#}")))
+            }
+        })?;
 
         let data_key = DataKey::from_kms_plaintext(plaintext_key)?;
         let plaintext = self
@@ -291,6 +300,26 @@ mod tests {
                 .contains("Decrypt"),
             "got: {err}"
         );
+    }
+
+    /// A KMS failure says nothing of the value: it is the key service's
+    /// unavailability, so a store never takes the value for an unreadable one.
+    /// A value AES-GCM refuses is not.
+    #[test]
+    fn a_kms_failure_is_the_key_services_unavailability_and_a_refused_value_is_not() {
+        let good = envelope(MockMode::RoundTrip);
+        let mut encrypted = good
+            .encrypt(b"secret")
+            .unwrap();
+        let err = envelope(MockMode::FailDecrypt)
+            .decrypt(&encrypted)
+            .unwrap_err();
+        assert!(err.is::<crate::encryption::EncryptionUnavailable>(), "got: {err:#}");
+        encrypted.ciphertext[12] ^= 0xFF;
+        let err = good
+            .decrypt(&encrypted)
+            .unwrap_err();
+        assert!(!err.is::<crate::encryption::EncryptionUnavailable>(), "got: {err:#}");
     }
 
     #[test]

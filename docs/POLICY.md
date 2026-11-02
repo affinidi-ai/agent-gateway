@@ -464,9 +464,9 @@ more: the outbound forward sends it only to the origin of its provider's `resour
 The vendor clients of external consent, which carry a client's credentials or a person's token,
 ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
 connect directly: the fetch of an external consent provider's authorization server metadata,
-RFC 7009 revocation, and the forward of a request that carries a grant by binding. A proxy would
-resolve the host again and connect to an address nobody vetted, voiding the pin. The gateway
-warns at startup when a proxy variable is set. Every other pinned client, the authorization
+the code exchange and refresh, RFC 7009 revocation, and the forward of a request that carries a
+grant by binding. A proxy would resolve the host again and connect to an address nobody vetted,
+voiding the pin. The gateway warns at startup when a proxy variable is set. Every other pinned client, the authorization
 server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
 before; the proxy then resolves the host itself, so the pin does not hold through it.
 
@@ -570,6 +570,11 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
   exact `http` or loopback fixture, never cloud metadata. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
+- A grant's **code exchange and refresh** (`src/delegation_vault/token_endpoint.rs`)
+  go to its provider's token endpoint through `egress::pinned_vendor_client` as
+  revocation does, with a 30-second timeout and a 64 KiB cap on the answer, whose
+  body is never logged or echoed. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
 
 `pinned_forward_client` and `pinned_strict_client` share one `pin_and_build` body; the
 metadata and vendor clients above build their client with `pinned_direct_client`, which ignores
