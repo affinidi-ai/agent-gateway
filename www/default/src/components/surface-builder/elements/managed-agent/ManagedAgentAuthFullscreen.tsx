@@ -4,6 +4,8 @@ import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { ConfigPanelProps } from '../types';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
+import { managedAgentTargetAuthProblems } from './targetAuth';
 
 interface SecretOption {
   id: string;
@@ -38,6 +40,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const source = config.target_auth_source === 'provider' ? 'provider' : 'secret';
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
+  const { errors, warnings } = managedAgentTargetAuthProblems(config);
 
   useEffect(() => {
     setLoadingSecrets(true);
@@ -87,6 +90,12 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
           requires authentication.
         </small>
 
+        <TargetAuthProblemNotice
+          testId="managed-agent-target-auth"
+          errors={[errors.target_auth_https].filter((m): m is string => !!m)}
+          warnings={warnings}
+        />
+
         <div className="mb-3">
           <label htmlFor="target-auth-source" className="form-label fw-bold">
             Credential Source
@@ -118,6 +127,34 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               value={config.target_auth_provider_id || ''}
               onChange={providerId => updateField('target_auth_provider_id', providerId)}
             />
+            {errors.target_auth_provider_id && (
+              <div
+                className="text-danger small mt-1"
+                data-testid="managed-agent-target-auth-provider-error"
+              >
+                {errors.target_auth_provider_id}
+              </div>
+            )}
+          </div>
+        )}
+
+        {source === 'provider' && (
+          <div className="mb-3">
+            <label htmlFor="target-auth-scopes" className="form-label fw-bold">
+              Scopes
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              id="target-auth-scopes"
+              data-testid="managed-agent-target-auth-scopes"
+              value={config.target_auth_scopes || ''}
+              onChange={e => updateField('target_auth_scopes', e.target.value)}
+              placeholder="Space-separated; the provider's default scopes when empty"
+            />
+            <small className="form-text text-muted">
+              Scopes to request for this Target. Leave empty to use the provider's default scopes.
+            </small>
           </div>
         )}
 
@@ -189,7 +226,20 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             value={config.target_auth_header_name || ''}
             onChange={e => updateField('target_auth_header_name', e.target.value)}
             placeholder="Authorization"
+            aria-invalid={!!errors.target_auth_header_name}
+            aria-describedby={
+              errors.target_auth_header_name ? 'target-auth-header-name-error' : undefined
+            }
           />
+          {errors.target_auth_header_name && (
+            <div
+              className="text-danger small"
+              id="target-auth-header-name-error"
+              data-testid="managed-agent-target-auth-header-name-error"
+            >
+              {errors.target_auth_header_name}
+            </div>
+          )}
           <small className="form-text text-muted">
             The HTTP header name to inject (e.g., Authorization, X-API-Key)
           </small>
@@ -208,7 +258,20 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               onChange={e => updateField('target_auth_header_format', e.target.value)}
               placeholder="Bearer {value}"
               style={{ fontFamily: 'monospace' }}
+              aria-invalid={!!errors.target_auth_header_format}
+              aria-describedby={
+                errors.target_auth_header_format ? 'target-auth-header-format-error' : undefined
+              }
             />
+            {errors.target_auth_header_format && (
+              <div
+                className="text-danger small"
+                id="target-auth-header-format-error"
+                data-testid="managed-agent-target-auth-header-format-error"
+              >
+                {errors.target_auth_header_format}
+              </div>
+            )}
             <small className="form-text text-muted">
               Format for the header value. Use <code>{'{value}'}</code> as a placeholder for the
               secret value.

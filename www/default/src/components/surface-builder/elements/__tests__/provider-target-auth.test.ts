@@ -80,6 +80,7 @@ describe('credential provider target auth wire shape', () => {
       headerName: 'X-Key',
       headerFormat: 'Bearer {value}',
       fallback: 'passthrough',
+      scopes: [],
     });
     expect(
       providerTargetAuthFromApi({

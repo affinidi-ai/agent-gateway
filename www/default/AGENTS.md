@@ -578,9 +578,66 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`_shared/TargetAuthProviderSelect.tsx`), which lists only Client Credentials, JWT Bearer,
   Client Credentials JWT and API Key providers, since the gateway refuses an Authorization Code
   provider here. `_shared/providerTargetAuth.ts` maps the form to and from the wire
-  `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
+  `method.credential_provider`, and a Managed Agent or Transit Point with the option but no
+  provider blocks Save.
   Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
   `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
+  - **Scopes.** The credential provider method has an optional space-separated **Scopes** input
+    (`managed-agent-target-auth-scopes`, `transit-point-target-auth-provider-scopes`) wired to the
+    wire `scopes`; empty uses the provider's default scopes.
+  - **Rules that block Save**, which the gateway refuses in every mode: a header name that is not
+    an HTTP token or is reserved (Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive,
+    Proxy-Connection, TE, Upgrade, Trailer, and the gateway's own transit, caller, identity, trace and
+    MCP session headers: 23 names in all); a format without exactly one `{value}` or with CR, LF
+    or NUL; a provider method with no provider picked. Header names are compared as the gateway
+    compares them, in any letter case and with `_` read as `-` (`sameHeaderName`), so
+    `X_Transit_Token` is reserved too. In the Managed Agent's full-screen editor the header,
+    format and provider messages show next to their inputs, each in a `role="alert"` region and
+    tied to its input with `aria-invalid` and `aria-describedby`; the Managed Agent and Transit
+    Point panels show every message in a notice (`*-target-auth-errors`), and the Transit
+    Point's header inputs point at that notice the same way. Rules that need the whole surface
+    live in `elements/targetAuthRules.ts`, run by `validateSurfacePayload` when the page passes
+    the stored surface (`stored`, `null` for a new one): a header another credential on the same
+    leg already sends (a binding, header metadata mapping, the token header of any JWT Bearer
+    caller method that forwards it) blocks Save, on the Managed Agent or on the Transit Point it
+    belongs to.
+  - **Advisories that allow Save.** A Target that is not `https://` (`http://`, `fabric://` and
+    `a2a-proxy://` are not) and a leg that authenticates no caller (an Access Point with no source
+    authentication, a Transit Point that authenticates no caller) are shown as an advisory
+    (`*-target-auth-advisories`, warning styling) and never block Save: the gateway refuses them
+    on save only while its `target_https` or `target_source_auth` rule is `enforce`, and in
+    `warn` saves with a `Warning: 299` header. The dashboard does not read the rule mode. A
+    `proxy://` Target gets no https advisory, since the gateway decides it from the MCP proxy's
+    `base_url`, which the editor does not see. The Managed Agent editors learn whether the
+    Access Point checks its callers from `accessPointChecksCallers` in `SurfaceMetaContext`,
+    which the surface pages set from the draft payload (`hasCallerAuthentication`). After a
+    save in `warn` the header's message shows in the save toast and the surface page's save
+    warnings banner; in `enforce` the gateway's 400 shows in the page's error alert. The
+    whole-surface caller check is a `warning` issue in `validateSurfacePayload`.
+  - **Advice with no gateway rule.** The same box also shows a passthrough fallback (the
+    request goes on without the credential when the credential cannot be resolved) and a stored
+    method the editor cannot show, each ending "Save is allowed".
+  - **Messages name their kind.** `TargetAuthProblemNotice` opens every message with **Error:**,
+    **Advisory:** or **Warning:**, so colour is not the only difference, and keeps its
+    `role="alert"` and `role="status"` regions mounted while empty, so a message that appears is
+    announced.
+  - **Stored settings are kept.** The gateway refuses only a new or changed header problem, so one
+    on a stored setting left unedited (same auth, same endpoint) shows as a warning
+    (`*-target-auth-warnings`) and does not block Save.
+  - **Lossless save.** Each Managed Agent and Transit Point keeps the stored `target_auth` and
+    endpoint in the node config (`_stored_target_auth`); the edited fields are merged onto it
+    (`mergeTargetAuth`), so a field the editor does not show survives. That holds while the edit
+    keeps the stored credential: another method kind, secret or provider replaces the stored
+    setting, so nothing unseen follows a credential it was not set for. A Transit Point whose
+    auth form was never opened sends the stored `target_auth` unchanged, and so does a Managed
+    Agent or Transit Point whose stored method the editor cannot show, until the operator
+    chooses a secret or a provider.
+  - **Never in the canvas data.** The Target authentication form fields, the stored copy and a
+    Transit Point's `target_auth` are left out of the canvas blob on save and ignored when one
+    is read (`withoutTargetAuth` in `elements/registry.ts`; the key lists are
+    `MANAGED_AGENT_TARGET_AUTH_FORM_KEYS` and `TRANSIT_POINT_TARGET_AUTH_FORM_KEYS`), so a node
+    the stored surface no longer has comes back without a Target authentication. A new form
+    field must be added to its key list.
 - **Tenant-aware pickers.** A surface's tenant (`tenantId` in `SurfaceMetaContext`, from the stored
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
@@ -1461,8 +1518,8 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`text-bg-success`), or a "Deactivated" badge (`credential-provider-deactivated-badge-<id>`,
   `text-bg-secondary`) with "No new consent" under it. The Type column shows only the type. The
   row stays in the list either way. Deactivate and Activate are shown with
-  `credential_providers.edit`, the permission their routes ask for; the tab's other controls
-  keep `settings.edit`.
+  `credential_providers.edit`, the permission their routes ask for, as **Add Provider** is; the
+  row delete button is shown with `credential_providers.delete`.
   The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
   again while access already given keeps working, and never sends `deactivated_at` on save. The
   Delegated Access tab marks the access of a deactivated provider "No new consent"
@@ -1478,12 +1535,15 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   `/credential-providers/new` needs `credential_providers.edit`; `/credential-providers/:id`
   needs `credential_providers.view`. A user with view but not edit gets the editor read-only: the
   form is a disabled `fieldset`, there is no Save (`Cmd+S` and Enter do nothing), and
-  `credential-provider-editor-read-only-notice` explains why. The tab shows **Add Provider**
-  with `.edit` and the row delete button with `.delete`.
+  `credential-provider-editor-read-only-notice`, the first thing in the card, explains why. A
+  save error shows in an alert (`credential-provider-editor-error`), and Back and Cancel (which
+  reads **Back** while read-only) return to `/credentials?tab=credential-providers`. The tab
+  shows **Add Provider** with `.edit` and the row delete button with `.delete`.
 - The Credentials page and its sidebar entry open for `settings.view` or
-  `credential_providers.view` (`ProtectedRoute` takes `permissionsAny`). The Credential Providers
-  tab needs `.view`; the JWT Verification and Credential Tokens tabs need `settings.view`. A user
-  without `settings.view` lands on the Credential Providers tab.
+  `credential_providers.view` (`ProtectedRoute`'s `permission` takes one permission or a list of
+  which any one is enough). The Credential Providers
+  tab needs `.view`; the JWT Verification, Credential Tokens and Delegated Access tabs need
+  `settings.view`. A user without `settings.view` lands on the Credential Providers tab.
 - The credential provider routes live in `src/pages/credentialProviderRoutes.tsx`. The retired
   OIDC Providers pages are gone; `/oidc-providers` and every path under it redirect to
   `/credentials?tab=credential-providers`.
@@ -1501,6 +1561,19 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
+- Deleting a secret from the Secrets page asks the gateway first. A 409 with `references` (a
+  surface, credential provider, A2A proxy or STS client that uses the secret) opens
+  `ConfirmDeleteSecretModal` (`confirm-delete-secret-modal`): it names each reference by kind and
+  name (`ReferenceList`), adds "and N more you cannot view" for `hidden_references`, and offers
+  Cancel (focused first, sends nothing) and **Delete secret anyway** (`confirm-delete-secret-confirm`, repeats
+  the delete with `?force=true`). While the forced delete runs both buttons stay focusable with
+  `aria-disabled` and ignore clicks, so focus stays in the dialog. A 409 without `references` (an integration endpoint uses the
+  secret) and every other failure show inline (`secrets-delete-error`), with no override and no
+  toast.
+- A refused credential provider delete shows the `providerDeleteError` message inline on the
+  Credential Providers tab (`credential-providers-delete-error`), with no override. The
+  provider editor lists the references of a refused retype under its error
+  (`credential-provider-editor-references`).
 
 ## API key delete
 
@@ -1606,6 +1679,12 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
   refused** in the deny tone, with a Refusal group of Stage, Reason, HTTP status, JSON-RPC error
   and Requested variant. `http_status` is absent on a Fabric refusal and `rpc_error_code` present
   only when the caller got a JSON-RPC error; a row shows only when the value is recorded.
+- A `target_auth_failed` record carries `target_auth` (`outcome` and, when the token endpoint
+  sent one, `oauth_error`), shown as **Credential outcome** and **OAuth error** in the Refusal
+  group. With outcome `passthrough` the request was forwarded without the Target credential: it is
+  titled **Forwarded without Target credential** in the warn tone, not as a refusal. With outcome
+  `refused_by_target` the Target refused the gateway's credential: it is titled **Target refused
+  the credential** in the deny tone, and `upstream_status` shows as **Target status**.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 

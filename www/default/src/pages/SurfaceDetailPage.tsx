@@ -930,7 +930,7 @@ const SurfaceDetailPage: React.FC = () => {
         protocol,
         status,
       });
-      const issues = validateSurfacePayload(draftPayload);
+      const issues = validateSurfacePayload(draftPayload, { stored: surface ?? undefined });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };

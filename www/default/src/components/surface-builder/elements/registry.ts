@@ -18,6 +18,7 @@ import {
 import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
+import { STORED_TARGET_AUTH_KEY, storedTargetAuth } from './_shared/providerTargetAuth';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { RATE_LIMIT_FIELDS, carriesRateLimit, rateLimitConfigFromWire } from './rate-limit/wire';
 import { workloadBindingApiToForm } from './workload-binding/config';
@@ -775,6 +776,7 @@ class ElementRegistry {
         delete tpConfig.header_metadata_mapping;
         delete tpConfig.trust_check_list;
         delete tpConfig.trust_check_migrated;
+        tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_endpoint, tp.target_auth);
       }
       nodes.push({
         id: tpId,

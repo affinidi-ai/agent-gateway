@@ -13,6 +13,8 @@ import FabricDelegatedCredentialsSection, {
 } from '../_shared/FabricDelegatedCredentialsSection';
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
+import { transitPointTargetAuthProblems } from './targetAuth';
 import {
   PROVIDER_TARGET_AUTH_DEFAULTS,
   providerTargetAuthFromApi,
@@ -99,6 +101,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         auth_header_name: provider.headerName,
         auth_header_format: provider.headerFormat,
         auth_fallback: provider.fallback,
+        auth_scopes: (provider.scopes ?? []).join(' '),
       });
       return;
     }
@@ -130,6 +133,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
   );
 
   const tpProtocol = transitPointProtocol(node?.type);
+  const targetAuthProblems = transitPointTargetAuthProblems(config);
 
   // Only A2A/AP2 destinations serve an agent card, so the location override
   // is shown for those protocols only. Protocol is encoded in the TP node
@@ -380,6 +384,11 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
 
       <div className="config-section">
         <label>Target Authentication</label>
+        <TargetAuthProblemNotice
+          testId="transit-point-target-auth"
+          errors={Object.values(targetAuthProblems.errors)}
+          warnings={targetAuthProblems.warnings}
+        />
         <Form.Select
           size="sm"
           data-testid="transit-point-target-auth-type"
@@ -430,6 +439,20 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
                 Use <code>{'{value}'}</code> as the placeholder for the provider's token.
               </Form.Text>
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1" htmlFor="transit-point-auth-scopes">
+                Scopes
+              </Form.Label>
+              <Form.Control
+                size="sm"
+                id="transit-point-auth-scopes"
+                type="text"
+                data-testid="transit-point-target-auth-provider-scopes"
+                placeholder="Space-separated; the provider's default scopes when empty"
+                value={config.auth_scopes || ''}
+                onChange={e => updateField('auth_scopes', e.target.value)}
+              />
             </Form.Group>
           </>
         )}

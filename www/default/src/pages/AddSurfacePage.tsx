@@ -436,7 +436,7 @@ const AddSurfacePage: React.FC = () => {
     // surface after a successful POST.
     try {
       const draft = buildSurfacePayload();
-      const issues = validateSurfacePayload(draft);
+      const issues = validateSurfacePayload(draft, { stored: null });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };

@@ -13,6 +13,7 @@
  */
 
 import { registry } from './registry';
+import { targetAuthBreaches } from './targetAuthRules';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -37,7 +38,18 @@ export interface ValidationIssue {
  * answers with a `Warning` header for a public, a not-ready, and a legacy
  * Access Point that admits every caller.
  */
-export function validateSurfacePayload(payload: any): ValidationIssue[] {
+export interface ValidateSurfaceOptions {
+  /**
+   * The stored surface, or null for a new one. When given, a Target authentication rule that
+   * needs the whole surface is checked, except a breach the stored surface already had.
+   */
+  stored?: unknown;
+}
+
+export function validateSurfacePayload(
+  payload: any,
+  options: ValidateSurfaceOptions = {}
+): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!payload || typeof payload !== 'object') {
     issues.push({ severity: 'error', message: 'Surface payload is missing or malformed.' });
@@ -161,6 +173,12 @@ export function validateSurfacePayload(payload: any): ValidationIssue[] {
           'The primary target enables Workload Binding but the surface has no managed-identity source to sign the VP — add an Identity element or enable a managed agent DID.',
         path: 'target.workload_binding',
       });
+    }
+  }
+
+  if (options.stored !== undefined) {
+    for (const message of targetAuthBreaches(payload, options.stored)) {
+      issues.push({ severity: 'error', message, nodeId: 'target', path: 'target.auth' });
     }
   }
 

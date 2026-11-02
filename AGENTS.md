@@ -183,7 +183,8 @@ with `send_resource: false`, and tell an external consent provider that sends it
 re-created with `send_resource: false`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
-The secret editor has one save button and never shows a stored secret value; see
+The secret editor has one save button and never shows a stored secret value, and deleting a
+secret that other resources use asks first and can force the delete; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
@@ -272,7 +273,12 @@ Callback URL in a second request once the gateway returns the path it built from
 generated for the provider, then opens that provider, also when the second request fails; a
 stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
-Point can take its credential from a credential provider; see _Credential provider editor_ and
+Point can take its credential from a credential provider, with optional scopes. The Surface
+Builder shows header name and format problems next to the fields, which block Save, shows a
+Target that is not https and a leg that authenticates no caller as advisories that allow Save
+(the gateway refuses them only when `target_https` or `target_source_auth` is `enforce`), advises
+on a passthrough fallback, keeps a stored `target_auth` it did not edit, and keeps Target
+authentication settings out of the canvas data; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
