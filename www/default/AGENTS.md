@@ -1484,6 +1484,9 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   `credential_providers.view` (`ProtectedRoute` takes `permissionsAny`). The Credential Providers
   tab needs `.view`; the JWT Verification and Credential Tokens tabs need `settings.view`. A user
   without `settings.view` lands on the Credential Providers tab.
+- The credential provider routes live in `src/pages/credentialProviderRoutes.tsx`. The retired
+  OIDC Providers pages are gone; `/oidc-providers` and every path under it redirect to
+  `/credentials?tab=credential-providers`.
 
 ## Secret editor
 
