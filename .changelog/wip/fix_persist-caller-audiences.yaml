@@ -19,7 +19,8 @@ changes:
       description: >-
         The license and Rustfmt checks checked out the pull request branch by name from the base
         repository, so they failed for branches that live on a fork. They now use the default
-        pull request checkout.
+        pull request checkout, and the Rust security scan, which needs repository secrets that
+        fork pull requests do not receive, is skipped for them.
   removed: []
   security: []
   breaking: []
