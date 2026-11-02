@@ -167,6 +167,10 @@ export function categoryLabel(name: string): string {
       return 'User Revoked';
     case 'token_not_found':
       return 'Not Found';
+    case 'identity_binding_verified':
+      return 'Identity Binding Verified';
+    case 'identity_binding_failed':
+      return 'Identity Binding Failed';
     case 'policy_created':
     case 'policy_updated':
     case 'policy_deleted':

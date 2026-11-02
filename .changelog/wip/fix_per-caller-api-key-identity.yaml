@@ -34,6 +34,12 @@ changes:
         Concurrent first requests for an identity with no record could each mint a different
         DID. The identity record is now created only if none exists for its hash, under a lock
         on that record, so every concurrent first request gets the one stored DID.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Title-case Identity Binding events in the Audit Log
+      description: >-
+        The Audit Log showed `identity_binding_verified` and `identity_binding_failed` records
+        as lowercase raw names. They now show as Identity Binding Verified and Identity
+        Binding Failed, like the other events.
   removed: []
   security:
     - timestamp: '2026-10-31T00:00:00Z'
