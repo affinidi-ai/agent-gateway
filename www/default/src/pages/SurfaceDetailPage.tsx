@@ -39,7 +39,6 @@ import {
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
 import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
-import SurfacePaymentActivity from '../components/surface-builder/elements/payment/SurfacePaymentActivity';
 import './SurfaceBuilder.css';
 
 interface DetailBuilderState {
@@ -1267,11 +1266,15 @@ const SurfaceDetailPage: React.FC = () => {
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
       let headerWarnings: string[] = [];
-      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(surfaceId, payload, {
-        onWarnings: warnings => {
-          headerWarnings = warnings;
-        },
-      });
+      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(
+        surfaceId,
+        payload,
+        {
+          onWarnings: warnings => {
+            headerWarnings = warnings;
+          },
+        }
+      );
       const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
       setSavedWarnings({ surfaceId, warnings: serverWarnings });
       setSurface(updated);
@@ -1650,9 +1653,7 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error ||
-          (saveWarnings && saveWarnings.length > 0) ||
-          (agentPayGatewayId && canViewPayments) ? (
+          error || (saveWarnings && saveWarnings.length > 0) ? (
             <>
               {error && (
                 <div
@@ -1665,12 +1666,6 @@ const SurfaceDetailPage: React.FC = () => {
                 </div>
               )}
               <SaveWarningsBanner warnings={saveWarnings} />
-              {agentPayGatewayId && canViewPayments && (
-                <SurfacePaymentActivity
-                  surfaceId={surface.surface_id}
-                  paymentGatewayId={agentPayGatewayId}
-                />
-              )}
             </>
           ) : null
         }

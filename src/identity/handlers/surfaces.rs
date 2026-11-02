@@ -2323,7 +2323,11 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, transit_point_warnings(&state, &surface).await, SurfaceSaveResponse::new(surface, warnings)))
+    Ok((
+        StatusCode::CREATED,
+        transit_point_warnings(&state, &surface).await,
+        SurfaceSaveResponse::new(surface, warnings),
+    ))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -3919,7 +3923,11 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, transit_point_warnings(&state, &saved).await, SurfaceSaveResponse::new(new_variant, warnings)))
+    Ok((
+        StatusCode::CREATED,
+        transit_point_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(new_variant, warnings),
+    ))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`

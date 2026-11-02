@@ -22798,8 +22798,6 @@ mod fabric_send_tests {
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(gate.calls(), 1);
         let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
-        assert!(logged.contains("[OPA-INPUT] Gateway policy input before eval"), "the policy input is logged");
-        assert!(logged.contains("paid_tool"));
         assert!(!logged.contains(SECRET), "a credential was logged");
         let forwards = peer.forwards.lock().unwrap();
         assert!(

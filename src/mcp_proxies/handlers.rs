@@ -3112,16 +3112,10 @@ mod tests {
             );
 
             let prepared = super::prepare_mcp_request(&proxy, request.clone(), None, "tool-errors").unwrap();
-            let error = super::execute_mcp_request(
-                &proxy,
-                prepared,
-                &surface,
-                Some(&policy_manager),
-                &client,
-                "tool-errors",
-            )
-            .await
-            .expect_err("a closed backend fails the tool call");
+            let error =
+                super::execute_mcp_request(&proxy, prepared, &surface, Some(&policy_manager), &client, "tool-errors")
+                    .await
+                    .expect_err("a closed backend fails the tool call");
 
             assert_eq!(error, "Tool execution failed: network error (Connect)", "{path}");
         }

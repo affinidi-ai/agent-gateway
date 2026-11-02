@@ -4669,7 +4669,10 @@ pub(crate) mod tests {
     fn the_audit_payer_is_a_peppered_hash_of_the_principal() {
         use sha2::{Digest, Sha256};
 
-        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "acme-prod".into(), provider_agent_id: None };
+        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "acme-prod".into(),
+            provider_agent_id: None,
+        };
         let payer = Caller {
             identity: Some(&identity),
             verified_agent_did: None,
@@ -6352,8 +6355,14 @@ pub(crate) mod tests {
             .caller_authentication = None;
         assert!(!held_payments_unpollable(&paid), "a surface that charges nothing");
 
-        let alice = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "alice".into(), provider_agent_id: None };
-        let bob = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "bob".into(), provider_agent_id: None };
+        let alice = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "alice".into(),
+            provider_agent_id: None,
+        };
+        let bob = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "bob".into(),
+            provider_agent_id: None,
+        };
         assert_eq!(caller_principal(Some(&alice)), caller_principal(Some(&alice)));
         assert_ne!(caller_principal(Some(&alice)), caller_principal(Some(&bob)));
         assert_eq!(caller_principal(None), None);
