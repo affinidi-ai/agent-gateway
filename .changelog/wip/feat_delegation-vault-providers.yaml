@@ -193,4 +193,6 @@ changes:
         that any surface binds, of any tenant, in its base or a variant, through
         `outbound_credentials` or a Transit Point's `transit_credentials`, or uses for target
         authentication, instead of moving it: its bindings would name another tenant's provider, and moving it back would serve
-        their grants again. Remove the bindings first.
+        their grants again. Remove the bindings first. A move is serialised with surface writes,
+        and a write that binds a provider moved to a tenant its surface may not reference since
+        the write checked its references is refused, as one that binds a deleted provider is.
