@@ -16388,17 +16388,20 @@ mod target_auth_tests {
         let fixture = Fixture::new(200).await;
         let mut enforced = fixture.context();
         enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
-        for (context, secret_id, expected) in [
+        for (case, (context, secret_id, expected)) in [
             (&enforced, "OWN_KEY", Ok(Some(("x-key".to_string(), "own-value".to_string())))),
             (&enforced, "WIDE_KEY", Err(TargetAuthError::SecretNotFound)),
             (&enforced, "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
             (&fixture.context(), "WIDE_KEY", Ok(Some(("x-key".to_string(), "wide-value".to_string())))),
             (&fixture.context(), "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let result =
                 inject_target_auth_header(&secret_auth(secret_id), context, "surface", CallerAssertion::Authenticated)
                     .await;
-            assert_eq!(result, expected, "{secret_id}");
+            assert_eq!(result, expected, "case {case}");
         }
     }
 
