@@ -528,7 +528,7 @@ const EditCredentialProviderPage: React.FC = () => {
                   </div>
                 )}
 
-                {/* Callback URL — only for authorization_code flow */}
+                {/* Callback URL, only for authorization_code flow */}
                 {form.provider_type === 'oauth2_authorization_code' && (
                   <div className="mb-3">
                     <div className="field-label-with-help">
@@ -747,7 +747,7 @@ const EditCredentialProviderPage: React.FC = () => {
                   onChange={handleChange}
                 />
 
-                {/* API Key field — only for api_key type */}
+                {/* API Key field, only for api_key type */}
                 {form.provider_type === 'api_key' && (
                   <>
                     <hr />
