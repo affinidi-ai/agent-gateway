@@ -657,6 +657,17 @@ does, and the outcome depends on the path:
 - Appliance-wide surfaces are unaffected. Their custom metadata may name a secret of any
   tenant, at runtime and on save, until a reassignment gives the surface a tenant.
 
+Proxies are the exception. An MCP Proxy holds no credential of its own: its upstream
+authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
+Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
+another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
+accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with
+a warning in `warn` mode and refused in `enforce` mode, where a request through the proxy also
+fails as target unavailable, as for a missing secret, before the secret is read. An
+appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
+modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
+sends the secret nor read it.
+
 Saving a surface applies the same rule: a save that adds a reference breaking it is refused
 with `400` "reference is not accessible", while a reference the stored surface already held
 is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept only on the

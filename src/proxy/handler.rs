@@ -14386,7 +14386,19 @@ async fn handle_a2a_proxy_target_request(
     };
 
     adapter
-        .dispatch_message_send(proxy_id, body_bytes, state.secrets_store.as_ref(), channel_name, caller)
+        .dispatch_message_send(
+            proxy_id,
+            body_bytes,
+            state.secrets_store.as_ref(),
+            channel_name,
+            caller,
+            crate::tenancy::SurfaceTenancy::configured(
+                state
+                    .surface
+                    .tenant_id
+                    .as_deref(),
+            ),
+        )
         .await
 }
 

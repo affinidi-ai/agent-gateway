@@ -8115,7 +8115,14 @@ async fn handle_a2a_proxy_forward(
 
     let secrets_store = get_secrets_store();
     let response = adapter
-        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name, caller)
+        .dispatch_message_send(
+            proxy_id,
+            &body_bytes,
+            secrets_store.as_ref(),
+            &surface.name,
+            caller,
+            crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
+        )
         .await;
 
     let request_body_bytes = body_bytes;
