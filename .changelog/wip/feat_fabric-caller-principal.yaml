@@ -16,8 +16,8 @@ changes:
         that admits a verified caller by its hash also admits it when it arrives over Fabric;
         add `not input.transit.caller.fabric` to keep out partner requests that carry the
         transit token issued for them, on a Transit Point that requires it. `verified` covers
-        the hash only, never the DID the peer named, so match the caller by its hash, never by
-        `did`. Its audit records
+        the hash only, never the DID the peer named, which policy sees only as the peer's,
+        under `fabric.caller_did`, so match the caller by its hash. Its audit records
         name it with `auth_method: fabric_verified`, its identity hash as `user_identity_hash`
         and the claims the receiving surface verified, with the peer as `peer_gateway` and no
         `iss`, ahead of a caller the Transit Point verified itself, as a verified Access Point
@@ -64,7 +64,19 @@ changes:
         omits it keeps it while that view still tells users apart, since the Surface Builder
         does not show it. Service-level bindings need no switch. `2026-07-28` MCP requests keep
         their own rule: a resource-token caller and verified consent.
-  changed: []
+  changed:
+    - timestamp: '2026-11-02T12:00:00.000Z'
+      title: Show a partner's caller DID in Transit Point policy only as the peer's word
+      description: >-
+        A Transit Point policy saw the caller DID a partner gateway vouched for as
+        `input.transit.caller.did`, beside a `verified: true` that covers only the identity hash
+        the receiving surface verified, so a rule on `did` and `verified` admitted any partner
+        that presented that DID. A `fabric_peer` caller now has no `did`; the DID a presentation
+        from one of the connection's issuers carried is `input.transit.caller.fabric.caller_did`,
+        never verified. To admit a DID one partner vouches for, match it with
+        `identity_source == "fabric-presentation"` and `fabric.peer_issuer_did`. The audit
+        records of such a call name the Fabric caller, not a client the Transit Point verified
+        itself on the same call, which stays in policy input as `input.transit.client`.
   fixed: []
   removed: []
   security:

@@ -87,13 +87,19 @@ pub enum TransitCallerVerification {
 
 /// `input.transit.caller.fabric`: the peer gateway that sent the request a
 /// Fabric-issued transit token was issued for. The Fabric handshake verified
-/// the peer.
+/// the peer; `caller_did` is the peer's word about its caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TransitFabricPeer {
     pub peer_gateway_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_issuer_did: Option<String>,
     pub hops: u8,
+    /// The caller DID a presentation from one of the connection's issuers
+    /// carried (`fabric.caller_did` in the token). Never verified, so never
+    /// the caller's `did`, which sits beside a `verified` that covers only the
+    /// identity hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
 }
 
 impl From<&crate::proxy::transit_token::FabricTransitClaims> for TransitFabricPeer {
@@ -102,6 +108,7 @@ impl From<&crate::proxy::transit_token::FabricTransitClaims> for TransitFabricPe
             peer_gateway_id: claims.peer_gateway_id.clone(),
             peer_issuer_did: claims.peer_issuer_did.clone(),
             hops: claims.hops,
+            caller_did: claims.caller_did.clone(),
         }
     }
 }
@@ -126,9 +133,11 @@ pub struct TransitCallerContext {
     /// the Access Point computed. Present only when `verified`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
-    /// The caller DID the transit token carries (`sub`). Always asserted:
-    /// nothing on the Access Point verifies a DID presentation yet, so there
-    /// is no `did_verified` and no Agent DNA UAI here.
+    /// The caller DID an Access Point's transit token carries (`sub`). Always
+    /// asserted: nothing on the Access Point verifies a DID presentation yet,
+    /// so there is no `did_verified` and no Agent DNA UAI here. Never present
+    /// for a `fabric_peer` caller, whose DID is the peer's word, in
+    /// `fabric.caller_did`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
     /// The operator-allowlisted `caller_context_fields` the transit token
@@ -163,7 +172,8 @@ impl TransitCallerContext {
     /// `fabric.principal_hash`, the caller the receiving surface's own
     /// `source_auth` or resource token verified on that request, never by
     /// anything the peer said. The caller's DID is never verified, even when a
-    /// connection issuer's presentation carried it (`fabric-presentation`).
+    /// connection issuer's presentation carried it (`fabric-presentation`), so
+    /// it is the peer's, in `fabric.caller_did`, never the caller's `did`.
     pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
         if let Some(fabric) = &claims.fabric {
             let verified = fabric
@@ -174,7 +184,7 @@ impl TransitCallerContext {
                 verification: TransitCallerVerification::FabricPeer,
                 identity_source: claims.identity_source.clone(),
                 user_identity_hash: fabric.principal_hash.clone(),
-                did: fabric.caller_did.clone(),
+                did: None,
                 fields: if verified {
                     claims
                         .caller_context_fields

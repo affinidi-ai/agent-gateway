@@ -12337,8 +12337,9 @@ mod tests {
     /// Transit Point that opts in, finds no grant: it is answered `401` with an
     /// authorization URL whose consent state is keyed by that caller's
     /// `fabric.principal_hash`, never by the DID or a top-level hash the token
-    /// carries, and the grant the callback stores under it is then released to
-    /// the same caller.
+    /// carries, nor by a client the Transit Point verified on the same call, so
+    /// it can bind no other caller's grant; and the grant the callback stores
+    /// under it is then released to the same caller.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_opted_in_fabric_callers_first_call_asks_for_consent_keyed_by_its_principal() {
         let directory = tempfile::tempdir().unwrap();
@@ -12349,6 +12350,13 @@ mod tests {
         }
         .principal_hash(None)
         .unwrap();
+        let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "dave".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+        };
+        let direct_client_hash = direct_client
+            .principal_hash(None)
+            .unwrap();
         let call = || {
             let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("consent"));
             point["delegated_credentials_for_fabric_callers"] = json!(true);
@@ -12358,6 +12366,8 @@ mod tests {
             let mut claims = verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash);
             claims.user_identity_hash = Some("sha256:user".to_string());
             ctx.transit_token_claims = Some(claims);
+            ctx.authenticated_identity = Some(direct_client.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
             ctx
         };
 
@@ -12381,6 +12391,7 @@ mod tests {
             .unwrap();
         let consent = crate::delegation_vault::oauth::decode_oauth_state(&encoded_state).unwrap();
         assert_eq!(consent.user_identity_hash, carol_hash, "the caller the receiving surface verified");
+        assert_ne!(consent.user_identity_hash, direct_client_hash, "never the client the Transit Point verified");
         assert_eq!(consent.agent_did, "did:web:agent.example", "the Transit Point's managed identity");
 
         state
@@ -12603,8 +12614,9 @@ mod tests {
     /// A Fabric-issued token is a `fabric_peer` caller: not verified without a
     /// caller the receiving surface verified, whatever else it carries, its
     /// DID never verified, even when a connection issuer's presentation
-    /// carried it (the peer vouches for it, this gateway checked nothing), and
-    /// always with the peer that sent the request.
+    /// carried it (the peer vouches for it, this gateway checked nothing), so
+    /// named as the peer's (`fabric.caller_did`), and always with the peer
+    /// that sent the request.
     #[test]
     fn outbound_policy_input_names_the_peer_gateway_of_a_fabric_issued_token() {
         let mut ctx = test_pipeline_context();
@@ -12613,14 +12625,15 @@ mod tests {
             json!({ "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example", "hops": 2 });
 
         ctx.transit_token_claims = Some(fabric_claims(Some("did:web:agent.example"), "fabric-presentation", None, 2));
+        let mut vouching = peer.clone();
+        vouching["caller_did"] = json!("did:web:agent.example");
         assert_eq!(
             transit_caller_json(&ctx),
             json!({
                 "verified": false,
                 "verification": "fabric_peer",
                 "identity_source": "fabric-presentation",
-                "did": "did:web:agent.example",
-                "fabric": peer
+                "fabric": vouching
             })
         );
 
@@ -12652,10 +12665,16 @@ mod tests {
         let transit = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap()["transit"].clone();
         assert_eq!(transit["caller"]["verification"], "fabric_peer");
         assert_eq!(transit["caller"]["verified"], false);
-        assert_eq!(transit["caller"]["did"], "did:web:agent.example");
+        assert!(
+            transit["caller"]
+                .get("did")
+                .is_none(),
+            "the peer's DID is not the caller's"
+        );
         assert_eq!(
             transit["caller"]["fabric"],
-            json!({ "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example", "hops": 4 })
+            json!({ "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example", "hops": 4,
+                "caller_did": "did:web:agent.example" })
         );
         assert_eq!(transit["client"]["verification"], "source_auth");
         assert_eq!(transit["client"]["subject"], "partner-agent");
@@ -12702,7 +12721,8 @@ mod tests {
     /// A Fabric-issued token whose request the receiving surface verified is a
     /// verified `fabric_peer` caller: its identity hash is the one the
     /// receiving surface verified, its fields only those this Transit Point
-    /// allowlists, and the DID the peer named stays asserted.
+    /// allowlists, and the DID the peer named stays the peer's, under
+    /// `fabric`, never beside `verified` as the caller's `did`.
     #[test]
     fn a_fabric_token_naming_the_caller_the_receiving_surface_verified_is_a_verified_fabric_peer() {
         let mut ctx = test_pipeline_context();
@@ -12720,10 +12740,9 @@ mod tests {
                 "verification": "fabric_peer",
                 "identity_source": "fabric-asserted",
                 "user_identity_hash": "receiver-verified-hash",
-                "did": "did:web:agent.example",
                 "fields": { "email": "a@b.example" },
                 "fabric": { "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example",
-                    "hops": 2 }
+                    "hops": 2, "caller_did": "did:web:agent.example" }
             })
         );
     }
@@ -12823,19 +12842,28 @@ mod tests {
         let verified_caller = "package surface.policy\n\ndefault allow := false\n\n\
                                allow if input.transit.caller.verification == \"transit_token\"\n";
 
-        // A Fabric caller the receiving surface verified is `verified`, but the
-        // DID is still the partner's word: a rule on `verified` with `did`
-        // admits any partner naming it, and none that only vouches for it.
+        // A Fabric caller's DID is the partner's word, so it is never the
+        // caller's `did`, beside a `verified` that covers only the identity
+        // hash: a rule on both admits no partner, and the DID is matched, as
+        // the peer's assertion, under `fabric.caller_did`.
         let verified_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
                             input.transit.caller.did == \"did:web:q-agent.example\"\n    \
                             input.transit.caller.verified\n}\n";
+        let vouched_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                           input.transit.caller.fabric.caller_did == \"did:web:q-agent.example\"\n    \
+                           input.transit.caller.identity_source == \"fabric-presentation\"\n    \
+                           input.transit.caller.fabric.peer_issuer_did == \"did:web:partner.example\"\n}\n";
         let mut verified_partner = test_pipeline_context();
         verified_partner.transit_token_claims =
             Some(verified_fabric_claims(Some("did:web:q-agent.example"), "receiver-verified-hash"));
         assert!(
-            decide(&mut verified_partner, verified_did).await,
-            "`verified` covers the identity hash, never the DID"
+            !decide(&mut verified_partner, verified_did).await,
+            "a partner's DID never sits beside `verified` as the caller's"
         );
+        let caller = transit_caller_json(&verified_partner);
+        assert_eq!(caller["verified"], true);
+        assert!(caller.get("did").is_none(), "{caller}");
+        assert_eq!(caller["fabric"]["caller_did"], "did:web:q-agent.example", "{caller}");
         let mut vouched = test_pipeline_context();
         vouched.transit_token_claims =
             Some(fabric_claims(Some("did:web:q-agent.example"), "fabric-presentation", None, 1));
@@ -12843,6 +12871,7 @@ mod tests {
             !decide(&mut vouched, verified_did).await,
             "a DID a partner only vouches for never passes a verified-caller rule"
         );
+        assert!(decide(&mut vouched, vouched_did).await, "the DID one partner's presentation carried");
 
         let mut partner = test_pipeline_context();
         partner.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, 1));

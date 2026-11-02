@@ -524,7 +524,8 @@ the receiving surface checked a credential itself on the request, normally the o
 A Transit Point accepts such a token as it accepts an Access Point's, and its policy sees the
 caller as `verification: fabric_peer`, verified only with a `fabric.principal_hash` (see
 [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)), and its DID never verified,
-even when a presentation carried it. Static `target_auth`
+even when a presentation carried it, so policy sees it as the peer's (`fabric.caller_did`),
+never as the caller's `did`. Static `target_auth`
 credentials are added as for any caller. Delegated per-user credentials are released for it
 only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, which the
 admin API accepts only on a surface whose caller authentication tells a partner's users apart,
