@@ -5173,7 +5173,7 @@ async fn process_forward_request_in_request_scope(
     // the peer gateway asserts, so such a request is refused before any
     // payment is asked for or settled, and so is a discovery read, which
     // would carry the peer's headers to the vendor.
-    if let Some(refused) = crate::proxy::target_grant::refuse_over_fabric(&surface, &body_bytes) {
+    if let Some(refused) = crate::proxy::target_grant::refuse_over_fabric(&surface, &body_bytes, &audit_facts) {
         return axum_response_to_forward_result(refused).await;
     }
 

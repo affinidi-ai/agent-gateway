@@ -110,6 +110,12 @@ changes:
         listener already bound on the port accepts its connections, where an IPv6 wildcard covers
         IPv4 only on a dual-stack socket, so an address that is not served is no longer skipped
         silently.
+    - timestamp: '2026-11-03T10:00:00Z'
+      title: Audit a Fabric request refused by a Target bound by external consent
+      description: >-
+        A request that arrives over Fabric for a surface whose Access Point Target is bound by
+        external consent is still refused 403, and is now recorded as a request_rejected at
+        admission, consent_identity_required, so these refusals appear in the Audit Log.
   removed: []
   security:
     - timestamp: '2026-10-29T12:00:00Z'

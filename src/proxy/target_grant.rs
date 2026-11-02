@@ -381,6 +381,184 @@ fn unavailable(
     refuse(surface, mcp, body, &GrantRefusal::ConnectorUnavailable, reason)
 }
 
+/// A refusal of [`route_unaudited`], with what its `request_rejected` record
+/// names.
+struct Refused {
+    response: Response,
+    reason: crate::audit::request_events::RejectionReason,
+    rpc_error_code: Option<i32>,
+}
+
+impl Refused {
+    /// A `2026-07-28` MCP request, refused with `-32022`.
+    fn version(body: &[u8]) -> Self {
+        Self {
+            response: unsupported_modern_request(body),
+            reason: crate::audit::request_events::RejectionReason::VersionUnsupported,
+            rpc_error_code: Some(crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION),
+        }
+    }
+
+    /// A path or query the grant is not sent with ([`path_refused`]).
+    fn path(
+        mcp: bool,
+        body: &[u8],
+    ) -> Self {
+        Self {
+            response: path_refused(mcp, body),
+            reason: crate::audit::request_events::RejectionReason::TargetPathRefused,
+            rpc_error_code: mcp.then_some(crate::mcp::errors::error_codes::INVALID_REQUEST),
+        }
+    }
+
+    /// A method the grant is not sent with ([`method_refused`]).
+    fn method(mcp: bool) -> Self {
+        Self {
+            response: method_refused(mcp),
+            reason: crate::audit::request_events::RejectionReason::TargetMethodRefused,
+            rpc_error_code: None,
+        }
+    }
+
+    /// A rule the surface breaks, or anything else a new connect would not fix
+    /// ([`unavailable`]).
+    fn unavailable(
+        surface: &AgentSurface,
+        mcp: bool,
+        body: &[u8],
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            response: unavailable(surface, mcp, body, reason),
+            reason: crate::audit::request_events::RejectionReason::ConnectorUnavailable,
+            rpc_error_code: mcp.then_some(crate::mcp::errors::error_codes::INTERNAL_ERROR),
+        }
+    }
+}
+
+/// A rule of the Access Point Target's `consent_mode: external` binding that
+/// a view of the surface breaks. A save is refused with [`Self::refusal`], and
+/// a surface stored outside the API that breaks one answers
+/// `connector_unavailable`, logged with [`Self::reason`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetBindingViolation {
+    OtherBindings,
+    TransitPoints,
+    InjectedIntoTheBody,
+    AtTheOriginRoot,
+    TargetAuth,
+    CallerCredentialForwarded,
+    CallersCharged,
+    PresentationOfTheAgent,
+    CustomMetadata,
+}
+
+impl TargetBindingViolation {
+    /// The fixed reason a request refused for it is logged with.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::OtherBindings => "other_outbound_credentials",
+            Self::TransitPoints => "surface_with_transit_points",
+            Self::InjectedIntoTheBody => "grant_injected_into_the_body",
+            Self::AtTheOriginRoot => "target_at_the_origin_root",
+            Self::TargetAuth => "target_auth_beside_the_grant",
+            Self::CallerCredentialForwarded => "caller_credential_forwarded",
+            Self::CallersCharged => "callers_charged",
+            Self::PresentationOfTheAgent => "presentation_of_the_agent",
+            Self::CustomMetadata => "custom_metadata_beside_the_grant",
+        }
+    }
+
+    /// What a save that breaks it is refused with.
+    pub(crate) fn refusal(self) -> &'static str {
+        match self {
+            Self::OtherBindings => {
+                "consent_mode external binds the Access Point's Target alone: outbound_credentials can hold no \
+                 other binding"
+            }
+            Self::TransitPoints => {
+                "consent_mode external in outbound_credentials binds the Access Point's Target, on a surface \
+                 without Transit Points: outbound_credentials apply on every Transit Point"
+            }
+            Self::InjectedIntoTheBody => {
+                "consent_mode external injects the grant as a header: bearer_header or custom_header"
+            }
+            Self::AtTheOriginRoot => {
+                "consent_mode external on an A2A or AP2 Access Point sends the grant at or under the Target's \
+                 endpoint path, so target.endpoint cannot be the root of its origin, where that is every path \
+                 of the vendor's: give it the agent's own path"
+            }
+            Self::TargetAuth => {
+                "consent_mode external sends the grant in place of the Target's own credential: remove \
+                 target.auth"
+            }
+            Self::CallerCredentialForwarded => {
+                "consent_mode external sends the grant in place of the caller's credential: turn the Access \
+                 Point's forward_header off"
+            }
+            Self::CallersCharged => {
+                "consent_mode external charges callers nothing: a payment is settled before the grant is \
+                 released, and the release can still be refused; remove target.payment_policy"
+            }
+            Self::PresentationOfTheAgent => {
+                "consent_mode external sends the vendor no presentation of the agent: turn off \
+                 target.identity_injection.inject_vp and target.workload_binding, remove \
+                 identity_slots.inbound, and inject the surface's DID in a header, not protocol_native"
+            }
+            Self::CustomMetadata => {
+                "consent_mode external sends the vendor nothing of the gateway's beside the grant: turn \
+                 target.custom_metadata off"
+            }
+        }
+    }
+}
+
+/// The first rule of the Access Point Target's binding `binding` that `view`
+/// breaks: the binding sends the grant, in a header, in place of every other
+/// credential, as the only binding of `outbound_credentials`, which would
+/// otherwise apply on every Transit Point too, so the surface has none; and
+/// the vendor is sent no presentation of the agent, no custom metadata and no
+/// payment.
+pub(crate) fn target_binding_violation(
+    view: &AgentSurface,
+    binding: &OutboundCredentialBinding,
+) -> Option<TargetBindingViolation> {
+    let violation = if view
+        .outbound_credentials
+        .len()
+        != 1
+    {
+        TargetBindingViolation::OtherBindings
+    } else if !view
+        .transit_points()
+        .is_empty()
+    {
+        TargetBindingViolation::TransitPoints
+    } else if matches!(binding.inject_as, CredentialInjection::Meta { .. }) {
+        TargetBindingViolation::InjectedIntoTheBody
+    } else if sends_the_grant_across_the_origin(view) {
+        TargetBindingViolation::AtTheOriginRoot
+    } else if view.target_auth().is_some() {
+        TargetBindingViolation::TargetAuth
+    } else if view
+        .source_auth()
+        .is_some_and(
+            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+        )
+    {
+        TargetBindingViolation::CallerCredentialForwarded
+    } else if view.charges_callers() {
+        TargetBindingViolation::CallersCharged
+    } else if view.presents_the_agent_to_the_target() {
+        TargetBindingViolation::PresentationOfTheAgent
+    } else if view.injects_custom_metadata() {
+        TargetBindingViolation::CustomMetadata
+    } else {
+        return None;
+    };
+    Some(violation)
+}
+
 /// The route of a request to `surface`'s Target when the Target is bound by
 /// external consent, or `None` when it is not, when the request is a public
 /// discovery read, which carries no caller and so no grant, or when it is an
@@ -403,34 +581,24 @@ pub(crate) async fn route(
     state: &ProxyState,
     request: TargetRequest<'_>,
 ) -> Result<Option<TargetGrantRoute>, Response> {
-    use crate::audit::request_events::{RejectionReason, RejectionStage, request_rejected};
-    use crate::mcp::errors::error_codes;
-    let facts = request.facts;
-    let modern = request.modern;
-    let mcp = state
-        .surface
-        .access_point
-        .protocol
-        == SurfaceProtocol::Mcp;
+    use crate::audit::request_events::{RejectionStage, request_rejected};
+    let request_facts = request.facts;
     route_unaudited(state, request)
         .await
-        .inspect_err(|refused| {
-            // Every refusal of `route_unaudited` is one of these, by its
-            // status: the `-32022` of a 2026-07-28 request and a path
-            // refused are its only `400`s, a method refused its only `405`,
-            // and every other is `connector_unavailable`.
-            let status = refused.status();
-            let (reason, rpc_error_code) = match status {
-                StatusCode::BAD_REQUEST if modern => {
-                    (RejectionReason::VersionUnsupported, Some(error_codes::UNSUPPORTED_PROTOCOL_VERSION))
-                }
-                StatusCode::BAD_REQUEST => {
-                    (RejectionReason::TargetPathRefused, mcp.then_some(error_codes::INVALID_REQUEST))
-                }
-                StatusCode::METHOD_NOT_ALLOWED => (RejectionReason::TargetMethodRefused, None),
-                _ => (RejectionReason::ConnectorUnavailable, mcp.then_some(error_codes::INTERNAL_ERROR)),
-            };
-            request_rejected(facts, RejectionStage::Admission, reason, status.as_u16(), rpc_error_code.map(i64::from));
+        .map_err(|refused| {
+            request_rejected(
+                request_facts,
+                RejectionStage::Admission,
+                refused.reason,
+                refused
+                    .response
+                    .status()
+                    .as_u16(),
+                refused
+                    .rpc_error_code
+                    .map(i64::from),
+            );
+            refused.response
         })
 }
 
@@ -438,7 +606,7 @@ pub(crate) async fn route(
 async fn route_unaudited(
     state: &ProxyState,
     request: TargetRequest<'_>,
-) -> Result<Option<TargetGrantRoute>, Response> {
+) -> Result<Option<TargetGrantRoute>, Refused> {
     let surface = &state.surface;
     let Some(binding) = surface.target_external_credentials() else {
         return Ok(None);
@@ -453,18 +621,18 @@ async fn route_unaudited(
             "A 2026-07-28 MCP request was sent to an Access Point whose Target is bound by external consent - \
              refusing the request"
         );
-        return Err(unsupported_modern_request(body));
+        return Err(Refused::version(body));
     }
     let Some(segments) = forwarded_segments(request.path) else {
         log_refusal(surface, "path_not_read_alike");
-        return Err(path_refused(mcp, body));
+        return Err(Refused::path(mcp, body));
     };
     if crate::proxy::paths::is_public_request(request.method, request.path) {
         return Ok(None);
     }
     if mcp && !segments.is_empty() {
         log_refusal(surface, "path_not_the_endpoint");
-        return Err(path_refused(mcp, body));
+        return Err(Refused::path(mcp, body));
     }
     if mcp
         && ((request.method == "GET" && crate::mcp::sse_server::client_wants_sse(request.headers))
@@ -474,81 +642,42 @@ async fn route_unaudited(
     }
     if !methods_with_the_grant(mcp).contains(&request.method) {
         log_refusal(surface, "method_not_sent_the_grant");
-        return Err(method_refused(mcp));
+        return Err(Refused::method(mcp));
     }
     if request
         .query
         .is_some_and(|query| !query.is_empty())
     {
         log_refusal(surface, "query_not_sent");
-        return Err(path_refused(mcp, body));
+        return Err(Refused::path(mcp, body));
     }
     let Some(target_url) = forwarded_url(&surface.target.endpoint, &segments) else {
-        return Err(unavailable(surface, mcp, body, "target_not_a_url"));
+        return Err(Refused::unavailable(surface, mcp, body, "target_not_a_url"));
     };
-    if sends_the_grant_across_the_origin(surface) {
-        return Err(unavailable(surface, mcp, body, "target_at_the_origin_root"));
-    }
     let Some(subject) = binding.subject else {
-        return Err(unavailable(surface, mcp, body, "no_subject"));
+        return Err(Refused::unavailable(surface, mcp, body, "no_subject"));
     };
     if let Some(unchecked) = unchecked_callers(surface, subject) {
-        return Err(unavailable(surface, mcp, body, unchecked.reason()));
+        return Err(Refused::unavailable(surface, mcp, body, unchecked.reason()));
     }
-    if surface.presents_the_agent_to_the_target() {
-        return Err(unavailable(surface, mcp, body, "presentation_of_the_agent"));
-    }
-    if surface.injects_custom_metadata() {
-        return Err(unavailable(surface, mcp, body, "custom_metadata_beside_the_grant"));
-    }
-    if surface.charges_callers() {
-        return Err(unavailable(surface, mcp, body, "callers_charged"));
-    }
-    if surface
-        .outbound_credentials
-        .len()
-        != 1
-    {
-        return Err(unavailable(surface, mcp, body, "other_outbound_credentials"));
-    }
-    if !surface
-        .transit_points()
-        .is_empty()
-    {
-        return Err(unavailable(surface, mcp, body, "surface_with_transit_points"));
-    }
-    if matches!(binding.inject_as, CredentialInjection::Meta { .. }) {
-        return Err(unavailable(surface, mcp, body, "grant_injected_into_the_body"));
-    }
-    if surface
-        .target_auth()
-        .is_some()
-    {
-        return Err(unavailable(surface, mcp, body, "target_auth_beside_the_grant"));
-    }
-    if surface
-        .source_auth()
-        .is_some_and(
-            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
-        )
-    {
-        return Err(unavailable(surface, mcp, body, "caller_credential_forwarded"));
+    if let Some(violation) = target_binding_violation(surface, binding) {
+        return Err(Refused::unavailable(surface, mcp, body, violation.reason()));
     }
     let (Some(_), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
-        return Err(unavailable(surface, mcp, body, "stores_unavailable"));
+        return Err(Refused::unavailable(surface, mcp, body, "stores_unavailable"));
     };
     let provider = match providers
         .get(&binding.credential_provider_id)
         .await
     {
         Ok(Some(provider)) => provider,
-        Ok(None) | Err(_) => return Err(unavailable(surface, mcp, body, "provider_unavailable")),
+        Ok(None) | Err(_) => return Err(Refused::unavailable(surface, mcp, body, "provider_unavailable")),
     };
     if !provider.is_external_consent() {
-        return Err(unavailable(surface, mcp, body, "provider_without_issuer"));
+        return Err(Refused::unavailable(surface, mcp, body, "provider_without_issuer"));
     }
     if provider.tenant_id != surface.tenant_id {
-        return Err(unavailable(surface, mcp, body, "provider_of_another_tenant"));
+        return Err(Refused::unavailable(surface, mcp, body, "provider_of_another_tenant"));
     }
     let allowlist = state
         .egress_allowlist
@@ -557,7 +686,7 @@ async fn route_unaudited(
         .await
         .is_err()
     {
-        return Err(unavailable(surface, mcp, body, "destination_not_the_resource"));
+        return Err(Refused::unavailable(surface, mcp, body, "destination_not_the_resource"));
     }
     if !crate::credential_providers::external::resource_permitted(
         &provider,
@@ -565,7 +694,7 @@ async fn route_unaudited(
             .network_config
             .external_consent_resource_origins,
     ) {
-        return Err(unavailable(surface, mcp, body, "resource_not_permitted_for_issuer"));
+        return Err(Refused::unavailable(surface, mcp, body, "resource_not_permitted_for_issuer"));
     }
     if crate::credential_providers::external::issuer_permitted(
         &provider,
@@ -576,7 +705,7 @@ async fn route_unaudited(
     )
     .is_err()
     {
-        return Err(unavailable(surface, mcp, body, "issuer_not_permitted"));
+        return Err(Refused::unavailable(surface, mcp, body, "issuer_not_permitted"));
     }
     let timeout = std::time::Duration::from_secs(
         state
@@ -593,7 +722,7 @@ async fn route_unaudited(
                 error = ?error.to_string(),
                 "The Target of a request carrying a grant by binding was refused by Strict egress"
             );
-            unavailable(surface, mcp, body, "forward_refused_by_strict_egress")
+            Refused::unavailable(surface, mcp, body, "forward_refused_by_strict_egress")
         })?;
     Ok(Some(TargetGrantRoute {
         binding: binding.clone(),
@@ -667,12 +796,16 @@ fn caller_not_identified(
 /// refused as a request whose caller the gateway did not identify. A public
 /// discovery read is refused too: it would carry the peer's headers, its
 /// caller's cookies among them, to the vendor, and no request over Fabric can
-/// use such a Target, so nothing needs its discovery there. Any request to a
-/// Target that is not bound by external consent passes.
+/// use such a Target, so nothing needs its discovery there. A refusal is
+/// audited `request_rejected` at admission, as `consent_identity_required`.
+/// Any request to a Target that is not bound by external consent passes.
 pub(crate) fn refuse_over_fabric(
     surface: &AgentSurface,
     body: &[u8],
+    facts: &crate::audit::request_events::RequestFacts<'_>,
 ) -> Option<Response> {
+    use crate::audit::request_events::{RejectionReason, RejectionStage, request_rejected};
+
     if !binds_the_target(surface) {
         return None;
     }
@@ -683,7 +816,15 @@ pub(crate) fn refuse_over_fabric(
         "The Access Point Target's grant by binding is not released for a request that arrived over Fabric - \
          refusing the request"
     );
-    Some(caller_not_identified(surface.access_point.protocol == SurfaceProtocol::Mcp, body))
+    let refused = caller_not_identified(surface.access_point.protocol == SurfaceProtocol::Mcp, body);
+    request_rejected(
+        facts,
+        RejectionStage::Admission,
+        RejectionReason::ConsentIdentityRequired,
+        refused.status().as_u16(),
+        None,
+    );
+    Some(refused)
 }
 
 /// What releasing the Target's grant for one caller needs.
@@ -1037,23 +1178,138 @@ mod tests {
     /// Target is let through.
     #[tokio::test]
     async fn a_request_over_fabric_never_gets_the_targets_grant() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage, RequestFacts};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
         let external = serde_json::json!([{"credential_provider_id": "vendor", "consent_mode": "external",
             "subject": "owner"}]);
         let call = br#"{"jsonrpc":"2.0","id":"call-1","method":"tools/list"}"#;
-        let refused = refuse_over_fabric(&surface("mcp", external.clone()), call).expect("a Fabric caller is refused");
-        let (status, body) = read(refused).await;
+        type Rejection = (RejectionStage, RejectionReason, Option<u16>, Option<i64>);
+        async fn refuse(
+            protocol: &str,
+            bindings: serde_json::Value,
+            body: &[u8],
+        ) -> (Option<Response>, Vec<Rejection>) {
+            let facts = RequestFacts {
+                via_fabric: true,
+                ..RequestFacts::unroutable()
+            };
+            let (refused, events) = crate::audit::producer::capture(async {
+                refuse_over_fabric(&surface(protocol, bindings), body, &facts)
+            })
+            .await;
+            let rejections = events
+                .into_iter()
+                .filter_map(|event| match event.event {
+                    DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        ..
+                    } => Some((stage, reason, http_status, rpc_error_code)),
+                    _ => None,
+                })
+                .collect();
+            (refused, rejections)
+        }
+        let (refused, rejections) = refuse("mcp", external.clone(), call).await;
+        let (status, body) = read(refused.expect("a Fabric caller is refused")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["id"], "call-1");
         assert_eq!(body["error"]["code"], -32001);
-        let refused = refuse_over_fabric(&surface("a2a", external.clone()), call).expect("a Fabric caller is refused");
-        let (status, body) = read(refused).await;
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, None, None)]);
+        let (refused, rejections) = refuse("a2a", external.clone(), call).await;
+        let (status, body) = read(refused.expect("a Fabric caller is refused")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/identity-required");
-        let refused =
-            refuse_over_fabric(&surface("a2a", external), b"").expect("a Fabric discovery read, without a body");
-        assert_eq!(read(refused).await.0, StatusCode::FORBIDDEN);
-        let agent_keyed = serde_json::json!([{"credential_provider_id": "agent-keyed"}]);
-        assert!(refuse_over_fabric(&surface("mcp", agent_keyed), call).is_none());
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, None, None)]);
+        let (refused, rejections) = refuse("a2a", external, b"").await;
+        assert_eq!(
+            read(refused.expect("a Fabric discovery read, without a body"))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(rejections.len(), 1, "a discovery read is audited too");
+        let (refused, rejections) =
+            refuse("mcp", serde_json::json!([{"credential_provider_id": "agent-keyed"}]), call).await;
+        assert!(refused.is_none());
+        assert!(rejections.is_empty(), "a request let through is not audited");
+    }
+
+    /// Each rule of the Access Point Target's binding is one violation, found
+    /// in the same view at save and at run time, with a reason and a refusal of
+    /// its own; a view that breaks none has none.
+    #[test]
+    fn each_rule_of_the_targets_binding_is_one_violation_at_save_and_run_time() {
+        let external = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner"});
+        let with = |change: serde_json::Value| {
+            let mut view = serde_json::to_value(surface("mcp", serde_json::json!([external.clone()]))).unwrap();
+            json_patch::merge(&mut view, &change);
+            serde_json::from_value::<AgentSurface>(view).unwrap()
+        };
+        let cases = [
+            (
+                TargetBindingViolation::OtherBindings,
+                with(serde_json::json!({"outbound_credentials": [external.clone(),
+                    {"credential_provider_id": "agent-keyed"}]})),
+            ),
+            (
+                TargetBindingViolation::TransitPoints,
+                with(serde_json::json!({"transit": {"points": [{"alias": "crm",
+                    "target_endpoint": "https://crm.example/mcp"}]}})),
+            ),
+            (
+                TargetBindingViolation::InjectedIntoTheBody,
+                with(serde_json::json!({"outbound_credentials": [{"credential_provider_id": "vendor",
+                    "consent_mode": "external", "subject": "owner", "inject_as": {"type": "meta", "field": "token"}}]})),
+            ),
+            (
+                TargetBindingViolation::AtTheOriginRoot,
+                with(serde_json::json!({"access_point": {"protocol": "a2a"},
+                    "target": {"endpoint": "https://mcp.vendor.example"}})),
+            ),
+            (
+                TargetBindingViolation::TargetAuth,
+                with(
+                    serde_json::json!({"target": {"auth": {"method": {"static_secret": {"secret_id": "s", "header_name": "X-Api-Key"}}}}}),
+                ),
+            ),
+            (
+                TargetBindingViolation::CallersCharged,
+                with(serde_json::json!({"target": {"payment_policy": {"type": "x402", "enabled": true}}})),
+            ),
+            (
+                TargetBindingViolation::PresentationOfTheAgent,
+                with(serde_json::json!({"target": {"workload_binding": {"enabled": true}}})),
+            ),
+            (
+                TargetBindingViolation::CustomMetadata,
+                with(serde_json::json!({"target": {"custom_metadata": {"enabled": true, "payload": {"a": "b"}}}})),
+            ),
+        ];
+        let mut reasons = std::collections::HashSet::new();
+        let mut refusals = std::collections::HashSet::new();
+        for (expected, view) in &cases {
+            let binding = view
+                .target_external_credentials()
+                .unwrap();
+            assert_eq!(target_binding_violation(view, binding), Some(*expected), "{expected:?}");
+            assert!(reasons.insert(expected.reason()), "{expected:?} has a reason of its own");
+            assert!(refusals.insert(expected.refusal()), "{expected:?} has a refusal of its own");
+        }
+        let clean = with(serde_json::json!({}));
+        assert_eq!(
+            target_binding_violation(
+                &clean,
+                clean
+                    .target_external_credentials()
+                    .unwrap()
+            ),
+            None
+        );
     }
 
     /// A grant by binding is never released to callers the gateway cannot
