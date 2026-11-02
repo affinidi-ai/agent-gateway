@@ -1,8 +1,10 @@
 //! How many Fabric crossings a request has made. Gateways carry the count in
 //! `X-Gateway-Fabric-Hops`; inside a gateway it rides in the transit token the
-//! receiving gateway issues, so an agent cannot lower it. A request past
-//! [`MAX_FABRIC_HOPS`] crossings is refused, which bounds chains of agents that
-//! call each other through their gateways.
+//! receiving gateway issues, signed, so an agent cannot lower the count in the
+//! token it was given, though a call with an older token or none starts lower.
+//! A request past [`MAX_FABRIC_HOPS`] crossings is refused, which bounds chains
+//! of Transit Point calls through gateways whose agents send the token they
+//! were given.
 
 use std::collections::HashMap;
 

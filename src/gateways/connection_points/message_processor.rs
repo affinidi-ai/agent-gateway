@@ -5921,7 +5921,13 @@ async fn process_forward_request_in_request_scope(
     ) {
         Ok(Some((token, jti))) => {
             req = req.header("X-Transit-Token", token);
-            channel_debug!(config_id, "Injected a transit token for the fabric request (jti={})", jti);
+            info!(
+                surface_id = ?surface.surface_id,
+                peer_gateway_id = ?sender.id,
+                hops = fabric_hops,
+                jti = ?jti,
+                "Issued a transit token for a fabric request"
+            );
         }
         Ok(None) => {}
         Err(()) => return transit_token_unavailable_refusal(&surface, audit_trace_id),

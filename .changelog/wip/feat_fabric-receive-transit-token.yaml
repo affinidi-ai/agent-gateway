@@ -27,7 +27,9 @@ changes:
         `target_auth` credentials are added as for any caller. `proxy://` and `a2a-proxy://`
         Targets never get a token, nor does a public discovery `GET` such as an agent card fetch,
         nor a request relayed to an MCP Target over the legacy HTTP+SSE transport, on this path
-        or the Access Point's.
+        or the Access Point's. Like an Access Point token, the token can be presented again
+        until it expires; the receiving gateway logs each one it issues at `INFO` with its token
+        ID, the peer and the hop count.
     - timestamp: '2026-10-30T09:00:00.000Z'
       title: Refuse requests that cross Fabric more than 8 times
       description: >-
@@ -44,10 +46,12 @@ changes:
         counts as its first crossing: during a rolling upgrade, a chain through a node that
         predates the count starts again at 1 after it. A Transit Point reads the count from the
         transit token the agent sends, required or not, so a call without one starts again at 1,
-        as does a public discovery `GET` through a Transit Point, and an agent holding an older
-        token can present it. The limit bounds chains
-        of Transit Point calls; agents calling each other's Access Points directly are not
-        bounded by it.
+        as do a call through a Transit Point without `allow_fabric_callers` or on a gateway with
+        no transit token issuer, a public discovery `GET` through a Transit Point, and an agent's
+        call to an Access Point, its own gateway's included; an agent holding an older token can
+        present it. The limit bounds chains of Transit Point calls whose agents send the token
+        they were given; agents calling each other's Access Points are not bounded by it, and
+        it is not an access control.
     - timestamp: '2026-10-30T12:00:00.000Z'
       title: Warn on save of a Fabric Transit Point that does not require the transit token
       description: >-

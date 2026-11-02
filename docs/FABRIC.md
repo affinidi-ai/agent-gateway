@@ -543,14 +543,27 @@ request back and forth without end. A hop count bounds them.
   unless a surface sets `terminate_trace_id`. The hop count crosses a terminated trace too.
 
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
-gateway's Access Point, or an agent calling another surface's Access Point directly, starts
-again at 1, and so does a call without a transit token through a Transit Point that does not
-require one (it reads the count from a token the agent sends), and a public discovery `GET` (an
-agent card or `.well-known` document) through any Transit Point, which reads no token. So does a chain through a gateway that predates
-the hop count, which neither reads nor sends it. A peer that does not follow these rules can
-reset the count. The limit bounds a chain of Transit Point calls through gateways that follow
-these rules; agents that call each other's Access Points directly are not bounded by it, and it
-is not an access control.
+gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
+included, starts again at 1, and so does a call without a transit token through a Transit Point
+that does not require one (it reads the count from a token the agent sends), a call through a
+Transit Point that does not list `allow_fabric_callers` (the agent got no token for it), a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
+public discovery `GET` (an agent card or `.well-known` document) through any Transit Point,
+which reads no token either. So does a chain through a gateway that predates the hop count,
+which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
+the agent sending the token it was given each time; two agents that call each other's Access
+Points are not bounded by it, nor are agents that keep calling through any of the resets above.
+It is not an access control, and an agent can escape it.
+
+A Fabric-issued transit token, like an Access Point's, is a bearer token until it expires.
+Nothing records which token IDs were presented, so the agent, or anyone who obtains the token,
+can present it again on any call to a Transit Point it lists, and an agent holding several
+valid tokens can choose which one a Transit Point sees, with its `fabric.hops` and
+`fabric.caller_did`. The surface's [transit token
+lifetime](SOURCE_AUTH.md#transit-token-lifetime) bounds this. The receiving gateway logs each
+token it issues at `INFO`, with its token ID (`jti`), the peer's Remote gateway record and the
+hop count, so a token presented later can be traced to the request it was issued for.
 
 A managed agent serving a partner's request gets a transit token only for the Transit Points
 that set `allow_fabric_callers: true`, off by default and set through the admin API only (a
