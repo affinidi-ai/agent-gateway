@@ -58,7 +58,6 @@ test.describe('Credential providers: JWT Bearer form', () => {
 
         await page.getByTestId('credential-provider-type-select').selectOption('oauth2_jwt_bearer');
         await page.locator('#name').fill('Calendar provider');
-        await page.locator('#provider_id').fill('calendar');
         await page.locator('#token_endpoint').fill('https://oauth2.googleapis.com/token');
         await page
             .getByTestId('credential-provider-jwt-issuer-input')
@@ -77,7 +76,7 @@ test.describe('Credential providers: JWT Bearer form', () => {
         await expect.poll(() => posted.length).toBe(1);
         expect(posted[0].postDataJSON()).toMatchObject({
             provider_type: 'oauth2_jwt_bearer',
-            provider_id: 'calendar',
+            provider_id: 'calendar-provider',
             jwt_issuer: 'sa@project.iam.gserviceaccount.com',
             jwt_subject: 'user@example.com',
             jwt_signing_key_secret_ref: 'SA_KEY',
