@@ -49,7 +49,6 @@ describe('Transit Settings listener authentication', () => {
     });
     expect(config).toEqual({
       transit_token_mode: 'embedded',
-      sign_requests: true,
       opa_policy_definition_id: 'policy-1',
     });
   });
@@ -68,7 +67,6 @@ describe('Transit Settings listener authentication', () => {
       configured: true,
       config: {
         transit_token_mode: 'embedded',
-        sign_requests: true,
         listener_auth_type: 'api_key',
         listener_auth_header: 'X-API-Key',
         listener_auth_secret_id: 'transit-secret',
