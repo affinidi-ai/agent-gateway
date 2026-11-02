@@ -326,6 +326,16 @@ impl CredentialProvider {
             .collect()
     }
 
+    /// Is a secret of `secret_tenant` outside this provider's own tenant? A tenant provider
+    /// may use only its own tenant's secrets and an appliance-wide provider only appliance-wide
+    /// ones.
+    pub fn secret_is_outside_tenant(
+        &self,
+        secret_tenant: Option<&str>,
+    ) -> bool {
+        self.tenant_id.as_deref() != secret_tenant
+    }
+
     /// Does the provider send the gateway's own credential on a tenant surface from an
     /// appliance-wide provider? Only that credential is held to tenant isolation.
     pub fn breaks_tenant_isolation_for(
@@ -614,6 +624,17 @@ mod tests {
             assert_eq!(wide.breaks_tenant_isolation_for(Some("a")), sends_gateway_credential);
             assert!(!wide.breaks_tenant_isolation_for(None));
         }
+    }
+
+    #[test]
+    fn a_secret_is_outside_a_provider_tenant_unless_both_name_the_same_one() {
+        let mut provider = make_provider("p", "p");
+        assert!(!provider.secret_is_outside_tenant(None));
+        assert!(provider.secret_is_outside_tenant(Some("a")));
+        provider.tenant_id = Some("a".into());
+        assert!(!provider.secret_is_outside_tenant(Some("a")));
+        assert!(provider.secret_is_outside_tenant(Some("b")));
+        assert!(provider.secret_is_outside_tenant(None));
     }
 
     fn make_provider(

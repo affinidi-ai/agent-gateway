@@ -439,7 +439,8 @@ fn backoff_delay(failures: u32) -> chrono::Duration {
 /// SHA-256 of the provider digest, the sorted scopes and each referenced secret's id, tenant
 /// and `updated_at`. Secrets are read from the store's metadata listing, never decrypted.
 /// A missing secret, or one outside the provider's tenant while `isolation` is enforced, is
-/// refused here, so a cached token stops being served at once.
+/// refused here, so a cached token stops being served at once. Under `warn` the grant itself
+/// logs the out-of-tenant secret, once per token request.
 async fn cache_identity(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -460,12 +461,9 @@ async fn cache_identity(
                 warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Credential provider secret not found");
                 ServiceTokenError::SecretUnavailable
             })?;
-        if secret.tenant_id != provider.tenant_id {
-            if isolation.is_enforced() {
-                warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Refusing a credential provider secret outside the provider's tenant");
-                return Err(ServiceTokenError::SecretUnavailable);
-            }
-            warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Using a credential provider secret outside the provider's tenant");
+        if isolation.is_enforced() && provider.secret_is_outside_tenant(secret.tenant_id.as_deref()) {
+            warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Refusing a credential provider secret outside the provider's tenant");
+            return Err(ServiceTokenError::SecretUnavailable);
         }
         versions.push(serde_json::json!([secret_ref, secret.id, secret.tenant_id, secret.updated_at]));
     }
@@ -2290,6 +2288,75 @@ mod tests {
             assert!(!backoff.holds_back(now), "{error}");
             assert_eq!(backoff.failures, 0, "{error}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_secret_warns_once_per_token_grant_and_not_on_a_cache_hit() {
+        const WARNING: &str = "Using a credential provider secret outside the provider's tenant";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                             "jwt_signing_key_secret_ref": "SIGNING_KEY", "tenant_id": "tenant-a"}))
+            .await;
+        let now = Utc::now();
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        assert_eq!(
+            logs.text()
+                .matches(WARNING)
+                .count(),
+            1,
+            "{}",
+            logs.text()
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &["read"], now)
+                        .await
+                ),
+                ("issued".into(), Freshness::Cached)
+            );
+        }
+        assert_eq!(
+            logs.text()
+                .matches(WARNING)
+                .count(),
+            1,
+            "{}",
+            logs.text()
+        );
+        fixture
+            .egress
+            .policy
+            .tenant_credential_isolation = RuleMode::Enforce;
+        assert_eq!(
+            fixture
+                .acquire(&provider, &["read"], now)
+                .await
+                .err(),
+            Some(ServiceTokenError::SecretUnavailable)
+        );
+        assert_eq!(
+            logs.text()
+                .matches(WARNING)
+                .count(),
+            1
+        );
+        assert_eq!(
+            logs.text()
+                .matches("Refusing a credential provider secret outside the provider's tenant")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

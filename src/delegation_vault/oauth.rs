@@ -1114,7 +1114,7 @@ pub(super) async fn resolve_secret(
         .iter()
         .find(|s| s.secret_id == secret_ref)
         .ok_or(ProviderSecretError::NotFound)?;
-    if secret.tenant_id != provider.tenant_id {
+    if provider.secret_is_outside_tenant(secret.tenant_id.as_deref()) {
         if mode.is_enforced() {
             warn!(target: "credential_delegation", provider_id = %provider.provider_id, secret_ref, "Refusing a credential provider secret outside the provider's tenant");
             return Err(ProviderSecretError::OutsideTenant);
