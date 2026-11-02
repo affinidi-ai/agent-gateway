@@ -310,7 +310,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     applies and the surface does not set `delegated_credentials_for_fabric_callers`) and
     `consent_not_available_for_partners` (the caller has no grant, and consent is never started
     through a partner); the peer is answered `403` with that reason (see
-    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
+    Transit Point records `consent_not_available_for_partners` too, against its surface with the
+    call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
+    and answers the agent `403` with that reason (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
   - `forward`: `ssrf_blocked` (egress policy refuses the target address),
     `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric

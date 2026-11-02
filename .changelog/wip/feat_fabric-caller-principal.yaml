@@ -38,10 +38,17 @@ changes:
         users apart: anything but a resource token, or a `jwt_bearer` method that names an
         audience through a JWT verification strategy that names an issuer. With `api_key`, for
         example, every key in the secret, the partner's and direct callers' alike, would be one
-        caller with one grant. That grant is the same one the user's direct calls through the
-        Transit Point use, so whoever completes the consent URL of an opted-in caller's first
-        call binds it for both. The Transit Point also needs a managed identity, and a save of
-        one that sets the switch without one answers with a `Warning` header, since a binding
+        caller with one grant. It releases only a grant that already exists, the one the user's
+        direct calls through the Transit Point use: no consent is started for a Fabric caller,
+        on legacy or `2026-07-28` MCP calls, so one with no grant gets `403` and
+        `consent_not_available_for_partners`, with no authorization URL, as a JSON-RPC error
+        (`-32001`) on an MCP Transit Point and a problem JSON otherwise, recorded as a
+        `request_rejected` audit event. A person consents by connecting to the gateway directly:
+        the user calls the surface's Access Point directly once, with the credential the
+        receiving surface verifies, and completes the consent that call asks for; the partner's
+        calls for that user then use that grant. The Transit Point also needs a managed
+        identity, and a save of one that sets the switch without one answers with a `Warning`
+        header, since a binding
         there refuses every Fabric caller. A `PUT` of the surface or of a variant that omits the
         switch keeps the stored value while the Transit Point requires the transit token and the
         surface's caller authentication tells users apart, since the Surface Builder does not
@@ -102,8 +109,8 @@ changes:
         their provider account for the rest. A per-user binding now refuses a legacy Fabric
         request with `403` and the reason `delegation_not_enabled_for_partners` unless the
         surface sets `delegated_credentials_for_fabric_callers`. The receiving gateway also no
-        longer starts consent for a Fabric request, whose authorization URL would travel through
-        the partner and bind whoever completes it: a caller with no grant gets `403` and
+        longer starts consent for a legacy Fabric request, whose authorization URL would travel
+        through the partner and bind whoever completes it: a caller with no grant gets `403` and
         `consent_not_available_for_partners`. A request with no verified caller gets
         `partner_caller_not_verified`. Each refusal is an MCP JSON-RPC error (`-32001`) or a
         problem JSON naming only that reason, and is recorded as a `request_rejected` audit event
@@ -131,4 +138,5 @@ changes:
         the identity they named, or on consent through the partner, stop getting credentials:
         give the receiving surface caller authentication the partner's `target_auth` satisfies
         for service-level bindings, and for per-user ones a JWT whose `sub` is the end user,
-        with an audience, plus the switch. Agent card and discovery reads are not affected.
+        with an audience, plus the switch. Consent is given only by connecting to the gateway
+        directly, never through a partner. Agent card and discovery reads are not affected.

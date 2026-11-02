@@ -486,8 +486,8 @@ usually the partner's own `target_auth` credential, which names all of the partn
 so per-user grants reach a legacy Fabric request only on a surface that sets
 `delegated_credentials_for_fabric_callers: true`, which the admin API accepts only beside caller
 authentication that tells a partner's users apart. Service-level credentials need no switch. The
-receiving gateway never starts consent for a Fabric request, so an opted-in caller with no grant
-is refused too. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
+receiving gateway never starts consent for a legacy Fabric request, so an opted-in caller with no
+grant is refused too. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
 `partner_caller_not_verified` or `consent_not_available_for_partners`), answered before the Target
 is called and recorded as a `request_rejected`; an agent card fetch is never refused for a binding
 (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
@@ -515,20 +515,24 @@ for any caller (see
 
 What the agent serving a partner's request gets back from an opted-in Transit Point:
 
-- the caller's grant, injected as the binding says, when one is stored under its
-  `fabric.principal_hash` and the Transit Point's managed identity;
-- otherwise, as for any caller with no grant, the consent answer: `401` with a
-  `consent_required` body whose authorization URL carries consent state keyed by that
-  `fabric.principal_hash`, never by the DID, a top-level hash the token carries or a client the
-  Transit Point verified. If the agent passes it back through the partner gateway, whoever
-  completes it binds their provider account to that caller, so the next call from the same
-  caller, and that user's direct calls through the same Transit Point, which use the same grant,
-  are sent with it. This is why the admin API accepts the switch only where the receiving
-  surface verifies a per-user credential, and why it belongs only beside partners trusted with
-  the users' tokens;
+- the caller's grant, injected as the binding says, when one is already stored under its
+  `fabric.principal_hash` and the Transit Point's managed identity, the same grant that user's
+  direct calls through that Transit Point use;
+- otherwise `403` with the fixed reason `consent_not_available_for_partners`, recorded as a
+  `request_rejected` audit event: a JSON-RPC error (`-32001`) on an MCP Transit Point, a problem
+  JSON otherwise. No consent is started for a Fabric caller and no authorization URL is sent,
+  since whoever completed one would bind their provider account to that user;
 - on a `2026-07-28` MCP call, whose grant is keyed by the Transit Point's resource-token
-  caller, the grant only when that caller is the one the receiving surface verified; otherwise
-  `403` (`-32001`).
+  caller, the grant only when that caller is the one the receiving surface verified, otherwise
+  `403` (`-32001`); and with no grant, the same `consent_not_available_for_partners` refusal,
+  never `input_required`.
+
+A person therefore consents by connecting to this gateway directly, never through a partner:
+the user first calls the surface's Access Point directly, with the credential the receiving
+surface verifies (the same JWT issuer and `sub`), so the agent's call through the Transit Point
+for that request gets the consent answer and the user completes it. The partner's calls for that
+user, on a Transit Point that opts in, then use that grant. Tell partners to send their users to
+the gateway once before relying on delegated credentials through it.
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
 (`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has

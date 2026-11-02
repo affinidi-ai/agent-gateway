@@ -3978,7 +3978,7 @@ impl FabricDelegationRefusal {
         match self {
             Self::CallerNotVerified => "partner_caller_not_verified",
             Self::NotEnabledForPartners => "delegation_not_enabled_for_partners",
-            Self::ConsentNotAvailable => "consent_not_available_for_partners",
+            Self::ConsentNotAvailable => crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON,
         }
     }
 
@@ -3986,9 +3986,7 @@ impl FabricDelegationRefusal {
         match self {
             Self::CallerNotVerified => "Delegated credentials need a caller this surface verified",
             Self::NotEnabledForPartners => "This surface does not release per-user delegated credentials to partners",
-            Self::ConsentNotAvailable => {
-                "Delegated credentials need the user's consent, which cannot be given through a partner"
-            }
+            Self::ConsentNotAvailable => crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE,
         }
     }
 

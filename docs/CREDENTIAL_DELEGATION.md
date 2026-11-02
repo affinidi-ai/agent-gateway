@@ -195,13 +195,18 @@ for any of its users or from a direct caller, is sent with it. A JWT whose `sub`
 user, with an audience naming this gateway, keys each user apart. A `PUT` that omits the switch
 drops it once the surface's caller authentication no longer tells users apart.
 
-The grant a Fabric caller gets on a Transit Point is the same grant that user's direct calls
+A Fabric caller gets only a grant that already exists. It is the grant that user's direct calls
 through that Transit Point use: the Transit Point's managed identity and the same identity hash.
-An opted-in caller with no grant yet gets the consent answer below, and whoever completes that
-authorization URL binds their provider account to the user, for direct calls through that
-Transit Point too. The URL goes to the managed agent, which may pass it back to the partner, so
-set the switch only for partners trusted with the users' credentials: a partner that holds a
-user's JWT for this gateway can already start consent for that user directly.
+Consent is never started for a Fabric caller, since a person consents by connecting to this
+gateway directly, never through a partner, and whoever completes an authorization URL binds
+their provider account to the user. An opted-in caller with no grant yet is refused with `403`
+and the fixed reason `consent_not_available_for_partners`, with no authorization URL and nothing
+stored: a JSON-RPC error (`-32001`, the request's id, `data.reason`) on an MCP Transit Point and
+an `application/problem+json` body with `reason` otherwise, recorded as a `request_rejected`
+audit event at the `admission` stage. So the user first calls the surface's Access Point
+directly, with the same credential the receiving surface verifies (the same JWT issuer and
+`sub`), and completes the consent the agent's call through that Transit Point asks for; the
+partner's calls for that user then use that grant.
 
 Without the switch, or when the receiving surface verified no caller, a binding that applies
 refuses the call with `403` and the target is not called. The log says delegated credentials
@@ -226,9 +231,9 @@ Fabric-issued token there follows the same rule and one more: without the switch
 a caller the receiving surface verified, a binding that applies refuses the call with `403`
 (`-32001`), and with them the call goes on only when the resource-token caller has the same
 identity hash as `fabric.principal_hash`. The grant of a resource-token caller is never
-released for a Fabric caller it is not. An opted-in caller with no grant yet gets the consent
-answer of [When a token is missing](#when-a-token-is-missing), with consent state keyed by its
-`fabric.principal_hash`; see
+released for a Fabric caller it is not. As on legacy calls, only a grant that already exists is
+released: a Fabric caller with none, or one whose consent is still pending, gets `403` (`-32001`)
+with `consent_not_available_for_partners`, never `input_required`, and no consent is issued; see
 [`FABRIC.md`](FABRIC.md#delegated-credentials-over-fabric) for what the agent receives.
 
 ### The caller on Fabric receive
@@ -275,7 +280,7 @@ when:
 | --- | --- |
 | `delegation_not_enabled_for_partners` | A per-user binding applies and the surface does not release per-user grants to partners. |
 | `partner_caller_not_verified` | Any binding applies and the surface verified no caller of the request. |
-| `consent_not_available_for_partners` | The caller has no grant yet. Consent is never started for a Fabric request: whoever completes an authorization URL binds their account to the caller, and on Fabric the URL would travel through the partner. |
+| `consent_not_available_for_partners` | The caller has no grant yet. Consent is never started for a legacy Fabric request: a person consents by connecting to this gateway directly, never through a partner, since whoever completes an authorization URL binds their account to the caller. |
 
 The reason is the only part of the refusal the peer sees: a JSON-RPC error with `-32001`, the
 request's id and `data.reason` on an MCP surface, an `application/problem+json` body with

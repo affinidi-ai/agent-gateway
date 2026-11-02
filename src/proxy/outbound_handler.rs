@@ -215,21 +215,34 @@ pub(crate) enum DelegationRefusal {
     AgentIdentityMissing,
     #[error("{}", crate::proxy::credential_delegation::DELEGATION_UNAVAILABLE)]
     Unavailable,
+    /// A caller that arrived over Fabric has no grant yet, and consent is
+    /// never started through a partner: a person consents by connecting to
+    /// this gateway directly.
+    #[error("{}", crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE)]
+    ConsentNotAvailableForPartners,
 }
 
 impl DelegationRefusal {
     fn status_code(self) -> StatusCode {
         match self {
-            Self::CallerIdentityMissing | Self::AgentIdentityMissing => StatusCode::FORBIDDEN,
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing | Self::ConsentNotAvailableForPartners => {
+                StatusCode::FORBIDDEN
+            }
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
     fn jsonrpc_code(self) -> i32 {
         match self {
-            Self::CallerIdentityMissing | Self::AgentIdentityMissing => -32001,
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing | Self::ConsentNotAvailableForPartners => -32001,
             Self::Unavailable => crate::mcp::errors::error_codes::INTERNAL_ERROR,
         }
+    }
+
+    /// The fixed reason the caller is told, for a refusal that has one.
+    fn reason(self) -> Option<&'static str> {
+        matches!(self, Self::ConsentNotAvailableForPartners)
+            .then_some(crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON)
     }
 }
 
@@ -330,9 +343,20 @@ impl IntoResponse for OutboundPipelineError {
                 id: Some(id),
                 code: refusal.jsonrpc_code(),
                 message: refusal.to_string(),
-                data: None,
+                data: refusal
+                    .reason()
+                    .map(|reason| serde_json::json!({ "reason": reason })),
             }
             .into_response();
+        }
+        if let Self::DelegationRefused { refusal, mcp_request_id: None } = &self
+            && let Some(reason) = refusal.reason()
+        {
+            return crate::proxy::credential_delegation::refusal_problem(
+                refusal.status_code(),
+                &refusal.to_string(),
+                reason,
+            );
         }
         if let Self::TransitPointUnavailable { mcp_request_id: Some(id) }
         | Self::FabricChainTooLong { mcp_request_id: Some(id) } = &self
@@ -4505,6 +4529,10 @@ async fn step_prepare_modern_credentials(
             ctx.modern_delegation = Some(prepared);
             Ok(None)
         }
+        Err(error @ ModernDelegationError::ConsentNotAvailableForPartners) => {
+            record_partner_consent_refusal(ctx);
+            Ok(Some(error.response(&request)))
+        }
         Err(error) => Ok(Some(error.response(&request))),
     }
 }
@@ -4643,6 +4671,40 @@ fn refuse_delegation(
         refusal,
         mcp_request_id: mcp_refusal_id(ctx),
     }
+}
+
+/// Logs and records, as a `request_rejected` at the `admission` stage, the
+/// refusal of a call carrying a Fabric-issued transit token whose caller has
+/// no grant yet: consent is never started through a partner, so a person
+/// connects to this gateway directly first.
+fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
+    let refusal = DelegationRefusal::ConsentNotAvailableForPartners;
+    warn!(
+        target: "credential_delegation",
+        request_id = %ctx.request_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        reason = crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON,
+        "The caller of a request that arrived over Fabric has no grant, and consent is not started through a \
+         partner - refusing the request"
+    );
+    crate::audit::request_events::request_rejected(
+        &crate::audit::request_events::RequestFacts {
+            surface_id: &ctx.surface.surface_id,
+            channel_name: &ctx.surface.name,
+            trace_id: Some(&ctx.request_id),
+            via_fabric: false,
+        },
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::ConsentNotAvailableForPartners,
+        refusal.status_code().as_u16(),
+        mcp_refusal_id(ctx).map(|_| i64::from(refusal.jsonrpc_code())),
+    );
+}
+
+/// [`record_partner_consent_refusal`], and the refusal itself.
+fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    record_partner_consent_refusal(ctx);
+    refuse_delegation(ctx, DelegationRefusal::ConsentNotAvailableForPartners)
 }
 
 /// [11] Credential Injection — resolve delegated OAuth tokens from the credential
@@ -4815,6 +4877,22 @@ async fn step_inject_credentials(
         })
     {
         return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
+    }
+
+    if ctx
+        .transit_token_claims
+        .as_ref()
+        .is_some_and(|claims| claims.fabric.is_some())
+        && results
+            .iter()
+            .any(|resolution| {
+                matches!(
+                    &resolution.result,
+                    crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired { .. }
+                )
+            })
+    {
+        return Err(refuse_partner_consent(ctx));
     }
 
     // Check for consent_required — if any binding needs consent, return the signal
@@ -12333,15 +12411,21 @@ mod tests {
         );
     }
 
-    /// The first call of a Fabric caller the receiving surface verified, on a
-    /// Transit Point that opts in, finds no grant: it is answered `401` with an
-    /// authorization URL whose consent state is keyed by that caller's
-    /// `fabric.principal_hash`, never by the DID or a top-level hash the token
-    /// carries, nor by a client the Transit Point verified on the same call, so
-    /// it can bind no other caller's grant; and the grant the callback stores
-    /// under it is then released to the same caller.
+    /// A Fabric caller the receiving surface verified, on a Transit Point that
+    /// opts in, gets only a grant already stored for its
+    /// `fabric.principal_hash` and the Transit Point's managed identity: a
+    /// person consents by connecting to this gateway directly, never through a
+    /// partner. Its first call, with no grant yet, starts no consent. It is
+    /// refused with `403` and `consent_not_available_for_partners`, with no
+    /// authorization URL, stores nothing for that caller or for a client the
+    /// Transit Point verified on the call, and is recorded as a
+    /// `request_rejected`, answered as a JSON-RPC error with its id on an MCP
+    /// Transit Point and as a problem JSON otherwise. Once that user's grant
+    /// exists, the same call is served with it. A caller an Access Point's
+    /// token names still gets the consent answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_opted_in_fabric_callers_first_call_asks_for_consent_keyed_by_its_principal() {
+    async fn an_opted_in_fabric_caller_gets_only_an_existing_grant_and_never_starts_consent() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
         let directory = tempfile::tempdir().unwrap();
         let (state, _) = delegation_pipeline(directory.path(), "https://partner.example/mcp", &[]).await;
         let carol_hash = crate::source_auth::AuthenticatedIdentity::ApiKey {
@@ -12357,9 +12441,10 @@ mod tests {
         let direct_client_hash = direct_client
             .principal_hash(None)
             .unwrap();
-        let call = || {
+        let call = |protocol: &str| {
             let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("consent"));
             point["delegated_credentials_for_fabric_callers"] = json!(true);
+            point["protocol"] = json!(protocol);
             let surface = transit_surface(json!([point]), json!([]));
             let (resolved, point) = resolved_transit_point(&surface, None, "partner");
             let mut ctx = legacy_delegation_context(resolved, point);
@@ -12370,38 +12455,80 @@ mod tests {
             ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
             ctx
         };
-
-        let mut first = call();
-        let body = match step_inject_credentials(&state, &mut first).await {
-            Err(OutboundPipelineError::ConsentRequired(body)) => {
-                serde_json::from_str::<serde_json::Value>(&body).unwrap()
-            }
-            other => panic!("expected consent_required, got {other:?}"),
-        };
-        let authorization_url = url::Url::parse(
-            body["consent_required"][0]["authorization_url"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        let encoded_state = authorization_url
-            .query_pairs()
-            .find(|(name, _)| name == "state")
-            .map(|(_, value)| value.into_owned())
-            .unwrap();
-        let consent = crate::delegation_vault::oauth::decode_oauth_state(&encoded_state).unwrap();
-        assert_eq!(consent.user_identity_hash, carol_hash, "the caller the receiving surface verified");
-        assert_ne!(consent.user_identity_hash, direct_client_hash, "never the client the Transit Point verified");
-        assert_eq!(consent.agent_did, "did:web:agent.example", "the Transit Point's managed identity");
-
-        state
+        let vault = state
             .delegation_vault_store
-            .as_ref()
-            .unwrap()
+            .clone()
+            .unwrap();
+
+        for protocol in ["mcp", "a2a"] {
+            let mut first = call(protocol);
+            let (result, events) = crate::audit::producer::capture(step_inject_credentials(&state, &mut first)).await;
+            let refused = result.expect_err("no consent is started for a Fabric caller");
+            assert!(
+                matches!(
+                    refused,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::ConsentNotAvailableForPartners,
+                        ..
+                    }
+                ),
+                "{protocol}: {refused:?}"
+            );
+            let rejected: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage, reason, ..
+                    } => Some((*stage, *reason)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rejected,
+                [(RejectionStage::Admission, RejectionReason::ConsentNotAvailableForPartners)],
+                "{protocol}"
+            );
+            let response = refused.into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{protocol}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !body
+                    .to_string()
+                    .contains("authorize"),
+                "{protocol}: no authorization URL: {body}"
+            );
+            if protocol == "mcp" {
+                assert_eq!(body["id"], 1, "{body}");
+                assert_eq!(body["error"]["code"], -32001, "{body}");
+                assert_eq!(body["error"]["data"]["reason"], "consent_not_available_for_partners", "{body}");
+            } else {
+                assert_eq!(body["status"], 403, "{body}");
+                assert_eq!(body["reason"], "consent_not_available_for_partners", "{body}");
+            }
+        }
+        for user in [carol_hash.as_str(), direct_client_hash.as_str(), "sha256:user"] {
+            assert!(
+                matches!(
+                    vault
+                        .lookup("did:web:agent.example", user, "consent")
+                        .await
+                        .unwrap(),
+                    crate::delegation_vault::VaultLookupResult::NotFound
+                ),
+                "nothing is stored for {user}"
+            );
+        }
+
+        vault
             .store(
                 serde_json::from_value(json!({
-                    "id": "carol-consent", "agent_did": consent.agent_did,
-                    "user_identity_hash": consent.user_identity_hash, "credential_provider_id": "consent",
+                    "id": "carol-consent", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": carol_hash, "credential_provider_id": "consent",
                     "provider_id": "consent", "access_token": "carol-access", "scopes": ["read"],
                     "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
                     "consent_granted_at": "2026-10-01T00:00:00Z",
@@ -12411,7 +12538,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(injected_credential(&state, call()).await, "carol-access");
+        assert_eq!(injected_credential(&state, call("mcp")).await, "carol-access", "the grant that already exists");
+
+        let mut direct = call("mcp");
+        direct.transit_token_claims = Some(caller_claims(None, None, Some("sha256:direct-user"), json!({})));
+        assert!(
+            matches!(
+                step_inject_credentials(&state, &mut direct).await,
+                Err(OutboundPipelineError::ConsentRequired(_))
+            ),
+            "a caller an Access Point's token names connected directly, so it is asked for consent"
+        );
     }
 
     fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
