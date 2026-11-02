@@ -249,7 +249,10 @@ fault, rejected request or Trust Recorder write, so it leaves the dashboard metr
 At startup and on every configuration reload (including the reload that follows a surface
 change) the gateway logs one `WARN` line per credential provider or surface whose stored
 configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
-find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead.
+find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
+(for example a variant that cannot be resolved) is not checked: it logs one `WARN` line naming
+its `id`, `tenant` and the `error`, and the `INFO` line then says the rest are clean and how many
+surfaces could not be inspected.
 Nothing else changes: the report writes no audit record and carries no secret value or token
 endpoint URL.
 

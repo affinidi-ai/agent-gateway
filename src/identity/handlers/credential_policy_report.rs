@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 use super::surface_tenancy::collect_surface_reference_keys;
+use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
+use crate::config::credential_policy::CredentialPolicyConfig;
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::state::IdentityApiState;
@@ -53,19 +55,17 @@ fn provider_breaks_isolation(
 }
 
 /// Does a tenant surface send an appliance-wide secret or credential provider upstream?
-/// A reference that no longer resolves is not a breach.
+/// A reference that no longer resolves is not a breach; a surface whose references cannot be
+/// collected is an error.
 fn surface_breaks_isolation(
     surface: &AgentSurface,
     secret_tenants: &HashMap<&str, Option<&str>>,
     providers: &HashMap<&str, &CredentialProvider>,
-) -> bool {
+) -> Result<bool, SurfaceApiError> {
     let Some(tenant_id) = surface.tenant_id.as_deref() else {
-        return false;
+        return Ok(false);
     };
-    let Ok(references) = collect_surface_reference_keys(surface) else {
-        return false;
-    };
-    references
+    Ok(collect_surface_reference_keys(surface)?
         .iter()
         .any(|reference| match reference.kind {
             ResourceKind::Secrets => reference.same_tenant && secret_tenants.get(reference.id.as_str()) == Some(&None),
@@ -73,7 +73,21 @@ fn surface_breaks_isolation(
                 .get(reference.id.as_str())
                 .is_some_and(|provider| provider.breaks_tenant_isolation_for(Some(tenant_id))),
             _ => false,
-        })
+        }))
+}
+
+/// A surface whose references could not be collected, so it was not checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedSurface {
+    pub id: String,
+    pub tenant_id: Option<String>,
+    pub error: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Findings {
+    pub breaches: Vec<PolicyBreach>,
+    pub skipped: Vec<SkippedSurface>,
 }
 
 pub(crate) fn find_breaches(
@@ -81,20 +95,22 @@ pub(crate) fn find_breaches(
     surfaces: &[AgentSurface],
     secret_tenants: &HashMap<&str, Option<&str>>,
     egress: &TokenEgress,
-) -> Vec<PolicyBreach> {
+) -> Findings {
     let by_id: HashMap<&str, &CredentialProvider> = providers
         .iter()
         .map(|provider| (provider.id.as_str(), provider))
         .collect();
-    let mut breaches = Vec::new();
+    let mut findings = Findings::default();
     for provider in providers {
         let mut breach = |rule| {
-            breaches.push(PolicyBreach {
-                subject: "credential_provider",
-                id: provider.id.clone(),
-                tenant_id: provider.tenant_id.clone(),
-                rule,
-            })
+            findings
+                .breaches
+                .push(PolicyBreach {
+                    subject: "credential_provider",
+                    id: provider.id.clone(),
+                    tenant_id: provider.tenant_id.clone(),
+                    rule,
+                })
         };
         if token_endpoint_breaks_https(provider, egress) {
             breach(RULE_TOKEN_ENDPOINT_HTTPS);
@@ -104,16 +120,26 @@ pub(crate) fn find_breaches(
         }
     }
     for surface in surfaces {
-        if surface_breaks_isolation(surface, secret_tenants, &by_id) {
-            breaches.push(PolicyBreach {
-                subject: "surface",
-                id: surface.surface_id.clone(),
-                tenant_id: surface.tenant_id.clone(),
-                rule: RULE_TENANT_CREDENTIAL_ISOLATION,
-            });
+        match surface_breaks_isolation(surface, secret_tenants, &by_id) {
+            Ok(true) => findings
+                .breaches
+                .push(PolicyBreach {
+                    subject: "surface",
+                    id: surface.surface_id.clone(),
+                    tenant_id: surface.tenant_id.clone(),
+                    rule: RULE_TENANT_CREDENTIAL_ISOLATION,
+                }),
+            Ok(false) => {}
+            Err(error) => findings
+                .skipped
+                .push(SkippedSurface {
+                    id: surface.surface_id.clone(),
+                    tenant_id: surface.tenant_id.clone(),
+                    error: format!("{error:?}"),
+                }),
         }
     }
-    breaches
+    findings
 }
 
 /// Log one warning per credential provider or surface that breaks a credential policy rule.
@@ -155,8 +181,14 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         .map(|secret| (secret.secret_id.as_str(), secret.tenant_id.as_deref()))
         .collect();
 
-    let breaches = find_breaches(&providers, &surfaces, &secret_tenants, &egress);
-    for breach in &breaches {
+    log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, &egress), policy);
+}
+
+fn log_findings(
+    findings: &Findings,
+    policy: &CredentialPolicyConfig,
+) {
+    for breach in &findings.breaches {
         let mode = if breach.rule == RULE_TOKEN_ENDPOINT_HTTPS {
             policy.token_endpoint_https
         } else {
@@ -171,8 +203,25 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
             "Stored configuration breaks a credential policy rule"
         );
     }
-    if breaches.is_empty() {
+    for skipped in &findings.skipped {
+        warn!(
+            id = %skipped.id,
+            tenant = skipped.tenant_id.as_deref().unwrap_or("appliance"),
+            error = %skipped.error,
+            "Credential policy report could not inspect a surface"
+        );
+    }
+    if !findings.breaches.is_empty() {
+        return;
+    }
+    if findings.skipped.is_empty() {
         info!("Credential policy report: no credential provider or surface breaks a rule");
+    } else {
+        info!(
+            skipped = findings.skipped.len(),
+            "Credential policy report: no other credential provider or surface breaks a rule, but {} surfaces could not be inspected",
+            findings.skipped.len()
+        );
     }
 }
 
@@ -221,6 +270,7 @@ mod tests {
             .copied()
             .collect();
         find_breaches(providers, &[], &secret_tenants, &egress(policy))
+            .breaches
             .into_iter()
             .map(|breach| (breach.id, breach.rule))
             .collect()
@@ -323,6 +373,7 @@ mod tests {
                     &secret_tenants,
                     &egress(CredentialPolicyConfig::default()),
                 )
+                .breaches
                 .iter()
                 .filter(|breach| breach.subject == "surface")
                 .collect::<Vec<_>>()
@@ -332,11 +383,99 @@ mod tests {
         assert_eq!(reported, vec![true, false, true, false, false, false]);
         let breach =
             find_breaches(&providers, &surfaces[..1], &secret_tenants, &egress(CredentialPolicyConfig::default()))
+                .breaches
                 .into_iter()
                 .find(|breach| breach.subject == "surface")
                 .unwrap();
         assert_eq!(breach.id, "s");
         assert_eq!(breach.tenant_id.as_deref(), Some("t1"));
         assert_eq!(breach.rule, RULE_TENANT_CREDENTIAL_ISOLATION);
+    }
+
+    fn surface_that_cannot_be_inspected(id: &str) -> AgentSurface {
+        let variant = |variant_id: &str, enabled: bool| serde_json::json!({"id": variant_id, "alias": "same", "name": variant_id, "enabled": enabled});
+        let mut surface = AgentSurface {
+            surface_id: id.to_string(),
+            tenant_id: Some("t1".to_string()),
+            ..Default::default()
+        };
+        surface.variants =
+            serde_json::from_value(serde_json::json!([variant("a", false), variant("b", true)])).unwrap();
+        surface
+    }
+
+    #[test]
+    fn a_surface_that_cannot_be_inspected_is_skipped_and_counted() {
+        let secret_tenants = HashMap::new();
+        let healthy = AgentSurface {
+            surface_id: "healthy".to_string(),
+            tenant_id: Some("t1".to_string()),
+            ..Default::default()
+        };
+        let surfaces = [surface_that_cannot_be_inspected("broken"), healthy];
+        let findings = find_breaches(&[], &surfaces, &secret_tenants, &egress(CredentialPolicyConfig::default()));
+        assert_eq!(findings.breaches, vec![]);
+        assert_eq!(findings.skipped.len(), 1);
+        assert_eq!(findings.skipped[0].id, "broken");
+        assert_eq!(
+            findings.skipped[0]
+                .tenant_id
+                .as_deref(),
+            Some("t1")
+        );
+        assert!(
+            findings.skipped[0]
+                .error
+                .contains("Variant 'same' references could not be resolved"),
+            "{}",
+            findings.skipped[0].error
+        );
+    }
+
+    #[test]
+    fn the_clean_line_is_logged_only_when_nothing_was_skipped() {
+        let policy = CredentialPolicyConfig::default();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        log_findings(&Findings::default(), &policy);
+        let text = logs.text();
+        assert!(text.contains("no credential provider or surface breaks a rule"), "{text}");
+        assert!(!text.contains("could not be inspected"), "{text}");
+
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let skipped = SkippedSurface {
+            id: "broken".to_string(),
+            tenant_id: Some("t1".to_string()),
+            error: "BadRequest(\"reason\")".to_string(),
+        };
+        log_findings(
+            &Findings {
+                breaches: vec![],
+                skipped: vec![skipped.clone()],
+            },
+            &policy,
+        );
+        let text = logs.text();
+        assert!(!text.contains("no credential provider or surface breaks a rule"), "{text}");
+        assert!(text.contains("could not inspect a surface"), "{text}");
+        assert!(text.contains("broken") && text.contains("t1") && text.contains("reason"), "{text}");
+        assert!(text.contains("1 surfaces could not be inspected"), "{text}");
+
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        log_findings(
+            &Findings {
+                breaches: vec![PolicyBreach {
+                    subject: "surface",
+                    id: "leaky".to_string(),
+                    tenant_id: None,
+                    rule: RULE_TENANT_CREDENTIAL_ISOLATION,
+                }],
+                skipped: vec![skipped],
+            },
+            &policy,
+        );
+        let text = logs.text();
+        assert!(text.contains("Stored configuration breaks a credential policy rule"), "{text}");
+        assert!(text.contains("could not inspect a surface"), "{text}");
+        assert!(!text.contains("could not be inspected"), "{text}");
     }
 }
