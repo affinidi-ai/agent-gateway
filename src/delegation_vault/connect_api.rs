@@ -704,12 +704,40 @@ pub async fn list_grants(
             "credential_provider_id": binding.credential_provider_id,
             "subject": match subject { GrantSubject::Owner => "owner", GrantSubject::Caller => "caller" },
         });
-        let principal = match subject {
+        let key = match subject {
             GrantSubject::Owner => {
                 entry["connected"] = serde_json::json!(false);
-                Some(OWNER_PRINCIPAL.to_string())
+                Some(GrantKey::owner(
+                    surface.tenant_id.as_deref(),
+                    &surface.surface_id,
+                    binding.hop,
+                    binding.credential_provider_id,
+                ))
             }
             GrantSubject::Caller => {
+                let key = match query
+                    .principal
+                    .as_deref()
+                    .filter(|principal| *principal != OWNER_PRINCIPAL)
+                {
+                    None => None,
+                    Some(principal) => match GrantKey::caller(
+                        surface.tenant_id.as_deref(),
+                        &surface.surface_id,
+                        binding.hop,
+                        binding.credential_provider_id,
+                        principal,
+                    ) {
+                        Some(key) => Some(key),
+                        None => {
+                            return error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_principal",
+                                "principal is owner or an identity hash",
+                            );
+                        }
+                    },
+                };
                 let ids = match state
                     .vault_store
                     .binding_grant_ids(&grant_binding)
@@ -731,22 +759,10 @@ pub async fn list_grants(
                         .filter(|id| **id != owner)
                         .count()
                 );
-                query
-                    .principal
-                    .clone()
-                    .filter(|principal| principal != OWNER_PRINCIPAL)
+                key
             }
         };
-        if let Some(principal) = principal {
-            let key = GrantKey {
-                principal,
-                ..GrantKey::owner(
-                    surface.tenant_id.as_deref(),
-                    &surface.surface_id,
-                    binding.hop,
-                    binding.credential_provider_id,
-                )
-            };
+        if let Some(key) = key {
             match state
                 .vault_store
                 .grant(&key)
@@ -1574,6 +1590,29 @@ mod tests {
         assert_eq!(listed["bindings"][0]["subject"], "caller");
         assert_eq!(listed["bindings"][0]["callers"], 1);
         assert_eq!(listed["bindings"][0]["grant"]["grant_id"], grant.id);
+        for malformed in ["not-an-identity-hash", &CALLER.to_uppercase(), &CALLER[1..]] {
+            let (status, refused) = read(
+                list_grants(
+                    State(fixture.state.clone()),
+                    caller(),
+                    None,
+                    tenant_context(Some("tenant-a")),
+                    None,
+                    Query(GrantsQuery {
+                        surface_id: "vendor-agent".into(),
+                        hop: Some("target".into()),
+                        principal: Some(malformed.into()),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                (status, refused["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid_principal")),
+                "a malformed principal {malformed:?} is refused, as on connect and removal: {refused}"
+            );
+        }
 
         let (status, removed) = read(
             delete_binding_grants(

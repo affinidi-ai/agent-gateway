@@ -90,7 +90,13 @@ changes:
         identity_injection.inject_vp or a managed_identity of its own, or an enabled
         workload_binding, as the Access Point Target already is. A Transit Point stored outside
         the API with one answers connector_unavailable and reads no grant.
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-02T18:00:00Z'
+      title: Refuse a malformed caller principal in the grants report
+      description: >-
+        GET /api/v1/delegation-vault/grants now answers 400 invalid_principal for a principal
+        that is neither owner nor an identity hash, as starting a connect and removing grants
+        already did, instead of reporting that caller as not connected.
   removed: []
   security:
     - timestamp: '2026-10-30T21:00:00Z'

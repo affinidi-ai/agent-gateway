@@ -1404,7 +1404,8 @@ server's words are never echoed or logged.
 `consent_mode: external` binding the surface serves: its `hop`, `credential_provider_id` and
 `subject`; for an owner binding, `connected` and its grant; for a caller binding, `callers`, the
 number of callers connected, counted from file names, and, with `principal`, that caller's own
-grant. A grant is reported as metadata only: `grant_id`, `principal`, `scopes`, `created_at`,
+grant. A `principal` that is neither `owner` nor an identity hash is refused `400`
+`invalid_principal`, as on a connect or a removal. A grant is reported as metadata only: `grant_id`, `principal`, `scopes`, `created_at`,
 `refreshed_at`, `last_used_at`, `expires_at` and `state` (`live`, `refresh_failed`, or
 `unreadable`). Removing grants is described in [Removing grants](#removing-grants).
 
