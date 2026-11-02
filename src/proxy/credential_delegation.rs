@@ -1799,6 +1799,28 @@ mod tests {
         ) -> Result<Option<Secret>> {
             Ok(None)
         }
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> Result<Option<Secret>> {
+            Ok(self
+                .list_all()
+                .await?
+                .into_iter()
+                .find(|secret| secret.secret_id == secret_id)
+                .map(|item| Secret {
+                    id: item.id,
+                    tenant_id: item.tenant_id,
+                    name: item.name,
+                    secret_id: item.secret_id,
+                    description: None,
+                    value: String::new(),
+                    secret_type: item.secret_type,
+                    tags: vec![],
+                    created_at: item.created_at,
+                    updated_at: item.updated_at,
+                }))
+        }
         async fn list_all(&self) -> Result<Vec<SecretListItem>> {
             let at = chrono::DateTime::<Utc>::UNIX_EPOCH;
             Ok(["CLIENT_ID", "CLIENT_SECRET"]
