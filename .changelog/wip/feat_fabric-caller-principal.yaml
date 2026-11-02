@@ -50,5 +50,26 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-02T03:00:00.000Z'
+      title: Key a partner's delegated credentials only by the caller this gateway verified
+      description: >-
+        On Fabric receive, the receiving gateway keyed its Target's delegated credentials by the
+        caller identity the peer's request named, a payload pseudonym, a DID or a presentation's
+        DID, ahead of the caller its own source authentication verified, so a paired gateway
+        could name another caller and have that caller's stored grant sent to the Target. A
+        partner's claim about who it acts for no longer selects stored credentials: the grant is
+        keyed only by the caller the receiving surface verified, a request it verified no caller
+        for is refused with `403` when a binding applies, and on a `2026-07-28` MCP request the
+        agent half of the key is a caller DID only a connection issuer's presentation proved.
+        Grants stored under a caller the peer named are no longer looked up.
+    - timestamp: '2026-11-02T03:00:00.000Z'
+      title: Refuse a partner's modern MCP Transit Point call the opt-in does not cover
+      description: >-
+        A `2026-07-28` MCP Transit Point call keyed delegated credentials by the Transit Point's
+        resource-token caller even when it carried a Fabric-issued transit token, so with
+        `delegated_credentials_for_fabric_callers` off, or with another caller verified on the
+        partner's request, it was served with the resource-token caller's grant. It now follows
+        the Fabric rule: a binding that applies refuses the call with `403` unless the Transit
+        Point opts in and its resource-token caller is the one the receiving surface verified.
   breaking: []

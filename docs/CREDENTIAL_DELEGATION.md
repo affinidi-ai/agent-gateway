@@ -208,6 +208,30 @@ On a `fabric://` Transit Point the two switches are independent:
 at all, and `fabric_delegated_credentials` whether a resolved credential crosses to the next
 peer (see [Across Fabric](#across-fabric)).
 
+A `2026-07-28` MCP call keys its grant by the Transit Point's resource-token caller, so a
+Fabric-issued token there follows the same rule and one more: without the switch, or without
+a caller the receiving surface verified, a binding that applies refuses the call with `403`
+(`-32001`), and with them the call goes on only when the resource-token caller has the same
+identity hash as `fabric.principal_hash`. The grant of a resource-token caller is never
+released for a Fabric caller it is not. An opted-in caller with no grant yet gets the consent
+answer of [When a token is missing](#when-a-token-is-missing), with consent state keyed by its
+`fabric.principal_hash`; see
+[`FABRIC.md`](FABRIC.md#delegated-credentials-over-fabric) for what the agent receives.
+
+### The caller on Fabric receive
+
+The receiving gateway keys its Target's grants by the identity hash of the caller its own
+surface's source authentication verified on the request, the same value its Access Point
+computes for the same credential. A pseudonym, a DID or a presentation the peer's request names
+never selects a grant: any paired gateway can name any caller, and a connection issuer can sign a
+presentation for any DID. When the surface verified no caller, a binding that applies refuses the
+request with `403` and the Target is not called. On a `2026-07-28` MCP request the user half of the
+key is the resource-token caller the surface verified, and the agent half is a caller DID only
+when a presentation from one of the connection's issuers proved it; otherwise the request is
+refused with `403` (`-32001`). Grants stored under a caller the peer named, before this rule, are
+never looked up again; remove them as in
+[Removing grants keyed by the old identity hash](#removing-grants-keyed-by-the-old-identity-hash).
+
 ## Target authentication from a credential provider
 
 A Target's `target.auth` or a Transit Point's `target_auth` can take its credential from a
@@ -308,8 +332,8 @@ credential, as it is without the `target_auth` one.
 
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores
-are not available, on Fabric receive for a request with no user identity, and on the `elicit`
-outcomes above.
+are not available, and on the `elicit` outcomes above. Fabric receive refuses a request whose
+caller its surface did not verify (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
 
 A grant is looked up by the managed agent's DID, the caller's identity hash and the provider,
 not by surface or Transit Point. Surfaces that share an agent DID, such as surfaces whose

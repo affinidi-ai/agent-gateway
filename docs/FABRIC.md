@@ -479,7 +479,11 @@ credentials over Fabric** switch on the Managed Agent or Transit Point panel, sh
 
 The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
-whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
+whose `params.name` it lists, read after admission has refused batches and ambiguous keys. It keys
+the grant only by the caller its own source authentication verified on the request: a pseudonym,
+DID or presentation the peer's request names never selects stored credentials, and without a
+verified caller a binding that applies refuses the request with `403` before the Target is called
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 
 When the agent behind the receiving surface then calls one of its own Transit Points with the
 transit token it got for the peer's request, that Transit Point releases a delegated per-user
@@ -492,6 +496,20 @@ reason. The token names the call's caller, so a client the Transit Point's own `
 verified on the same call gets no grant either; static `target_auth` credentials are added as
 for any caller (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+
+What the agent serving a partner's request gets back from an opted-in Transit Point:
+
+- the caller's grant, injected as the binding says, when one is stored under its
+  `fabric.principal_hash` and the Transit Point's managed identity;
+- otherwise, as for any caller with no grant, the consent answer: `401` with a
+  `consent_required` body whose authorization URL carries consent state keyed by that
+  `fabric.principal_hash`, never by the DID or a top-level hash the token carries. The agent
+  passes it back through the partner gateway, and whoever completes it binds their provider
+  account to that caller, so the next call from the same caller is sent with that grant. This
+  is why the switch belongs only where the receiving surface verifies a per-user credential;
+- on a `2026-07-28` MCP call, whose grant is keyed by the Transit Point's resource-token
+  caller, the grant only when that caller is the one the receiving surface verified; otherwise
+  `403` (`-32001`).
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
 (`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has

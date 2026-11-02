@@ -4464,6 +4464,16 @@ async fn step_prepare_modern_credentials(
         log_fabric_delegation_withheld(ctx);
         return Ok(None);
     }
+    if let Some(reason) = modern_fabric_caller_refusal(ctx) {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            reason,
+            "Delegated credentials are not released for this request that arrived over Fabric - refusing the request"
+        );
+        return Ok(Some(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing).into_response()));
+    }
     let Some(runtime) = state
         .mcp_continuations
         .as_deref()
@@ -4497,6 +4507,39 @@ async fn step_prepare_modern_credentials(
         }
         Err(error) => Ok(Some(error.response(&request))),
     }
+}
+
+/// Why a `2026-07-28` MCP Transit Point call carrying a Fabric-issued transit
+/// token may not use delegated credentials, or `None` when it may. The token
+/// decides the caller, as on the legacy path ([`delegation_caller_hash`]), but
+/// a modern grant is keyed by the Transit Point's resource-token caller, so the
+/// call proceeds only when that caller is the one the receiving surface
+/// verified, on a Transit Point that opts Fabric callers in.
+fn modern_fabric_caller_refusal(ctx: &OutboundPipelineContext) -> Option<&'static str> {
+    ctx.transit_token_claims
+        .as_ref()
+        .and_then(|claims| claims.fabric.as_ref())?;
+    if !ctx
+        .virtual_channel
+        .delegated_credentials_for_fabric_callers
+    {
+        return Some("delegated_credentials_for_fabric_callers=false");
+    }
+    let Some(principal) = delegation_caller_hash(ctx) else {
+        return Some("no_fabric_caller_verified");
+    };
+    let resource_caller = ctx
+        .authenticated_identity
+        .as_ref()
+        .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::ResourceToken))
+        .and_then(|identity| {
+            identity.principal_hash(
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
+        });
+    (resource_caller.as_deref() != Some(principal.as_str())).then_some("fabric_caller_is_not_the_resource_token_caller")
 }
 
 fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
@@ -12204,6 +12247,160 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// On a `2026-07-28` MCP request a Fabric-issued transit token decides the
+    /// caller as it does on the legacy path. Without
+    /// `delegated_credentials_for_fabric_callers`, or without a caller the
+    /// receiving surface verified, a binding that applies refuses the call
+    /// with `403`, never serving the grant of the Transit Point's
+    /// resource-token caller. With it, the call goes on to be keyed only when
+    /// that resource-token caller is the one the receiving surface verified.
+    #[tokio::test]
+    async fn a_modern_mcp_request_with_a_fabric_token_uses_delegated_credentials_only_as_opted_in() {
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, McpRequestClassification, ValidatedModernMessage};
+
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_continuations = Some(continuation_runtime(now, 60));
+        let mut surface = test_surface();
+        surface.outbound_credentials =
+            vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
+        let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+        };
+        let alice_hash = alice
+            .principal_hash(None)
+            .unwrap();
+        let answer = async |opted_in: bool, claims: crate::proxy::transit_token::TransitTokenClaims| {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = Arc::new(surface.clone());
+            ctx.virtual_channel
+                .delegated_credentials_for_fabric_callers = opted_in;
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            ctx.mcp_classification = Some(McpRequestClassification::Modern(Box::new(ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/call".into(),
+                params: None,
+                id: Some(json!(7)),
+                kind: McpMessageKind::Request,
+            })));
+            ctx.authenticated_identity = Some(alice.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
+            ctx.transit_token_claims = Some(claims);
+            let response = step_prepare_modern_credentials(&state, &mut ctx)
+                .await
+                .unwrap()
+                .expect("a binding applies and no grant is prepared");
+            let status = response.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["id"], 7, "{body}");
+            (
+                status,
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        let refused = (StatusCode::FORBIDDEN, DelegationRefusal::CallerIdentityMissing.to_string());
+
+        assert_eq!(answer(false, verified_fabric_claims(None, &alice_hash)).await, refused, "the switch off");
+        assert_eq!(answer(true, fabric_claims(None, "fabric-asserted", None, 2)).await, refused, "no verified caller");
+        assert_eq!(
+            answer(true, verified_fabric_claims(None, "another-callers-hash")).await,
+            refused,
+            "the resource-token caller is not the one the receiving surface verified"
+        );
+        assert_ne!(
+            answer(true, verified_fabric_claims(None, &alice_hash)).await,
+            refused,
+            "the same caller goes on to the modern credential path"
+        );
+        assert_ne!(
+            answer(false, caller_claims(None, None, Some(&alice_hash), json!({}))).await,
+            refused,
+            "an Access Point's token is not a Fabric caller"
+        );
+    }
+
+    /// The first call of a Fabric caller the receiving surface verified, on a
+    /// Transit Point that opts in, finds no grant: it is answered `401` with an
+    /// authorization URL whose consent state is keyed by that caller's
+    /// `fabric.principal_hash`, never by the DID or a top-level hash the token
+    /// carries, and the grant the callback stores under it is then released to
+    /// the same caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opted_in_fabric_callers_first_call_asks_for_consent_keyed_by_its_principal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _) = delegation_pipeline(directory.path(), "https://partner.example/mcp", &[]).await;
+        let carol_hash = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "carol".to_string(),
+            provider_agent_id: None,
+        }
+        .principal_hash(None)
+        .unwrap();
+        let call = || {
+            let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("consent"));
+            point["delegated_credentials_for_fabric_callers"] = json!(true);
+            let surface = transit_surface(json!([point]), json!([]));
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = legacy_delegation_context(resolved, point);
+            let mut claims = verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash);
+            claims.user_identity_hash = Some("sha256:user".to_string());
+            ctx.transit_token_claims = Some(claims);
+            ctx
+        };
+
+        let mut first = call();
+        let body = match step_inject_credentials(&state, &mut first).await {
+            Err(OutboundPipelineError::ConsentRequired(body)) => {
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()
+            }
+            other => panic!("expected consent_required, got {other:?}"),
+        };
+        let authorization_url = url::Url::parse(
+            body["consent_required"][0]["authorization_url"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let encoded_state = authorization_url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let consent = crate::delegation_vault::oauth::decode_oauth_state(&encoded_state).unwrap();
+        assert_eq!(consent.user_identity_hash, carol_hash, "the caller the receiving surface verified");
+        assert_eq!(consent.agent_did, "did:web:agent.example", "the Transit Point's managed identity");
+
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "carol-consent", "agent_did": consent.agent_did,
+                    "user_identity_hash": consent.user_identity_hash, "credential_provider_id": "consent",
+                    "provider_id": "consent", "access_token": "carol-access", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-10-01T00:00:00Z",
+                    "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(injected_credential(&state, call()).await, "carol-access");
     }
 
     fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
