@@ -228,11 +228,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
   appliance-wide authorization code providers, which send the user's own token and which the gateway
   keeps accepting (`sendsGatewayCredential`), except a provider with an `issuer` (external consent),
-  which the gateway refuses outside its own tenant and the pickers leave out of that allowance. A provider or secret already stored on the surface that
-  lies outside its tenant stays selectable and is labelled by what the gateway does with it:
-  "appliance-wide, stops working when enforced" for an appliance-wide one, so it can be replaced
-  before the gateway enforces tenant isolation, and "another tenant, refused by the gateway" for one
-  of another tenant, which the gateway already refuses. While creating, every visible item is offered
+  which the gateway refuses outside its own tenant and the pickers leave out of that allowance. A
+  provider or secret already stored on the surface that lies outside its tenant stays selectable and
+  is labelled by what the gateway does with it (`outOfTenantLabel`): "appliance-wide, stops working
+  when enforced" for an appliance-wide one, so it can be replaced before the gateway enforces tenant
+  isolation, "appliance-wide, refused by the gateway" for an appliance-wide provider with an
+  `issuer`, and "another tenant, refused by the gateway" for one of another tenant, which the
+  gateway already refuses. While creating, every visible item is offered
   and the gateway refuses a cross-tenant reference on save.
 
 | Element                                                        | Test id                                                                                                                                                                                            |

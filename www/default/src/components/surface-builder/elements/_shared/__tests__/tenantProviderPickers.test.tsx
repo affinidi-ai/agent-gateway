@@ -2,6 +2,7 @@ import React from 'react';
 import { render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import TargetAuthProviderSelect from '../TargetAuthProviderSelect';
+import OutboundCredentialsListSection from '../OutboundCredentialsListSection';
 import TransitCredentialBindingSection, {
   EMPTY_TRANSIT_CREDENTIALS,
 } from '../TransitCredentialBindingSection';
@@ -181,5 +182,72 @@ describe('TransitCredentialBindingSection tenant scope', () => {
     await screen.findByText('Wide Code');
     const select = screen.getAllByRole('combobox')[0];
     expect(optionTexts(select)).toEqual(['-- Select provider --', 'Wide', 'Wide Code']);
+  });
+});
+
+describe('stored appliance-wide provider with an issuer', () => {
+  const withIssuer = [
+    ...providers,
+    {
+      id: 'wide-consent',
+      name: 'Wide Consent',
+      provider_type: 'oauth2_authorization_code',
+      issuer: 'https://issuer.example',
+    },
+  ];
+
+  beforeEach(() => {
+    (apiClient.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(withIssuer),
+    });
+  });
+
+  it('is labelled as refused in the transit binding picker', async () => {
+    render(
+      withTenant(
+        'acme',
+        <TransitCredentialBindingSection
+          value={{ ...EMPTY_TRANSIT_CREDENTIALS, credential_provider_id: 'wide-consent' }}
+          onChange={() => {}}
+        />
+      )
+    );
+    await screen.findByText('Acme');
+    const select = screen.getAllByRole('combobox')[0];
+    expect(optionTexts(select)).toEqual([
+      '-- Select provider --',
+      'Acme',
+      'Wide Code',
+      'Wide Consent (appliance-wide, refused by the gateway)',
+    ]);
+  });
+
+  it('is labelled as refused in the outbound credentials picker', async () => {
+    render(
+      withTenant(
+        'acme',
+        <OutboundCredentialsListSection
+          rows={[
+            {
+              credential_provider_id: 'wide-consent',
+              scopes: '',
+              consent_mode: 'on_demand',
+              required_for_mode: 'all',
+              inject_as_type: 'bearer_header',
+            },
+          ]}
+          onChange={() => {}}
+        />
+      )
+    );
+    await screen.findByText('Acme');
+    const select = screen.getAllByRole('combobox')[0];
+    expect(optionTexts(select)).toEqual([
+      '-- Select provider --',
+      'Acme',
+      'Wide Code',
+      'Wide Consent (appliance-wide, refused by the gateway)',
+    ]);
   });
 });

@@ -3,6 +3,7 @@ export interface TenantOwned {
 }
 
 export const OUT_OF_TENANT_LABEL = 'appliance-wide, stops working when enforced';
+export const REFUSED_APPLIANCE_WIDE_LABEL = 'appliance-wide, refused by the gateway';
 export const OTHER_TENANT_LABEL = 'another tenant, refused by the gateway';
 
 /** The tenant that owns the thing being edited: `null` is appliance-wide, `undefined` is not yet known. */
@@ -49,6 +50,7 @@ export function splitByTenant<T extends TenantOwned>(
   };
 }
 
-export function outOfTenantLabel(item: TenantOwned): string {
-  return item.tenant_id ? OTHER_TENANT_LABEL : OUT_OF_TENANT_LABEL;
+export function outOfTenantLabel(item: TenantOwned & { issuer?: string | null }): string {
+  if (item.tenant_id) return OTHER_TENANT_LABEL;
+  return item.issuer ? REFUSED_APPLIANCE_WIDE_LABEL : OUT_OF_TENANT_LABEL;
 }

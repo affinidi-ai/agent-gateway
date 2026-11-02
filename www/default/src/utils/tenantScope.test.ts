@@ -81,4 +81,19 @@ describe('tenantScope', () => {
     );
     expect(outOfTenantLabel({ tenant_id: 'other' })).toBe('another tenant, refused by the gateway');
   });
+
+  it('labels an appliance-wide provider with an issuer as refused', () => {
+    expect(outOfTenantLabel({ tenant_id: null, issuer: 'https://issuer.example' })).toBe(
+      'appliance-wide, refused by the gateway'
+    );
+    expect(outOfTenantLabel({ issuer: 'https://issuer.example' })).toBe(
+      'appliance-wide, refused by the gateway'
+    );
+    expect(outOfTenantLabel({ tenant_id: null, issuer: null })).toBe(
+      'appliance-wide, stops working when enforced'
+    );
+    expect(outOfTenantLabel({ tenant_id: 'other', issuer: 'https://issuer.example' })).toBe(
+      'another tenant, refused by the gateway'
+    );
+  });
 });
