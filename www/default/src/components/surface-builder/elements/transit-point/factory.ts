@@ -270,7 +270,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
           );
           if (transitNodes.length === 0) return undefined;
           const transit: any = {
-            sign_requests: true,
             transit_token_mode: 'embedded',
             points: (() => {
               // Pre-derive aliases with collision dedupe so the backend's
