@@ -478,4 +478,33 @@ mod tests {
         assert!(text.contains("could not inspect a surface"), "{text}");
         assert!(!text.contains("could not be inspected"), "{text}");
     }
+
+    #[test]
+    fn a_tenant_surface_naming_an_appliance_wide_secret_in_custom_metadata_is_reported() {
+        let secret_tenants: HashMap<&str, Option<&str>> = [("S_WIDE", None), ("S_OWN", Some("t1"))]
+            .into_iter()
+            .collect();
+        let reported = |tenant: Option<&str>, secret_id: &str| {
+            let mut surface = AgentSurface {
+                surface_id: "s".to_string(),
+                tenant_id: tenant.map(String::from),
+                ..Default::default()
+            };
+            surface
+                .target
+                .response_custom_metadata = Some(
+                serde_json::from_value(serde_json::json!({"payload": {"key": format!("$SECRET:{secret_id}")}}))
+                    .unwrap(),
+            );
+            find_breaches(&[], &[surface], &secret_tenants, &egress(CredentialPolicyConfig::default()))
+                .breaches
+                .iter()
+                .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
+        };
+
+        assert!(reported(Some("t1"), "S_WIDE"));
+        assert!(!reported(Some("t1"), "S_OWN"));
+        assert!(!reported(Some("t1"), "S_GONE"));
+        assert!(!reported(None, "S_WIDE"));
+    }
 }

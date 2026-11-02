@@ -257,6 +257,7 @@ mod tests {
             crate::protocols::MetadataRuntimeContext {
                 request_id: Some("trace-123"),
                 surface_id: Some("surface-456"),
+                ..Default::default()
             },
         )
         .await

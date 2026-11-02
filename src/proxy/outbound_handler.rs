@@ -2784,6 +2784,11 @@ async fn step_inject_custom_metadata(
                 crate::protocols::MetadataRuntimeContext {
                     request_id: Some(ctx.request_id.as_str()),
                     surface_id: ctx.surface.config_id(),
+                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                        ctx.surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                 },
             )
             .await
@@ -2806,6 +2811,11 @@ async fn step_inject_custom_metadata(
                 crate::protocols::MetadataRuntimeContext {
                     request_id: Some(ctx.request_id.as_str()),
                     surface_id: ctx.surface.config_id(),
+                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                        ctx.surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                 },
                 ctx.mcp_metadata_context,
                 crate::mcp::meta::McpMetaTarget::TopLevel,

@@ -251,6 +251,12 @@ impl AccessPointEvents {
                         .surface_id
                         .as_str(),
                 ),
+                tenancy: crate::tenancy::SurfaceTenancy::configured(
+                    self.state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                ),
             },
         )
         .await

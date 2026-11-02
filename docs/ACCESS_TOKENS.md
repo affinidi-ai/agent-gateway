@@ -150,10 +150,13 @@ already `"off"`; it may choose any other level. See
 
 A tenant surface may reference an appliance-wide record in general, with one exception: it
 may not send the appliance's own credential upstream. An appliance-wide secret used as
-`static_secret` Target authentication, and an appliance-wide `api_key`, client-credentials
-or JWT bearer credential provider used for Target authentication or in
-`outbound_credentials` or `transit_credentials`, are refused with `400` when a save adds
-them, and a tenant credential provider may not reference an appliance-wide secret. A
+`static_secret` Target authentication or named by a `$SECRET:<id>` value in custom metadata
+(the Target's `custom_metadata` and `response_custom_metadata`, the Access Point's
+`response_custom_metadata`, and the Transit Points' shared `custom_metadata`), and an
+appliance-wide `api_key`, client-credentials or JWT bearer credential provider used for Target
+authentication or in `outbound_credentials` or `transit_credentials`, are refused with `400` when
+a save adds them, and a tenant credential provider may not reference an appliance-wide secret.
+Another tenant's secret is refused in custom metadata as everywhere else. A
 reference the stored surface or provider already held is kept in the default `warn` mode (on a
 provider, only in the same field and while the provider's type and destination are unchanged;
 on a surface, only while every leg that sends it is one that already sent it and keeps its

@@ -5073,6 +5073,12 @@ async fn proxy_handler_with_mcp_runtime(
                     crate::protocols::MetadataRuntimeContext {
                         request_id: Some(egress_trace_id.as_str()),
                         surface_id: Some(config_id),
+                        tenancy: crate::tenancy::SurfaceTenancy::configured(
+                            state
+                                .surface
+                                .tenant_id
+                                .as_deref(),
+                        ),
                     },
                 )
                 .await
@@ -6275,6 +6281,12 @@ async fn proxy_handler_with_mcp_runtime(
             crate::protocols::MetadataRuntimeContext {
                 request_id: Some(egress_trace_id.as_str()),
                 surface_id: Some(config_id),
+                tenancy: crate::tenancy::SurfaceTenancy::configured(
+                    state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                ),
             },
             mcp_metadata_context,
             crate::mcp::meta::McpMetaTarget::Params,
@@ -8294,6 +8306,12 @@ async fn proxy_handler_with_mcp_runtime(
                                 crate::protocols::MetadataRuntimeContext {
                                     request_id: Some(trace_id.as_str()),
                                     surface_id: Some(config_id),
+                                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                                        state
+                                            .surface
+                                            .tenant_id
+                                            .as_deref(),
+                                    ),
                                 },
                             )
                             .await
@@ -8317,6 +8335,12 @@ async fn proxy_handler_with_mcp_runtime(
                                 crate::protocols::MetadataRuntimeContext {
                                     request_id: Some(trace_id.as_str()),
                                     surface_id: Some(config_id),
+                                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                                        state
+                                            .surface
+                                            .tenant_id
+                                            .as_deref(),
+                                    ),
                                 },
                                 mcp_metadata_context,
                                 crate::mcp::meta::McpMetaTarget::Result,
@@ -11546,6 +11570,12 @@ async fn handle_fabric_request(
                 crate::protocols::MetadataRuntimeContext {
                     request_id: Some(egress_trace_id.as_str()),
                     surface_id: Some(config_id),
+                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                 },
             )
             .await
@@ -11581,6 +11611,12 @@ async fn handle_fabric_request(
                 crate::protocols::MetadataRuntimeContext {
                     request_id: Some(egress_trace_id.as_str()),
                     surface_id: Some(config_id),
+                    tenancy: crate::tenancy::SurfaceTenancy::configured(
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                 },
             )
             .await
@@ -13280,7 +13316,7 @@ async fn handle_fabric_request(
                             crate::config::ChannelProtocol::Mcp => {
                                 let injected = crate::mcp::metadata::inject_custom_metadata_with_context(
                                     &bytes::Bytes::from(response_body.clone()), response_custom_metadata, channel_name, &state.secrets_store,
-                                    crate::protocols::MetadataRuntimeContext { request_id: Some(trace_id.as_str()), surface_id: Some(config_id) },
+                                    crate::protocols::MetadataRuntimeContext { request_id: Some(trace_id.as_str()), surface_id: Some(config_id), tenancy: crate::tenancy::SurfaceTenancy::configured(state.surface.tenant_id.as_deref()) },
                                     mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Result,
                                 ).await.map_err(|error| {
                                     channel_warn!(config_id, "MCP response metadata injection failed: {}", error);

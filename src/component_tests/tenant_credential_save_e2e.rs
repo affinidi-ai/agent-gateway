@@ -13,6 +13,7 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 
 const STORED_SECRET_SURFACE: &str = "stored-secret-surface";
 const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
+const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
 const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
 const STORED_TENANT_JWT_PROVIDER: &str = "stored-tenant-jwt-provider";
@@ -230,6 +231,10 @@ fn static_secret(secret_id: &str) -> Value {
     json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "Authorization"}}})
 }
 
+fn secret_metadata(secret_id: &str) -> Value {
+    json!({"enabled": true, "payload": {"outer": {"keys": [format!("$SECRET:{secret_id}")]}}})
+}
+
 fn binding(provider_id: &str) -> Value {
     json!([{"credential_provider_id": provider_id}])
 }
@@ -327,6 +332,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             &bootstrap
                 .storage_paths
                 .agent_surfaces,
+            STORED_METADATA_SURFACE,
+            surface(
+                STORED_METADATA_SURFACE,
+                json!({"target": {"endpoint": "http://127.0.0.1:9/", "custom_metadata": secret_metadata("appliance-key")}}),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
             STORED_BINDING_SURFACE,
             surface(STORED_BINDING_SURFACE, json!({"outbound_credentials": binding(STORED_PROVIDER)})),
         ),
@@ -388,6 +403,7 @@ async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
         ("appliance-client-secret", None, "v"),
         ("appliance-signing-key", None, signing_key.as_str()),
         ("tenant-key", Some("tenant-a"), "v"),
+        ("other-tenant-key", Some("tenant-b"), "v"),
         ("tenant-client-id", Some("tenant-a"), "v"),
         ("tenant-client-secret", Some("tenant-a"), "v"),
     ] {
@@ -877,4 +893,163 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_refused_when
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+const METADATA_PLACES: [fn(&mut Value, Value); 4] = [
+    |surface, metadata| surface["target"]["custom_metadata"] = metadata,
+    |surface, metadata| surface["target"]["response_custom_metadata"] = metadata,
+    |surface, metadata| surface["access_point"]["response_custom_metadata"] = metadata,
+    |surface, metadata| {
+        surface["transit"] = json!({"custom_metadata": metadata, "points": [{
+            "id": "partner-id", "alias": "partner", "target_endpoint": "http://127.0.0.1:9/partner",
+            "protocol": "a2a", "require_transit_token": false, "allow_unauthenticated_callers": true
+        }]})
+    },
+];
+
+fn with_metadata(
+    api: &Api,
+    route: &str,
+    tenant: Option<&str>,
+    place: fn(&mut Value, Value),
+    secret_id: &str,
+) -> Value {
+    let mut surface = api.surface(route, tenant, json!({}));
+    place(&mut surface, secret_metadata(secret_id));
+    surface
+}
+
+async fn assert_new_metadata_secrets_follow_the_tenant(api: &Api) {
+    for (index, place) in METADATA_PLACES
+        .into_iter()
+        .enumerate()
+    {
+        for refused in ["other-tenant-key", "appliance-key"] {
+            assert_refused(
+                api.create(&with_metadata(
+                    api,
+                    &format!("/smoke/metadata-{refused}-{index}"),
+                    Some("tenant-a"),
+                    place,
+                    refused,
+                ))
+                .await,
+                NOT_ACCESSIBLE_SECRET,
+            );
+        }
+        for saved in ["tenant-key", "no-such-secret"] {
+            assert_saved(
+                api.create(&with_metadata(
+                    api,
+                    &format!("/smoke/metadata-{saved}-{index}"),
+                    Some("tenant-a"),
+                    place,
+                    saved,
+                ))
+                .await,
+            );
+        }
+    }
+    assert_saved(
+        api.create(&with_metadata(api, "/smoke/metadata-appliance-surface", None, METADATA_PLACES[0], "appliance-key"))
+            .await,
+    );
+    assert_refused(
+        api.create(&with_metadata(
+            api,
+            "/smoke/metadata-appliance-surface-tenant-secret",
+            None,
+            METADATA_PLACES[0],
+            "tenant-key",
+        ))
+        .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_custom_metadata_secret_follows_the_tenant_and_a_stored_appliance_wide_one_is_kept_in_warn_mode() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    assert_new_metadata_secrets_follow_the_tenant(&api).await;
+
+    let unchanged = api
+        .stored(STORED_METADATA_SURFACE)
+        .await;
+    assert_saved(
+        api.put(STORED_METADATA_SURFACE, &unchanged)
+            .await,
+    );
+    let mut redirected = unchanged.clone();
+    redirected["target"]["endpoint"] = json!(api.target);
+    assert_refused(
+        api.put(STORED_METADATA_SURFACE, &redirected)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    let mut moved = unchanged;
+    moved["target"]["response_custom_metadata"] = moved["target"]["custom_metadata"].take();
+    assert_saved(
+        api.put(STORED_METADATA_SURFACE, &moved)
+            .await,
+    );
+    assert_eq!(
+        api.stored(STORED_METADATA_SURFACE)
+            .await["target"]["response_custom_metadata"],
+        secret_metadata("appliance-key"),
+        "the Target's request and response metadata are one leg"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_wide_custom_metadata_secret_is_refused_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    assert_new_metadata_secrets_follow_the_tenant(&api).await;
+
+    let unchanged = api
+        .stored(STORED_METADATA_SURFACE)
+        .await;
+    assert_refused(
+        api.put(STORED_METADATA_SURFACE, &unchanged)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    let mut fixed = unchanged;
+    fixed["target"]["custom_metadata"] = secret_metadata("tenant-key");
+    assert_saved(
+        api.put(STORED_METADATA_SURFACE, &fixed)
+            .await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reassignment_that_would_give_a_tenant_surface_an_appliance_wide_custom_metadata_secret_is_a_conflict() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let appliance_metadata_surface = api
+        .created_id(&with_metadata(&api, "/smoke/wide-metadata", None, METADATA_PLACES[3], "appliance-key"))
+        .await;
+    let missing_metadata_surface = api
+        .created_id(&with_metadata(&api, "/smoke/missing-metadata", None, METADATA_PLACES[0], "no-such-secret"))
+        .await;
+
+    let (status, body) = api
+        .reassign("surfaces", &appliance_metadata_surface, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "tenant_reassignment_blocked", "{body}");
+    assert_eq!(
+        body["conflicts"][0]["reason"], "The proposed tenant would give a tenant resource an appliance-wide credential",
+        "{body}"
+    );
+    assert_eq!(
+        api.stored(&appliance_metadata_surface)
+            .await["tenant_id"],
+        Value::Null,
+        "a blocked reassignment changes nothing"
+    );
+
+    let (status, body) = api
+        .reassign("surfaces", &missing_metadata_surface, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], "tenant-a", "{body}");
 }

@@ -209,7 +209,7 @@ pub fn can_reference(
 }
 
 /// The tenant of a surface and how strictly it is held to tenant isolation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SurfaceTenancy<'a> {
     pub tenant_id: Option<&'a str>,
     pub mode: crate::config::credential_policy::RuleMode,

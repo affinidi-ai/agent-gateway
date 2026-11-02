@@ -46,6 +46,13 @@ pub struct ResponseExtensionInspectionContext<'a> {
 pub struct MetadataRuntimeContext<'a> {
     pub request_id: Option<&'a str>,
     pub surface_id: Option<&'a str>,
+    /// The surface's tenant: a `$SECRET:` helper resolves only a secret the surface may send.
+    pub tenancy: crate::tenancy::SurfaceTenancy<'a>,
+}
+
+/// The secret id a whole-string `$SECRET:<id>` custom-metadata helper names.
+pub(crate) fn secret_helper_id(value: &str) -> Option<&str> {
+    value.strip_prefix("$SECRET:")
 }
 
 /// Recursively resolve custom-metadata value helpers in a JSON value.
@@ -64,34 +71,36 @@ pub fn resolve_metadata_references<'a>(
     Box::pin(async move {
         match value {
             JsonValue::String(s) => {
-                if s.starts_with("$SECRET:") {
-                    let secret_id_ref = s
-                        .strip_prefix("$SECRET:")
-                        .unwrap();
-
+                if let Some(secret_id_ref) = secret_helper_id(s) {
                     let store = secrets_store
                         .as_ref()
                         .ok_or_else(|| {
                             anyhow::anyhow!("Secret reference {} found but secrets store is not configured", s)
                         })?;
-
-                    let secrets = store.list_all().await?;
-                    let secret_uuid = secrets
-                        .iter()
-                        .find(|sec| sec.secret_id == secret_id_ref)
-                        .map(|sec| sec.id.clone())
-                        .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id_ref))?;
-
+                    let not_found = || anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id_ref);
                     let secret = store
-                        .get(&secret_uuid)
+                        .get_by_secret_id(secret_id_ref)
                         .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Secret with secret_id '{}' (UUID: {}) was deleted",
-                                secret_id_ref,
-                                secret_uuid
-                            )
-                        })?;
+                        .ok_or_else(not_found)?;
+
+                    let tenancy = runtime.tenancy;
+                    let secret_tenant = secret.tenant_id.as_deref();
+                    if !crate::tenancy::can_reference_with_rule(tenancy.tenant_id, secret_tenant, tenancy.mode) {
+                        warn!(
+                            channel = channel_name,
+                            secret_id = secret_id_ref,
+                            "Refusing custom metadata secret outside the surface's tenant"
+                        );
+                        return Err(not_found());
+                    }
+                    if crate::tenancy::breaks_tenant_isolation(tenancy.tenant_id, secret_tenant) {
+                        warn!(
+                            channel = channel_name,
+                            secret_id = secret_id_ref,
+                            tenant_id = ?tenancy.tenant_id,
+                            "Custom metadata secret is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                        );
+                    }
 
                     debug!(channel = channel_name, secret_id = secret_id_ref, "Resolved secret reference");
 
@@ -1750,6 +1759,7 @@ mod tests {
             MetadataRuntimeContext {
                 request_id: Some("trace-123"),
                 surface_id: Some("surface-456"),
+                ..Default::default()
             },
         )
         .await
@@ -1764,6 +1774,88 @@ mod tests {
                 .contains('T')
         );
         assert_eq!(resolved["literal"], "$CALLER_DID");
+    }
+
+    async fn tenant_secrets() -> (tempfile::TempDir, Option<Arc<dyn crate::secrets::SecretsStore>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::secrets::FilesystemSecretsStore::new_async(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        for (secret_id, tenant_id) in [("own", Some("tenant-a")), ("wide", None), ("other", Some("tenant-b"))] {
+            crate::secrets::SecretsStore::create(
+                &store,
+                crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant_id.map(String::from),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: format!("{secret_id}-value"),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        (dir, Some(Arc::new(store)))
+    }
+
+    async fn resolve_secret(
+        store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
+        tenant_id: Option<&str>,
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Result<JsonValue, String> {
+        resolve_metadata_references(
+            &json!({"nested": [{"key": format!("$SECRET:{secret_id}")}]}),
+            store,
+            "test-surface",
+            MetadataRuntimeContext {
+                tenancy: crate::tenancy::SurfaceTenancy { tenant_id, mode },
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|resolved| resolved["nested"][0]["key"].clone())
+        .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_metadata_secret_resolves_only_within_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = tenant_secrets().await;
+
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(resolve_secret(&store, Some("tenant-a"), mode, "own").await, Ok(json!("own-value")));
+            assert_eq!(
+                resolve_secret(&store, Some("tenant-a"), mode, "other").await,
+                Err("Secret with secret_id 'other' not found".to_string()),
+                "{mode:?}"
+            );
+            assert_eq!(resolve_secret(&store, None, mode, "wide").await, Ok(json!("wide-value")), "{mode:?}");
+            assert_eq!(
+                resolve_secret(&store, None, mode, "own").await,
+                Err("Secret with secret_id 'own' not found".to_string()),
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_secret(&store, Some("tenant-a"), mode, "missing").await,
+                Err("Secret with secret_id 'missing' not found".to_string()),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_metadata_secret_resolves_on_a_tenant_surface_only_in_warn_mode() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = tenant_secrets().await;
+
+        assert_eq!(resolve_secret(&store, Some("tenant-a"), RuleMode::Warn, "wide").await, Ok(json!("wide-value")));
+        assert_eq!(
+            resolve_secret(&store, Some("tenant-a"), RuleMode::Enforce, "wide").await,
+            Err("Secret with secret_id 'wide' not found".to_string())
+        );
     }
 
     #[test]

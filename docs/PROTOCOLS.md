@@ -144,7 +144,9 @@ configured DID directly without hashing or issuance; see
 [`docs/POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)).
 
 Target `custom_metadata` is merged into outbound extension metadata. A secret reference must occupy
-the whole string and use `$SECRET:<secret_id>`.
+the whole string and use `$SECRET:<secret_id>`. On a tenant surface it resolves only a secret the
+surface may send (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)).
 
 Relevant implementation:
 

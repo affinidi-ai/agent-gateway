@@ -438,8 +438,13 @@ OAuth-protected endpoint needs a static secret for now.
 
 A surface owned by a tenant sends only credentials of its own tenant. The check covers
 `static_secret` and `credential_provider` Target authentication on a Target, a Transit Point,
-Fabric receive and the agent card fetch, and `outbound_credentials` and `transit_credentials`
-bindings on the legacy and modern delegation paths.
+Fabric receive and the agent card fetch, `outbound_credentials` and `transit_credentials`
+bindings on the legacy and modern delegation paths, and every whole-string `$SECRET:<id>` value
+in custom metadata: the Target's `custom_metadata` and `response_custom_metadata`, the Access
+Point's `response_custom_metadata` and the Transit Points' shared `custom_metadata`, at any depth
+of the payload. Response custom metadata is returned to the caller, so it follows the same rule.
+A custom metadata secret that cannot be sent fails its injection as a secret that does not exist
+does: an MCP request is refused, and an A2A request or response is forwarded without the metadata.
 
 - A secret or provider of another tenant is always refused.
 - An appliance-wide secret or provider is refused according to the bootstrap
@@ -459,7 +464,10 @@ is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept
 legs that already sent it and only while each keeps its endpoint: the Target of the base
 surface or of a variant, or a Transit Point, identified by the variant's and the Transit Point's
 `id`, so renaming or reordering them keeps it. Surface `outbound_credentials` are sent on the
-Target and every Transit Point. A save that changes such a leg's endpoint, moves the reference
+Target and every Transit Point. A secret in the Target's custom metadata or in either response
+custom metadata belongs to the Target's leg, and one in the shared transit custom metadata to
+every Transit Point. A `$SECRET:` that names no existing secret is saved as before and fails when
+the metadata is injected. A save that changes such a leg's endpoint, moves the reference
 to another leg, or adds a leg that would send it is refused with `400` in `warn` mode too.
 A tenant reassignment that would create such a reference answers `409`. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
 

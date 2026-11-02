@@ -449,6 +449,9 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             for reference in collect_surface_reference_keys(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })? {
+                if reference.may_be_missing && !secret_exists(state, &reference.id).await? {
+                    continue;
+                }
                 let same_tenant = reference.same_tenant
                     || (reference.kind == ResourceKind::CredentialProviders
                         && provider_sends_gateway_credential(state, &reference.id).await?);
@@ -752,6 +755,21 @@ async fn add_reference_with_rule(
         same_tenant,
     });
     Ok(())
+}
+
+async fn secret_exists(
+    state: &IdentityApiState,
+    secret_id: &str,
+) -> Result<bool, OwnershipApiError> {
+    let store = state
+        .secrets_store
+        .as_ref()
+        .ok_or_else(|| unavailable(ResourceKind::Secrets))?;
+    Ok(store
+        .get_by_secret_id(secret_id)
+        .await
+        .map_err(internal)?
+        .is_some())
 }
 
 async fn provider_sends_gateway_credential(
