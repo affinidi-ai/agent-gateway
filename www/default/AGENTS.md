@@ -200,6 +200,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
+- A Transit Point's **Inject outbound credential** binding (`_shared/TransitCredentialBindingSection.tsx`)
+  keeps what its controls do not set: `elicit_timeout_secs`, `elicit_fallback` and an external
+  consent binding's `subject` round-trip through the form, and the consent select
+  (`transit-point-consent-mode-select`) shows a stored `elicit` or `external` mode as a disabled
+  option. An `external` binding's select is disabled, with a line saying whose grant it uses
+  (`transit-point-binding-subject`): such a binding is changed through the API.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent
   editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,
@@ -451,7 +457,13 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   rejects it (AADSTS901002), the form warns under Token Endpoint
   (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
   (`credential-provider-entra-resource-badge`).
-- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module.
+- A provider with an `issuer` (external consent) shows a notice naming the issuer
+  (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
+  additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
+  description, default scopes and token refresh (`externalProviderUpdate`).
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module. A
+  refused delete shows the API's reason and, for a `409`, the surface that binds the provider
+  (`providerDeleteError`).
 
 ## Secret editor
 

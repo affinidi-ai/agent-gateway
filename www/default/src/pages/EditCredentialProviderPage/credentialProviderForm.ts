@@ -223,3 +223,24 @@ export const PROVIDER_TYPE_LABELS: Record<CredentialProviderType, string> = {
   oauth2_client_credentials_jwt_auth: 'Client Credentials JWT',
   api_key: 'API Key',
 };
+
+/**
+ * The request that edits an external consent provider, one with an `issuer`: only the
+ * fields that stay editable, since the gateway refuses a change to any other.
+ */
+export function externalProviderUpdate(form: {
+  name: string;
+  description: string;
+  default_scopes: string;
+  token_refresh_enabled: boolean;
+}): Record<string, unknown> {
+  return {
+    name: form.name.trim(),
+    description: form.description.trim() || undefined,
+    default_scopes: form.default_scopes
+      .split(/[,\s]+/)
+      .map(scope => scope.trim())
+      .filter(Boolean),
+    token_refresh_enabled: form.token_refresh_enabled,
+  };
+}

@@ -11,10 +11,13 @@ interface CredentialProviderOption {
   callback_url?: string;
 }
 
+/** The consent modes the panel's select sets; a stored `elicit` or `external` is kept. */
+type SelectableConsentMode = 'on_demand' | 'pre_authorize';
+
 export interface TransitCredentialsForm {
   credential_provider_id: string;
   scopes: string;
-  consent_mode: 'on_demand' | 'pre_authorize';
+  consent_mode: SelectableConsentMode | 'elicit' | 'external';
   inject_as_type: 'bearer_header' | 'custom_header' | 'meta';
   inject_as_custom_name?: string;
   inject_as_custom_format?: string;
@@ -22,7 +25,15 @@ export interface TransitCredentialsForm {
   /** Kept from the stored value: the panel has no control for them. */
   elicit_timeout_secs?: number;
   elicit_fallback?: string;
+  /** Whose account an `external` binding's grant is: kept from the stored value. */
+  subject?: 'owner' | 'caller';
 }
+
+/** Labels of the consent modes the select shows only when they are stored. */
+const KEPT_CONSENT_MODES: Record<string, string> = {
+  elicit: 'Elicit (set through the API)',
+  external: 'External consent (set through the API)',
+};
 
 export const EMPTY_TRANSIT_CREDENTIALS: TransitCredentialsForm = {
   credential_provider_id: '',
@@ -56,6 +67,7 @@ export function transitCredentialsFormToApi(f: TransitCredentialsForm | null | u
     inject_as,
     ...(f.elicit_timeout_secs !== undefined ? { elicit_timeout_secs: f.elicit_timeout_secs } : {}),
     ...(f.elicit_fallback !== undefined ? { elicit_fallback: f.elicit_fallback } : {}),
+    ...(f.subject !== undefined ? { subject: f.subject } : {}),
   };
 }
 
@@ -86,6 +98,7 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
       ? { elicit_timeout_secs: api.elicit_timeout_secs }
       : {}),
     ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
+    ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
   };
 }
 
@@ -250,14 +263,33 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
             </Form.Label>
             <Form.Select
               size="sm"
+              data-testid="transit-point-consent-mode-select"
               value={value.consent_mode}
+              disabled={value.consent_mode === 'external'}
               onChange={e =>
                 update('consent_mode', e.target.value as TransitCredentialsForm['consent_mode'])
               }
             >
               <option value="on_demand">On demand (signal consent_required)</option>
               <option value="pre_authorize">Pre-authorize (block until granted)</option>
+              {KEPT_CONSENT_MODES[value.consent_mode] && (
+                <option value={value.consent_mode} disabled>
+                  {KEPT_CONSENT_MODES[value.consent_mode]}
+                </option>
+              )}
             </Form.Select>
+            {value.consent_mode === 'external' && (
+              <Form.Text
+                className="text-muted d-block"
+                data-testid="transit-point-binding-subject"
+                style={{ fontSize: '10px' }}
+              >
+                {value.subject === 'caller'
+                  ? 'Each caller uses the grant of their own account.'
+                  : 'Every caller uses the one grant of the account that connected.'}{' '}
+                Another system obtains the grant; change this binding through the API.
+              </Form.Text>
+            )}
           </Form.Group>
 
           <Form.Group className="mb-2">
