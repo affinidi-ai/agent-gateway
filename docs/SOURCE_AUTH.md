@@ -812,8 +812,9 @@ presents to the surface's caller authentication:
 
 Per-key caller identity therefore needs an API Key Provider.
 
-- A missing, invalid or revoked key resolves no caller identity. Policy sees
-  `input.source_auth.method == "failed"` and decides; see
+- A missing, invalid or revoked key resolves no caller identity. On a closed Access Point, or
+  with `on_failure: reject`, the request is refused with `401` before policy; otherwise policy
+  sees `input.source_auth.method == "failed"` and decides; see
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
 - On a direct request, the key's DID replaces any identity the request body asserts, such as
   an identity presentation or a credential extension. [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)
