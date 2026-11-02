@@ -205,290 +205,304 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
         </div>
       )}
 
-      {rows.map((row, idx) => (
-        <div
-          key={idx}
-          className="border rounded p-2 mb-2 position-relative"
-          style={{ background: 'rgba(0,0,0,0.02)' }}
-        >
-          <button
-            type="button"
-            className="btn btn-link btn-sm text-decoration-none p-0 text-danger position-absolute"
-            style={{ top: '0.5rem', right: '0.5rem', zIndex: 1 }}
-            onClick={() => removeRow(idx)}
-            title="Remove binding"
+      {rows.map((row, idx) => {
+        /** Another system obtains an external binding's grant, so only its removal is offered here. */
+        const readOnly = row.consent_mode === 'external';
+        return (
+          <div
+            key={idx}
+            className="border rounded p-2 mb-2 position-relative"
+            style={{ background: 'rgba(0,0,0,0.02)' }}
           >
-            <i className="fas fa-trash" />
-          </button>
-
-          <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-0">Credential Provider</Form.Label>
-            <Form.Select
-              size="sm"
-              value={row.credential_provider_id}
-              onChange={e => updateRow(idx, { credential_provider_id: e.target.value })}
-              disabled={loading}
+            <button
+              type="button"
+              className="btn btn-link btn-sm text-decoration-none p-0 text-danger position-absolute"
+              style={{ top: '0.5rem', right: '0.5rem', zIndex: 1 }}
+              onClick={() => removeRow(idx)}
+              title="Remove binding"
             >
-              <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {offered.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                  {p.provider_id ? ` (${p.provider_id})` : ''}
-                </option>
-              ))}
-              {outside
-                .filter(p => p.id === row.credential_provider_id)
-                .map(p => (
+              <i className="fas fa-trash" />
+            </button>
+
+            <Form.Group className="mb-2">
+              <Form.Label className="small text-muted mb-0">Credential Provider</Form.Label>
+              <Form.Select
+                size="sm"
+                value={row.credential_provider_id}
+                onChange={e => updateRow(idx, { credential_provider_id: e.target.value })}
+                disabled={loading || readOnly}
+              >
+                <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
+                {offered.map(p => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({outOfTenantLabel(p)})
+                    {p.name}
+                    {p.provider_id ? ` (${p.provider_id})` : ''}
                   </option>
                 ))}
-              {row.credential_provider_id &&
-                !providers.some(p => p.id === row.credential_provider_id) && (
-                  <option value={row.credential_provider_id}>
-                    {row.credential_provider_id} (not in list)
-                  </option>
-                )}
-            </Form.Select>
-            {!loading && (
-              <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-                {offered.length === 0
-                  ? 'No credential providers configured yet. '
-                  : "Don't see the one you need? "}
-                <AddResourceLink
-                  to={deepLinks.credentialProvider}
-                  testid={`outbound-credentials-${idx}-add-provider-link`}
-                >
-                  Add credential provider
-                </AddResourceLink>
-              </Form.Text>
-            )}
-            {(() => {
-              const selected = providers.find(p => p.id === row.credential_provider_id);
-              if (!selected) return null;
-              const cb = selected.callback_url;
-              return (
-                <div className="outbound-credential-callback mt-2 p-2 small">
-                  <div className="outbound-credential-callback-title">
-                    <i className="fas fa-shield-halved me-1" />
-                    Gateway-held credential callback URL
-                  </div>
-                  {cb ? (
-                    <>
-                      <div className="mb-1">OAuth callback URL configured on this provider:</div>
-                      <div className="d-flex align-items-center gap-1 mb-2">
-                        <code style={{ wordBreak: 'break-all', flex: 1 }}>{cb}</code>
-                        <button
-                          type="button"
-                          className="btn btn-link btn-sm p-0"
-                          title="Copy callback URL"
-                          onClick={() => navigator.clipboard.writeText(cb)}
-                        >
-                          <i className="fas fa-copy" />
-                        </button>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="mb-1 fst-italic">
-                      No callback URL configured on this provider yet.
-                    </div>
+                {outside
+                  .filter(p => p.id === row.credential_provider_id)
+                  .map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({outOfTenantLabel(p)})
+                    </option>
+                  ))}
+                {row.credential_provider_id &&
+                  !providers.some(p => p.id === row.credential_provider_id) && (
+                    <option value={row.credential_provider_id}>
+                      {row.credential_provider_id} (not in list)
+                    </option>
                   )}
-                  <div>
-                    Tokens returned to this callback are stored on the gateway and re-injected
-                    automatically onto outbound calls. The calling agent never sees the user's
-                    credentials.
-                  </div>
-                </div>
-              );
-            })()}
-          </Form.Group>
-
-          <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-0">
-              Scopes - leave empty for provider defaults
-            </Form.Label>
-            <Form.Control
-              size="sm"
-              type="text"
-              value={row.scopes}
-              onChange={e => updateRow(idx, { scopes: e.target.value })}
-            />
-          </Form.Group>
-
-          <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-0 d-flex align-items-center justify-content-between">
-              <span>Consent Mode</span>
-              <a
-                href="/guides/credential-delegation.html#consent-modes-explained"
-                target="_blank"
-                rel="noreferrer"
-                title="What do these consent modes mean?"
-                className="text-decoration-none"
-                style={{ fontSize: '0.85em' }}
-              >
-                <i className="fas fa-circle-question me-1" />
-                Help
-              </a>
-            </Form.Label>
-            <Form.Select
-              size="sm"
-              data-testid="credential-delegation-consent-mode-select"
-              value={row.consent_mode}
-              disabled={row.consent_mode === 'external'}
-              onChange={e =>
-                updateRow(idx, {
-                  consent_mode: e.target.value as OutboundCredentialFormRow['consent_mode'],
-                })
-              }
-            >
-              <option value="on_demand">On demand (signal consent_required)</option>
-              <option value="pre_authorize">Pre-authorize (block until granted)</option>
-              <option value="elicit">Elicit (MCP elicitation/create prompt)</option>
-              {row.consent_mode === 'external' && (
-                <option value="external" disabled>
-                  External consent (set through the API)
-                </option>
+              </Form.Select>
+              {!loading && (
+                <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
+                  {offered.length === 0
+                    ? 'No credential providers configured yet. '
+                    : "Don't see the one you need? "}
+                  <AddResourceLink
+                    to={deepLinks.credentialProvider}
+                    testid={`outbound-credentials-${idx}-add-provider-link`}
+                  >
+                    Add credential provider
+                  </AddResourceLink>
+                </Form.Text>
               )}
-            </Form.Select>
-            {row.consent_mode === 'external' && (
-              <Form.Text
-                className="text-muted d-block"
-                data-testid="credential-delegation-binding-subject"
-                style={{ fontSize: '10px' }}
-              >
-                {row.subject === 'caller'
-                  ? "Each caller's requests to the Target carry the grant of their own account."
-                  : "Every caller's requests to the Target carry the one grant of the account that connected."}{' '}
-                Another system obtains the grant; change this binding through the API.
-              </Form.Text>
-            )}
-            {row.consent_mode === 'elicit' && (
-              <div className="mt-2 ps-2" style={{ borderLeft: '2px solid rgba(0,0,0,0.1)' }}>
-                <Form.Label className="small text-muted mb-0">Elicit timeout (seconds)</Form.Label>
-                <Form.Control
-                  size="sm"
-                  type="number"
-                  min={1}
-                  value={row.elicit_timeout_secs ?? 300}
-                  onChange={e =>
-                    updateRow(idx, { elicit_timeout_secs: parseInt(e.target.value, 10) || 300 })
-                  }
-                />
-                <Form.Label className="small text-muted mb-0 mt-2">
-                  Fallback when client doesn't support elicitation
-                </Form.Label>
-                <Form.Select
-                  size="sm"
-                  value={row.elicit_fallback ?? 'on_demand'}
-                  onChange={e =>
-                    updateRow(idx, {
-                      elicit_fallback: e.target
-                        .value as OutboundCredentialFormRow['elicit_fallback'],
-                    })
-                  }
-                >
-                  <option value="on_demand">On demand (signal consent_required)</option>
-                  <option value="fail">Fail (return not_applicable)</option>
-                </Form.Select>
-              </div>
-            )}
-          </Form.Group>
+              {(() => {
+                const selected = providers.find(p => p.id === row.credential_provider_id);
+                if (!selected) return null;
+                const cb = selected.callback_url;
+                return (
+                  <div className="outbound-credential-callback mt-2 p-2 small">
+                    <div className="outbound-credential-callback-title">
+                      <i className="fas fa-shield-halved me-1" />
+                      Gateway-held credential callback URL
+                    </div>
+                    {cb ? (
+                      <>
+                        <div className="mb-1">OAuth callback URL configured on this provider:</div>
+                        <div className="d-flex align-items-center gap-1 mb-2">
+                          <code style={{ wordBreak: 'break-all', flex: 1 }}>{cb}</code>
+                          <button
+                            type="button"
+                            className="btn btn-link btn-sm p-0"
+                            title="Copy callback URL"
+                            onClick={() => navigator.clipboard.writeText(cb)}
+                          >
+                            <i className="fas fa-copy" />
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="mb-1 fst-italic">
+                        No callback URL configured on this provider yet.
+                      </div>
+                    )}
+                    <div>
+                      Tokens returned to this callback are stored on the gateway and re-injected
+                      automatically onto outbound calls. The calling agent never sees the user's
+                      credentials.
+                    </div>
+                  </div>
+                );
+              })()}
+            </Form.Group>
 
-          <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-0">Required For</Form.Label>
-            <Form.Select
-              size="sm"
-              value={row.required_for_mode}
-              onChange={e =>
-                updateRow(idx, {
-                  required_for_mode: e.target
-                    .value as OutboundCredentialFormRow['required_for_mode'],
-                })
-              }
-            >
-              <option value="all">All outbound requests</option>
-              <option value="tools">Specific MCP tools only</option>
-            </Form.Select>
-            {row.required_for_mode === 'tools' && (
+            <Form.Group className="mb-2">
+              <Form.Label className="small text-muted mb-0">
+                Scopes - leave empty for provider defaults
+              </Form.Label>
               <Form.Control
                 size="sm"
                 type="text"
-                className="mt-1"
-                value={row.required_for_tools ?? ''}
-                onChange={e => updateRow(idx, { required_for_tools: e.target.value })}
-                placeholder="create_issue, update_pr (comma-separated tool names)"
-              />
-            )}
-          </Form.Group>
-
-          <Form.Group className="mb-2">
-            <div className="d-flex align-items-center gap-1 mb-0">
-              <Form.Label className="small text-muted mb-0">Inject As</Form.Label>
-              <FieldHelp
-                testId="field-help-outbound-credentials-list-section-inject-as"
-                ariaLabel="About Inject As"
-              >
-                Bearer header sends the credential in a standard <code>Authorization: Bearer</code>{' '}
-                header (most common). Custom header sends it in a header you name, in a format you
-                control. JSON-RPC <code>_meta</code> attaches it inside the request&apos;s{' '}
-                <code>_meta</code> field instead of a header, for protocols/tools that expect it
-                there.
-              </FieldHelp>
-            </div>
-            <Form.Select
-              size="sm"
-              value={row.inject_as_type}
-              onChange={e =>
-                updateRow(idx, {
-                  inject_as_type: e.target.value as OutboundCredentialFormRow['inject_as_type'],
-                })
-              }
-            >
-              <option value="bearer_header">Bearer header</option>
-              <option value="custom_header">Custom header</option>
-              <option value="meta">JSON-RPC _meta</option>
-            </Form.Select>
-          </Form.Group>
-
-          {row.inject_as_type === 'custom_header' && (
-            <>
-              <Form.Group className="mb-1">
-                <Form.Label className="small text-muted mb-0">Header name</Form.Label>
-                <Form.Control
-                  size="sm"
-                  type="text"
-                  value={row.inject_as_custom_name ?? ''}
-                  onChange={e => updateRow(idx, { inject_as_custom_name: e.target.value })}
-                  placeholder="X-GitHub-Token"
-                />
-              </Form.Group>
-              <Form.Group className="mb-1">
-                <Form.Label className="small text-muted mb-0">Header format</Form.Label>
-                <Form.Control
-                  size="sm"
-                  type="text"
-                  value={row.inject_as_custom_format ?? ''}
-                  onChange={e => updateRow(idx, { inject_as_custom_format: e.target.value })}
-                  placeholder="token {value}"
-                />
-              </Form.Group>
-            </>
-          )}
-
-          {row.inject_as_type === 'meta' && (
-            <Form.Group className="mb-1">
-              <Form.Label className="small text-muted mb-0">Meta field name</Form.Label>
-              <Form.Control
-                size="sm"
-                type="text"
-                value={row.inject_as_meta_field ?? ''}
-                onChange={e => updateRow(idx, { inject_as_meta_field: e.target.value })}
-                placeholder="oauth_token"
+                value={row.scopes}
+                onChange={e => updateRow(idx, { scopes: e.target.value })}
+                disabled={readOnly}
               />
             </Form.Group>
-          )}
-        </div>
-      ))}
+
+            <Form.Group className="mb-2">
+              <Form.Label className="small text-muted mb-0 d-flex align-items-center justify-content-between">
+                <span>Consent Mode</span>
+                <a
+                  href="/guides/credential-delegation.html#consent-modes-explained"
+                  target="_blank"
+                  rel="noreferrer"
+                  title="What do these consent modes mean?"
+                  className="text-decoration-none"
+                  style={{ fontSize: '0.85em' }}
+                >
+                  <i className="fas fa-circle-question me-1" />
+                  Help
+                </a>
+              </Form.Label>
+              <Form.Select
+                size="sm"
+                data-testid="credential-delegation-consent-mode-select"
+                value={row.consent_mode}
+                disabled={readOnly}
+                onChange={e =>
+                  updateRow(idx, {
+                    consent_mode: e.target.value as OutboundCredentialFormRow['consent_mode'],
+                  })
+                }
+              >
+                <option value="on_demand">On demand (signal consent_required)</option>
+                <option value="pre_authorize">Pre-authorize (block until granted)</option>
+                <option value="elicit">Elicit (MCP elicitation/create prompt)</option>
+                {row.consent_mode === 'external' && (
+                  <option value="external" disabled>
+                    External consent (set through the API)
+                  </option>
+                )}
+              </Form.Select>
+              {readOnly && (
+                <Form.Text
+                  className="text-muted d-block"
+                  data-testid="credential-delegation-binding-subject"
+                  style={{ fontSize: '10px' }}
+                >
+                  {row.subject === 'caller'
+                    ? "Each caller's requests to the Target carry the grant of their own account."
+                    : "Every caller's requests to the Target carry the one grant of the account that connected."}{' '}
+                  Another system obtains the grant; change this binding through the API. Changing or
+                  removing this binding revokes its grants.
+                </Form.Text>
+              )}
+              {row.consent_mode === 'elicit' && (
+                <div className="mt-2 ps-2" style={{ borderLeft: '2px solid rgba(0,0,0,0.1)' }}>
+                  <Form.Label className="small text-muted mb-0">
+                    Elicit timeout (seconds)
+                  </Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    min={1}
+                    value={row.elicit_timeout_secs ?? 300}
+                    onChange={e =>
+                      updateRow(idx, { elicit_timeout_secs: parseInt(e.target.value, 10) || 300 })
+                    }
+                  />
+                  <Form.Label className="small text-muted mb-0 mt-2">
+                    Fallback when client doesn't support elicitation
+                  </Form.Label>
+                  <Form.Select
+                    size="sm"
+                    value={row.elicit_fallback ?? 'on_demand'}
+                    onChange={e =>
+                      updateRow(idx, {
+                        elicit_fallback: e.target
+                          .value as OutboundCredentialFormRow['elicit_fallback'],
+                      })
+                    }
+                  >
+                    <option value="on_demand">On demand (signal consent_required)</option>
+                    <option value="fail">Fail (return not_applicable)</option>
+                  </Form.Select>
+                </div>
+              )}
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+              <Form.Label className="small text-muted mb-0">Required For</Form.Label>
+              <Form.Select
+                size="sm"
+                value={row.required_for_mode}
+                onChange={e =>
+                  updateRow(idx, {
+                    required_for_mode: e.target
+                      .value as OutboundCredentialFormRow['required_for_mode'],
+                  })
+                }
+                disabled={readOnly}
+              >
+                <option value="all">All outbound requests</option>
+                <option value="tools">Specific MCP tools only</option>
+              </Form.Select>
+              {row.required_for_mode === 'tools' && (
+                <Form.Control
+                  size="sm"
+                  type="text"
+                  className="mt-1"
+                  value={row.required_for_tools ?? ''}
+                  onChange={e => updateRow(idx, { required_for_tools: e.target.value })}
+                  placeholder="create_issue, update_pr (comma-separated tool names)"
+                  disabled={readOnly}
+                />
+              )}
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+              <div className="d-flex align-items-center gap-1 mb-0">
+                <Form.Label className="small text-muted mb-0">Inject As</Form.Label>
+                <FieldHelp
+                  testId="field-help-outbound-credentials-list-section-inject-as"
+                  ariaLabel="About Inject As"
+                >
+                  Bearer header sends the credential in a standard{' '}
+                  <code>Authorization: Bearer</code> header (most common). Custom header sends it in
+                  a header you name, in a format you control. JSON-RPC <code>_meta</code> attaches
+                  it inside the request&apos;s <code>_meta</code> field instead of a header, for
+                  protocols/tools that expect it there.
+                </FieldHelp>
+              </div>
+              <Form.Select
+                size="sm"
+                value={row.inject_as_type}
+                onChange={e =>
+                  updateRow(idx, {
+                    inject_as_type: e.target.value as OutboundCredentialFormRow['inject_as_type'],
+                  })
+                }
+                disabled={readOnly}
+              >
+                <option value="bearer_header">Bearer header</option>
+                <option value="custom_header">Custom header</option>
+                <option value="meta">JSON-RPC _meta</option>
+              </Form.Select>
+            </Form.Group>
+
+            {row.inject_as_type === 'custom_header' && (
+              <>
+                <Form.Group className="mb-1">
+                  <Form.Label className="small text-muted mb-0">Header name</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={row.inject_as_custom_name ?? ''}
+                    onChange={e => updateRow(idx, { inject_as_custom_name: e.target.value })}
+                    placeholder="X-GitHub-Token"
+                    disabled={readOnly}
+                  />
+                </Form.Group>
+                <Form.Group className="mb-1">
+                  <Form.Label className="small text-muted mb-0">Header format</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={row.inject_as_custom_format ?? ''}
+                    onChange={e => updateRow(idx, { inject_as_custom_format: e.target.value })}
+                    placeholder="token {value}"
+                    disabled={readOnly}
+                  />
+                </Form.Group>
+              </>
+            )}
+
+            {row.inject_as_type === 'meta' && (
+              <Form.Group className="mb-1">
+                <Form.Label className="small text-muted mb-0">Meta field name</Form.Label>
+                <Form.Control
+                  size="sm"
+                  type="text"
+                  value={row.inject_as_meta_field ?? ''}
+                  onChange={e => updateRow(idx, { inject_as_meta_field: e.target.value })}
+                  placeholder="oauth_token"
+                  disabled={readOnly}
+                />
+              </Form.Group>
+            )}
+          </div>
+        );
+      })}
 
       <Button size="sm" variant="outline-primary" onClick={addRow}>
         <i className="fas fa-plus me-1" />
