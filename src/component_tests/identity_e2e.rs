@@ -100,7 +100,7 @@ fn configure_header_metadata_inbound_identity_surface(
     }
 }
 
-fn a2a_request() -> serde_json::Value {
+pub(super) fn a2a_request() -> serde_json::Value {
     json!({
         "jsonrpc": "2.0",
         "method": "message/send",
@@ -140,7 +140,7 @@ fn find_did(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
+pub(super) fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
     use base64::Engine as _;
 
     let payload = jwt.split('.').nth(1)?;
@@ -2299,6 +2299,7 @@ fn inbound_api_key_identity_surface(policy_id: &str) -> crate::config::agent_sur
             extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
             secret_id: INBOUND_CALLER_KEY_SECRET.to_string(),
         })],
+        on_failure: Default::default(),
     });
     surface
 }
