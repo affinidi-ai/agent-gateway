@@ -77,21 +77,46 @@ pub enum TransitCallerVerification {
     /// verified by credential: the DID was asserted or derived from request
     /// fields on the Access Point.
     Unverified,
+    /// The transit token was issued for a request that arrived over Fabric. The
+    /// peer gateway that sent it is verified, its caller is not.
+    FabricPeer,
     /// Nothing identifies the caller.
     Anonymous,
+}
+
+/// `input.transit.caller.fabric`: the peer gateway that sent the request a
+/// Fabric-issued transit token was issued for. The Fabric handshake verified
+/// the peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitFabricPeer {
+    pub peer_gateway_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_issuer_did: Option<String>,
+    pub hops: u8,
+}
+
+impl From<&crate::proxy::transit_token::FabricTransitClaims> for TransitFabricPeer {
+    fn from(claims: &crate::proxy::transit_token::FabricTransitClaims) -> Self {
+        Self {
+            peer_gateway_id: claims.peer_gateway_id.clone(),
+            peer_issuer_did: claims.peer_issuer_did.clone(),
+            hops: claims.hops,
+        }
+    }
 }
 
 /// `input.transit.caller`: the caller of a Transit Point call and how the
 /// gateway came to know it.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitCallerContext {
-    /// `true` for a `transit_token` caller; `false` for `unverified` and
-    /// `anonymous`.
+    /// `true` for a `transit_token` caller; `false` for `unverified`,
+    /// `fabric_peer` and `anonymous`.
     pub verified: bool,
     pub verification: TransitCallerVerification,
-    /// How the Access Point established the caller DID: the transit token's
+    /// How the caller DID was established: the transit token's
     /// `identity_source` (`gateway-computed`, `self-presented`,
-    /// `verified-presentation`).
+    /// `verified-presentation`, or `fabric-presentation` and `fabric-asserted`
+    /// for a token issued on Fabric receive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
     /// The caller's identity hash
@@ -108,6 +133,10 @@ pub struct TransitCallerContext {
     /// carries, verbatim. Empty unless the caller is `verified`.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     pub fields: serde_json::Map<String, serde_json::Value>,
+    /// The peer gateway, when the transit token was issued for a request that
+    /// arrived over Fabric.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<TransitFabricPeer>,
 }
 
 impl TransitCallerContext {
@@ -119,14 +148,28 @@ impl TransitCallerContext {
             user_identity_hash: None,
             did: None,
             fields: serde_json::Map::new(),
+            fabric: None,
         }
     }
 
     /// The caller a validated transit token carries. Only a token whose
     /// `user_identity_hash` came from source authentication verifies the
     /// caller; the allowlisted fields are copied from that authenticated
-    /// identity, so they are dropped when there is no hash.
+    /// identity, so they are dropped when there is no hash. A token issued for
+    /// a request that arrived over Fabric is a `fabric_peer` caller, never
+    /// verified: the peer that sent the request is, its caller is not.
     pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
+        if let Some(fabric) = &claims.fabric {
+            return Self {
+                verified: false,
+                verification: TransitCallerVerification::FabricPeer,
+                identity_source: claims.identity_source.clone(),
+                user_identity_hash: None,
+                did: fabric.caller_did.clone(),
+                fields: serde_json::Map::new(),
+                fabric: Some(fabric.into()),
+            };
+        }
         let verified = claims
             .user_identity_hash
             .is_some();
@@ -153,6 +196,7 @@ impl TransitCallerContext {
             } else {
                 serde_json::Map::new()
             },
+            fabric: None,
         }
     }
 }

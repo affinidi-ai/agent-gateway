@@ -7,6 +7,7 @@ pub mod card_preview;
 pub mod channel_logging;
 pub mod credential_delegation;
 pub mod fabric_forward;
+pub(crate) mod fabric_hops;
 pub mod fabric_identity;
 pub(crate) mod fabric_response_waiter;
 pub(crate) mod fabric_stream;

@@ -544,7 +544,7 @@ impl TargetCardFetch<'_> {
             .surface
             .source_auth()
             .and_then(|sa| sa.credential_header_name());
-        let forwarded_headers = headers
+        let mut forwarded_headers = headers
             .iter()
             .filter(|(key, _)| super::should_forward_header(key.as_str(), source_cred_header))
             .filter_map(|(key, value)| {
@@ -554,6 +554,7 @@ impl TargetCardFetch<'_> {
                     .map(|value| (key.as_str().to_string(), value.to_string()))
             })
             .collect::<HashMap<_, _>>();
+        crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
         let trace_id = uuid::Uuid::new_v4().to_string();
         let path = super::agent_card_fabric_forward_path(&state.surface);
         let response = crate::proxy::fabric_forward::forward_via_fabric(

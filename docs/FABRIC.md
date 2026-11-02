@@ -190,6 +190,15 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The presentation the receiving gateway signs for its agent's response, when the Target has a
+Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
+`delegated: true`) only when a presentation from one of the connection's issuers proved the
+caller's DID (`vp` below), the caller a transit token issued for the request carries (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A payload pseudonym, a DID computed from the
+extension's fields, or any other identity the peer named is left out, so the presentation never
+attests a delegation the peer only claimed. A `vp` DID is still the peer's word: any paired
+gateway's issuer can sign a presentation for any DID.
+
 The `did` field is never a source of identity. A credential extension carrying only a
 `did` claim yields nothing, and a `did` field in the raw `agent-identity/v1` extension is
 ignored. The identity is instead computed from:
@@ -354,8 +363,14 @@ request received by the destination gateway:
    whatever the request timeout says (see [Fabric envelope
    lifetime](CONFIGURATION_RELOAD.md#fabric-envelope-lifetime)), leaving 120 s of clock skew below the
    receiver's cap; the caller deadline (`deadline_ms`) keeps the full timeout.
-3. Resolve the destination surface from the legacy wire field `channel_id`.
-4. Run the destination surface's configured source authentication and MCP request-boundary
+3. Read the hop count (`X-Gateway-Fabric-Hops`) and remove it, and every `X-Transit-Token` the peer
+   sent, from the request, buffered or framed. A count that is not one integer from 1 to 255 is
+   refused with `400`, and one above the limit with `508`, before surface lookup. A framed stream
+   resolves its surface and variant when it opens, so one to a surface or variant that is not
+   available is refused for that before its hop count is read; see
+   [Chains across gateways](#chains-across-gateways).
+4. Resolve the destination surface from the legacy wire field `channel_id`.
+5. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
    evaluates caller evidence presented to the destination surface. On an MCP surface that
    publishes protected resource metadata, a missing or refused token is answered here with a
@@ -364,13 +379,18 @@ request received by the destination gateway:
    resource, can pass. There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
    (see below).
-5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
+6. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
-6. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
+7. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
    Check, surface policy, and MCP tool gating in that order where configured.
-7. Forward to the local surface Target.
-8. Apply response processing, including MCP tool-list filtering when configured, before packaging
+8. Forward to the local surface Target. When the surface has Transit Points and the Target is an
+   HTTP or HTTPS URL, the request carries a transit token this gateway issued for it, naming the
+   peer and the hop count, so the agent can call its own Transit Points (see
+   [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
+   card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
+   transport.
+9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
@@ -460,6 +480,15 @@ The receiving gateway applies its own surface's `outbound_credentials` toward it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
 whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
 
+When the agent behind the receiving surface then calls one of its own Transit Points with the
+transit token it got for the peer's request, that Transit Point releases it no delegated per-user
+credential: the token names the peer, never a principal, and never keys a vault lookup. A binding
+that applies refuses the call with `403`, and the Transit Point's target is not called; the log
+says delegated credentials are not released for requests that arrived over Fabric. The token
+names the call's caller, so a client the Transit Point's own `source_auth` verified on the same
+call gets no grant either; static `target_auth` credentials are added as for any caller (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
 (`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has
 `[mcp.continuations]`, `sts.mcp_issuer` and a credential provider whose consent identity strategy
@@ -483,3 +512,83 @@ A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 surface's `access_point.a2a`, before a `fabric://` request is dispatched. The receive pipeline above
 does not run them again, so the receiving surface's A2A settings do not apply to fabric requests;
 see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap).
+
+## Chains across gateways
+
+A request can cross Fabric more than once: a caller reaches gateway A, which forwards it to
+gateway C, whose agent calls its Transit Point to gateway B. Every hop is a new request, each
+with its own deadline, so agents that call each other through their gateways could pass a
+request back and forth without end. A hop count bounds them.
+
+- Every Fabric send sets `X-Gateway-Fabric-Hops`, the number of Fabric crossings including this
+  one, in the buffered forward's headers and in a framed stream Open's headers: `1` from an
+  Access Point (its Target, an agent card fetch through it, a delegated payment), and from a
+  Transit Point one more than the Fabric-issued transit token its agent sent records, or `1`
+  with an Access Point token or none. No copy a caller, an agent or a peer sent is ever
+  forwarded, to an HTTP target or over Fabric.
+- The receiving gateway reads and removes it before anything else uses the request. Missing,
+  as from a sender that predates it, means `1`. It carries the count into the transit token it
+  issues (`fabric.hops`), signed, so an agent cannot lower the count in the token it was given.
+  An agent that still holds an older valid token, from an Access Point request or an earlier
+  Fabric request, can present that one instead, which records fewer crossings.
+- The limit is 8 crossings, so a chain reaches at most 9 gateways. A request past it is refused
+  with `508` and the message that it passed through too many gateways, recorded as a
+  `request_rejected` audit event (stage `routing`, reason `fabric_chain_too_long`; a malformed
+  count is `fabric_hops_invalid`, refused with `400`). A Transit Point whose next send would
+  pass the limit refuses the call itself with `508`, before anything is resolved or forwarded,
+  recorded as a `request_rejected` audit event (stage `forward`, reason
+  `fabric_chain_too_long`).
+- The trace continues along the chain: the receiving gateway's onward trace id rides in the
+  token, and the Transit Point sends it on the next hop, so caller to A to C to B is one trace
+  unless a surface sets `terminate_trace_id`. The hop count crosses a terminated trace too.
+
+Hops are counted only across Fabric. A chain through an `http` Transit Point into another
+gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
+included, starts again at 1, and so does a call without a transit token through a Transit Point
+that does not require one (it reads the count from a token the agent sends), a call through a
+Transit Point that does not list `allow_fabric_callers` (the agent got no token for it), a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
+public discovery `GET` (an agent card or `.well-known` document) through any Transit Point,
+which reads no token either. So does a chain through a gateway that predates the hop count,
+which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
+the agent sending the token it was given each time; two agents that call each other's Access
+Points are not bounded by it, nor are agents that keep calling through any of the resets above.
+It is not an access control, and an agent can escape it.
+
+A Fabric-issued transit token, like an Access Point's, is a bearer token until it expires.
+Nothing records which token IDs were presented, so the agent, or anyone who obtains the token,
+can present it again on any call to a Transit Point it lists, and an agent holding several
+valid tokens can choose which one a Transit Point sees, with its `fabric.hops` and
+`fabric.caller_did`. The surface's [transit token
+lifetime](SOURCE_AUTH.md#transit-token-lifetime) bounds this. The receiving gateway logs each
+token it issues at `INFO`, with its token ID (`jti`), the peer's Remote gateway record and the
+hop count, so a token presented later can be traced to the request it was issued for.
+
+A managed agent serving a partner's request gets a transit token only for the Transit Points
+that set `allow_fabric_callers: true`, off by default and set through the admin API only (a
+Surface Builder save keeps it, as it keeps a Transit Point's `source_auth`). Without one, the
+agent gets no token, and a Transit Point that requires one refuses its calls with `401`. A
+surface variant's Transit Points set it for that variant. When a token should be issued and
+cannot be, the receiving gateway refuses the request with `503`, recorded as a
+`request_rejected` audit event (stage `forward`, reason `transit_token_unavailable`), rather than
+forwarding a partner's request as one with no token.
+
+A Transit Point that was set to `require_transit_token: false`, with
+`allow_unauthenticated_callers: true`, only so that agents serving partner requests could call
+it should require the token again, set `allow_fabric_callers` and drop
+`allow_unauthenticated_callers`: those agents then get a token, and while the Transit Point does
+not require it, an agent that sends none starts the hop count again.
+A create or update of a surface or of one of its variants is answered with a `Warning` header
+for each `fabric://` Transit Point, on the surface or in a variant, that does not require the
+transit token:
+
+```
+Warning: 299 - "Transit Point 'partner' sends to a peer gateway without requiring the transit token, so the Fabric hop limit holds through it only when the agent sends one; require the transit token"
+```
+
+`make gw-e2e` verifies a chain across three gateway binaries and the hop limit between two
+(`tests/features/g2g/transit_token_over_fabric.feature`): an agent serving a partner's request
+calls onward through its own Transit Point with the token it was given, in the caller's trace;
+without the token, or with one issued for another surface, the Transit Point answers `401`;
+and two agents passing a request back and forth are stopped with `508` after 8 crossings.

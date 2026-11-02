@@ -34,6 +34,13 @@ pub enum IdentitySource {
     /// The gateway resolved the caller's `did.jsonl` and verified the Data
     /// Integrity proof chain before accepting the identity.
     VerifiedPresentation,
+    /// The request arrived over Fabric, and the caller DID comes from a
+    /// presentation one of the connection's issuers signed: the peer gateway
+    /// vouches for it.
+    FabricPresentation,
+    /// The request arrived over Fabric, and its caller comes from anything else
+    /// the peer sent, or the request names none.
+    FabricAsserted,
 }
 
 impl std::fmt::Display for IdentitySource {
@@ -45,6 +52,8 @@ impl std::fmt::Display for IdentitySource {
             Self::GatewayComputed => write!(f, "gateway-computed"),
             Self::SelfPresented => write!(f, "self-presented"),
             Self::VerifiedPresentation => write!(f, "verified-presentation"),
+            Self::FabricPresentation => write!(f, "fabric-presentation"),
+            Self::FabricAsserted => write!(f, "fabric-asserted"),
         }
     }
 }

@@ -153,7 +153,7 @@ logic.
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
 | Headers | Trace ID, `did:webvh` identity headers (`x-did-identity`, `x-did-signed-identity`), and caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`); the caller's own copies of these headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs) |
-| Transit token | The token a managed agent echoes back on its Transit Point calls | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
+| Transit token | The token a managed agent echoes back on its Transit Point calls. Fabric receive issues one too, for an HTTP(S) Target | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
@@ -223,7 +223,8 @@ Outbound:
 caller authentication (a Transit Point whose caller authentication cannot be enforced, or
 whose surface sets `transit.source_auth`, is refused here; otherwise its `source_auth`, or on
 a Transit Point with `mcp_http.authorization` the Resource Server token) →
-transit token validation → rate limit → protocol context → Transit Point header mapping
+transit token validation → rate limit → protocol context → Fabric hop check (a `fabric://`
+Transit Point refuses a call past the hop limit with `508`) → Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
@@ -250,6 +251,7 @@ sequenceDiagram
     M->>G2: Deliver
     Note over G2: Sender authorization: the Connection Point DID<br/>must belong to a paired Remote gateway
     Note over G2: Envelope admission: expiry at most one hour ahead,<br/>and not already seen for this sender and message id
+    Note over G2: Hop count: at most 8 Fabric crossings,<br/>peer's hop count and transit tokens removed
     Note over G2: Surface lookup, source auth, then the inbound path
     G2->>T: Forward
     T-->>G2: Response
@@ -296,8 +298,13 @@ as from a legacy-only endpoint.
 | Receive | [`src/gateways/connection_points/message_processor.rs`](src/gateways/connection_points/message_processor.rs) |
 | Framed streams | [`src/proxy/fabric_stream/`](src/proxy/fabric_stream/) |
 
-On receive, sender authorization and envelope admission, meaning expiry and replay
-checks, run **before** surface lookup and source auth. Each gateway keeps its own trust
+On receive, sender authorization, envelope admission, meaning expiry and replay checks,
+and the hop count check run **before** surface lookup and source auth; a framed stream resolves
+its surface and variant when it opens, so it reads the hop count after them. A request forwarded to
+an HTTP(S) Target of a surface with a Transit Point that sets `allow_fabric_callers` carries a
+transit token the receiving gateway issued, naming the peer and the hop count and opening only
+those Transit Points (see
+[`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways)). Each gateway keeps its own trust
 boundary: an identity presentation is attributed to the caller only when its issuer is
 one of that connection's issuers.
 
@@ -320,6 +327,8 @@ Breaking one of these is a correctness bug, not a style question.
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
 | A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a public discovery `GET` without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | A managed agent receives the caller-info and `did:webvh` identity headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent, and a Transit Point sends its target none of them. | The agent, or a Transit Point's target, could not rely on these headers. |
+| A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a principal or a `sub`, so it never keys a delegated credential, opens only the Transit Points that allow Fabric callers, and the agent gets only the one this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
+| Every Fabric send sets its own hop count, never a copy a caller, agent or peer sent, and a request past 8 Fabric crossings is refused. | Agents that call each other through their gateways could pass a request back and forth without end. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
