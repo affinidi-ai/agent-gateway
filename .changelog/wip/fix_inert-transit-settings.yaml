@@ -3,20 +3,13 @@ changes:
   added: []
   changed:
     - timestamp: '2026-10-30T16:00:00.000Z'
-      title: Refuse transit_token_mode reference, and warn of settings that do nothing
+      title: Deprecate sign_requests, which has no effect, and warn of a stored false
       description: >-
-        `transit.transit_token_mode` and `transit.sign_requests` ship in generated configs
-        but the gateway never read either. The admin API now refuses
-        `transit_token_mode: reference`, on a surface or in a variant, with a 400 that says it
-        is not supported: the transit token is always embedded, so a surface that chose
-        `reference` was exposing its `caller_context_fields` to its agent while expecting
-        them kept server-side. A surface stored with `reference` still loads and serves
-        embedded tokens, with a warning naming the surface and variant; set it to `embedded`
-        or remove it, since a save that sends `reference` back is refused. `sign_requests` is documented as having no effect and deprecated:
-        a Transit Point's VP follows its `managed_identity` and
-        `identity_injection.inject_vp`. It is never refused, and a stored `false` logs a
-        warning at load, since it may be read as meaning no VP is sent. The built-in
-        surface templates no longer set `sign_requests`.
+        `transit.sign_requests` ships in generated configs but the gateway never read it.
+        It is documented as having no effect and deprecated: a Transit Point's VP follows its
+        `managed_identity` and `identity_injection.inject_vp`. It is never refused, and a
+        stored `false` logs a warning at load, since it may be read as meaning no VP is sent.
+        The built-in surface templates no longer set it.
   fixed:
     - timestamp: '2026-11-02T04:00:00.000Z'
       title: Stop the Surface Builder offering reference transit tokens and request signing
@@ -25,8 +18,7 @@ changes:
         every save then refused, a "Sign every outbound request" switch that has no effect,
         and an `unsigned` canvas summary, and a variant's overrides carried both settings. The
         panel now shows the embedded mode without a choice, and every save sends
-        `transit_token_mode: embedded`, so a surface stored with `reference` saves from the
-        dashboard again. Neither the panel, the Transit Point defaults nor a variant's overrides
+        `transit_token_mode: embedded`, Neither the panel, the Transit Point defaults nor a variant's overrides
         set `sign_requests`, and the gateway writes it back only when it is `false`.
     - timestamp: '2026-11-02T04:00:00.000Z'
       title: Refuse a surface template that asks for reference transit tokens
@@ -36,5 +28,22 @@ changes:
         created from it was then refused. Template create, update and import now refuse it
         with the same 400 as a surface save.
   removed: []
-  security: []
-  breaking: []
+  security:
+    - timestamp: '2026-10-30T16:00:00.000Z'
+      title: Refuse transit_token_mode reference, which exposed caller context
+      description: >-
+        The gateway has no server-side store for transit tokens, so a surface that chose
+        `transit.transit_token_mode: reference` was exposing its `caller_context_fields` to its
+        agent while expecting them kept server-side. The admin API now refuses `reference`,
+        on a surface or in a variant, with a 400. A surface stored with `reference` is rewritten
+        to `embedded` when it loads, with a warning naming the surface and variant, so later
+        writes are not refused.
+  breaking:
+    - timestamp: '2026-11-02T10:00:00.000Z'
+      title: Refuse transit_token_mode reference in the admin API
+      description: >-
+        A surface or surface template that sets `transit.transit_token_mode: reference`, on
+        the surface or in a variant's overrides, now gets a 400 on create, update and import,
+        where it was accepted although the gateway always issued embedded tokens. Send
+        `embedded` or leave the field out. A stored `reference` is rewritten to `embedded` on
+        load.

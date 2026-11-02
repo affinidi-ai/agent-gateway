@@ -397,30 +397,6 @@ request received by the destination gateway:
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
 gating on each side composes: a tool hidden or denied by either surface remains unavailable.
 
-### Reference surface for Fabric inbound
-
-A surface a paired gateway reaches needs no Fabric-specific setting of its own: it is exposed
-to the peer by the peer's [`exposure_mode`](#peer-exposure), and the receiving gateway issues
-its agent a transit token for the Transit Points that set `allow_fabric_callers`. The `transit`
-block below is a complete one for such a surface; the token is always embedded, and
-`sign_requests` is left out because it has no effect.
-
-```json
-"transit": {
-  "transit_token_mode": "embedded",
-  "points": [
-    {
-      "id": "",
-      "alias": "crm",
-      "target_endpoint": "https://crm.internal.example/mcp",
-      "protocol": "mcp",
-      "require_transit_token": true,
-      "allow_fabric_callers": true
-    }
-  ]
-}
-```
-
 ### Modern MCP activation
 
 Modern MCP (`2026-07-28`) is active on every MCP surface and crosses Fabric only

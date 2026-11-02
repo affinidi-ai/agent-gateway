@@ -1412,30 +1412,7 @@ pub(crate) async fn set_transit_token_lifetime(
     world: &mut SurfaceWorld,
     lifetime_secs: u64,
 ) {
-    ensure_admin_session(world).await;
-    let surface_id = get_tracked_surface_id(world, "setting the transit token lifetime");
-    let client = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist");
-    let current = client
-        .get_surface_recorded(&surface_id)
-        .await
-        .unwrap_or_else(|error| panic!("fetch surface before setting the transit token lifetime: {error}"));
-    assert_eq!(
-        current.status, 200,
-        "fetch surface before setting the transit token lifetime should succeed, got status {} body {}",
-        current.status, current.body
-    );
-
-    let mut payload = current.body;
-    payload["transit"]["transit_token_lifetime_secs"] = serde_json::json!(lifetime_secs);
-    let response = client
-        .update_surface_recorded(&surface_id, &payload)
-        .await
-        .unwrap_or_else(|error| panic!("set the transit token lifetime through admin API: {error}"));
-
-    record_admin_response(world, response);
+    set_surface_transit_field(world, "transit_token_lifetime_secs", serde_json::json!(lifetime_secs)).await;
 }
 
 #[when(expr = "the operator sets the surface's transit token mode to {string}")]
@@ -1443,8 +1420,18 @@ async fn operator_sets_the_transit_token_mode(
     world: &mut SurfaceWorld,
     mode: String,
 ) {
+    set_surface_transit_field(world, "transit_token_mode", serde_json::json!(mode)).await;
+}
+
+/// Save the surface with `transit.<field>` set to `value` through the admin
+/// API, and record its answer.
+async fn set_surface_transit_field(
+    world: &mut SurfaceWorld,
+    field: &str,
+    value: serde_json::Value,
+) {
     ensure_admin_session(world).await;
-    let surface_id = get_tracked_surface_id(world, "setting the transit token mode");
+    let surface_id = get_tracked_surface_id(world, "setting a transit setting");
     let client = world
         .admin_client
         .as_ref()
@@ -1452,19 +1439,19 @@ async fn operator_sets_the_transit_token_mode(
     let current = client
         .get_surface_recorded(&surface_id)
         .await
-        .unwrap_or_else(|error| panic!("fetch surface before setting the transit token mode: {error}"));
+        .unwrap_or_else(|error| panic!("fetch surface before setting transit.{field}: {error}"));
     assert_eq!(
         current.status, 200,
-        "fetch surface before setting the transit token mode should succeed, got status {} body {}",
+        "fetch surface before setting transit.{field} should succeed, got status {} body {}",
         current.status, current.body
     );
 
     let mut payload = current.body;
-    payload["transit"]["transit_token_mode"] = serde_json::json!(mode);
+    payload["transit"][field] = value;
     let response = client
         .update_surface_recorded(&surface_id, &payload)
         .await
-        .unwrap_or_else(|error| panic!("set the transit token mode through admin API: {error}"));
+        .unwrap_or_else(|error| panic!("set transit.{field} through admin API: {error}"));
 
     record_admin_response(world, response);
 }

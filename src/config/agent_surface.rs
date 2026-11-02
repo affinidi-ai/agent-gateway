@@ -1108,7 +1108,7 @@ pub struct SharedTransitConfig {
     /// Transit token mode (how caller context is carried). Only `embedded` is
     /// supported, and it is what every surface gets: the admin API refuses
     /// `reference` ([`TRANSIT_TOKEN_REFERENCE_REFUSED`]), and a stored `reference`
-    /// is served as `embedded` with a warning when the surface loads.
+    /// is rewritten to `embedded`, with a warning, when the surface loads.
     #[serde(default)]
     pub transit_token_mode: TransitTokenMode,
 
@@ -1253,7 +1253,7 @@ pub enum TransitTokenMode {
     #[default]
     Embedded,
     /// Deprecated: no server-side store exists. Accepted when a stored surface
-    /// loads, with a warning, and served as [`Self::Embedded`]; the admin API
+    /// loads, with a warning, and rewritten to [`Self::Embedded`]; the admin API
     /// refuses it on a surface, a variant and a template
     /// ([`TRANSIT_TOKEN_REFERENCE_REFUSED`]).
     Reference,
@@ -1863,8 +1863,9 @@ impl StorableEntity for AgentSurface {
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
         warn_inert_transit_settings(value);
+        let embedded = rewrite_reference_transit_tokens(value);
         let marked = mark_transit_point_source_auth(value);
-        Ok(stripped || split || marked)
+        Ok(stripped || split || embedded || marked)
     }
 }
 
@@ -1873,8 +1874,37 @@ impl StorableEntity for AgentSurface {
 fn asks_for_reference_transit_tokens(shared: &serde_json::Value) -> bool {
     shared
         .get("transit_token_mode")
-        .and_then(serde_json::Value::as_str)
-        == Some("reference")
+        .is_some_and(asks_for_mode_reference)
+}
+
+/// Rewrite a stored `transit_token_mode: reference`, on the surface and in each
+/// variant's overrides, to `embedded`, the mode the gateway serves it as, so the
+/// admin API accepts every later write. Returns whether anything changed.
+pub(crate) fn rewrite_reference_transit_tokens(value: &mut serde_json::Value) -> bool {
+    let rewrite = |shared: Option<&mut serde_json::Value>| -> bool {
+        let Some(mode) = shared.and_then(|shared| shared.get_mut("transit_token_mode")) else {
+            return false;
+        };
+        if !asks_for_mode_reference(mode) {
+            return false;
+        }
+        *mode = serde_json::Value::String("embedded".to_string());
+        true
+    };
+    let mut changed = rewrite(value.get_mut("transit"));
+    if let Some(variants) = value
+        .get_mut("variants")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for variant in variants {
+            changed |= rewrite(variant.pointer_mut("/overrides/transit/shared"));
+        }
+    }
+    changed
+}
+
+fn asks_for_mode_reference(mode: &serde_json::Value) -> bool {
+    mode.as_str() == Some("reference")
 }
 
 /// The refusal for a surface as JSON, such as a template's, that sets
@@ -1912,7 +1942,8 @@ pub(crate) fn reference_transit_token_refusal(value: &serde_json::Value) -> Opti
 /// act on, on the base surface or in a variant's overrides: `transit_token_mode:
 /// reference` (the tokens are embedded all the same) and `sign_requests: false`
 /// (it changes nothing; a VP follows each Transit Point's `managed_identity` and
-/// `identity_injection.inject_vp`). Nothing is changed and nothing is refused.
+/// `identity_injection.inject_vp`). It changes nothing itself; a stored `reference`
+/// is then rewritten to `embedded` by [`rewrite_reference_transit_tokens`].
 fn warn_inert_transit_settings(value: &serde_json::Value) {
     let surface_id = value
         .get("surface_id")
@@ -4230,7 +4261,8 @@ mod tests {
 
     /// A stored surface that asks for reference transit tokens, or for unsigned
     /// transit requests, loads and gets a warning naming it, on the base surface
-    /// and in each variant; the stored JSON is left as it is.
+    /// and in each variant; `reference` is rewritten to `embedded` and
+    /// `sign_requests` is left as it is.
     #[test]
     fn load_warns_of_reference_transit_tokens_and_unsigned_transit_requests() {
         let mut json = serde_json::json!({
@@ -4243,7 +4275,6 @@ mod tests {
                     "transit_token_mode": "embedded", "sign_requests": true } } } }
             ]
         });
-        let before = json.clone();
         let mut warnings = inert_transit_warnings(&mut json);
         warnings.sort();
         let expected = [
@@ -4254,7 +4285,25 @@ mod tests {
         ]
         .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
         assert_eq!(warnings, expected);
-        assert_eq!(json, before, "a warning changes nothing");
+        assert_eq!(json["transit"]["transit_token_mode"], "embedded");
+        assert_eq!(json["transit"]["sign_requests"], false);
+        assert_eq!(json["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
+        assert_eq!(json["variants"][1]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
+    }
+
+    #[test]
+    fn migrate_raw_json_rewrites_reference_transit_tokens_and_reports_a_change() {
+        let mut json = serde_json::json!({
+            "surface_id": "rewrite",
+            "transit": { "transit_token_mode": "reference", "points": [] },
+            "variants": [{ "alias": "dev", "overrides": { "transit": { "shared": {
+                "transit_token_mode": "reference" } } } }]
+        });
+        assert!(migrate(&mut json), "a rewrite is persisted");
+        assert_eq!(json["transit"]["transit_token_mode"], "embedded");
+        assert_eq!(json["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
+        assert!(reference_transit_token_refusal(&json).is_none());
+        assert!(!migrate(&mut json), "nothing is left to rewrite");
     }
 
     /// Nothing to warn of for the supported values, for no setting at all, or for
@@ -4291,10 +4340,10 @@ mod tests {
         assert_eq!(written(&unsigned), Some(serde_json::json!(false)), "a stored false is kept");
     }
 
-    /// A surface stored with `reference` still deserializes and serves embedded
-    /// tokens: the gateway never stops for it.
+    /// A stored `reference` still deserializes, so a surface written before it
+    /// was refused loads and is then rewritten to `embedded`.
     #[test]
-    fn a_stored_reference_mode_still_loads() {
+    fn a_stored_reference_mode_still_deserializes() {
         let transit: SharedTransitConfig = serde_json::from_value(serde_json::json!({
             "transit_token_mode": "reference", "sign_requests": false
         }))

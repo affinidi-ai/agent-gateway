@@ -20,8 +20,7 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
     c.outbound_listen_address = t.outbound_listen_address;
     any = true;
   }
-  // Only embedded tokens exist: a stored `reference` is served as embedded,
-  // and a save sends `embedded`, which the gateway accepts.
+  // Only embedded tokens exist, so every save sends `embedded`.
   c.transit_token_mode = 'embedded';
   if (t.transit_policy?.policy_definition_id) {
     c.transit_policy_definition_id = t.transit_policy.policy_definition_id;
