@@ -65,7 +65,7 @@ impl AdminApi {
     ) -> String {
         let mut surface = json!({
             "name": route.trim_start_matches('/').replace('/', "-"), "status": "active",
-            "access_point": {"listen_address": self.listener, "route": route, "protocol": "a2a"},
+            "access_point": {"listen_address": self.listener, "route": route, "protocol": "a2a", "public": true},
             "target": target
         });
         for (key, value) in extra.as_object().unwrap() {
