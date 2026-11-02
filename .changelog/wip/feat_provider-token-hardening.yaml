@@ -39,35 +39,6 @@ changes:
         and the modern consent exchange. A request that runs past it fails and starts the
         retry backoff. Changing it needs a restart.
   changed:
-    - timestamp: '2026-10-30T21:30:00Z'
-      title: Refuse new http token endpoints and cross-tenant credential references on save
-      description: >-
-        Creating a credential provider, changing its token endpoint, or turning an API key
-        provider into an OAuth type now answers 400 "token_endpoint must be an https URL"
-        unless the endpoint is https or listed exactly in credential_policy
-        insecure_token_endpoints, and the Validate check refuses such an endpoint without
-        contacting it. Saving a stored provider that keeps its http endpoint still works
-        while credential_policy token_endpoint_https is warn.
-    - timestamp: '2026-10-30T22:00:00Z'
-      title: Refuse new credential provider references to another tenant's secrets
-      description: >-
-        Creating a credential provider, or changing a secret reference, now answers 400
-        "Secret reference is not accessible" unless the secret belongs to the provider's own
-        tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
-        applies the same rule to a signing key or certificate. While credential_policy
-        tenant_credential_isolation is warn, a stored reference is kept only in the field that
-        holds it and while the provider's type, token and authorization endpoints, resource,
-        additional parameters and JWT issuer, subject and audience are unchanged, so a tenant
-        cannot redirect an appliance-wide secret or signing key to its own endpoint.
-    - timestamp: '2026-10-30T22:30:00Z'
-      title: Refuse new appliance-wide credentials on tenant surfaces when saving
-      description: >-
-        Saving a tenant surface that newly names an appliance-wide secret for static secret
-        Target authentication, or an appliance-wide API key, client credentials or JWT
-        bearer provider, is refused with 400, and a tenant reassignment that would create
-        such a reference answers 409. References already stored are kept, only while each
-        Target or Transit Point that sends them keeps its endpoint, until
-        credential_policy tenant_credential_isolation is enforce.
     - timestamp: '2026-10-30T22:45:00Z'
       title: Report providers and surfaces that break the credential rules at startup
       description: >-
@@ -85,6 +56,10 @@ changes:
         stopping to work once tenant isolation is enforced, and one of another tenant as
         already refused by the gateway. The Token Endpoint field shows an inline error for an
         http URL and points to the bootstrap credential_policy.insecure_token_endpoints list.
+    - timestamp: '2026-11-02T15:30:00Z'
+      title: Add audit detail values and shorter token failure texts for grants
+      description: >-
+        Delegation audit details gain the values insecure_token_endpoint, appliance_wide_credential and the _stale suffix on a grant, and a refused token request, refresh, code exchange or SAML Graph API token request now logs, returns and audits only the OAuth error code, so consumers that parse audit details or token failure texts must accept the new values and the shorter texts.
   fixed:
     - timestamp: '2026-10-30T23:00:04Z'
       title: Stop reusing a service token after its provider or a referenced secret changes
@@ -170,12 +145,7 @@ changes:
     - timestamp: '2026-10-30T20:30:00Z'
       title: Pin credential provider token requests to the vetted address
       description: >-
-        Client Credentials, JWT Bearer and private_key_jwt grants, refreshes and
-        authorization-code exchanges, including the 2026-07-28 consent exchange, now connect
-        only to the address the token endpoint resolved to when it was checked, closing a
-        DNS-rebinding gap. Redirects stay off, and a token endpoint resolving to loopback, an
-        unspecified address or cloud metadata is refused before any request and reported as
-        refused by egress policy.
+        Client Credentials, JWT Bearer and private_key_jwt grants, refreshes and authorization-code exchanges, including the 2026-07-28 consent exchange, now connect only to the address the token endpoint resolved to when it was checked, closing a DNS-rebinding gap when no HTTP proxy is configured (with HTTPS_PROXY, HTTP_PROXY or ALL_PROXY set, the proxy resolves the host itself). Redirects stay off, and a token endpoint resolving to loopback, an unspecified address or cloud metadata is refused before any request and reported as refused by egress policy.
     - timestamp: '2026-10-30T21:30:00Z'
       title: Warn about http token endpoints, enforced from the next release
       description: >-
@@ -211,4 +181,45 @@ changes:
       title: Hold custom metadata secrets to the tenant of the surface that sends them
       description: >-
         On a tenant surface, a $SECRET: reference in the Target's custom metadata, in either response custom metadata or in the shared Transit Point custom metadata resolves only a secret of the surface's own tenant, or an appliance-wide one in warn mode. Another tenant's secret and a new appliance-wide secret are refused on save with 400, and so is a reference to a secret that does not exist, whether new or already stored. A reassignment that would create such a reference answers 409, and the request path refuses them at runtime. A stored appliance-wide reference is kept only in warn mode and only on the destination that already sent it: the endpoint of its Target or Transit Point for request metadata and Target authentication, and the caller for response metadata, so moving a secret into response metadata is refused. Only enabled metadata counts as sent. A surface with no tenant is unchanged.
-  breaking: []
+    - timestamp: '2026-11-02T15:10:00Z'
+      title: Refuse appliance-wide secrets in a tenant's MCP tool discovery
+      description: >-
+        POST /v1/mcp-proxies/discover-tools with a tenant token may now use only that tenant's own static secret. Before, it could load an appliance-wide secret and send its value to an endpoint the caller chose. Such a request is refused with 400 'Target auth secret is not accessible' whatever tenant_credential_isolation says, because discovery stores nothing that the stricter rule would break. Operator sessions and appliance-wide tokens are unchanged.
+    - timestamp: '2026-11-02T15:11:00Z'
+      title: Hold a tenant A2A Proxy's Direct Line secret to the proxy's tenant
+      description: >-
+        Saving a tenant A2A Proxy that names another tenant's secret, or a new appliance-wide one, is refused with 400 'A2A proxy secret is not accessible'. Before, a tenant could send the appliance's Direct Line secret to a base URL it picked. An update that keeps the stored appliance-wide secret and base URL is saved with a warning in warn mode and refused in enforce mode, where a request through such a proxy also fails as target unavailable before the secret is read. An operator's appliance-wide A2A Proxy stays usable by tenant surfaces as a shared bot.
+    - timestamp: '2026-11-02T15:12:00Z'
+      title: Refuse a tenant provider holding an outside secret on a new surface leg
+      description: >-
+        A tenant credential provider that sends the gateway's own credential and still holds a secret outside its tenant now follows the appliance-wide provider rule on a tenant surface. In warn mode it is kept only on the legs that already sent it at the same endpoint; on a new or redirected Target, Transit Point or outbound_credentials leg it is refused with 400; in enforce mode it is refused everywhere. This stops a token minted with the appliance's OAuth client from reaching an endpoint the tenant chose. Changing a provider's default_scopes now drops its kept secret references, and the startup credential policy report names surfaces that bind such a provider.
+  breaking:
+    - timestamp: '2026-10-30T21:30:00Z'
+      title: Refuse new http token endpoints and cross-tenant credential references on save
+      description: >-
+        Creating a credential provider, changing its token endpoint, or turning an API key
+        provider into an OAuth type now answers 400 "token_endpoint must be an https URL"
+        unless the endpoint is https or listed exactly in credential_policy
+        insecure_token_endpoints, and the Validate check refuses such an endpoint without
+        contacting it. Saving a stored provider that keeps its http endpoint still works
+        while credential_policy token_endpoint_https is warn. Upgrade note: provisioning that creates or changes a provider with an internal http:// token endpoint now gets 400; use https, or list the exact URL in credential_policy.insecure_token_endpoints.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Refuse new credential provider references to another tenant's secrets
+      description: >-
+        Creating a credential provider, or changing a secret reference, now answers 400
+        "Secret reference is not accessible" unless the secret belongs to the provider's own
+        tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
+        applies the same rule to a signing key or certificate. While credential_policy
+        tenant_credential_isolation is warn, a stored reference is kept only in the field that
+        holds it and while the provider's type, token and authorization endpoints, resource,
+        additional parameters and JWT issuer, subject and audience are unchanged, so a tenant
+        cannot redirect an appliance-wide secret or signing key to its own endpoint. Upgrade note: provisioning that gives a tenant provider an appliance-wide or another tenant's secret now gets 400; create the secret in the tenant first.
+    - timestamp: '2026-10-30T22:30:00Z'
+      title: Refuse new appliance-wide credentials on tenant surfaces when saving
+      description: >-
+        Saving a tenant surface that newly names an appliance-wide secret for static secret
+        Target authentication, or an appliance-wide API key, client credentials or JWT
+        bearer provider, is refused with 400, and a tenant reassignment that would create
+        such a reference answers 409. References already stored are kept, only while each
+        Target or Transit Point that sends them keeps its endpoint, until
+        credential_policy tenant_credential_isolation is enforce. Upgrade note: provisioning that names an appliance-wide secret or provider on a tenant surface now gets 400, and a tenant reassignment that would create such a reference gets 409; move the credential into the tenant first.
