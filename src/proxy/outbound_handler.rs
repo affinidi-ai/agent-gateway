@@ -160,9 +160,10 @@ pub(crate) enum OutboundPipelineError {
     TransitPointUnavailable { mcp_request_id: Option<serde_json::Value> },
 
     /// The Transit Point's `source_auth` refused the caller's credential. Why
-    /// is logged, never shown to the caller.
+    /// is logged, never shown to the caller. `mcp_request_id` is set, to the id
+    /// the JSON-RPC error answers, when the Transit Point speaks MCP.
     #[error("Caller credential missing or invalid")]
-    TransitCallerUnauthenticated,
+    TransitCallerUnauthenticated { mcp_request_id: Option<serde_json::Value> },
 
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
@@ -293,7 +294,7 @@ impl OutboundPipelineError {
 
             Self::RateLimitExceeded | Self::UpstreamCapacityReached(_) => StatusCode::TOO_MANY_REQUESTS,
 
-            Self::TransitTokenInvalid(_) | Self::TransitCallerUnauthenticated | Self::ConsentRequired(_) => {
+            Self::TransitTokenInvalid(_) | Self::TransitCallerUnauthenticated { .. } | Self::ConsentRequired(_) => {
                 StatusCode::UNAUTHORIZED
             }
 
@@ -381,6 +382,16 @@ impl IntoResponse for OutboundPipelineError {
                 &refusal.to_string(),
                 reason,
             );
+        }
+        if let Self::TransitCallerUnauthenticated { mcp_request_id: Some(id) } = &self {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: self.status_code(),
+                id: Some(id.clone()),
+                code: -32001,
+                message: self.to_string(),
+                data: None,
+            }
+            .into_response();
         }
         if let Self::TransitPointUnavailable { mcp_request_id: Some(id) }
         | Self::FabricChainTooLong { mcp_request_id: Some(id) }
@@ -1648,7 +1659,9 @@ async fn authenticate_transit_caller(
                 true,
                 Some(ctx.remote_addr.ip()),
             );
-            Err(OutboundPipelineError::TransitCallerUnauthenticated)
+            Err(OutboundPipelineError::TransitCallerUnauthenticated {
+                mcp_request_id: mcp_id_before_body(ctx),
+            })
         }
         Err(error) => Err(caller_authentication_unavailable(ctx, &error)),
     }
@@ -1672,9 +1685,15 @@ fn caller_authentication_unavailable(
 /// as a JSON-RPC error, sent before the request id is read.
 fn transit_point_unavailable(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
     OutboundPipelineError::TransitPointUnavailable {
-        mcp_request_id: (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
-            .then_some(serde_json::Value::Null),
+        mcp_request_id: mcp_id_before_body(ctx),
     }
+}
+
+/// The JSON-RPC id of a refusal sent before the request body is read: `null`
+/// on an MCP Transit Point, none otherwise.
+fn mcp_id_before_body(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
+    (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
+        .then_some(serde_json::Value::Null)
 }
 
 /// [4] Agent Identity Resolution — extracts, validates, and resolves the
@@ -10410,7 +10429,7 @@ mod tests {
         for (key, reason) in [(Some("wrong-key"), "invalid_credential"), (None, "missing_credential")] {
             let mut ctx = context(key);
             let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut ctx)).await;
-            assert!(matches!(result, Err(OutboundPipelineError::TransitCallerUnauthenticated)), "{result:?}");
+            assert!(matches!(result, Err(OutboundPipelineError::TransitCallerUnauthenticated { .. })), "{result:?}");
             assert_eq!(events.len(), 1, "{reason}: {events:?}");
             assert!(
                 matches!(
@@ -10498,7 +10517,7 @@ mod tests {
                 )))
                 .await;
             assert!(
-                matches!(response, Err(OutboundPipelineError::TransitCallerUnauthenticated)),
+                matches!(response, Err(OutboundPipelineError::TransitCallerUnauthenticated { .. })),
                 "{path}: {response:?}"
             );
             let refusals = events
@@ -20633,6 +20652,43 @@ mod tests {
 
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{protocol}: {body}");
             assert_refusal(protocol, protocol, &body, "Target authentication credentials unavailable");
+        }
+        assert!(target.received().is_empty());
+    }
+
+    /// An MCP Transit Point answers a caller its `source_auth` refuses with a
+    /// JSON-RPC error; any other Transit Point with problem JSON.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_transit_point_answers_a_refused_caller_with_a_json_rpc_error() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        for protocol in ["mcp", "http"] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = transit_caller_key_state(directory.path()).await;
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": protocol, "require_transit_token": false,
+                    "target_endpoint": target.url, "source_auth": {"type": "api_key",
+                    "extraction": {"source": "http_header", "field": "X-API-Key"},
+                    "secret_id": "transit-caller-key"}}]),
+                json!([]),
+            ));
+
+            let (status, body) =
+                send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &protocol_request_body(protocol))
+                    .await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{protocol}: {body}");
+            if protocol == "mcp" {
+                assert_eq!(body["jsonrpc"], "2.0", "{body}");
+                assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+                assert_eq!(body["error"]["code"], -32001, "{body}");
+                assert_eq!(body["error"]["message"], "Caller credential missing or invalid", "{body}");
+            } else {
+                assert_eq!(body["detail"], "Caller credential missing or invalid", "{body}");
+            }
         }
         assert!(target.received().is_empty());
     }

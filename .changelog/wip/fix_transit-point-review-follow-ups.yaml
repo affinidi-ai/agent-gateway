@@ -35,6 +35,13 @@ changes:
         custom metadata cannot be injected, now answers with a JSON-RPC error (`-32603`)
         carrying the request's id, with the same `502` or `500` status, instead of a problem
         JSON body that an MCP client cannot match to its request.
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Answer a caller an MCP Transit Point refuses with a JSON-RPC error
+      description: >-
+        An MCP Transit Point whose `source_auth` refuses the caller's credential now answers with
+        a JSON-RPC error (`-32001`, `Caller credential missing or invalid`, id `null`) with the
+        same `401` status, instead of a problem JSON body an MCP client cannot read as a
+        JSON-RPC response. Other Transit Points still answer with problem JSON.
     - timestamp: '2026-10-29T12:00:00Z'
       title: Record unreachable and timed-out Transit Point calls as failed
       description: >-
@@ -172,11 +179,3 @@ changes:
         `agent-card.json`, `agent.json` or `discovery` directly below the Transit Point now
         counts. Any other path needs a transit token and carries the credentials, so a managed
         agent that fetched such a path without a token must now send one.
-    - timestamp: '2026-10-29T12:00:00Z'
-      title: Use an IP address, not a host name, as every listener's `bind_address`
-      description: >-
-        A listener whose `bind_address` is not an IP address, such as `localhost` or
-        `gateway.internal`, stops the gateway from loading its network configuration, on
-        inbound and outbound listeners alike. Inbound listeners used to ignore the value, so a
-        host name there went unnoticed. Replace a host name with the address it should bind,
-        such as `127.0.0.1` for `localhost`, or `0.0.0.0` for every interface, before upgrading.

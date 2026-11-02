@@ -498,7 +498,8 @@ name only its own tenant's or appliance-wide ones (see
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)).
 
 Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
-refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
+refused, with `401` saying only `Caller credential missing or invalid`, as a JSON-RPC error
+(`-32001`, id `null`) on an MCP Transit Point and a problem JSON on any other;
 which check failed is logged, and the refusal is recorded as an `auth_failed` audit event (see
 [`OBSERVABILITY.md`](OBSERVABILITY.md)). Failed attempts are not throttled: protect a Transit
 Point reachable from untrusted networks with a strong key or certificate, and watch those
