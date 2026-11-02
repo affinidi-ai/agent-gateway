@@ -939,7 +939,7 @@ mod tests {
         let refused = credential_for(Some("tenant-a"), "appliance-direct-line", tenant_a(RuleMode::Enforce)).await;
         assert!(
             matches!(&refused, Err(A2aProxyRuntimeError::TargetUnavailable(message)) if message == "Direct Line secret not found"),
-            "{refused:?}"
+            "an appliance-wide secret is refused when enforced"
         );
         assert_eq!(
             credential_for(Some("tenant-a"), "appliance-direct-line", tenant_a(RuleMode::Warn))
@@ -949,7 +949,7 @@ mod tests {
         );
         for mode in [RuleMode::Warn, RuleMode::Enforce] {
             let refused = credential_for(Some("tenant-a"), "tenant-b-direct-line", tenant_a(mode)).await;
-            assert!(matches!(refused, Err(A2aProxyRuntimeError::TargetUnavailable(_))), "{mode:?}: {refused:?}");
+            assert!(matches!(refused, Err(A2aProxyRuntimeError::TargetUnavailable(_))), "{mode:?}");
             assert_eq!(
                 credential_for(Some("tenant-a"), "tenant-a-direct-line", tenant_a(mode))
                     .await
