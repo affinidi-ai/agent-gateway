@@ -65,7 +65,8 @@ changes:
         Saving a tenant surface that newly names an appliance-wide secret for static secret
         Target authentication, or an appliance-wide API key, client credentials or JWT
         bearer provider, is refused with 400, and a tenant reassignment that would create
-        such a reference answers 409. References already stored are kept until
+        such a reference answers 409. References already stored are kept, only while each
+        Target or Transit Point that sends them keeps its endpoint, until
         credential_policy tenant_credential_isolation is enforce.
     - timestamp: '2026-10-30T22:45:00Z'
       title: Report providers and surfaces that break the credential rules at startup

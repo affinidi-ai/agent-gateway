@@ -1,7 +1,8 @@
 //! Saving a tenant surface or credential provider and reassigning a tenant over the admin API:
 //! a new appliance-wide credential on a tenant surface or provider is refused, one the stored
 //! record already held is kept in `warn` mode (on a provider, only while it stays in the same
-//! field and goes to the same destination) and refused in `enforce` mode, and a reassignment
+//! field and goes to the same destination; on a surface, only while each Target and Transit
+//! Point that sends it keeps its endpoint) and refused in `enforce` mode, and a reassignment
 //! that would give a tenant resource an appliance-wide credential or another tenant's resource
 //! is a conflict.
 
@@ -256,6 +257,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         .as_u64()
         .unwrap();
     let now = chrono::Utc::now().to_rfc3339();
+    let point = |alias: &str, extra: Value| {
+        let mut point = json!({
+            "id": format!("{alias}-id"), "alias": alias, "target_endpoint": format!("http://127.0.0.1:9/{alias}"),
+            "protocol": "a2a", "require_transit_token": false, "allow_unauthenticated_callers": true
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            point[key] = value.clone();
+        }
+        point
+    };
     let surface = |surface_id: &str, extra: Value| {
         let mut surface = json!({
             "surface_id": surface_id, "name": surface_id, "status": "disabled", "tenant_id": "tenant-a",
@@ -263,10 +274,17 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
                 "listen_address": format!("http://localhost:{port}"), "route": format!("/smoke/{surface_id}"),
                 "protocol": "a2a"
             },
-            "target": {"endpoint": "http://127.0.0.1:9/"}
+            "target": {"endpoint": "http://127.0.0.1:9/"},
+            "transit": {"points": [point("partner", extra.get("partner").cloned().unwrap_or_else(|| json!({}))), point("peer", json!({}))]},
+            "variants": [{
+                "id": "staging-id", "alias": "staging", "name": "Staging",
+                "overrides": {"target": {"endpoint": "http://127.0.0.1:9/staging"}}
+            }]
         });
         for (key, value) in extra.as_object().unwrap() {
-            surface[key] = value.clone();
+            if key != "partner" {
+                surface[key] = value.clone();
+            }
         }
         surface
     };
@@ -299,7 +317,10 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             STORED_SECRET_SURFACE,
             surface(
                 STORED_SECRET_SURFACE,
-                json!({"target": {"endpoint": "http://127.0.0.1:9/", "auth": static_secret("appliance-key")}}),
+                json!({
+                    "target": {"endpoint": "http://127.0.0.1:9/", "auth": static_secret("appliance-key")},
+                    "partner": {"target_auth": static_secret("appliance-key")}
+                }),
             ),
         ),
         (
@@ -504,6 +525,63 @@ async fn assert_new_references_follow_the_tenant(api: &Api) {
     );
 }
 
+async fn assert_a_redirected_leg_is_refused(
+    api: &Api,
+    surface_id: &str,
+    details: &str,
+) {
+    let redirects: [fn(&mut Value, &str); 3] = [
+        |surface, endpoint| surface["target"]["endpoint"] = json!(endpoint),
+        |surface, endpoint| surface["transit"]["points"][0]["target_endpoint"] = json!(endpoint),
+        |surface, endpoint| surface["variants"][0]["overrides"]["target"]["endpoint"] = json!(endpoint),
+    ];
+    for redirect in redirects {
+        let mut redirected = api.stored(surface_id).await;
+        redirect(&mut redirected, &api.target);
+        assert_refused(
+            api.put(surface_id, &redirected)
+                .await,
+            details,
+        );
+    }
+    assert_refused(
+        api.patch(surface_id, &json!({"target": {"endpoint": api.target}}))
+            .await,
+        details,
+    );
+    let stored = api.stored(surface_id).await;
+    assert_eq!(
+        stored["target"]["endpoint"], "http://127.0.0.1:9/",
+        "a refused save leaves the stored surface as it was"
+    );
+    assert_eq!(stored["transit"]["points"][0]["target_endpoint"], "http://127.0.0.1:9/partner");
+    assert_eq!(stored["variants"][0]["overrides"]["target"]["endpoint"], "http://127.0.0.1:9/staging");
+}
+
+async fn assert_renamed_and_reordered_legs_are_kept(
+    api: &Api,
+    surface_id: &str,
+) {
+    let mut renamed = api.stored(surface_id).await;
+    renamed["description"] = json!("renamed legs");
+    renamed["transit"]["points"][0]["alias"] = json!("partner-renamed");
+    renamed["transit"]["points"][0]["name"] = json!("Partner renamed");
+    renamed["variants"][0]["alias"] = json!("staging-renamed");
+    renamed["variants"][0]["name"] = json!("Staging renamed");
+    renamed["transit"]["points"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    assert_saved(
+        api.put(surface_id, &renamed)
+            .await,
+    );
+    let stored = api.stored(surface_id).await;
+    assert_eq!(stored["description"], "renamed legs", "{stored}");
+    assert_eq!(stored["transit"]["points"][1]["alias"], "partner-renamed", "{stored}");
+    assert_eq!(stored["variants"][0]["alias"], "staging-renamed", "{stored}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_appliance_wide_credential_on_a_tenant_surface_is_refused_and_a_stored_one_is_kept_in_warn_mode() {
     let (_harness, api) = harness(RuleMode::Warn).await;
@@ -516,6 +594,31 @@ async fn a_new_appliance_wide_credential_on_a_tenant_surface_is_refused_and_a_st
                 .await,
         );
     }
+
+    assert_a_redirected_leg_is_refused(&api, STORED_SECRET_SURFACE, NOT_ACCESSIBLE_SECRET).await;
+    assert_a_redirected_leg_is_refused(&api, STORED_BINDING_SURFACE, NOT_ACCESSIBLE_PROVIDER).await;
+
+    let mut moved_leg = api
+        .stored(STORED_SECRET_SURFACE)
+        .await;
+    moved_leg["transit"]["points"][1]["target_auth"] = moved_leg["transit"]["points"][0]["target_auth"].take();
+    assert_refused(
+        api.put(STORED_SECRET_SURFACE, &moved_leg)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    let mut new_leg = api
+        .stored(STORED_BINDING_SURFACE)
+        .await;
+    new_leg["transit"]["points"][0]["id"] = json!("partner-replacement-id");
+    assert_refused(
+        api.put(STORED_BINDING_SURFACE, &new_leg)
+            .await,
+        NOT_ACCESSIBLE_PROVIDER,
+    );
+
+    assert_renamed_and_reordered_legs_are_kept(&api, STORED_SECRET_SURFACE).await;
+    assert_renamed_and_reordered_legs_are_kept(&api, STORED_BINDING_SURFACE).await;
 
     let mut moved = api
         .stored(STORED_SECRET_SURFACE)
@@ -555,10 +658,17 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_surface_is_refused_when_
         NOT_ACCESSIBLE_PROVIDER,
     );
 
-    let mut fixed = api
+    let mut target_fixed = api
         .stored(STORED_SECRET_SURFACE)
         .await;
-    fixed["target"]["auth"] = static_secret("tenant-key");
+    target_fixed["target"]["auth"] = static_secret("tenant-key");
+    assert_refused(
+        api.put(STORED_SECRET_SURFACE, &target_fixed)
+            .await,
+        NOT_ACCESSIBLE_SECRET,
+    );
+    let mut fixed = target_fixed;
+    fixed["transit"]["points"][0]["target_auth"] = static_secret("tenant-key");
     assert_saved(
         api.put(STORED_SECRET_SURFACE, &fixed)
             .await,

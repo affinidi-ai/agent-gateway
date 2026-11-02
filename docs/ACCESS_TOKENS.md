@@ -155,8 +155,9 @@ or JWT bearer credential provider used for Target authentication or in
 `outbound_credentials` or `transit_credentials`, are refused with `400` when a save adds
 them, and a tenant credential provider may not reference an appliance-wide secret. A
 reference the stored surface or provider already held is kept in the default `warn` mode (on a
-provider, only in the same field and while the provider's type and destination are unchanged)
-and refused once `credential_policy.tenant_credential_isolation` is `enforce` (see
+provider, only in the same field and while the provider's type and destination are unchanged;
+on a surface, only while every leg that sends it is one that already sent it and keeps its
+endpoint) and refused once `credential_policy.tenant_credential_isolation` is `enforce` (see
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#credential-policy)). Appliance-wide
 secrets stay usable for caller authentication, and an appliance-wide
 `oauth2_authorization_code` provider stays usable. See

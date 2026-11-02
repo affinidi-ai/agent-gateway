@@ -342,8 +342,13 @@ bindings on the legacy and modern delegation paths.
 
 Saving a surface applies the same rule: a save that adds a reference breaking it is refused
 with `400` "reference is not accessible", while a reference the stored surface already held
-is kept in `warn` mode and refused in `enforce` mode. A tenant reassignment that would create
-such a reference answers `409`. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
+is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept only on the
+legs that already sent it and only while each keeps its endpoint: the Target of the base
+surface or of a variant, or a Transit Point, identified by the variant's and the Transit Point's
+`id`, so renaming or reordering them keeps it. Surface `outbound_credentials` are sent on the
+Target and every Transit Point. A save that changes such a leg's endpoint, moves the reference
+to another leg, or adds a leg that would send it is refused with `400` in `warn` mode too.
+A tenant reassignment that would create such a reference answers `409`. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
 `fallback`), and the cause is logged only. A refused legacy binding records

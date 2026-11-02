@@ -19,8 +19,9 @@ use super::surfaces::SurfaceApiError;
 
 /// Validates the resources a surface references. A tenant surface may not send an
 /// appliance-wide secret or credential provider upstream: a reference that breaks that
-/// rule is refused when it is new, and when `tenant_credential_isolation` is `enforce` even
-/// when `stored` (the surface as stored, if any) already held it.
+/// rule is refused unless `stored` (the surface as stored, if any) already sent it on every
+/// leg that sends it now, at the same endpoint, and even then when
+/// `tenant_credential_isolation` is `enforce`.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -30,13 +31,9 @@ pub async fn validate_surface_references(
 ) -> Result<(), SurfaceApiError> {
     let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
     let grandfathered = match stored {
-        Some(stored) if stored.tenant_id == surface.tenant_id => collect_surface_reference_keys(stored)
-            .map(|keys| {
-                keys.into_iter()
-                    .map(|key| (key.kind, key.id))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        Some(stored) if stored.tenant_id == surface.tenant_id => {
+            grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?)
+        }
         _ => Vec::new(),
     };
     let authorizer = ReferenceAuthorizer {
@@ -138,6 +135,106 @@ pub(crate) fn collect_surface_reference_keys(
         duplicate
     });
     Ok(references)
+}
+
+/// A credential a surface sends upstream, with the leg that sends it: the Target, or a
+/// Transit Point by `id`, of the base surface or of a variant by `id`, and that leg's
+/// endpoint. Ids, not aliases or positions, name the legs, so renaming or reordering
+/// variants and Transit Points keeps them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SentCredential {
+    variant_id: Option<String>,
+    transit_point_id: Option<String>,
+    endpoint: String,
+    kind: ResourceKind,
+    id: String,
+}
+
+/// Every Target authentication secret or provider and every `outbound_credentials` or
+/// `transit_credentials` provider, on each leg that sends it. A surface's
+/// `outbound_credentials` are sent on its Target and on each of its Transit Points.
+fn sent_credentials(surface: &AgentSurface) -> Result<Vec<SentCredential>, SurfaceApiError> {
+    let variant_ids = std::iter::once(None).chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| Some(variant.id.clone())),
+    );
+    let mut sent = Vec::new();
+    for (variant_id, view) in variant_ids.zip(resolved_views(surface)?) {
+        let bindings = view
+            .outbound_credentials
+            .iter()
+            .map(|binding| {
+                binding
+                    .credential_provider_id
+                    .as_str()
+            });
+        let mut legs = vec![(None, view.target.endpoint.as_str(), view.target.auth.as_ref(), None)];
+        legs.extend(
+            view.transit
+                .iter()
+                .flat_map(|transit| transit.points.iter())
+                .map(|point| {
+                    (
+                        Some(point.id.as_str()),
+                        point.target_endpoint.as_str(),
+                        point.target_auth.as_ref(),
+                        point
+                            .transit_credentials
+                            .as_ref()
+                            .map(|credentials| {
+                                credentials
+                                    .credential_provider_id
+                                    .as_str()
+                            }),
+                    )
+                }),
+        );
+        for (transit_point_id, endpoint, authentication, transit_provider) in legs {
+            let mut references = Vec::new();
+            collect_target_auth_reference(authentication, &mut references);
+            for id in bindings
+                .clone()
+                .chain(transit_provider)
+            {
+                push_reference(&mut references, ResourceKind::CredentialProviders, id);
+            }
+            sent.extend(
+                references
+                    .into_iter()
+                    .map(|reference| SentCredential {
+                        variant_id: variant_id.clone(),
+                        transit_point_id: transit_point_id.map(str::to_string),
+                        endpoint: endpoint.to_string(),
+                        kind: reference.kind,
+                        id: reference.id,
+                    }),
+            );
+        }
+    }
+    Ok(sent)
+}
+
+/// The references `saved` keeps from `stored`: those that every leg of `saved` sending them
+/// already sent, at the same endpoint, in `stored`.
+fn grandfathered_references(
+    stored: &[SentCredential],
+    saved: &[SentCredential],
+) -> Vec<(ResourceKind, String)> {
+    let mut grandfathered: Vec<(ResourceKind, String)> = Vec::new();
+    for credential in saved {
+        let key = (credential.kind, credential.id.clone());
+        if !grandfathered.contains(&key)
+            && saved
+                .iter()
+                .filter(|other| other.kind == credential.kind && other.id == credential.id)
+                .all(|other| stored.contains(other))
+        {
+            grandfathered.push(key);
+        }
+    }
+    grandfathered
 }
 
 fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
@@ -474,8 +571,8 @@ impl ReferenceAuthorizer<'_> {
     }
 }
 
-/// How strictly a reference is held to tenant isolation: one the stored surface already
-/// held (`grandfathered`) is held only to `isolation`, any other is held to `enforce`.
+/// How strictly a reference is held to tenant isolation: one the save keeps from the stored
+/// surface (`grandfathered`) is held only to `isolation`, any other is held to `enforce`.
 fn reference_rule(
     grandfathered: &[(ResourceKind, String)],
     isolation: RuleMode,
@@ -985,6 +1082,203 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    fn legs_surface() -> AgentSurface {
+        let mut surface = AgentSurface::default();
+        surface.target.endpoint = "https://target.example".into();
+        surface.target.auth = Some(static_secret_auth("target-secret"));
+        surface.outbound_credentials =
+            serde_json::from_value(serde_json::json!([{"credential_provider_id": "bound"}])).unwrap();
+        let point = |alias: &str, extra: serde_json::Value| {
+            let mut point = serde_json::json!({
+                "id": format!("{alias}-id"), "alias": alias,
+                "target_endpoint": format!("https://{alias}.example"), "protocol": "a2a"
+            });
+            point
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(point).unwrap()
+        };
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![
+                point(
+                    "partner",
+                    serde_json::json!({"target_auth": {"method": {"credential_provider": {"provider_id": "partner-provider"}}}}),
+                ),
+                point("peer", serde_json::json!({"transit_credentials": {"credential_provider_id": "peer-provider"}})),
+            ],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        surface.variants = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "staging-id", "alias": "staging", "name": "Staging",
+                "overrides": {"target": {"endpoint": "https://staging.example"}}
+            }))
+            .unwrap(),
+        ];
+        surface
+    }
+
+    fn kept(
+        stored: &AgentSurface,
+        saved: &AgentSurface,
+    ) -> Vec<String> {
+        let mut kept: Vec<String> =
+            grandfathered_references(&sent_credentials(stored).unwrap(), &sent_credentials(saved).unwrap())
+                .into_iter()
+                .map(|(kind, id)| format!("{kind}:{id}"))
+                .collect();
+        kept.sort();
+        kept
+    }
+
+    fn all_kept() -> Vec<String> {
+        let mut all: Vec<String> = [
+            (ResourceKind::CredentialProviders, "bound"),
+            (ResourceKind::CredentialProviders, "partner-provider"),
+            (ResourceKind::CredentialProviders, "peer-provider"),
+            (ResourceKind::Secrets, "target-secret"),
+        ]
+        .into_iter()
+        .map(|(kind, id)| format!("{kind}:{id}"))
+        .collect();
+        all.sort();
+        all
+    }
+
+    fn without(removed: &[&str]) -> Vec<String> {
+        all_kept()
+            .into_iter()
+            .filter(|key| {
+                !removed
+                    .iter()
+                    .any(|id| key.ends_with(&format!(":{id}")))
+            })
+            .collect()
+    }
+
+    fn points(surface: &mut AgentSurface) -> &mut Vec<crate::config::agent_surface::TransitPoint> {
+        &mut surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+    }
+
+    #[test]
+    fn a_credential_is_sent_on_each_leg_of_the_base_and_each_variant_with_the_legs_endpoint() {
+        let sent = sent_credentials(&legs_surface()).unwrap();
+        let legs: HashSet<_> = sent
+            .iter()
+            .map(|credential| {
+                (
+                    credential
+                        .variant_id
+                        .as_deref(),
+                    credential
+                        .transit_point_id
+                        .as_deref(),
+                    credential.endpoint.as_str(),
+                    credential.id.as_str(),
+                )
+            })
+            .collect();
+
+        let mut expected = HashSet::new();
+        for (variant, target_endpoint) in
+            [(None, "https://target.example"), (Some("staging-id"), "https://staging.example")]
+        {
+            expected.extend([
+                (variant, None, target_endpoint, "target-secret"),
+                (variant, None, target_endpoint, "bound"),
+                (variant, Some("partner-id"), "https://partner.example", "partner-provider"),
+                (variant, Some("partner-id"), "https://partner.example", "bound"),
+                (variant, Some("peer-id"), "https://peer.example", "peer-provider"),
+                (variant, Some("peer-id"), "https://peer.example", "bound"),
+            ]);
+        }
+        assert_eq!(legs, expected);
+        assert_eq!(sent.len(), expected.len());
+        assert!(
+            sent.iter()
+                .all(|credential| (credential.kind == ResourceKind::Secrets) == (credential.id == "target-secret"))
+        );
+    }
+
+    #[test]
+    fn a_stored_credential_is_kept_while_each_leg_that_sends_it_keeps_its_endpoint() {
+        let stored = legs_surface();
+        assert_eq!(kept(&stored, &stored), all_kept());
+
+        let mut renamed = legs_surface();
+        renamed.name = "renamed".into();
+        points(&mut renamed).reverse();
+        for point in points(&mut renamed) {
+            point.alias = format!("{}-renamed", point.alias);
+            point.name = "Renamed".into();
+        }
+        renamed.variants[0].alias = "staging-renamed".into();
+        assert_eq!(kept(&stored, &renamed), all_kept());
+
+        let mut dropped = legs_surface();
+        points(&mut dropped).remove(1);
+        assert_eq!(kept(&stored, &dropped), without(&["peer-provider"]));
+    }
+
+    #[test]
+    fn a_stored_credential_is_not_kept_when_a_leg_that_sends_it_is_redirected_moved_or_new() {
+        let stored = legs_surface();
+
+        let mut target = legs_surface();
+        target.target.endpoint = "https://tenant.example".into();
+        assert_eq!(kept(&stored, &target), without(&["target-secret", "bound"]));
+
+        let mut variant = legs_surface();
+        variant.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint = Some("https://tenant.example".into());
+        assert_eq!(kept(&stored, &variant), without(&["target-secret", "bound"]));
+
+        let mut partner = legs_surface();
+        points(&mut partner)[0].target_endpoint = "https://tenant.example".into();
+        assert_eq!(kept(&stored, &partner), without(&["partner-provider", "bound"]));
+
+        let mut moved = legs_surface();
+        let authentication = points(&mut moved)[0]
+            .target_auth
+            .take();
+        points(&mut moved)[1].target_auth = authentication;
+        assert_eq!(kept(&stored, &moved), without(&["partner-provider"]));
+
+        let mut replaced = legs_surface();
+        points(&mut replaced)[1].id = "peer-replacement-id".into();
+        assert_eq!(kept(&stored, &replaced), without(&["peer-provider", "bound"]));
+
+        let mut added = legs_surface();
+        let mut extra = points(&mut added)[1].clone();
+        extra.id = "extra-id".into();
+        extra.alias = "extra".into();
+        extra.transit_credentials = None;
+        extra.target_endpoint = "https://tenant.example".into();
+        points(&mut added).push(extra);
+        assert_eq!(kept(&stored, &added), without(&["bound"]));
+
+        let mut removed_variant = legs_surface();
+        removed_variant.variants[0].id = "other-variant-id".into();
+        assert_eq!(kept(&stored, &removed_variant), Vec::<String>::new());
+
+        assert_eq!(kept(&AgentSurface::default(), &stored), Vec::<String>::new());
     }
 
     #[test]
