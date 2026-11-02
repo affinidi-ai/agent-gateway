@@ -291,6 +291,13 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
       does any stream that could not be opened;
     - a legacy `ForwardRequest`: the receiver answers with the refusal's status, and the sending
       gateway passes the peer's `404` or `500` on to its caller.
+
+    On Fabric receive, `fabric_hops_invalid` (an `X-Gateway-Fabric-Hops` that is not one integer
+    from 1 to 255; the peer is answered `400`) and `fabric_chain_too_long` (a request past 8
+    Fabric crossings; `508`) are recorded against the surface id the peer addressed, before it is
+    looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
+    resolves its surface and variant when it opens, so one to a surface or variant that is not
+    available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
   - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
@@ -298,7 +305,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller).
-  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address),
+    `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
+    pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
+    receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
+    get a transit token for the request and it could not be issued.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.

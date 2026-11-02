@@ -371,6 +371,7 @@ mod tests {
             caller_context_fields: fields,
             allowed_transit_points: vec![],
             trace_id: None,
+            fabric: None,
         }
     }
 

@@ -103,6 +103,121 @@ pub async fn managed_agent_sends_a2a_request_through_transit_point(
     send_a2a_request_through_transit_point(world, &agent_name, &transit_point, Vec::new()).await;
 }
 
+/// The transit token the gateway gave managed agent `agent_name` with the
+/// last request it forwarded to it.
+pub(crate) async fn transit_token_received_by(
+    world: &G2gWorld,
+    agent_name: &str,
+) -> String {
+    last_transit_token_received_by(world, agent_name)
+        .await
+        .unwrap_or_else(|| panic!("managed agent '{agent_name}' received no transit token"))
+}
+
+/// The transit token on the last request `agent_name` served, other than an
+/// agent card fetch, if it carried one.
+pub(crate) async fn last_transit_token_received_by(
+    world: &G2gWorld,
+    agent_name: &str,
+) -> Option<String> {
+    let (gw_index, surface_id) = world.target(agent_name);
+    world
+        .harness()
+        .gw(gw_index)
+        .mock(&surface_id)
+        .unwrap_or_else(|| panic!("no managed agent backing surface '{surface_id}' on gateway {gw_index}"))
+        .requests()
+        .await
+        .into_iter()
+        .rev()
+        .find(|request| {
+            !request
+                .path_and_query
+                .contains(".well-known/agent")
+        })
+        .and_then(|request| {
+            request
+                .headers
+                .get("x-transit-token")
+                .cloned()
+        })
+}
+
+#[when(expr = "managed agent {string} calls Transit Point {string} with the transit token it received")]
+pub async fn managed_agent_calls_transit_point_with_its_transit_token(
+    world: &mut G2gWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let token = transit_token_received_by(world, &agent_name).await;
+    send_a2a_request_through_transit_point(
+        world,
+        &agent_name,
+        &transit_point,
+        vec![("x-transit-token".to_string(), token)],
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} calls Transit Point {string} with the transit token managed agent {string} received"
+)]
+pub async fn managed_agent_calls_transit_point_with_another_agents_transit_token(
+    world: &mut G2gWorld,
+    agent_name: String,
+    transit_point: String,
+    token_holder: String,
+) {
+    let token = transit_token_received_by(world, &token_holder).await;
+    send_a2a_request_through_transit_point(
+        world,
+        &agent_name,
+        &transit_point,
+        vec![("x-transit-token".to_string(), token)],
+    )
+    .await;
+}
+
+/// More Transit Point calls than any relay between two agents can make before
+/// the hop limit stops it.
+const MAX_RELAY_CALLS: usize = 20;
+
+/// Each managed agent in turn calls its Transit Point to the other's gateway
+/// with the transit token its last request carried, as two agents handing a
+/// request back and forth would, until a call is refused.
+#[when(
+    expr = "managed agents {string} and {string} pass the request back and forth through Transit Points {string} and {string}"
+)]
+pub async fn managed_agents_pass_the_request_back_and_forth(
+    world: &mut G2gWorld,
+    first_agent: String,
+    second_agent: String,
+    first_transit_point: String,
+    second_transit_point: String,
+) {
+    let turns = [(first_agent, first_transit_point), (second_agent, second_transit_point)];
+    let mut forwarded = 0;
+    for (agent_name, transit_point) in turns
+        .iter()
+        .cycle()
+        .take(MAX_RELAY_CALLS)
+    {
+        let token = transit_token_received_by(world, agent_name).await;
+        send_a2a_request_through_transit_point(
+            world,
+            agent_name,
+            transit_point,
+            vec![("x-transit-token".to_string(), token)],
+        )
+        .await;
+        if world.response_status != Some(200) {
+            break;
+        }
+        forwarded += 1;
+    }
+    world.relayed_transit_point_calls = Some(forwarded);
+}
+
 #[when(expr = "the caller sends a Fabric A2A request through gateway {int} surface {string}")]
 pub async fn a2a_request_sent_to_surface(
     world: &mut G2gWorld,

@@ -169,6 +169,12 @@ uses delegated credentials on legacy MCP, A2A and HTTP requests. The agent half 
 carries, so a `source_auth` caller without a transit token needs a managed identity for the
 Transit Point.
 
+A transit token the gateway issued for a request that arrived over Fabric (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)) keys no grant: it carries no principal, and
+the caller DID in it is the peer gateway's word, so it is never the agent half of a key either.
+A binding that applies to such a call refuses it with `403` and the target is not called; the
+log says delegated credentials are not released for requests that arrived over Fabric. Static `target_auth` credentials are added as for any caller.
+
 ## Target authentication from a credential provider
 
 A Target's `target.auth` or a Transit Point's `target_auth` can take its credential from a
