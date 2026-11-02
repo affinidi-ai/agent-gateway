@@ -144,20 +144,6 @@ impl AgentIdentityRecord {
             None => None,
         }
     }
-
-    /// True when no surface other than `surface_id` has created or used the record.
-    pub fn used_only_by(
-        &self,
-        surface_id: &str,
-    ) -> bool {
-        self.channel_config_id
-            .as_deref()
-            .is_none_or(|id| id == surface_id)
-            && self
-                .channel_usage
-                .iter()
-                .all(|usage| usage.channel_config_id == surface_id)
-    }
 }
 
 /// Implement StorableEntity for AgentIdentityRecord to use generic filesystem storage
@@ -543,34 +529,6 @@ impl IdentityStore for FilesystemIdentityStore {
         Ok(Some(origin))
     }
 
-    async fn replace_origin(
-        &self,
-        identity_hash: &str,
-        surface_id: &str,
-        from: Option<IdentityOrigin>,
-        to: IdentityOrigin,
-    ) -> Result<bool> {
-        let _guard = self
-            .record_lock(identity_hash)
-            .lock()
-            .await;
-        let Some(mut record) = self
-            .storage
-            .get(identity_hash)
-            .await?
-        else {
-            return Ok(false);
-        };
-        if record.origin != from || !record.used_only_by(surface_id) {
-            return Ok(false);
-        }
-        record.origin = Some(to);
-        self.storage
-            .save(&record)
-            .await?;
-        Ok(true)
-    }
-
     fn base_path(&self) -> Option<std::path::PathBuf> {
         Some(self.storage_path.clone())
     }
@@ -927,73 +885,6 @@ mod tests {
             .unwrap();
         assert_eq!(stored.did, first.did);
         assert_eq!(stored.origin, Some(IdentityOrigin::Managed));
-    }
-
-    #[tokio::test]
-    async fn test_replace_origin_changes_only_the_expected_origin() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let store = FilesystemIdentityStore::new(temp_dir.path())
-            .await
-            .unwrap();
-        let mut caller = local_record("caller");
-        caller.origin = Some(IdentityOrigin::ExternalCaller);
-        store
-            .create(caller)
-            .await
-            .unwrap();
-        store
-            .create(local_record("unset"))
-            .await
-            .unwrap();
-        let mut shared = local_record("shared");
-        shared.origin = Some(IdentityOrigin::ExternalCaller);
-        shared.channel_config_id = Some("s1".into());
-        store
-            .create(shared)
-            .await
-            .unwrap();
-        store
-            .update_usage("shared", Some("s2".into()))
-            .await
-            .unwrap();
-        let replace = |hash: &'static str| {
-            let store = &store;
-            async move {
-                store
-                    .replace_origin(hash, "s1", Some(IdentityOrigin::ExternalCaller), IdentityOrigin::Managed)
-                    .await
-                    .unwrap()
-            }
-        };
-
-        let replaced = replace("caller").await;
-        let again = replace("caller").await;
-        let unset = replace("unset").await;
-        let missing = replace("missing").await;
-        let used_elsewhere = replace("shared").await;
-
-        assert_eq!([replaced, again, unset, missing, used_elsewhere], [true, false, false, false, false]);
-        let origin_of = |hash: &'static str| {
-            let store = &store;
-            async move {
-                store
-                    .find_by_hash(hash)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .origin
-            }
-        };
-        assert_eq!(origin_of("caller").await, Some(IdentityOrigin::Managed));
-        assert_eq!(origin_of("unset").await, None);
-        assert_eq!(origin_of("shared").await, Some(IdentityOrigin::ExternalCaller));
-
-        let from_none = store
-            .replace_origin("unset", "s1", None, IdentityOrigin::Managed)
-            .await
-            .unwrap();
-        assert!(from_none);
-        assert_eq!(origin_of("unset").await, Some(IdentityOrigin::Managed));
     }
 
     /// Races `write` against `set_origin(Managed)` on fresh origin-less local

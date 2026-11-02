@@ -95,33 +95,6 @@ struct SavedIssuerConfig {
     is_vp_challenge_required: bool,
 }
 
-/// An API key's identity record already belongs to the other role: one key is
-/// either a Managed Agent's or an External Caller's, never both.
-#[derive(Debug, thiserror::Error)]
-#[error("identity record belongs to another role")]
-pub struct IdentityRoleClash;
-
-/// An API key's identity record has no role and the store could not record
-/// one, so the record's role cannot be checked.
-#[derive(Debug, thiserror::Error)]
-#[error("identity origin could not be recorded")]
-pub struct IdentityOriginUnavailable;
-
-/// What [`VCIssuer::take_over_legacy_caller_api_key`] did with a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LegacyCallerTakeover {
-    TakenOver,
-    NotApplicable,
-    SharedWithAnotherSurface,
-}
-
-fn is_api_key_identity(identity_fields: &std::collections::HashMap<String, serde_json::Value>) -> bool {
-    identity_fields
-        .get("credential_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("api_key")
-}
-
 /// Response containing agent DID and credential
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentIdentityResponse {
@@ -795,7 +768,8 @@ impl VCIssuer {
     }
 
     /// [`Self::issue_or_get_credential`] for the managed agent of `channel_config_id`:
-    /// records the identity as managed and names the VC with its managed display name.
+    /// records the identity as managed unless the record already has an origin. The VC
+    /// follows the record's origin: a managed one is named with its managed display name.
     pub async fn issue_or_get_managed_credential(
         &self,
         identity_fields: std::collections::HashMap<String, serde_json::Value>,
@@ -813,8 +787,9 @@ impl VCIssuer {
         .await
     }
 
-    /// [`Self::issue_or_get_credential`] for a caller reaching the surface: records
-    /// the identity as an external caller. The VC carries no name.
+    /// [`Self::issue_or_get_credential`] for a caller reaching the surface: records the
+    /// identity as an external caller unless the record already has an origin. The VC
+    /// follows the record's origin, so it carries no name unless the record is managed.
     pub async fn issue_or_get_caller_credential(
         &self,
         identity_fields: std::collections::HashMap<String, serde_json::Value>,
@@ -938,7 +913,6 @@ impl VCIssuer {
     ) -> Result<AgentIdentityResponse> {
         let identity_hash = &record.identity_hash;
         info!("[TR-TRACE] Identity ALREADY EXISTS for hash={}, did={}", identity_hash, record.did);
-        let api_key_identity = is_api_key_identity(&identity_fields);
         let effective_origin = match (record.origin, origin) {
             (None, Some(requested)) => match self
                 .identity_store
@@ -946,10 +920,6 @@ impl VCIssuer {
                 .await
             {
                 Ok(stored) => stored.or(Some(requested)),
-                Err(e) if api_key_identity => {
-                    warn!(identity_hash = %identity_hash, error = %e, "Failed to record API key identity origin — refused");
-                    return Err(e.context(IdentityOriginUnavailable));
-                }
                 Err(e) => {
                     warn!(identity_hash = %identity_hash, error = %e, "Failed to record identity origin (non-fatal)");
                     Some(requested)
@@ -957,13 +927,6 @@ impl VCIssuer {
             },
             (existing, _) => existing,
         };
-        if let (Some(existing), Some(requested)) = (effective_origin, origin)
-            && existing != requested
-            && api_key_identity
-        {
-            warn!(did = %record.did, ?existing, ?requested, "API key identity requested in another role — refused");
-            return Err(IdentityRoleClash.into());
-        }
         self.identity_store
             .update_usage(identity_hash, channel_config_id.clone())
             .await?;
@@ -1000,50 +963,6 @@ impl VCIssuer {
         {
             warn!(birth_log_dir, error = %e, "Failed to remove the birth log of a discarded DID (non-fatal)");
         }
-    }
-
-    /// Turn the API key identity `identity_hash` from an External Caller, or
-    /// from a record with no role, into the Managed Agent of `surface_id`. Only
-    /// for a key the surface's inbound slot named when that slot resolved its
-    /// stored key as a caller, and only while no other surface has used the
-    /// record.
-    pub async fn take_over_legacy_caller_api_key(
-        &self,
-        identity_hash: &str,
-        surface_id: &str,
-    ) -> Result<LegacyCallerTakeover> {
-        let Some(record) = self
-            .identity_store
-            .find_by_hash(identity_hash)
-            .await?
-        else {
-            return Ok(LegacyCallerTakeover::NotApplicable);
-        };
-        if !matches!(record.origin, None | Some(IdentityOrigin::ExternalCaller))
-            || !is_api_key_identity(&record.identity_fields)
-        {
-            return Ok(LegacyCallerTakeover::NotApplicable);
-        }
-        if !record.used_only_by(surface_id) {
-            if record.origin.is_none() {
-                return Ok(LegacyCallerTakeover::NotApplicable);
-            }
-            warn!(surface_id, did = %record.did, "API key identity is a caller of another surface — not taken over");
-            return Ok(LegacyCallerTakeover::SharedWithAnotherSurface);
-        }
-        if !self
-            .identity_store
-            .replace_origin(identity_hash, surface_id, record.origin, IdentityOrigin::Managed)
-            .await?
-        {
-            return Ok(LegacyCallerTakeover::NotApplicable);
-        }
-        warn!(
-            surface_id,
-            did = %record.did,
-            "Legacy API key identity of the inbound slot now identifies the surface's Managed Agent"
-        );
-        Ok(LegacyCallerTakeover::TakenOver)
     }
 
     /// Display name `surface_id` gives its managed agent `agent_did`; `None` when the
@@ -2976,14 +2895,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn api_key_identity_is_refused_when_its_origin_cannot_be_recorded() {
-            let (result, _) =
+        async fn api_key_identity_resolves_when_its_origin_cannot_be_recorded() {
+            let (result, legacy_did) =
                 existing_identity_with_failing_origin_store(api_key_fields("atgk_f"), "hash-atgk_f").await;
 
-            let err = result.unwrap_err();
-            assert!(!err.is::<IdentityRoleClash>());
-            assert!(err.is::<IdentityOriginUnavailable>());
-            assert_eq!(err.root_cause().to_string(), crate::identity::test_helpers::OriginFailingIdentityStore::DETAIL);
+            assert_eq!(result.unwrap().did, legacy_did);
         }
 
         #[tokio::test]
@@ -2995,30 +2911,30 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn api_key_role_stamped_concurrently_is_refused_and_kept() {
+        async fn api_key_role_stamped_concurrently_is_kept_and_shared() {
             let store = Arc::new(StaleOriginStore(crate::identity::test_helpers::MockIdentityStore::new()));
             let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(store.clone()).await;
             let managed = issuer
                 .issue_or_get_managed_credential(
                     api_key_fields("atgk_r"),
                     api_key_hash("atgk_r"),
-                    Some("vc-clash-r".into()),
+                    Some("vc-shared-r".into()),
                     None,
                 )
                 .await
                 .unwrap();
 
-            let err = issuer
+            let caller = issuer
                 .issue_or_get_caller_credential(
                     api_key_fields("atgk_r"),
                     api_key_hash("atgk_r"),
-                    Some("vc-clash-r".into()),
+                    Some("vc-shared-r".into()),
                     None,
                 )
                 .await
-                .unwrap_err();
+                .unwrap();
 
-            assert!(err.is::<IdentityRoleClash>());
+            assert_eq!(caller.did, managed.did);
             let record = store
                 .0
                 .find_by_did(&managed.did)
@@ -3029,58 +2945,60 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn caller_api_key_on_a_managed_record_is_refused() {
+        async fn caller_api_key_on_a_managed_record_shares_its_did_and_role() {
             let f = fixture().await;
             let issuer = &f.issuer;
             let managed = issuer
                 .issue_or_get_managed_credential(
                     api_key_fields("atgk_m"),
                     api_key_hash("atgk_m"),
-                    Some("vc-clash-m".into()),
+                    Some("vc-shared-m".into()),
                     None,
                 )
                 .await
                 .unwrap();
 
-            let err = issuer
+            let caller = issuer
                 .issue_or_get_caller_credential(
                     api_key_fields("atgk_m"),
                     api_key_hash("atgk_m"),
-                    Some("vc-clash-m".into()),
+                    Some("vc-shared-m".into()),
                     None,
                 )
                 .await
-                .unwrap_err();
+                .unwrap();
 
-            assert!(err.is::<IdentityRoleClash>());
+            assert_eq!(caller.did, managed.did);
+            assert!(!caller.is_new);
             assert_eq!(origin_of(issuer, &managed.did).await, Some(IdentityOrigin::Managed));
         }
 
         #[tokio::test]
-        async fn managed_api_key_on_a_caller_record_is_refused() {
+        async fn managed_api_key_on_a_caller_record_shares_its_did_and_role() {
             let f = fixture().await;
             let issuer = &f.issuer;
             let caller = issuer
                 .issue_or_get_caller_credential(
                     api_key_fields("atgk_c"),
                     api_key_hash("atgk_c"),
-                    Some("vc-clash-c".into()),
+                    Some("vc-shared-c".into()),
                     None,
                 )
                 .await
                 .unwrap();
 
-            let err = issuer
+            let managed = issuer
                 .issue_or_get_managed_credential(
                     api_key_fields("atgk_c"),
                     api_key_hash("atgk_c"),
-                    Some("vc-clash-c".into()),
+                    Some("vc-shared-c".into()),
                     None,
                 )
                 .await
-                .unwrap_err();
+                .unwrap();
 
-            assert!(err.is::<IdentityRoleClash>());
+            assert_eq!(managed.did, caller.did);
+            assert!(!managed.is_new);
             assert_eq!(origin_of(issuer, &caller.did).await, Some(IdentityOrigin::ExternalCaller));
         }
 
@@ -3092,7 +3010,7 @@ mod tests {
                 .issue_or_get_caller_credential(
                     api_key_fields("atgk_s"),
                     api_key_hash("atgk_s"),
-                    Some("vc-clash-s".into()),
+                    Some("vc-shared-s".into()),
                     None,
                 )
                 .await
@@ -3101,7 +3019,7 @@ mod tests {
                 .issue_or_get_caller_credential(
                     api_key_fields("atgk_s"),
                     api_key_hash("atgk_s"),
-                    Some("vc-clash-s".into()),
+                    Some("vc-shared-s".into()),
                     None,
                 )
                 .await
@@ -3245,7 +3163,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn a_managed_and_a_caller_first_use_keep_one_did_and_role() {
+        async fn a_managed_and_a_caller_first_use_share_one_did_and_role() {
             let f = fixture().await;
             for round in 0..ROUNDS {
                 let key_id = format!("atgk_first_mixed_{round}");
@@ -3254,30 +3172,23 @@ mod tests {
                     tokio::spawn(issue(f.issuer.clone(), barrier.clone(), key_id.clone(), IdentityOrigin::Managed));
                 let caller =
                     tokio::spawn(issue(f.issuer.clone(), barrier, key_id.clone(), IdentityOrigin::ExternalCaller));
-                let results = [
-                    (IdentityOrigin::Managed, managed.await.unwrap()),
-                    (IdentityOrigin::ExternalCaller, caller.await.unwrap()),
-                ];
+                let managed = managed
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let caller = caller.await.unwrap().unwrap();
 
-                let winners: Vec<_> = results
-                    .iter()
-                    .filter_map(|(origin, result)| {
-                        result
-                            .as_ref()
-                            .ok()
-                            .map(|response| (*origin, response.did.clone()))
-                    })
-                    .collect();
-                assert_eq!(winners.len(), 1, "round {round}: exactly one role resolves, got {winners:?}");
-                let refused = results
-                    .iter()
-                    .find_map(|(_, result)| result.as_ref().err())
-                    .expect("the other role is refused");
-                assert!(refused.is::<IdentityRoleClash>(), "round {round}: {refused:?}");
+                assert_eq!(managed.did, caller.did, "round {round}");
                 let records = records_for(&f.issuer, &key_id).await;
                 assert_eq!(records.len(), 1, "round {round}");
-                assert_eq!(records[0].did, winners[0].1, "round {round}");
-                assert_eq!(records[0].origin, Some(winners[0].0), "round {round}");
+                assert_eq!(records[0].did, managed.did, "round {round}");
+                assert_ne!(managed.is_new, caller.is_new, "round {round}: exactly one request creates the record");
+                let creator = if managed.is_new {
+                    IdentityOrigin::Managed
+                } else {
+                    IdentityOrigin::ExternalCaller
+                };
+                assert_eq!(records[0].origin, Some(creator), "round {round}");
             }
             assert_eq!(birth_logs(f.store_dir.path()), ROUNDS, "a discarded DID leaves no birth log");
         }
@@ -3320,179 +3231,6 @@ mod tests {
                 assert_eq!(records[0].usage_count, CALLERS as u64, "round {round}");
             }
             assert_eq!(birth_logs(f.store_dir.path()), ROUNDS, "a discarded DID leaves no birth log");
-        }
-
-        #[tokio::test]
-        async fn a_caller_api_key_record_is_taken_over_once() {
-            let f = fixture().await;
-            let caller = f
-                .issuer
-                .issue_or_get_caller_credential(
-                    api_key_fields("atgk_legacy"),
-                    Some("hash-atgk_legacy".into()),
-                    Some("legacy-surface".into()),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            for expected in [LegacyCallerTakeover::TakenOver, LegacyCallerTakeover::NotApplicable] {
-                assert_eq!(
-                    f.issuer
-                        .take_over_legacy_caller_api_key("hash-atgk_legacy", "legacy-surface")
-                        .await
-                        .unwrap(),
-                    expected
-                );
-            }
-
-            let managed = f
-                .issuer
-                .issue_or_get_managed_credential(
-                    api_key_fields("atgk_legacy"),
-                    Some("hash-atgk_legacy".into()),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(managed.did, caller.did);
-            let records = records_for(&f.issuer, "atgk_legacy").await;
-            assert_eq!(records[0].origin, Some(IdentityOrigin::Managed));
-        }
-
-        #[tokio::test]
-        async fn only_a_caller_api_key_record_is_taken_over() {
-            let f = fixture().await;
-            f.issuer
-                .issue_or_get_managed_credential(
-                    api_key_fields("atgk_managed"),
-                    Some("hash-atgk_managed".into()),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            let payload = HashMap::from([("agent".to_string(), json!("payload"))]);
-            f.issuer
-                .issue_or_get_caller_credential(payload, Some("hash-payload".into()), None, None)
-                .await
-                .unwrap();
-
-            for hash in ["hash-atgk_managed", "hash-payload", "hash-missing"] {
-                assert_eq!(
-                    f.issuer
-                        .take_over_legacy_caller_api_key(hash, "legacy-surface")
-                        .await
-                        .unwrap(),
-                    LegacyCallerTakeover::NotApplicable,
-                    "{hash}"
-                );
-            }
-            let store = f.issuer.get_identity_store();
-            for (hash, origin) in
-                [("hash-atgk_managed", IdentityOrigin::Managed), ("hash-payload", IdentityOrigin::ExternalCaller)]
-            {
-                let record = store
-                    .find_by_hash(hash)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(record.origin, Some(origin), "{hash}");
-            }
-        }
-
-        #[tokio::test]
-        async fn a_caller_api_key_record_another_surface_used_is_not_taken_over() {
-            let f = fixture().await;
-            for surface in ["legacy-surface", "other-surface"] {
-                f.issuer
-                    .issue_or_get_caller_credential(
-                        api_key_fields("atgk_shared"),
-                        Some("hash-atgk_shared".into()),
-                        Some(surface.into()),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            let outcome = f
-                .issuer
-                .take_over_legacy_caller_api_key("hash-atgk_shared", "legacy-surface")
-                .await
-                .unwrap();
-
-            assert_eq!(outcome, LegacyCallerTakeover::SharedWithAnotherSurface);
-            let records = records_for(&f.issuer, "atgk_shared").await;
-            assert_eq!(records[0].origin, Some(IdentityOrigin::ExternalCaller));
-        }
-
-        #[tokio::test]
-        async fn an_api_key_record_with_no_role_is_taken_over_only_when_this_surface_alone_used_it() {
-            let f = fixture().await;
-            let surfaces_by_key: [(&str, &[&str]); 2] = [
-                ("atgk_roleless", &["legacy-surface"]),
-                ("atgk_roleless_shared", &["legacy-surface", "other-surface"]),
-            ];
-            let mut dids = HashMap::new();
-            for (key_id, surfaces) in &surfaces_by_key {
-                for surface in surfaces.iter() {
-                    let issued = f
-                        .issuer
-                        .issue_or_get_credential(
-                            api_key_fields(key_id),
-                            Some(format!("hash-{key_id}")),
-                            Some((*surface).into()),
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                    dids.insert(*key_id, issued.did);
-                }
-                assert_eq!(records_for(&f.issuer, key_id).await[0].origin, None, "{key_id}");
-            }
-
-            let mut outcomes = Vec::new();
-            for (key_id, _) in &surfaces_by_key {
-                outcomes.push(
-                    f.issuer
-                        .take_over_legacy_caller_api_key(&format!("hash-{key_id}"), "legacy-surface")
-                        .await
-                        .unwrap(),
-                );
-            }
-
-            assert_eq!(outcomes, [LegacyCallerTakeover::TakenOver, LegacyCallerTakeover::NotApplicable]);
-            let taken_over = records_for(&f.issuer, "atgk_roleless").await;
-            assert_eq!(taken_over[0].origin, Some(IdentityOrigin::Managed));
-            assert_eq!(taken_over[0].did, dids["atgk_roleless"]);
-            let shared = records_for(&f.issuer, "atgk_roleless_shared").await;
-            assert_eq!(shared[0].origin, None);
-        }
-
-        #[tokio::test]
-        async fn a_takeover_the_store_cannot_record_is_an_error() {
-            let store = Arc::new(crate::identity::test_helpers::OriginFailingIdentityStore(
-                crate::identity::test_helpers::MockIdentityStore::new(),
-            ));
-            let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(store).await;
-            issuer
-                .issue_or_get_caller_credential(
-                    api_key_fields("atgk_unrecordable"),
-                    Some("hash-atgk_unrecordable".into()),
-                    Some("legacy-surface".into()),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            assert!(
-                issuer
-                    .take_over_legacy_caller_api_key("hash-atgk_unrecordable", "legacy-surface")
-                    .await
-                    .is_err()
-            );
         }
     }
 }

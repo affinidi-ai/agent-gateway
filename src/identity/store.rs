@@ -75,19 +75,6 @@ pub trait IdentityStore: Send + Sync {
         Ok(None)
     }
 
-    /// Change the record's origin from `from` (`None`: no origin) to `to`, only
-    /// from `from` and only while no surface other than `surface_id` has used
-    /// the record. Returns whether the origin changed.
-    async fn replace_origin(
-        &self,
-        _identity_hash: &str,
-        _surface_id: &str,
-        _from: Option<filesystem::IdentityOrigin>,
-        _to: filesystem::IdentityOrigin,
-    ) -> Result<bool> {
-        anyhow::bail!("this identity store cannot change an identity origin")
-    }
-
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.
     /// Returns `None` for in-memory or mock implementations.
     fn base_path(&self) -> Option<std::path::PathBuf> {

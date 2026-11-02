@@ -242,11 +242,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Save unless the first Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`, an
-  `atgk_` secret id, one key as both Managed Agent and caller) and rules on inactive variants show
-  as the save-error banner. A save that leaves a legacy inbound API key refused, because another
-  surface's callers used its record, answers with a `Warning: 299` header naming the key id and
-  telling the operator to issue a new API key for the Managed Agent or Transit Point; it names no
-  Transit Point alias, so it shows only in the save warnings banner and toast.
+  `atgk_` secret id) and rules on inactive variants show as the save-error banner.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener

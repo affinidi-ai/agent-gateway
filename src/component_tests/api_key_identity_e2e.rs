@@ -11,7 +11,6 @@ use serde_json::json;
 use std::sync::atomic::Ordering;
 
 const PROVIDER_AGENT_ID: &str = "per-key-provider-agent";
-const CALLER_UNRESOLVED: &str = "Caller identity could not be resolved";
 
 struct ProviderKey {
     key_id: String,
@@ -773,95 +772,94 @@ async fn a_managed_agent_fallback_ignores_the_presented_key() {
     );
 
     let records = identity_records(&identities_dir);
-    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records.len(), 1, "identity record count");
     assert_eq!(records[0].identity_hash, api_key_identity_hash(MANAGED_KEY_ID));
     assert_eq!(records[0].origin, Some(IdentityOrigin::Managed));
 }
 
-const LEGACY_DUAL_ROLE_DID: &str = "did:web:legacy-dual-role.example";
+const SHARED_KEY_DID: &str = "did:web:shared-key.example";
+
+/// Seed a [`SHARED_KEY_DID`] record for `key_id` with `origin`, on `surface_id`
+/// and keyed as the configured key is.
+fn seed_api_key_record(
+    identities_dir: &str,
+    surface_id: &str,
+    key_id: &str,
+    origin: IdentityOrigin,
+) {
+    let (fields, hash) = block_on(configured_key_identity(key_id));
+    let mut record = crate::identity::test_helpers::test_surface_identity_record(SHARED_KEY_DID, surface_id);
+    record.identity_hash = hash;
+    record.identity_fields = fields;
+    record.origin = Some(origin);
+    record.private_key = Some(serde_json::to_value(ssi::jwk::JWK::generate_ed25519().unwrap()).unwrap());
+    seed_identity(identities_dir, record);
+}
 
 /// Seed the record the inbound slot of an older build gave `key_id`: an External
-/// Caller keyed as the configured key was, of `surface_id` and, when named, also
-/// used by the callers of `also_used_by`.
+/// Caller of `surface_id`, keyed as the configured key was.
 fn seed_legacy_caller_record(
     identities_dir: &str,
     surface_id: &str,
     key_id: &str,
-    also_used_by: Option<&str>,
 ) {
-    let (fields, hash) = block_on(configured_key_identity(key_id));
-    let mut legacy = crate::identity::test_helpers::test_surface_identity_record(LEGACY_DUAL_ROLE_DID, surface_id);
-    legacy.identity_hash = hash;
-    legacy.identity_fields = fields;
-    legacy.origin = Some(IdentityOrigin::ExternalCaller);
-    legacy.private_key = Some(serde_json::to_value(ssi::jwk::JWK::generate_ed25519().unwrap()).unwrap());
-    if let Some(other) = also_used_by {
-        legacy
-            .channel_usage
-            .push(crate::identity::filesystem::ChannelUsage {
-                channel_config_id: other.to_string(),
-                usage_count: 1,
-                last_used_at: chrono::Utc::now(),
-            });
-    }
-    seed_identity(identities_dir, legacy);
+    seed_api_key_record(identities_dir, surface_id, key_id, IdentityOrigin::ExternalCaller);
 }
 
-/// A surface whose Managed Agent and Transit Point are identified by
-/// `managed_key`, with `stored_inbound` left on its inbound slot.
-fn legacy_dual_role_surface(
+/// A surface whose callers are identified by the key they present and whose
+/// Managed Agent and Transit Point are identified by `managed_key`.
+fn shared_key_surface(
     surface_id: &str,
     policy_id: &str,
-    stored_inbound: Option<String>,
     managed_key: &str,
 ) -> AgentSurface {
     let managed = json!({ "type": "from_api_key", "api_key_id": managed_key });
     let mut transit = transit_with_one_point();
     transit["points"][0]["managed_identity"] = managed.clone();
     let mut surface = provider_caller_surface(surface_id, "/smoke", policy_id, Some(transit));
-    surface.identity_slots.inbound =
-        Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: stored_inbound });
     surface
         .identity_slots
         .protected = Some(serde_json::from_value(managed).unwrap());
     surface
 }
 
-struct LegacyDualRoleRun {
-    caller_status: u16,
-    transit_point_status: u16,
-    record: AgentIdentityRecord,
-    restamped: u64,
-}
-
-/// The key id a legacy surface's inbound slot stores, chosen from the test keys.
-type StoredInboundKey = fn(&[ProviderKey]) -> Option<String>;
-
-/// Seed the Managed Agent key as a legacy caller record, then send one caller
-/// request with another key and call the Transit Point with its transit token.
-async fn run_legacy_dual_role(
-    surface_id: &'static str,
-    stored_inbound: StoredInboundKey,
-    also_used_by: Option<&'static str>,
-) -> LegacyDualRoleRun {
+/// A Managed Agent key that an older build recorded as a caller keeps that
+/// record: an unknown caller key adds no identity record, another caller key
+/// adds only its own, the Managed Agent and the Transit Point reuse the record,
+/// and a caller presenting the Managed Agent key on the same surface is served
+/// with the record's DID. The record keeps its DID and role throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_agent_key_recorded_as_a_caller_keeps_its_record() {
+    const SURFACE: &str = "legacy-dual-role";
     const POLICY: &str = "legacy-dual-role-allow";
     let mut keys = Vec::new();
     let mut identities_dir = String::new();
     let h = GatewayHarness::start_with_outbound_mock(MockServer::start().await, |dir, gw_config, bootstrap| {
-        keys = create_provider_keys(bootstrap, &["legacy-managed", "legacy-caller", "legacy-other"], &[]);
+        keys = create_provider_keys(bootstrap, &["legacy-managed", "legacy-caller"], &[]);
         identities_dir = bootstrap
             .storage_paths
             .identities
             .clone();
-        seed_legacy_caller_record(&identities_dir, surface_id, &keys[0].key_id, also_used_by);
+        seed_legacy_caller_record(&identities_dir, SURFACE, &keys[0].key_id);
         write_policy(dir, POLICY, "package surface.policy\n\ndefault allow := true\n");
-        gw_config.surfaces = vec![legacy_dual_role_surface(surface_id, POLICY, stored_inbound(&keys), &keys[0].key_id)];
+        gw_config.surfaces = vec![shared_key_surface(SURFACE, POLICY, &keys[0].key_id)];
     })
     .await;
-    let restamped_before = resolve_count(surface_id, "legacy_role_restamped");
+    let managed_hash = api_key_identity_hash(&keys[0].key_id);
 
-    let caller = send_with_key(&h.gateway_url, &keys[1].secret).await;
-    let caller_status = caller.status().as_u16();
+    let unknown = send_with_key(&h.gateway_url, "atgk_unknown_caller_key").await;
+
+    assert_eq!(unknown.status(), 200, "{}", unknown.text().await.unwrap());
+    let records = identity_records(&identities_dir);
+    assert_eq!(records.len(), 1, "identity record count");
+    assert_eq!(records[0].identity_hash, managed_hash);
+
+    assert_eq!(
+        send_with_key(&h.gateway_url, &keys[1].secret)
+            .await
+            .status(),
+        200
+    );
     let transit_point_status = reqwest::Client::new()
         .post(format!(
             "{}/outbound/smoke/target",
@@ -874,72 +872,93 @@ async fn run_legacy_dual_role(
         .send()
         .await
         .expect("Transit Point request failed")
-        .status()
-        .as_u16();
+        .status();
+    assert_eq!(transit_point_status, 200);
 
     let records = identity_records(&identities_dir);
-    let record = record_for_hash(&records, &api_key_identity_hash(&keys[0].key_id))
-        .expect("the Managed Agent key record")
-        .clone();
-    LegacyDualRoleRun {
-        caller_status,
-        transit_point_status,
-        record,
-        restamped: resolve_count(surface_id, "legacy_role_restamped") - restamped_before,
-    }
+    assert_eq!(records.len(), 2, "the seeded record and the second caller key's record");
+    let record = record_for_hash(&records, &managed_hash).expect("the Managed Agent key record");
+    assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+    assert_eq!(record.did, SHARED_KEY_DID);
+
+    let same_key = send_with_key(&h.gateway_url, &keys[0].secret).await;
+
+    assert_eq!(same_key.status(), 200, "{}", same_key.text().await.unwrap());
+    assert_eq!(transit_token_sub(&forwarded_transit_token(&h)), SHARED_KEY_DID);
+    let records = identity_records(&identities_dir);
+    assert_eq!(records.len(), 2, "identity record count");
+    let record = record_for_hash(&records, &managed_hash).expect("the Managed Agent key record");
+    assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+    assert_eq!(record.did, SHARED_KEY_DID);
 }
 
-/// A Managed Agent key that the surface's inbound slot still names, and that
-/// the older build recorded as a caller, is taken over as managed once and keeps
-/// its DID.
+/// A surface policy denying the Managed Agent's key id refuses a caller that
+/// presents that key before the target is called, and leaves the Managed
+/// Agent's record as it was.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_legacy_inbound_key_of_the_managed_agent_is_taken_over_once() {
-    let run = run_legacy_dual_role("legacy-dual-role-same", |keys| Some(keys[0].key_id.clone()), None).await;
+async fn a_surface_policy_on_key_name_refuses_a_caller_with_the_managed_agent_key() {
+    const SURFACE: &str = "shared-key-refused";
+    const POLICY: &str = "shared-key-refuse-managed-key";
+    let mut keys = Vec::new();
+    let mut identities_dir = String::new();
+    let h = GatewayHarness::start_with_outbound_mock(MockServer::start().await, |dir, gw_config, bootstrap| {
+        keys = create_provider_keys(bootstrap, &["refused-managed", "refused-caller"], &[]);
+        identities_dir = bootstrap
+            .storage_paths
+            .identities
+            .clone();
+        seed_api_key_record(&identities_dir, SURFACE, &keys[0].key_id, IdentityOrigin::Managed);
+        write_policy(
+            dir,
+            POLICY,
+            &format!(
+                r#"package surface.policy
 
-    assert_eq!(run.caller_status, 200);
-    assert_eq!(run.transit_point_status, 200);
-    assert_eq!(run.record.origin, Some(IdentityOrigin::Managed));
-    assert_eq!(run.record.did, LEGACY_DUAL_ROLE_DID);
-    assert_eq!(run.restamped, 1);
-}
+default allow := false
 
-/// A caller record of the Managed Agent key is not taken over when the
-/// surface's inbound slot names no key or another key, or when the callers of
-/// another surface also use it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_caller_record_of_the_managed_agent_key_is_refused_without_the_legacy_inbound_key() {
-    let cases: [(&'static str, StoredInboundKey, Option<&'static str>); 3] = [
-        ("legacy-dual-role-absent", |_| None, None),
-        ("legacy-dual-role-other", |keys| Some(keys[2].key_id.clone()), None),
-        ("legacy-dual-role-shared", |keys| Some(keys[0].key_id.clone()), Some("another-caller-surface")),
-    ];
-    for (surface_id, stored_inbound, also_used_by) in cases {
-        let clashes_before = resolve_count(surface_id, "role_clash");
+managed_agent_key if {{
+    input.source_auth.key_name == "{}"
+}}
 
-        let run = run_legacy_dual_role(surface_id, stored_inbound, also_used_by).await;
+allow if {{
+    not managed_agent_key
+}}
 
-        assert_eq!(run.transit_point_status, 500, "{surface_id}");
-        assert_eq!(run.record.origin, Some(IdentityOrigin::ExternalCaller), "{surface_id}");
-        assert_eq!(run.restamped, 0, "{surface_id}");
-        assert!(resolve_count(surface_id, "role_clash") > clashes_before, "{surface_id}");
-    }
+deny_reason := "The Managed Agent's API key cannot be used by a caller" if managed_agent_key
+"#,
+                keys[0].key_id
+            ),
+        );
+        gw_config.surfaces = vec![shared_key_surface(SURFACE, POLICY, &keys[0].key_id)];
+    })
+    .await;
+    let managed_hash = api_key_identity_hash(&keys[0].key_id);
+    assert_eq!(
+        send_with_key(&h.gateway_url, &keys[1].secret)
+            .await
+            .status(),
+        200
+    );
+    let records = identity_records(&identities_dir);
+    let forwarded_before = forwarded(&h);
+
+    let refused = send_with_key(&h.gateway_url, &keys[0].secret).await;
+
+    assert_eq!(refused.status(), 403, "{}", refused.text().await.unwrap());
+    assert_eq!(forwarded(&h), forwarded_before, "the target is not called");
+    let after = identity_records(&identities_dir);
+    assert_eq!(after.len(), records.len(), "identity record count");
+    let record = record_for_hash(&after, &managed_hash).expect("the Managed Agent key record");
+    assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    assert_eq!(record.did, SHARED_KEY_DID);
 }
 
 const LEGACY_SAVED_KEY_ID: &str = "atgk_e2e0000000000000000000000000079";
 
-/// The name of a stored legacy surface, which differs from its id.
-fn legacy_surface_name(surface_id: &str) -> String {
-    format!("{surface_id}-name")
-}
-
-/// A gateway with surface `surface_id`, named [`legacy_surface_name`], stored as
-/// an older build saved it, its inbound slot naming its Managed Agent key when
-/// `stored_inbound_id`, and that key's legacy caller record.
-async fn start_with_stored_legacy_dual_role_surface(
-    surface_id: &'static str,
-    stored_inbound_id: bool,
-    also_used_by: Option<&'static str>,
-) -> (GatewayHarness, reqwest::Client, String) {
+/// A gateway with surface `surface_id` stored as an older build saved it, its
+/// inbound slot naming its Managed Agent key, and that key's legacy caller
+/// record.
+async fn start_with_stored_shared_key_surface(surface_id: &'static str) -> (GatewayHarness, reqwest::Client, String) {
     let mock = MockServer::start().await;
     let target = mock.url();
     let mut admin = None;
@@ -950,17 +969,12 @@ async fn start_with_stored_legacy_dual_role_surface(
             .storage_paths
             .identities
             .clone();
-        seed_legacy_caller_record(&identities_dir, surface_id, LEGACY_SAVED_KEY_ID, also_used_by);
-        let inbound = if stored_inbound_id {
-            json!({ "type": "from_api_key", "api_key_id": LEGACY_SAVED_KEY_ID })
-        } else {
-            json!({ "type": "from_api_key" })
-        };
+        seed_legacy_caller_record(&identities_dir, surface_id, LEGACY_SAVED_KEY_ID);
         let gateway: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
         let stored = json!({
             "surface_id": surface_id,
-            "name": legacy_surface_name(surface_id),
+            "name": surface_id,
             "access_point": {
                 "listen_address": gateway["listeners"][0]["external_urls"][0],
                 "route": "/legacy",
@@ -973,7 +987,7 @@ async fn start_with_stored_legacy_dual_role_surface(
             },
             "target": { "endpoint": target },
             "identity_slots": {
-                "inbound": inbound,
+                "inbound": { "type": "from_api_key", "api_key_id": LEGACY_SAVED_KEY_ID },
                 "protected": { "type": "from_api_key", "api_key_id": LEGACY_SAVED_KEY_ID }
             }
         });
@@ -989,51 +1003,27 @@ async fn start_with_stored_legacy_dual_role_surface(
     (h, admin.unwrap(), identities_dir)
 }
 
-/// The stored surface no longer names its inbound key, and the key's record is
-/// the Managed Agent's, with its DID kept.
-async fn assert_legacy_dual_role_taken_over(
-    h: &GatewayHarness,
-    admin: &reqwest::Client,
-    identities_dir: &str,
-    surface_id: &str,
-) {
-    let stored: serde_json::Value = admin
-        .get(format!("{}/api/v1/surfaces/{surface_id}", h.gateway_base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(stored["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
-    let records = identity_records(identities_dir);
-    let record =
-        record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the Managed Agent record");
-    assert_eq!(record.origin, Some(IdentityOrigin::Managed));
-    assert_eq!(record.did, LEGACY_DUAL_ROLE_DID);
-}
-
-/// Saving a stored surface whose inbound slot still names its Managed Agent key
-/// takes over that key's caller record and saves the surface without the id.
-/// The takeover counts under the surface name, not its id.
+/// Saving a stored surface whose Managed Agent key is also its external
+/// Identity key succeeds without a warning and drops only the stored inbound
+/// id; a tenant reassignment succeeds too, and the key's caller record keeps
+/// its DID and role.
 #[tokio::test(flavor = "multi_thread")]
-async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id() {
+async fn saving_one_key_as_managed_agent_and_caller_identity_is_accepted() {
     const SURFACE: &str = "legacy-dual-role-save";
-    let name = legacy_surface_name(SURFACE);
-    let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(SURFACE, true, None).await;
+    let (h, admin, identities_dir) = start_with_stored_shared_key_surface(SURFACE).await;
     let surface_url = format!("{}/api/v1/surfaces/{SURFACE}", h.gateway_base);
-    let mut body: serde_json::Value = admin
-        .get(&surface_url)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["name"], name.as_str());
-    body["identity_slots"]["inbound"] = json!({ "type": "from_api_key" });
-    let restamped_before = resolve_count(&name, "legacy_role_restamped");
-    let restamped_by_id_before = resolve_count(SURFACE, "legacy_role_restamped");
+    let stored = || async {
+        admin
+            .get(&surface_url)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let mut body = stored().await;
+    body["identity_slots"]["external"] = body["identity_slots"]["protected"].clone();
 
     let saved = admin
         .put(&surface_url)
@@ -1041,6 +1031,7 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
         .send()
         .await
         .unwrap();
+
     assert!(
         saved
             .headers()
@@ -1048,33 +1039,9 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
             .is_none()
     );
     assert_eq!(saved.status(), 200, "{}", saved.text().await.unwrap());
-    let again = admin
-        .put(&surface_url)
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(again.status(), 200);
-    assert!(
-        again
-            .headers()
-            .get(reqwest::header::WARNING)
-            .is_none()
-    );
-
-    assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
-    assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
-    assert_eq!(resolve_count(SURFACE, "legacy_role_restamped") - restamped_by_id_before, 0);
-}
-
-/// Reassigning the tenant of a stored surface whose inbound slot still names
-/// its Managed Agent key takes over that key's caller record too.
-#[tokio::test(flavor = "multi_thread")]
-async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id() {
-    const SURFACE: &str = "legacy-dual-role-reassign";
-    let name = legacy_surface_name(SURFACE);
-    let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(SURFACE, true, None).await;
-    let restamped_before = resolve_count(&name, "legacy_role_restamped");
+    let after = stored().await;
+    assert_eq!(after["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+    assert_eq!(after["identity_slots"]["external"], after["identity_slots"]["protected"]);
 
     let reassigned = admin
         .put(format!("{}/api/v1/tenant-ownership/surfaces/{SURFACE}", h.gateway_base))
@@ -1082,7 +1049,6 @@ async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the
         .send()
         .await
         .unwrap();
-    assert!(warning_headers(&reassigned).is_empty());
     assert_eq!(
         reassigned.status(),
         200,
@@ -1093,201 +1059,20 @@ async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the
             .unwrap()
     );
 
-    assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
-    assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
-}
-
-/// Reassigning the tenant of a stored legacy surface whose Managed Agent key
-/// record another surface's callers also used leaves the record a caller's and
-/// warns that the key stays refused.
-#[tokio::test(flavor = "multi_thread")]
-async fn reassigning_a_legacy_surface_whose_key_record_is_shared_warns() {
-    const SURFACE: &str = "legacy-dual-role-reassign-shared";
-    let (h, admin, identities_dir) =
-        start_with_stored_legacy_dual_role_surface(SURFACE, true, Some("another-caller-surface")).await;
-
-    let reassigned = admin
-        .put(format!("{}/api/v1/tenant-ownership/surfaces/{SURFACE}", h.gateway_base))
-        .json(&json!({ "tenant_id": "tenant-a" }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(warning_headers(&reassigned), vec![shared_legacy_key_warning()]);
-    assert_eq!(
-        reassigned.status(),
-        200,
-        "{}",
-        reassigned
-            .text()
-            .await
-            .unwrap()
-    );
     let records = identity_records(&identities_dir);
     let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
     assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+    assert_eq!(record.did, SHARED_KEY_DID);
 }
 
-/// Replace the record file of `key_id` with a directory of the same name, so the
-/// running gateway still reads the record from its cache but cannot write it.
-/// Returns the path and the bytes [`restore_record_file`] puts back.
-fn block_record_writes(
-    identities_dir: &str,
-    key_id: &str,
-) -> (std::path::PathBuf, Vec<u8>) {
-    let hash = api_key_identity_hash(key_id);
-    let path = [".json", ".json.enc"]
-        .iter()
-        .map(|extension| std::path::Path::new(identities_dir).join(format!("{hash}{extension}")))
-        .find(|path| path.is_file())
-        .expect("the record file");
-    let bytes = std::fs::read(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
-    (path, bytes)
-}
-
-fn restore_record_file((path, bytes): (std::path::PathBuf, Vec<u8>)) {
-    std::fs::remove_dir(&path).unwrap();
-    std::fs::write(&path, bytes).unwrap();
-}
-
-/// A save or tenant reassignment whose takeover the identity store cannot
-/// write answers 503, keeps the stored inbound id and leaves the record a
-/// caller's, so a retry once the store recovers takes the record over.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_takeover_the_identity_store_cannot_write_refuses_the_save_and_keeps_the_id() {
-    for (surface_id, reassign) in
-        [("legacy-dual-role-save-unwritable", false), ("legacy-dual-role-reassign-unwritable", true)]
-    {
-        let name = legacy_surface_name(surface_id);
-        let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(surface_id, true, None).await;
-        let surface_url = format!("{}/api/v1/surfaces/{surface_id}", h.gateway_base);
-        let tenant_url = format!("{}/api/v1/tenant-ownership/surfaces/{surface_id}", h.gateway_base);
-        let stored = || async {
-            admin
-                .get(&surface_url)
-                .send()
-                .await
-                .unwrap()
-                .json::<serde_json::Value>()
-                .await
-                .unwrap()
-        };
-        let mut body = stored().await;
-        assert_eq!(body["identity_slots"]["inbound"]["api_key_id"], LEGACY_SAVED_KEY_ID, "{surface_id}");
-        body["identity_slots"]["inbound"] = json!({ "type": "from_api_key" });
-        let send = || {
-            if reassign {
-                admin
-                    .put(&tenant_url)
-                    .json(&json!({ "tenant_id": "tenant-a" }))
-            } else {
-                admin
-                    .put(&surface_url)
-                    .json(&body)
-            }
-        };
-        let restamped_before = resolve_count(&name, "legacy_role_restamped");
-        let blocked = block_record_writes(&identities_dir, LEGACY_SAVED_KEY_ID);
-
-        let refused = send().send().await.unwrap();
-
-        assert_eq!(refused.status(), 503, "{surface_id}: {}", refused.text().await.unwrap());
-        assert_eq!(stored().await["identity_slots"]["inbound"]["api_key_id"], LEGACY_SAVED_KEY_ID, "{surface_id}");
-        restore_record_file(blocked);
-        let records = identity_records(&identities_dir);
-        let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
-        assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller), "{surface_id}");
-        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 0, "{surface_id}");
-
-        let retried = send().send().await.unwrap();
-
-        assert_eq!(retried.status(), 200, "{surface_id}: {}", retried.text().await.unwrap());
-        assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, surface_id).await;
-        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1, "{surface_id}");
-    }
-}
-
-/// The `Warning` header a save or reassignment answers with when another
-/// surface's callers used the record of [`LEGACY_SAVED_KEY_ID`].
-fn shared_legacy_key_warning() -> String {
-    format!(
-        "299 - \"API key '{LEGACY_SAVED_KEY_ID}' identifies callers of another surface, so this surface's \
-         Managed Agent or Transit Point is refused with it; issue a new API key for the Managed Agent or \
-         Transit Point\""
-    )
-}
-
-fn warning_headers(response: &reqwest::Response) -> Vec<String> {
-    response
-        .headers()
-        .get_all(reqwest::header::WARNING)
-        .iter()
-        .map(|value| {
-            value
-                .to_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect()
-}
-
-/// A save leaves the Managed Agent key's caller record alone when the key is
-/// named only by the saved body's inbound slot, or when another surface's
-/// callers also use the record, and then warns that the key stays refused.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_save_takes_over_only_a_record_the_stored_surface_alone_named() {
-    let cases: [(&'static str, bool, Option<&'static str>, u64); 2] = [
-        ("legacy-dual-role-body-only", false, None, 0),
-        ("legacy-dual-role-save-shared", true, Some("another-caller-surface"), 1),
-    ];
-    for (surface_id, stored_inbound_id, also_used_by, clashes) in cases {
-        let (h, admin, identities_dir) =
-            start_with_stored_legacy_dual_role_surface(surface_id, stored_inbound_id, also_used_by).await;
-        let surface_url = format!("{}/api/v1/surfaces/{surface_id}", h.gateway_base);
-        let mut body: serde_json::Value = admin
-            .get(&surface_url)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        body["identity_slots"]["inbound"] = json!({ "type": "from_api_key", "api_key_id": LEGACY_SAVED_KEY_ID });
-        let name = legacy_surface_name(surface_id);
-        let restamped_before = resolve_count(&name, "legacy_role_restamped");
-        let clashes_before = resolve_count(&name, "role_clash");
-
-        let saved = admin
-            .put(&surface_url)
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-
-        let expected_warnings = if clashes == 0 {
-            Vec::new()
-        } else {
-            vec![shared_legacy_key_warning()]
-        };
-        assert_eq!(warning_headers(&saved), expected_warnings, "{surface_id}");
-        assert_eq!(saved.status(), 200, "{surface_id}: {}", saved.text().await.unwrap());
-        let records = identity_records(&identities_dir);
-        let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
-        assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller), "{surface_id}");
-        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 0, "{surface_id}");
-        assert_eq!(resolve_count(&name, "role_clash") - clashes_before, clashes, "{surface_id}");
-    }
-}
-
-/// A provider key whose record already identifies a Managed Agent on another
-/// surface is refused when a caller presents it, and the record stays managed.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_key_already_identifying_a_managed_agent_is_refused_as_a_caller() {
-    const CALLER_SURFACE: &str = "role-clash-callers";
-    const POLICY: &str = "role-clash-allow-callers";
-
+/// A gateway with a caller surface on `/smoke` whose callers are identified by
+/// the key they present, and a surface on `/managed` whose Managed Agent is
+/// identified by the first of two provider keys.
+async fn start_shared_key_gateway(
+    caller_surface: &'static str,
+    managed_surface: &'static str,
+) -> (GatewayHarness, Vec<ProviderKey>, String) {
+    const POLICY: &str = "shared-key-allow-callers";
     let mut keys = Vec::new();
     let mut identities_dir = String::new();
     let h = GatewayHarness::start(|dir, gw_config, bootstrap| {
@@ -1302,11 +1087,20 @@ async fn a_key_already_identifying_a_managed_agent_is_refused_as_a_caller() {
         );
         write_policy(dir, POLICY, "package surface.policy\n\ndefault allow := true\n");
         gw_config.surfaces = vec![
-            provider_caller_surface(CALLER_SURFACE, "/smoke", POLICY, None),
-            managed_api_key_surface("role-clash-managed", "/managed", &keys[0].key_id),
+            provider_caller_surface(caller_surface, "/smoke", POLICY, None),
+            managed_api_key_surface(managed_surface, "/managed", &keys[0].key_id),
         ];
     })
     .await;
+    (h, keys, identities_dir)
+}
+
+/// A provider key that already identifies a Managed Agent on another surface
+/// is served when a caller presents it, with the Managed Agent's DID, and its
+/// record stays the Managed Agent's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_already_identifying_a_managed_agent_is_served_as_a_caller() {
+    let (h, keys, identities_dir) = start_shared_key_gateway("shared-key-callers", "shared-key-managed").await;
     let shared_hash = api_key_identity_hash(&keys[0].key_id);
 
     let managed = send_with_key(&format!("{}/managed/rpc", h.gateway_base), &keys[1].secret).await;
@@ -1316,24 +1110,40 @@ async fn a_key_already_identifying_a_managed_agent_is_refused_as_a_caller() {
     assert_eq!(managed_record.origin, Some(IdentityOrigin::Managed));
     let managed_did = managed_record.did.clone();
     let forwarded_before = forwarded(&h);
-    let clashes_before = resolve_count(CALLER_SURFACE, "role_clash");
 
-    let refused = send_with_key(&h.gateway_url, &keys[0].secret).await;
+    let caller = send_with_key(&h.gateway_url, &keys[0].secret).await;
 
-    assert_eq!(refused.status(), 500);
-    let body = refused.text().await.unwrap();
-    assert!(body.contains(CALLER_UNRESOLVED), "{body}");
-    assert_eq!(resolve_count(CALLER_SURFACE, "role_clash") - clashes_before, 1);
-    assert_eq!(forwarded(&h), forwarded_before);
-    let records = identity_records(&identities_dir);
-    let kept = record_for_hash(&records, &shared_hash).expect("the Managed Agent record");
+    assert_eq!(caller.status(), 200, "{}", caller.text().await.unwrap());
+    assert_eq!(forwarded(&h), forwarded_before + 1);
+    let after = identity_records(&identities_dir);
+    assert_eq!(after.len(), records.len(), "identity record count");
+    let kept = record_for_hash(&after, &shared_hash).expect("the Managed Agent record");
     assert_eq!(kept.origin, Some(IdentityOrigin::Managed));
     assert_eq!(kept.did, managed_did);
+}
 
-    assert_eq!(
-        send_with_key(&h.gateway_url, &keys[1].secret)
-            .await
-            .status(),
-        200
-    );
+/// A provider key that a caller presented first is served as another
+/// surface's Managed Agent key with the caller's DID, and its record stays the
+/// caller's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_already_identifying_a_caller_is_served_as_a_managed_agent() {
+    let (h, keys, identities_dir) =
+        start_shared_key_gateway("shared-key-callers-first", "shared-key-managed-second").await;
+    let shared_hash = api_key_identity_hash(&keys[0].key_id);
+
+    let caller = send_with_key(&h.gateway_url, &keys[0].secret).await;
+    assert_eq!(caller.status(), 200);
+    let records = identity_records(&identities_dir);
+    let caller_record = record_for_hash(&records, &shared_hash).expect("the caller record");
+    assert_eq!(caller_record.origin, Some(IdentityOrigin::ExternalCaller));
+    let caller_did = caller_record.did.clone();
+
+    let managed = send_with_key(&format!("{}/managed/rpc", h.gateway_base), &keys[1].secret).await;
+
+    assert_eq!(managed.status(), 200, "{}", managed.text().await.unwrap());
+    let after = identity_records(&identities_dir);
+    assert_eq!(after.len(), records.len(), "identity record count");
+    let kept = record_for_hash(&after, &shared_hash).expect("the caller record");
+    assert_eq!(kept.origin, Some(IdentityOrigin::ExternalCaller));
+    assert_eq!(kept.did, caller_did);
 }

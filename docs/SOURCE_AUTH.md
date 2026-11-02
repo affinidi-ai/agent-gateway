@@ -833,51 +833,69 @@ with `400` when:
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
 - the target is an MCP `proxy://` MCP Proxy;
 - the API Key secret id starts with `atgk_`, the prefix of API Key Provider key ids, so its
-  DID would equal that provider key's;
-- the API Key secret id is also the `api_key_id` of the protected slot or a Transit Point's
-  `managed_identity`.
+  DID would equal that provider key's.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
-`api_key_id`, and the external key cannot be a protected or Transit Point key on the same
-surface. A surface with no inbound identity whose protected slot is `from_api_key`,
+`api_key_id`. A surface with no inbound identity whose protected slot is `from_api_key`,
 `from_mtls` or `static` identifies its callers with the Managed Agent's DID, but only when the
 request body carries no identity, and never on public discovery paths.
 
-One API key cannot identify both a Managed Agent and a caller. The first request that uses an
-API key creates its identity record, in the role it is used in, only if no record exists for
-the key yet, so concurrent first requests with one key share one DID. The record then keeps
-that role, except for the one-time takeover below, and a key used in the other role, on any
-surface, is refused at request time (`role_clash`). To recover from a refused role, issue a new
-API key for the role that was refused.
+One API key has one identity record and one DID, whatever role uses it. The first request that
+uses an API key creates the record, in the role it is used in, only if no record exists for the
+key yet, so concurrent first requests with one key share one DID. The record keeps the role it
+was created in. A key used as both a Managed Agent (protected slot or Transit Point
+`managed_identity`) and a caller (presented key or external slot), on one surface or across
+surfaces, resolves to that same DID in both roles, and a save that uses one key in both roles
+is accepted. A record with no role takes the role of the next request that uses it. When only
+the role cannot be recorded, the request still resolves the record's DID; a store that cannot
+write the record fails the request.
 
-A surface can still store an inbound `api_key_id` that its inbound slot resolved as a caller.
-When that key is also the surface's Managed Agent key (protected slot) or a Transit Point's
-`managed_identity` key, the Managed Agent takes over the key's caller record, or a record of
-the key with no role, once: the role becomes Managed and the DID is kept. The takeover runs
-when the Managed Agent's response or the Transit Point's outbound request resolves the key, and
-when the surface or a variant is saved or the surface is reassigned to another tenant. It
-applies only while no other surface has used the record; a record with no recorded surface
-counts as this surface's. Otherwise a caller record stays a caller's, the save still drops the
-stored id, and the Managed Agent is refused with `role_clash`; a record with no role is left
-as it is. The save or reassignment then answers `200` with a `Warning` header naming the key
-id and the recovery:
+#### One key in both roles
 
+A caller presenting a key that also identifies a Managed Agent is identified as that Managed
+Agent. It gets the same DID, `source_auth` verification for an API Key Provider key, and the
+trust tied to that DID: policy rules, Trust Check entries, Transit Point grants, the transit
+token `sub` and the Workload Binding `userIdentity.id`. A plain API Key secret that is also the
+Managed Agent's key gives every caller the Managed Agent's DID.
+
+To refuse such callers, deny the key in the surface policy and keep the condition in every
+`allow` rule:
+
+```rego
+package surface.policy
+
+default allow := false
+
+managed_agent_key if {
+    input.source_auth.key_name == "<Managed Agent api_key_id>"
+}
+
+allow if {
+    not managed_agent_key
+}
+
+deny_reason := "The Managed Agent's API key cannot be used by a caller" if managed_agent_key
 ```
-Warning: 299 - "API key 'atgk_...' identifies callers of another surface, so this surface's Managed Agent or Transit Point is refused with it; issue a new API key for the Managed Agent or Transit Point"
-```
 
-A variant create, update, promotion or deletion answers with the same header. The dashboard
-shows it after a Surface Builder save, in the save warnings banner and a toast; it does not
-reassign tenants. Each takeover counts as `legacy_role_restamped`. When the identity store fails during
-the takeover, the request answers `503` (`identity_origin_unavailable`). A save or reassignment
-answers `503`, and keeps the stored id so it can be retried, when the identity store or the
-secrets store fails during the takeover.
+`input.source_auth.key_name` is the key id for an API Key Provider key and the `secret_id` for
+a plain API Key. Denying a plain API Key refuses every holder of that secret, so give the
+Managed Agent a separate secret. The rule refuses only the caller's request: policy input has
+nothing for the Managed Agent's own leg.
 
-After an upgrade, find the affected surfaces through
+A Managed Agent whose key a caller used first keeps the External Caller role. Its VC carries
+no name, and Agent Identities lists it as an External Caller with no surface and no Trust
+Recorder chip. Trust Recorder writes are unaffected. Issue the Managed Agent a new API key to
+give it a Managed Agent record.
+
+A caller using a Managed Agent's key on another surface that accepts it counts as a use of that
+surface. The Managed Agent is then treated as shared by several surfaces, and its name is not
+published (see [Managed agents](#managed-agents)).
+
+Find surfaces whose callers do not authenticate with an API key through
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
-`api_key_unavailable` or `role_clash`. Its `channel_id` label is the surface name on every
-path: the caller path, the Managed Agent fallback, the Managed Agent's response, a Transit
-Point's outbound request, a save and a reassignment.
+`api_key_unavailable`. Its `channel_id` label is the surface name wherever `from_api_key`
+results are counted: the caller path, the Managed Agent's response and a Transit Point's
+outbound request.
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`:
@@ -890,13 +908,6 @@ Request-time refusals return a fixed body and log the cause server-side. Each co
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 | No VC issuer is configured | `500` | `vc_issuer_missing` |
 | DID issuance fails | `502` | `vc_issuer_error` |
-| The key's identity record has no role and the role cannot be recorded | `503` | `identity_origin_unavailable` |
-| The identity store fails during the takeover of a legacy inbound key | `503` | `identity_origin_unavailable` |
-| The key already identifies the other role: a Managed Agent for a caller key, a caller for a Managed Agent or Transit Point key | `500` | `role_clash` |
-
-The no-role and role rows apply on the caller path, the Managed Agent fallback above, the
-Managed Agent's response and a Transit Point's outbound request. The takeover row applies on
-the Managed Agent's response and a Transit Point's outbound request, where the takeover runs.
 
 ### `from_jwt_claim`
 

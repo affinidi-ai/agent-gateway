@@ -1739,47 +1739,6 @@ async fn step_resolve_agent_identity(
                     ),
                 ));
             };
-            if ctx
-                .surface
-                .stores_inbound_api_key_of(managed_identity)
-            {
-                match vc_issuer
-                    .take_over_legacy_caller_api_key(&identity_hash, &ctx.surface.surface_id)
-                    .await
-                {
-                    Ok(crate::identity::LegacyCallerTakeover::TakenOver) => {
-                        crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                            &cred_id_channel,
-                            mode_label,
-                            "legacy_role_restamped",
-                            cred_id_start
-                                .elapsed()
-                                .as_secs_f64(),
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            request_id = %ctx.request_id,
-                            error = %e,
-                            "Failed to take over the legacy inbound API key identity"
-                        );
-                        crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                            &cred_id_channel,
-                            mode_label,
-                            "identity_origin_unavailable",
-                            cred_id_start
-                                .elapsed()
-                                .as_secs_f64(),
-                        );
-                        return Err(OutboundPipelineError::IdentityResolutionFailed(
-                            IdentityResolutionFailure::BackendUnavailable(format!(
-                                "Legacy inbound API key identity could not be taken over: {e}"
-                            )),
-                        ));
-                    }
-                }
-            }
             let response = vc_issuer
                 .issue_or_get_managed_credential(
                     identity_fields.clone(),
@@ -1791,30 +1750,17 @@ async fn step_resolve_agent_identity(
                 )
                 .await
                 .map_err(|e| {
-                    let role_clash = e.is::<crate::identity::IdentityRoleClash>();
-                    let origin_unavailable = e.is::<crate::identity::IdentityOriginUnavailable>();
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &cred_id_channel,
                         mode_label,
-                        if role_clash {
-                            "role_clash"
-                        } else if origin_unavailable {
-                            "identity_origin_unavailable"
-                        } else {
-                            "vc_issuer_error"
-                        },
+                        "vc_issuer_error",
                         cred_id_start
                             .elapsed()
                             .as_secs_f64(),
                     );
-                    let msg = format!("DID creation/lookup failed for credential identity: {}", e);
-                    OutboundPipelineError::IdentityResolutionFailed(if role_clash {
-                        IdentityResolutionFailure::Misconfigured(msg)
-                    } else if origin_unavailable {
-                        IdentityResolutionFailure::BackendUnavailable(msg)
-                    } else {
-                        IdentityResolutionFailure::ServiceUnavailable(msg)
-                    })
+                    OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::ServiceUnavailable(
+                        format!("DID creation/lookup failed for credential identity: {}", e),
+                    ))
                 })?;
             if response.is_new {
                 info!(
@@ -11615,185 +11561,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_step_resolve_agent_identity_refuses_an_api_key_that_identifies_a_caller() {
+    async fn test_step_resolve_agent_identity_shares_the_did_of_an_api_key_that_identifies_a_caller() {
         let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let (fields, hash) = crate::identity::credential_identity::global_resolver()
             .resolve_presented_api_key("atgk_ob_caller", true, None)
             .await
             .unwrap();
-        vc_issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+        let caller = vc_issuer
+            .issue_or_get_caller_credential(fields, Some(hash.clone()), None, None)
             .await
             .unwrap();
+        let vc_issuer = Arc::new(vc_issuer);
         let mut state = test_outbound_state();
-        state.vc_issuer = Some(Arc::new(vc_issuer));
+        state.vc_issuer = Some(vc_issuer.clone());
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
             api_key_id: Some("atgk_ob_caller".to_string()),
         });
-        let channel = ctx.surface.name.clone();
-        let role_clashes = || {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&[channel.as_str(), "from_api_key", "role_clash"])
-                .get()
-        };
-        let before = role_clashes();
-
-        let err = step_resolve_agent_identity(&state, &mut ctx)
-            .await
-            .expect_err("an API key that identifies a caller cannot be a Managed Agent key");
-
-        assert!(
-            matches!(err, OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::Misconfigured(_))),
-            "expected a misconfiguration, got {err:?}"
-        );
-        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(role_clashes() - before, 1);
-    }
-
-    #[tokio::test]
-    async fn test_step_resolve_agent_identity_refuses_a_key_whose_role_cannot_be_recorded() {
-        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
-            crate::identity::test_helpers::OriginFailingIdentityStore(
-                crate::identity::test_helpers::MockIdentityStore::new(),
-            ),
-        ))
-        .await;
-        let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_ob_origin".to_string()),
-        };
-        let Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash }) =
-            crate::identity::credential_identity::derive_credential_identity(&config, None, None)
-                .await
-                .unwrap()
-        else {
-            panic!("API key identity is derived");
-        };
-        vc_issuer
-            .issue_or_get_credential(identity_fields, Some(identity_hash), None, None)
-            .await
-            .unwrap();
-        let mut state = test_outbound_state();
-        state.vc_issuer = Some(Arc::new(vc_issuer));
-        let mut ctx = test_pipeline_context();
-        ctx.virtual_channel
-            .managed_identity = Some(config);
-        let channel = ctx.surface.name.clone();
-        let count = |result: &str| {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&[channel.as_str(), "from_api_key", result])
-                .get()
-        };
-        let (origin_before, issuer_error_before) = (count("identity_origin_unavailable"), count("vc_issuer_error"));
-
-        let err = step_resolve_agent_identity(&state, &mut ctx)
-            .await
-            .expect_err("a key whose role cannot be recorded is refused");
-
-        assert!(
-            matches!(
-                err,
-                OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::BackendUnavailable(_))
-            ),
-            "expected an unavailable identity backend, got {err:?}"
-        );
-        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(count("identity_origin_unavailable") - origin_before, 1);
-        assert_eq!(count("vc_issuer_error") - issuer_error_before, 0);
-    }
-
-    #[tokio::test]
-    async fn test_step_resolve_agent_identity_takes_over_the_legacy_inbound_key_of_a_transit_point() {
-        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
-        let (fields, hash) = crate::identity::credential_identity::global_resolver()
-            .resolve_presented_api_key("atgk_ob_legacy", true, None)
-            .await
-            .unwrap();
-        let caller = vc_issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
-            .await
-            .unwrap();
-        let mut state = test_outbound_state();
-        state.vc_issuer = Some(Arc::new(vc_issuer));
-        let mut ctx = test_pipeline_context();
-        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_ob_legacy".to_string()),
-        };
-        ctx.virtual_channel
-            .managed_identity = Some(legacy_key.clone());
         let mut surface = (*ctx.surface).clone();
-        surface.identity_slots.inbound = Some(legacy_key);
+        surface.surface_id = "ob-shared-key".to_string();
+        surface.name = "ob-shared-key-name".to_string();
         ctx.surface = Arc::new(surface);
-        let restamped = crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE.with_label_values(&[
-            ctx.surface.name.as_str(),
-            "from_api_key",
-            "legacy_role_restamped",
-        ]);
-        let before = restamped.get();
+        let count = |channel: &str, result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&[channel, "from_api_key", result])
+                .get()
+        };
 
         step_resolve_agent_identity(&state, &mut ctx)
             .await
-            .expect("the legacy inbound key resolves as the Managed Agent");
+            .expect("an API key that identifies a caller also resolves as the Managed Agent");
 
         match &ctx.resolved_identity {
             ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, &caller.did),
             ProtectedAgentIdentity::Anonymous => panic!("expected Managed identity, got Anonymous"),
         }
-        assert_eq!(restamped.get() - before, 1);
-    }
-
-    #[tokio::test]
-    async fn test_step_resolve_agent_identity_refuses_a_legacy_inbound_key_whose_takeover_cannot_be_recorded() {
-        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
-            crate::identity::test_helpers::OriginFailingIdentityStore(
-                crate::identity::test_helpers::MockIdentityStore::new(),
-            ),
-        ))
-        .await;
-        let (fields, hash) = crate::identity::credential_identity::global_resolver()
-            .resolve_presented_api_key("atgk_ob_unrecordable", true, None)
+        let record = vc_issuer
+            .get_identity_store()
+            .find_by_hash(&hash)
             .await
+            .unwrap()
             .unwrap();
-        vc_issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
-            .await
-            .unwrap();
-        let mut state = test_outbound_state();
-        state.vc_issuer = Some(Arc::new(vc_issuer));
-        let mut ctx = test_pipeline_context();
-        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_ob_unrecordable".to_string()),
-        };
-        ctx.virtual_channel
-            .managed_identity = Some(legacy_key.clone());
-        let mut surface = (*ctx.surface).clone();
-        surface.surface_id = "ob-takeover-unavailable".to_string();
-        surface.name = "ob-takeover-unavailable-name".to_string();
-        surface.identity_slots.inbound = Some(legacy_key);
-        ctx.surface = Arc::new(surface);
-        let count_under = |channel: &str, result: &str| {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&[channel, "from_api_key", result])
-                .get()
-        };
-        let count = |result: &str| count_under("ob-takeover-unavailable-name", result);
-
-        let err = step_resolve_agent_identity(&state, &mut ctx)
-            .await
-            .expect_err("a takeover the identity store cannot record is refused");
-
-        assert!(
-            matches!(
-                err,
-                OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::BackendUnavailable(_))
-            ),
-            "expected an unavailable identity backend, got {err:?}"
-        );
-        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(count("identity_origin_unavailable"), 1);
-        assert_eq!(count("role_clash"), 0);
-        assert_eq!(count_under("ob-takeover-unavailable", "identity_origin_unavailable"), 0);
+        assert_eq!(record.origin, Some(crate::identity::IdentityOrigin::ExternalCaller));
+        assert_eq!(count("ob-shared-key-name", "ok_cached"), 1);
+        assert_eq!(count("ob-shared-key", "ok_cached"), 0);
     }
 
     #[tokio::test]

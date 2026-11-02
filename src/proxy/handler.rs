@@ -10237,7 +10237,6 @@ async fn resolve_configured_caller_identity(
             }
         }
         Ok(Some(CredentialIdentity::Derived { identity_fields, identity_hash })) => {
-            let started = std::time::Instant::now();
             let Some(issuer) = state
                 .identity_selector
                 .as_ref()
@@ -10279,30 +10278,6 @@ async fn resolve_configured_caller_identity(
             };
             let response = match issued {
                 Ok(response) => response,
-                Err(e) if e.is::<crate::identity::IdentityRoleClash>() => {
-                    warn!(channel = channel_name, leg, "Managed Agent API key already identifies a caller — refused");
-                    crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                        channel_name,
-                        "from_api_key",
-                        "role_clash",
-                        started
-                            .elapsed()
-                            .as_secs_f64(),
-                    );
-                    return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
-                }
-                Err(e) if e.is::<crate::identity::IdentityOriginUnavailable>() => {
-                    warn!(channel = channel_name, leg, error = %e, "API key identity role could not be recorded — refused");
-                    crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                        channel_name,
-                        "from_api_key",
-                        "identity_origin_unavailable",
-                        started
-                            .elapsed()
-                            .as_secs_f64(),
-                    );
-                    return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, CALLER_IDENTITY_UNRESOLVED));
-                }
                 Err(e) => {
                     warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for inbound credential-based identity");
                     return Ok(None);
@@ -10455,16 +10430,6 @@ async fn resolve_presented_api_key_identity(
         .await
     {
         Ok(response) => response,
-        Err(e) if e.is::<crate::identity::IdentityRoleClash>() => {
-            warn!(channel = channel_name, leg, "Caller API key already identifies a Managed Agent — refused");
-            track("role_clash");
-            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
-        }
-        Err(e) if e.is::<crate::identity::IdentityOriginUnavailable>() => {
-            warn!(channel = channel_name, leg, error = %e, "Caller API key identity role could not be recorded — refused");
-            track("identity_origin_unavailable");
-            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, CALLER_IDENTITY_UNRESOLVED));
-        }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for the presented API key");
             track("vc_issuer_error");
@@ -21825,45 +21790,48 @@ allow if {
             assert_eq!(resolve_count("pak-issuer-error", "vc_issuer_error"), 1);
         }
 
+        async fn origin_of(
+            state: &crate::state::ProxyState,
+            hash: &str,
+        ) -> Option<IdentityOrigin> {
+            state
+                .vc_issuer
+                .as_ref()
+                .unwrap()
+                .get_identity_store()
+                .find_by_hash(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin
+        }
+
         #[tokio::test]
-        async fn caller_key_of_a_managed_agent_is_refused() {
+        async fn caller_key_of_a_managed_agent_shares_its_did_and_role() {
             let (issuer, _dir) = test_vc_issuer().await;
             let (fields, hash) = crate::identity::credential_identity::global_resolver()
                 .resolve_presented_api_key("atgk_pak_managed", true, None)
                 .await
                 .unwrap();
             let managed = issuer
-                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-clash".into()), None)
+                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-shared".into()), None)
                 .await
                 .unwrap();
-            let state = state_with(inbound_from_api_key("pak-clash"), Some(issuer));
+            let state = state_with(inbound_from_api_key("pak-shared"), Some(issuer));
 
-            let response = resolve(&state, Some(&provider_key("atgk_pak_managed")), false)
-                .await
-                .unwrap_err();
-
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(
-                body_text(response)
-                    .await
-                    .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
-            );
-            assert_eq!(resolve_count("pak-clash", "role_clash"), 1);
-            let record = state
-                .vc_issuer
-                .as_ref()
-                .unwrap()
-                .get_identity_store()
-                .find_by_hash(&hash)
+            let result = resolve(&state, Some(&provider_key("atgk_pak_managed")), false)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(record.did, managed.did);
-            assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+
+            assert_eq!(result.did, managed.did);
+            assert!(!result.is_new);
+            assert_eq!(origin_of(&state, &hash).await, Some(IdentityOrigin::Managed));
+            assert_eq!(resolve_count("pak-shared", "ok_cached"), 1);
         }
 
         #[tokio::test]
-        async fn plain_key_of_a_managed_agent_is_refused() {
+        async fn plain_key_of_a_managed_agent_shares_its_did() {
             let (issuer, _dir) = test_vc_issuer().await;
             let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
                 crate::integrations::definitions::test_secrets::Secrets(vec![("pak-shared-secret", None, "v1")]),
@@ -21883,24 +21851,25 @@ allow if {
             else {
                 panic!("API key identity is derived");
             };
-            issuer
+            let managed = issuer
                 .issue_or_get_managed_credential(
                     identity_fields,
-                    Some(identity_hash),
-                    Some("pak-plain-clash".into()),
+                    Some(identity_hash.clone()),
+                    Some("pak-plain-shared".into()),
                     None,
                 )
                 .await
                 .unwrap();
-            let mut state = state_with(inbound_from_api_key("pak-plain-clash"), Some(issuer));
+            let mut state = state_with(inbound_from_api_key("pak-plain-shared"), Some(issuer));
             state.secrets_store = Some(secrets);
 
-            let response = resolve(&state, Some(&plain_key("pak-shared-secret")), false)
+            let result = resolve(&state, Some(&plain_key("pak-shared-secret")), false)
                 .await
-                .unwrap_err();
+                .unwrap()
+                .unwrap();
 
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(resolve_count("pak-plain-clash", "role_clash"), 1);
+            assert_eq!(result.did, managed.did);
+            assert_eq!(origin_of(&state, &identity_hash).await, Some(IdentityOrigin::Managed));
         }
 
         async fn issuer_that_cannot_record_origins() -> (crate::identity::VCIssuer, tempfile::TempDir) {
@@ -21913,79 +21882,41 @@ allow if {
         }
 
         #[tokio::test]
-        async fn caller_key_whose_role_cannot_be_recorded_is_refused() {
+        async fn caller_key_whose_role_cannot_be_recorded_resolves() {
             let (issuer, _dir) = issuer_that_cannot_record_origins().await;
             let (fields, hash) = crate::identity::credential_identity::global_resolver()
                 .resolve_presented_api_key("atgk_pak_origin_caller", true, None)
                 .await
                 .unwrap();
-            issuer
+            let legacy = issuer
                 .issue_or_get_credential(fields, Some(hash), Some("pak-origin-caller".into()), None)
                 .await
                 .unwrap();
             let state = state_with(inbound_from_api_key("pak-origin-caller"), Some(issuer));
 
-            let response = resolve(&state, Some(&provider_key("atgk_pak_origin_caller")), false)
+            let result = resolve(&state, Some(&provider_key("atgk_pak_origin_caller")), false)
                 .await
-                .unwrap_err();
+                .unwrap()
+                .unwrap();
 
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                body_text(response)
-                    .await
-                    .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
-            );
-            assert_eq!(resolve_count("pak-origin-caller", "identity_origin_unavailable"), 1);
+            assert_eq!(result.did, legacy.did);
+            assert_eq!(resolve_count("pak-origin-caller", "ok_cached"), 1);
             assert_eq!(resolve_count("pak-origin-caller", "vc_issuer_error"), 0);
         }
 
         #[tokio::test]
-        async fn managed_key_whose_role_cannot_be_recorded_is_refused() {
-            let (issuer, _dir) = issuer_that_cannot_record_origins().await;
-            let config = ManagedIdentityConfig::FromApiKey {
-                api_key_id: Some("atgk_pak_origin_managed".into()),
-            };
-            let Some(crate::identity::credential_identity::CredentialIdentity::Derived {
-                identity_fields,
-                identity_hash,
-            }) = crate::identity::credential_identity::derive_credential_identity(&config, None, None)
-                .await
-                .unwrap()
-            else {
-                panic!("API key identity is derived");
-            };
-            issuer
-                .issue_or_get_credential(identity_fields, Some(identity_hash), Some("pak-origin-managed".into()), None)
-                .await
-                .unwrap();
-            let state = state_with(surface_with("pak-origin-managed", None, Some(config)), Some(issuer));
-
-            let response = resolve(&state, None, false)
-                .await
-                .unwrap_err();
-
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                body_text(response)
-                    .await
-                    .contains(super::super::CALLER_IDENTITY_UNRESOLVED)
-            );
-            assert_eq!(resolve_count("pak-origin-managed", "identity_origin_unavailable"), 1);
-        }
-
-        #[tokio::test]
-        async fn managed_key_of_a_caller_is_refused() {
+        async fn managed_key_of_a_caller_shares_its_did_and_role() {
             let (issuer, _dir) = test_vc_issuer().await;
             let (fields, hash) = crate::identity::credential_identity::global_resolver()
                 .resolve_presented_api_key("atgk_pak_caller", true, None)
                 .await
                 .unwrap();
-            issuer
-                .issue_or_get_caller_credential(fields, Some(hash.clone()), Some("pak-clash-managed".into()), None)
+            let caller = issuer
+                .issue_or_get_caller_credential(fields, Some(hash.clone()), Some("pak-shared-managed".into()), None)
                 .await
                 .unwrap();
             let surface = surface_with(
-                "pak-clash-managed",
+                "pak-shared-managed",
                 None,
                 Some(ManagedIdentityConfig::FromApiKey {
                     api_key_id: Some("atgk_pak_caller".into()),
@@ -21993,22 +21924,13 @@ allow if {
             );
             let state = state_with(surface, Some(issuer));
 
-            let response = resolve(&state, None, false)
-                .await
-                .unwrap_err();
-
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(resolve_count("pak-clash-managed", "role_clash"), 1);
-            let record = state
-                .vc_issuer
-                .as_ref()
-                .unwrap()
-                .get_identity_store()
-                .find_by_hash(&hash)
+            let result = resolve(&state, None, false)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+
+            assert_eq!(result.did, caller.did);
+            assert_eq!(origin_of(&state, &hash).await, Some(IdentityOrigin::ExternalCaller));
         }
 
         #[tokio::test]

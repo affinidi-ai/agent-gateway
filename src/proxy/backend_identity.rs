@@ -524,36 +524,6 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
-                if slot == IdentitySlot::Protected && surface.stores_inbound_api_key_of(cfg) {
-                    match vc_issuer
-                        .take_over_legacy_caller_api_key(&identity_hash, &surface.surface_id)
-                        .await
-                    {
-                        Ok(crate::identity::LegacyCallerTakeover::TakenOver) => {
-                            crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                                channel_name,
-                                mode_label,
-                                "legacy_role_restamped",
-                                started
-                                    .elapsed()
-                                    .as_secs_f64(),
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(channel = channel_name, error = %e, "Failed to take over the legacy inbound API key identity");
-                            crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                                channel_name,
-                                mode_label,
-                                "identity_origin_unavailable",
-                                started
-                                    .elapsed()
-                                    .as_secs_f64(),
-                            );
-                            return Err(IdentityResolutionError::IdentityBackendUnavailable(e.to_string()));
-                        }
-                    }
-                }
                 match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
                     .await
                 {
@@ -585,26 +555,15 @@ pub async fn resolve_agent_identity_for_slot(
                         });
                     }
                     Err(e) => {
-                        let role_clash = e.is::<crate::identity::IdentityRoleClash>();
                         crate::metrics::backends::prometheus::track_managed_identity_resolve(
                             channel_name,
                             mode_label,
-                            if role_clash {
-                                "role_clash"
-                            } else if e.is::<crate::identity::IdentityOriginUnavailable>() {
-                                "identity_origin_unavailable"
-                            } else {
-                                "vc_issuer_error"
-                            },
+                            "vc_issuer_error",
                             started
                                 .elapsed()
                                 .as_secs_f64(),
                         );
-                        return Err(if role_clash {
-                            IdentityResolutionError::DidCreationFailed(e.to_string())
-                        } else {
-                            IdentityResolutionError::IdentityBackendUnavailable(e.to_string())
-                        });
+                        return Err(IdentityResolutionError::IdentityBackendUnavailable(e.to_string()));
                     }
                 }
             }
@@ -1253,18 +1212,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_api_key_of_a_caller_is_a_misconfiguration() {
+    async fn protected_api_key_of_a_caller_shares_its_did_and_role() {
         let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let (fields, hash) = crate::identity::credential_identity::global_resolver()
             .resolve_presented_api_key("atgk_bi_caller", true, None)
             .await
             .unwrap();
-        issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+        let caller = issuer
+            .issue_or_get_caller_credential(fields, Some(hash.clone()), None, None)
             .await
             .unwrap();
+        let issuer = Arc::new(issuer);
         let selector =
-            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), issuer.clone()).unwrap());
         let mut surface = crate::config::agent_surface::AgentSurface::default();
         surface
             .identity_slots
@@ -1277,25 +1237,34 @@ mod tests {
             &surface,
             Some(&selector),
             None,
-            "bi-role-clash",
+            "bi-shared-key",
             IdentityResponseKind::Message,
             None,
         )
         .await;
 
-        let err = resolved.unwrap_err();
-        assert!(matches!(err, IdentityResolutionError::DidCreationFailed(_)), "{err:?}");
-        assert_eq!(err.http_status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
+        match resolved.unwrap() {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, caller.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected the Managed Agent identity"),
+        }
+        let record = issuer
+            .get_identity_store()
+            .find_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(crate::identity::IdentityOrigin::ExternalCaller));
+        let count = |result: &str| {
             crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&["bi-role-clash", "from_api_key", "role_clash"])
-                .get(),
-            1
-        );
+                .with_label_values(&["bi-shared-key", "from_api_key", result])
+                .get()
+        };
+        assert_eq!(count("ok_cached"), 1);
+        assert_eq!(count("vc_issuer_error"), 0);
     }
 
     #[tokio::test]
-    async fn protected_api_key_whose_role_cannot_be_recorded_is_unavailable() {
+    async fn protected_api_key_resolves_when_its_role_cannot_be_recorded() {
         let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
             crate::identity::test_helpers::OriginFailingIdentityStore(
                 crate::identity::test_helpers::MockIdentityStore::new(),
@@ -1312,7 +1281,7 @@ mod tests {
         else {
             panic!("API key identity is derived");
         };
-        issuer
+        let legacy = issuer
             .issue_or_get_credential(identity_fields, Some(identity_hash), None, None)
             .await
             .unwrap();
@@ -1328,118 +1297,16 @@ mod tests {
             &surface,
             Some(&selector),
             None,
-            "bi-origin-unavailable",
-            IdentityResponseKind::Message,
-            None,
-        )
-        .await;
-
-        let err = resolved.unwrap_err();
-        assert!(matches!(err, IdentityResolutionError::IdentityBackendUnavailable(_)), "{err:?}");
-        assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        let count = |result: &str| {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&["bi-origin-unavailable", "from_api_key", result])
-                .get()
-        };
-        assert_eq!(count("identity_origin_unavailable"), 1);
-        assert_eq!(count("vc_issuer_error"), 0);
-    }
-
-    #[tokio::test]
-    async fn protected_api_key_the_inbound_slot_still_names_is_taken_over() {
-        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
-        let (fields, hash) = crate::identity::credential_identity::global_resolver()
-            .resolve_presented_api_key("atgk_bi_legacy", true, None)
-            .await
-            .unwrap();
-        let caller = issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
-            .await
-            .unwrap();
-        let selector =
-            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
-        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_bi_legacy".to_string()),
-        };
-        let mut surface = crate::config::agent_surface::AgentSurface::default();
-        surface
-            .identity_slots
-            .protected = Some(legacy_key.clone());
-        surface.identity_slots.inbound = Some(legacy_key);
-
-        let resolved = resolve_protected_agent_identity(
-            br#"{"name":"agent"}"#,
-            &surface,
-            Some(&selector),
-            None,
-            "bi-legacy-restamp",
+            "bi-origin-unrecorded",
             IdentityResponseKind::Message,
             None,
         )
         .await;
 
         match resolved.unwrap() {
-            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, caller.did),
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, legacy.did),
             ProtectedAgentIdentity::Anonymous => panic!("expected the Managed Agent identity"),
         }
-        let count = |result: &str| {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&["bi-legacy-restamp", "from_api_key", result])
-                .get()
-        };
-        assert_eq!(count("legacy_role_restamped"), 1);
-        assert_eq!(count("role_clash"), 0);
-    }
-
-    #[tokio::test]
-    async fn protected_api_key_whose_takeover_cannot_be_recorded_is_unavailable() {
-        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
-            crate::identity::test_helpers::OriginFailingIdentityStore(
-                crate::identity::test_helpers::MockIdentityStore::new(),
-            ),
-        ))
-        .await;
-        let (fields, hash) = crate::identity::credential_identity::global_resolver()
-            .resolve_presented_api_key("atgk_bi_unrecordable", true, None)
-            .await
-            .unwrap();
-        issuer
-            .issue_or_get_caller_credential(fields, Some(hash), None, None)
-            .await
-            .unwrap();
-        let selector =
-            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
-        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_bi_unrecordable".to_string()),
-        };
-        let mut surface = crate::config::agent_surface::AgentSurface::default();
-        surface
-            .identity_slots
-            .protected = Some(legacy_key.clone());
-        surface.identity_slots.inbound = Some(legacy_key);
-
-        let resolved = resolve_protected_agent_identity(
-            br#"{"name":"agent"}"#,
-            &surface,
-            Some(&selector),
-            None,
-            "bi-takeover-unavailable",
-            IdentityResponseKind::Message,
-            None,
-        )
-        .await;
-
-        let err = resolved.unwrap_err();
-        assert!(matches!(err, IdentityResolutionError::IdentityBackendUnavailable(_)), "{err:?}");
-        assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        let count = |result: &str| {
-            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
-                .with_label_values(&["bi-takeover-unavailable", "from_api_key", result])
-                .get()
-        };
-        assert_eq!(count("identity_origin_unavailable"), 1);
-        assert_eq!(count("role_clash"), 0);
     }
 
     #[test]

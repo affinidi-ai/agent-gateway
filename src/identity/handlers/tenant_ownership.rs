@@ -33,7 +33,6 @@ pub enum OwnershipApiError {
     Conflict(OwnershipConflictResponse),
     Refused(String),
     Internal(String),
-    Unavailable(String),
 }
 
 impl IntoResponse for OwnershipApiError {
@@ -57,14 +56,6 @@ impl IntoResponse for OwnershipApiError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": "Tenant ownership operation failed" })),
-                )
-                    .into_response()
-            }
-            Self::Unavailable(message) => {
-                tracing::error!(%message, "Tenant ownership operation unavailable");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({ "error": "Tenant ownership operation unavailable" })),
                 )
                     .into_response()
             }
@@ -203,7 +194,7 @@ pub async fn reassign_ownership(
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
     Json(request): Json<ReassignOwnershipRequest>,
-) -> Result<(axum::http::HeaderMap, Json<OwnershipReassignmentResponse>), OwnershipApiError> {
+) -> Result<Json<OwnershipReassignmentResponse>, OwnershipApiError> {
     if context.is_some() || scope.is_some() {
         return Err(OwnershipApiError::Forbidden(
             "Resource-scoped access tokens cannot reassign tenant ownership".to_string(),
@@ -252,17 +243,14 @@ pub async fn reassign_ownership(
             .as_ref()
             .map(|Extension(delegation)| delegation.token_id.as_str()),
     );
-    let takeover_warnings = persist_tenant_id(&state, kind, &id, request.tenant_id.clone(), actor.as_ref()).await?;
+    persist_tenant_id(&state, kind, &id, request.tenant_id.clone(), actor.as_ref()).await?;
 
-    Ok((
-        super::surfaces::warning_headers(takeover_warnings),
-        Json(OwnershipReassignmentResponse {
-            kind: kind.to_string(),
-            id,
-            previous_tenant_id,
-            tenant_id: request.tenant_id,
-        }),
-    ))
+    Ok(Json(OwnershipReassignmentResponse {
+        kind: kind.to_string(),
+        id,
+        previous_tenant_id,
+        tenant_id: request.tenant_id,
+    }))
 }
 
 fn parse_owned_kind(raw: &str) -> Result<ResourceKind, OwnershipApiError> {
@@ -911,16 +899,13 @@ fn reassignment_conflicts(
         .collect()
 }
 
-/// Returns the warnings of the legacy API keys a surface reassignment left
-/// refused.
 async fn persist_tenant_id(
     state: &IdentityApiState,
     kind: ResourceKind,
     id: &str,
     tenant_id: Option<String>,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
-) -> Result<Vec<String>, OwnershipApiError> {
-    let mut takeover_warnings = Vec::new();
+) -> Result<(), OwnershipApiError> {
     match kind {
         ResourceKind::Gateways => {
             let store = state
@@ -958,7 +943,6 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
-            let legacy_api_key_ids = super::surfaces::legacy_inbound_api_key_ids(&resource, &resource);
             super::surfaces::drop_inbound_api_key_ids(&mut resource);
             if resource.tenant_id != tenant_id {
                 resource.tenant_id = tenant_id;
@@ -974,10 +958,6 @@ async fn persist_tenant_id(
                     super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
                     other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
                 })?;
-            takeover_warnings =
-                super::surfaces::take_over_legacy_inbound_api_keys(state, &resource, &legacy_api_key_ids)
-                    .await
-                    .map_err(OwnershipApiError::Unavailable)?;
             let allowlist = crate::egress::bdd_egress_allowlist();
             super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
@@ -1229,7 +1209,7 @@ async fn persist_tenant_id(
             return Err(OwnershipApiError::BadRequest(format!("{} cannot be reassigned directly", kind)));
         }
     }
-    Ok(takeover_warnings)
+    Ok(())
 }
 
 fn endpoint(

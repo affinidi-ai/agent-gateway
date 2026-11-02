@@ -20,7 +20,9 @@ changes:
         key, reported to policy as `source_auth`; a plain API Key gives one DID per secret,
         shared by everyone holding it and reported as `unverified`. A failed or revoked key
         resolves no caller identity. The inbound slot stores no key id; a stored one is
-        ignored and dropped on save.
+        ignored and dropped on save. A key that also identifies a Managed Agent resolves to
+        that Managed Agent's DID for its callers, and a surface policy on
+        `input.source_auth.key_name` refuses it.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Stop asking for an API key on the inbound Identity in the Surface Builder
       description: >-
@@ -70,11 +72,8 @@ changes:
         API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
         it, on the surface or an enabled variant, is refused with 400, as is combining it with
         `mcp_http.authorization`. A missing VC issuer returns 500 and an issuance failure 502.
-        When an API key identity record has no role and the role cannot be recorded, the
-        request returns 503 (metric `identity_origin_unavailable`) on the caller path, the
-        Managed Agent fallback, the Managed Agent's response and a Transit Point's outbound
-        request. Find affected surfaces through `agent_gateway_managed_identity_resolve_total`
-        with `mode="from_api_key"` and `result` `api_key_unavailable`.
+        Find affected surfaces through `agent_gateway_managed_identity_resolve_total` with
+        `mode="from_api_key"` and `result` `api_key_unavailable`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching
       description: >-
@@ -85,27 +84,6 @@ changes:
         Caller Context secret id, callers now get that secret's DID instead of the stored
         key's, and the stored id is dropped on save. Re-grant or update rules for the affected
         keys.
-    - timestamp: '2026-11-02T00:00:00Z'
-      title: Refuse one API key identifying both a Managed Agent and a caller
-      description: >-
-        A caller could otherwise share a Managed Agent's DID and the trust attached to it.
-        Save refuses with 400 a surface that names one key in both roles, such as a Managed
-        Agent `api_key_id` equal to the external Identity's key or the plain API Key secret
-        id. An API key's identity record keeps the role it was first used in, and whichever
-        role resolves the key second, on any surface, gets 500 (metric `role_clash`), on the
-        caller path and the Managed Agent paths alike. To recover, issue a new API key for the
-        refused role. When a surface still stores an inbound key id that is also its Managed
-        Agent or a Transit Point key, the Managed Agent takes over that key's caller record, or
-        its record with no role, once, keeping its DID, at request time or when the surface is
-        saved or reassigned, provided no other surface has used the record (metric
-        `legacy_role_restamped`). When another surface has used it, the save or reassignment
-        answers 200 with a `Warning` header naming the key id and telling the operator to
-        issue a new API key for the Managed Agent or Transit Point. A request returns 503
-        (metric `identity_origin_unavailable`) when the identity store fails during the takeover, and a save or reassignment returns
-        503 and keeps the stored id when the identity or secrets store fails during it. Find
-        affected surfaces through
-        `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
-        `role_clash`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse From API Key on an MCP proxy:// surface when it is saved again
       description: >-

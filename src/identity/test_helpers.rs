@@ -177,31 +177,10 @@ impl IdentityStore for MockIdentityStore {
                 .get_or_insert(origin),
         ))
     }
-
-    async fn replace_origin(
-        &self,
-        identity_hash: &str,
-        surface_id: &str,
-        from: Option<IdentityOrigin>,
-        to: IdentityOrigin,
-    ) -> Result<bool> {
-        let mut records = self.records.write().await;
-        match records.get_mut(identity_hash) {
-            Some(record) if record.origin == from && record.used_only_by(surface_id) => {
-                record.origin = Some(to);
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
 }
 
 /// A [`MockIdentityStore`] that cannot record an identity origin.
 pub struct OriginFailingIdentityStore(pub MockIdentityStore);
-
-impl OriginFailingIdentityStore {
-    pub const DETAIL: &'static str = "origin store unavailable";
-}
 
 #[async_trait]
 impl IdentityStore for OriginFailingIdentityStore {
@@ -259,17 +238,7 @@ impl IdentityStore for OriginFailingIdentityStore {
         _identity_hash: &str,
         _origin: IdentityOrigin,
     ) -> Result<Option<IdentityOrigin>> {
-        Err(anyhow::anyhow!(Self::DETAIL))
-    }
-
-    async fn replace_origin(
-        &self,
-        _identity_hash: &str,
-        _surface_id: &str,
-        _from: Option<IdentityOrigin>,
-        _to: IdentityOrigin,
-    ) -> Result<bool> {
-        Err(anyhow::anyhow!(Self::DETAIL))
+        Err(anyhow::anyhow!("origin store unavailable"))
     }
 }
 

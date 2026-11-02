@@ -138,7 +138,6 @@ pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
 pub(crate) const INBOUND_API_KEY_RESERVED_SECRET_ID: &str = "The API Key Caller Context secret id starts with the \
      reserved 'atgk_' prefix, so Identity 'From API Key' cannot identify its callers; use a secret id without it";
 pub(crate) const API_KEY_IDENTITY_NEEDS_ID: &str = "Identity 'From API Key' needs a non-empty api_key_id";
-pub(crate) const API_KEY_IDENTIFIES_BOTH_ROLES: &str = "one API key cannot identify both a Managed Agent and a caller";
 
 /// The inbound slot identifies each caller by the key it presents, so a stored
 /// `api_key_id` there is never read. Variants replace `identity_slots`
@@ -160,178 +159,6 @@ pub(crate) fn drop_inbound_api_key_ids(surface: &mut AgentSurface) {
     }
 }
 
-/// The inbound API key ids `stored` still holds that `saved` also uses as its
-/// Managed Agent or a Transit Point key, across the base and every variant.
-pub(crate) fn legacy_inbound_api_key_ids(
-    stored: &AgentSurface,
-    saved: &AgentSurface,
-) -> Vec<String> {
-    use crate::source_auth::ManagedIdentityConfig::FromApiKey;
-    let key_of = |identity: Option<&crate::source_auth::ManagedIdentityConfig>| match identity {
-        Some(FromApiKey { api_key_id: Some(id) }) => Some(id.clone()),
-        _ => None,
-    };
-    let variant_slots = |surface: &AgentSurface| {
-        surface
-            .variants
-            .iter()
-            .filter_map(|variant| {
-                variant
-                    .overrides
-                    .identity_slots
-                    .clone()
-            })
-            .collect::<Vec<_>>()
-    };
-    let variant_points = saved
-        .variants
-        .iter()
-        .filter_map(|variant| {
-            variant
-                .overrides
-                .transit
-                .as_ref()
-                .and_then(|transit| transit.points.as_ref())
-        })
-        .flatten();
-    let managed_keys: Vec<String> = std::iter::once(key_of(
-        saved
-            .managed_identity()
-            .as_ref(),
-    ))
-    .chain(
-        saved
-            .transit_points()
-            .iter()
-            .chain(variant_points)
-            .map(|point| {
-                key_of(
-                    point
-                        .managed_identity
-                        .as_ref(),
-                )
-            }),
-    )
-    .chain(
-        variant_slots(saved)
-            .iter()
-            .map(|slots| key_of(slots.protected.as_ref())),
-    )
-    .flatten()
-    .collect();
-    let mut legacy: Vec<String> = std::iter::once(key_of(
-        stored
-            .identity_slots
-            .inbound
-            .as_ref(),
-    ))
-    .chain(
-        variant_slots(stored)
-            .iter()
-            .map(|slots| key_of(slots.inbound.as_ref())),
-    )
-    .flatten()
-    .filter(|id| managed_keys.contains(id))
-    .collect();
-    legacy.sort_unstable();
-    legacy.dedup();
-    legacy
-}
-
-fn legacy_takeover_unavailable(detail: String) -> SurfaceApiError {
-    error!(error = %detail, "Legacy inbound API key takeover failed");
-    SurfaceApiError::Unavailable("The identity store is unavailable; retry the save".to_string())
-}
-
-/// Re-stamp as managed, once, each API key identity in `api_key_ids` that the
-/// inbound slot of `surface` recorded as a caller. Errors when the identity
-/// store or a key's secret cannot be read, so the save keeps the stored id the
-/// runtime takeover reads. Outcomes are counted under the surface name, as the
-/// request path counts them. Returns a warning for each key left refused
-/// because another surface used its record.
-pub(crate) async fn take_over_legacy_inbound_api_keys(
-    state: &IdentityApiState,
-    surface: &AgentSurface,
-    api_key_ids: &[String],
-) -> Result<Vec<String>, String> {
-    use crate::identity::LegacyCallerTakeover;
-    let surface_id = surface.surface_id.as_str();
-    let mut warnings = Vec::new();
-    for api_key_id in api_key_ids {
-        let started = std::time::Instant::now();
-        let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some(api_key_id.clone()),
-        };
-        let identity_hash = match crate::identity::credential_identity::derive_credential_identity(
-            &config,
-            state
-                .certificate_store
-                .as_ref(),
-            state.secrets_store.as_ref(),
-        )
-        .await
-        {
-            Ok(Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_hash, .. })) => {
-                identity_hash
-            }
-            Ok(_) => continue,
-            Err(e)
-                if e.classify()
-                    == crate::identity::credential_identity::CredentialIdentityErrorClass::BackendUnavailable =>
-            {
-                return Err(format!("legacy inbound API key identity could not be derived: {e}"));
-            }
-            Err(e) => {
-                warn!(surface_id, error = %e, "Legacy inbound API key identity could not be derived — not taken over");
-                continue;
-            }
-        };
-        let outcome = state
-            .vc_issuer
-            .take_over_legacy_caller_api_key(&identity_hash, surface_id)
-            .await
-            .map_err(|e| format!("legacy inbound API key identity could not be taken over: {e}"))?;
-        let result = match outcome {
-            LegacyCallerTakeover::TakenOver => "legacy_role_restamped",
-            LegacyCallerTakeover::SharedWithAnotherSurface => {
-                warnings.push(shared_legacy_api_key_warning(api_key_id));
-                "role_clash"
-            }
-            LegacyCallerTakeover::NotApplicable => continue,
-        };
-        crate::metrics::backends::prometheus::track_managed_identity_resolve(
-            &surface.name,
-            "from_api_key",
-            result,
-            started
-                .elapsed()
-                .as_secs_f64(),
-        );
-    }
-    Ok(warnings)
-}
-
-fn shared_legacy_api_key_warning(api_key_id: &str) -> String {
-    format!(
-        "API key '{api_key_id}' identifies callers of another surface, so this surface's Managed Agent or \
-         Transit Point is refused with it; issue a new API key for the Managed Agent or Transit Point"
-    )
-}
-
-/// `Warning` headers (code 299), one per message.
-pub(crate) fn warning_headers(warnings: impl IntoIterator<Item = String>) -> axum::http::HeaderMap {
-    let mut headers = axum::http::HeaderMap::new();
-    for warning in warnings {
-        let quoted = warning
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")) {
-            headers.append(axum::http::header::WARNING, value);
-        }
-    }
-    headers
-}
-
 fn configured_api_key_id<'a>(
     identity: Option<&'a crate::source_auth::ManagedIdentityConfig>,
     slot: &str,
@@ -347,9 +174,8 @@ fn configured_api_key_id<'a>(
 }
 
 /// Refuse `from_api_key` identities the request path cannot resolve: an
-/// inbound slot whose callers do not authenticate with an API key, a stored
-/// slot without a key, and one key serving as both a Managed Agent identity
-/// and a caller identity.
+/// inbound slot whose callers do not authenticate with an API key, and a
+/// stored slot without a key.
 fn validate_api_key_identities(
     surface: &AgentSurface,
     label: &str,
@@ -395,41 +221,23 @@ fn validate_api_key_identities(
     }
 
     let protected = surface.managed_identity();
-    let mut managed_keys: Vec<&str> = configured_api_key_id(protected.as_ref(), "identity_slots.protected")
-        .map_err(|message| refuse(&message))?
-        .into_iter()
-        .collect();
+    configured_api_key_id(protected.as_ref(), "identity_slots.protected").map_err(|message| refuse(&message))?;
     for point in surface
         .transit
         .iter()
         .flat_map(|transit| transit.points.iter())
     {
         let slot = format!("transit.points['{}'].managed_identity", point.alias);
-        managed_keys.extend(
-            configured_api_key_id(
-                point
-                    .managed_identity
-                    .as_ref(),
-                &slot,
-            )
-            .map_err(|message| refuse(&message))?,
-        );
+        configured_api_key_id(
+            point
+                .managed_identity
+                .as_ref(),
+            &slot,
+        )
+        .map_err(|message| refuse(&message))?;
     }
-    let mut caller_keys: Vec<&str> = configured_api_key_id(surface.external_identity(), "identity_slots.external")
-        .map_err(|message| refuse(&message))?
-        .into_iter()
-        .collect();
-    if inbound_from_api_key && let Some(SourceAuthConfig::ApiKey(config)) = surface.source_auth() {
-        caller_keys.push(&config.secret_id);
-    }
-    if let Some(key) = managed_keys
-        .iter()
-        .find(|key| caller_keys.contains(key))
-    {
-        return Err(refuse(&format!(
-            "API key '{key}' is set as both a Managed Agent and a caller identity; {API_KEY_IDENTIFIES_BOTH_ROLES}"
-        )));
-    }
+    configured_api_key_id(surface.external_identity(), "identity_slots.external")
+        .map_err(|message| refuse(&message))?;
     Ok(())
 }
 
@@ -1272,13 +1080,12 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
-    takeover_warnings: Vec<String>,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let mut headers = axum::http::HeaderMap::new();
-    for warning in takeover_warnings
+    for warning in surface
+        .access_point_warnings()
         .into_iter()
-        .chain(surface.access_point_warnings())
         .chain(
             crate::proxy::server::open_transit_points(&state.network_config, surface)
                 .iter()
@@ -2627,7 +2434,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, save_warnings(&state, &surface, Vec::new()).await, Json(surface.into())))
+    Ok((StatusCode::CREATED, save_warnings(&state, &surface).await, Json(surface.into())))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -2715,7 +2522,7 @@ pub async fn update_surface(
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -2726,7 +2533,7 @@ pub async fn update_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -3501,7 +3308,7 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
-) -> Result<(AgentSurface, Vec<String>), SurfaceApiError> {
+) -> Result<AgentSurface, SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -3580,14 +3387,6 @@ async fn validate_and_save_surface(
     let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    let takeover_warnings = match existing {
-        Some(stored) => {
-            take_over_legacy_inbound_api_keys(state, &surface, &legacy_inbound_api_key_ids(stored, &surface))
-                .await
-                .map_err(legacy_takeover_unavailable)?
-        }
-        None => Vec::new(),
-    };
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
         store.clone(),
@@ -3619,7 +3418,7 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((surface, takeover_warnings))
+    Ok(surface)
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
@@ -3720,7 +3519,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3731,7 +3530,7 @@ pub async fn patch_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -3816,7 +3615,7 @@ pub async fn patch_variant(
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3827,7 +3626,7 @@ pub async fn patch_variant(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -4473,7 +4272,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4493,7 +4292,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut warnings = save_warnings(&state, &saved, takeover_warnings).await;
+    let mut warnings = save_warnings(&state, &saved).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
         warnings.append(axum::http::header::WARNING, value);
     }
@@ -4629,7 +4428,7 @@ pub async fn update_variant(
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4655,7 +4454,7 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(SurfaceResponse::variant(updated, &saved))))
+    Ok((save_warnings(&state, &saved).await, Json(SurfaceResponse::variant(updated, &saved))))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -4670,7 +4469,7 @@ pub async fn delete_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
-) -> Result<(axum::http::HeaderMap, Json<DeleteSurfaceResponse>), SurfaceApiError> {
+) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -4707,7 +4506,7 @@ pub async fn delete_variant(
         .variants
         .remove(position);
 
-    let (_, takeover_warnings) = validate_and_save_surface(
+    validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4721,13 +4520,10 @@ pub async fn delete_variant(
 
     info!("Deleted variant '{}' (id={}) from surface '{}'", removed.alias, removed.id, surface_id);
 
-    Ok((
-        warning_headers(takeover_warnings),
-        Json(DeleteSurfaceResponse {
-            success: true,
-            message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
-        }),
-    ))
+    Ok(Json(DeleteSurfaceResponse {
+        success: true,
+        message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
+    }))
 }
 
 /// `POST /v1/surfaces/{id}/variants/{variant_id}/promote-to-default`
@@ -4774,7 +4570,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let (saved, takeover_warnings) = validate_and_save_surface(
+    let saved = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4788,7 +4584,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok((save_warnings(&state, &saved, takeover_warnings).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -7265,7 +7061,7 @@ mod validation_tests {
     fn refusal(result: Result<(), SurfaceApiError>) -> String {
         match result {
             Err(SurfaceApiError::BadRequest(message)) => message,
-            other => panic!("expected BadRequest, got {other:?}"),
+            _ => panic!("expected BadRequest"),
         }
     }
 
@@ -7273,7 +7069,7 @@ mod validation_tests {
     fn inbound_from_api_key_is_accepted_behind_an_api_key_or_provider_caller_method() {
         for caller in [api_key_caller("caller-keys"), provider_caller()] {
             let s = inbound_api_key_surface(&[caller.clone(), jwt_caller()]);
-            validate_api_key_identities(&s, "").unwrap_or_else(|e| panic!("{caller}: {e:?}"));
+            assert!(validate_api_key_identities(&s, "").is_ok(), "{caller}");
         }
     }
 
@@ -7293,14 +7089,14 @@ mod validation_tests {
             ("api key second", vec![jwt_caller(), provider_caller()]),
         ] {
             let s = inbound_api_key_surface(&caller);
-            assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+            assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
         }
 
         let mut other_mode = inbound_api_key_surface(&[jwt_caller()]);
         other_mode
             .identity_slots
             .inbound = None;
-        validate_api_key_identities(&other_mode, "").expect("another inbound mode");
+        assert!(validate_api_key_identities(&other_mode, "").is_ok(), "another inbound mode");
     }
 
     #[test]
@@ -7308,13 +7104,13 @@ mod validation_tests {
         let mut s = inbound_api_key_surface(&[provider_caller()]);
         s.access_point.protocol = SurfaceProtocol::Mcp;
         s.mcp_http = Some(Default::default());
-        validate_api_key_identities(&s, "").expect("mcp_http without authorization");
+        assert!(validate_api_key_identities(&s, "").is_ok(), "mcp_http without authorization");
 
         s.mcp_http = Some(
             serde_json::from_value(serde_json::json!({ "authorization": { "resource": "https://mcp.example/mcp" } }))
                 .unwrap(),
         );
-        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_WITH_RESOURCE_TOKENS);
+        assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_WITH_RESOURCE_TOKENS);
     }
 
     #[test]
@@ -7322,26 +7118,26 @@ mod validation_tests {
         let mut s = inbound_api_key_surface(&[provider_caller()]);
         s.access_point.protocol = SurfaceProtocol::Mcp;
         s.target.endpoint = "proxy://mcp-proxy-1".to_string();
-        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_ON_MCP_PROXY);
+        assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_ON_MCP_PROXY);
 
         s.identity_slots.inbound = None;
-        validate_api_key_identities(&s, "").expect("another inbound mode");
+        assert!(validate_api_key_identities(&s, "").is_ok(), "another inbound mode");
 
         let mut a2a = inbound_api_key_surface(&[provider_caller()]);
         a2a.target.endpoint = "a2a-proxy://worker".to_string();
-        validate_api_key_identities(&a2a, "").expect("a2a-proxy target");
+        assert!(validate_api_key_identities(&a2a, "").is_ok(), "a2a-proxy target");
     }
 
     #[test]
     fn inbound_from_api_key_is_refused_behind_a_reserved_plain_secret_id() {
         let s = inbound_api_key_surface(&[api_key_caller("atgk_aliased")]);
-        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_RESERVED_SECRET_ID);
+        assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_RESERVED_SECRET_ID);
 
         let mut other_mode = s.clone();
         other_mode
             .identity_slots
             .inbound = None;
-        validate_api_key_identities(&other_mode, "").expect("another inbound mode");
+        assert!(validate_api_key_identities(&other_mode, "").is_ok(), "another inbound mode");
     }
 
     #[test]
@@ -7351,9 +7147,9 @@ mod validation_tests {
             protected
                 .identity_slots
                 .protected = from_api_key(id);
-            assert_eq!(
-                refusal(validate_api_key_identities(&protected, "")),
-                format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
+            assert!(
+                refusal(validate_api_key_identities(&protected, ""))
+                    == format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
                 "{id:?}"
             );
 
@@ -7361,9 +7157,9 @@ mod validation_tests {
             external
                 .identity_slots
                 .external = from_api_key(id);
-            assert_eq!(
-                refusal(validate_api_key_identities(&external, "")),
-                format!("identity_slots.external: {API_KEY_IDENTITY_NEEDS_ID}"),
+            assert!(
+                refusal(validate_api_key_identities(&external, ""))
+                    == format!("identity_slots.external: {API_KEY_IDENTITY_NEEDS_ID}"),
                 "{id:?}"
             );
         }
@@ -7375,37 +7171,29 @@ mod validation_tests {
                 "managed_identity": { "type": "from_api_key", "api_key_id": "" }
             }] }),
         );
-        assert_eq!(
-            refusal(validate_api_key_identities(&transit, "")),
-            format!("transit.points['partner'].managed_identity: {API_KEY_IDENTITY_NEEDS_ID}")
+        assert!(
+            refusal(validate_api_key_identities(&transit, ""))
+                == format!("transit.points['partner'].managed_identity: {API_KEY_IDENTITY_NEEDS_ID}")
         );
 
         let mut keyed = base_surface();
         keyed.identity_slots.protected = from_api_key(Some("managed-key"));
         keyed.identity_slots.external = from_api_key(Some("external-key"));
-        validate_api_key_identities(&keyed, "").expect("both slots keyed");
+        assert!(validate_api_key_identities(&keyed, "").is_ok(), "both slots keyed");
     }
 
     #[test]
-    fn one_key_cannot_identify_both_a_managed_agent_and_a_caller() {
-        let clash = format!(
-            "API key 'shared' is set as both a Managed Agent and a caller identity; {API_KEY_IDENTIFIES_BOTH_ROLES}"
-        );
-
+    fn one_key_may_identify_both_a_managed_agent_and_a_caller() {
         let mut slots = base_surface();
         slots.identity_slots.protected = from_api_key(Some("shared"));
         slots.identity_slots.external = from_api_key(Some("shared"));
-        assert_eq!(refusal(validate_api_key_identities(&slots, "")), clash);
+        assert!(validate_api_key_identities(&slots, "").is_ok(), "protected and external");
 
         let mut plain_caller = inbound_api_key_surface(&[api_key_caller("shared")]);
         plain_caller
             .identity_slots
             .protected = from_api_key(Some("shared"));
-        assert_eq!(refusal(validate_api_key_identities(&plain_caller, "")), clash);
-        plain_caller
-            .identity_slots
-            .protected = from_api_key(Some("managed-key"));
-        validate_api_key_identities(&plain_caller, "").expect("distinct keys");
+        assert!(validate_api_key_identities(&plain_caller, "").is_ok(), "protected and plain caller secret");
 
         let mut transit = with_transit(
             base_surface(),
@@ -7417,15 +7205,7 @@ mod validation_tests {
         transit
             .identity_slots
             .external = from_api_key(Some("shared"));
-        assert_eq!(refusal(validate_api_key_identities(&transit, "")), clash);
-
-        transit
-            .identity_slots
-            .external = None;
-        transit
-            .identity_slots
-            .protected = from_api_key(Some("shared"));
-        validate_api_key_identities(&transit, "").expect("a Transit Point may share the Managed Agent key");
+        assert!(validate_api_key_identities(&transit, "").is_ok(), "Transit Point and external");
     }
 
     fn variant_with_caller(
@@ -7454,13 +7234,12 @@ mod validation_tests {
         let mut s = inbound_api_key_surface(&[provider_caller()]);
         s.variants
             .push(variant_with_caller("jwt", true, &[jwt_caller()]));
-        assert_eq!(
-            refusal(validate_resolved_variants(&s)),
-            format!("Variant 'jwt': {INBOUND_API_KEY_NEEDS_API_KEY_CALLER}")
+        assert!(
+            refusal(validate_resolved_variants(&s)) == format!("Variant 'jwt': {INBOUND_API_KEY_NEEDS_API_KEY_CALLER}")
         );
 
         s.variants[0].enabled = false;
-        validate_resolved_variants(&s).expect("a disabled variant is not resolved");
+        assert!(validate_resolved_variants(&s).is_ok(), "a disabled variant is not resolved");
     }
 
     #[test]
@@ -7493,56 +7272,6 @@ mod validation_tests {
             assert_eq!(slots.inbound, from_api_key(None), "{}", variant.alias);
             assert_eq!(slots.protected, from_api_key(Some("variant-managed-key")), "{}", variant.alias);
         }
-    }
-
-    #[test]
-    fn legacy_inbound_api_key_ids_are_the_stored_inbound_keys_the_saved_surface_manages() {
-        let mut stored = base_surface();
-        stored.identity_slots.inbound = from_api_key(Some("managed-key"));
-        let mut variant = variant_with_caller("legacy", false, &[provider_caller()]);
-        variant
-            .overrides
-            .identity_slots = Some(crate::config::agent_surface::SurfaceIdentitySlots {
-            inbound: from_api_key(Some("transit-key")),
-            protected: None,
-            external: None,
-        });
-        stored.variants.push(variant);
-
-        let mut saved = with_transit(
-            base_surface(),
-            serde_json::json!({ "points": [{
-                "alias": "tp",
-                "target_endpoint": "https://partner.example",
-                "managed_identity": { "type": "from_api_key", "api_key_id": "transit-key" }
-            }] }),
-        );
-        saved.identity_slots.protected = from_api_key(Some("managed-key"));
-        assert_eq!(legacy_inbound_api_key_ids(&stored, &saved), vec!["managed-key", "transit-key"]);
-
-        saved.identity_slots.protected = from_api_key(Some("other-key"));
-        let base_points = saved
-            .transit
-            .take()
-            .unwrap()
-            .points;
-        assert!(legacy_inbound_api_key_ids(&stored, &saved).is_empty());
-
-        let mut variant = variant_with_caller("variant-points", true, &[provider_caller()]);
-        variant.overrides.transit = Some(crate::config::agent_surface_variants::TransitOverrides {
-            points: Some(base_points),
-            ..Default::default()
-        });
-        saved.variants.push(variant);
-        assert_eq!(legacy_inbound_api_key_ids(&stored, &saved), vec!["transit-key"]);
-        saved.variants.clear();
-
-        let mut no_stored_id = base_surface();
-        no_stored_id
-            .identity_slots
-            .inbound = from_api_key(None);
-        saved.identity_slots.protected = from_api_key(Some("managed-key"));
-        assert!(legacy_inbound_api_key_ids(&no_stored_id, &saved).is_empty());
     }
 
     /// Attach a transit config (parsed from JSON for brevity) to a surface.

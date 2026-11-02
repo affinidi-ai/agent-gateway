@@ -274,25 +274,6 @@ impl AgentSurface {
         matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
     }
 
-    /// True when slot 1 still stores the `api_key_id` it resolved as a caller
-    /// before it identified callers by the presented key, and `managed` names
-    /// that same key.
-    pub fn stores_inbound_api_key_of(
-        &self,
-        managed: &crate::source_auth::ManagedIdentityConfig,
-    ) -> bool {
-        use crate::source_auth::ManagedIdentityConfig::FromApiKey;
-        match (
-            self.identity_slots
-                .inbound
-                .as_ref(),
-            managed,
-        ) {
-            (Some(FromApiKey { api_key_id: Some(stored) }), FromApiKey { api_key_id: Some(key) }) => stored == key,
-            _ => false,
-        }
-    }
-
     /// Slot 2 — protected agent identity extracted from response (MA → AP).
     #[inline]
     pub fn protected_identity(&self) -> Option<&crate::source_auth::ManagedIdentityConfig> {

@@ -314,6 +314,9 @@ receive does not read this mode; the request body sets the caller there (see
   those trust-registry claims are always dropped.
 - Gateway and global policy run before the key resolves, so they see no
   `input.agent.did` and none of those claims on these surfaces.
+- A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
+  [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
+  refuses it.
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries
