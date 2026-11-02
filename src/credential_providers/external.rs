@@ -49,7 +49,11 @@ pub type IssuerMetadata =
 pub fn strict_issuer_metadata() -> IssuerMetadata {
     Arc::new(|issuer| {
         Box::pin(async move {
-            crate::authz_metadata::discover_client(&issuer, EgressPosture::Strict, DiscoveryOptions::default()).await
+            let options = DiscoveryOptions {
+                direct: true,
+                ..DiscoveryOptions::default()
+            };
+            crate::authz_metadata::discover_client(&issuer, EgressPosture::Strict, options).await
         })
     })
 }

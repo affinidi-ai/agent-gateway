@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 pub use discovery::{discover, discover_client, metadata_urls, parse_client_metadata, parse_metadata, validate_issuer};
 #[allow(unused_imports)]
 pub use fetch::get_bounded;
+#[cfg(test)]
+pub(crate) use fetch::pinned_client as discovery_client;
 
 /// Largest metadata document accepted by default, in bytes.
 pub const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -105,6 +107,9 @@ pub struct DiscoveryOptions {
     /// itself, from connecting to reading the last byte of the body; a step that takes
     /// longer fails with `unreachable`.
     pub timeout: Duration,
+    /// Connect directly, ignoring any proxy the environment or the system names, as
+    /// the vendor clients of external consent do; otherwise a configured proxy is used.
+    pub direct: bool,
 }
 
 impl Default for DiscoveryOptions {
@@ -114,6 +119,7 @@ impl Default for DiscoveryOptions {
         Self {
             max_bytes: MAX_METADATA_BYTES,
             timeout: Duration::from_secs(crate::http_client::SHORT_TIMEOUT_SECS),
+            direct: false,
         }
     }
 }

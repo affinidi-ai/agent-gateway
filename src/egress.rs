@@ -823,6 +823,27 @@ mod tests {
                 assert!(!through_proxy(vendor).await, "a vendor call of external consent connects directly");
                 let (metadata, _) = pinned_metadata_client(&url, false, Duration::from_secs(5)).unwrap();
                 assert!(!through_proxy(metadata).await, "authorization server metadata is read directly");
+
+                let operator = crate::authz_metadata::EgressPosture::CloudMetadataOnly;
+                let discovery = crate::authz_metadata::discovery_client(
+                    &url,
+                    operator,
+                    crate::authz_metadata::DiscoveryOptions::default(),
+                )
+                .await
+                .unwrap();
+                assert!(through_proxy(discovery).await, "inbound and MCP discovery use the proxy, as before");
+                let direct = crate::authz_metadata::DiscoveryOptions {
+                    direct: true,
+                    ..Default::default()
+                };
+                let provider_metadata = crate::authz_metadata::discovery_client(&url, operator, direct)
+                    .await
+                    .unwrap();
+                assert!(
+                    !through_proxy(provider_metadata).await,
+                    "an external consent provider's issuer metadata is read directly"
+                );
             });
     }
 
