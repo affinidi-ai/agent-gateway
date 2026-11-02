@@ -898,17 +898,17 @@ async fn persist_tenant_id(
                 .trust_registry_store
                 .as_ref()
                 .ok_or_else(|| unavailable(kind))?;
-            let mut resource = store
-                .get(id)
+            store
+                .modify(
+                    id,
+                    Box::new(move |resource| {
+                        resource.tenant_id = tenant_id;
+                        resource.updated_at = chrono::Utc::now();
+                    }),
+                )
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
-            resource.tenant_id = tenant_id;
-            resource.updated_at = chrono::Utc::now();
-            store
-                .update(&resource)
-                .await
-                .map_err(internal)?;
         }
         ResourceKind::Authorities => {
             let store = state
