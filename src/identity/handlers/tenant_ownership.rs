@@ -660,8 +660,16 @@ async fn collect_credential_references(
         {
             let source = endpoint(ResourceKind::A2aProxies, &proxy.id, proxy.tenant_id.clone(), true);
             let crate::a2a_proxies::types::A2aProxyBackend::CopilotDirectLine(config) = &proxy.backend;
-            add_reference(state, references, source, ResourceKind::Secrets, &config.secret_id, "A2A proxy secret")
-                .await?;
+            add_reference_with_rule(
+                state,
+                references,
+                source,
+                ResourceKind::Secrets,
+                &config.secret_id,
+                "A2A proxy secret",
+                true,
+            )
+            .await?;
         }
     }
     if let Some(store) = state
@@ -1577,6 +1585,51 @@ mod tests {
             1
         );
         assert_eq!(conflict_reasons(stored(), ResourceKind::Surfaces, "surface-1", None, RuleMode::Warn).len(), 0);
+    }
+
+    #[test]
+    fn a_reassignment_that_gives_a_tenant_a2a_proxy_an_appliance_wide_direct_line_secret_is_a_conflict() {
+        let proxy_edge = |proxy_tenant: Option<&str>, secret_tenant: Option<&str>| OwnershipReference {
+            source: endpoint(ResourceKind::A2aProxies, "proxy-1", proxy_tenant.map(str::to_string), true),
+            context: "A2A proxy secret".to_string(),
+            ..credential_edge(None, secret_tenant)
+        };
+        for isolation in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(
+                conflict_reasons(
+                    proxy_edge(None, None),
+                    ResourceKind::A2aProxies,
+                    "proxy-1",
+                    Some("tenant-a"),
+                    isolation
+                ),
+                vec!["The proposed tenant would give a tenant resource an appliance-wide credential".to_string()]
+            );
+            assert_eq!(
+                conflict_reasons(
+                    proxy_edge(Some("tenant-a"), Some("tenant-a")),
+                    ResourceKind::Secrets,
+                    "secret-1",
+                    None,
+                    isolation
+                ),
+                vec!["The proposed tenant would give a tenant resource an appliance-wide credential".to_string()]
+            );
+            assert!(
+                conflict_reasons(
+                    proxy_edge(Some("tenant-a"), Some("tenant-a")),
+                    ResourceKind::A2aProxies,
+                    "proxy-1",
+                    Some("tenant-a"),
+                    isolation
+                )
+                .is_empty()
+            );
+            assert!(
+                conflict_reasons(proxy_edge(None, None), ResourceKind::A2aProxies, "proxy-1", None, isolation)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

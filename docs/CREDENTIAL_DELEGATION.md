@@ -668,7 +668,9 @@ a warning in `warn` mode and refused in `enforce` mode, where a request through 
 fails as target unavailable, as for a missing secret, before the secret is read. An
 appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
 modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
-sends the secret nor read it.
+sends the secret nor read it. A tenant reassignment that would give a tenant proxy an
+appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
+secret becomes appliance-wide.
 
 Saving a surface applies the same rule: a save that adds a reference breaking it is refused
 with `400` "reference is not accessible", while a reference the stored surface already held

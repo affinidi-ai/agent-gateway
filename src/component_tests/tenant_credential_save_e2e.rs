@@ -832,6 +832,64 @@ async fn a_reassignment_that_would_cross_tenants_or_give_a_tenant_an_appliance_w
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reassignment_that_would_give_a_tenant_a2a_proxy_an_appliance_wide_secret_is_a_conflict() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let proxy_key = api
+        .secret("proxy-key", Some("tenant-a"), "v")
+        .await;
+    let proxy = |secret_id: &str, tenant: Option<&str>| {
+        json!({
+            "name": secret_id, "tenant_id": tenant,
+            "backend": {"kind": "copilot_direct_line", "secret_id": secret_id, "base_url": "https://203.0.113.7/v3/directline"}
+        })
+    };
+    let mut ids = Vec::new();
+    for body in [proxy("appliance-key", None), proxy("proxy-key", Some("tenant-a"))] {
+        let (status, created) = api
+            .send(
+                api.client
+                    .post(api.url("a2a-proxies"))
+                    .json(&body),
+            )
+            .await;
+        assert!(matches!(status, 200 | 201), "{status} {created}");
+        ids.push(
+            created["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let blocked = |result: (u16, Value)| {
+        assert_eq!(result.0, 409, "{}", result.1);
+        assert!(
+            result.1["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|conflict| conflict["context"] == "A2A proxy secret"
+                    && conflict["reason"]
+                        == "The proposed tenant would give a tenant resource an appliance-wide credential"),
+            "{}",
+            result.1
+        );
+    };
+
+    blocked(
+        api.reassign("a2a-proxies", &ids[0], Some("tenant-a"))
+            .await,
+    );
+    blocked(
+        api.reassign("secrets", &proxy_key, None)
+            .await,
+    );
+    let (status, body) = api
+        .reassign("a2a-proxies", &ids[1], Some("tenant-a"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_kept_only_while_its_destination_is_unchanged() {
     let (_harness, api) = harness(RuleMode::Warn).await;
 
