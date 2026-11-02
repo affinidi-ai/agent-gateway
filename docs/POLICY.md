@@ -463,11 +463,12 @@ more: the outbound forward sends it only to the origin of its provider's `resour
 
 The vendor clients of external consent, which carry a client's credentials or a person's token,
 ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
-connect directly: the authorization server metadata fetch, RFC 7009 revocation, and the forward
-of a request that carries a grant by binding. A proxy would resolve the host again and connect
-to an address nobody vetted, voiding the pin. The gateway warns at startup when a proxy variable
-is set. Every other pinned client uses a configured proxy as before; the proxy then resolves the
-host itself, so the pin does not hold through it.
+connect directly: the fetch of an external consent provider's authorization server metadata,
+RFC 7009 revocation, and the forward of a request that carries a grant by binding. A proxy would
+resolve the host again and connect to an address nobody vetted, voiding the pin. The gateway
+warns at startup when a proxy variable is set. Every other pinned client, the authorization
+server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
+before; the proxy then resolves the host itself, so the pin does not hold through it.
 
 ```mermaid
 flowchart LR
