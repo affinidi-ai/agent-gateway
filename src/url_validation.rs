@@ -193,12 +193,6 @@ pub(crate) fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Shared implementation for DNS-aware URL validation.
-///
-/// When `block_loopback` is `true` the behaviour matches [`validate_resolved_url`]:
-/// loopback and unspecified addresses are rejected both statically and after DNS
-/// resolution.  When `false` only cloud-provider metadata endpoints are blocked,
-/// and loopback / RFC 1918 are allowed — see [`validate_resolved_cloud_metadata_url`].
 /// The static half of [`validate_resolved_cloud_metadata_url`]: an http(s) URL
 /// with a host, no embedded credentials, and a host that is not a cloud-provider
 /// metadata service. Resolves nothing.
@@ -229,6 +223,12 @@ pub(crate) fn validate_url_not_cloud_metadata_host(raw: &str) -> Result<Url, Str
     Ok(parsed)
 }
 
+/// Shared implementation for DNS-aware URL validation.
+///
+/// When `block_loopback` is `true` the behaviour matches [`validate_resolved_url`]:
+/// loopback and unspecified addresses are rejected both statically and after DNS
+/// resolution.  When `false` only cloud-provider metadata endpoints are blocked,
+/// and loopback / RFC 1918 are allowed — see [`validate_resolved_cloud_metadata_url`].
 fn validate_resolved_url_inner(
     raw: &str,
     block_loopback: bool,
