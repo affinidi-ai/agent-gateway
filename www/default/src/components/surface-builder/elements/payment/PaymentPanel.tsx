@@ -1,9 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { Form } from 'react-bootstrap';
-import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../../../api';
-import FieldHelp from '../../../shared/FieldHelp';
 import type { ConfigPanelProps } from '../types';
+import { deepLinks } from '../../../../utils/deepLinks';
+import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
+import {
+  useGatewaySurfaces,
+  type GatewayOption,
+  type RemoteSurface,
+} from '../_shared/useGatewaySurfaces';
 import PaymentManifestPreview from './PaymentManifestPreview';
 import { usePaymentManifest } from './usePaymentManifest';
 import { describeTriggers } from './triggers';
@@ -22,32 +27,15 @@ import {
 } from './policy';
 import type { PaymentNodeConfig } from './types';
 
-interface DiscoveredSurface {
-  config_id: string;
-  name: string;
-  tags: string[];
-  is_payment_surface: boolean | null;
-  has_manifest: boolean;
+/** The connected agent-pay gateways that expose at least one payment surface. */
+async function loadPaymentGateways(force: boolean): Promise<GatewayOption[]> {
+  const { data } = await apiClient.get<Array<{ id: string; name?: string }>>(
+    `/gateways/payment-providers${force ? '?force_refresh=true' : ''}`
+  );
+  return (Array.isArray(data) ? data : []).map(gw => ({ id: gw.id, name: gw.name }));
 }
 
-interface GatewayRecord {
-  id: string;
-  name?: string;
-  gateway_type?: string;
-  creation_type?: string;
-}
-
-interface SurfaceRecord {
-  config_id: string;
-  name?: string;
-  tags?: unknown;
-  is_payment_surface?: unknown;
-  payment_manifest?: unknown;
-}
-
-type SurfaceListResponse = SurfaceRecord[] | { channels?: SurfaceRecord[] };
-
-const isPaymentCandidate = (s: DiscoveredSurface) =>
+const isPaymentCandidate = (s: RemoteSurface) =>
   s.is_payment_surface === true || s.has_manifest || s.tags.includes('payment');
 
 const LegacyPaymentBanner: React.FC<{ kind: string; onMigrate: () => void }> = ({
@@ -89,19 +77,16 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
   const isPaymentSupported = protocol === 'mcp' || protocol === 'a2a';
   const legacy = config.unsupported_legacy;
   const active = isPaymentSupported && !legacy;
-  const navigate = useNavigate();
   const selectedGatewayId = config.payment_gateway_id || '';
   const selectedSurfaceId = config.payment_surface_id || '';
 
-  const [peerGateways, setPeerGateways] = useState<Array<{ id: string; name?: string }>>([]);
-  const [gatewaysLoaded, setGatewaysLoaded] = useState(false);
-  const [surfaces, setSurfaces] = useState<DiscoveredSurface[]>([]);
-  const [surfacesLoading, setSurfacesLoading] = useState(false);
-  const [surfacesError, setSurfacesError] = useState<string | null>(null);
-  const [surfacesRefreshTick, setSurfacesRefreshTick] = useState(0);
-  const [manualEntry, setManualEntry] = useState(false);
-  const [paymentOnly, setPaymentOnly] = useState(true);
-  const [paymentGatewayIds, setPaymentGatewayIds] = useState<Set<string> | null>(null);
+  const gatewayState = useGatewaySurfaces({
+    enabled: active,
+    gatewayId: selectedGatewayId,
+    loadGateways: loadPaymentGateways,
+    surfacesBasePath: '/payment-gateways',
+  });
+  const { surfaces, surfacesLoading, refreshSurfaces } = gatewayState;
 
   const manifest = usePaymentManifest(
     selectedGatewayId,
@@ -113,7 +98,6 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
   // A surface id only means something on its own gateway, so another gateway clears it too.
   const selectGateway = (value: string) => {
     if (value === selectedGatewayId) return;
-    setManualEntry(false);
     updateFields({
       payment_gateway_id: value,
       payment_surface_id: undefined,
@@ -123,91 +107,15 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
   const selectSurface = (value: string) =>
     updateFields({ payment_surface_id: value, manifest_snapshot: undefined });
 
-  useEffect(() => {
-    if (!active) return;
-    let cancelled = false;
-    apiClient
-      .get<GatewayRecord[]>('/gateways')
-      .then(({ data }) => {
-        if (cancelled) return;
-        const remotes = (data || []).filter(
-          gw => gw.gateway_type === 'remote' && gw.creation_type === 'user'
-        );
-        setPeerGateways(remotes.map(gw => ({ id: gw.id, name: gw.name })));
-        setGatewaysLoaded(true);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setPeerGateways([]);
-        setGatewaysLoaded(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [active]);
-
-  useEffect(() => {
-    if (!active || !selectedGatewayId) {
-      setSurfaces([]);
-      setSurfacesError(null);
-      return;
-    }
-    let cancelled = false;
-    setSurfacesLoading(true);
-    setSurfacesError(null);
-    const force = surfacesRefreshTick > 0 ? '?force_refresh=true' : '';
-    apiClient
-      .get<SurfaceListResponse>(
-        `/gateways/${encodeURIComponent(selectedGatewayId)}/surfaces${force}`
-      )
-      .then(({ data }) => {
-        if (cancelled) return;
-        const list = Array.isArray(data) ? data : data?.channels || [];
-        setSurfaces(
-          list.map(c => ({
-            config_id: c.config_id,
-            name: c.name || c.config_id,
-            tags: Array.isArray(c.tags) ? c.tags : [],
-            is_payment_surface:
-              typeof c.is_payment_surface === 'boolean' ? c.is_payment_surface : null,
-            has_manifest: !!c.payment_manifest,
-          }))
-        );
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setSurfaces([]);
-        const msg = err instanceof Error && err.message ? err.message : String(err);
-        setSurfacesError(
-          msg.toLowerCase().includes('not connected') || msg.includes('503')
-            ? 'Gateway not connected, cannot list its payment surfaces. Enter the surface id manually, or retry once it reconnects.'
-            : `Could not load surfaces: ${msg}`
-        );
-      })
-      .finally(() => {
-        if (!cancelled) setSurfacesLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [active, selectedGatewayId, surfacesRefreshTick]);
-
   // A peer that predates the payment markers sends none on any surface; the
-  // payment-only filter is then a no-op so discovery still works.
+  // payment filter then keeps every surface so discovery still works.
   const peerSupportsPaymentFilter = useMemo(
-    () =>
-      surfaces.some(
-        s =>
-          (s.is_payment_surface !== null && s.is_payment_surface !== undefined) ||
-          s.has_manifest ||
-          s.tags.length > 0
-      ),
+    () => surfaces.some(s => s.is_payment_surface !== null || s.has_manifest || s.tags.length > 0),
     [surfaces]
   );
   const visibleSurfaces = useMemo(
-    () =>
-      paymentOnly && peerSupportsPaymentFilter ? surfaces.filter(isPaymentCandidate) : surfaces,
-    [paymentOnly, peerSupportsPaymentFilter, surfaces]
+    () => (peerSupportsPaymentFilter ? surfaces.filter(isPaymentCandidate) : surfaces),
+    [peerSupportsPaymentFilter, surfaces]
   );
 
   // A stale discovery cache can predate the peer's payment markers; refresh
@@ -215,47 +123,22 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
   const autoRefreshedGatewayRef = useRef<string | null>(null);
   useEffect(() => {
     if (!active || !selectedGatewayId) return;
-    if (surfacesLoading || surfaces.length === 0) return;
-    if (!paymentOnly || peerSupportsPaymentFilter) return;
+    if (surfacesLoading || surfaces.length === 0 || peerSupportsPaymentFilter) return;
     if (autoRefreshedGatewayRef.current === selectedGatewayId) return;
     autoRefreshedGatewayRef.current = selectedGatewayId;
-    setSurfacesRefreshTick(t => t + 1);
+    refreshSurfaces();
   }, [
     active,
     selectedGatewayId,
     surfacesLoading,
     surfaces,
-    paymentOnly,
     peerSupportsPaymentFilter,
+    refreshSurfaces,
   ]);
 
-  useEffect(() => {
-    if (!active || !paymentOnly) {
-      setPaymentGatewayIds(null);
-      return;
-    }
-    let cancelled = false;
-    apiClient
-      .get<Array<{ id: string }>>('/gateways/payment-providers')
-      .then(({ data }) => {
-        if (!cancelled) setPaymentGatewayIds(new Set((data || []).map(g => g.id)));
-      })
-      .catch(() => {
-        if (!cancelled) setPaymentGatewayIds(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [active, paymentOnly]);
-
-  const visibleGateways = useMemo(() => {
-    if (!paymentOnly || !paymentGatewayIds || paymentGatewayIds.size === 0) return peerGateways;
-    return peerGateways.filter(gw => paymentGatewayIds.has(gw.id) || gw.id === selectedGatewayId);
-  }, [peerGateways, paymentGatewayIds, paymentOnly, selectedGatewayId]);
-
   const timeoutValid = isTimeoutValid(config.timeout_ms);
-  const selectedBase = selectedSurfaceId.split('$')[0];
-  const selectedListed = visibleSurfaces.some(s => s.config_id === selectedSurfaceId);
+  const savedSurfaceLabel = (id: string) =>
+    `${id} ${visibleSurfaces.some(s => s.config_id === id.split('$')[0]) ? '(variant)' : '(not currently exposed)'}`;
 
   if (!isPaymentSupported) {
     return (
@@ -297,157 +180,41 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
           <div className="surface-info-panel-summary">{DISABLED_LEGACY_PAYMENT_MESSAGE}</div>
         </div>
       )}
-      {gatewaysLoaded && peerGateways.length === 0 && (
-        <div className="config-section surface-info-panel surface-info-panel--warning">
-          <div className="surface-info-panel-title">
-            <i className="fas fa-plug me-1" aria-hidden="true" />
-            No connected gateway
-          </div>
-          <div className="surface-info-panel-summary">
-            There is no connected gateway to take payments. Connect an agent-pay gateway first, then
-            select it here.
-          </div>
-          <button
-            type="button"
-            className="btn btn-outline-primary btn-sm w-100 mt-2"
-            onClick={() => navigate('/gateways/connect')}
-            data-testid="payment-connect-gateway-button"
-          >
-            <i className="fas fa-link me-1" aria-hidden="true" /> Connect a gateway…
-          </button>
-        </div>
-      )}
 
-      {peerGateways.length > 0 && (
-        <div className="config-section">
-          <label htmlFor="payment-gateway-select">Payment Gateway</label>
-          <Form.Check
-            type="switch"
-            id="payment-only-filter-toggle"
-            data-testid="payment-only-filter-toggle"
-            className="mt-1 mb-1"
-            style={{ fontSize: '11px' }}
-            checked={paymentOnly}
-            onChange={e => setPaymentOnly(e.target.checked)}
-            label="Only payment connection points"
-          />
-          <Form.Select
-            id="payment-gateway-select"
-            size="sm"
-            data-testid="payment-gateway-select"
-            value={selectedGatewayId}
-            onChange={e => selectGateway(e.target.value)}
-          >
-            <option value="">Select a connected gateway…</option>
-            {visibleGateways.map(gw => (
-              <option key={gw.id} value={gw.id}>
-                {gw.name || gw.id}
-              </option>
-            ))}
-          </Form.Select>
-          {paymentOnly &&
-            !!paymentGatewayIds &&
-            paymentGatewayIds.size > 0 &&
-            visibleGateways.length < peerGateways.length && (
-              <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-                Showing only gateways that expose a payment surface. Turn off the filter to see all{' '}
-                {peerGateways.length}.
-              </Form.Text>
-            )}
-        </div>
-      )}
-
-      {selectedGatewayId && (
-        <div className="config-section">
-          <div className="d-flex justify-content-between align-items-center">
-            <label className="mb-0" htmlFor="payment-surface-select">
-              Payment Surface
-            </label>
-            <button
-              type="button"
-              className="btn btn-link btn-sm p-0"
-              style={{ fontSize: '10px' }}
-              onClick={() => setSurfacesRefreshTick(t => t + 1)}
-              disabled={surfacesLoading}
-              data-testid="payment-surface-refresh-button"
-            >
-              <i className="fas fa-rotate me-1" aria-hidden="true" />
-              {surfacesLoading ? 'Loading…' : 'Refresh'}
-            </button>
-          </div>
-
-          <Form.Select
-            id="payment-surface-select"
-            size="sm"
-            data-testid="payment-surface-select"
-            value={selectedSurfaceId}
-            onChange={e => selectSurface(e.target.value)}
-            disabled={surfacesLoading}
-          >
-            <option value="">
-              {surfacesLoading ? 'Loading…' : 'Select an exposed payment surface…'}
-            </option>
-            {selectedSurfaceId && !selectedListed && (
-              <option value={selectedSurfaceId}>
-                {selectedSurfaceId}{' '}
-                {visibleSurfaces.some(s => s.config_id === selectedBase)
-                  ? '(variant)'
-                  : '(not currently exposed)'}
-              </option>
-            )}
-            {visibleSurfaces.map(s => (
-              <option key={s.config_id} value={s.config_id}>
-                {s.name && s.name !== s.config_id
-                  ? `${s.name} (${s.config_id.slice(0, 8)}…)`
-                  : s.config_id}
-              </option>
-            ))}
-          </Form.Select>
-
-          {surfacesError ? (
-            <Form.Text className="text-warning d-block" style={{ fontSize: '10px' }}>
-              <i className="fas fa-triangle-exclamation me-1" aria-hidden="true" />
-              {surfacesError}
-            </Form.Text>
-          ) : visibleSurfaces.length === 0 && !surfacesLoading ? (
-            <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-              {surfaces.length > 0 && paymentOnly && peerSupportsPaymentFilter
-                ? 'No payment surfaces found on this gateway. Expose a payment surface (or a surface on a connection point tagged “payment”) in agent-pay and press Refresh, or turn off the filter above to see all surfaces.'
-                : 'No exposed surfaces discovered. Expose the payment surface on the agent-pay gateway, then Refresh.'}
-            </Form.Text>
-          ) : null}
-
-          {!surfacesLoading && (
-            <button
-              type="button"
-              className="btn btn-link btn-sm p-0"
-              style={{ fontSize: '10px' }}
-              onClick={() => setManualEntry(m => !m)}
-              data-testid="payment-surface-manual-toggle-button"
-            >
-              {manualEntry ? 'Hide manual entry' : 'Enter surface id manually'}
-            </button>
-          )}
-
-          {manualEntry && (
-            <>
-              <Form.Control
-                className="mt-1"
-                size="sm"
-                type="text"
-                aria-label="Payment surface id"
-                placeholder="surface-id or surface-id$alias"
-                data-testid="payment-surface-manual-input"
-                value={selectedSurfaceId}
-                onChange={e => selectSurface(e.target.value)}
-              />
-              <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-                Add <code>$alias</code> to charge through one of the surface&apos;s variants.
-              </Form.Text>
-            </>
-          )}
-        </div>
-      )}
+      <div className="config-section">
+        <GatewaySurfacePicker
+          testIdPrefix="payment"
+          state={gatewayState}
+          gatewayId={selectedGatewayId}
+          surfaceId={selectedSurfaceId}
+          surfaces={visibleSurfaces}
+          onGatewayChange={selectGateway}
+          onSurfaceChange={selectSurface}
+          gatewayLabel="Payment Gateway"
+          gatewayPlaceholder="Select a payment gateway…"
+          gatewayHelp={
+            <p className="mb-0">
+              The active payment gateways (Connections → Payment Gateways) that expose at least one
+              payment surface. Payments for this surface are taken by the gateway you pick.
+            </p>
+          }
+          noGatewayTitle="No connected payment gateway"
+          noGatewayText="Connect an agent-pay payment gateway that exposes a payment surface, then select it here."
+          addGatewayLink={deepLinks.paymentGateway}
+          addGatewayLabel="Add Payment Gateway"
+          surfaceLabel="Payment Surface"
+          surfacePlaceholder="Select a payment surface…"
+          surfaceHelp={
+            <p className="mb-0">
+              The payment surfaces this gateway exposes: a surface with a payment manifest, or one
+              on a connection point tagged “payment”. Refresh loads the list again.
+            </p>
+          }
+          emptySurfacesText="No exposed surfaces discovered. Expose the payment surface on the agent-pay gateway, then Refresh."
+          hiddenSurfacesText="No payment surfaces found on this gateway. Expose a payment surface (or a surface on a connection point tagged “payment”) in agent-pay, then Refresh."
+          savedSurfaceLabel={savedSurfaceLabel}
+        />
+      </div>
 
       {selectedGatewayId && selectedSurfaceId.trim() && (
         <PaymentManifestPreview
@@ -478,37 +245,6 @@ const PaymentPanel: React.FC<ConfigPanelProps> = ({
         >
           <i className="fas fa-pen-to-square me-1" aria-hidden="true" /> Configure triggers…
         </button>
-      </div>
-
-      <div className="config-section">
-        <Form.Check
-          type="switch"
-          id="payment-require-all-toggle"
-          data-testid="payment-require-all-toggle"
-          style={{ fontSize: '11px' }}
-          checked={config.require_all === true}
-          onChange={e => updateField('require_all', e.target.checked)}
-          label="Charge every request"
-        />
-        <div className="d-flex align-items-center gap-1">
-          <Form.Check
-            type="switch"
-            id="payment-share-email-toggle"
-            data-testid="payment-share-email-toggle"
-            style={{ fontSize: '11px' }}
-            checked={config.share_payer_email === true}
-            onChange={e => updateField('share_payer_email', e.target.checked)}
-            label="Share the payer's email with agent-pay"
-          />
-          <FieldHelp ariaLabel="About sharing the payer email" testId="payment-share-email-help">
-            <p className="mb-0">
-              Off by default. When on, the caller&apos;s email from source authentication is sent to
-              agent-pay with each payment. agent-pay stores a pseudonymous reference rather than the
-              address, but the address still leaves this gateway. An email address is personal data:
-              turn this on only when agent-pay needs it and your privacy notice covers sharing it.
-            </p>
-          </FieldHelp>
-        </div>
       </div>
 
       <div className="config-section">

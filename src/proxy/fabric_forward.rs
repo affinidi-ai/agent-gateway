@@ -1138,6 +1138,7 @@ mod tests {
                 abort_handle: sender_task,
                 metrics: Default::default(),
                 client: sender_client,
+                inbound_acl: crate::mediators::utils::InboundAcl::Open,
             })
             .await;
         let manager = Arc::new(manager);

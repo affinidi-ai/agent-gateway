@@ -124,59 +124,49 @@ describe('getPaymentManifest', () => {
   });
 });
 
-describe('payment audit, summary and breaker', () => {
-  it('asks for the filtered audit page and fills a malformed body with defaults', async () => {
+describe('payment gateways', () => {
+  it('lists the payment gateways and treats a non-list body as none', async () => {
+    fetchMock.mockResolvedValueOnce(json([{ id: 'gw-pay', name: 'Agent Pay' }]));
+    await expect(apiClient.listPaymentGateways()).resolves.toEqual([
+      { id: 'gw-pay', name: 'Agent Pay' },
+    ]);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/payment-gateways');
+
+    fetchMock.mockResolvedValueOnce(json({ error: 'unexpected' }));
+    await expect(apiClient.listPaymentGateways()).resolves.toEqual([]);
+  });
+
+  it('reads the gateway info and rejects a peer that is not a payment gateway with 502', async () => {
+    const info = {
+      info_version: '1',
+      role: 'payment',
+      protocols: ['x402'],
+      payment_methods: [],
+      payable_count: 1,
+      units: ['USDC'],
+    };
+    fetchMock.mockResolvedValueOnce(json(info));
+    await expect(apiClient.getPaymentGatewayInfo('gw/1')).resolves.toEqual(info);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/payment-gateways/gw%2F1/info');
+
+    fetchMock.mockResolvedValueOnce(new Response('not a payment gateway', { status: 502 }));
+    await expect(apiClient.getPaymentGatewayInfo('gw-1')).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('posts the payment role and surfaces a 409 refusal as text', async () => {
+    fetchMock.mockResolvedValueOnce(json({ id: 'gw-1', role: 'payment' }));
+    await expect(apiClient.setGatewayPaymentRole('gw-1')).resolves.toMatchObject({
+      role: 'payment',
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/gateways/gw-1/payment-role');
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+
     fetchMock.mockResolvedValueOnce(
-      json({ events: [{ timestamp: 't' }], total: 1, page: 1, page_size: 25, total_pages: 1 })
+      new Response('1 surface(s) route to this gateway over fabric://', { status: 409 })
     );
-    const page = await apiClient.listPaymentAudit({
-      surface_id: 'weather',
-      stage: 'failed',
-      trace_id: '',
-      page: 2,
-      page_size: 25,
+    await expect(apiClient.setGatewayPaymentRole('gw-1')).rejects.toMatchObject({
+      status: 409,
+      message: '1 surface(s) route to this gateway over fabric:// (409)',
     });
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      '/api/admin/payments/audit?surface_id=weather&stage=failed&page=2&page_size=25'
-    );
-    expect(page.total).toBe(1);
-
-    fetchMock.mockResolvedValueOnce(json({ events: 'nope' }));
-    await expect(apiClient.listPaymentAudit()).resolves.toEqual({
-      events: [],
-      total: 0,
-      page: 1,
-      page_size: 50,
-      total_pages: 1,
-    });
-    expect(fetchMock.mock.calls[1][0]).toBe('/api/admin/payments/audit');
-  });
-
-  it('asks for a surface summary over the given hours', async () => {
-    fetchMock.mockResolvedValue(json({ since: 's', total: 3, counts: { paid: 3 } }));
-    await expect(apiClient.getPaymentSummary('weather', 24)).resolves.toEqual({
-      since: 's',
-      total: 3,
-      counts: { paid: 3 },
-    });
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      '/api/admin/payments/summary?hours=24&surface_id=weather'
-    );
-  });
-
-  it('asks for a breaker by its encoded payment gateway id', async () => {
-    fetchMock.mockResolvedValue(
-      json({
-        payment_gateway_id: 'gw/1',
-        state: 'open',
-        consecutive_failures: 5,
-        retry_after_secs: 12,
-        failures_to_open: 5,
-        open_secs: 30,
-      })
-    );
-    const breaker = await apiClient.getPaymentBreaker('gw/1');
-    expect(breaker.state).toBe('open');
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/admin/payments/breakers/gw%2F1');
   });
 });

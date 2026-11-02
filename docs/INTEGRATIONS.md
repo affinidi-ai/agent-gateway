@@ -193,8 +193,8 @@ Every event fills these variables, plus its own:
 
 The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
 `APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
-event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`, and
-`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
+event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
+`GATEWAY_ROLE` (`Peer` or `Payment`) and `GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
 the connection point `created`, `updated` and `deleted` events, also carry `OLD_STATE` and
 `NEW_STATE`: the resource before and after the change as JSON, empty for a create or a delete
 respectively. A connection point's state leaves out its invitation (`oob_id`, `oob_url`,

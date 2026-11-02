@@ -81,8 +81,11 @@ describe('ElementRegistry', () => {
     it('treats missing gateway fields as incomplete for gateway endpoint type', () => {
       expect(registry.isConfigured('target', { endpoint_type: 'gateway' })).toBe(false);
       expect(registry.getIncompleteReason('target', { endpoint_type: 'gateway' })).toBe(
-        'Gateway connection is required'
+        'Select a gateway'
       );
+      expect(
+        registry.getIncompleteReason('target', { endpoint_type: 'gateway', gateway_id: 'gw1' })
+      ).toBe('Select an Agent Surface on the gateway');
       expect(
         registry.isConfigured('target', {
           endpoint_type: 'gateway',

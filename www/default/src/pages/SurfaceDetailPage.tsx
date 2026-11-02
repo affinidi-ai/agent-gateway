@@ -105,7 +105,6 @@ const SurfaceDetailPage: React.FC = () => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('surfaces.edit');
-  const canViewPayments = hasPermission('payments.view');
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
@@ -1587,10 +1586,6 @@ const SurfaceDetailPage: React.FC = () => {
   }
 
   if (!surface) return null;
-
-  const savedPayment = surface.target?.payment_policy;
-  const agentPayGatewayId =
-    savedPayment?.type === 'agent_pay' ? savedPayment.payment_gateway_id : undefined;
 
   const livePayload = (() => {
     try {

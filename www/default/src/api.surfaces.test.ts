@@ -221,10 +221,10 @@ describe('getPaymentManifest', () => {
     await apiClient.getPaymentManifest('gw-1', 'pay-ch', true);
 
     expect(fetchMock.mock.calls[0][0]).toBe(
-      '/api/v1/gateways/gw-1/surfaces/pay-ch%24eu/payment-manifest'
+      '/api/v1/payment-gateways/gw-1/surfaces/pay-ch%24eu/payment-manifest'
     );
     expect(fetchMock.mock.calls[1][0]).toBe(
-      '/api/v1/gateways/gw-1/surfaces/pay-ch/payment-manifest?force_refresh=true'
+      '/api/v1/payment-gateways/gw-1/surfaces/pay-ch/payment-manifest?force_refresh=true'
     );
   });
 

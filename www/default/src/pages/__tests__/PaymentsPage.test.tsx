@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import PaymentsPage from '../PaymentsPage';
-import { MAX_BUCKETS, OUTCOME_META, bucketByOutcome } from '../PaymentsPage/ledger';
+import { OUTCOME_META } from '../PaymentsPage/ledger';
 import { apiClient } from '../../api';
 import { PAYMENT_OUTCOMES } from '../../types';
 import type { PaymentCaseStatus, PaymentLedgerPage, PaymentLedgerRow } from '../../types';
@@ -13,18 +13,14 @@ jest.mock('../../api', () => ({
     fetch: jest.fn(),
     listPayments: jest.fn(),
     getPayment: jest.fn(),
-    listPaymentAudit: jest.fn(),
+    listPaymentGateways: jest.fn(),
   },
-}));
-
-jest.mock('react-chartjs-2', () => ({
-  Bar: () => null,
 }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
 const mockList = apiClient.listPayments as jest.Mock;
 const mockGet = apiClient.getPayment as jest.Mock;
-const mockAudit = apiClient.listPaymentAudit as jest.Mock;
+const mockGateways = apiClient.listPaymentGateways as jest.Mock;
 
 const row = (over: Partial<PaymentLedgerRow>): PaymentLedgerRow => ({
   id: 'p-1',
@@ -85,6 +81,7 @@ const renderPage = (path = '/payments') =>
 
 beforeEach(() => {
   jest.resetAllMocks();
+  mockGateways.mockResolvedValue([]);
 });
 
 describe('PaymentsPage', () => {
@@ -242,16 +239,14 @@ describe('PaymentsPage', () => {
     expect(screen.queryByTestId('payments-detail-modal')).not.toBeInTheDocument();
   });
 
-  it('hides the legacy tab when the old endpoints are empty', async () => {
+  it('hides the legacy list when the old endpoints are empty', async () => {
     mockApi();
     renderPage();
     await screen.findByTestId('payments-row-p-1');
 
-    expect(screen.queryByTestId('payments-legacy-tab')).not.toBeInTheDocument();
-    expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual([
-      'Ledger',
-      'Audit trail',
-    ]);
+    expect(screen.queryByTestId('payments-legacy-panel')).not.toBeInTheDocument();
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument();
+    expect(screen.queryByText('Audit trail')).not.toBeInTheDocument();
   });
 
   it('shows the empty state when the ledger is empty', async () => {
@@ -270,6 +265,38 @@ describe('PaymentsPage', () => {
     expect(await screen.findByTestId('payments-error-alert')).toHaveTextContent('Forbidden');
 
     fireEvent.click(screen.getByTestId('payments-error-dismiss-button'));
+    expect(screen.queryByTestId('payments-error-alert')).not.toBeInTheDocument();
+  });
+});
+
+describe('PaymentsPage — payment gateway names', () => {
+  it('names the payment gateway in the row and the details', async () => {
+    mockApi();
+    mockGateways.mockResolvedValue([{ id: 'gw-pay', name: 'Agent Pay' }]);
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId('payments-gateway-p-1')).toHaveTextContent(
+        'via pay-ch on Agent Pay'
+      )
+    );
+    expect(screen.getByTestId('payments-gateway-p-1')).toHaveAttribute('title', 'gw-pay');
+    expect(mockGateways).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId('payments-details-button-p-1'));
+    expect(await screen.findByTestId('payments-detail-gateway')).toHaveTextContent('Agent Pay');
+  });
+
+  it('falls back to the id when the gateway is not listed or the list fails', async () => {
+    mockApi();
+    mockGateways.mockRejectedValue(new Error('Forbidden (403)'));
+    renderPage();
+
+    expect(await screen.findByTestId('payments-gateway-p-1')).toHaveTextContent(
+      'via pay-ch on gw-pay'
+    );
+    fireEvent.click(screen.getByTestId('payments-details-button-p-1'));
+    expect(await screen.findByTestId('payments-detail-gateway')).toHaveTextContent('gw-pay');
     expect(screen.queryByTestId('payments-error-alert')).not.toBeInTheDocument();
   });
 });
@@ -384,10 +411,7 @@ describe('PaymentsPage — unconfirmed outcome', () => {
     expect(screen.queryByTestId('payments-detail-outcome-note')).not.toBeInTheDocument();
   });
 
-  it('counts it in its own bucket column', () => {
-    const buckets = bucketByOutcome([row({ id: 'a', created_at: 0, outcome: 'unconfirmed' })], 60);
-    expect(buckets[0].counts.unconfirmed).toBe(1);
-    expect(buckets[0].counts.unavailable).toBe(0);
+  it('labels it', () => {
     expect(OUTCOME_META.unconfirmed.label).toBe('Unconfirmed');
     expect(OUTCOME_META.unconfirmed.note).toBe(note);
     expect(PAYMENT_OUTCOMES).toContain('unconfirmed');
@@ -395,19 +419,7 @@ describe('PaymentsPage — unconfirmed outcome', () => {
 });
 
 describe('PaymentsPage — payments held until delivery', () => {
-  it('labels and counts authorized, voided and capture_failed rows', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'a', created_at: 0, outcome: 'authorized' }),
-        row({ id: 'b', created_at: 0, outcome: 'voided' }),
-        row({ id: 'c', created_at: 0, outcome: 'capture_failed' }),
-      ],
-      60
-    );
-    expect(buckets[0].counts.authorized).toBe(1);
-    expect(buckets[0].counts.voided).toBe(1);
-    expect(buckets[0].counts.capture_failed).toBe(1);
-    expect(buckets[0].counts.paid).toBe(0);
+  it('labels authorized, voided and capture_failed rows', () => {
     expect(OUTCOME_META.capture_failed.label).toBe('Capture failed');
     expect(OUTCOME_META.capture_failed.tone).toBe('danger');
     expect(OUTCOME_META.voided.label).toBe('Voided');
@@ -617,7 +629,7 @@ describe('PaymentsPage — held payment status', () => {
   });
 });
 
-describe('PaymentsPage — legacy tab', () => {
+describe('PaymentsPage — legacy rows', () => {
   const verification = (id: string, amount: string, created_at: number) => ({
     type: 'verification',
     id: `${id}_verification`,
@@ -664,10 +676,6 @@ describe('PaymentsPage — legacy tab', () => {
     });
     renderPage();
 
-    const tab = await screen.findByTestId('payments-legacy-tab');
-    expect(tab).toHaveTextContent('3');
-    fireEvent.click(tab);
-
     const panel = await screen.findByTestId('payments-legacy-panel');
     expect(within(panel).getAllByTestId(/^payments-legacy-row-/)).toHaveLength(3);
 
@@ -697,8 +705,6 @@ describe('PaymentsPage — legacy tab', () => {
     });
     renderPage();
 
-    fireEvent.click(await screen.findByTestId('payments-legacy-tab'));
-
     const panel = await screen.findByTestId('payments-legacy-panel');
     const keys = within(panel)
       .getAllByTestId(/^payments-legacy-row-/)
@@ -706,144 +712,16 @@ describe('PaymentsPage — legacy tab', () => {
     expect(keys).toEqual(['payments-legacy-row-x402-tx-new', 'payments-legacy-row-x402-tx-old']);
   });
 
-  it('switches back to the ledger tab', async () => {
+  it('shows the legacy rows below the payments list', async () => {
     mockApi({ x402: [verification('tx-1', '10000', 1_700_000_100)] });
     renderPage();
 
-    fireEvent.click(await screen.findByTestId('payments-legacy-tab'));
-    await screen.findByTestId('payments-legacy-panel');
-    const ledgerTab = screen.getByRole('tab', { name: /Ledger/ });
-    expect(ledgerTab).toHaveAttribute('aria-selected', 'false');
-
-    fireEvent.click(screen.getByTestId('payments-ledger-tab'));
-
-    expect(ledgerTab).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByTestId('payments-legacy-panel')).toBeInTheDocument();
     expect(screen.getByTestId('payments-row-p-1')).toBeInTheDocument();
   });
 });
 
-describe('bucketByOutcome', () => {
-  it('counts each outcome per window and fills empty windows', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'a', created_at: 0, outcome: 'paid' }),
-        row({ id: 'b', created_at: 30, outcome: 'held' }),
-        row({ id: 'c', created_at: 150, outcome: 'rejected' }),
-      ],
-      60
-    );
-    expect(buckets.map(b => b.start)).toEqual([0, 60_000, 120_000]);
-    expect(buckets[0].counts).toEqual({
-      paid: 1,
-      challenge: 0,
-      held: 1,
-      rejected: 0,
-      unavailable: 0,
-      unconfirmed: 0,
-      authorized: 0,
-      voided: 0,
-      capture_failed: 0,
-    });
-    expect(buckets[1].counts.paid + buckets[1].counts.rejected).toBe(0);
-    expect(buckets[2].counts.rejected).toBe(1);
-  });
-
-  it('accepts RFC 3339 timestamps and skips unreadable ones', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'a', created_at: '1970-01-01T00:00:10Z' }),
-        row({ id: 'b', created_at: 'not a date' }),
-      ],
-      60
-    );
-    expect(buckets).toHaveLength(1);
-    expect(buckets[0].counts.paid).toBe(1);
-  });
-
-  it('keeps every window while they fit in the cap', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'old', created_at: 0, outcome: 'paid' }),
-        row({ id: 'new', created_at: (MAX_BUCKETS - 1) * 60, outcome: 'rejected' }),
-      ],
-      60
-    );
-
-    expect(buckets).toHaveLength(MAX_BUCKETS);
-    expect(buckets[0].start).toBe(0);
-    expect(buckets[0].counts.paid).toBe(1);
-    expect(buckets[MAX_BUCKETS - 1].counts.rejected).toBe(1);
-  });
-
-  it('keeps the newest windows, not the oldest, when the rows span more than the cap', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'old', created_at: 0, outcome: 'paid' }),
-        row({ id: 'mid', created_at: 300 * 60, outcome: 'held' }),
-        row({ id: 'new', created_at: 700 * 60 + 5, outcome: 'rejected' }),
-      ],
-      60
-    );
-
-    expect(buckets).toHaveLength(MAX_BUCKETS);
-    expect(buckets[MAX_BUCKETS - 1].start).toBe(700 * 60_000);
-    expect(buckets[MAX_BUCKETS - 1].counts.rejected).toBe(1);
-    expect(buckets[0].start).toBe((700 - (MAX_BUCKETS - 1)) * 60_000);
-    const gaps = buckets.slice(1).map((b, i) => b.start - buckets[i].start);
-    expect(gaps).toHaveLength(MAX_BUCKETS - 1);
-    expect(gaps.every(gap => gap === 60_000)).toBe(true);
-    const total = (outcome: 'paid' | 'held' | 'rejected') =>
-      buckets.reduce((n, b) => n + b.counts[outcome], 0);
-    expect(total('rejected')).toBe(1);
-    expect(total('held')).toBe(1);
-    expect(total('paid')).toBe(0);
-  });
-
-  it('drops only the single oldest window when the rows span one window too many', () => {
-    const buckets = bucketByOutcome(
-      [
-        row({ id: 'old', created_at: 0, outcome: 'paid' }),
-        row({ id: 'new', created_at: MAX_BUCKETS * 60, outcome: 'challenge' }),
-      ],
-      60
-    );
-
-    expect(buckets).toHaveLength(MAX_BUCKETS);
-    expect(buckets[0].start).toBe(60_000);
-    expect(buckets[MAX_BUCKETS - 1].counts.challenge).toBe(1);
-  });
-
-  it('returns nothing without a usable row', () => {
-    expect(bucketByOutcome([], 60)).toEqual([]);
-    expect(bucketByOutcome([row({ created_at: 'never' })], 60)).toEqual([]);
-  });
-});
-
-describe('PaymentsPage — reasons, hidden fields and the audit trail', () => {
-  const auditPage = {
-    events: [
-      {
-        event_id: 'e-1',
-        timestamp: '2026-10-26T10:00:00Z',
-        surface_id: 'weather',
-        trace_id: 'trace-9',
-        vp_fingerprint: 'sha256:grant',
-        event: {
-          payment_event: {
-            rail: 'mpp',
-            stage: 'failed',
-            transaction_id: 'p-9',
-            error: 'insufficient_funds',
-          },
-        },
-      },
-    ],
-    total: 1,
-    page: 1,
-    page_size: 50,
-    total_pages: 1,
-  };
-
+describe('PaymentsPage — reasons and hidden fields', () => {
   it('shows a refused row its reason as a hint and in its details with the hidden fields', async () => {
     const rejected = row({
       id: 'p-9',
@@ -896,44 +774,11 @@ describe('PaymentsPage — reasons, hidden fields and the audit trail', () => {
     }
   });
 
-  it('opens the audit trail of a payment by its trace id from the details', async () => {
+  it('offers no audit link from a payment with a trace id', async () => {
     mockApi();
-    mockAudit.mockResolvedValue(auditPage);
     renderPage();
-
     fireEvent.click(await screen.findByTestId('payments-details-button-p-1'));
-    fireEvent.click(await screen.findByTestId('payments-detail-audit-link'));
-
-    expect(screen.queryByTestId('payments-detail-modal')).not.toBeInTheDocument();
-    expect(await screen.findByTestId('payments-audit-row-e-1')).toHaveTextContent('failed');
-    const table = screen.getByTestId('payments-audit-table');
-    expect(table).toHaveTextContent('insufficient_funds');
-    expect(table).toHaveTextContent('sha256:grant');
-    expect(screen.getByTestId('payments-audit-trace-input')).toHaveValue('trace-1');
-    expect(mockAudit).toHaveBeenLastCalledWith(
-      expect.objectContaining({ trace_id: 'trace-1', page: 1, page_size: 50 })
-    );
-  });
-
-  it('filters the audit trail by stage and shows an empty state and errors', async () => {
-    mockApi();
-    mockAudit.mockResolvedValue({ ...auditPage, events: [], total: 0 });
-    renderPage('/payments?surface_id=weather');
-
-    fireEvent.click(await screen.findByTestId('payments-audit-tab'));
-    expect(await screen.findByText('No payment audit events')).toBeInTheDocument();
-    expect(mockAudit).toHaveBeenLastCalledWith(expect.objectContaining({ surface_id: 'weather' }));
-
-    fireEvent.change(screen.getByTestId('payments-audit-stage-filter'), {
-      target: { value: 'settled' },
-    });
-    await waitFor(() =>
-      expect(mockAudit).toHaveBeenLastCalledWith(expect.objectContaining({ stage: 'settled' }))
-    );
-
-    await waitFor(() => expect(screen.getByTestId('payments-audit-refresh-button')).toBeEnabled());
-    mockAudit.mockRejectedValue(new Error('audit down'));
-    fireEvent.click(screen.getByTestId('payments-audit-refresh-button'));
-    expect(await screen.findByTestId('payments-audit-error')).toHaveTextContent('audit down');
+    await screen.findByText('rcpt-1');
+    expect(screen.queryByTestId('payments-detail-audit-link')).not.toBeInTheDocument();
   });
 });

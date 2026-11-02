@@ -4,10 +4,16 @@ import type { LegacyPaymentRow } from './legacy';
 
 const LegacyPaymentsTab: React.FC<{ rows: LegacyPaymentRow[] }> = ({ rows }) => (
   <div className="card shadow mb-4" data-testid="payments-legacy-panel">
+    <div className="card-header py-3">
+      <h6 className="m-0 font-weight-bold text-primary">
+        <i className="fas fa-history me-2" aria-hidden="true" />
+        Legacy x402/MPP
+      </h6>
+    </div>
     <div className="card-body">
       <p className="text-muted small">
         Payments taken by this gateway&apos;s former local x402/MPP paywall. Read-only; new payments
-        go through agent-pay and appear on the Ledger tab.
+        go through agent-pay and appear in the list above.
       </p>
       <div className="table-responsive">
         <table className="table table-sm mb-0">

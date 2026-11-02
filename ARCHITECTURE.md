@@ -416,7 +416,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
+| [`gateways/`](src/gateways/) | Remote gateway records (peers and payment gateways, kept apart by `role_scope.rs`; `usage.rs` says what still depends on one), pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
 | [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane

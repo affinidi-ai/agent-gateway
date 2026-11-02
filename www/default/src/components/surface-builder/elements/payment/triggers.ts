@@ -1,8 +1,6 @@
 import type { A2AMethodFilter, McpPaymentTriggers } from '../../../../types';
 import type { PaymentNodeConfig } from './types';
 
-export type TriggerMode = McpPaymentTriggers['mode'];
-
 const MAX_CHECKED_LENGTH = 1000;
 const UNSUPPORTED_BY_GATEWAY = /\(\?<?[=!]|\\[1-9]/;
 const INLINE_FLAGS = /\(\?[imsxUu-]+\)/g;
@@ -30,6 +28,123 @@ export function triggerPatternAdvice(pattern: string): string | null {
   } catch {
     return 'The browser could not read this pattern. The gateway checks it when you save.';
   }
+}
+
+const HAS_INLINE_FLAGS = /\(\?[imsxUu-]+[:)]/;
+
+/**
+ * The browser's reading of `pattern`, or null when the browser cannot read it the way the
+ * gateway does. Like the gateway, a pattern matches anywhere in the tool name unless anchored.
+ */
+export function browserTriggerRegExp(pattern: string): RegExp | null {
+  if (pattern.length > MAX_CHECKED_LENGTH || HAS_INLINE_FLAGS.test(pattern)) return null;
+  if (UNSUPPORTED_BY_GATEWAY.test(pattern.replace(/\\\\/g, ''))) return null;
+  try {
+    return new RegExp(pattern.replace(NAMED_GROUP, '(?<'));
+  } catch {
+    return null;
+  }
+}
+
+const REGEX_SPECIAL = /[\\^$.*+?()[\]{}|]/g;
+const EXACT_TOOL_PATTERN = /^\^((?:\\[\\^$.*+?()[\]{}|]|[^\\^$.*+?()[\]{}|])+)\$$/;
+
+/** The pattern that matches exactly one tool name, in both the gateway's and the browser's syntax. */
+export const exactToolPattern = (name: string): string =>
+  `^${name.replace(REGEX_SPECIAL, '\\$&')}$`;
+
+/** The tool a pattern written by `exactToolPattern` names, or null for any other pattern. */
+export function toolFromExactPattern(pattern: string): string | null {
+  const m = EXACT_TOOL_PATTERN.exec(pattern);
+  return m ? m[1].replace(/\\(.)/g, '$1') : null;
+}
+
+export interface ToolCharge {
+  charged: boolean;
+  /** A pattern other than an exact tool pattern decides this tool, so it is edited as a pattern. */
+  decidedBy?: string;
+}
+
+/** Whether a `tools/call` of `tool` is charged under `raw`, by the gateway's rule. */
+export function toolCharge(raw: unknown, tool: string): ToolCharge {
+  const t = normaliseMcpTriggers(raw);
+  if (!t || t.mode === 'all') return { charged: true };
+  const exact = t.patterns.some(p => toolFromExactPattern(p) === tool);
+  const decidedBy = t.patterns.find(
+    p => toolFromExactPattern(p) === null && browserTriggerRegExp(p)?.test(tool)
+  );
+  const matched = exact || decidedBy !== undefined;
+  return {
+    charged: t.mode === 'match' ? matched : !matched,
+    ...(decidedBy !== undefined ? { decidedBy } : {}),
+  };
+}
+
+/**
+ * Whether the selected tools and patterns are charged (Match, or All and no trigger, where
+ * nothing is selected yet) rather than free (Exclude).
+ */
+export const mcpSelectionCharged = (raw: unknown): boolean =>
+  normaliseMcpTriggers(raw)?.mode !== 'exclude';
+
+/**
+ * The trigger for a selection: a charged one is Match, or All while it is empty, so clearing
+ * the last tool charges every tool again; a free one is Exclude, whose empty list also charges
+ * every tool.
+ */
+export function buildMcpTriggers(
+  selectionCharged: boolean,
+  patterns: string[]
+): McpPaymentTriggers {
+  if (!selectionCharged) return { mode: 'exclude', patterns };
+  return patterns.length > 0 ? { mode: 'match', patterns } : { mode: 'all' };
+}
+
+/** The stored patterns as the editor lists them, blank rows included. */
+export function storedMcpPatterns(raw: unknown): string[] {
+  const t = (raw ?? {}) as { mode?: unknown; patterns?: unknown };
+  return t.mode === 'all' || !Array.isArray(t.patterns)
+    ? []
+    : t.patterns.filter((p): p is string => typeof p === 'string');
+}
+
+/** The tools selected by their exact pattern, in list order. */
+export const selectedToolNames = (raw: unknown): string[] =>
+  storedMcpPatterns(raw)
+    .map(toolFromExactPattern)
+    .filter((tool): tool is string => tool !== null);
+
+/**
+ * Selects `tools` by appending the exact patterns they lack, or clears them by removing their
+ * exact patterns. Every other row keeps its place.
+ */
+export function setToolsSelected(
+  raw: unknown,
+  tools: string[],
+  selected: boolean
+): McpPaymentTriggers {
+  const stored = storedMcpPatterns(raw);
+  const listed = stored.map(toolFromExactPattern);
+  const next = selected
+    ? [
+        ...stored,
+        ...tools
+          .filter((tool, i) => !listed.includes(tool) && tools.indexOf(tool) === i)
+          .map(exactToolPattern),
+      ]
+    : stored.filter((_, i) => listed[i] === null || !tools.includes(listed[i] as string));
+  return buildMcpTriggers(mcpSelectionCharged(raw), next);
+}
+
+/** The same patterns with the other meaning: what was charged becomes free, and the reverse. */
+export const setMcpSelectionCharged = (raw: unknown, charged: boolean): McpPaymentTriggers =>
+  buildMcpTriggers(charged, storedMcpPatterns(raw));
+
+/** Patterns the browser cannot evaluate, so the tool list may not show their effect. */
+export function uncheckedMcpPatterns(raw: unknown): string[] {
+  const t = normaliseMcpTriggers(raw);
+  if (!t || t.mode === 'all') return [];
+  return t.patterns.filter(p => toolFromExactPattern(p) === null && !browserTriggerRegExp(p));
 }
 
 const nonBlank = (patterns: unknown): string[] =>

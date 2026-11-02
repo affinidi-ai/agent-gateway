@@ -36,17 +36,18 @@ const manifest = (
 
 function mockDiscovery() {
   mockGet.mockImplementation((url: string) => {
-    if (url === '/gateways') {
+    if (url.startsWith('/gateways/payment-providers')) {
       return Promise.resolve({
         data: [
-          { id: 'gw-pay', name: 'Agent Pay', gateway_type: 'remote', creation_type: 'user' },
-          { id: 'gw-other', name: 'Other', gateway_type: 'remote', creation_type: 'user' },
-          { id: 'gw-local', name: 'Local', gateway_type: 'local', creation_type: 'system' },
+          { id: 'gw-pay', name: 'Agent Pay' },
+          { id: 'gw-pay-2', name: 'Second Pay' },
         ],
       });
     }
-    if (url === '/gateways/payment-providers') return Promise.resolve({ data: [{ id: 'gw-pay' }] });
-    if (url.startsWith('/gateways/gw-pay/surfaces')) {
+    if (url.startsWith('/payment-gateways/gw-pay-2/surfaces')) {
+      return Promise.resolve({ data: [{ config_id: 'eu-ch', name: 'eu-ch', tags: ['payment'] }] });
+    }
+    if (url.startsWith('/payment-gateways/gw-pay/surfaces')) {
       return Promise.resolve({
         data: [
           { config_id: 'pay-ch', name: 'pay-ch', is_payment_surface: true },
@@ -95,22 +96,100 @@ beforeEach(() => {
 });
 
 describe('PaymentPanel', () => {
-  it('lists only payment gateways and payment surfaces', async () => {
+  it('lists only the payment gateways and their payment surfaces, with no filter switch', async () => {
     render(<Harness initial={{}} />);
 
     const gatewaySelect = await screen.findByTestId('payment-gateway-select');
-    await waitFor(() => expect(within(gatewaySelect).queryByText('Other')).not.toBeInTheDocument());
-    expect(within(gatewaySelect).getByText('Agent Pay')).toBeInTheDocument();
-    expect(within(gatewaySelect).queryByText('Local')).not.toBeInTheDocument();
+    await waitFor(() => expect(within(gatewaySelect).getByText('Agent Pay')).toBeInTheDocument());
+    expect(within(gatewaySelect).getByText('Second Pay')).toBeInTheDocument();
+    expect(within(gatewaySelect).getAllByRole('option')).toHaveLength(3);
+    expect(within(gatewaySelect).queryByText('Plain Peer')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('payment-only-filter-toggle')).not.toBeInTheDocument();
 
     fireEvent.change(gatewaySelect, { target: { value: 'gw-pay' } });
     const surfaceSelect = await screen.findByTestId('payment-surface-select');
     await waitFor(() => expect(within(surfaceSelect).getByText('pay-ch')).toBeInTheDocument());
     expect(within(surfaceSelect).getByText('card-ch')).toBeInTheDocument();
     expect(within(surfaceSelect).queryByText('free-ch')).not.toBeInTheDocument();
+    expect(mockGet).not.toHaveBeenCalledWith('/gateways');
+    expect(mockGet).not.toHaveBeenCalledWith(expect.stringMatching(/^\/gateways\/gw-pay\//));
+  });
 
-    fireEvent.click(screen.getByTestId('payment-only-filter-toggle'));
-    await waitFor(() => expect(within(surfaceSelect).getByText('free-ch')).toBeInTheDocument());
+  it('lists every surface of a peer that sends no payment markers', async () => {
+    mockGet.mockImplementation((url: string) =>
+      url === '/gateways/payment-providers'
+        ? Promise.resolve({ data: [{ id: 'gw-pay', name: 'Agent Pay' }] })
+        : Promise.resolve({ data: [{ config_id: 'old-ch', name: 'old-ch' }] })
+    );
+    render(<Harness initial={{ payment_gateway_id: 'gw-pay' }} />);
+
+    const surfaceSelect = await screen.findByTestId('payment-surface-select');
+    await waitFor(() =>
+      expect(mockGet).toHaveBeenCalledWith('/payment-gateways/gw-pay/surfaces?force_refresh=true')
+    );
+    await waitFor(() => expect(within(surfaceSelect).getByText('old-ch')).toBeInTheDocument());
+  });
+
+  it('offers Add Payment Gateway in a new tab when no payment gateway is connected', async () => {
+    mockGet.mockResolvedValue({ data: [] });
+    render(<Harness initial={{}} />);
+
+    expect(await screen.findByTestId('payment-no-gateway')).toHaveTextContent(
+      'No connected payment gateway'
+    );
+    const link = screen.getByTestId('payment-add-gateway-link');
+    expect(link).toHaveAttribute('href', '/payment-gateways/connect');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveTextContent('Add Payment Gateway');
+    expect(link).not.toHaveTextContent(/^\s*Add Gateway\s*$/);
+    expect(screen.queryByTestId('payment-gateway-select')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('payment-gateway-note')).not.toBeInTheDocument();
+  });
+
+  it('points the muted Add link at the payment gateway wizard too', async () => {
+    render(<Harness initial={{}} />);
+
+    const gatewaySelect = await screen.findByTestId('payment-gateway-select');
+    await waitFor(() => expect(within(gatewaySelect).getByText('Agent Pay')).toBeInTheDocument());
+    const link = screen.getByTestId('payment-add-gateway-link');
+    expect(link).toHaveAttribute('href', '/payment-gateways/connect');
+    expect(link).toHaveTextContent('Add Payment Gateway');
+  });
+
+  it('lists no gateway and offers a retry when the payment gateways cannot be loaded', async () => {
+    let failed = false;
+    const discovery = mockGet.getMockImplementation()!;
+    mockGet.mockImplementation((url: string) => {
+      if (url.startsWith('/gateways/payment-providers') && !failed) {
+        failed = true;
+        return Promise.reject(new Error('boom'));
+      }
+      return discovery(url);
+    });
+    render(<Harness initial={{}} />);
+
+    expect(await screen.findByTestId('payment-gateway-error')).toHaveTextContent(
+      'Could not load the connected gateways.'
+    );
+    expect(screen.queryByTestId('payment-no-gateway')).not.toBeInTheDocument();
+    const gatewaySelect = screen.getByTestId('payment-gateway-select');
+    expect(within(gatewaySelect).getAllByRole('option')).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId('payment-gateway-retry-button'));
+    await waitFor(() => expect(within(gatewaySelect).getByText('Agent Pay')).toBeInTheDocument());
+    expect(screen.queryByTestId('payment-gateway-error')).not.toBeInTheDocument();
+  });
+
+  it('keeps a saved gateway that is no longer a payment gateway visible', async () => {
+    render(<Harness initial={{ payment_gateway_id: 'gw-gone' }} />);
+
+    const gatewaySelect = await screen.findByTestId('payment-gateway-select');
+    await waitFor(() =>
+      expect(
+        within(gatewaySelect).getByText('gw-gone (not currently connected)')
+      ).toBeInTheDocument()
+    );
+    expect(gatewaySelect).toHaveValue('gw-gone');
   });
 
   it('previews the live manifest of the chosen surface', async () => {
@@ -188,29 +267,40 @@ describe('PaymentPanel', () => {
     expect(screen.getByTestId('payment-manifest-amount')).toHaveTextContent('0.05 USDC');
   });
 
-  it('accepts a manually entered surface id with a variant alias', async () => {
-    mockManifest.mockResolvedValue(null);
+  it('offers no manual surface entry', async () => {
     render(<Harness initial={{ payment_gateway_id: 'gw-pay' }} />);
 
-    fireEvent.click(await screen.findByTestId('payment-surface-manual-toggle-button'));
-    const input = screen.getByTestId('payment-surface-manual-input');
-    expect(input).toHaveAttribute('placeholder', expect.stringContaining('$alias'));
-    fireEvent.change(input, { target: { value: 'pay-ch$eu' } });
-
-    expect(await screen.findByTestId('payment-manifest-empty')).toBeInTheDocument();
-    expect(mockManifest).toHaveBeenCalledWith('gw-pay', 'pay-ch$eu', false);
-    expect(within(screen.getByTestId('payment-surface-select')).getByText(/variant/)).toBeTruthy();
+    const surfaceSelect = await screen.findByTestId('payment-surface-select');
+    await waitFor(() => expect(within(surfaceSelect).getByText('pay-ch')).toBeInTheDocument());
+    expect(screen.queryByTestId('payment-surface-manual-toggle-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('payment-surface-manual-input')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Payment surface id' })).not.toBeInTheDocument();
   });
 
-  it('leaves sharing the payer email off by default', async () => {
-    render(<Harness initial={{}} />);
+  it('keeps a saved surface variant selected', async () => {
+    mockManifest.mockResolvedValue(null);
+    render(<Harness initial={{ payment_gateway_id: 'gw-pay', payment_surface_id: 'pay-ch$eu' }} />);
 
-    const toggle = await screen.findByTestId('payment-share-email-toggle');
-    expect(toggle).not.toBeChecked();
-    fireEvent.click(toggle);
-    expect(updates).toContainEqual({ share_payer_email: true });
-    expect(screen.getByTestId('payment-require-all-toggle')).not.toBeChecked();
-    expect(screen.getByTestId('payment-timeout-input')).toHaveAttribute('placeholder', '15000');
+    const surfaceSelect = await screen.findByTestId('payment-surface-select');
+    await waitFor(() =>
+      expect(within(surfaceSelect).getByText('pay-ch$eu (variant)')).toBeInTheDocument()
+    );
+    expect(surfaceSelect).toHaveValue('pay-ch$eu');
+    expect(await screen.findByTestId('payment-manifest-empty')).toBeInTheDocument();
+    expect(mockManifest).toHaveBeenCalledWith('gw-pay', 'pay-ch$eu', false);
+  });
+
+  it('offers neither a charge-every-request nor a share-email switch', async () => {
+    render(<Harness initial={{ require_all: true, share_payer_email: true }} />);
+
+    expect(await screen.findByTestId('payment-timeout-input')).toHaveAttribute(
+      'placeholder',
+      '15000'
+    );
+    expect(screen.queryByTestId('payment-require-all-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('payment-share-email-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Share the payer's email/)).not.toBeInTheDocument();
+    expect(updates).toEqual([]);
   });
 
   it('flags a local payment policy and migrates it keeping the triggers', async () => {
@@ -307,14 +397,15 @@ describe('PaymentPanel', () => {
       render(<Harness initial={saved} />);
       await screen.findByTestId('payment-manifest-preview');
 
-      fireEvent.click(await screen.findByTestId('payment-only-filter-toggle'));
       const gatewaySelect = screen.getByTestId('payment-gateway-select');
-      await waitFor(() => expect(within(gatewaySelect).getByText('Other')).toBeInTheDocument());
-      fireEvent.change(gatewaySelect, { target: { value: 'gw-other' } });
+      await waitFor(() =>
+        expect(within(gatewaySelect).getByText('Second Pay')).toBeInTheDocument()
+      );
+      fireEvent.change(gatewaySelect, { target: { value: 'gw-pay-2' } });
 
       expect(updates).toStrictEqual([
         {
-          payment_gateway_id: 'gw-other',
+          payment_gateway_id: 'gw-pay-2',
           payment_surface_id: undefined,
           manifest_snapshot: undefined,
         },
@@ -327,45 +418,12 @@ describe('PaymentPanel', () => {
     it('leaves the surface id alone when the same gateway is chosen again', async () => {
       render(<Harness initial={saved} />);
       const gatewaySelect = await screen.findByTestId('payment-gateway-select');
+      await waitFor(() => expect(within(gatewaySelect).getByText('Agent Pay')).toBeInTheDocument());
 
       fireEvent.change(gatewaySelect, { target: { value: 'gw-pay' } });
 
       expect(updates).toEqual([]);
       expect(lastConfig.payment_surface_id).toBe('pay-ch');
-    });
-
-    it('closes the manual surface entry when another gateway is chosen', async () => {
-      mockManifest.mockResolvedValue(null);
-      render(<Harness initial={saved} />);
-
-      fireEvent.click(await screen.findByTestId('payment-surface-manual-toggle-button'));
-      expect(screen.getByTestId('payment-surface-manual-input')).toHaveValue('pay-ch');
-
-      fireEvent.click(await screen.findByTestId('payment-only-filter-toggle'));
-      const gatewaySelect = screen.getByTestId('payment-gateway-select');
-      await waitFor(() => expect(within(gatewaySelect).getByText('Other')).toBeInTheDocument());
-      fireEvent.change(gatewaySelect, { target: { value: 'gw-other' } });
-
-      expect(screen.queryByTestId('payment-surface-manual-input')).not.toBeInTheDocument();
-    });
-
-    it('is dropped when a surface id is typed in', async () => {
-      mockManifest.mockResolvedValue(null);
-      render(<Harness initial={saved} />);
-      await screen.findByTestId('payment-manifest-preview');
-
-      fireEvent.click(await screen.findByTestId('payment-surface-manual-toggle-button'));
-      fireEvent.change(screen.getByTestId('payment-surface-manual-input'), {
-        target: { value: 'pay-ch$eu' },
-      });
-
-      expect(updates).toStrictEqual([
-        { payment_surface_id: 'pay-ch$eu', manifest_snapshot: undefined },
-      ]);
-      expect(await screen.findByTestId('payment-manifest-empty')).toBeInTheDocument();
-      expect(screen.getByTestId('payment-manifest-preview')).not.toHaveTextContent(
-        '(saved snapshot)'
-      );
     });
 
     it('stays while the selection is untouched', async () => {

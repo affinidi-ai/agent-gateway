@@ -585,7 +585,11 @@ with the registered catalogs, so an update that does not rebuild them (for
 example only `name`, `status` or `mcp_http`) still returns it; a rebuild that
 loads the legacy catalog clears it. Management tool discovery
 (`POST /v1/mcp-proxies/discover-tools`) lists tools from the modern catalog, so
-it works for such a Proxy too. Both catalogs are published as one snapshot after
+it works for such a Proxy too. Each listed tool carries its `name`, its
+`description` when it has one, and `read_only` from a remote server's
+`annotations.readOnlyHint` when that is a boolean. Discovery with `surface_id`
+lists the saved MCP surface's Target instead of a caller-supplied one; see
+[POLICY.md](POLICY.md#other-pinned-egress-sinks) for its egress rule. Both catalogs are published as one snapshot after
 a successful build; a failed reload keeps the previous snapshot and removal
 drops both. Tests cover conditional input constraints, nested component
 references, scoped local definitions, output constraints, truthful discovery and

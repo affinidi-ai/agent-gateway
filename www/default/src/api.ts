@@ -6,14 +6,11 @@ import {
   CliLoginRequest,
   CreateAccessTokenRequest,
   DashboardStats,
+  GatewayInfo,
   Issuer,
   LogEntry,
-  PaymentAuditPage,
-  PaymentAuditQuery,
-  PaymentBreaker,
   PaymentLedgerPage,
   PaymentLedgerQuery,
-  PaymentSummary,
   PaymentLedgerRow,
   PaymentManifest,
   PredefinedTrustCheckQuery,
@@ -32,6 +29,7 @@ import {
 import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { extractErrorCode, formatApiError } from './utils/apiError';
 import { parseWarningHeader } from './utils/warningHeader';
+import type { GatewayListItem } from './utils/gateways';
 
 const API_BASE = '/api/v1';
 const ADMIN_API_BASE = '/api/admin';
@@ -611,10 +609,29 @@ class APIClient {
   ): Promise<PaymentManifest | null> {
     const query = forceRefresh ? '?force_refresh=true' : '';
     const data = await this.request<{ manifest?: PaymentManifest | null }>(
-      `/gateways/${encodeURIComponent(gatewayId)}/surfaces/${encodeURIComponent(surfaceId)}/payment-manifest${query}`,
+      `/payment-gateways/${encodeURIComponent(gatewayId)}/surfaces/${encodeURIComponent(surfaceId)}/payment-manifest${query}`,
       { timeout: 10000 }
     );
     return data?.manifest ?? null;
+  }
+
+  async listPaymentGateways(): Promise<GatewayListItem[]> {
+    const data = await this.request<GatewayListItem[]>('/payment-gateways');
+    return Array.isArray(data) ? data : [];
+  }
+
+  async getPaymentGatewayInfo(gatewayId: string): Promise<GatewayInfo> {
+    return this.request<GatewayInfo>(`/payment-gateways/${encodeURIComponent(gatewayId)}/info`, {
+      timeout: 15000,
+    });
+  }
+
+  /** Turns a connected peer into a payment gateway. */
+  async setGatewayPaymentRole(gatewayId: string): Promise<GatewayListItem> {
+    return this.request<GatewayListItem>(
+      `/gateways/${encodeURIComponent(gatewayId)}/payment-role`,
+      { method: 'POST' }
+    );
   }
 
   async listPayments(query: PaymentLedgerQuery = {}): Promise<PaymentLedgerPage> {
@@ -635,39 +652,6 @@ class APIClient {
   async getPayment(id: string): Promise<PaymentLedgerRow> {
     return this.requestUrl<PaymentLedgerRow>(
       `${ADMIN_API_BASE}/payments/${encodeURIComponent(id)}`
-    );
-  }
-
-  async listPaymentAudit(query: PaymentAuditQuery = {}): Promise<PaymentAuditPage> {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(query)) {
-      if (value !== undefined && value !== '') params.set(key, String(value));
-    }
-    const qs = params.toString();
-    const data = await this.requestUrl<Partial<PaymentAuditPage> | null>(
-      `${ADMIN_API_BASE}/payments/audit${qs ? `?${qs}` : ''}`
-    );
-    return {
-      events: Array.isArray(data?.events) ? data.events : [],
-      total: data?.total ?? 0,
-      page: data?.page ?? 1,
-      page_size: data?.page_size ?? query.page_size ?? 50,
-      total_pages: data?.total_pages ?? 1,
-    };
-  }
-
-  async getPaymentSummary(surfaceId?: string, hours = 24): Promise<PaymentSummary> {
-    const params = new URLSearchParams({ hours: String(hours) });
-    if (surfaceId) params.set('surface_id', surfaceId);
-    const data = await this.requestUrl<Partial<PaymentSummary> | null>(
-      `${ADMIN_API_BASE}/payments/summary?${params.toString()}`
-    );
-    return { since: data?.since ?? '', total: data?.total ?? 0, counts: data?.counts ?? {} };
-  }
-
-  async getPaymentBreaker(paymentGatewayId: string): Promise<PaymentBreaker> {
-    return this.requestUrl<PaymentBreaker>(
-      `${ADMIN_API_BASE}/payments/breakers/${encodeURIComponent(paymentGatewayId)}`
     );
   }
 

@@ -449,7 +449,7 @@ agent-pay takes the payment; see [Taking the payment](#taking-the-payment).
 ```json
 "payment_policy": {
   "type": "agent_pay",
-  "payment_gateway_id": "<connected Remote gateway id>",
+  "payment_gateway_id": "<payment gateway id>",
   "payment_surface_id": "<payment surface id>[$<alias>]",
   "mcp_payment_triggers": { "mode": "match", "patterns": ["^premium_"] },
   "a2a_method_filters": [{ "method": "message/send", "message_patterns": [] }],
@@ -461,7 +461,7 @@ agent-pay takes the payment; see [Taking the payment](#taking-the-payment).
 
 | Field | Default | Behaviour |
 | --- | --- | --- |
-| `payment_gateway_id` | required | A user-created Remote gateway the caller's tenant and token scope may reference |
+| `payment_gateway_id` | required | A payment gateway (a Remote gateway with `role: "payment"`, see [Payment gateways](#payment-gateways)), whichever side opened the connection, the caller's tenant and token scope may reference |
 | `payment_surface_id` | required | The payment surface on that gateway. `payment_channel_id` is read as an alias. A `$alias` suffix names one of its variants. |
 | `mcp_payment_triggers` | none, which charges every `tools/call` | Which MCP `tools/call` requests are chargeable: `all`, `match` or `exclude` with regex `patterns`. The patterns are checked on save. Blank patterns are ignored. A policy with no triggers, and a stored `match` with no non-blank pattern, charge every `tools/call`; saving a `match` with no non-blank pattern is refused with `400`, code `invalid_payment_policy`. |
 | `a2a_method_filters` | none, which charges `message/send` and `message/stream` | Which A2A methods, and optionally which messages, are chargeable. Each entry has a `method` and optional `message_patterns`: plain text, matched case-sensitively and exactly against the text parts of the message joined by single spaces, never as a regular expression, so any text is accepted. Blank patterns are ignored, and an entry with no non-blank `message_patterns` charges every message of its method. A policy with no filter, an empty list or only entries without a method charges `message/send` and `message/stream` (in either spelling). |
@@ -474,8 +474,10 @@ Every save (create, update, merge `PATCH`, and every variant operation) checks e
 `agent_pay` policy and fetches the payment surface's manifest over the fabric:
 
 - A manifest that is missing or offers no payment point refuses the save with `400`, code
-  `payment_manifest_invalid`. A malformed policy or an unusable gateway is `400`, code
-  `invalid_payment_policy`.
+  `payment_manifest_invalid`. A malformed policy or an unusable gateway, including a peer that
+  is not a payment gateway, is `400`, code `invalid_payment_policy`.
+- A Managed Agent or Transit Point route (base or variant) to `fabric://<payment gateway>/…` is
+  `400`, code `fabric_route_to_payment_gateway`: a payment gateway takes payments only.
 - The manifest is fetched afresh on every save, never taken from the one-minute cache, and
   replaces `manifest_snapshot`; a value sent by the client is discarded.
 - When the payment gateway cannot be reached, the save goes ahead and the response carries
@@ -488,17 +490,19 @@ Every save (create, update, merge `PATCH`, and every variant operation) checks e
   agent-pay payment surface that takes only MPP is refused with `400`, since MPP's
   `Authorization: Payment` credential cannot be sent beside a Bearer token.
 
-Every 15 minutes, on an Active node, the gateway re-fetches each referenced manifest and
+A minute after startup, once its fabric listeners have connected, and every 15 minutes after
+that, on an Active node, the gateway re-fetches each referenced manifest and
 stores a change in what it offers (the price, the payment points and the variants; the signed
-`credential` agent-pay attaches to every answer and a label do not count), logging how the price
-or payment points drifted. An unchanged manifest stores nothing and reloads nothing. A manifest
+`credential` agent-pay attaches to every answer and a label do not count) or in its points'
+labels or logos, so a snapshot taken before agent-pay renamed a point or gave it a logo shows the
+change, logging how the price or payment points drifted. A manifest unchanged in both stores nothing and reloads nothing. A manifest
 that cannot be fetched leaves the snapshot as it was. A snapshot that would make the surface fail
 the check above, such as a payment surface that has become MPP-only, is not stored, and a warning
 says so. Only the snapshots are written, and only while the stored surface is the one that was
 read: an edit made through the API in the meantime is never overwritten, and the refresh waits for
 a save in progress. A save and a delete wait for each other and for a refresh in the same way.
-`GET /v1/gateways/{id}/surfaces/{surface_id}/payment-manifest` (permission `gateways.view`,
-same tenant scoping as the other gateway routes) returns `{gateway_id, surface_id, manifest}`
+`GET /v1/payment-gateways/{id}/surfaces/{surface_id}/payment-manifest` (permission
+`payment_gateways.view`, same tenant scoping as the gateway routes) returns `{gateway_id, surface_id, manifest}`
 for a payment surface; a payable manifest is reused for a minute, and `?force_refresh=true` skips
 that cache, but one manifest is forced at most once every 10 seconds: inside that time the cached
 manifest is served with `"refresh_throttled": true`. A missing payment surface or a manifest with
@@ -506,6 +510,45 @@ no payment point is never reused, so fixing the payment surface takes effect on 
 At most 4 requests wait on payment gateways at once; the others are answered `429`
 `payment_manifest_busy`. It answers `404` `gateway_not_found` or `payment_manifest_not_found`,
 `502` `payment_manifest_rejected`, or `503` `payment_gateway_unavailable`.
+
+Each payment point may name its logo, `logo: {id, media_type, sha256}`, and agent-pay sends the
+logo's bytes beside the manifest. Every fetch keeps the logos that the manifest references, that
+hash to their `sha256`, and that are SVG of at most 32 KiB with no script, event handler, embedded
+document or image, entity, doctype, stylesheet import or reference outside the document; anything
+else is dropped with a warning and never fails the fetch. Kept logos are stored by hash under
+`<storage>/payment_logos/` and served by `GET /v1/gateways/payment-logos/{sha256}` (permission
+`gateways.view`) as `image/svg+xml` with `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox`; a name that is
+not a lowercase hex SHA-256, or a stored file that no longer hashes to it, is `404`.
+
+### Payment gateways
+
+A remote gateway record carries `role`: `peer` (the default) or `payment`. Only a payment gateway
+takes payments: an `agent_pay` policy must name one, the payment gate refuses a request with `503`
+when the gateway it names is no longer one, and `GET /v1/gateways/payment-providers` lists only
+active payment gateways that expose a payment surface. A payment gateway is never a `fabric://`
+route. Payment gateways have their own routes and permissions (`/v1/payment-gateways/*`,
+`payment_gateways.*`, see [RBAC](RBAC.md#gateways-and-payment-gateways)); `/v1/gateways/*`
+neither lists them nor acts on them.
+
+- `POST /v1/payment-gateways/connect-via-oob` connects to an agent-pay connection point with the
+  same body as `POST /v1/gateways/connect-via-oob` and creates a payment gateway whose exposure is
+  `none`. agent-pay's administrator approves every connection, so the gateway stays
+  `awaiting-approval` until then. A link already connected as a peer is `409`.
+- `GET /v1/payment-gateways/{id}/info` asks agent-pay for its `gateway-info` summary
+  (`{info_version, role, protocols, payment_methods, payable_count, units}`, built from the payment
+  surfaces exposed to this gateway only). It answers `503` while agent-pay cannot be reached and
+  `502` when the peer answers but does not say it is a payment gateway.
+- `POST /v1/gateways/{id}/payment-role` turns a connected peer into a payment gateway and sets its
+  exposure to `none`; `409` while a surface routes to it over `fabric://`.
+- Disabling (`PUT` with `status: "disabled"`) or deleting any remote gateway is `409` while a
+  surface's `agent_pay` policy names it or it holds payments that are not settled yet
+  ([`usage.rs`](../src/gateways/usage.rs)).
+- Payment gateways count toward their own appliance limit, `connections.paymentgateways` in
+  `limits.json`, and peers toward `connections.gateways`; both count toward the `connections`
+  total. Connecting and turning a peer into a payment gateway are refused with `403` at the limit.
+- At startup every peer that an `agent_pay` policy names becomes a payment gateway with exposure
+  `none`, so surfaces that already charge keep charging and agent-pay reaches no local surface.
 
 ### Taking the payment
 

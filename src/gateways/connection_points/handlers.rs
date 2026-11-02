@@ -1655,6 +1655,7 @@ pub async fn get_connection_point_metrics(
             .last_active_at
             .unwrap_or_else(chrono::Utc::now),
         last_activity: runtime.last_active_at,
+        peer_last_seen: None,
         message_count: 0,
         error_count: 0,
         reconnect_attempts: runtime.consecutive_failures,

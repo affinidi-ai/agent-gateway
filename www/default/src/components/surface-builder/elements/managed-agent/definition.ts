@@ -6,6 +6,7 @@ import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
 import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import { providerTargetAuthFromApi, providerTargetAuthToApi } from '../_shared/providerTargetAuth';
+import { parseFabricEndpoint } from '../_shared/useGatewaySurfaces';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -53,7 +54,8 @@ export const managedAgentDefinition: NodeDefinition = {
   incompleteReason: config => {
     const type = config.endpoint_type || 'url';
     if (type === 'gateway') {
-      if (!config.gateway_id || !config.gateway_channel) return 'Gateway connection is required';
+      if (!config.gateway_id) return 'Select a gateway';
+      if (!config.gateway_channel) return 'Select an Agent Surface on the gateway';
       return null;
     }
     if (type === 'mcp-proxy') {
@@ -124,13 +126,12 @@ export const managedAgentDefinition: NodeDefinition = {
     // never seeds it onto the target panel's state.
     delete c.trust_check_list;
     const ep: string = typeof slice?.endpoint === 'string' ? slice.endpoint : '';
-    if (ep.startsWith('fabric://')) {
+    const fabricRoute = parseFabricEndpoint(ep);
+    if (fabricRoute) {
       c.endpoint_type = 'gateway';
-      const rest = ep.slice('fabric://'.length);
-      const slash = rest.indexOf('/');
-      if (slash > 0) {
-        c.gateway_id = rest.slice(0, slash);
-        c.gateway_channel = rest.slice(slash + 1);
+      if (fabricRoute.gatewayId && fabricRoute.surfaceId) {
+        c.gateway_id = fabricRoute.gatewayId;
+        c.gateway_channel = fabricRoute.surfaceId;
       }
       if (typeof slice?.fabric_target_name === 'string') {
         c.fabric_target_name = slice.fabric_target_name;

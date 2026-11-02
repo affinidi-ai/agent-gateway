@@ -85,31 +85,23 @@ async function mockSurfaceApis(
   const saves: SavedSurface[] = [];
   const manifestRequests: string[] = [];
 
-  await page.route("**/api/v1/gateways", (route) =>
-    json(route, [
-      {
-        id: GATEWAY_ID,
-        name: "Agent Pay",
-        gateway_type: "remote",
-        creation_type: "user",
-      },
-    ]),
-  );
   await page.route("**/api/v1/gateways/payment-providers", (route) =>
-    json(route, [{ id: GATEWAY_ID }]),
-  );
-  await page.route(`**/api/v1/gateways/${GATEWAY_ID}/surfaces*`, (route) =>
-    json(
-      route,
-      Object.keys(LIVE_PRICES).map((id) => ({
-        config_id: id,
-        name: id,
-        is_payment_surface: true,
-      })),
-    ),
+    json(route, [{ id: GATEWAY_ID, name: "Agent Pay", payment_surfaces: [] }]),
   );
   await page.route(
-    `**/api/v1/gateways/${GATEWAY_ID}/surfaces/*/payment-manifest*`,
+    `**/api/v1/payment-gateways/${GATEWAY_ID}/surfaces*`,
+    (route) =>
+      json(
+        route,
+        Object.keys(LIVE_PRICES).map((id) => ({
+          config_id: id,
+          name: id,
+          is_payment_surface: true,
+        })),
+      ),
+  );
+  await page.route(
+    `**/api/v1/payment-gateways/${GATEWAY_ID}/surfaces/*/payment-manifest*`,
     (route) => {
       const url = new URL(route.request().url());
       manifestRequests.push(url.pathname + url.search);
@@ -175,9 +167,6 @@ test.describe("Payment element", () => {
     await expect(page.getByTestId("payment-manifest-amount")).toContainText(
       `${SAVED_PRICE} USDC`,
     );
-    await expect(
-      page.getByTestId("payment-share-email-toggle"),
-    ).not.toBeChecked();
     expect(manifestRequests).toEqual([]);
 
     await page.getByTestId("payment-manifest-refresh-button").click();
@@ -409,7 +398,7 @@ test.describe("Payments page", () => {
     await expect(page.getByTestId("payments-held-case-pay-2")).toContainText(
       "case-42",
     );
-    await expect(page.getByTestId("payments-legacy-tab")).toHaveCount(0);
+    await expect(page.getByTestId("payments-legacy-panel")).toHaveCount(0);
 
     await page.getByTestId("payments-outcome-filter").selectOption("held");
     await expect(page.getByTestId("payments-row-pay-1")).toHaveCount(0);
@@ -468,14 +457,11 @@ test.describe("Payments page", () => {
     await expect(page.getByTestId("payments-detail-modal")).toHaveCount(0);
   });
 
-  test("the legacy tab lists one row per old transaction with its amount in dollars", async ({
+  test("the legacy list shows one row per old transaction with its amount in dollars", async ({
     page,
   }) => {
     await mockLedgerApis(page, { legacy: true });
     await page.goto(`${BASE_URL}/x402payments`);
-
-    await expect(page.getByTestId("payments-legacy-tab")).toContainText("1");
-    await page.getByTestId("payments-legacy-tab").click();
 
     const row = page.getByTestId("payments-legacy-row-x402-tx-1");
     await expect(row).toContainText("old-surface");
@@ -483,7 +469,6 @@ test.describe("Payments page", () => {
     await expect(row).toContainText("$0.01");
     await expect(row).not.toContainText("0x8335");
 
-    await page.getByTestId("payments-ledger-tab").click();
     await expect(page.getByTestId("payments-row-pay-1")).toBeVisible();
   });
 });

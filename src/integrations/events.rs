@@ -61,6 +61,7 @@ const VARIABLES: &[VariableSpec] = &[
     var("GATEWAY_DESCRIPTION", "Gateway Description", "Description of the gateway"),
     var("GATEWAY_DID", "Gateway DID", "DID of the gateway"),
     var("GATEWAY_TYPE", "Gateway Type", "Type of the gateway"),
+    var("GATEWAY_ROLE", "Gateway Role", "What a remote gateway is used for: Peer or Payment"),
     var("GATEWAY_STATUS", "Gateway Status", "Status of the gateway after the event"),
     var("GATEWAY_OLD_STATUS", "Previous Gateway Status", "Status of the gateway before the change"),
     var("USER_ID", "User ID", "ID of the user"),
@@ -221,6 +222,7 @@ const GATEWAY_VARIABLES: &[&str] = &[
     "GATEWAY_DESCRIPTION",
     "GATEWAY_DID",
     "GATEWAY_TYPE",
+    "GATEWAY_ROLE",
     "GATEWAY_STATUS",
 ];
 const USER_VARIABLES: &[&str] =

@@ -5,7 +5,10 @@ import { rateLimitConfigToWire } from '../rate-limit/definition';
 import type { NodeDefinition, Protocol } from '../types';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
-import TransitPointPanel from './TransitPointPanel';
+import TransitPointPanel, {
+  inferEndpointType,
+  transitPointGatewayRoute,
+} from './TransitPointPanel';
 import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
 import { providerTargetAuthToApi } from '../_shared/providerTargetAuth';
 import { identityConfigToWire } from '../identity/definition';
@@ -190,7 +193,12 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     requires: {},
     incompleteReason: config => {
       if (!config.listen_address) return 'Outbound listener address is required';
-      if (!config.target_endpoint) return 'Target endpoint is required';
+      if (inferEndpointType(config) === 'gateway') {
+        if (!transitPointGatewayRoute(config).gatewayId) return 'Select a gateway';
+        if (!config.target_endpoint) return 'Select an Agent Surface on the gateway';
+        return null;
+      }
+      if (!config.target_endpoint) return 'Target endpoint URL is required';
       return null;
     },
     validate: c => {

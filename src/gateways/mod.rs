@@ -2,17 +2,21 @@ pub mod approve;
 pub mod connection_points;
 pub mod did_cache;
 pub mod filesystem;
+pub mod gateway_info;
 pub mod handlers;
 pub mod issuer_attestation;
 pub mod issuer_exchange;
 pub mod payment_case;
+pub mod payment_logos;
 pub mod payment_manifest;
 pub mod pending_connections;
+pub mod role_scope;
 pub mod store;
 pub mod surface_cache;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod types;
+pub mod usage;
 
 pub use connection_points::{
     ConnectionPointListenerManager, ConnectionStatus, FileSystemConnectionPointStore, MessageStore, ReceivedMessage,

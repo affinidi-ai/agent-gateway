@@ -10,7 +10,7 @@ use crate::auth::periodic_session_cleanup;
 use crate::config::GatewayConfig;
 use crate::gateways::connection_points::ConnectionPointStore;
 use crate::gateways::filesystem::GatewayStore;
-use crate::gateways::types::GatewayType;
+use crate::gateways::types::{GatewayRole, GatewayType};
 use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::mediators::filesystem::MediatorStore;
 use crate::observability::{loggable, periodic_metrics_update};
@@ -174,19 +174,21 @@ fn register_resource_limit_counters(
         });
     }
 
-    // connections.gateways — the Local Gateway is always excluded so the quota
-    // only tracks remote gateways that are being connected to this appliance.
+    // connections.gateways and connections.paymentgateways — the Local Gateway
+    // is always excluded so each quota only tracks remote gateways of its role.
     if let Some(store) = gateway_store {
-        let s = store.clone();
-        register_counter("connections.gateways", move || {
-            let s = s.clone();
-            async move {
-                s.list_all()
-                    .await
-                    .map(count_remote_gateways)
-                    .unwrap_or(0)
-            }
-        });
+        for role in [GatewayRole::Peer, GatewayRole::Payment] {
+            let s = store.clone();
+            register_counter(role.limit_dimension(), move || {
+                let s = s.clone();
+                async move {
+                    s.list_all()
+                        .await
+                        .map(|gateways| count_remote_gateways(gateways, role))
+                        .unwrap_or(0)
+                }
+            });
+        }
     }
     // connections.mediators
     if let Some(store) = mediator_store {
@@ -304,10 +306,13 @@ fn register_resource_limit_counters(
     });
 }
 
-fn count_remote_gateways(gateways: Vec<crate::gateways::types::Gateway>) -> usize {
+fn count_remote_gateways(
+    gateways: Vec<crate::gateways::types::Gateway>,
+    role: GatewayRole,
+) -> usize {
     gateways
         .into_iter()
-        .filter(|gateway| gateway.gateway_type == GatewayType::Remote)
+        .filter(|gateway| gateway.gateway_type == GatewayType::Remote && gateway.role == role)
         .count()
 }
 
@@ -1583,6 +1588,28 @@ pub async fn run_axum_proxy(
                         Ok(0) => {}
                         Ok(n) => info!("Migrated the exposure mode of {n} remote gateway(s)"),
                         Err(e) => warn!("Failed to migrate remote gateway exposure modes: {}", e),
+                    }
+                    let payment_gateway_ids = match agent_surface_store.as_ref() {
+                        Some(surfaces) => match crate::surfaces::AgentSurfaceStore::list_all(surfaces.as_ref()).await {
+                            Ok(surfaces) => surfaces
+                                .iter()
+                                .flat_map(|surface| surface.payment_gateway_ids())
+                                .map(str::to_string)
+                                .collect(),
+                            Err(e) => {
+                                warn!("Failed to list surfaces for the payment gateway migration: {}", e);
+                                Default::default()
+                            }
+                        },
+                        None => Default::default(),
+                    };
+                    match store
+                        .migrate_payment_roles(&payment_gateway_ids)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => info!("Migrated {n} gateway(s) that take payments to payment gateways"),
+                        Err(e) => warn!("Failed to migrate payment gateways: {}", e),
                     }
                     info!("Gateway store initialized");
                     Some(Arc::new(store))
@@ -3301,7 +3328,13 @@ pub async fn run_axum_proxy(
 
         let identity_state_for_manifests = identity_state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            // The first run waits for the fabric listeners to connect: one at
+            // startup cannot reach any payment gateway, so it would leave every
+            // snapshot as it was until the next run.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(15 * 60),
+            );
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -4574,7 +4607,7 @@ async fn initialize_saml_state(
 mod tests {
     use super::{count_remote_gateways, count_user_connection_points};
     use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
-    use crate::gateways::types::{Gateway, GatewayType};
+    use crate::gateways::types::{Gateway, GatewayRole, GatewayType};
 
     fn cp(cp_type: ConnectionPointType) -> GatewayConnectionPoint {
         GatewayConnectionPoint::new(
@@ -4594,7 +4627,15 @@ mod tests {
 
     #[test]
     fn remote_gateway_count_excludes_local_gateway() {
+        let mut payment = Gateway::new(
+            "agent-pay".to_string(),
+            "Payment gateway".to_string(),
+            "did:web:pay.example".to_string(),
+            GatewayType::Remote,
+        );
+        payment.role = GatewayRole::Payment;
         let gateways = vec![
+            payment,
             Gateway::new(
                 "This Gateway (Local)".to_string(),
                 "Local gateway".to_string(),
@@ -4615,7 +4656,8 @@ mod tests {
             ),
         ];
 
-        assert_eq!(count_remote_gateways(gateways), 2);
+        assert_eq!(count_remote_gateways(gateways.clone(), GatewayRole::Peer), 2);
+        assert_eq!(count_remote_gateways(gateways, GatewayRole::Payment), 1);
     }
 
     #[test]

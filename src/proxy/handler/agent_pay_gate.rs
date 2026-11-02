@@ -1192,6 +1192,12 @@ pub(crate) trait GateTransport: Send + Sync {
         &'a self,
         gateway_id: &'a str,
     ) -> futures::future::BoxFuture<'a, Option<String>>;
+
+    /// Whether `gateway_id` is a payment gateway this gateway may charge through.
+    fn takes_payments<'a>(
+        &'a self,
+        gateway_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, bool>;
 }
 
 /// The production transport: a `forward-request` over the fabric.
@@ -1234,6 +1240,20 @@ impl GateTransport for FabricTransport {
             let manager = self.0.read().await.clone()?;
             manager
                 .get_gateway_did(gateway_id)
+                .await
+        })
+    }
+
+    fn takes_payments<'a>(
+        &'a self,
+        gateway_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Some(manager) = self.0.read().await.clone() else {
+                return false;
+            };
+            manager
+                .is_payment_gateway(gateway_id)
                 .await
         })
     }
@@ -3080,6 +3100,13 @@ async fn exchange(
         Ok(target) => target,
         Err(reason) => return Exchange::denied(502, reason),
     };
+    if !hop
+        .transport
+        .takes_payments(&hop.gateway_id)
+        .await
+    {
+        return Exchange::denied(503, "payment gateway is not a connected payment gateway");
+    }
     if let Err(seconds) = breaker_admit(&hop.gateway_id, Instant::now()) {
         return Exchange {
             retry_after: Some(seconds),
@@ -3442,6 +3469,7 @@ pub(crate) mod tests {
         pub delay: Mutex<Duration>,
         pub calls: AtomicUsize,
         pub requests: Mutex<Vec<GateWireRequest>>,
+        pub not_payment_gateway: std::sync::atomic::AtomicBool,
     }
 
     fn answer(
@@ -3467,7 +3495,14 @@ pub(crate) mod tests {
                 delay: Mutex::new(Duration::ZERO),
                 calls: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
+                not_payment_gateway: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        pub(crate) fn not_a_payment_gateway(self: Arc<Self>) -> Arc<Self> {
+            self.not_payment_gateway
+                .store(true, Ordering::SeqCst);
+            self
         }
 
         pub(crate) fn answering(
@@ -3570,6 +3605,16 @@ pub(crate) mod tests {
             _gateway_id: &'a str,
         ) -> futures::future::BoxFuture<'a, Option<String>> {
             Box::pin(async { Some("did:web:agent-pay.example".to_string()) })
+        }
+
+        fn takes_payments<'a>(
+            &'a self,
+            _gateway_id: &'a str,
+        ) -> futures::future::BoxFuture<'a, bool> {
+            let takes = !self
+                .not_payment_gateway
+                .load(Ordering::SeqCst);
+            Box::pin(async move { takes })
         }
     }
 
@@ -5748,6 +5793,20 @@ pub(crate) mod tests {
             headers: HashMap::new(),
             body: vec![0; MAX_RESPONSE_BODY_BYTES],
         }));
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_is_not_a_payment_gateway_is_never_asked_to_charge() {
+        let surface = mcp_surface("gw-peer", json!({"require_all": true}));
+        let gate = MockGate::answering(200, &[], json!({})).not_a_payment_gateway();
+        install_test_transport("gw-peer", gate.clone());
+        let fabric = no_fabric();
+        let intake = read(&surface, &HeaderMap::new(), &tool_call("t", json!({})));
+        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+            panic!("a peer that is not a payment gateway must refuse")
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gate.calls(), 0);
     }
 
     #[tokio::test]

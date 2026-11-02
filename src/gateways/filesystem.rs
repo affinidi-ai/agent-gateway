@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::types::{Gateway, GatewayType};
+use super::types::{Gateway, GatewayRole, GatewayType};
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
 /// Filesystem-based implementation of GatewayStore with in-memory cache
@@ -68,6 +68,32 @@ impl FileSystemGatewayStore {
         for mut gateway in self.list_all().await? {
             if gateway.migrate_exposure_mode() {
                 tracing::info!(gateway_id = %gateway.id, mode = ?gateway.exposure_mode, "Migrating remote gateway exposure mode");
+                self.update(&gateway).await?;
+                migrated += 1;
+            }
+        }
+        Ok(migrated)
+    }
+
+    /// Makes every remote peer in `payment_gateway_ids` (the gateways that
+    /// `agent_pay` policies name) a payment gateway reaching no local surface,
+    /// so the surfaces keep charging through it. Returns how many changed.
+    pub async fn migrate_payment_roles(
+        &self,
+        payment_gateway_ids: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut migrated = 0usize;
+        for mut gateway in self.list_all().await? {
+            if gateway.gateway_type == GatewayType::Remote
+                && gateway.role == GatewayRole::Peer
+                && payment_gateway_ids.contains(&gateway.id)
+            {
+                tracing::info!(gateway_id = %gateway.id, "Migrating a gateway that takes payments to a payment gateway");
+                gateway.role = GatewayRole::Payment;
+                gateway.exposure_mode = Some(super::types::ExposureMode::None);
+                gateway
+                    .exposed_channels
+                    .clear();
                 self.update(&gateway).await?;
                 migrated += 1;
             }
@@ -242,6 +268,80 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migrate_payment_roles_turns_only_named_remote_peers_into_payment_gateways() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
+            .await
+            .expect("store");
+        let remote = |id: &str| {
+            let mut gateway =
+                Gateway::new(id.into(), String::new(), format!("did:web:{id}.example"), GatewayType::Remote);
+            gateway.id = id.into();
+            gateway
+        };
+        let mut agent_pay = remote("agent-pay");
+        agent_pay.exposure_mode = Some(super::super::types::ExposureMode::List);
+        agent_pay.exposed_channels = vec!["s1".to_string()];
+        for gateway in [agent_pay, remote("routing-peer")] {
+            store
+                .create(&gateway)
+                .await
+                .expect("create");
+        }
+        let self_id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::SelfGateway)
+            .unwrap()
+            .id;
+        let named: std::collections::HashSet<String> =
+            ["agent-pay".to_string(), self_id.clone(), "gone".to_string()].into();
+
+        assert_eq!(
+            store
+                .migrate_payment_roles(&named)
+                .await
+                .unwrap(),
+            1
+        );
+        let role_of = |id: String| {
+            let store = &store;
+            async move {
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .role
+            }
+        };
+        assert_eq!(role_of("agent-pay".into()).await, GatewayRole::Payment);
+        let migrated = store
+            .get("agent-pay")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.exposure_mode, Some(super::super::types::ExposureMode::None));
+        assert!(
+            migrated
+                .exposed_channels
+                .is_empty()
+        );
+        assert_eq!(role_of("routing-peer".into()).await, GatewayRole::Peer);
+        assert_eq!(role_of(self_id).await, GatewayRole::Peer);
+        assert_eq!(
+            store
+                .migrate_payment_roles(&named)
+                .await
+                .unwrap(),
+            0,
+            "the migration runs once"
+        );
+    }
 
     #[tokio::test]
     async fn a_management_request_records_the_gateway_policies_its_writes_attach_and_detach() {

@@ -82,6 +82,32 @@ The Surface Builder's **Send delegated credentials over Fabric** switch is per r
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder's Managed Agent and Transit Point **via Gateway Connection** routes and the
+Payment element share one gateway-then-surface picker with the same placeholders, empty and
+error states, add link (new tab), Refresh and test ids; Payment lists only the
+payment gateways from `GET /gateways/payment-providers`, with no switch to show others, and its
+**Add Payment Gateway** link opens the payment gateway wizard. See
+_Gateway picker_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+Connections has a **Payment Gateways** tab beside Gateways, Mediators and Registries, with a
+connect wizard that waits for agent-pay's approval and verifies the peer with `gateway-info`, a
+detail page per payment gateway, and a **Use as payment gateway** action on the Gateways tab; see
+_Connections page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#connections-page).
+
+The Surface Builder's Payment manifest preview shows each payment method with the logo agent-pay
+sent beside the manifest, served by `GET /v1/gateways/payment-logos/{sha256}`, or a generic icon;
+see _Payment_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md).
+
+The Payment triggers editor of an MCP surface edits one visible pattern list: selecting a tool
+adds `^<name>$` and clearing it removes that row, and a Charged | Free switch sets only what the
+list means (`match`, or `all` while empty, versus `exclude`), never rewriting it; with no trigger
+set the selection starts as Charged. It lists the Target's tools on
+demand through `POST /v1/mcp-proxies/discover-tools` (MCP Proxy and Direct URL Targets only; a
+saved surface's Target is asked by `surface_id` under the forward step's egress policy), with
+select-all, Select all and Clear over the filtered list. See _Payment_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
 Transit Point element's **Who can call this Transit Point** section sets the transit token, a
@@ -112,6 +138,10 @@ surface-wide list are flagged for review (migrated copies can exist on MCP and H
 Points, but new Trust Checks can't be added there), and every surface write and template create
 or update sends `trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
+
+The Gateways list shows, under a remote gateway's status, when its peer was last heard from
+(`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
+_Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
@@ -182,7 +212,10 @@ A2A request shape). An `a2a-proxy://` surface's versions are fixed (`1.0` only w
 [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md#a2a-surface-settings).
 
 **Payment is delegated to agent-pay.** A surface charges only through an `agent_pay`
-payment policy that names a payment surface on a connected agent-pay gateway. An enabled local
+payment policy that names a payment surface on a connected payment gateway: a remote gateway
+record with `role: payment`, managed under `/v1/payment-gateways/*` and `payment_gateways.*`
+while `/v1/gateways/*` serves peers only ([`src/gateways/role_scope.rs`](src/gateways/role_scope.rs));
+a payment gateway is never a `fabric://` route. An enabled local
 x402 or MPP policy still loads but is unsupported: the surface answers `503
 payment_unavailable` and the policy cannot be saved. Read it through
 `AgentSurface::agent_pay_policy` / `payment_policy_unsupported`

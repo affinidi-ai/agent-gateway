@@ -979,12 +979,20 @@ export type PaymentPointDetail =
   | { kind: 'onChain'; scheme: string; network: string; pay_to: string }
   | { kind: 'settled'; provider: string; instrument: PaymentInstrument };
 
+/** A payment point's logo, stored by its SHA-256 when the manifest was fetched. */
+export interface PaymentLogoRef {
+  id: string;
+  media_type: string;
+  sha256: string;
+}
+
 export interface PaymentPoint {
   id: string;
   label: string;
   protocol: 'x402' | 'mpp';
   credential: string;
   detail: PaymentPointDetail;
+  logo?: PaymentLogoRef;
 }
 
 export interface PaymentManifestVariant {
@@ -1008,6 +1016,26 @@ export interface PaymentManifest {
   payment_points: PaymentPoint[];
   variants?: PaymentManifestVariant[];
   credential?: string;
+}
+
+/** One way a payment gateway takes payment, as `GET /payment-gateways/{id}/info` summarises it. */
+export interface PaymentMethodSummary {
+  protocol: string;
+  /** `onChain` or `settled`. */
+  kind: string;
+  provider?: string;
+  network?: string;
+  settles_via?: string;
+}
+
+/** What a connected agent-pay gateway offers this gateway (`GET /payment-gateways/{id}/info`). */
+export interface GatewayInfo {
+  info_version: string;
+  role: string;
+  protocols: string[];
+  payment_methods: PaymentMethodSummary[];
+  payable_count: number;
+  units: string[];
 }
 
 export interface AgentPayPaymentPolicy {
@@ -1125,77 +1153,4 @@ export interface PaymentLedgerQuery {
 export interface PaymentLedgerPage {
   payments: PaymentLedgerRow[];
   total: number;
-}
-
-export const PAYMENT_AUDIT_STAGES = [
-  'challenge_issued',
-  'verify_attempt',
-  'verified',
-  'failed',
-  'held',
-  'unconfirmed',
-  'authorized',
-  'voided',
-  'settled',
-  'settlement_failed',
-] as const;
-
-export type PaymentAuditStage = (typeof PAYMENT_AUDIT_STAGES)[number];
-
-/** One `payment` record of the VP Audit Log; the API never returns its signed credential. */
-export interface PaymentAuditEvent {
-  event_id?: string;
-  timestamp: string;
-  surface_id?: string;
-  channel_name?: string;
-  trace_id?: string;
-  via_fabric?: boolean;
-  vp_fingerprint?: string;
-  event: {
-    payment_event: {
-      rail: 'x402' | 'mpp';
-      stage: PaymentAuditStage;
-      transaction_id: string;
-      amount?: string;
-      currency?: string;
-      error?: string;
-      delegated?: boolean;
-      payment_gateway_id?: string;
-      payment_surface_id?: string;
-      remote_status?: number;
-    };
-  };
-}
-
-export interface PaymentAuditQuery {
-  surface_id?: string;
-  stage?: PaymentAuditStage;
-  trace_id?: string;
-  since?: string;
-  until?: string;
-  page?: number;
-  page_size?: number;
-}
-
-export interface PaymentAuditPage {
-  events: PaymentAuditEvent[];
-  total: number;
-  page: number;
-  page_size: number;
-  total_pages: number;
-}
-
-export interface PaymentSummary {
-  since: string;
-  total: number;
-  counts: Partial<Record<PaymentOutcome, number>>;
-}
-
-export interface PaymentBreaker {
-  payment_gateway_id: string;
-  state: 'closed' | 'open' | 'half_open';
-  consecutive_failures: number;
-  retry_after_secs?: number;
-  failures_to_open: number;
-  open_secs: number;
 }

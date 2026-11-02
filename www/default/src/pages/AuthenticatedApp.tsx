@@ -71,6 +71,8 @@ const CreateGatewayConnectionPointWizardPage = lazy(
 );
 const AddGatewayViaOOBWizardPage = lazy(() => import('./AddGatewayViaOOBWizardPage'));
 const ApproveGatewayWizardPage = lazy(() => import('./ApproveGatewayWizardPage'));
+const AddPaymentGatewayWizardPage = lazy(() => import('./AddPaymentGatewayWizardPage'));
+const PaymentGatewayDetailPage = lazy(() => import('./PaymentGatewayDetailPage'));
 const AddMcpProxyWizardPage = lazy(() => import('./AddMcpProxyWizardPage'));
 const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
@@ -103,6 +105,8 @@ const IssuerEditRedirect: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   return <IssuersRedirect issuer={id} />;
 };
+
+const CONNECTIONS_PERMISSIONS = ['gateways.view', 'payment_gateways.view'] as const;
 
 const AuthoritiesRedirect: React.FC<{ authority?: string }> = ({ authority }) => {
   const searchParams = new URLSearchParams({ tab: 'authorities' });
@@ -310,7 +314,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/connections"
                   element={
-                    <ProtectedRoute permission="gateways.view">
+                    <ProtectedRoute permission={CONNECTIONS_PERMISSIONS}>
                       <ConnectionsPage />
                     </ProtectedRoute>
                   }
@@ -368,6 +372,30 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   element={
                     <ProtectedRoute permission="gateways.edit">
                       <EditGatewayPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways/connect"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.edit">
+                      <AddPaymentGatewayWizardPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways/:id"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.view">
+                      <PaymentGatewayDetailPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.view">
+                      <Navigate to="/connections?tab=payment-gateways" replace />
                     </ProtectedRoute>
                   }
                 />

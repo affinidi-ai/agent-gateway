@@ -8,6 +8,14 @@ import type {
 export const formatMoney = (m?: PaymentMoney): string =>
   m && m.amount ? `${m.amount} ${m.unit}`.trim() : '—';
 
+const LOGO_HASH = /^[0-9a-f]{64}$/;
+
+/** Where the gateway serves a point's logo, or null when the point names none it could store. */
+export function paymentLogoUrl(point: PaymentPoint): string | null {
+  const sha256 = point.logo?.sha256;
+  return sha256 && LOGO_HASH.test(sha256) ? `/api/v1/gateways/payment-logos/${sha256}` : null;
+}
+
 const instrumentLabel = (i: PaymentInstrument): string => {
   switch (i?.type) {
     case 'card':

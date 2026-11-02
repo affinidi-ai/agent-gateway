@@ -105,6 +105,25 @@ default), as append-only hourly segment files; the list serves the newest 50,000
 of a held payment adds the live `case_status` agent-pay reports for its case, for a caller who
 may read the row. See [Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment).
 
+## Gateways and payment gateways
+
+A remote gateway is either a peer (`role: "peer"`) or a payment gateway (`role: "payment"`,
+agent-pay). The two are managed by separate permissions and separate routes, so `gateways.*`
+never reaches a payment gateway and `payment_gateways.*` never reaches a peer:
+
+| Routes | Permissions |
+| --- | --- |
+| `/v1/gateways`, `/v1/gateways/{id}/…`, `/v1/gateways/{gateway_id}/connection-points` | `gateways.view` / `gateways.edit` / `gateways.delete` |
+| `/v1/payment-gateways`, `/v1/payment-gateways/connect-via-oob`, `/v1/payment-gateways/{id}` (get, put, delete), `/v1/payment-gateways/{id}/ping`, `…/surfaces`, `…/surfaces/{surface_id}/payment-manifest`, `…/info` | `payment_gateways.view` / `payment_gateways.edit` / `payment_gateways.delete` |
+| `GET /v1/gateways/payment-providers` (the Surface Builder's payment gateway list) | `payment_gateways.view` |
+| `POST /v1/gateways/{id}/payment-role` (turn a peer into a payment gateway) | `gateways.edit` and `payment_gateways.edit` |
+
+A route answers `404` for a gateway of the other role
+([`role_scope.rs`](../src/gateways/role_scope.rs)), after the permission check, so a caller
+without the permission learns nothing about which ids exist. The built-in defaults grant
+`payment_gateways.view` to `user` and `payment_gateways.edit` / `payment_gateways.delete` to
+`administrator`. A token's resource scope treats both as `gateways` resources.
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the

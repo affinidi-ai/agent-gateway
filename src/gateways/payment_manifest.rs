@@ -70,6 +70,10 @@ pub struct PaymentPoint {
     pub protocol: String,
     pub credential: String,
     pub detail: serde_json::Value,
+    /// The logo this point is shown with, stored by [`super::payment_logos`]
+    /// from the bytes sent beside the manifest. Omitted when it has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo: Option<super::payment_logos::LogoRef>,
 }
 
 impl PaymentManifest {
@@ -119,6 +123,36 @@ impl PaymentManifest {
         self.amount == other.amount
             && self.point_terms() == other.point_terms()
             && self.variants_by_alias() == other.variants_by_alias()
+    }
+
+    /// Whether both manifests show each payment point (matched by id) with the
+    /// same label and logo. Not part of what is offered, but a snapshot taken
+    /// before agent-pay renamed a point or gave it a logo has to be replaced for
+    /// the dashboard to show the change.
+    pub fn shows_same_as(
+        &self,
+        other: &PaymentManifest,
+    ) -> bool {
+        self.point_presentation() == other.point_presentation()
+    }
+
+    fn point_presentation(&self) -> Vec<(&str, &str, Option<&str>)> {
+        let mut points: Vec<_> = self
+            .payment_points
+            .iter()
+            .map(|point| {
+                (
+                    point.id.as_str(),
+                    point.label.as_str(),
+                    point
+                        .logo
+                        .as_ref()
+                        .map(|logo| logo.sha256.as_str()),
+                )
+            })
+            .collect();
+        points.sort_by(|a, b| a.0.cmp(b.0));
+        points
     }
 
     fn point_terms(&self) -> Vec<(&str, &str, &str, &serde_json::Value)> {

@@ -2,7 +2,9 @@ import React, { useState } from 'react';
 import { Form } from 'react-bootstrap';
 import type { A2AMethodFilter } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
-import { defaultA2aFilters, triggerPatternAdvice, type TriggerMode } from './triggers';
+import McpTriggerEditor from './McpTriggerEditor';
+import { PatternList } from './PatternList';
+import { defaultA2aFilters } from './triggers';
 import type { PaymentNodeConfig } from './types';
 
 const A2A_CONTROL_METHODS = [
@@ -33,89 +35,6 @@ const MESSAGE_METHODS: Array<{ method: string; icon: string; detail: string; exa
 ];
 
 const slug = (method: string) => method.replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase();
-
-const PatternAdvice: React.FC<{ testId: string; text: string }> = ({ testId, text }) => (
-  <Form.Text className="text-warning d-block mb-2" data-testid={testId}>
-    <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
-    {text}
-  </Form.Text>
-);
-
-interface PatternListProps {
-  patterns: string[];
-  onChange: (patterns: string[]) => void;
-  placeholder: string;
-  icon: string;
-  testIdPrefix: string;
-  /** What a row is called: a regular expression or plain text. */
-  label: 'Pattern' | 'Text';
-  /** The browser's doubt about a row, shown as a warning; it never blocks Save. */
-  advise?: (value: string) => string | null;
-}
-
-const PatternList: React.FC<PatternListProps> = ({
-  patterns,
-  onChange,
-  placeholder,
-  icon,
-  testIdPrefix,
-  label,
-  advise,
-}) => {
-  const rows = patterns.length === 0 ? [''] : patterns;
-  return (
-    <>
-      {rows.map((pattern, idx) => {
-        const advice = advise && pattern.trim() !== '' ? advise(pattern) : null;
-        return (
-          <React.Fragment key={idx}>
-            <div className="input-group input-group-sm mb-2">
-              <span className="input-group-text">
-                <i className={`fas ${icon}`} aria-hidden="true" />
-              </span>
-              <input
-                type="text"
-                className={`form-control${label === 'Pattern' ? ' font-monospace' : ''}`}
-                value={pattern}
-                aria-label={`${label} ${idx + 1}`}
-                data-testid={`${testIdPrefix}-pattern-${idx}`}
-                onChange={e => {
-                  const next = [...rows];
-                  next[idx] = e.target.value;
-                  onChange(next);
-                }}
-                placeholder={placeholder}
-              />
-              {rows.length > 1 && (
-                <button
-                  className="btn btn-outline-danger"
-                  type="button"
-                  aria-label={`Remove ${label.toLowerCase()}`}
-                  data-testid={`${testIdPrefix}-remove-pattern-button-${idx}`}
-                  onClick={() => onChange(rows.filter((_, i) => i !== idx))}
-                >
-                  <i className="fas fa-times" aria-hidden="true" />
-                </button>
-              )}
-            </div>
-            {advice && (
-              <PatternAdvice testId={`${testIdPrefix}-pattern-warning-${idx}`} text={advice} />
-            )}
-          </React.Fragment>
-        );
-      })}
-      <button
-        className="btn btn-sm btn-outline-secondary"
-        type="button"
-        data-testid={`${testIdPrefix}-add-pattern-button`}
-        onClick={() => onChange([...rows, ''])}
-      >
-        <i className="fas fa-plus me-1" aria-hidden="true" />
-        Add {label}
-      </button>
-    </>
-  );
-};
 
 interface A2AMethodFilterEditorProps {
   filters: A2AMethodFilter[];
@@ -261,123 +180,24 @@ const A2AMethodFilterEditor: React.FC<A2AMethodFilterEditorProps> = ({ filters, 
   );
 };
 
-interface McpTriggerEditorProps {
-  value: unknown;
-  hasAttemptedSave: boolean;
-  onChange: (next: { mode: 'all' } | { mode: 'match' | 'exclude'; patterns: string[] }) => void;
-}
-
-const McpTriggerEditor: React.FC<McpTriggerEditorProps> = ({
-  value,
-  hasAttemptedSave,
-  onChange,
-}) => {
-  const stored = (value ?? {}) as { mode?: TriggerMode; patterns?: string[] };
-  const unset = stored.mode !== 'all' && stored.mode !== 'exclude' && stored.mode !== 'match';
-  const mode: TriggerMode = unset ? 'all' : (stored.mode as TriggerMode);
-  const patterns = mode === 'all' ? [] : Array.isArray(stored.patterns) ? stored.patterns : [];
-  const write = (nextMode: TriggerMode, nextPatterns: string[]) =>
-    onChange(nextMode === 'all' ? { mode: 'all' } : { mode: nextMode, patterns: nextPatterns });
-  const noPatterns = patterns.every(p => !p.trim());
-
-  return (
-    <div className="mb-3">
-      <label className="form-label small fw-bold" htmlFor="payment-triggers-mcp-mode">
-        <i className="fas fa-wrench me-1" aria-hidden="true" /> MCP Payment Trigger Mode
-      </label>
-      <small className="text-muted d-block mb-2">
-        Only <code>tools/call</code> requests can be charged. Free methods like{' '}
-        <code>tools/list</code> or <code>initialize</code> are never charged.
-      </small>
-      <Form.Select
-        id="payment-triggers-mcp-mode"
-        size="sm"
-        className="mb-3"
-        value={mode}
-        data-testid="payment-triggers-mcp-mode"
-        onChange={e => {
-          const next = e.target.value as TriggerMode;
-          write(next, next === 'all' ? [] : patterns);
-        }}
-      >
-        <option value="all">Charge all tools</option>
-        <option value="match">Charge tools matching regex</option>
-        <option value="exclude">Charge all EXCEPT regex matches</option>
-      </Form.Select>
-
-      {mode === 'all' ? (
-        <div
-          className="alert alert-success mb-0"
-          role="status"
-          data-testid="payment-triggers-mcp-scope"
-        >
-          <i className="fas fa-check-circle me-2" aria-hidden="true" />
-          {unset ? 'No trigger is set, so ' : ''}
-          <strong>{unset ? 'every' : 'Every'}</strong> <code>tools/call</code> on this surface will
-          require payment.
-        </div>
-      ) : (
-        <>
-          <small className="text-muted d-block mb-2">
-            {mode === 'match'
-              ? 'A tool is charged when its name matches ANY of the patterns below. Patterns are full regex (anchor with ^ and $ for exact match).'
-              : 'A tool is charged UNLESS its name matches at least one pattern below. Patterns are full regex. With no pattern, every tool is charged.'}
-          </small>
-          <PatternList
-            patterns={patterns}
-            onChange={next => write(mode, next)}
-            placeholder={
-              mode === 'match' ? '^paid_.*$  or  premium' : '^free_.*$  or  health_check'
-            }
-            icon="fa-asterisk"
-            testIdPrefix="payment-triggers-mcp"
-            label="Pattern"
-            advise={triggerPatternAdvice}
-          />
-          {hasAttemptedSave && mode === 'match' && noPatterns && (
-            <div
-              className="alert alert-danger mt-3 mb-0"
-              role="alert"
-              data-testid="payment-triggers-mcp-error"
-            >
-              <i className="fas fa-exclamation-circle me-2" aria-hidden="true" />
-              <strong>Error:</strong> At least one tool pattern is required when charging selected
-              tools. Add a pattern above or switch to &ldquo;Charge all tools&rdquo;.
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
-};
-
 const PaymentTriggersEditor: React.FC<ConfigPanelProps> = ({
   config: panelConfig,
   updateField,
   protocol,
+  allNodes,
   hasAttemptedSave = false,
 }) => {
   const config: PaymentNodeConfig = panelConfig;
-  const requireAll = config.require_all === true;
   return (
     <div className="mb-3" data-testid="payment-triggers-editor">
       <label className="form-label">Payment Triggers</label>
       <div className="card bg-light">
         <div className="card-body">
-          <Form.Check
-            type="switch"
-            id="payment-triggers-require-all"
-            data-testid="payment-triggers-require-all"
-            className="mb-3"
-            checked={requireAll}
-            onChange={e => updateField('require_all', e.target.checked)}
-            label="Charge every request on this surface, ignoring the triggers below"
-          />
-
           {protocol === 'mcp' && (
-            <fieldset disabled={requireAll}>
+            <fieldset>
               <McpTriggerEditor
                 value={config.mcp_payment_triggers}
+                target={allNodes?.find(n => n.type === 'target')?.config}
                 hasAttemptedSave={hasAttemptedSave}
                 onChange={next => updateField('mcp_payment_triggers', next)}
               />
@@ -385,7 +205,7 @@ const PaymentTriggersEditor: React.FC<ConfigPanelProps> = ({
           )}
 
           {protocol === 'a2a' && (
-            <fieldset disabled={requireAll} className="mb-3">
+            <fieldset className="mb-3">
               <label className="form-label small fw-bold">
                 <i className="fas fa-exchange-alt me-1" aria-hidden="true" /> A2A Methods Requiring
                 Payment

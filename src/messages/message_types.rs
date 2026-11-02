@@ -47,6 +47,8 @@ pub enum MessageType {
     GetSurfacesResponse,
     GetManifest,
     GetManifestResponse,
+    GatewayInfo,
+    GatewayInfoResponse,
     PaymentCaseStatus,
     PaymentCaseStatusResponse,
     PaymentSettle,
@@ -134,6 +136,8 @@ impl MessageType {
             "https://affinidi.com/atm/client-actions/get-surfaces-response" => Self::GetSurfacesResponse,
             "https://affinidi.com/atm/client-actions/get-manifest" => Self::GetManifest,
             "https://affinidi.com/atm/client-actions/get-manifest-response" => Self::GetManifestResponse,
+            "https://affinidi.com/atm/client-actions/gateway-info" => Self::GatewayInfo,
+            "https://affinidi.com/atm/client-actions/gateway-info-response" => Self::GatewayInfoResponse,
             "https://affinidi.com/atm/client-actions/payment-case-status" => Self::PaymentCaseStatus,
             "https://affinidi.com/atm/client-actions/payment-case-status-response" => Self::PaymentCaseStatusResponse,
             "https://affinidi.com/atm/client-actions/payment-settle" => Self::PaymentSettle,
@@ -223,6 +227,8 @@ impl MessageType {
             Self::GetSurfacesResponse => "https://affinidi.com/atm/client-actions/get-surfaces-response",
             Self::GetManifest => "https://affinidi.com/atm/client-actions/get-manifest",
             Self::GetManifestResponse => "https://affinidi.com/atm/client-actions/get-manifest-response",
+            Self::GatewayInfo => "https://affinidi.com/atm/client-actions/gateway-info",
+            Self::GatewayInfoResponse => "https://affinidi.com/atm/client-actions/gateway-info-response",
             Self::PaymentCaseStatus => "https://affinidi.com/atm/client-actions/payment-case-status",
             Self::PaymentCaseStatusResponse => "https://affinidi.com/atm/client-actions/payment-case-status-response",
             Self::PaymentSettle => "https://affinidi.com/atm/client-actions/payment-settle",
@@ -285,6 +291,8 @@ impl MessageType {
             | Self::GetSurfacesResponse
             | Self::GetManifest
             | Self::GetManifestResponse
+            | Self::GatewayInfo
+            | Self::GatewayInfoResponse
             | Self::PaymentCaseStatus
             | Self::PaymentCaseStatusResponse
             | Self::PaymentSettle
@@ -408,6 +416,19 @@ mod tests {
             "https://affinidi.com/atm/client-actions/get-manifest-response"
         );
         for message_type in [MessageType::GetManifest, MessageType::GetManifestResponse] {
+            assert_eq!(MessageType::from_str(message_type.as_str()), message_type);
+            assert_eq!(message_type.protocol_family(), ProtocolFamily::GatewayQuery);
+        }
+    }
+
+    #[test]
+    fn gateway_info_types_round_trip_through_their_uris() {
+        assert_eq!(MessageType::GatewayInfo.as_str(), "https://affinidi.com/atm/client-actions/gateway-info");
+        assert_eq!(
+            MessageType::GatewayInfoResponse.as_str(),
+            "https://affinidi.com/atm/client-actions/gateway-info-response"
+        );
+        for message_type in [MessageType::GatewayInfo, MessageType::GatewayInfoResponse] {
             assert_eq!(MessageType::from_str(message_type.as_str()), message_type);
             assert_eq!(message_type.protocol_family(), ProtocolFamily::GatewayQuery);
         }

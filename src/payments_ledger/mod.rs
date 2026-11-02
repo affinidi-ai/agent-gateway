@@ -357,6 +357,17 @@ pub fn global() -> Option<Arc<DelegatedPaymentStore>> {
     GLOBAL_STORE.get().cloned()
 }
 
+/// Payments taken through `payment_gateway_id` that are still held or
+/// unconfirmed, so removing that gateway would strand them.
+pub fn unsettled_payments(
+    store: &DelegatedPaymentStore,
+    payment_gateway_id: &str,
+) -> usize {
+    store
+        .rows_where(|row| row.payment_gateway_id == payment_gateway_id && store::awaits_settlement(row))
+        .len()
+}
+
 /// Records a row in the global store, when it is initialised. A row that
 /// records money ([`LedgerOutcome::is_money`]) is on the disk when this
 /// returns; any other is written by the background worker.
@@ -562,6 +573,36 @@ pub(crate) mod tests {
         rows.iter()
             .map(|r| r.id.as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn unsettled_payments_count_held_and_unconfirmed_rows_of_one_gateway() {
+        let (store, _dir) = store().await;
+        for outcome in [
+            LedgerOutcome::Authorized,
+            LedgerOutcome::Unconfirmed,
+            LedgerOutcome::Paid,
+            LedgerOutcome::Voided,
+            LedgerOutcome::Held,
+        ] {
+            store
+                .record(row("s-1", outcome, Duration::zero()), None)
+                .unwrap();
+        }
+        let mut other = row("s-1", LedgerOutcome::Authorized, Duration::zero());
+        other.payment_gateway_id = "gw-other".to_string();
+        store
+            .record(other, None)
+            .unwrap();
+        let mut superseded = row("s-1", LedgerOutcome::Unconfirmed, Duration::zero());
+        superseded.superseded_by = Some("later".to_string());
+        store
+            .record(superseded, None)
+            .unwrap();
+
+        assert_eq!(unsettled_payments(&store, "gw-pay"), 2);
+        assert_eq!(unsettled_payments(&store, "gw-other"), 1);
+        assert_eq!(unsettled_payments(&store, "gw-none"), 0);
     }
 
     #[tokio::test]

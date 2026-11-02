@@ -495,6 +495,14 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   **origin-locked** to the SSE host via
   `mcp::sse_transport::resolve_session_post_url`, so a cross-origin `endpoint`
   event can't redirect the POST to an internal address).
+- `egress::pinned_forward_client` (the forward step's policy) pins **MCP tool
+  discovery of a saved surface** (`surface_id`): the gateway reads the surface's
+  stored Target and `target.auth` itself, so it reaches exactly what the
+  surface already forwards to (loopback and RFC 1918 allowed, cloud metadata
+  blocked) and the caller cannot choose the host. The caller must be able to
+  read the surface (tenant and resource scope, else `404`), and a
+  `target_endpoint` sent with it that differs from the saved one is refused
+  with `409` before any dial.
 - `egress::pinned_configured_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, allows RFC 1918) pins the
   modern owned **MCP Proxy `tools/call`** to its REST backend

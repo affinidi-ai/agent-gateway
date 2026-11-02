@@ -10,7 +10,8 @@ interface Props {
   paymentId: string;
   onClose: () => void;
   /** Shows the audit events of the payment's trace id. */
-  onShowAudit?: (traceId: string) => void;
+  /** The payment gateway's name for its id. */
+  gatewayName: (id: string) => string;
 }
 
 const optional = (
@@ -29,7 +30,7 @@ const optional = (
         ],
       ];
 
-const PaymentDetailModal: React.FC<Props> = ({ paymentId, onClose, onShowAudit }) => {
+const PaymentDetailModal: React.FC<Props> = ({ paymentId, onClose, gatewayName }) => {
   const { row, error, loading, reload } = usePaymentRow(paymentId);
 
   const caseStatus: Array<[string, React.ReactNode]> =
@@ -58,7 +59,12 @@ const PaymentDetailModal: React.FC<Props> = ({ paymentId, onClose, onShowAudit }
           'payments-detail-updated-at'
         ),
         ['Surface', `${row.surface_id}${row.variant ? `$${row.variant}` : ''}`],
-        ['Payment gateway', row.payment_gateway_id],
+        [
+          'Payment gateway',
+          <span key="gateway" title={row.payment_gateway_id} data-testid="payments-detail-gateway">
+            {gatewayName(row.payment_gateway_id)}
+          </span>,
+        ],
         ['Payment surface', row.payment_surface_id],
         ['Tool / method', row.resource ?? '—'],
         ['Rail', row.rail ?? '—'],
@@ -73,27 +79,7 @@ const PaymentDetailModal: React.FC<Props> = ({ paymentId, onClose, onShowAudit }
         ['VC fingerprint', row.vc_fingerprint ? <code key="vc">{row.vc_fingerprint}</code> : '—'],
         ['Latency', `${row.latency_ms} ms`],
         ['Remote status', row.remote_status ?? '—'],
-        [
-          'Trace id',
-          row.trace_id ? (
-            <span key="trace">
-              <code>{row.trace_id}</code>
-              {onShowAudit && (
-                <AppButton
-                  variant="link"
-                  size="sm"
-                  className="p-0 ms-2 text-primary"
-                  onClick={() => onShowAudit(row.trace_id as string)}
-                  data-testid="payments-detail-audit-link"
-                >
-                  Audit events
-                </AppButton>
-              )}
-            </span>
-          ) : (
-            '—'
-          ),
-        ],
+        ['Trace id', row.trace_id ? <code key="trace">{row.trace_id}</code> : '—'],
         ...optional(
           'Idempotency key',
           row.idempotency_key ? <code>{row.idempotency_key}</code> : undefined,

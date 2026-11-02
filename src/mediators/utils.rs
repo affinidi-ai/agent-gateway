@@ -51,9 +51,91 @@ impl std::fmt::Display for WellKnownDidResponse {
 
 /// Construct a `MediatorAcl` that allows everything.
 fn allow_all_acl() -> Result<MediatorAcl, String> {
+    account_acl(MediatorAclAccessListMode::ExplicitDeny, true)
+}
+
+/// Construct the `MediatorAcl` of a paired connection point: every delivery
+/// capability, but only the DIDs on its access list may send, never anonymously.
+fn peer_only_acl() -> Result<MediatorAcl, String> {
+    account_acl(MediatorAclAccessListMode::ExplicitAllow, false)
+}
+
+/// Who a connection point's mediator account admits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InboundAcl {
+    /// Anyone may send: invitation endpoints, pairing temporaries and legacy
+    /// connection points, which do not serve a single known peer.
+    Open,
+    /// Only these DIDs may send; none admits no one.
+    Peers(Vec<String>),
+}
+
+impl InboundAcl {
+    /// The access-list mode the mediator reports while this ACL is in force.
+    pub fn access_list_mode(&self) -> &'static str {
+        match self {
+            InboundAcl::Open => "explicitDeny",
+            InboundAcl::Peers(_) => "explicitAllow",
+        }
+    }
+}
+
+/// Serializes ACL replacement per DID: it is two Trust Tasks, and interleaved
+/// callers would leave the wrong access list.
+static ACL_MUTATION_LOCKS: std::sync::LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn acl_mutation_lock(did: &str) -> Arc<tokio::sync::Mutex<()>> {
+    ACL_MUTATION_LOCKS
+        .entry(did.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn did_hash(did: &str) -> String {
+    format!("{:x}", Sha256::digest(did.as_bytes()))
+}
+
+/// Apply `acl` to `profile`'s mediator account.
+pub async fn apply_inbound_acl(
+    atm: &affinidi_messaging_sdk::ATM,
+    profile: Arc<affinidi_messaging_sdk::profiles::ATMProfile>,
+    acl: &InboundAcl,
+) -> Result<(), String> {
+    let InboundAcl::Peers(peers) = acl else {
+        return set_acl_to_allow_everything_and_more(atm, profile).await;
+    };
+    let did = profile.inner.did.to_string();
+    let lock = acl_mutation_lock(&did);
+    let _guard = lock.lock().await;
+    atm.trust_tasks()
+        .account_update(&profile, Some(did_hash(&did)), None, Some(peer_only_acl()?), None)
+        .await
+        .map_err(|e| format!("Failed to set mediator account ACL: {e}"))?;
+    atm.trust_tasks()
+        .access_list_update(
+            &profile,
+            None,
+            true,
+            peers
+                .iter()
+                .map(|peer| did_hash(peer))
+                .collect(),
+            vec![],
+        )
+        .await
+        .map_err(|e| format!("Failed to replace access list: {e}"))?;
+    info!("Inbound ACL for {} admits only {} peer DID(s)", did, peers.len());
+    Ok(())
+}
+
+fn account_acl(
+    access_list_mode: MediatorAclAccessListMode,
+    anon_receive: bool,
+) -> Result<MediatorAcl, String> {
     MediatorAcl::builder()
-        .access_list_mode(MediatorAclAccessListMode::ExplicitDeny)
-        .anon_receive(true)
+        .access_list_mode(access_list_mode)
+        .anon_receive(anon_receive)
         .blocked(false)
         .create_invites(true)
         .local(true)
@@ -255,9 +337,9 @@ pub async fn set_acl_to_allow_everything_and_more_retrying(
     let did = profile.inner.did.to_string();
     info!("set_acl_to_allow_everything_and_more called for did: {}", did);
 
-    let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    let did_hash = format!("{:x}", hasher.finalize());
+    let lock = acl_mutation_lock(&did);
+    let _guard = lock.lock().await;
+    let did_hash = did_hash(&did);
     let acl = allow_all_acl()?;
     retry
         .run(
@@ -564,6 +646,31 @@ pub(crate) mod test_documents {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn peer_only_acl_grants_delivery_but_admits_only_the_access_list() {
+        let acl = serde_json::to_value(peer_only_acl().unwrap()).unwrap();
+        assert_eq!(acl["accessListMode"], "explicitAllow");
+        assert_eq!(acl["anonReceive"], false);
+        assert_eq!(acl["receiveMessages"], true);
+        assert_eq!(acl["sendMessages"], true);
+        assert_eq!(acl["blocked"], false);
+    }
+
+    #[test]
+    fn each_inbound_acl_names_the_access_list_mode_the_mediator_reports() {
+        assert_eq!(InboundAcl::Open.access_list_mode(), "explicitDeny");
+        assert_eq!(InboundAcl::Peers(vec!["did:example:peer".into()]).access_list_mode(), "explicitAllow");
+        assert_eq!(InboundAcl::Peers(vec![]).access_list_mode(), "explicitAllow");
+        assert_eq!(
+            serde_json::to_value(allow_all_acl().unwrap()).unwrap()["accessListMode"],
+            InboundAcl::Open.access_list_mode()
+        );
+        assert_eq!(
+            serde_json::to_value(peer_only_acl().unwrap()).unwrap()["accessListMode"],
+            InboundAcl::Peers(vec![]).access_list_mode()
+        );
+    }
 
     #[test]
     fn allow_all_acl_grants_every_capability_in_explicit_deny_mode() {

@@ -108,12 +108,30 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - Payment setup dependency alerts stay hidden until the first Save attempt. Invalid
   payment configuration remains blocked on Save, while embedded safety warnings stay
   visible. The one exception is a local x402/MPP policy, which is always flagged.
-- **Payment** (`elements/payment/`) charges through a connected agent-pay gateway only.
-  The sidebar picks the gateway and payment surface (manual entry accepts `id$alias`),
+- **Payment** (`elements/payment/`) charges through a connected agent-pay payment gateway
+  only. The sidebar picks the gateway and payment surface with the shared **Gateway picker**.
+  It lists only the gateways `GET /gateways/payment-providers` returns: active payment
+  gateways (Connections → **Payment Gateways**) exposing at least one payment surface. A Fabric
+  peer is never one. There is no switch to show other gateways, and a failed load lists none.
+  Its Add link reads **Add Payment Gateway** and opens the payment gateway wizard
+  (`deepLinks.paymentGateway`, `/payment-gateways/connect`). Surfaces come from
+  `GET /payment-gateways/{id}/surfaces` (`surfacesBasePath: '/payment-gateways'`) and the
+  manifest from `GET /payment-gateways/{id}/surfaces/{surface}/payment-manifest`
+  (`apiClient.getPaymentManifest`). It offers only payment surfaces (a payment flag, a manifest or a
+  `payment` tag); a peer that sends none of these markers is refreshed once and then
+  lists every surface. A surface id cannot be typed in, so a variant (`id$alias`) cannot be
+  newly chosen; a saved one stays selected as `<id>$<alias> (variant)`. The sidebar
   previews the agent-pay manifest (the saved `manifest_snapshot` until the selection
   changes or Refresh is pressed, then the live one with a drift notice; Refresh bypasses
-  the gateway's manifest cache, and the route's error codes map to readable messages), and holds
-  **Charge every request**, **Share the payer's email** (off by default) and the timeout.
+  the gateway's manifest cache, and the route's error codes map to readable messages; each
+  payment method shows its logo, `/api/v1/gateways/payment-logos/<sha256>` from the point's
+  `logo`, built only from a lowercase hex hash by `paymentLogoUrl` and shown with an `<img>`,
+  never inlined, with empty alt text since the label follows, or a generic `fa-coins` (x402) or
+  `fa-credit-card` (MPP) icon when there is none or it fails to load, test ids
+  `payment-manifest-point-logo-<id>` / `payment-manifest-point-icon-<id>`), and holds
+  the timeout. It has no **Charge every request** switch (the triggers editor has none either)
+  and no switch to share the payer's email; a stored
+  `require_all` or `share_payer_email` is kept as saved.
   The timeout is a whole number of milliseconds from 1000 to 120000, the range the gateway
   accepts; an empty field means the default, and anything else shows
   `payment-timeout-error` and blocks Save.
@@ -123,12 +141,43 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   The editor says so (`payment-triggers-mcp-scope`, `payment-triggers-a2a-defaults-note`), and
   the A2A **Add default filters** button (`payment-triggers-a2a-add-defaults-button`) writes the
   two default filters; editing while none are set starts from them, so an edit never un-charges
-  them. Blank patterns count as unset, and the only blocking trigger error is an MCP Match with
-  no non-blank pattern, which the gateway refuses with 400 `invalid_payment_policy`. The
+  them. Blank patterns count as unset, and the only blocking trigger error is an MCP charged
+  selection with no non-blank pattern (a Match with no pattern), which the gateway refuses with
+  400 `invalid_payment_policy`; the editor warns about it at once
+  (`payment-triggers-mcp-none-charged`) and shows it as `payment-triggers-mcp-error` after a
+  save attempt. The
   browser's check of an MCP regex (`triggerPatternAdvice`) is advisory: the gateway's regex
   engine differs from the browser's (inline flags such as `(?i)` and `(?P<name>...)` are valid
   there), so a doubted pattern shows a warning under it and a warning-level dependency, and
   never blocks Save. The gateway's 400 on save is final, and its `details` reach the page error.
+  The MCP editor (`McpTriggerEditor`) has no mode dropdown. Its **Patterns** list is the
+  selection and is always shown with every stored row: selecting a tool adds the exact pattern
+  `^<escaped name>$` at the end, clearing it removes that row, and removing or editing a row
+  updates the tool's box; other rows keep their place. **Selected tools and patterns are
+  Charged | Free** (`-mcp-selection-charged-button`, `-mcp-selection-free-button`) sets only
+  what the list means and never rewrites it: Charged saves `match`, or `all` while the list is
+  empty, and Free saves `exclude`. A surface with no trigger, or `all`, shows Charged with nothing
+  selected and every tool charged, so the first tool selected is charged and every other tool
+  becomes free; clearing the last one charges every tool again. The line under the switch
+  (`-mcp-others`) says that every other tool, including tools the Target adds later, gets the
+  opposite, or that nothing is selected yet. The **Tools** card lists the selected tools and, with
+  **Discover tools**, the Target's tools, fetched on demand, never on open, through
+  `POST /mcp-proxies/discover-tools` (`_shared/mcpToolDiscovery.ts`): an MCP Proxy Target by id;
+  a Direct URL Target of a saved surface (`/surfaces/:surfaceId`) by `surface_id` with the draft
+  endpoint, so the gateway dials the saved Target and auth under the forward step's egress
+  policy (local and private Targets work, and an unsaved endpoint change answers `409`); on an
+  unsaved surface, the URL with its auth secret reference (never a secret value), which the
+  strict policy refuses for local and private hosts, so the error then adds a save hint
+  (`-mcp-discover-save-hint`). A gateway (`fabric://`) or A2A proxy Target offers no discovery
+  and says why; tools can still be added by name. Each row shows the tool's effective
+  charge. A tool a non-exact pattern matches shows as ticked and locked and names that pattern.
+  The select-all box (checked, indeterminate or clear), **Select all** and **Clear** act on the
+  tools the filter shows (**Select shown** / **Clear shown** while filtering); selecting skips
+  tools a pattern already matches. **Add tool** adds a tool by name to the list, and **Add
+  Pattern** adds a blank regex row; the last row can be removed. A selected tool the Target no
+  longer lists is badged. A pattern the browser cannot read the gateway's way (inline flags,
+  lookaround) is ignored by the list and counted in a warning. The gateway's discovery error,
+  such as a missing permission, is shown as is.
   A2A message patterns are plain, case-sensitive "message contains" text, never checked as a
   regex. While a message method has no text, the editor says every message of that method
   is charged (`payment-triggers-a2a-<method>-scope`). A loaded enabled local x402/MPP policy
@@ -138,36 +187,31 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   chosen. `manifest_snapshot` and the save response's `warnings` (objects `{code, message}`,
   shown as toasts by `showSaveWarnings`, used by the Add and Edit surface pages) are
   server-written and never sent. Choosing another gateway drops `manifest_snapshot` and the
-  surface id (a surface id only exists on its own gateway) and closes manual entry; choosing
+  surface id (a surface id only exists on its own gateway); choosing
   another surface drops `manifest_snapshot`. The API client reads and writes through one scrub:
   `stripServerWrittenFields` removes the snapshot from the policies and from every canvas blob
   it sends, both a Payment node's config and the Managed Agent node's copy of the policy, and
   `fromBackendSurface` removes it from the canvas blobs of every surface it reads (get, list,
   and the create/update responses), so an earlier surface's price never comes back as the new
   surface's saved price. Test ids:
-  `payment-connect-gateway-button`, `payment-gateway-select`, `payment-surface-select`, `payment-surface-manual-input`,
-  `payment-surface-refresh-button`, `payment-surface-manual-toggle-button`,
-  `payment-only-filter-toggle`, `payment-manifest-preview`, `payment-manifest-refresh-button`,
+  the shared picker's `payment-*` ids (see **Gateway picker**), `payment-manifest-preview`,
+  `payment-manifest-refresh-button`,
   `payment-manifest-drift`, `payment-legacy-unsupported-banner`,
   `payment-legacy-migrate-button`, `payment-disabled-legacy-note`,
-  `payment-require-all-toggle`, `payment-timeout-input`, `payment-timeout-error`,
-  `payment-share-email-toggle`, `payment-configure-triggers-button`, and
-  `payment-triggers-*` in the fullscreen (`-require-all`, `-mcp-mode`, `-mcp-scope`,
+  `payment-timeout-input`, `payment-timeout-error`, `payment-configure-triggers-button`, and
+  `payment-triggers-*` in the fullscreen (`-mcp-scope`,
   `-mcp-error`, `-a2a-defaults-note`, `-a2a-add-defaults-button`,
   `-a2a-command-toggle-button`, `-a2a-control-toggle-button`, `-a2a-<method>-scope`,
   `-a2a-method-<method>` for a control method, `-pattern-<n>`, `-pattern-warning-<n>`,
-  `-add-pattern-button`, `-remove-pattern-button-<n>`). Transit Points take no Payment node.
-- On `/surfaces/<id>`, a saved surface whose `target.payment_policy` is `agent_pay` shows
-  `SurfacePaymentActivity` (`elements/payment/SurfacePaymentActivity.tsx`) above the canvas,
-  for a user holding `payments.view` only: its outcome counts over the last 24 hours
-  (`GET /api/admin/payments/summary`), its payment gateway's circuit breaker
-  (`GET /api/admin/payments/breakers/{id}`, left out when it cannot be read), a **Recent**
-  toggle listing the newest five rows, and **View payments** linking to
-  `/payments?surface_id=<id>`. Test ids: `surface-payment-activity`,
-  `surface-payment-activity-error`, `surface-payment-activity-empty`,
-  `surface-payment-count-<outcome>`, `surface-payment-breaker`,
-  `surface-payment-recent-toggle`, `surface-payment-recent`, `surface-payment-recent-<id>`,
-  `surface-payment-activity-link`.
+  `-add-pattern-button`, `-remove-pattern-button-<n>`, and for MCP
+  `-mcp-selection-charged-button`, `-mcp-selection-free-button`, `-mcp-others`, `-mcp-none-charged`,
+  `-mcp-tools`, `-mcp-discover-button`, `-mcp-discover-unavailable`, `-mcp-discover-error`,
+  `-mcp-discover-save-hint`, `-mcp-no-tools`, `-mcp-tool-count`, `-mcp-select-all`,
+  `-mcp-tool-filter`, `-mcp-select-all-button`, `-mcp-clear-button`, `-mcp-tool-<name>`,
+  `-mcp-tool-row-<name>`, `-mcp-tool-missing-<name>`, `-mcp-add-tool-input`,
+  `-mcp-add-tool-button`, `-mcp-patterns`, `-mcp-unchecked`). Transit Points take no Payment node.
+- `/surfaces/<id>` shows no payment activity for a surface charging through agent-pay; its
+  payments are on the Payments page.
 - **Send delegated credentials over Fabric** is one shared section
   (`_shared/FabricDelegatedCredentialsSection.tsx`) used by the Managed Agent and Transit
   Point panels. It writes `fabric_delegated_credentials` and appears only when that route
@@ -176,6 +220,45 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Gateway picker** is one shared gateway-then-surface picker
+  (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
+  Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user
+  gets the same states:
+  - Placeholders read `Select a gateway…` / `Select an Agent Surface…` (Payment: `Select a
+    payment gateway…` / `Select a payment surface…`) and `Loading…` while a list loads.
+  - With no gateway to offer, a warning panel replaces the dropdown with the Add link, which
+    opens in a new tab so the canvas is kept. Otherwise a muted "Don't see the one you need?"
+    line with the same link sits under it. The link is the picker's `addGatewayLink` and
+    `addGatewayLabel`: **Add Gateway** to `/gateways/connect` by default (Managed Agent,
+    Transit Point), **Add Payment Gateway** to `/payment-gateways/connect` for Payment.
+  - A failed gateway load lists none and shows the error with **Retry**; it never reads as
+    "no gateway". Retry reloads the gateways bypassing any cache.
+  - `useGatewaySurfaces` lists surfaces from `{surfacesBasePath}/{id}/surfaces`: `/gateways`
+    by default, `/payment-gateways` for Payment.
+  - A failed surface load says why (not connected, not found, or a generic retry message,
+    never the raw error). A gateway with no surfaces, or none passing the panel's filter, gets
+    a muted line naming the next step.
+  - **Refresh** reloads the surface list from the gateway (`force_refresh=true`). A response
+    for an earlier gateway is dropped, so it never lists under a later one.
+  - A saved gateway or surface missing from the list stays selected, as
+    `<id> (not currently connected)` / `<id> (not currently exposed)`.
+  - Surfaces read `name (first 8 id characters…)`.
+  - The full explanation of each field sits behind its `FieldHelp`.
+
+  Managed Agent and Transit Point list active remote peers (`filterSelectableGateways`, never a
+  payment gateway)
+  and read the route from config, falling back to the saved `fabric://` URL, so undo, redo
+  and an API-authored surface restore it. They keep surfaces of the route's protocol plus
+  surfaces with no protocol; an HTTP Transit Point keeps every surface. Choosing another
+  gateway clears the surface, the endpoint and the synthesized gateway and channel names.
+  Choosing a surface writes `fabric://<gateway>/<surface>` and names the channel after it. The
+  node's incomplete reason names the missing step: `Select a gateway`, then `Select an Agent
+  Surface on the gateway`. Test ids, with `<prefix>` one of `managed-agent`, `transit-point`
+  or `payment`: `<prefix>-gateway-select`, `-gateway-error`, `-gateway-retry-button`,
+  `-no-gateway`, `-add-gateway-link`, `-surface-select`, `-surface-refresh-button`,
+  `-surface-error`, `-surface-empty`, and `field-help-<prefix>-gateway` / `-surface`. The
+  route type selects are `<managed-agent|transit-point>-endpoint-type-select`, and the URL
+  inputs are `managed-agent-endpoint-input` and `transit-point-target-endpoint-input`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -407,10 +490,14 @@ fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-sta
 
 ## Payments page
 
-`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`) reads the
+`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`) is one list of payments, with no tabs, chart or audit trail view, and reads the
 append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
 `outcome` from the filter) and shows one row per payment check with an outcome badge; a
-held row shows its case id. `usePaymentLedger` only lets the latest request write rows,
+held row shows its case id. The Surface cell says `via <payment surface> on <payment
+gateway>` (`payments-gateway-<id>`, the id as its tooltip) and the details show the
+**Payment gateway** by name (`payments-detail-gateway`). `usePaymentGatewayNames` reads
+`GET /payment-gateways` once per page and falls back to the id for an unlisted gateway or a
+failed read; the ledger is never filtered by it. `usePaymentLedger` only lets the latest request write rows,
 the error and the Refresh state, so a slow answer to an earlier filter never overwrites a
 later one. When a refresh fails, the rows of the same filter stay under
 `payments-stale-note` ("may be out of date"), and the rows of an earlier filter are dropped.
@@ -419,8 +506,7 @@ An outcome or surface filter with no rows shows "No payments match this filter" 
 charge outcome is unknown), `authorized` (funds held until the Target delivers), `voided` (held funds released) and
 `capture_failed` (the Target delivered but the capture failed), each with its note in `OUTCOME_META`; an unconfirmed row's details show `payments-detail-outcome-note`
 ("Payment taken or unconfirmed - retry the same request with the same credential within 2
-minutes"). The chart stacks counts per outcome per time bucket and keeps the newest 500
-buckets when the rows span more. **Details** opens `GET /api/admin/payments/{id}`; for a
+minutes"). **Details** opens `GET /api/admin/payments/{id}`; for a
 held row the response may carry `case_status` (`{status, checked_at}` from agent-pay), shown
 as **Case status** in plain words, and **Refresh status** reads the row again while the
 shown row stays. It is absent whenever agent-pay could not be asked, and the modal says "Not available" with the
@@ -433,20 +519,16 @@ void pending, unconfirmed, settled, superseded, or reconciliation gave up), **Ch
 with a "Price mismatch" badge, **Superseded by** and a "Reconcile failed" badge.
 The details also show **Reason** (why a refused, failed or released payment ended so),
 **Updated at**, **Idempotency key**, **Settle timeout** and **Caller (hashed)** (the peppered hash
-the ledger records, never the caller) when the row has them, and an **Audit events** link beside
-the trace id that closes the modal and opens the **Audit trail** tab filtered by that trace id.
+the ledger records, never the caller) when the row has them.
 A row with a reason shows it, truncated with the full text as its tooltip, under the outcome badge.
-The **Audit trail** tab (`pages/PaymentsPage/PaymentAuditTab.tsx`, `usePaymentAudit`) reads
-`GET /api/admin/payments/audit` with the page's surface filter plus stage, trace id and a from/to
-time, 50 events per page; it loads only while the tab is open.
 `capture_failed` reads "Payment capture failed or is unconfirmed - reconcile before asking
 the payer to pay again". `listPayments` and `getPayment` go through the shared request path,
-so a 401 expires the session. The page always has **Ledger** and **Audit trail** tabs; a
-read-only **Legacy x402/MPP** tab appears only while the old
+so a 401 expires the session. A
+read-only **Legacy x402/MPP** list appears below the payments only while the old
 x402/MPP endpoints still return rows: one row per transaction (the verification and
 settlement summaries merged, the settlement giving the status) with the x402 amount scaled
 by the token's decimals and shown in dollars. `/x402payments` redirects here and keeps its query string and hash. Test ids:
-`page-payments`, `payments-outcome-filter`, `payments-bucket-select`, `payments-filter-input`, `payments-refresh-button`,
+`page-payments`, `payments-outcome-filter`, `payments-filter-input`, `payments-refresh-button`,
 `payments-row-<id>`, `payments-surface-link-<id>`, `payments-held-case-<id>`,
 `payments-details-button-<id>`, `payments-detail-modal`, `payments-detail-dismiss-button`,
 `payments-detail-close-button`, `payments-detail-error`, `payments-detail-case-status`,
@@ -455,15 +537,10 @@ by the token's decimals and shown in dollars. `/x402payments` redirects here and
 `payments-detail-settlement-status`, `payments-detail-price-mismatch`, `payments-detail-superseded-by`,
 `payments-detail-reconcile-failed`, `payments-detail-reason`, `payments-detail-updated-at`,
 `payments-detail-idempotency-key`, `payments-detail-settle-timeout`,
-`payments-detail-caller-principal`, `payments-detail-audit-link`, `payments-reason-<id>`,
-`payments-audit-tab`, `payments-audit-tab-panel`, `payments-audit-stage-filter`,
-`payments-audit-trace-input`, `payments-audit-since-input`, `payments-audit-until-input`,
-`payments-audit-refresh-button`, `payments-audit-table`, `payments-audit-row-<event id>`,
-`payments-audit-error`, `payments-audit-prev-button`, `payments-audit-next-button`,
-`payments-audit-page`, `payments-ledger-tab`,
-`payments-legacy-tab`, `payments-legacy-panel`, `payments-legacy-row-<key>`,
+`payments-detail-caller-principal`, `payments-reason-<id>`,
+`payments-legacy-panel`, `payments-legacy-row-<key>`,
 `payments-error-alert`, `payments-error-dismiss-button`, `payments-stale-note`,
-`payments-surface-filter`.
+`payments-surface-filter`, `payments-gateway-<id>`, `payments-detail-gateway`.
 
 ## Access Tokens page
 
@@ -721,6 +798,110 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
 | Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
 | Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
 
+## Connections page
+
+`/connections` (`pages/ConnectionsPage.tsx`) has the tabs **Gateways**, **Payment Gateways**,
+**Mediators** and **Registries**, kept in `?tab=` (`gateways`, `payment-gateways`,
+`mediators`, `trust-registries`). The active tab follows the URL, so a link to another tab of
+the page switches it; an unknown or hidden value opens the first tab shown. The page (route and
+sidebar entry) opens with either `gateways.view` or `payment_gateways.view`
+(`ProtectedRoute` accepts a list, any one of which is enough). **Gateways** shows only with
+`gateways.view` and **Payment Gateways** (`connections-tab-payment-gateways`) only with
+`payment_gateways.view`. One filter box serves every tab; each tab reports its
+filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
+portals its add button into the tab banner.
+
+### Payment Gateways tab
+
+`pages/PaymentGatewaysPage.tsx` (`page-payment-gateways`, sections in
+`pages/PaymentGatewaysPage/`) lists `GET /payment-gateways` (`apiClient.listPaymentGateways`);
+its Connect button is limit-guarded on `connections.paymentgateways` like the Gateways tab's on
+`connections.gateways`. It lists:
+remote gateways with `role: 'payment'`, which `GET /gateways` never returns. The filter matches
+name, description, id and DID.
+
+- Columns: name with its description, status (`GatewayStatusCell` in
+  `components/gateways/`, shared with the Gateways tab: badge, failure reason, peer last seen),
+  and **Offers**. An active row reads `GET /payment-gateways/{id}/info`
+  (`usePaymentGatewayInfo` in `components/payment-gateways/`) and shows
+  `PaymentGatewayOfferSummary`: protocol badges, one chip per distinct payment method (network
+  or provider, `via <settles_via>`) and the payment surface count. A row exposing no payment
+  surface adds a warning line. A failed read shows a short warning with the reason as its
+  tooltip (503 not reachable, 502 not a payment gateway) and never blocks the list.
+- A row opens the detail page. Actions: **Verify** (`payment_gateways.edit`, a pending or
+  awaiting-approval row) resumes the wizard at `/payment-gateways/connect?id=<id>`; Open; Ping
+  (`payment_gateways.edit`, `POST /payment-gateways/{id}/ping`, not for a pending row); Delete
+  (`payment_gateways.delete`, the two-step `DeleteButton`). A refused delete (409 while surfaces
+  take payments through it or it holds unsettled payments) shows the gateway's message.
+- **Connect Payment Gateway** (`payment_gateways.edit`) opens the wizard. With no payment
+  gateway an `EmptyState` explains agent-pay and has the same action.
+
+### Connect Payment Gateway wizard
+
+`/payment-gateways/connect` (`pages/AddPaymentGatewayWizardPage.tsx`, `payment_gateways.edit`,
+root `wizard-add-payment-gateway`) reuses the Connect via OOB step components in
+`components/gateway-add-via-oob/` with payment wording (`AddPaymentGatewayWizardPage/wording.ts`);
+their `wording` props (and ConnectStep's `endpoint` and `title`) default to the gateway
+wizard's, so `/gateways/connect` is unchanged. Steps:
+
+1. **Enter Details**, then **Connection Point Link**, then **Connect**, which posts to
+   `POST /payment-gateways/connect-via-oob` (a 409 says the connection point is already a
+   Fabric peer) and puts `?id=<new id>` in the URL.
+2. **Awaiting Approval** (`AwaitApprovalStep`) reads `GET /payment-gateways/{id}` every 3
+   seconds until the status is `active`, says agent-pay's administrator must approve, and lets
+   the user leave; Verify on the list returns here. A 404 stops with an error.
+3. **Verify** (`VerifyPaymentGatewayStep`) reads `/payment-gateways/{id}/info`. It passes when
+   the gateway answers with role `payment`; `payable_count` 0 passes with a warning to expose a
+   payment surface on the shared connection point. 502 fails (not a payment gateway, or
+   agent-pay too old) and 503 retries by itself every 5 seconds. **Re-check** asks again.
+4. **Complete** links to the detail page and back to the tab.
+
+`?id=` opens the wizard at Awaiting Approval, which moves on to Verify at once for an active
+gateway. Every wizard's step bar is the shared `components/shared/WizardProgress.tsx`.
+
+### Payment gateway detail page
+
+`/payment-gateways/:id` (`pages/PaymentGatewayDetailPage.tsx`, `payment_gateways.view`,
+sections in `pages/PaymentGatewayDetailPage/`) has four tabs, mounted when opened, and no
+Publishing or Global Policy tab:
+
+- **Overview**: name and description saved with `PUT /payment-gateways/{id}`, DID, id,
+  status, offer, dates, and **Disable**/**Enable** (`PUT` with `status`). A 409 refusal shows
+  the gateway's message. A pending gateway links to Verify. Editing needs
+  `payment_gateways.edit`; Delete in the header needs `payment_gateways.delete` and shows a 409
+  message the same way.
+- **Payment Surfaces**: `GET /payment-gateways/{id}/surfaces`, each surface with its manifest
+  through `PaymentManifestPreview` (a `testIdPrefix` per surface and no Refresh); **Refresh**
+  adds `force_refresh=true`.
+- **Used by**: the surfaces from `GET /surfaces` whose `target.payment_policy`, or a variant's
+  `overrides.target.payment_policy`, is `agent_pay` naming this gateway (`usedBy.ts`), linked
+  to `/surfaces/<id>`.
+- **Health**: runtime status, last contact, and **Ping** (`payment_gateways.edit`).
+
+### Use as payment gateway
+
+The Gateways tab (icon button per row) and the gateway edit page (header) offer **Use as
+payment gateway** (`components/gateways/UseAsPaymentGatewayButton.tsx`) for an active remote
+peer, only with both `gateways.edit` and `payment_gateways.edit`. A confirm says it moves to
+Payment Gateways and stops reaching this gateway's surfaces; then
+`POST /gateways/{id}/payment-role` and the Payment Gateways tab opens. A 409 (a surface routes
+to it over `fabric://`) shows the gateway's message.
+
+| Element                                  | Test id                                                                                                                                                       |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tab, list, rows                          | `connections-tab-payment-gateways`, `page-payment-gateways`, `payment-gateways-table`, `payment-gateways-row-<id>`, `gateway-status-<id>`                       |
+| List actions                             | `payment-gateways-connect-button`, `-open-button-<id>`, `-verify-button-<id>`, `-ping-button-<id>`, `-delete-button-<id>` (all `payment-gateways-`)              |
+| List offer                               | `payment-gateways-offer-<id>` (and `-payable-count`), `-offer-loading-<id>`, `-offer-error-<id>`, `-offer-empty-<id>`                                           |
+| List states                              | `payment-gateways-empty-state`, `payment-gateways-empty-connect-button`, `payment-gateways-no-match`, `payment-gateways-error-alert`, `payment-gateways-success-alert`, each alert with `-dismiss-button` |
+| Wizard steps                             | `wizard-progress`, `wizard-progress-step-<key>`, `wizard-step-details`, `wizard-step-link`, `wizard-step-connect`, `wizard-step-approval`, `wizard-step-verify`, `wizard-step-complete` |
+| Wizard navigation (both OOB wizards)     | `wizard-next`, `wizard-back`, `wizard-cancel`, `wizard-submit`, `wizard-oob-view-button`, `wizard-oob-connect-retry-button`                                     |
+| Wizard fields (both OOB wizards)         | `wizard-oob-name-input`, `wizard-oob-description-input`, `wizard-oob-did-method-select`, `wizard-oob-link-input`, `wizard-oob-secret-input`, `wizard-oob-details-error`, `wizard-oob-link-error`, `wizard-oob-connect-error` |
+| Approval and verify                      | `payment-gateway-approval-status`, `payment-gateway-approval-error`, `payment-gateway-verify-loading`, `-verify-ok`, `-verify-no-surface`, `-verify-error`, `-verify-offer`, `-verify-recheck-button` |
+| Detail page                              | `page-payment-gateway`, `payment-gateway-back-button`, `-delete-button`, `-error-alert`, `-tab-<overview\|surfaces\|used-by\|health>`                          |
+| Detail overview                          | `payment-gateway-name-input`, `-description-input`, `-did`, `-status`, `-offer`, `-offer-error`, `-save-button`, `-toggle-status-button`, `-pending-note`, `-verify-button` |
+| Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
+| Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card
@@ -745,6 +926,12 @@ The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card
 - Mutations are gated by `gateways.edit`. View-only users still see the lists.
 - The Gateways list shows a muted **ISSUER NOT ESTABLISHED** badge on active remote rows
   that have neither an established nor a trusted issuer DID.
+- Under the status of an active, pending or failed remote row it shows when the peer
+  gateway was last heard from (`PeerLastSeen` in `utils/connectionHealth.tsx`, from the list's
+  `peer_last_seen_at`, rendered by the shared `GatewayStatusCell` that the Payment Gateways
+  list uses too): "Peer seen <relative time>" with the absolute time as the tooltip, or
+  "Peer not heard from since this gateway started" (testid `gateway-peer-last-seen-<id>`). It
+  is separate from the row's own status, which reflects this gateway's mediator link.
 
 ## Remote gateway exposure
 

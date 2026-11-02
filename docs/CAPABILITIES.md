@@ -296,7 +296,9 @@ A surface charges for requests by delegating payment to a payment surface on a c
 agent-pay gateway, which owns the price, the accepted x402 and MPP methods, verification and
 settlement. The gateway decides which requests are chargeable (selected MCP tools, A2A methods,
 or every request) and asks agent-pay to take the payment after policy, just before forwarding.
-When agent-pay only holds the funds (`payment-authorization`), the gateway captures them after the
+The payment gateways on offer, `GET /v1/gateways/payment-providers`, are the active remote peers
+that expose at least one payment surface, whichever side opened the connection; their surfaces
+are cached for 5 minutes, and `?force_refresh=true` asks each peer again. When agent-pay only holds the funds (`payment-authorization`), the gateway captures them after the
 Target delivers and voids them otherwise, and a reconciler on the Active node finishes any capture
 or void left open; see [Capture on delivery](CONFIGURATION_REFERENCE.md#capture-on-delivery).
 A streamed response is returned without waiting for the capture and is captured when the stream
@@ -325,9 +327,8 @@ sequenceDiagram
 agent-pay can also hold a payment for human review; the request is then answered `202`, or
 JSON-RPC error `1003` for MCP and A2A, and the client retries later. Payment receipts, metrics and
 a payments ledger are kept for every call, with the reason a payment was refused or failed. The
-Payments page lists the ledger and, on its **Audit trail** tab, the payment audit events by
-surface, stage, trace id and time; a surface charging through agent-pay shows its last 24 hours of
-outcomes and its payment gateway's circuit breaker on its own page. Local x402 and MPP
+Payments page is one list of payments. The payment audit events stay available from
+`GET /api/admin/payments/audit`. Local x402 and MPP
 verification is no longer supported.
 See [Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy).
 

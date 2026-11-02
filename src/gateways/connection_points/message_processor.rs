@@ -525,6 +525,8 @@ pub async fn process_message_internal(
         MessageType::GetSurfacesResponse => process_get_surfaces_response(message).await,
         MessageType::GetManifest => process_get_manifest(message),
         MessageType::GetManifestResponse => ProcessingResult::ProcessedNoResponse,
+        MessageType::GatewayInfo => process_gateway_info(message),
+        MessageType::GatewayInfoResponse => ProcessingResult::ProcessedNoResponse,
         MessageType::PaymentCaseStatus => process_payment_case_status(message),
         MessageType::PaymentCaseStatusResponse => ProcessingResult::ProcessedNoResponse,
         MessageType::PaymentSettle => process_payment_settlement(message, MessageType::PaymentSettleResponse),
@@ -1568,6 +1570,16 @@ fn process_get_manifest(message: &ReceivedMessage) -> ProcessingResult {
     ProcessingResult::RequiresResponse {
         response_type: MessageType::GetManifestResponse.to_string(),
         response_body: serde_json::json!({ "manifest": null }),
+    }
+}
+
+/// This gateway is not a payment gateway, so a `gateway-info` query is always
+/// answered with null info.
+fn process_gateway_info(message: &ReceivedMessage) -> ProcessingResult {
+    debug!("Received gateway-info query from {:?}", message.from_did);
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::GatewayInfoResponse.to_string(),
+        response_body: serde_json::json!({ "info": null }),
     }
 }
 
@@ -9578,6 +9590,18 @@ mod tests {
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+
+    #[test]
+    fn a_gateway_info_query_is_answered_with_null_info() {
+        let message = make_handshake_msg(MessageType::GatewayInfo.as_str(), None, serde_json::json!({}));
+        match process_gateway_info(&message) {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
+                assert_eq!(response_type, MessageType::GatewayInfoResponse.to_string());
+                assert_eq!(response_body, serde_json::json!({"info": null}));
+            }
+            other => panic!("expected RequiresResponse, got {other:?}"),
+        }
+    }
 
     #[test]
     fn a_manifest_query_is_answered_with_a_null_manifest() {

@@ -98,25 +98,59 @@ describe('questionableMcpPatterns', () => {
 });
 
 describe('PaymentTriggersEditor — MCP', () => {
-  it('switches between all, match and exclude modes', () => {
+  it('adds a pattern that charges the tools it matches, without writing on open', () => {
     render(<Harness protocol="mcp" />);
 
-    const mode = screen.getByTestId('payment-triggers-mcp-mode');
-    expect(mode).toHaveValue('all');
+    expect(screen.getByTestId('payment-triggers-mcp-selection-charged-button')).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
     expect(latest).toEqual({});
 
-    fireEvent.change(mode, { target: { value: 'match' } });
-    expect(latest.mcp_payment_triggers).toEqual({ mode: 'match', patterns: [] });
+    fireEvent.click(screen.getByTestId('payment-triggers-mcp-add-pattern-button'));
+    expect(latest.mcp_payment_triggers).toEqual({ mode: 'match', patterns: [''] });
+    fireEvent.change(screen.getByTestId('payment-triggers-mcp-pattern-0'), {
+      target: { value: '^paid_' },
+    });
+    expect(latest.mcp_payment_triggers).toEqual({ mode: 'match', patterns: ['^paid_'] });
+    expect(screen.getByTestId('payment-triggers-mcp-patterns')).toHaveTextContent(
+      'A tool whose name matches a pattern is charged.'
+    );
+  });
 
-    fireEvent.change(mode, { target: { value: 'all' } });
-    expect(latest.mcp_payment_triggers).toEqual({ mode: 'all' });
-    expect(screen.queryByTestId('payment-triggers-mcp-pattern-0')).not.toBeInTheDocument();
+  it('frees the tools a pattern matches once the selection is Free', () => {
+    render(<Harness protocol="mcp" />);
 
-    fireEvent.change(mode, { target: { value: 'exclude' } });
+    fireEvent.click(screen.getByTestId('payment-triggers-mcp-selection-free-button'));
+    expect(latest.mcp_payment_triggers).toEqual({ mode: 'exclude', patterns: [] });
+    expect(screen.getByTestId('payment-triggers-mcp-scope')).toHaveTextContent(
+      'Every tools/call on this surface will require payment.'
+    );
+    fireEvent.click(screen.getByTestId('payment-triggers-mcp-add-pattern-button'));
     fireEvent.change(screen.getByTestId('payment-triggers-mcp-pattern-0'), {
       target: { value: '^free_' },
     });
     expect(latest.mcp_payment_triggers).toEqual({ mode: 'exclude', patterns: ['^free_'] });
+    expect(screen.getByTestId('payment-triggers-mcp-patterns')).toHaveTextContent(
+      'A tool whose name matches a pattern is free.'
+    );
+  });
+
+  it('says a pattern charges a tool while the selection is charged', () => {
+    render(
+      <Harness
+        protocol="mcp"
+        initial={{ mcp_payment_triggers: { mode: 'match', patterns: ['^paid_'] } }}
+      />
+    );
+
+    expect(screen.getByTestId('payment-triggers-mcp-selection-charged-button')).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(screen.getByTestId('payment-triggers-mcp-patterns')).toHaveTextContent(
+      'A tool whose name matches a pattern is charged.'
+    );
   });
 
   it('adds and removes patterns', () => {
@@ -175,8 +209,9 @@ describe('PaymentTriggersEditor — MCP', () => {
     );
 
     expect(screen.getByTestId('payment-triggers-mcp-error')).toHaveTextContent(
-      'At least one tool pattern is required'
+      'Error: No tool is charged:'
     );
+    expect(screen.queryByTestId('payment-triggers-mcp-none-charged')).not.toBeInTheDocument();
   });
 
   it('does not require a pattern when no trigger is set, or for exclude', () => {
@@ -212,12 +247,12 @@ describe('PaymentTriggersEditor — MCP', () => {
     expect(screen.getByTestId('payment-triggers-mcp-scope')).not.toHaveTextContent('No trigger');
   });
 
-  it('disables the triggers while every request is charged', () => {
+  it('offers no charge-every-request switch and keeps the triggers editable', () => {
     render(<Harness protocol="mcp" />);
 
-    fireEvent.click(screen.getByTestId('payment-triggers-require-all'));
-    expect(latest.require_all).toBe(true);
-    expect(screen.getByTestId('payment-triggers-mcp-mode')).toBeDisabled();
+    expect(screen.queryByTestId('payment-triggers-require-all')).not.toBeInTheDocument();
+    expect(screen.getByTestId('payment-triggers-mcp-selection-charged-button')).toBeEnabled();
+    expect(screen.getByTestId('payment-triggers-mcp-add-tool-input')).toBeEnabled();
   });
 });
 

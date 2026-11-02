@@ -1748,7 +1748,8 @@ pub async fn get_trust_recorder_status(
 /// Validate every payment setting on the surface, its variants and its
 /// Transit Points. Local x402/MPP policies, MPP auto-pay and Transit Point
 /// payment policies are refused with `local_payment_unsupported`. Each
-/// `agent_pay` policy must name a connected, user-created Remote gateway and
+/// `agent_pay` policy must name a Remote gateway (either side may have opened
+/// the connection) and
 /// a payment surface whose manifest offers at least one payment point; the
 /// manifest, fetched afresh, replaces `manifest_snapshot`. When the payment
 /// gateway cannot be reached the save goes ahead with a `payment_unverified`
@@ -1760,6 +1761,7 @@ async fn validate_surface_payment_policies(
     stored: Option<&AgentSurface>,
 ) -> Result<Vec<SurfaceWarning>, SurfaceApiError> {
     reject_unsupported_payment_settings(surface)?;
+    reject_fabric_routes_to_payment_gateways(gateway_store, surface).await?;
 
     let mut warnings = Vec::new();
     if let Some(crate::config::agent_surface::PaymentPolicy::AgentPay(policy)) = surface
@@ -1843,8 +1845,10 @@ fn agent_pay_policies_mut(
 static SURFACE_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Re-fetch the manifest of every payment surface an `agent_pay` policy
-/// points at and store a change in what it offers in the policy's
-/// `manifest_snapshot`, logging how the price or payment points drifted. A
+/// points at and store a change in what it offers, or in its points' labels or
+/// logos, in
+/// the policy's `manifest_snapshot`, logging how the price or payment points
+/// drifted. A
 /// manifest that cannot be fetched, or no longer offers a payment point, leaves
 /// the snapshot as it was, and so does one the surface could not be saved
 /// with: the snapshot is stored only if the surface still passes the
@@ -1913,7 +1917,7 @@ async fn refreshed_surface(
                 if policy
                     .manifest_snapshot
                     .as_ref()
-                    .is_some_and(|snapshot| snapshot.offers_same_as(&manifest))
+                    .is_some_and(|snapshot| snapshot.offers_same_as(&manifest) && snapshot.shows_same_as(&manifest))
                 {
                     continue;
                 }
@@ -1988,6 +1992,33 @@ async fn commit_refreshed_surface(
     }
     apply(updated).await;
     true
+}
+
+/// A payment gateway takes payments only; no Target or Transit Point may route to it.
+async fn reject_fabric_routes_to_payment_gateways(
+    gateway_store: Option<&std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    use crate::gateways::GatewayStore;
+
+    let gateway_ids = surface.fabric_gateway_ids();
+    if gateway_ids.is_empty() {
+        return Ok(());
+    }
+    let store = gateway_store.ok_or_else(|| SurfaceApiError::InternalError("Gateway store not initialized".into()))?;
+    for gateway_id in gateway_ids {
+        let gateway = store
+            .get(gateway_id)
+            .await
+            .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load gateway: {e}")))?;
+        if gateway.is_some_and(|gateway| gateway.is_payment_gateway()) {
+            return Err(SurfaceApiError::BadRequestCode(
+                "fabric_route_to_payment_gateway",
+                format!("gateway '{gateway_id}' is a payment gateway and cannot be a fabric:// route"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn reject_unsupported_payment_settings(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
@@ -7850,13 +7881,14 @@ mod validation_tests {
             .await
             .unwrap(),
         );
-        let gateway = Gateway::new_with_creation_type(
+        let mut gateway = Gateway::new_with_creation_type(
             "pay".into(),
             String::new(),
             "did:web:pay.example".into(),
             GatewayType::Remote,
             GatewayCreationType::User,
         );
+        gateway.role = crate::gateways::types::GatewayRole::Payment;
         gateways
             .create(&gateway)
             .await
@@ -7996,6 +8028,46 @@ mod validation_tests {
             .payment_policy
             .clone();
         assert_eq!(serde_json::to_value(&updated).unwrap(), serde_json::to_value(&expected).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_the_logos_a_snapshot_taken_before_them_lacks() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut with_logo = priced(&["x402"], "0.01");
+        with_logo.payment_points[0].logo = Some(crate::gateways::payment_logos::LogoRef {
+            id: "base".into(),
+            media_type: "image/svg+xml".into(),
+            sha256: "a".repeat(64),
+        });
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(with_logo.clone())));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("the logo is stored although the offer did not change");
+        assert_eq!(snapshot_of(&updated), Some(&with_logo));
+
+        let refreshed_again = paid_surface(&stores.gateway, Some(with_logo));
+        assert!(
+            refreshed_surface(&refreshed_again, &stores.gateways, None)
+                .await
+                .is_none(),
+            "an unchanged offer with the same logos is not rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_a_point_agent_pay_renamed() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut renamed = priced(&["x402"], "0.01");
+        renamed.payment_points[0].label = "PayPal".into();
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(renamed.clone())));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("the new label is stored although the offer did not change");
+        assert_eq!(snapshot_of(&updated), Some(&renamed));
     }
 
     #[tokio::test]
@@ -8248,6 +8320,53 @@ mod validation_tests {
             .await
             .unwrap_err();
         assert!(matches!(error, SurfaceApiError::BadRequestCode("payment_manifest_invalid", _)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_surface_cannot_route_to_a_payment_gateway_over_fabric() {
+        let stores = stores().await;
+        let mut surface = base_surface();
+        surface.target.endpoint = format!("fabric://{}/agent", stores.gateway.id);
+        let error = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SurfaceApiError::BadRequestCode("fabric_route_to_payment_gateway", _)), "{error:?}");
+
+        surface.target.endpoint = "fabric://some-peer/agent".into();
+        assert!(
+            validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+                .await
+                .is_ok(),
+            "a route to a peer is unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_pay_policy_naming_a_peer_is_refused() {
+        let stores = stores().await;
+        let mut peer = Gateway::new_with_creation_type(
+            "peer".into(),
+            String::new(),
+            "did:web:peer.example".into(),
+            GatewayType::Remote,
+            GatewayCreationType::User,
+        );
+        peer.id = "routing-peer".into();
+        stores
+            .gateways
+            .create(&peer)
+            .await
+            .unwrap();
+        let mut surface = paid_surface(&peer, None);
+        let error = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+            .await
+            .unwrap_err();
+        match error {
+            SurfaceApiError::BadRequestCode("invalid_payment_policy", message) => {
+                assert!(message.ends_with("gateway 'routing-peer' is not a payment gateway"), "{message}")
+            }
+            other => panic!("expected invalid_payment_policy, got {other:?}"),
+        }
     }
 
     #[tokio::test]

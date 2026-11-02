@@ -86,7 +86,7 @@ const Sidebar: React.FC = () => {
       label: 'Connections',
       icon: 'fa-link',
       path: '/connections',
-      permission: 'gateways.view' as const,
+      permissionsAny: ['gateways.view', 'payment_gateways.view'] as const,
     },
     {
       id: 'integrations',

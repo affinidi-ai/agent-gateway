@@ -1,4 +1,5 @@
 import React from 'react';
+import { formatDateTime, timeAgo } from './stringUtils';
 
 /** Listener-level runtime state (mirrors the backend `ConnectionStatus`). */
 export type RuntimeConnectionStatus = 'connected' | 'reconnecting' | 'failed';
@@ -104,3 +105,28 @@ export const ConnectionHealthBadge: React.FC<ConnectionHealthBadgeProps> = ({
     </span>
   );
 };
+
+interface PeerLastSeenProps {
+  gatewayId: string;
+  /** When a listener of this gateway last heard from the peer gateway. */
+  peerLastSeenAt?: string | null;
+}
+
+/**
+ * When the peer gateway was last heard from (an authenticated message or a
+ * pong), kept apart from our own mediator link: a gateway can be connected to
+ * its mediator while its peer is unreachable.
+ */
+export const PeerLastSeen: React.FC<PeerLastSeenProps> = ({ gatewayId, peerLastSeenAt }) => (
+  <div
+    className="text-muted"
+    style={{ fontSize: '0.7rem' }}
+    data-testid={`gateway-peer-last-seen-${gatewayId}`}
+  >
+    {peerLastSeenAt ? (
+      <span title={formatDateTime(peerLastSeenAt)}>Peer seen {timeAgo(peerLastSeenAt)}</span>
+    ) : (
+      'Peer not heard from since this gateway started'
+    )}
+  </div>
+);

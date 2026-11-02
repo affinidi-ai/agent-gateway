@@ -1,6 +1,58 @@
 branch: feat/agent-pay-int
 changes:
   added:
+    - timestamp: '2026-11-01T00:00:00Z'
+      title: ⭐ Add a Payment Gateways tab and wizard for connecting agent-pay
+      description: >-
+        Connections now has a Payment Gateways tab. Its wizard connects to an agent-pay connection
+        point, waits while agent-pay's administrator approves the connection, and then checks with
+        agent-pay's new `gateway-info` answer that the peer is a payment gateway and what it offers
+        before finishing. Each payment gateway has a page with its payment surfaces, the surfaces
+        that charge through it and a ping. A connected peer can be turned into a payment gateway
+        from the Gateways tab. Payment gateways have their own routes, `/v1/payment-gateways/*`,
+        permissions, `payment_gateways.view|edit|delete`, and appliance limit,
+        `connections.paymentgateways`, so connecting agent-pay no longer uses up a remote gateway
+        slot.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Show when a remote gateway's peer was last heard from
+      description: >-
+        `GET /v1/gateways` now reports `peer_last_seen_at` for a remote gateway: when one of its
+        listeners last received an authenticated message from the peer or a pong to a ping. The
+        Gateways list shows it under the status as "Peer seen <time ago>" or "Peer not heard from
+        since this gateway started", so a gateway whose own mediator link is connected no longer
+        looks healthy while its peer has gone silent.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Select MCP tools from the Target's live list into the trigger patterns
+      description: >-
+        The Payment triggers editor of an MCP surface replaces the match/exclude mode dropdown with
+        one visible pattern list and a switch that says whether the selected tools and patterns are
+        charged or free. Ticking a tool, from a list the Target's tools fill on demand or added by
+        name, adds its exact pattern to the list and unticking removes it; Select all and Clear act
+        on the filtered list, tools a pattern already matches are shown ticked, and selected tools
+        the Target no longer lists are flagged. The saved trigger keeps the `all`, `exclude` and
+        `match` shapes, so existing patterns keep working.
+        `POST /v1/mcp-proxies/discover-tools` now also returns each tool's `description` and, for
+        remote servers, `read_only` from `annotations.readOnlyHint`, and accepts `surface_id` to
+        list a saved MCP surface's own Target under the forward step's egress policy, so a
+        localhost or private-network Target can be discovered without letting callers point
+        discovery at arbitrary internal hosts.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Show agent-pay payment method logos in the Payment manifest preview
+      description: >-
+        agent-pay now names each payment point's logo in the Payment Manifest and sends the
+        logo beside it. The gateway keeps only referenced SVG logos that match their SHA-256 and
+        pass a safety check, stores them by hash, and serves them from
+        `GET /v1/gateways/payment-logos/{sha256}` as inert images; the Payment element's preview
+        shows them next to each method, or a generic icon. The snapshot refresh, a minute after
+        startup and every 15 minutes, also stores a manifest whose point labels or logos changed,
+        so a surface saved before them shows them when it is edited.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Name connected gateways the Payment element leaves out, and check again
+      description: >-
+        The Payment element now names each connected gateway that shares no payment surface
+        with this gateway, so a peer whose agent-pay exposure is missing is no longer silently
+        absent, and Check again reloads the list. `GET /v1/gateways/payment-providers` accepts
+        `force_refresh=true` to ask every peer again instead of reusing the 5-minute cache.
     - timestamp: '2026-10-26T00:00:00Z'
       title: ⭐ Capture held agent-pay payments only after the Target delivers
       description: >-
@@ -86,6 +138,35 @@ changes:
         any other event and every active integration holding one receives it. An appliance-wide
         `payment` integration from an earlier build keeps receiving all of them after the upgrade.
   changed:
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Show the Payments page as one list of payments
+      description: >-
+        The Payments page no longer has Ledger and Audit trail tabs or the outcome chart; it is a
+        single filterable list of payments, with the legacy x402/MPP rows below it while the old
+        endpoints still return any. The payment audit events remain available from
+        `GET /api/admin/payments/audit`.
+    - timestamp: '2026-11-01T00:00:00Z'
+      title: Take payments only through gateways marked as payment gateways
+      description: >-
+        A remote gateway now records whether it is a peer or a payment gateway. An `agent_pay`
+        policy must name a payment gateway, the payment gate refuses with 503 when its gateway is no
+        longer one, the Payment element lists only payment gateways, and a `fabric://` route to a
+        payment gateway is refused on save. At startup every peer an `agent_pay` policy names
+        becomes a payment gateway reaching no local surface, so surfaces that already charge keep
+        charging. Disabling or
+        deleting a gateway is refused with 409 while surfaces take payments through it or it holds
+        unsettled payments, instead of leaving those surfaces and payments stranded.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Share one gateway picker across Managed Agent, Transit Point and Payment
+      description: >-
+        The three Surface Builder panels now pick a gateway and its surface the same way: the
+        same placeholders, a no-gateway panel with Add Gateway opening in a new tab so the canvas
+        is kept, distinct load-failure messages with Retry and Refresh, a saved selection kept
+        visible when its gateway or surface is not listed, surfaces shown with a short id, and
+        one set of test ids. `GET /v1/gateways/payment-providers` now offers any active remote
+        peer with a payment surface, including one that opened the connection itself, and no
+        longer offers a pending or disabled peer. Saving an `agent_pay` policy likewise accepts
+        any Remote gateway instead of refusing one created by approving its connection request.
     - timestamp: '2026-10-26T00:00:00Z'
       title: Write payment ledger money rows and claim keys to disk before forwarding
       description: >-
@@ -209,6 +290,14 @@ changes:
         payment surface or a manifest with no payment point is no longer reused, so a save made
         right after fixing the payment surface is no longer refused.
   fixed:
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Keep a Transit Point's gateway route in step with the picked gateway
+      description: >-
+        Choosing another gateway on a Transit Point routed via Gateway Connection now clears the
+        previous `fabric://` endpoint and its names instead of saving the old route. A surface
+        list from an earlier gateway no longer appears under a later one, an unconnected gateway
+        is reported as such instead of "no Agent Surfaces", and a route saved through the API
+        opens with its gateway and surface selected.
     - timestamp: '2026-10-20T00:00:00Z'
       title: Charge agent_pay surfaces reached over the fabric
       description: >-
@@ -292,6 +381,30 @@ changes:
       description: >-
         A credential claimed for a request is now given back when the circuit breaker opens after the charge, the connection to the Target is refused, or the send over the fabric fails, on the direct Access Point, `fabric://`, MCP proxy and Fabric receive paths. The client can retry the same credential within agent-pay's replay window instead of getting `payment_already_used`. A request that may have reached the Target keeps its credential consumed.
   removed:
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Remove the Charge every request and share email switches from Payment
+      description: >-
+        The Payment element's sidebar no longer offers Charge every request, which stays in the
+        triggers editor, or Share the payer's email with agent-pay. A value already saved for
+        either is kept as it is.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Remove the payment activity panel from the surface page
+      description: >-
+        A surface charging through agent-pay no longer shows its last 24 hours of payment
+        outcomes, its payment gateway's circuit breaker, recent payments and a View payments link
+        above the canvas; its payments stay on the Payments page.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Remove the Payment element's "Only payment connection points" switch
+      description: >-
+        The Surface Builder's Payment element always lists only the connected agent-pay gateways
+        that expose a payment surface, and only their payment surfaces, so a gateway that cannot
+        take payments is never offered.
+    - timestamp: '2026-10-30T00:00:00Z'
+      title: Remove manual surface id entry from the Payment element
+      description: >-
+        The Payment element's payment surface is now chosen only from the surfaces the agent-pay
+        gateway lists. A surface id, or a `$alias` variant, can no longer be typed in; a saved
+        variant stays selected and keeps charging through that variant.
     - timestamp: '2026-10-20T00:00:00Z'
       title: Stop serving the x402 HTTP facilitator and test endpoints
       description: >-
@@ -327,6 +440,21 @@ changes:
       description: >-
         The `mpp.example.json` example is deleted: nothing reads a local MPP configuration.
   security:
+    - timestamp: '2026-11-01T00:00:00Z'
+      title: Keep gateway permissions away from payment gateways
+      description: >-
+        `gateways.*` no longer reaches a payment gateway and `payment_gateways.*` never reaches a
+        peer: each route family answers 404 for the other kind. A new payment gateway, and a peer
+        turned into one, reaches no local surface, and its exposure cannot be widened.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Let a paired connection point's mediator account admit only its peer
+      description: >-
+        A paired Connection Point (OOB responder or acceptor) now sets its mediator account to
+        explicit-allow with only its peer's DID on the access list and anonymous receipt off,
+        instead of admitting every sender. The peer is the secure DID recorded at pairing, else the
+        DID on its gateway record; with neither the account admits no one. Invitation endpoints,
+        pairing temporaries and legacy Connection Points stay open. The periodic account check and
+        the Gateway Ping repair now restore each Connection Point's own ACL rather than opening it.
     - timestamp: '2026-10-21T00:00:00Z'
       title: Strip payment credentials from requests that are not charged
       description: >-

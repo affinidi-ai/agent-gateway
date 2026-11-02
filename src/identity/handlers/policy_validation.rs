@@ -35,12 +35,15 @@ pub fn unsupported_payment_settings(surface: &AgentSurface) -> Vec<String> {
     problems
 }
 
-/// An `agent_pay` policy must name a connected, user-created Remote gateway.
+/// An `agent_pay` policy must name a payment gateway, whichever side opened
+/// the connection: a peer created by approving its connection request
+/// (`creation_type: system`) takes payments like one this gateway connected to.
 pub fn check_payment_gateway(gateway: &crate::gateways::types::Gateway) -> Result<(), String> {
-    if gateway.gateway_type != crate::gateways::types::GatewayType::Remote
-        || gateway.creation_type != crate::gateways::types::GatewayCreationType::User
-    {
-        return Err(format!("payment gateway '{}' is not a user-created Remote gateway", gateway.id));
+    if gateway.gateway_type != crate::gateways::types::GatewayType::Remote {
+        return Err(format!("payment gateway '{}' is not a Remote gateway", gateway.id));
+    }
+    if !gateway.is_payment_gateway() {
+        return Err(format!("gateway '{}' is not a payment gateway", gateway.id));
     }
     Ok(())
 }
@@ -293,23 +296,29 @@ mod tests {
     }
 
     #[test]
-    fn only_user_created_remote_gateways_take_payments() {
+    fn only_payment_gateways_take_payments_whoever_opened_the_connection() {
         let gateway = |gateway_type, creation_type| {
-            Gateway::new_with_creation_type(
+            let mut gateway = Gateway::new_with_creation_type(
                 "gw".into(),
                 String::new(),
                 "did:web:gw".into(),
                 gateway_type,
                 creation_type,
-            )
+            );
+            gateway.role = crate::gateways::types::GatewayRole::Payment;
+            gateway
         };
         assert!(check_payment_gateway(&gateway(GatewayType::Remote, GatewayCreationType::User)).is_ok());
-        let system = gateway(GatewayType::Remote, GatewayCreationType::System);
+        assert!(check_payment_gateway(&gateway(GatewayType::Remote, GatewayCreationType::System)).is_ok());
+        let mut peer = gateway(GatewayType::Remote, GatewayCreationType::User);
+        peer.role = crate::gateways::types::GatewayRole::Peer;
+        assert_eq!(check_payment_gateway(&peer), Err(format!("gateway '{}' is not a payment gateway", peer.id)));
+        let local = gateway(GatewayType::SelfGateway, GatewayCreationType::User);
         assert_eq!(
-            check_payment_gateway(&system),
-            Err(format!("payment gateway '{}' is not a user-created Remote gateway", system.id))
+            check_payment_gateway(&local),
+            Err(format!("payment gateway '{}' is not a Remote gateway", local.id))
         );
-        assert!(check_payment_gateway(&gateway(GatewayType::SelfGateway, GatewayCreationType::User)).is_err());
+        assert!(check_payment_gateway(&gateway(GatewayType::SelfGateway, GatewayCreationType::System)).is_err());
     }
 
     #[test]

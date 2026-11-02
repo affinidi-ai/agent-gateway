@@ -1,5 +1,4 @@
 import React, { useMemo, useState } from 'react';
-import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
@@ -8,13 +7,12 @@ import SearchInput from '../components/shared/SearchInput';
 import InfoBanner from '../components/shared/InfoBanner';
 import { DOCS_URL } from '../config/docs';
 import { PAYMENT_OUTCOMES, type PaymentLedgerRow, type PaymentOutcome } from '../types';
-import PaymentOutcomeChart from './PaymentsPage/PaymentOutcomeChart';
 import PaymentLedgerTable from './PaymentsPage/PaymentLedgerTable';
 import PaymentDetailModal from './PaymentsPage/PaymentDetailModal';
 import LegacyPaymentsTab from './PaymentsPage/LegacyPaymentsTab';
-import PaymentAuditTab from './PaymentsPage/PaymentAuditTab';
 import { OUTCOME_META } from './PaymentsPage/ledger';
 import { usePaymentLedger } from './PaymentsPage/usePaymentLedger';
+import { usePaymentGatewayNames } from './PaymentsPage/usePaymentGatewayNames';
 
 const matchesText = (row: PaymentLedgerRow, needle: string) =>
   [
@@ -34,15 +32,14 @@ const PaymentsPage: React.FC = () => {
   const surfaceId = searchParams.get('surface_id') || undefined;
   const [outcome, setOutcome] = useState<PaymentOutcome | ''>('');
   const [filterText, setFilterText] = useState('');
-  const [bucketSeconds, setBucketSeconds] = useState(900);
   const [detailId, setDetailId] = useState<string | null>(null);
-  const [tab, setTab] = useState<string>('ledger');
-  const [auditTraceId, setAuditTraceId] = useState('');
   const { rows, total, legacyRows, refreshing, stale, error, dismissError, refresh } =
     usePaymentLedger({
       surfaceId,
       outcome,
     });
+
+  const gatewayName = usePaymentGatewayNames();
 
   const needle = filterText.trim().toLowerCase();
   const visibleRows = useMemo(
@@ -50,18 +47,13 @@ const PaymentsPage: React.FC = () => {
     [rows, needle]
   );
 
-  const ledger = (
+  const transactions = (
     <>
-      <PaymentOutcomeChart
-        rows={visibleRows}
-        bucketSeconds={bucketSeconds}
-        onBucketChange={setBucketSeconds}
-      />
       <div className="card shadow mb-4">
         <div className="card-header py-3">
           <h6 className="m-0 font-weight-bold text-primary">
             <i className="fas fa-money-bill-wave me-2" aria-hidden="true" />
-            Payment ledger
+            Payments
             <Badge
               value={visibleRows.length}
               className="ms-2"
@@ -125,7 +117,11 @@ const PaymentsPage: React.FC = () => {
               <p className="mb-0">No payments match your search.</p>
             </div>
           ) : (
-            <PaymentLedgerTable rows={visibleRows} onViewDetails={setDetailId} />
+            <PaymentLedgerTable
+              rows={visibleRows}
+              onViewDetails={setDetailId}
+              gatewayName={gatewayName}
+            />
           )}
         </div>
       </div>
@@ -196,47 +192,14 @@ const PaymentsPage: React.FC = () => {
         </div>
       )}
 
-      <Tabs
-        activeKey={tab}
-        onSelect={key => setTab(key ?? 'ledger')}
-        id="payments-tabs"
-        className="mb-3 custom-channel-tabs"
-      >
-        <Tab eventKey="ledger" title={<span data-testid="payments-ledger-tab">Ledger</span>}>
-          {ledger}
-        </Tab>
-        <Tab eventKey="audit" title={<span data-testid="payments-audit-tab">Audit trail</span>}>
-          {tab === 'audit' && (
-            <PaymentAuditTab
-              surfaceId={surfaceId}
-              traceId={auditTraceId}
-              onTraceIdChange={setAuditTraceId}
-            />
-          )}
-        </Tab>
-        {legacyRows.length > 0 && (
-          <Tab
-            eventKey="legacy"
-            title={
-              <span data-testid="payments-legacy-tab">
-                Legacy x402/MPP <Badge value={legacyRows.length} tone="secondary" size="sm" />
-              </span>
-            }
-          >
-            <LegacyPaymentsTab rows={legacyRows} />
-          </Tab>
-        )}
-      </Tabs>
+      {transactions}
+      {legacyRows.length > 0 && <LegacyPaymentsTab rows={legacyRows} />}
 
       {detailId && (
         <PaymentDetailModal
           paymentId={detailId}
           onClose={() => setDetailId(null)}
-          onShowAudit={traceId => {
-            setAuditTraceId(traceId);
-            setDetailId(null);
-            setTab('audit');
-          }}
+          gatewayName={gatewayName}
         />
       )}
     </div>

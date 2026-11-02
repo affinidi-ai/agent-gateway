@@ -15,9 +15,11 @@ const formatWhen = (row: PaymentLedgerRow) => {
 interface Props {
   rows: PaymentLedgerRow[];
   onViewDetails: (id: string) => void;
+  /** The payment gateway's name for its id. */
+  gatewayName: (id: string) => string;
 }
 
-const PaymentLedgerTable: React.FC<Props> = ({ rows, onViewDetails }) => (
+const PaymentLedgerTable: React.FC<Props> = ({ rows, onViewDetails, gatewayName }) => (
   <div className="table-responsive">
     <table className="table table-sm table-hover mb-0" data-testid="payments-ledger-table">
       <thead>
@@ -73,8 +75,12 @@ const PaymentLedgerTable: React.FC<Props> = ({ rows, onViewDetails }) => (
                   {row.surface_id}
                 </Link>
                 {row.variant && <span className="text-muted small">${row.variant}</span>}
-                <div className="small text-muted" title={row.payment_gateway_id}>
-                  via {row.payment_surface_id}
+                <div
+                  className="small text-muted"
+                  title={row.payment_gateway_id}
+                  data-testid={`payments-gateway-${row.id}`}
+                >
+                  via {row.payment_surface_id} on {gatewayName(row.payment_gateway_id)}
                 </div>
               </td>
               <td>{row.resource ? <code>{row.resource}</code> : '—'}</td>

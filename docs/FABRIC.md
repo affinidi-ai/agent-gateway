@@ -43,6 +43,10 @@ the duration of a callback, avoiding a manager-to-listener-to-manager strong-ref
 Each Connection Point maintains a persistent DIDComm connection through its mediator. The listener
 authenticates, registers the receive ACL, receives encrypted envelopes, decrypts them, and dispatches
 them by DIDComm message type. Applicable messages are persisted and connection metrics are updated.
+The metrics keep, in memory, when the paired peer gateway was last heard from: an authenticated
+message whose sender is the DID on the Connection Point's gateway, or a pong to a gateway ping.
+`GET /v1/gateways` reports the latest per gateway as `peer_last_seen_at`, absent until the peer
+has been heard from since the process started.
 A forwarded G2G request also emits a dashboard `PayloadCaptured` event through the payload-capture
 helper.
 
@@ -251,11 +255,26 @@ Management API: `GET /v1/gateways/{id}` (`gateways.view`) exposes `issuer_did`,
 attested issuer; `POST /v1/gateways/{id}/trusted-issuers` and
 `DELETE /v1/gateways/{id}/trusted-issuers/{issuer_did}` manage operator trust.
 
+## Mediator account ACL
+
+Each listener sets its Connection Point's mediator account ACL on every connect
+(`mediators::utils::apply_inbound_acl`, chosen by `ws_listener::inbound_acl_for`). A paired
+Connection Point (OOB responder or acceptor) admits only its peer: the account is explicit-allow
+with anonymous receipt off, and its access list holds exactly the peer's DID. That DID is the secure
+DID recorded on the Connection Point at pairing (`acceptor_secure_did` or `inviter_secure_did`),
+else the DID on its remote gateway record, because a pairing's gateway record can still carry the
+peer's temporary DID when the listener starts; with neither, the account admits no one. Every other
+Connection Point (an invitation endpoint, a pairing's temporary listener, a legacy one) stays open
+to every sender, since it does not serve a single known peer. The mediator's own replies are not
+subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
+change is logged and the listener continues; the account check below restores it.
+
 ## Runtime health behavior
 
 After a Gateway Ping timeout, the Gateway checks its mediator account. It reauthenticates and
-reregisters if the account has disappeared, or restores the receive list when the account remains
-but its ACL has been reset.
+reregisters if the account has disappeared, or re-applies the Connection Point's ACL when the
+account remains but its access-list mode is not the one that ACL sets (explicit-allow for a paired
+Connection Point, explicit-deny for an open one).
 
 Every connected Connection Point also runs this check on its own account every 30 seconds. A
 mediator can lose accounts while the connections stay open, for example when its store is flushed
@@ -264,7 +283,7 @@ missing account with `e.p.delivery.refused`. Without the periodic check, a gatew
 receives would stay unreachable.
 
 Four Connection Points are checked at a time, so one slow mediator does not hold up the others.
-Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-opening a receive list up to
+Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-applying an ACL up to
 10 seconds; a repair that fails is tried again at the next check and logged at `warn`. An account
 that cannot be read changes nothing. When that happens on consecutive checks it is logged at
 `warn` on the second, then at doubling intervals, so a check that cannot reach its mediator is
@@ -287,6 +306,12 @@ reaches over Fabric ([`Gateway::exposes_surface`](../src/gateways/types.rs)):
 The same check applies to buffered `forward-request` traffic, framed-stream Opens, and the
 `get-channels` capability query, which lists only the surfaces the sender may reach. The tenant rule
 applies on top of every mode.
+
+A payment gateway (`role: payment`) is created with `none`, and turning a peer into one, by hand
+or by the startup migration, sets `none`; its exposure cannot be changed afterwards, because `/v1/gateways/{id}/exposed-surfaces`
+does not act on payment gateways. The `gateway-info` query
+(`https://affinidi.com/atm/client-actions/gateway-info`) asks agent-pay for its summary; this
+gateway, not being a payment gateway, answers one with `{"info": null}`.
 
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
