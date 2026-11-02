@@ -263,7 +263,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Point Target's binding with external consent in `outbound_credentials`
   (`credential-delegation-consent-mode-select`, `credential-delegation-binding-subject`), and asks
   for an agent identity only beside a binding without external consent, since the gateway
-  refuses a presentation of the agent beside one.
+  refuses a presentation of the agent beside one. Beside such a binding it disables **Add
+  credential** (`credential-delegation-add`), with a line saying it is the Target's only binding
+  (`credential-delegation-add-blocked`), and shows no gateway callback URL for it, since its
+  grant arrives through the connect API's own redirect.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent
   editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,

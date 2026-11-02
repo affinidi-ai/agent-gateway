@@ -124,6 +124,14 @@ changes:
         A request that arrives over Fabric for a surface whose Access Point Target is bound by
         external consent is still refused 403, and is now recorded as a request_rejected at
         admission, consent_identity_required, so these refusals appear in the Audit Log.
+    - timestamp: '2026-11-03T10:00:00Z'
+      title: Offer no second credential beside an external consent binding
+      description: >-
+        The Surface Builder's Credential Delegation element disables Add credential while it
+        holds a binding with external consent, which must be the Access Point Target's only
+        binding, and says why, instead of letting a second binding fail on save. It no longer
+        shows the gateway's callback URL for such a binding, whose grant arrives through the
+        connect API's own redirect.
   removed: []
   security:
     - timestamp: '2026-10-29T12:00:00Z'

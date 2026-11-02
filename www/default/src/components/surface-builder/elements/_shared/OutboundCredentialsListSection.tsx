@@ -184,6 +184,8 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
   }, []);
 
   const addRow = () => onChange([...rows, { ...EMPTY_ROW }]);
+  /** A binding with external consent is the Access Point Target's only binding, so none is added beside it. */
+  const holdsExternal = rows.some(r => r.consent_mode === 'external');
 
   const removeRow = (idx: number) => onChange(rows.filter((_, i) => i !== idx));
 
@@ -268,7 +270,7 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
               )}
               {(() => {
                 const selected = providers.find(p => p.id === row.credential_provider_id);
-                if (!selected) return null;
+                if (!selected || readOnly) return null;
                 const cb = selected.callback_url;
                 return (
                   <div className="outbound-credential-callback mt-2 p-2 small">
@@ -504,10 +506,25 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
         );
       })}
 
-      <Button size="sm" variant="outline-primary" onClick={addRow}>
+      <Button
+        size="sm"
+        variant="outline-primary"
+        onClick={addRow}
+        disabled={holdsExternal}
+        data-testid="credential-delegation-add"
+      >
         <i className="fas fa-plus me-1" />
         Add credential
       </Button>
+      {holdsExternal && (
+        <Form.Text
+          className="text-muted d-block mt-1"
+          data-testid="credential-delegation-add-blocked"
+        >
+          A binding with external consent is the Access Point Target&apos;s only binding: remove it
+          to add another.
+        </Form.Text>
+      )}
     </div>
   );
 };
