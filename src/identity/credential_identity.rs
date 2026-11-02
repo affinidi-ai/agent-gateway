@@ -15,8 +15,11 @@
 //!   PEM bytes. Rotating the cert or the secret value keeps the DID stable.
 //!   Re-pointing the channel at a different stored credential produces a
 //!   different DID.
-//! - **Independent of source auth.** The DID is derived from the *stored*
-//!   credential material, not from what the caller presents.
+//! - **Independent of source auth on the Managed Agent slot.** The DID is
+//!   derived from the *stored* credential the slot names, not from what the
+//!   caller presents.
+//!   `FromApiKey` without an `api_key_id` names no stored credential and
+//!   fails with [`CredentialIdentityError::ApiKeyIdMissing`].
 //! - **`Static { did }`** bypasses issuance: the configured DID is used
 //!   verbatim. No identity record is persisted.
 //! - **`Certificate.identity_did = Some(_)`** is honoured as a pre-bound
@@ -163,6 +166,9 @@ pub enum CredentialIdentityError {
     #[error("secret '{0}' not found in secrets store")]
     SecretNotFound(String),
 
+    #[error("from_api_key identity has no api_key_id")]
+    ApiKeyIdMissing,
+
     #[error("invalid static DID: {0}")]
     InvalidStaticDid(String),
 
@@ -202,6 +208,7 @@ impl CredentialIdentityError {
             }
             Self::CertificateNotFound(_)
             | Self::SecretNotFound(_)
+            | Self::ApiKeyIdMissing
             | Self::CertificateDisabled(_)
             | Self::CertificateExpired { .. }
             | Self::CertificateWrongKind { .. }
@@ -223,6 +230,7 @@ impl CredentialIdentityError {
             Self::CertificateWrongKind { .. } => "cert_wrong_kind",
             Self::CertificateParse { .. } => "cert_parse_failed",
             Self::SecretNotFound(_) => "secret_not_found",
+            Self::ApiKeyIdMissing => "api_key_id_missing",
             Self::InvalidStaticDid(_) => "invalid_static_did",
             Self::StoreLookup(_) => "store_lookup_failed",
             Self::JwtClaimsUnavailable => "jwt_claims_unavailable",
@@ -301,10 +309,12 @@ impl CredentialIdentityResolver {
                 .await
                 .map(Some),
 
-            ManagedIdentityConfig::FromApiKey { api_key_id } => self
+            ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) } => self
                 .resolve_api_key(api_key_id, secrets_store)
                 .await
                 .map(Some),
+
+            ManagedIdentityConfig::FromApiKey { api_key_id: None } => Err(CredentialIdentityError::ApiKeyIdMissing),
 
             ManagedIdentityConfig::Static { did } => {
                 validate_did(did).map_err(CredentialIdentityError::InvalidStaticDid)?;
@@ -935,12 +945,25 @@ mod tests {
 
     #[tokio::test]
     async fn from_api_key_requires_store() {
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "k-1".into() };
+        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: Some("k-1".into()) };
         let err = derive_credential_identity(&mi, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, CredentialIdentityError::SecretsStoreUnavailable));
         assert_eq!(err.classify(), CredentialIdentityErrorClass::BackendUnavailable);
+    }
+
+    #[tokio::test]
+    async fn from_api_key_without_id_is_misconfigured() {
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(make_secret("v")));
+        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: None };
+        let err = CredentialIdentityResolver::new()
+            .resolve(&mi, None, Some(&store))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CredentialIdentityError::ApiKeyIdMissing));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+        assert_eq!(err.reason_label(), "api_key_id_missing");
     }
 
     #[tokio::test]
@@ -1055,7 +1078,9 @@ mod tests {
         let secret = make_secret("super-secret-value");
         let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
         let resolver = CredentialIdentityResolver::new();
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "demo-key".into() };
+        let mi = ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("demo-key".into()),
+        };
         let r = resolver
             .resolve(&mi, None, Some(&store))
             .await
@@ -1082,7 +1107,9 @@ mod tests {
     async fn from_api_key_hash_stable_across_secret_value_rotation() {
         // Same api_key_id, different secret value, bumped updated_at → same hash.
         let resolver = CredentialIdentityResolver::new();
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "demo-key".into() };
+        let mi = ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("demo-key".into()),
+        };
 
         let s1 = make_secret("v1");
         let store_a: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(s1));
@@ -1130,7 +1157,7 @@ mod tests {
         let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "user-facing-key".into(),
+            api_key_id: Some("user-facing-key".into()),
         };
 
         let result = resolver
@@ -1159,7 +1186,7 @@ mod tests {
 
         // Confirm that looking up by the internal UUID would NOT resolve:
         let mi_wrong = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "internal-uuid-111".into(),
+            api_key_id: Some("internal-uuid-111".into()),
         };
         let err = resolver
             .resolve(&mi_wrong, None, Some(&store))
@@ -1342,7 +1369,7 @@ mod tests {
     async fn atgk_prefix_bypasses_secrets_store() {
         // atgk_-prefixed IDs must succeed even with no secrets store supplied.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "atgk_abc123def456".into(),
+            api_key_id: Some("atgk_abc123def456".into()),
         };
         let r = derive_credential_identity(&mi, None, None)
             .await
@@ -1372,7 +1399,7 @@ mod tests {
     async fn atgk_hash_stable_across_calls() {
         // Same api_key_id must always produce the same hash within a process.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "atgk_stable_key".into(),
+            api_key_id: Some("atgk_stable_key".into()),
         };
         let resolver = CredentialIdentityResolver::new();
         let h1 = unwrap_derived(
@@ -1401,7 +1428,7 @@ mod tests {
             &resolver
                 .resolve(
                     &ManagedIdentityConfig::FromApiKey {
-                        api_key_id: "atgk_key_a".into(),
+                        api_key_id: Some("atgk_key_a".into()),
                     },
                     None,
                     None,
@@ -1415,7 +1442,7 @@ mod tests {
             &resolver
                 .resolve(
                     &ManagedIdentityConfig::FromApiKey {
-                        api_key_id: "atgk_key_b".into(),
+                        api_key_id: Some("atgk_key_b".into()),
                     },
                     None,
                     None,
@@ -1432,7 +1459,7 @@ mod tests {
     async fn non_atgk_prefix_still_requires_secrets_store() {
         // Non-atgk_ api_key_ids must still go through the secrets store path.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "sk_some-secret-ref".into(),
+            api_key_id: Some("sk_some-secret-ref".into()),
         };
         let err = derive_credential_identity(&mi, None, None)
             .await

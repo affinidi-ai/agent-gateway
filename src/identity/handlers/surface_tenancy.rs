@@ -1569,7 +1569,7 @@ fn collect_managed_identity_reference(
         crate::source_auth::ManagedIdentityConfig::FromMtls { certificate_id } => {
             push_reference(references, ResourceKind::Certificates, certificate_id)
         }
-        crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id }
+        crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) }
             if !api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) =>
         {
             push_reference(references, ResourceKind::Secrets, api_key_id)
