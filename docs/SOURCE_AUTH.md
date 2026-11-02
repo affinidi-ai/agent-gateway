@@ -195,7 +195,7 @@ sequenceDiagram
 | --- | --- | --- |
 | `allowed_dids` | empty | Empty means any DID is accepted, so a surface with it takes no binding with external consent ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point)) |
 | `challenge_ttl_seconds` | 300 | Capped at 3600. A longer challenge widens the replay window. |
-| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. |
+| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. A save above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds. |
 | `allowed_algorithms` | `["EdDSA"]` | The verifier recognises `EdDSA` and `ES256`; a value outside that set is rejected at validation time |
 
 `IAT_SKEW_SECONDS` is 120 ([`verify.rs`](../src/didauth/verify.rs)). A JWS is rejected

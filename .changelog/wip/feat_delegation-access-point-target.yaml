@@ -103,5 +103,6 @@ changes:
         refused at once rather than when the session expires, and a session minted on a variant
         is not taken at the base surface or another variant. session_ttl_seconds is capped at
         86400, the default, and no session authenticates more than 86400 seconds after it was
-        minted, whatever it was stored with.
+        minted, whatever it was stored with. A save above 86400 is refused; a stored surface
+        above it still loads, with a startup warning, so an upgrade never stops the gateway.
   breaking: []
