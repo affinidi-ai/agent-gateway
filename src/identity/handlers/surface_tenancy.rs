@@ -19,9 +19,10 @@ use crate::trust_registries::TrustRegistryStore;
 use super::surfaces::SurfaceApiError;
 
 /// Validates the resources a surface references. A tenant surface may not send an
-/// appliance-wide secret or credential provider upstream or back to its caller: a reference
-/// that breaks that rule is refused unless `stored` (the surface as stored, if any) already
-/// sent it to every destination that it goes to now, and even then when
+/// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
+/// credential of a provider holding a secret outside the provider's tenant: a reference that
+/// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
+/// to every destination that it goes to now, and even then when
 /// `tenant_credential_isolation` is `enforce`.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
@@ -842,7 +843,11 @@ impl ReferenceAuthorizer<'_> {
             tenant_id: self.owner_tenant_id,
             mode: self.rule_for(ResourceKind::CredentialProviders, id),
         };
-        if !resource.usable_by(tenancy) {
+        if !resource.usable_by(tenancy)
+            || self
+                .sends_secret_outside_provider_tenant(&resource, tenancy.mode)
+                .await?
+        {
             return Err(inaccessible("Credential provider"));
         }
         self.ensure(
@@ -851,6 +856,47 @@ impl ReferenceAuthorizer<'_> {
             &resource.id,
             "Credential provider",
         )
+    }
+
+    /// Would a tenant surface send the gateway credential of a provider holding a secret outside
+    /// the provider's tenant, under `mode`, the provider reference's rule on this surface?
+    async fn sends_secret_outside_provider_tenant(
+        &self,
+        provider: &crate::credential_providers::CredentialProvider,
+        mode: RuleMode,
+    ) -> Result<bool, SurfaceApiError> {
+        if self.owner_tenant_id.is_none()
+            || !mode.is_enforced()
+            || !provider
+                .provider_type
+                .sends_gateway_credential()
+        {
+            return Ok(false);
+        }
+        let references = provider.secret_refs();
+        if references.is_empty() {
+            return Ok(false);
+        }
+        let store = self
+            .state
+            .secrets_store
+            .as_ref()
+            .ok_or_else(|| unavailable("Secret"))?;
+        let mut tenants = Vec::with_capacity(references.len());
+        for secret_ref in references {
+            if let Some(secret) = store
+                .get_by_secret_id(secret_ref)
+                .await
+                .map_err(|error| internal("Secret", error))?
+            {
+                tenants.push((secret_ref, secret.tenant_id));
+            }
+        }
+        let secret_tenants = tenants
+            .iter()
+            .map(|(secret_ref, tenant)| (*secret_ref, tenant.as_deref()))
+            .collect();
+        Ok(provider.uses_secret_outside_tenant(&secret_tenants))
     }
 
     async fn mcp_proxy(

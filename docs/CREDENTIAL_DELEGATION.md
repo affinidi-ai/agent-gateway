@@ -71,7 +71,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | | `warn` (default) | `enforce` |
 | --- | --- | --- |
 | Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
-| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params` and JWT issuer, subject and audience unchanged | Saved, except on a provider with an `issuer`, which never keeps a secret outside its own tenant | 400 |
+| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params`, `default_scopes` and JWT issuer, subject and audience unchanged | Saved, except on a provider with an `issuer`, which never keeps a secret outside its own tenant | 400 |
 | `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate in another tenant, before the key is read | The same |
 | Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret is read |
 
@@ -79,7 +79,9 @@ A stored reference is kept only while it goes where it went before. An update th
 of those settings, or moves a stored reference to another field (a client secret becoming the
 signing key, say), treats every such reference as new and answers 400, so a tenant cannot send
 an appliance-wide secret, or an assertion signed with an appliance-wide key, to an endpoint or
-audience of its choosing.
+audience of its choosing. A kept reference pins that destination, `default_scopes` included, but
+not the scopes a surface's Target authentication requests, which replace the default scopes on
+that leg.
 
 In `enforce` mode a service token or API key whose secret is outside the provider's tenant
 reports `SecretUnavailable`, and no token request is sent. A cached service token is checked
@@ -692,6 +694,13 @@ endpoint, moves the reference to another leg, or adds a leg that would send it i
 `400` in `warn` mode too. A tenant reassignment that would create such a reference answers
 `409`, and so does giving a surface whose custom metadata names a missing secret a different
 tenant. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
+
+A tenant provider that sends the gateway's own credential and still holds a secret outside its
+tenant, kept from before in `warn` mode, is held to the same rule on a tenant surface as an
+appliance-wide provider: a save keeps it only on the legs that already sent it at the same
+endpoint, refuses it on a new or redirected leg with `400` "Credential provider reference is not
+accessible", and refuses it everywhere in `enforce` mode. The startup credential policy report
+names such a surface. A provider holding only its own tenant's secrets attaches freely.
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
 `fallback`), and the cause is logged only. A refused legacy binding records

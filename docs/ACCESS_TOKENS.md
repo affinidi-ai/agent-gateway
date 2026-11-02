@@ -156,6 +156,8 @@ may not send the appliance's own credential upstream. An appliance-wide secret u
 appliance-wide `api_key`, client-credentials or JWT bearer credential provider used for Target
 authentication or in `outbound_credentials` or `transit_credentials`, are refused with `400` when
 a save adds them, and a tenant credential provider may not reference an appliance-wide secret.
+A tenant provider of those types that still holds a secret outside its tenant counts as
+appliance-wide on a tenant surface.
 Another tenant's secret is refused in custom metadata as everywhere else, and so is a
 `$SECRET:<id>` that names no existing secret, new or already stored, with the same answer, so a
 surface save never names an id before a secret with it exists and answers a missing secret and

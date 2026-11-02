@@ -15,6 +15,7 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 
 const STORED_SECRET_SURFACE: &str = "stored-secret-surface";
 const STORED_BINDING_SURFACE: &str = "stored-binding-surface";
+const STORED_TENANT_PROVIDER_SURFACE: &str = "stored-tenant-provider-surface";
 const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
 const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface";
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
@@ -383,6 +384,13 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
                 .agent_surfaces,
             STORED_BINDING_SURFACE,
             surface(STORED_BINDING_SURFACE, json!({"outbound_credentials": binding(STORED_PROVIDER)})),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_TENANT_PROVIDER_SURFACE,
+            surface(STORED_TENANT_PROVIDER_SURFACE, json!({"outbound_credentials": binding(STORED_TENANT_PROVIDER)})),
         ),
         (
             &bootstrap
@@ -854,15 +862,20 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_kept_only_wh
     assert_eq!(stored["token_endpoint"], STORED_TOKEN_ENDPOINT, "a refused save leaves the provider as it was");
     assert_eq!(stored["client_secret_secret_ref"], "appliance-client-secret");
 
+    let mut rescoped = stored.clone();
+    rescoped["default_scopes"] = json!(["read", "write"]);
+    assert_provider_refused(
+        api.update_provider(STORED_TENANT_PROVIDER, &rescoped)
+            .await,
+    );
     let mut renamed = stored.clone();
     renamed["name"] = json!("Renamed");
-    renamed["default_scopes"] = json!(["read", "write"]);
     let (status, body) = api
         .update_provider(STORED_TENANT_PROVIDER, &renamed)
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["name"], "Renamed");
-    assert_eq!(body["default_scopes"], json!(["read", "write"]));
+    assert_eq!(body["default_scopes"], json!(["read"]));
     assert_eq!(body["token_endpoint"], STORED_TOKEN_ENDPOINT);
     assert_eq!(body["client_secret_secret_ref"], "appliance-client-secret");
 
@@ -932,6 +945,101 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_refused_when
         )
         .await;
     assert_eq!(status, 200, "{body}");
+}
+
+fn provider_auth(provider_id: &str) -> Value {
+    json!({"method": {"credential_provider": {"provider_id": provider_id}}})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_provider_holding_an_appliance_wide_secret_is_kept_only_on_its_stored_legs_in_warn_mode() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let providers = providers(&api).await;
+
+    let unchanged = api
+        .stored(STORED_TENANT_PROVIDER_SURFACE)
+        .await;
+    assert_saved(
+        api.put(STORED_TENANT_PROVIDER_SURFACE, &unchanged)
+            .await,
+    );
+    assert_a_redirected_leg_is_refused(&api, STORED_TENANT_PROVIDER_SURFACE, NOT_ACCESSIBLE_PROVIDER).await;
+    let mut new_leg = api
+        .stored(STORED_TENANT_PROVIDER_SURFACE)
+        .await;
+    new_leg["transit"]["points"][0]["id"] = json!("partner-replacement-id");
+    assert_refused(
+        api.put(STORED_TENANT_PROVIDER_SURFACE, &new_leg)
+            .await,
+        NOT_ACCESSIBLE_PROVIDER,
+    );
+    let mut new_target_auth = api
+        .stored(STORED_TENANT_PROVIDER_SURFACE)
+        .await;
+    new_target_auth["target"]["auth"] = provider_auth(STORED_TENANT_PROVIDER);
+    assert_saved(
+        api.put(STORED_TENANT_PROVIDER_SURFACE, &new_target_auth)
+            .await,
+    );
+    let mut new_transit_binding = api
+        .stored(STORED_TENANT_PROVIDER_SURFACE)
+        .await;
+    new_transit_binding["transit"]["points"][0]["transit_credentials"] =
+        json!({"credential_provider_id": STORED_TENANT_PROVIDER});
+    assert_saved(
+        api.put(STORED_TENANT_PROVIDER_SURFACE, &new_transit_binding)
+            .await,
+    );
+    assert_renamed_and_reordered_legs_are_kept(&api, STORED_TENANT_PROVIDER_SURFACE).await;
+
+    for extra in [
+        json!({"outbound_credentials": binding(STORED_TENANT_PROVIDER)}),
+        json!({"target_auth": provider_auth(STORED_TENANT_PROVIDER)}),
+    ] {
+        assert_refused(
+            api.create(&api.surface("/smoke/new-tenant-provider-leg", Some("tenant-a"), extra))
+                .await,
+            NOT_ACCESSIBLE_PROVIDER,
+        );
+    }
+    assert_saved(
+        api.create(&api.surface(
+            "/smoke/own-secrets-provider-binding",
+            Some("tenant-a"),
+            json!({"outbound_credentials": binding(&providers.tenant_client_credentials)}),
+        ))
+        .await,
+    );
+    assert_saved(
+        api.create(&api.surface(
+            "/smoke/own-secrets-provider-target-auth",
+            Some("tenant-a"),
+            json!({"target_auth": provider_auth(&providers.tenant_client_credentials)}),
+        ))
+        .await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_provider_holding_an_appliance_wide_secret_is_refused_on_a_stored_surface_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let unchanged = api
+        .stored(STORED_TENANT_PROVIDER_SURFACE)
+        .await;
+    assert_refused(
+        api.put(STORED_TENANT_PROVIDER_SURFACE, &unchanged)
+            .await,
+        NOT_ACCESSIBLE_PROVIDER,
+    );
+    assert_refused(
+        api.create(&api.surface(
+            "/smoke/new-tenant-provider-leg",
+            Some("tenant-a"),
+            json!({"outbound_credentials": binding(STORED_TENANT_PROVIDER)}),
+        ))
+        .await,
+        NOT_ACCESSIBLE_PROVIDER,
+    );
 }
 
 const METADATA_PLACES: [fn(&mut Value, Value); 4] = [

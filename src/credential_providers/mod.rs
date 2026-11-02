@@ -365,8 +365,8 @@ impl CredentialProvider {
 
     /// Each secret reference, paired with whether `previous` held it in the same field while
     /// this provider keeps the type and sends it to the same place: the token and
-    /// authorization endpoints, resource, additional parameters and JWT issuer, subject and
-    /// audience.
+    /// authorization endpoints, resource, additional parameters, default scopes and JWT issuer,
+    /// subject and audience.
     fn secret_refs_kept_from(
         &self,
         previous: Option<&Self>,
@@ -378,6 +378,7 @@ impl CredentialProvider {
                     && self.authorization_endpoint == previous.authorization_endpoint
                     && self.resource == previous.resource
                     && self.additional_params == previous.additional_params
+                    && self.default_scopes == previous.default_scopes
                     && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
                     && self.jwt.jwt_subject == previous.jwt.jwt_subject
                     && self.jwt.jwt_audience == previous.jwt.jwt_audience
@@ -399,6 +400,21 @@ impl CredentialProvider {
         secret_tenant: Option<&str>,
     ) -> bool {
         self.tenant_id.as_deref() != secret_tenant
+    }
+
+    /// Does the provider name a secret outside its own tenant? `secret_tenants` maps a secret id
+    /// to its tenant; a secret missing from it no longer exists and does not count.
+    pub fn uses_secret_outside_tenant(
+        &self,
+        secret_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    ) -> bool {
+        self.secret_refs()
+            .into_iter()
+            .any(|secret_ref| {
+                secret_tenants
+                    .get(secret_ref)
+                    .is_some_and(|tenant| self.secret_is_outside_tenant(*tenant))
+            })
     }
 
     /// Does the provider send the gateway's own credential on a tenant surface from an
@@ -735,7 +751,7 @@ mod tests {
             .jwt_certificate_secret_ref = Some("KEY".into());
         assert_eq!(swapped.secret_refs_kept_from(Some(&stored)), vec![("CERT", false), ("KEY", false)]);
 
-        let redirected: [fn(&mut CredentialProvider); 8] = [
+        let redirected: [fn(&mut CredentialProvider); 9] = [
             |p| p.provider_type = CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
             |p| p.token_endpoint = Some("https://tenant.example/token".into()),
             |p| p.authorization_endpoint = Some("https://tenant.example/authorize".into()),
@@ -747,6 +763,7 @@ mod tests {
             |p| p.jwt.jwt_issuer = Some("tenant".into()),
             |p| p.jwt.jwt_subject = None,
             |p| p.jwt.jwt_audience = Some("https://tenant.example/token".into()),
+            |p| p.default_scopes = vec!["admin".into()],
         ];
         for change in redirected {
             let mut changed = stored.clone();
@@ -798,6 +815,26 @@ mod tests {
             assert_eq!(wide.breaks_tenant_isolation_for(Some("a")), sends_gateway_credential);
             assert!(!wide.breaks_tenant_isolation_for(None));
         }
+    }
+
+    #[test]
+    fn a_provider_uses_a_secret_outside_its_tenant_only_when_a_secret_it_names_lies_elsewhere() {
+        let secret_tenants: std::collections::HashMap<&str, Option<&str>> =
+            [("WIDE", None), ("OWN", Some("a")), ("OTHER", Some("b"))]
+                .into_iter()
+                .collect();
+        let provider = |tenant: Option<&str>, client_secret: &str| {
+            let mut provider = make_provider("p", "p");
+            provider.tenant_id = tenant.map(String::from);
+            provider.client_secret_secret_ref = Some(client_secret.into());
+            provider
+        };
+        assert!(provider(Some("a"), "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(Some("a"), "OTHER").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(None, "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(None, "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "GONE").uses_secret_outside_tenant(&secret_tenants));
     }
 
     #[test]

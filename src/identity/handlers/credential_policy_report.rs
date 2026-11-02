@@ -38,25 +38,10 @@ fn token_endpoint_breaks_https(
             .is_some_and(|endpoint| !egress.permits_token_endpoint(endpoint))
 }
 
-/// Does a provider name a secret outside its own tenant, the check the runtime applies? A
-/// secret that no longer exists is not a breach.
-fn provider_breaks_isolation(
-    provider: &CredentialProvider,
-    secret_tenants: &HashMap<&str, Option<&str>>,
-) -> bool {
-    provider
-        .secret_refs()
-        .into_iter()
-        .any(|secret_ref| {
-            secret_tenants
-                .get(secret_ref)
-                .is_some_and(|tenant| provider.secret_is_outside_tenant(*tenant))
-        })
-}
-
-/// Does a tenant surface send an appliance-wide secret or credential provider upstream?
-/// A reference that no longer resolves is not a breach; a surface whose references cannot be
-/// collected is an error.
+/// Does a tenant surface send an appliance-wide secret or credential provider upstream, or the
+/// gateway credential of a provider holding a secret outside the provider's tenant? A reference
+/// that no longer resolves is not a breach; a surface whose references cannot be collected is an
+/// error.
 fn surface_breaks_isolation(
     surface: &AgentSurface,
     secret_tenants: &HashMap<&str, Option<&str>>,
@@ -71,7 +56,13 @@ fn surface_breaks_isolation(
             ResourceKind::Secrets => reference.same_tenant && secret_tenants.get(reference.id.as_str()) == Some(&None),
             ResourceKind::CredentialProviders => providers
                 .get(reference.id.as_str())
-                .is_some_and(|provider| provider.breaks_tenant_isolation_for(Some(tenant_id))),
+                .is_some_and(|provider| {
+                    provider.breaks_tenant_isolation_for(Some(tenant_id))
+                        || provider
+                            .provider_type
+                            .sends_gateway_credential()
+                            && provider.uses_secret_outside_tenant(secret_tenants)
+                }),
             _ => false,
         }))
 }
@@ -115,7 +106,7 @@ pub(crate) fn find_breaches(
         if token_endpoint_breaks_https(provider, egress) {
             breach(RULE_TOKEN_ENDPOINT_HTTPS);
         }
-        if provider_breaks_isolation(provider, secret_tenants) {
+        if provider.uses_secret_outside_tenant(secret_tenants) {
             breach(RULE_TENANT_CREDENTIAL_ISOLATION);
         }
     }
@@ -327,6 +318,11 @@ mod tests {
         let providers = [
             provider("wide", None, Some("https://idp/token"), None),
             provider("own", Some("t1"), Some("https://idp/token"), None),
+            provider("own-with-wide-secret", Some("t1"), Some("https://idp/token"), Some("S_WIDE")),
+            CredentialProvider {
+                provider_type: CredentialProviderType::OAuth2AuthorizationCode,
+                ..provider("consent-with-wide-secret", Some("t1"), Some("https://idp/token"), Some("S_WIDE"))
+            },
         ];
         let secret_tenants: HashMap<&str, Option<&str>> = [("S_WIDE", None), ("S_OWN", Some("t1"))]
             .into_iter()
@@ -363,6 +359,8 @@ mod tests {
             surface_with(Some("t1"), provider_auth("own")),
             surface_with(None, secret_auth("S_WIDE")),
             surface_with(None, provider_auth("wide")),
+            surface_with(Some("t1"), provider_auth("own-with-wide-secret")),
+            surface_with(Some("t1"), provider_auth("consent-with-wide-secret")),
         ];
         let reported: Vec<bool> = surfaces
             .iter()
@@ -380,7 +378,7 @@ mod tests {
                 .is_empty()
             })
             .collect();
-        assert_eq!(reported, vec![true, false, true, false, false, false]);
+        assert_eq!(reported, vec![true, false, true, false, false, false, true, false]);
         let breach =
             find_breaches(&providers, &surfaces[..1], &secret_tenants, &egress(CredentialPolicyConfig::default()))
                 .breaches
