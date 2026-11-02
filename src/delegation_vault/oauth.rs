@@ -823,10 +823,10 @@ pub(crate) enum TokenPostFailure {
 /// POST `params` to the token endpoint `endpoint` through `client`, asking for
 /// JSON, with `authorization` as the `Authorization` header when one is given,
 /// and read the answer: at most [`MAX_TOKEN_RESPONSE_BYTES`] within
-/// [`TOKEN_REQUEST_TIMEOUT`]. Every token request the gateway sends goes
-/// through it or [`post_token_request_within`], a service token's, a delegated
-/// token's refresh and the code exchange and refresh of external consent; each
-/// caller judges the answer.
+/// [`TOKEN_REQUEST_TIMEOUT`]. The service token requests go through
+/// [`post_token_request_within`] and the code exchange and refresh of external
+/// consent through this function; the legacy delegated refresh and code
+/// exchange read their answers themselves. Each caller judges the answer.
 pub(crate) async fn post_token_request(
     client: &reqwest::Client,
     endpoint: &str,
