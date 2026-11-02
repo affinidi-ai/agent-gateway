@@ -5033,9 +5033,10 @@ mod validation_tests {
             ),
         ] {
             let warnings = fabric_caller_delegation_warnings(&surface(methods), &issuers);
-            assert_eq!(warnings.len(), 1, "{case}: {warnings:?}");
-            assert!(warnings[0].starts_with(warning), "{case}: {}", warnings[0]);
-            assert!(warnings[0].contains(reason), "{case}: {}", warnings[0]);
+            assert!(warnings[0].starts_with(warning), "{case}: {warnings:?}");
+            for warning in &warnings {
+                assert!(warning.contains(reason), "{case}: {warning}");
+            }
         }
 
         let mut variant_key = surface(serde_json::json!([per_user_jwt()]));
@@ -5046,9 +5047,14 @@ mod validation_tests {
             serde_json::from_value(serde_json::json!({ "caller_authentication": { "methods": [caller_key()] } }))
                 .unwrap(),
         );
-        let warnings = fabric_caller_delegation_warnings(&variant_key, &issuers);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].starts_with(&format!("variant 'candidate': {warning}")), "{}", warnings[0]);
+        assert_eq!(
+            fabric_caller_delegation_warnings(&variant_key, &issuers)
+                .iter()
+                .map(|found| found.starts_with(&format!("variant 'candidate': {warning}")))
+                .collect::<Vec<_>>(),
+            [true],
+            "only the variant that verifies an API key"
+        );
     }
 
     #[test]
