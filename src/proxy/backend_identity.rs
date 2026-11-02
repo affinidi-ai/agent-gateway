@@ -542,6 +542,15 @@ pub async fn resolve_agent_identity_for_slot(
                         Ok(_) => {}
                         Err(e) => {
                             warn!(channel = channel_name, error = %e, "Failed to take over the legacy inbound API key identity");
+                            crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                                channel_name,
+                                mode_label,
+                                "identity_origin_unavailable",
+                                started
+                                    .elapsed()
+                                    .as_secs_f64(),
+                            );
+                            return Err(IdentityResolutionError::IdentityBackendUnavailable(e.to_string()));
                         }
                     }
                 }
@@ -1380,6 +1389,56 @@ mod tests {
                 .get()
         };
         assert_eq!(count("legacy_role_restamped"), 1);
+        assert_eq!(count("role_clash"), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_api_key_whose_takeover_cannot_be_recorded_is_unavailable() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
+            crate::identity::test_helpers::OriginFailingIdentityStore(
+                crate::identity::test_helpers::MockIdentityStore::new(),
+            ),
+        ))
+        .await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_bi_unrecordable", true, None)
+            .await
+            .unwrap();
+        issuer
+            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+            .await
+            .unwrap();
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_unrecordable".to_string()),
+        };
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(legacy_key.clone());
+        surface.identity_slots.inbound = Some(legacy_key);
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-takeover-unavailable",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        let err = resolved.unwrap_err();
+        assert!(matches!(err, IdentityResolutionError::IdentityBackendUnavailable(_)), "{err:?}");
+        assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let count = |result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["bi-takeover-unavailable", "from_api_key", result])
+                .get()
+        };
+        assert_eq!(count("identity_origin_unavailable"), 1);
         assert_eq!(count("role_clash"), 0);
     }
 

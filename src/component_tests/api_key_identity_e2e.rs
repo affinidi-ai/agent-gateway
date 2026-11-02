@@ -927,9 +927,14 @@ async fn a_caller_record_of_the_managed_agent_key_is_refused_without_the_legacy_
 
 const LEGACY_SAVED_KEY_ID: &str = "atgk_e2e0000000000000000000000000079";
 
-/// A gateway with surface `surface_id` stored as an older build saved it, its
-/// inbound slot naming its Managed Agent key when `stored_inbound_id`, and that
-/// key's legacy caller record.
+/// The name of a stored legacy surface, which differs from its id.
+fn legacy_surface_name(surface_id: &str) -> String {
+    format!("{surface_id}-name")
+}
+
+/// A gateway with surface `surface_id`, named [`legacy_surface_name`], stored as
+/// an older build saved it, its inbound slot naming its Managed Agent key when
+/// `stored_inbound_id`, and that key's legacy caller record.
 async fn start_with_stored_legacy_dual_role_surface(
     surface_id: &'static str,
     stored_inbound_id: bool,
@@ -955,7 +960,7 @@ async fn start_with_stored_legacy_dual_role_surface(
             serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
         let stored = json!({
             "surface_id": surface_id,
-            "name": surface_id,
+            "name": legacy_surface_name(surface_id),
             "access_point": {
                 "listen_address": gateway["listeners"][0]["external_urls"][0],
                 "route": "/legacy",
@@ -1010,9 +1015,11 @@ async fn assert_legacy_dual_role_taken_over(
 
 /// Saving a stored surface whose inbound slot still names its Managed Agent key
 /// takes over that key's caller record and saves the surface without the id.
+/// The takeover counts under the surface name, not its id.
 #[tokio::test(flavor = "multi_thread")]
 async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id() {
     const SURFACE: &str = "legacy-dual-role-save";
+    let name = legacy_surface_name(SURFACE);
     let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(SURFACE, true, None).await;
     let surface_url = format!("{}/api/v1/surfaces/{SURFACE}", h.gateway_base);
     let mut body: serde_json::Value = admin
@@ -1023,8 +1030,10 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
         .json()
         .await
         .unwrap();
+    assert_eq!(body["name"], name.as_str());
     body["identity_slots"]["inbound"] = json!({ "type": "from_api_key" });
-    let restamped_before = resolve_count(SURFACE, "legacy_role_restamped");
+    let restamped_before = resolve_count(&name, "legacy_role_restamped");
+    let restamped_by_id_before = resolve_count(SURFACE, "legacy_role_restamped");
 
     let saved = admin
         .put(&surface_url)
@@ -1042,7 +1051,8 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
     assert_eq!(again.status(), 200);
 
     assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
-    assert_eq!(resolve_count(SURFACE, "legacy_role_restamped") - restamped_before, 1);
+    assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
+    assert_eq!(resolve_count(SURFACE, "legacy_role_restamped") - restamped_by_id_before, 0);
 }
 
 /// Reassigning the tenant of a stored surface whose inbound slot still names
@@ -1050,8 +1060,9 @@ async fn saving_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id()
 #[tokio::test(flavor = "multi_thread")]
 async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the_id() {
     const SURFACE: &str = "legacy-dual-role-reassign";
+    let name = legacy_surface_name(SURFACE);
     let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(SURFACE, true, None).await;
-    let restamped_before = resolve_count(SURFACE, "legacy_role_restamped");
+    let restamped_before = resolve_count(&name, "legacy_role_restamped");
 
     let reassigned = admin
         .put(format!("{}/api/v1/tenant-ownership/surfaces/{SURFACE}", h.gateway_base))
@@ -1070,7 +1081,88 @@ async fn reassigning_a_legacy_dual_role_surface_takes_over_the_key_and_drops_the
     );
 
     assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, SURFACE).await;
-    assert_eq!(resolve_count(SURFACE, "legacy_role_restamped") - restamped_before, 1);
+    assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1);
+}
+
+/// Replace the record file of `key_id` with a directory of the same name, so the
+/// running gateway still reads the record from its cache but cannot write it.
+/// Returns the path and the bytes [`restore_record_file`] puts back.
+fn block_record_writes(
+    identities_dir: &str,
+    key_id: &str,
+) -> (std::path::PathBuf, Vec<u8>) {
+    let hash = api_key_identity_hash(key_id);
+    let path = [".json", ".json.enc"]
+        .iter()
+        .map(|extension| std::path::Path::new(identities_dir).join(format!("{hash}{extension}")))
+        .find(|path| path.is_file())
+        .expect("the record file");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    (path, bytes)
+}
+
+fn restore_record_file((path, bytes): (std::path::PathBuf, Vec<u8>)) {
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+}
+
+/// A save or tenant reassignment whose takeover the identity store cannot
+/// write answers 503, keeps the stored inbound id and leaves the record a
+/// caller's, so a retry once the store recovers takes the record over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_the_identity_store_cannot_write_refuses_the_save_and_keeps_the_id() {
+    for (surface_id, reassign) in
+        [("legacy-dual-role-save-unwritable", false), ("legacy-dual-role-reassign-unwritable", true)]
+    {
+        let name = legacy_surface_name(surface_id);
+        let (h, admin, identities_dir) = start_with_stored_legacy_dual_role_surface(surface_id, true, None).await;
+        let surface_url = format!("{}/api/v1/surfaces/{surface_id}", h.gateway_base);
+        let tenant_url = format!("{}/api/v1/tenant-ownership/surfaces/{surface_id}", h.gateway_base);
+        let stored = || async {
+            admin
+                .get(&surface_url)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        let mut body = stored().await;
+        assert_eq!(body["identity_slots"]["inbound"]["api_key_id"], LEGACY_SAVED_KEY_ID, "{surface_id}");
+        body["identity_slots"]["inbound"] = json!({ "type": "from_api_key" });
+        let send = || {
+            if reassign {
+                admin
+                    .put(&tenant_url)
+                    .json(&json!({ "tenant_id": "tenant-a" }))
+            } else {
+                admin
+                    .put(&surface_url)
+                    .json(&body)
+            }
+        };
+        let restamped_before = resolve_count(&name, "legacy_role_restamped");
+        let blocked = block_record_writes(&identities_dir, LEGACY_SAVED_KEY_ID);
+
+        let refused = send().send().await.unwrap();
+
+        assert_eq!(refused.status(), 503, "{surface_id}: {}", refused.text().await.unwrap());
+        assert_eq!(stored().await["identity_slots"]["inbound"]["api_key_id"], LEGACY_SAVED_KEY_ID, "{surface_id}");
+        restore_record_file(blocked);
+        let records = identity_records(&identities_dir);
+        let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
+        assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller), "{surface_id}");
+        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 0, "{surface_id}");
+
+        let retried = send().send().await.unwrap();
+
+        assert_eq!(retried.status(), 200, "{surface_id}: {}", retried.text().await.unwrap());
+        assert_legacy_dual_role_taken_over(&h, &admin, &identities_dir, surface_id).await;
+        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 1, "{surface_id}");
+    }
 }
 
 /// A save leaves the Managed Agent key's caller record alone when the key is
@@ -1095,8 +1187,9 @@ async fn a_save_takes_over_only_a_record_the_stored_surface_alone_named() {
             .await
             .unwrap();
         body["identity_slots"]["inbound"] = json!({ "type": "from_api_key", "api_key_id": LEGACY_SAVED_KEY_ID });
-        let restamped_before = resolve_count(surface_id, "legacy_role_restamped");
-        let clashes_before = resolve_count(surface_id, "role_clash");
+        let name = legacy_surface_name(surface_id);
+        let restamped_before = resolve_count(&name, "legacy_role_restamped");
+        let clashes_before = resolve_count(&name, "role_clash");
 
         let saved = admin
             .put(&surface_url)
@@ -1109,8 +1202,8 @@ async fn a_save_takes_over_only_a_record_the_stored_surface_alone_named() {
         let records = identity_records(&identities_dir);
         let record = record_for_hash(&records, &api_key_identity_hash(LEGACY_SAVED_KEY_ID)).expect("the caller record");
         assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller), "{surface_id}");
-        assert_eq!(resolve_count(surface_id, "legacy_role_restamped") - restamped_before, 0, "{surface_id}");
-        assert_eq!(resolve_count(surface_id, "role_clash") - clashes_before, clashes, "{surface_id}");
+        assert_eq!(resolve_count(&name, "legacy_role_restamped") - restamped_before, 0, "{surface_id}");
+        assert_eq!(resolve_count(&name, "role_clash") - clashes_before, clashes, "{surface_id}");
     }
 }
 

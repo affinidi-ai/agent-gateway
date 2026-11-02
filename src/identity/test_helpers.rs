@@ -182,12 +182,12 @@ impl IdentityStore for MockIdentityStore {
         &self,
         identity_hash: &str,
         surface_id: &str,
-        from: IdentityOrigin,
+        from: Option<IdentityOrigin>,
         to: IdentityOrigin,
     ) -> Result<bool> {
         let mut records = self.records.write().await;
         match records.get_mut(identity_hash) {
-            Some(record) if record.origin == Some(from) && record.used_only_by(surface_id) => {
+            Some(record) if record.origin == from && record.used_only_by(surface_id) => {
                 record.origin = Some(to);
                 Ok(true)
             }
@@ -259,6 +259,16 @@ impl IdentityStore for OriginFailingIdentityStore {
         _identity_hash: &str,
         _origin: IdentityOrigin,
     ) -> Result<Option<IdentityOrigin>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn replace_origin(
+        &self,
+        _identity_hash: &str,
+        _surface_id: &str,
+        _from: Option<IdentityOrigin>,
+        _to: IdentityOrigin,
+    ) -> Result<bool> {
         Err(anyhow::anyhow!(Self::DETAIL))
     }
 }

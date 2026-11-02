@@ -547,7 +547,7 @@ impl IdentityStore for FilesystemIdentityStore {
         &self,
         identity_hash: &str,
         surface_id: &str,
-        from: IdentityOrigin,
+        from: Option<IdentityOrigin>,
         to: IdentityOrigin,
     ) -> Result<bool> {
         let _guard = self
@@ -561,7 +561,7 @@ impl IdentityStore for FilesystemIdentityStore {
         else {
             return Ok(false);
         };
-        if record.origin != Some(from) || !record.used_only_by(surface_id) {
+        if record.origin != from || !record.used_only_by(surface_id) {
             return Ok(false);
         }
         record.origin = Some(to);
@@ -960,7 +960,7 @@ mod tests {
             let store = &store;
             async move {
                 store
-                    .replace_origin(hash, "s1", IdentityOrigin::ExternalCaller, IdentityOrigin::Managed)
+                    .replace_origin(hash, "s1", Some(IdentityOrigin::ExternalCaller), IdentityOrigin::Managed)
                     .await
                     .unwrap()
             }
@@ -987,6 +987,13 @@ mod tests {
         assert_eq!(origin_of("caller").await, Some(IdentityOrigin::Managed));
         assert_eq!(origin_of("unset").await, None);
         assert_eq!(origin_of("shared").await, Some(IdentityOrigin::ExternalCaller));
+
+        let from_none = store
+            .replace_origin("unset", "s1", None, IdentityOrigin::Managed)
+            .await
+            .unwrap();
+        assert!(from_none);
+        assert_eq!(origin_of("unset").await, Some(IdentityOrigin::Managed));
     }
 
     /// Races `write` against `set_origin(Managed)` on fresh origin-less local

@@ -852,19 +852,25 @@ API key for the role that was refused.
 
 A surface can still store an inbound `api_key_id` that its inbound slot resolved as a caller.
 When that key is also the surface's Managed Agent key (protected slot) or a Transit Point's
-`managed_identity` key, the Managed Agent takes over the key's caller record once: the role
-becomes Managed and the DID is kept. The takeover runs when the Managed Agent's response or the
-Transit Point's outbound request resolves the key, and when the surface or a variant is saved or
-the surface is reassigned to another tenant. It applies only while no other surface has used
-the record; a record with no recorded surface counts as this surface's. Otherwise the record
-stays a caller's, the save still drops the stored id, and the Managed Agent is refused with
-`role_clash`. Each takeover counts as `legacy_role_restamped`. A save or reassignment answers
-`503`, and keeps the stored id so it can be retried, when the identity store or the secrets
-store fails during the takeover.
+`managed_identity` key, the Managed Agent takes over the key's caller record, or a record of
+the key with no role, once: the role becomes Managed and the DID is kept. The takeover runs
+when the Managed Agent's response or the Transit Point's outbound request resolves the key, and
+when the surface or a variant is saved or the surface is reassigned to another tenant. It
+applies only while no other surface has used the record; a record with no recorded surface
+counts as this surface's. Otherwise a caller record stays a caller's, the save still drops the
+stored id, and the Managed Agent is refused with `role_clash`; a record with no role is left
+as it is. Each takeover counts as `legacy_role_restamped`. When the identity store fails during
+the takeover, the request answers `503` (`identity_origin_unavailable`). A save or reassignment
+answers `503`, and keeps the stored id so it can be retried, when the identity store or the
+secrets store fails during the takeover.
 
 After an upgrade, find the affected surfaces through
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
-`api_key_unavailable` or `role_clash`.
+`api_key_unavailable` or `role_clash`. Its `channel_id` label is the surface name on the caller
+path, the Managed Agent fallback, the Managed Agent's response, a save and a reassignment, and
+the surface ID on a Transit Point's outbound request. A save-time takeover of a Transit Point
+key therefore counts under the surface name, and that key's outbound requests under the
+surface ID.
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`:
@@ -878,10 +884,12 @@ Request-time refusals return a fixed body and log the cause server-side. Each co
 | No VC issuer is configured | `500` | `vc_issuer_missing` |
 | DID issuance fails | `502` | `vc_issuer_error` |
 | The key's identity record has no role and the role cannot be recorded | `503` | `identity_origin_unavailable` |
+| The identity store fails during the takeover of a legacy inbound key | `503` | `identity_origin_unavailable` |
 | The key already identifies the other role: a Managed Agent for a caller key, a caller for a Managed Agent or Transit Point key | `500` | `role_clash` |
 
-The last two rows apply on the caller path, the Managed Agent fallback above, the Managed
-Agent's response and a Transit Point's outbound request.
+The no-role and role rows apply on the caller path, the Managed Agent fallback above, the
+Managed Agent's response and a Transit Point's outbound request. The takeover row applies on
+the Managed Agent's response and a Transit Point's outbound request, where the takeover runs.
 
 ### `from_jwt_claim`
 

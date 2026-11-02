@@ -968,7 +968,7 @@ async fn persist_tenant_id(
                     super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
                     other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
                 })?;
-            super::surfaces::take_over_legacy_inbound_api_keys(state, id, &legacy_api_key_ids)
+            super::surfaces::take_over_legacy_inbound_api_keys(state, &resource, &legacy_api_key_ids)
                 .await
                 .map_err(OwnershipApiError::Unavailable)?;
             let allowlist = crate::egress::bdd_egress_allowlist();

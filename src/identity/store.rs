@@ -75,14 +75,14 @@ pub trait IdentityStore: Send + Sync {
         Ok(None)
     }
 
-    /// Change the record's origin from `from` to `to`, only from `from` and only
-    /// while no surface other than `surface_id` has used the record. Returns
-    /// whether the origin changed.
+    /// Change the record's origin from `from` (`None`: no origin) to `to`, only
+    /// from `from` and only while no surface other than `surface_id` has used
+    /// the record. Returns whether the origin changed.
     async fn replace_origin(
         &self,
         _identity_hash: &str,
         _surface_id: &str,
-        _from: filesystem::IdentityOrigin,
+        _from: Option<filesystem::IdentityOrigin>,
         _to: filesystem::IdentityOrigin,
     ) -> Result<bool> {
         anyhow::bail!("this identity store cannot change an identity origin")

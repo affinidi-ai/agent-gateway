@@ -244,15 +244,17 @@ fn legacy_takeover_unavailable(detail: String) -> SurfaceApiError {
 }
 
 /// Re-stamp as managed, once, each API key identity in `api_key_ids` that the
-/// inbound slot of `surface_id` recorded as a caller. Errors when the identity
+/// inbound slot of `surface` recorded as a caller. Errors when the identity
 /// store or a key's secret cannot be read, so the save keeps the stored id the
-/// runtime takeover reads.
+/// runtime takeover reads. Outcomes are counted under the surface name, as the
+/// request path counts them.
 pub(crate) async fn take_over_legacy_inbound_api_keys(
     state: &IdentityApiState,
-    surface_id: &str,
+    surface: &AgentSurface,
     api_key_ids: &[String],
 ) -> Result<(), String> {
     use crate::identity::LegacyCallerTakeover;
+    let surface_id = surface.surface_id.as_str();
     for api_key_id in api_key_ids {
         let started = std::time::Instant::now();
         let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
@@ -293,7 +295,7 @@ pub(crate) async fn take_over_legacy_inbound_api_keys(
             LegacyCallerTakeover::NotApplicable => continue,
         };
         crate::metrics::backends::prometheus::track_managed_identity_resolve(
-            surface_id,
+            &surface.name,
             "from_api_key",
             result,
             started
@@ -3552,7 +3554,7 @@ async fn validate_and_save_surface(
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
     if let Some(stored) = existing {
-        take_over_legacy_inbound_api_keys(state, &surface.surface_id, &legacy_inbound_api_key_ids(stored, &surface))
+        take_over_legacy_inbound_api_keys(state, &surface, &legacy_inbound_api_key_ids(stored, &surface))
             .await
             .map_err(legacy_takeover_unavailable)?;
     }

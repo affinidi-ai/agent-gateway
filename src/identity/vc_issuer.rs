@@ -1002,10 +1002,11 @@ impl VCIssuer {
         }
     }
 
-    /// Turn the API key identity `identity_hash` from an External Caller into
-    /// the Managed Agent of `surface_id`. Only for a key the surface's inbound
-    /// slot named when that slot resolved its stored key as a caller, and only
-    /// while no other surface has used the record.
+    /// Turn the API key identity `identity_hash` from an External Caller, or
+    /// from a record with no role, into the Managed Agent of `surface_id`. Only
+    /// for a key the surface's inbound slot named when that slot resolved its
+    /// stored key as a caller, and only while no other surface has used the
+    /// record.
     pub async fn take_over_legacy_caller_api_key(
         &self,
         identity_hash: &str,
@@ -1018,16 +1019,21 @@ impl VCIssuer {
         else {
             return Ok(LegacyCallerTakeover::NotApplicable);
         };
-        if record.origin != Some(IdentityOrigin::ExternalCaller) || !is_api_key_identity(&record.identity_fields) {
+        if !matches!(record.origin, None | Some(IdentityOrigin::ExternalCaller))
+            || !is_api_key_identity(&record.identity_fields)
+        {
             return Ok(LegacyCallerTakeover::NotApplicable);
         }
         if !record.used_only_by(surface_id) {
+            if record.origin.is_none() {
+                return Ok(LegacyCallerTakeover::NotApplicable);
+            }
             warn!(surface_id, did = %record.did, "API key identity is a caller of another surface — not taken over");
             return Ok(LegacyCallerTakeover::SharedWithAnotherSurface);
         }
         if !self
             .identity_store
-            .replace_origin(identity_hash, surface_id, IdentityOrigin::ExternalCaller, IdentityOrigin::Managed)
+            .replace_origin(identity_hash, surface_id, record.origin, IdentityOrigin::Managed)
             .await?
         {
             return Ok(LegacyCallerTakeover::NotApplicable);
@@ -1035,7 +1041,7 @@ impl VCIssuer {
         warn!(
             surface_id,
             did = %record.did,
-            "API key identity the inbound slot stamped as a caller now identifies the surface's Managed Agent"
+            "Legacy API key identity of the inbound slot now identifies the surface's Managed Agent"
         );
         Ok(LegacyCallerTakeover::TakenOver)
     }
@@ -3420,6 +3426,49 @@ mod tests {
             assert_eq!(outcome, LegacyCallerTakeover::SharedWithAnotherSurface);
             let records = records_for(&f.issuer, "atgk_shared").await;
             assert_eq!(records[0].origin, Some(IdentityOrigin::ExternalCaller));
+        }
+
+        #[tokio::test]
+        async fn an_api_key_record_with_no_role_is_taken_over_only_when_this_surface_alone_used_it() {
+            let f = fixture().await;
+            let surfaces_by_key: [(&str, &[&str]); 2] = [
+                ("atgk_roleless", &["legacy-surface"]),
+                ("atgk_roleless_shared", &["legacy-surface", "other-surface"]),
+            ];
+            let mut dids = HashMap::new();
+            for (key_id, surfaces) in &surfaces_by_key {
+                for surface in surfaces.iter() {
+                    let issued = f
+                        .issuer
+                        .issue_or_get_credential(
+                            api_key_fields(key_id),
+                            Some(format!("hash-{key_id}")),
+                            Some((*surface).into()),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    dids.insert(*key_id, issued.did);
+                }
+                assert_eq!(records_for(&f.issuer, key_id).await[0].origin, None, "{key_id}");
+            }
+
+            let mut outcomes = Vec::new();
+            for (key_id, _) in &surfaces_by_key {
+                outcomes.push(
+                    f.issuer
+                        .take_over_legacy_caller_api_key(&format!("hash-{key_id}"), "legacy-surface")
+                        .await
+                        .unwrap(),
+                );
+            }
+
+            assert_eq!(outcomes, [LegacyCallerTakeover::TakenOver, LegacyCallerTakeover::NotApplicable]);
+            let taken_over = records_for(&f.issuer, "atgk_roleless").await;
+            assert_eq!(taken_over[0].origin, Some(IdentityOrigin::Managed));
+            assert_eq!(taken_over[0].did, dids["atgk_roleless"]);
+            let shared = records_for(&f.issuer, "atgk_roleless_shared").await;
+            assert_eq!(shared[0].origin, None);
         }
 
         #[tokio::test]

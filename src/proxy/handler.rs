@@ -22091,6 +22091,13 @@ allow if {
             assert_eq!(agent.did, None);
 
             let mut agent = asserted_agent();
+            agent.did = None;
+            agent.provider_did = Some("did:web:provider.example".into());
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            assert_eq!(agent.did, None);
+            assert_eq!(agent.provider_did, None);
+
+            let mut agent = asserted_agent();
             super::super::bind_api_key_caller_did(
                 &api_key,
                 "GET",

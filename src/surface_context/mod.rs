@@ -536,10 +536,10 @@ pub struct AgentContext {
 impl AgentContext {
     /// Make `did` the gateway-resolved caller DID, replacing any DID the
     /// request body asserted, or clear it when no caller identity was
-    /// resolved. When the DID changes, everything the body asserted or the
-    /// gateway verified about the previous DID (trust registry, provider,
-    /// authority, issuer, Agent DNA and trust verification) is dropped, so
-    /// the caller cannot choose them for the resolved DID.
+    /// resolved. When the DID changes or no caller identity was resolved,
+    /// everything the body asserted or the gateway verified about the previous
+    /// DID (trust registry, provider, authority, issuer, Agent DNA and trust
+    /// verification) is dropped, so the caller cannot choose them.
     pub fn bind_caller_did(
         &mut self,
         extension_identity: Option<&ExtensionIdentityContext>,
@@ -552,7 +552,7 @@ impl AgentContext {
         let resolved_did = resolved
             .as_ref()
             .map(|(did, _)| did.as_str());
-        if self.did.as_deref() != resolved_did {
+        if resolved_did.is_none() || self.did.as_deref() != resolved_did {
             self.trust_verification = None;
             self.source_trust_verification = None;
             self.target_trust_verification = None;
@@ -1934,21 +1934,16 @@ allow if {
     }
 
     #[test]
-    fn bind_caller_did_keeps_what_the_body_asserted_when_no_did_is_named_or_resolved() {
+    fn bind_caller_did_drops_what_the_body_asserted_when_no_did_is_named_or_resolved() {
         let mut agent = agent_with_body_assertions("did:web:unused.example");
         agent.did = None;
 
         agent.bind_caller_did(None);
 
         assert_eq!(agent.did, None);
-        assert_eq!(
-            agent
-                .trust_registry_did
-                .as_deref(),
-            Some("did:web:registry.example")
-        );
-        assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
-        assert_eq!(agent.authority_did.as_deref(), Some("did:web:authority.example"));
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, None);
+        assert_body_assertions_dropped(&agent);
     }
 
     #[test]

@@ -310,9 +310,10 @@ receive does not read this mode; the request body sets the caller there (see
   `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
   preset that reads `input.agent.provider_did` therefore denies unless the body
   asserts the key's own DID.
-- With no caller identity, such as after a failed key, `input.agent.did` is absent.
+- With no caller identity, such as after a failed key, `input.agent.did` is absent and
+  those trust-registry claims are always dropped.
 - Gateway and global policy run before the key resolves, so they see no
-  `input.agent.did` on these surfaces.
+  `input.agent.did` and none of those claims on these surfaces.
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries
