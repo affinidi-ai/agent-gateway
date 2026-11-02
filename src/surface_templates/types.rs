@@ -167,12 +167,16 @@ impl StorableEntity for SurfaceTemplate {
     /// Points, as a stored surface's is, and a `transit_token_mode: reference` in it
     /// is rewritten to `embedded`, with the warning a stored surface gets.
     fn migrate_raw_json(value: &mut serde_json::Value) -> anyhow::Result<bool> {
+        let template_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         Ok(value
             .get_mut("surface")
             .is_some_and(|surface| {
                 let split = crate::config::agent_surface::split_template_target_trust_checks(surface);
                 let marked = crate::config::agent_surface::mark_transit_point_source_auth(surface);
-                crate::config::agent_surface::warn_inert_transit_settings(surface);
+                crate::config::agent_surface::warn_inert_transit_settings(surface, template_id.as_deref());
                 let embedded = crate::config::agent_surface::rewrite_reference_transit_tokens(surface);
                 split || marked || embedded
             }))
@@ -290,7 +294,7 @@ mod tests {
     /// overrides, is rewritten to `embedded` and reported as a change.
     #[test]
     fn migrate_rewrites_a_stored_reference_transit_token_mode() {
-        let mut json = serde_json::json!({ "surface": {
+        let mut json = serde_json::json!({ "id": "legacy-template", "surface": {
             "transit": { "transit_token_mode": "reference" },
             "variants": [{ "alias": "dev", "overrides": { "transit": { "shared": {
                 "transit_token_mode": "reference" } } } }]
@@ -298,15 +302,21 @@ mod tests {
         let events = crate::observability::trust_check_audit::test_support::capture(|| {
             assert!(SurfaceTemplate::migrate_raw_json(&mut json).unwrap());
         });
-        let warned = events
+        let warned: Vec<_> = events
             .iter()
             .filter(|event| {
                 event.level == "WARN"
                     && crate::observability::trust_check_audit::test_support::field(event, "setting")
                         == Some("transit_token_mode")
             })
-            .count();
-        assert_eq!(warned, 2, "one warning for the surface and one for the variant");
+            .collect();
+        assert_eq!(warned.len(), 2, "one warning for the surface and one for the variant");
+        for event in warned {
+            assert_eq!(
+                crate::observability::trust_check_audit::test_support::field(event, "template_id"),
+                Some("legacy-template")
+            );
+        }
         assert_eq!(json["surface"]["transit"]["transit_token_mode"], "embedded");
         assert_eq!(json["surface"]["variants"][0]["overrides"]["transit"]["shared"]["transit_token_mode"], "embedded");
     }

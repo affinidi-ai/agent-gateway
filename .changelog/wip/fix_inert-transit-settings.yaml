@@ -35,8 +35,15 @@ changes:
         The gateway has no server-side store for transit tokens, so a surface that chose
         `transit.transit_token_mode: reference` was exposing its `caller_context_fields` to its
         agent while expecting them kept server-side. The admin API now refuses `reference`,
-        on a surface or in a variant, with a 400 where it was accepted before, so a client
-        that sends it must send `embedded` or leave the field out. A surface stored with
-        `reference` is rewritten to `embedded` when it loads, with a warning naming the
-        surface and variant, so later writes are not refused.
-  breaking: []
+        on a surface, in a variant and in a surface template. A surface or template stored
+        with `reference` is rewritten to `embedded` when it loads, with a warning naming the
+        surface or template and the variant, so later writes are not refused.
+  breaking:
+    - timestamp: '2026-11-02T10:00:00.000Z'
+      title: Refuse transit_token_mode reference in the admin API
+      description: >-
+        A surface or surface template that sets `transit.transit_token_mode: reference`, on
+        the surface or in a variant's overrides, now gets a 400 on create, update and import,
+        where it was accepted although the gateway always issued embedded tokens. Send
+        `embedded` or leave the field out. A stored `reference` is rewritten to `embedded` on
+        load.

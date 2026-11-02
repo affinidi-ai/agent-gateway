@@ -8,8 +8,8 @@ changes:
       description: >-
         A surface template stored with `transit.transit_token_mode: reference`, on its surface
         or in a variant, was rewritten to `embedded` when it loaded but gave no sign of it. The
-        gateway now logs the warning a stored surface gets, and the load warning for a surface
-        says the value is rewritten to `embedded` instead of asking the operator to change it.
+        gateway now logs the warning a stored surface gets, naming the template by its id, and
+        the load warning for a surface says the value is rewritten to `embedded` instead of asking the operator to change it.
         The configuration reference describes both, and the surface test suite covers a variant
         that asks for `reference` or `embedded`.
   removed: []

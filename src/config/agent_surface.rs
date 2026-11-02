@@ -1862,7 +1862,7 @@ impl StorableEntity for AgentSurface {
         let stripped = strip_legacy_trust_registry_fields(value);
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
-        warn_inert_transit_settings(value);
+        warn_inert_transit_settings(value, None);
         let embedded = rewrite_reference_transit_tokens(value);
         let marked = mark_transit_point_source_auth(value);
         Ok(stripped || split || embedded || marked)
@@ -1943,8 +1943,14 @@ pub(crate) fn reference_transit_token_refusal(value: &serde_json::Value) -> Opti
 /// reference` (the tokens are embedded all the same) and `sign_requests: false`
 /// (it changes nothing; a VP follows each Transit Point's `managed_identity` and
 /// `identity_injection.inject_vp`). It changes nothing itself; a stored `reference`
-/// is then rewritten to `embedded` by [`rewrite_reference_transit_tokens`].
-pub(crate) fn warn_inert_transit_settings(value: &serde_json::Value) {
+/// is then rewritten to `embedded` by [`rewrite_reference_transit_tokens`]. A
+/// template's surface snapshot has no surface id, so the warning names the
+/// template by `template_id`.
+pub(crate) fn warn_inert_transit_settings(
+    value: &serde_json::Value,
+    template_id: Option<&str>,
+) {
+    let template_id = template_id.unwrap_or_default();
     let surface_id = value
         .get("surface_id")
         .and_then(serde_json::Value::as_str)
@@ -1956,6 +1962,7 @@ pub(crate) fn warn_inert_transit_settings(value: &serde_json::Value) {
         if asks_for_reference_transit_tokens(shared) {
             tracing::warn!(
                 surface_id = %surface_id,
+                template_id = %template_id,
                 variant = %variant,
                 setting = "transit_token_mode",
                 "transit_token_mode 'reference' is not supported; the transit tokens are embedded, so the caller \
@@ -1965,6 +1972,7 @@ pub(crate) fn warn_inert_transit_settings(value: &serde_json::Value) {
         if shared.get("sign_requests") == Some(&serde_json::Value::Bool(false)) {
             tracing::warn!(
                 surface_id = %surface_id,
+                template_id = %template_id,
                 variant = %variant,
                 setting = "sign_requests",
                 "sign_requests has no effect: a Transit Point still sends a signed VP when its managed_identity and \
