@@ -3011,6 +3011,13 @@ pub struct BootstrapConfig {
     /// file's.
     #[serde(skip)]
     pub pinned_external_consent_resource_origins: Option<std::collections::HashMap<String, Vec<String>>>,
+
+    /// `gateway.json`'s `external_consent_issuers` as the gateway started with
+    /// it, set or not ([`Self::pin_external_consent_issuers`]); `None` until
+    /// pinned. Every later load of `gateway.json` takes this value instead of
+    /// the file's.
+    #[serde(skip)]
+    pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// DID document cache configuration

@@ -19,6 +19,9 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     "sessions",
     "avatars",
     crate::delegation_vault::grants::GRANTS_DIRECTORY,
+    crate::delegation_vault::connects::PENDING_CONNECTS_DIRECTORY,
+    crate::delegation_vault::storage::GRANT_REFRESH_CLAIMS_DIRECTORY,
+    crate::delegation_vault::storage::DEFERRED_REVOCATIONS_DIRECTORY,
 ];
 
 /// JSON keys whose values are DIDs — replaced with `did:redacted:{hash8}`

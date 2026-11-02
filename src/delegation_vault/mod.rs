@@ -10,16 +10,21 @@
 //! - DelegationCredential VC issuance
 
 pub mod audit;
+pub mod connect_api;
+pub mod connects;
 pub mod grants;
 pub mod handlers;
 pub mod jwt_assertion;
 pub mod modern_consent;
 pub mod notifier;
 pub mod oauth;
+pub mod release;
 pub mod revocation;
 pub mod router;
 pub mod service_token;
 pub mod storage;
+pub mod sweep;
+pub mod token_endpoint;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

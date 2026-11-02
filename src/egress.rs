@@ -285,11 +285,12 @@ pub(crate) const PROXY_VARIABLES: [&str; 6] =
     ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
 /// Warn, once at startup, when the environment names a proxy: the vendor
-/// clients of external consent (the providers' own issuer metadata, token
-/// revocation, and requests that carry a grant by binding) ignore it and
-/// connect directly, so the host needs direct egress to those vendors. Every
-/// other egress, inbound and MCP authorization server discovery included,
-/// uses the proxy as before. Returns the variables found set.
+/// clients of external consent (the providers' own issuer metadata, the code
+/// exchange, token refresh, token revocation, and requests that carry a grant
+/// by binding) ignore it and connect directly, so the host needs direct egress
+/// to those vendors. Every other egress, inbound and MCP authorization server
+/// discovery included, uses the proxy as before. Returns the variables found
+/// set.
 pub(crate) fn warn_when_vendor_clients_ignore_a_proxy(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
     let set: Vec<&'static str> = PROXY_VARIABLES
         .into_iter()
@@ -299,11 +300,11 @@ pub(crate) fn warn_when_vendor_clients_ignore_a_proxy(lookup: impl Fn(&str) -> O
         tracing::warn!(
             target: "credential_delegation",
             variables = ?set,
-            "A proxy is set, but the vendor clients of external consent (the providers' own issuer metadata, token \
-             revocation, and requests that carry a grant by binding) ignore it and connect directly, since a proxy \
-             would resolve each vendor's host again and void the pin to its vetted addresses; allow direct egress \
-             to those vendors. Inbound and MCP authorization server discovery, like all other egress, use the \
-             proxy"
+            "A proxy is set, but the vendor clients of external consent (the providers' own issuer metadata, the \
+             code exchange, token refresh, token revocation, and requests that carry a grant by binding) ignore it \
+             and connect directly, since a proxy would resolve each vendor's host again and void the pin to its \
+             vetted addresses; allow direct egress to those vendors. Inbound and MCP authorization server \
+             discovery, like all other egress, use the proxy"
         );
     }
     set
@@ -861,6 +862,7 @@ mod tests {
         assert!(text.contains("WARN"), "{text}");
         assert!(text.contains("connect directly"), "{text}");
         assert!(text.contains("providers' own issuer metadata"), "{text}");
+        assert!(text.contains("the code exchange, token refresh, token revocation"), "{text}");
         assert!(text.contains("MCP authorization server discovery, like all other egress, use the proxy"), "{text}");
         assert!(!text.contains("proxy.internal"), "the proxy's address is not logged: {text}");
 

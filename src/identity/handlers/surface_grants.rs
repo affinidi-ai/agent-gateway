@@ -35,7 +35,9 @@ use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::{AgentSurface, GrantSubject, TransitPoint};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::AuditCallerContext;
-use crate::delegation_vault::grants::{DelegatedGrant, GrantBinding, PepperMismatch, Principals, UnreadableGrant};
+use crate::delegation_vault::grants::{
+    DelegatedGrant, GrantBinding, OWNER_PRINCIPAL, PepperMismatch, Principals, StoredGrant, UnreadableGrant,
+};
 use crate::delegation_vault::storage::DelegationVaultStorage;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
@@ -83,6 +85,19 @@ struct ExternalBinding {
 }
 
 impl ExternalBinding {
+    fn holds(
+        &self,
+        grant: &DelegatedGrant,
+    ) -> bool {
+        grant.tenant_id == self.tenant_id
+            && grant.surface_id == self.surface_id
+            && grant.hop == self.hop
+            && grant.credential_provider_id == self.credential_provider_id
+            && self
+                .subject
+                .is_none_or(|owner| (grant.principal == OWNER_PRINCIPAL) == owner)
+    }
+
     fn grant_binding(&self) -> GrantBinding {
         GrantBinding::new(self.tenant_id.as_deref(), &self.surface_id, &self.hop, &self.credential_provider_id)
     }
@@ -123,28 +138,133 @@ fn live_transit_point_lists(surface: &AgentSurface) -> Vec<&[TransitPoint]> {
     lists
 }
 
+/// The binding `credentials` of `point` on `surface`, as its grants are keyed.
+fn external_binding(
+    surface: &AgentSurface,
+    point: &TransitPoint,
+    credentials: &crate::config::agent_surface::TransitCredentials,
+) -> ExternalBinding {
+    ExternalBinding {
+        tenant_id: surface.tenant_id.clone(),
+        surface_id: surface.surface_id.clone(),
+        hop: point.id.clone(),
+        credential_provider_id: credentials
+            .credential_provider_id
+            .clone(),
+        subject: credentials
+            .subject
+            .map(|subject| subject == GrantSubject::Owner),
+    }
+}
+
 /// The external consent bindings `surface` serves, in its base and every
 /// enabled variant.
 fn external_bindings(surface: &AgentSurface) -> HashSet<ExternalBinding> {
+    served_external_bindings(surface)
+        .into_iter()
+        .map(|(point, credentials)| external_binding(surface, point, credentials))
+        .collect()
+}
+
+/// The scopes each external consent binding `surface` serves names, in every
+/// place that serves it: the base, and each enabled variant that lists the
+/// Transit Point, as a surface stored outside the API may. Each place's list
+/// is sorted, and empty for one that names none, which permits its
+/// provider's default scopes.
+fn binding_scopes(surface: &AgentSurface) -> HashMap<ExternalBinding, Vec<Vec<String>>> {
+    let mut scopes: HashMap<ExternalBinding, Vec<Vec<String>>> = HashMap::new();
+    for (point, credentials) in served_external_bindings(surface) {
+        let mut named = credentials.scopes.clone();
+        named.sort();
+        named.dedup();
+        scopes
+            .entry(external_binding(surface, point, credentials))
+            .or_default()
+            .push(named);
+    }
+    for places in scopes.values_mut() {
+        places.sort();
+        places.dedup();
+    }
+    scopes
+}
+
+/// Whether every scope `grant` was asked for lies within `scopes`, a
+/// binding's, or `default_scopes`, its provider's, when it names none.
+fn within(
+    grant: &DelegatedGrant,
+    scopes: &[String],
+    default_scopes: &[String],
+) -> bool {
+    let permitted = if scopes.is_empty() {
+        default_scopes
+    } else {
+        scopes
+    };
+    grant
+        .scopes_asked_for()
+        .iter()
+        .all(|scope| permitted.contains(scope))
+}
+
+/// Whether `binding`, as saved now, permits every scope `grant` was asked
+/// for: its own scopes, or `default_scopes`, its provider's, when it names
+/// none. A grant left by a binding later narrowed is not released beyond it.
+pub(crate) fn binding_permits(
+    binding: &crate::config::agent_surface::TransitCredentials,
+    default_scopes: &[String],
+    grant: &DelegatedGrant,
+) -> bool {
+    within(grant, &binding.scopes, default_scopes)
+}
+
+/// Every binding of `surface` that holds `grant`: each place that serves its
+/// Transit Point with its tenant, provider and subject.
+fn holding_bindings<'a>(
+    surface: &'a AgentSurface,
+    grant: &DelegatedGrant,
+) -> Vec<&'a crate::config::agent_surface::TransitCredentials> {
+    served_external_bindings(surface)
+        .into_iter()
+        .filter(|(point, credentials)| external_binding(surface, point, credentials).holds(grant))
+        .map(|(_, credentials)| credentials)
+        .collect()
+}
+
+/// Whether `surface` serves the binding `grant` is kept for: its tenant,
+/// Transit Point, provider and subject, with the scopes the grant was asked
+/// for within the binding's, or `default_scopes`, its provider's, when it
+/// names none, in every place that serves it. Storing a grant, its release and
+/// the sweep all decide by this, so where the surface serves one Transit Point
+/// with other scopes in two places, the narrower decides for all three.
+pub(crate) fn serves_grant(
+    surface: &AgentSurface,
+    grant: &DelegatedGrant,
+    default_scopes: &[String],
+) -> bool {
+    let holding = holding_bindings(surface, grant);
+    !holding.is_empty()
+        && holding
+            .iter()
+            .all(|binding| binding_permits(binding, default_scopes, grant))
+}
+
+/// The `consent_mode: external` bindings `surface` serves, in its base and
+/// every enabled variant: each Transit Point that has one, with its
+/// credentials. A Transit Point id with such a binding names one Transit
+/// Point in one place, so each hop appears once.
+pub(crate) fn served_external_bindings(
+    surface: &AgentSurface
+) -> Vec<(&TransitPoint, &crate::config::agent_surface::TransitCredentials)> {
     live_transit_point_lists(surface)
         .into_iter()
         .flatten()
         .filter_map(|point| {
-            let binding = point
+            point
                 .transit_credentials
                 .as_ref()
-                .filter(|binding| binding.is_external())?;
-            Some(ExternalBinding {
-                tenant_id: surface.tenant_id.clone(),
-                surface_id: surface.surface_id.clone(),
-                hop: point.id.clone(),
-                credential_provider_id: binding
-                    .credential_provider_id
-                    .clone(),
-                subject: binding
-                    .subject
-                    .map(|subject| subject == GrantSubject::Owner),
-            })
+                .filter(|binding| binding.is_external())
+                .map(|binding| (point, binding))
         })
         .collect()
 }
@@ -209,6 +329,23 @@ pub(crate) async fn remove_changed_binding_grants(
     surface_lock: Option<SharedSurfaceLock>,
     outcome: Option<crate::delegation_vault::revocation::ChangeOutcome>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, SurfaceApiError> {
+    // A binding both serve whose scopes change, in any place that serves it,
+    // keeps only the grants asked for within its new scopes in every place:
+    // narrowing it anywhere removes the others.
+    let rescoped: Vec<(ExternalBinding, Vec<Vec<String>>)> = match (before, after) {
+        (Some(before), Some(after)) => {
+            let earlier = binding_scopes(before);
+            binding_scopes(after)
+                .into_iter()
+                .filter(|(binding, scopes)| {
+                    earlier
+                        .get(binding)
+                        .is_some_and(|earlier| earlier != scopes)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let before = before
         .map(external_bindings)
         .unwrap_or_default();
@@ -218,7 +355,7 @@ pub(crate) async fn remove_changed_binding_grants(
     let changed: Vec<&ExternalBinding> = before
         .symmetric_difference(&after)
         .collect();
-    if changed.is_empty() {
+    if changed.is_empty() && rescoped.is_empty() {
         return Ok(None);
     }
     let vault = removal
@@ -232,6 +369,35 @@ pub(crate) async fn remove_changed_binding_grants(
             .map_err(|error| refusal(binding, &error))?;
         for grant in grants {
             affected.insert(grant.id.clone(), grant);
+        }
+    }
+    for (binding, places) in &rescoped {
+        let default_scopes = match (
+            places
+                .iter()
+                .any(Vec::is_empty),
+            removal.providers,
+        ) {
+            (false, _) => Vec::new(),
+            (true, Some(store)) => store
+                .get(&binding.credential_provider_id)
+                .await
+                .map_err(|_| unavailable())?
+                .map(|provider| provider.default_scopes)
+                .unwrap_or_default(),
+            (true, None) => return Err(unavailable()),
+        };
+        let grants = vault
+            .binding_grants(&binding.grant_binding(), binding.principals())
+            .await
+            .map_err(|error| refusal(binding, &error))?;
+        for grant in grants {
+            if !places
+                .iter()
+                .all(|scopes| within(&grant, scopes, &default_scopes))
+            {
+                affected.insert(grant.id.clone(), grant);
+            }
         }
     }
     if affected.is_empty() {
@@ -264,10 +430,13 @@ pub(crate) async fn remove_changed_binding_grants(
             .exact_allowlist
             .map(str::to_string),
         actor: removal.actor.cloned(),
+        vault: Some(vault.clone()),
     };
     crate::delegation_vault::revocation::delete_then_revoke(
         vault,
-        affected.into_keys().collect(),
+        affected
+            .into_values()
+            .collect(),
         revoker,
         surface_lock,
         outcome,
@@ -410,7 +579,7 @@ where
     let (saved, outcome) = tokio::sync::oneshot::channel();
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
         saved: outcome,
-        stored: Box::pin(written(surfaces, surface_id.to_string(), after.map(external_bindings))),
+        stored: Box::pin(written(surfaces, surface_id.to_string(), after.map(binding_scopes))),
     };
     remove_changed_binding_grants(removal, current.as_ref(), after, Some(Arc::clone(&lock)), Some(outcome)).await?;
     let written = write().await;
@@ -419,17 +588,69 @@ where
     written
 }
 
+/// Why a grant was not stored.
+#[derive(Debug)]
+pub(crate) enum GrantNotStored {
+    /// The surface no longer serves the binding the grant was given for.
+    BindingRemoved,
+    /// The binding now permits fewer scopes than the grant was asked for.
+    BindingNarrowed,
+    /// The surface or the vault could not be read or written.
+    Unavailable,
+}
+
+/// Store `grant` only while its binding is saved: under the surface's lock,
+/// the stored surface must serve the binding, with the grant's tenant,
+/// Transit Point, provider and subject
+/// ([`GrantNotStored::BindingRemoved`] otherwise), and the scopes the grant
+/// was asked for must lie within the binding's, or `default_scopes`, its
+/// provider's, when it names none, in every place that serves it, as
+/// [`serves_grant`] decides ([`GrantNotStored::BindingNarrowed`] otherwise).
+/// Nothing is stored when it is refused, so no grant outlives a binding a
+/// concurrent write removed, or reaches beyond one it narrowed. The provider
+/// lock is held shared, so no provider delete reads the provider's grants
+/// while one is being stored.
+pub(crate) async fn store_grant_while_bound(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    surfaces: &dyn AgentSurfaceStore,
+    grant: DelegatedGrant,
+    default_scopes: &[String],
+) -> Result<StoredGrant, GrantNotStored> {
+    let _bindings = hold_provider_bindings().await;
+    let _lock = lock_surface(&grant.surface_id).await;
+    let surface = surfaces
+        .get(&grant.surface_id)
+        .await
+        .map_err(|error| {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a surface to store a grant");
+            GrantNotStored::Unavailable
+        })?;
+    let Some(surface) = surface.filter(|surface| !holding_bindings(surface, &grant).is_empty()) else {
+        return Err(GrantNotStored::BindingRemoved);
+    };
+    if !serves_grant(&surface, &grant, default_scopes) {
+        return Err(GrantNotStored::BindingNarrowed);
+    }
+    vault
+        .store_grant(grant)
+        .await
+        .map_err(|error| {
+            warn!(target: "credential_delegation", error = %error, "Failed to store a delegated grant");
+            GrantNotStored::Unavailable
+        })
+}
+
 /// Whether a dropped write was saved: the surface stored under `surface_id`
-/// serves exactly `expected`, the external consent bindings of the surface
-/// the write saves, or is absent when the write deleted it (`None`). The
-/// write removed grants only when its bindings differ from those stored
-/// before it, so this tells the two apart. A read that fails counts as saved,
-/// so the grants are revoked rather than kept under a binding that may be
-/// gone.
+/// serves exactly `expected`, the external consent bindings, with their
+/// scopes in every place, of the surface the write saves ([`binding_scopes`]),
+/// or is absent when the write deleted it (`None`). The write removed grants
+/// only when its bindings or their scopes differ from those stored before
+/// it, so this tells the two apart. A read that fails counts as saved, so the
+/// grants are revoked rather than kept under a binding that may be gone.
 async fn written(
     surfaces: Arc<dyn AgentSurfaceStore>,
     surface_id: String,
-    expected: Option<HashSet<ExternalBinding>>,
+    expected: Option<HashMap<ExternalBinding, Vec<Vec<String>>>>,
 ) -> bool {
     match surfaces
         .get(&surface_id)
@@ -438,7 +659,7 @@ async fn written(
         Ok(stored) => {
             stored
                 .as_ref()
-                .map(external_bindings)
+                .map(binding_scopes)
                 == expected
         }
         Err(error) => {
@@ -456,7 +677,7 @@ async fn written(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation_vault::grants::{GrantKey, StoredGrant};
+    use crate::delegation_vault::grants::GrantKey;
     use crate::delegation_vault::revocation::tests::RecordingServer;
     use serde_json::json;
 
@@ -1310,6 +1531,241 @@ mod tests {
             .expect("and goes on once it ends");
     }
 
+    /// The provider's default scopes in these tests.
+    fn read() -> Vec<String> {
+        vec!["read".to_string()]
+    }
+
+    /// A binding of `vendor` for its owner that names `scopes`.
+    fn scoped(scopes: &[&str]) -> Option<serde_json::Value> {
+        Some(json!({"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner",
+            "scopes": scopes}))
+    }
+
+    fn asked_for(
+        key: &GrantKey,
+        token: &str,
+        scopes: &[&str],
+    ) -> DelegatedGrant {
+        let mut grant = crate::delegation_vault::grants::tests::grant(key, token);
+        grant.requested_scopes = Some(
+            scopes
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        );
+        grant
+    }
+
+    /// A grant is stored only when the scopes it was asked for lie within its
+    /// binding's scopes as saved now, or its provider's default scopes when
+    /// the binding names none: a binding narrowed while the person consented
+    /// keeps no wider grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_asked_for_beyond_its_bindings_scopes_is_not_stored() {
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        surfaces
+            .save(&surface(json!([point("owner-hop", scoped(&["read"]))])))
+            .await
+            .unwrap();
+        let key = owner_key("owner-hop");
+        let refused = store_grant_while_bound(
+            &fixture.vault,
+            surfaces.as_ref(),
+            asked_for(&key, "wide", &["read", "write"]),
+            &[],
+        )
+        .await;
+        assert!(matches!(refused, Err(GrantNotStored::BindingNarrowed)), "{refused:?}");
+        assert!(!fixture.kept(&key).await);
+        store_grant_while_bound(&fixture.vault, surfaces.as_ref(), asked_for(&key, "within", &["read"]), &[])
+            .await
+            .expect("a grant within the binding's scopes is stored");
+
+        surfaces
+            .save(&surface(json!([point("owner-hop", external("vendor", "owner"))])))
+            .await
+            .unwrap();
+        let both = ["read".to_string(), "write".to_string()];
+        store_grant_while_bound(
+            &fixture.vault,
+            surfaces.as_ref(),
+            asked_for(&key, "defaults", &["read", "write"]),
+            &both,
+        )
+        .await
+        .expect("a binding that names no scopes permits its provider's default scopes");
+        let refused = store_grant_while_bound(
+            &fixture.vault,
+            surfaces.as_ref(),
+            asked_for(&key, "wide", &["read", "write"]),
+            &read(),
+        )
+        .await;
+        assert!(matches!(refused, Err(GrantNotStored::BindingNarrowed)), "{refused:?}");
+    }
+
+    /// Narrowing a binding's scopes removes, and revokes, the grants asked for
+    /// beyond them, and keeps those within; widening them removes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn narrowing_a_bindings_scopes_removes_the_grants_beyond_them() {
+        let fixture = Fixture::new().await;
+        let wide = owner_key("wide-hop");
+        let narrow = owner_key("narrow-hop");
+        for (key, token, scopes) in [(&wide, "wide", &["read", "write"][..]), (&narrow, "narrow", &["read"][..])] {
+            fixture
+                .vault
+                .store_grant(asked_for(key, token, scopes))
+                .await
+                .unwrap();
+        }
+        let both = surface(json!([
+            point("wide-hop", scoped(&["read", "write"])),
+            point("narrow-hop", scoped(&["read", "write"]))
+        ]));
+        let narrowed = surface(json!([point("wide-hop", scoped(&["read"])), point("narrow-hop", scoped(&["read"]))]));
+        fixture
+            .change(Some(&narrowed), Some(&both))
+            .await
+            .unwrap();
+        assert!(fixture.kept(&wide).await, "widening removes nothing");
+        fixture
+            .change(Some(&both), Some(&narrowed))
+            .await
+            .unwrap();
+        assert!(!fixture.kept(&wide).await, "the grant beyond the narrowed scopes is removed");
+        assert!(fixture.kept(&narrow).await, "the grant within them is kept");
+        assert_eq!(
+            fixture
+                .server
+                .revoked_tokens(),
+            ["wide", "wide-refresh"]
+        );
+    }
+
+    /// A surface that serves Transit Point `owner-hop` in its base, binding
+    /// `base`, and in an enabled variant, binding `variant`, as a surface
+    /// stored outside the API may.
+    fn served_twice(
+        base: &[&str],
+        variant: &[&str],
+    ) -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://managed.example/agent"},
+            "transit": {"points": [point("owner-hop", scoped(base))]},
+            "variants": [{"id": "v-1", "alias": "other", "name": "other", "enabled": true,
+                "overrides": {"transit": {"points": [point("owner-hop", scoped(variant))]}}}]
+        }))
+        .unwrap()
+    }
+
+    /// When a surface serves one Transit Point id in its base and in a variant
+    /// with other scopes, a grant lies within its binding only within every
+    /// one of them, as storing a grant, the sweep and its release decide
+    /// alike, whichever is listed first; and narrowing either one removes the
+    /// grants beyond it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_served_twice_with_other_scopes_permits_only_what_both_do() {
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        let key = owner_key("owner-hop");
+        let wide = || asked_for(&key, "wide", &["read", "write"]);
+        let within = || asked_for(&key, "within", &["read"]);
+        for (base, variant) in [(&["read", "write"][..], &["read"][..]), (&["read"][..], &["read", "write"][..])] {
+            let both = served_twice(base, variant);
+            surfaces
+                .save(&both)
+                .await
+                .unwrap();
+            let refused = store_grant_while_bound(&fixture.vault, surfaces.as_ref(), wide(), &[]).await;
+            assert!(matches!(refused, Err(GrantNotStored::BindingNarrowed)), "{base:?} {variant:?}: {refused:?}");
+            assert!(!serves_grant(&both, &wide(), &[]), "{base:?} {variant:?}");
+            assert!(serves_grant(&both, &within(), &[]), "{base:?} {variant:?}");
+            store_grant_while_bound(&fixture.vault, surfaces.as_ref(), within(), &[])
+                .await
+                .unwrap_or_else(|error| panic!("{base:?} {variant:?}: {error:?}"));
+        }
+
+        let both_wide = served_twice(&["read", "write"], &["read", "write"]);
+        for (narrowed, which) in [
+            (served_twice(&["read"], &["read", "write"]), "the base"),
+            (served_twice(&["read", "write"], &["read"]), "the variant"),
+        ] {
+            fixture
+                .vault
+                .store_grant(wide())
+                .await
+                .unwrap();
+            fixture
+                .change(Some(&both_wide), Some(&narrowed))
+                .await
+                .unwrap();
+            assert!(!fixture.kept(&key).await, "narrowing {which} removes the wider grant");
+        }
+    }
+
+    /// A grant is stored only under the surface's lock and only while its
+    /// binding is saved, so a write that is removing the binding cannot leave
+    /// a grant behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_stored_only_while_its_binding_is_saved() {
+        use crate::delegation_vault::grants::tests::grant;
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        surfaces
+            .save(&bound())
+            .await
+            .unwrap();
+        store_grant_while_bound(&fixture.vault, &*surfaces, grant(&owner_key("owner-hop"), "owner-access"), &read())
+            .await
+            .expect("the binding is saved");
+        assert!(
+            fixture
+                .kept(&owner_key("owner-hop"))
+                .await
+        );
+        for (case, key) in [
+            ("another Transit Point", owner_key("other-hop")),
+            ("the binding's other subject", caller_key("owner-hop")),
+        ] {
+            let refused = store_grant_while_bound(&fixture.vault, &*surfaces, grant(&key, "access"), &read()).await;
+            assert!(matches!(refused, Err(GrantNotStored::BindingRemoved)), "{case}");
+            assert!(!fixture.kept(&key).await, "{case}");
+        }
+
+        let unbound = surface(json!([point("caller-hop", external("vendor", "caller"))]));
+        let held = lock_surface("surface").await;
+        let late = tokio::spawn({
+            let vault = fixture.vault.clone();
+            let surfaces = surfaces.clone();
+            async move {
+                store_grant_while_bound(&vault, &*surfaces, grant(&owner_key("owner-hop"), "late-access"), &read())
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!late.is_finished(), "a grant waits for the write that holds the surface's lock");
+        fixture
+            .change(Some(&bound()), Some(&unbound))
+            .await
+            .unwrap();
+        surfaces
+            .save(&unbound)
+            .await
+            .unwrap();
+        drop(held);
+        assert!(matches!(late.await.unwrap(), Err(GrantNotStored::BindingRemoved)));
+        assert!(
+            !fixture
+                .kept(&owner_key("owner-hop"))
+                .await,
+            "no grant outlives the binding the write removed"
+        );
+    }
+
     /// A vault that pauses after its first grant deletion until `resume` has a
     /// permit, so a test can drop a write part way through deleting, and
     /// refuses to store a grant while `refuse_stores` is set.
@@ -1406,13 +1862,14 @@ mod tests {
                 .await
         }
 
-        async fn delete_grant(
+        async fn delete_grant_of_connection(
             &self,
             id: &str,
+            connected_at: chrono::DateTime<chrono::Utc>,
         ) -> anyhow::Result<Option<DelegatedGrant>> {
             let deleted = self
                 .inner
-                .delete_grant(id)
+                .delete_grant_of_connection(id, connected_at)
                 .await;
             self.deleted().await;
             deleted
@@ -1598,6 +2055,72 @@ mod tests {
                 .server
                 .revoked_tokens(),
             ["owner-access", "owner-access-refresh"]
+        );
+    }
+
+    /// A write that only narrows a binding's scopes, dropped before it was
+    /// saved, keeps every grant: the surface stored still has the wider
+    /// scopes, so the grants it removed are put back, not revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_that_narrows_scopes_dropped_before_its_save_puts_the_grants_back() {
+        const SURFACE: &str = "narrowing-dropped";
+        let fixture = Fixture::new().await;
+        let key = GrantKey::owner(Some("tenant-a"), SURFACE, "owner-hop", "vendor");
+        fixture
+            .vault
+            .store_grant(asked_for(&key, "wide", &["read", "write"]))
+            .await
+            .unwrap();
+        let mut before = surface(json!([point("owner-hop", scoped(&["read", "write"]))]));
+        before.surface_id = SURFACE.to_string();
+        let mut after = surface(json!([point("owner-hop", scoped(&["read"]))]));
+        after.surface_id = SURFACE.to_string();
+        let surfaces = fixture.surfaces().await;
+        surfaces
+            .save(&before)
+            .await
+            .unwrap();
+        let pausing = Arc::new(PausingVault {
+            inner: fixture.vault.clone(),
+            deletions: Default::default(),
+            first_deleted: Default::default(),
+            resume: tokio::sync::Semaphore::new(0),
+            refuse_stores: false,
+        });
+        let vault: Arc<dyn DelegationVaultStorage> = pausing.clone();
+        let origin = fixture.server.origin();
+        let removal = GrantRemoval {
+            vault: Some(&vault),
+            exact_allowlist: Some(&origin),
+            ..fixture.removal()
+        };
+
+        let mut write =
+            Box::pin(write_surface(&removal, surfaces.clone(), SURFACE, Stored::Any, Some(&after), || async {
+                surfaces
+                    .save(&after)
+                    .await
+                    .map_err(|error| SurfaceApiError::InternalError(error.to_string()))
+            }));
+        tokio::select! {
+            _ = &mut write => panic!("the write ended while a deletion was paused"),
+            () = pausing.first_deleted.notified() => {}
+        }
+        drop(write);
+        pausing.resume.add_permits(1);
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(10), lock_surface(SURFACE))
+                .await
+                .expect("the lock is released once the outcome is settled"),
+        );
+        assert!(fixture.kept(&key).await, "the grant is put back");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            fixture
+                .server
+                .revoked_tokens()
+                .is_empty(),
+            "and never revoked"
         );
     }
 }

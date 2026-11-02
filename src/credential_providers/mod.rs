@@ -16,6 +16,7 @@
 pub mod external;
 pub mod handlers;
 pub mod router;
+pub mod scope_comparison;
 pub mod storage;
 
 use chrono::{DateTime, Utc};
@@ -308,6 +309,30 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_unadvertised_pkce: bool,
 
+    /// Whether the issuer's metadata says its authorization responses carry
+    /// `iss` (RFC 9207), recorded from the metadata when an external consent
+    /// provider is created and never set by a request: a connect completed
+    /// without `iss` is then refused. `None` for a provider created before it
+    /// was recorded, whose connects need `iss` as well, since nothing says its
+    /// issuer omits it: recreate such a provider for an issuer that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_response_iss_parameter_supported: Option<bool>,
+
+    /// How the scopes an external consent provider's token endpoint grants are
+    /// compared with those asked for: exactly by default. An external consent
+    /// provider only, fixed for its life.
+    #[serde(default, skip_serializing_if = "scope_comparison::ScopeComparison::is_exact")]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+
+    /// Whether revoking any one token at the provider's revocation endpoint
+    /// ends the whole authorization of the person and the client, every
+    /// other grant of theirs included, as Google's does. The gateway then
+    /// revokes no grant while the same person holds another grant of the
+    /// provider: it would end that one too. Unset, every grant removed is
+    /// revoked. An external consent provider only, fixed for its life.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revocation_ends_authorization: bool,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -405,6 +430,10 @@ pub struct CreateCredentialProviderRequest {
     pub client_id: Option<String>,
     #[serde(default)]
     pub allow_unadvertised_pkce: bool,
+    #[serde(default)]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+    #[serde(default)]
+    pub revocation_ends_authorization: bool,
 }
 
 /// Request to update an existing credential provider
@@ -456,6 +485,12 @@ pub struct UpdateCredentialProviderRequest {
     /// Never changes a provider: a value other than the stored one is refused.
     #[serde(default)]
     pub allow_unadvertised_pkce: Option<bool>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub scope_comparison: Option<scope_comparison::ScopeComparison>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub revocation_ends_authorization: Option<bool>,
 }
 
 /// Request to check a provider before it is saved: the token endpoint's reachability and,
@@ -518,6 +553,10 @@ pub struct CredentialProviderListItem {
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_unadvertised_pkce: bool,
+    #[serde(default, skip_serializing_if = "scope_comparison::ScopeComparison::is_exact")]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revocation_ends_authorization: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -556,6 +595,8 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             token_endpoint_auth_method: p.token_endpoint_auth_method,
             client_id: p.client_id.clone(),
             allow_unadvertised_pkce: p.allow_unadvertised_pkce,
+            scope_comparison: p.scope_comparison,
+            revocation_ends_authorization: p.revocation_ends_authorization,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -598,6 +639,9 @@ mod tests {
             token_endpoint_auth_method: None,
             client_id: None,
             allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         }
     }
 
@@ -731,6 +775,9 @@ mod tests {
             token_endpoint_auth_method: None,
             client_id: None,
             allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));

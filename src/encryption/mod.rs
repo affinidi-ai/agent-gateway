@@ -48,6 +48,15 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::sync::Arc;
 
+/// A value could not be decrypted because the key service could not recover
+/// its data key, for a reason that says nothing of the value: AWS KMS
+/// unreachable, throttling, a disabled key, or no runtime to call it from. The
+/// same value may decrypt a moment later, so it must never be taken for an
+/// unreadable one. Carries the failure's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct EncryptionUnavailable(pub String);
+
 /// Field-encryption backend selected by `key_source`.
 ///
 /// `LocalMek` writes/reads `version = 1` envelopes with a process-held MEK

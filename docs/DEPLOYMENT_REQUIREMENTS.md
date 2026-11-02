@@ -173,13 +173,15 @@ The gateway only calls out to what you configure. Allow egress to:
 
 **Proxies and external consent.** The vendor calls of external consent connect directly and
 ignore `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy settings: reading an
-external consent provider's authorization server metadata, revoking its grants (RFC 7009), and
+external consent provider's authorization server metadata, exchanging a connect's code and
+refreshing its grants at the provider's token endpoint, revoking its grants (RFC 7009), and
 forwarding a Transit Point request that carries a grant by binding to the provider's
 `resource`. A proxy would resolve each vendor's host again and connect to an address the
 gateway never vetted, so the gateway pins these calls to the addresses it checked. On a network
-where egress goes only through a proxy, allow direct egress to those vendors, or external
-consent fails to connect. The gateway logs a warning at startup when a proxy variable is set.
-All other outbound calls use a configured proxy as before.
+where egress goes only through a proxy, allow direct egress to those vendors, including each
+provider's token endpoint host, or external consent fails to connect. The gateway logs a
+warning at startup when a proxy variable is set. All other outbound calls use a configured
+proxy as before.
 
 ## Secrets and keys
 

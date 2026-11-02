@@ -385,6 +385,21 @@ pub fn compile(
 }
 
 impl CompiledResourceScope {
+    /// A scope whose pattern selects no tenant, which no token can hold now
+    /// ([`compile`] refuses a pattern without one): for the tests of what such
+    /// a token would reach, should one ever exist.
+    #[cfg(test)]
+    pub(crate) fn untenanted_for_tests(pattern: &str) -> Self {
+        Self {
+            has_pattern: true,
+            segments: vec![Segment::Literal(pattern.to_string())],
+            validators: Vec::new(),
+            tenant_header_index: None,
+            tenant_selector: None,
+            cache: DashMap::new(),
+        }
+    }
+
     /// The tenant selector classification for this scope, or `None` when the
     /// scope selects no tenant (blank pattern / no placeholder).
     pub fn tenant_selector(&self) -> Option<&TenantSelector> {

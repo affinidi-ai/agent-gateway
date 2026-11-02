@@ -72,6 +72,12 @@ pub enum ExternalProviderError {
     /// The provider's `resource` is not permitted for its `issuer`
     /// ([`resource_permitted`]).
     ResourceNotPermitted,
+    /// The operator's `external_consent_issuers` does not permit the named
+    /// field: the issuer, or an endpoint off its host ([`issuer_permitted`]).
+    IssuerNotPermitted(&'static str),
+    /// A tenant's token asked for an external consent provider while the
+    /// operator lists no `external_consent_issuers`.
+    IssuersRequired,
 }
 
 impl ExternalProviderError {
@@ -116,6 +122,21 @@ impl IntoResponse for ExternalProviderError {
                           subdomains, or its origin one the gateway's external_consent_resource_origins lists for \
                           the issuer",
                 "code": "provider_resource_not_permitted",
+            }),
+            Self::IssuerNotPermitted(field) => serde_json::json!({
+                "error": format!(
+                    "{field} is not permitted by the gateway's external_consent_issuers: the issuer must be listed \
+                     there, and its endpoints must be on the issuer's host or have an origin listed for it"
+                ),
+                "code": "provider_issuer_not_permitted",
+                "field": field,
+            }),
+            Self::IssuersRequired => serde_json::json!({
+                "error": "A tenant cannot create a credential provider with an issuer while the gateway lists no \
+                          external_consent_issuers, since the tenant would choose the endpoints its client \
+                          authenticates at. The operator must list, in gateway.json's external_consent_issuers, the \
+                          issuers tenants may use",
+                "code": "external_consent_issuers_required",
             }),
         };
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
@@ -165,9 +186,14 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
                 .is_some()
             || provider.client_id.is_some()
             || provider.allow_unadvertised_pkce
+            || !provider
+                .scope_comparison
+                .is_exact()
+            || provider.revocation_ends_authorization
         {
             return Err(Invalid(
-                "revocation_endpoint, token_endpoint_auth_method, client_id and allow_unadvertised_pkce need an issuer",
+                "revocation_endpoint, token_endpoint_auth_method, client_id, allow_unadvertised_pkce, \
+                 scope_comparison and revocation_ends_authorization need an issuer",
             ));
         }
         return Ok(());
@@ -425,17 +451,40 @@ pub fn refuse_changes(
                 .is_some()
             || request.client_id.is_some()
             || request.allow_unadvertised_pkce == Some(true)
+            || request
+                .scope_comparison
+                .is_some_and(|comparison| !comparison.is_exact())
+            || request.revocation_ends_authorization == Some(true)
         {
             return Err(ExternalProviderError::Invalid(
                 "an existing provider cannot take an issuer, revocation_endpoint, token_endpoint_auth_method, \
-                 client_id or allow_unadvertised_pkce; create a new provider instead",
+                 client_id, allow_unadvertised_pkce, scope_comparison or revocation_ends_authorization; create a \
+                 new provider instead",
             ));
         }
         return Ok(());
     }
     let jwt = &request.jwt;
     let stored = &existing.jwt;
-    let fields: [(&'static str, bool); 22] = [
+    let fields: [(&'static str, bool); 24] = [
+        (
+            "scope_comparison",
+            changes(
+                request
+                    .scope_comparison
+                    .as_ref(),
+                Some(&existing.scope_comparison),
+            ),
+        ),
+        (
+            "revocation_ends_authorization",
+            changes(
+                request
+                    .revocation_ends_authorization
+                    .as_ref(),
+                Some(&existing.revocation_ends_authorization),
+            ),
+        ),
         ("issuer", changes(request.issuer.as_ref(), existing.issuer.as_ref())),
         ("provider_type", changes(request.provider_type.as_ref(), Some(&existing.provider_type))),
         (
@@ -604,15 +653,10 @@ pub fn resource_origin(provider: &CredentialProvider) -> Option<String> {
         })
 }
 
-/// An origin an operator wrote in `external_consent_resource_origins`, as its
-/// ASCII serialization: an `https` URL with a host and nothing after it but an
-/// optional `/`, whose host is an IP address or a plain DNS name, labels of
-/// letters, digits and `-` with none empty. Entries are exact origins, so a
-/// host such as `*.example.com`, which the URL parser takes literally, is not
-/// one. `None` for anything else, which then permits nothing.
-fn configured_origin(value: &str) -> Option<String> {
-    let url = url::Url::parse(value.trim()).ok()?;
-    let plain_host = match url.host()? {
+/// An IP address, or a DNS name whose labels are letters, digits and `-`, none
+/// empty: so no wildcard-looking `*`, no `_` and no trailing dot.
+fn plain_host(host: &url::Host<&str>) -> bool {
+    match host {
         url::Host::Domain(domain) => domain
             .split('.')
             .all(|label| {
@@ -622,9 +666,19 @@ fn configured_origin(value: &str) -> Option<String> {
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             }),
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => true,
-    };
+    }
+}
+
+/// An origin an operator wrote in `external_consent_resource_origins`, as its
+/// ASCII serialization: an `https` URL with a host and nothing after it but an
+/// optional `/`, whose host is an IP address or a plain DNS name, labels of
+/// letters, digits and `-` with none empty. Entries are exact origins, so a
+/// host such as `*.example.com`, which the URL parser takes literally, is not
+/// one. `None` for anything else, which then permits nothing.
+fn configured_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value.trim()).ok()?;
     let bare = url.scheme() == "https"
-        && plain_host
+        && plain_host(&url.host()?)
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == "/"
@@ -697,6 +751,141 @@ pub fn resource_permitted(
         .any(|listed| configured_origin(listed).as_deref() == Some(resource_origin.as_str()))
 }
 
+/// The origins gateway.json's `external_consent_issuers` lists for `issuer`,
+/// compared exactly, or `None` when it does not list the issuer, or names it
+/// by an entry that is not a plain `https` issuer.
+fn listed_issuer_origins(
+    issuer: &str,
+    issuers: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    issuers
+        .iter()
+        .find(|(entry, _)| entry.as_str() == issuer && configured_issuer(entry))
+        .map(|(_, origins)| {
+            origins
+                .iter()
+                .filter_map(|origin| configured_origin(origin))
+                .collect()
+        })
+}
+
+/// Whether `endpoint` is on `issuer`'s own host, as the URL parser normalises
+/// both (any port, since the host's owner controls its ports), or has one of
+/// the `listed` origins exactly.
+fn endpoint_on_issuer(
+    issuer: &str,
+    endpoint: &str,
+    listed: &[String],
+) -> bool {
+    let (Ok(issuer), Ok(endpoint)) = (url::Url::parse(issuer), url::Url::parse(endpoint)) else {
+        return false;
+    };
+    if issuer.host().is_some() && issuer.host() == endpoint.host() {
+        return true;
+    }
+    let origin = endpoint
+        .origin()
+        .ascii_serialization();
+    listed.contains(&origin)
+}
+
+/// Whether gateway.json's `external_consent_issuers` permits `provider`: when
+/// it is set, its issuer must be listed, compared exactly, and its
+/// authorization, token and revocation endpoints must each be on the issuer's
+/// own host or have an origin listed for it. Unset, every issuer is permitted.
+/// The error names the field that is not permitted. Checked when a provider is
+/// created, a surface binds it, a connect starts or completes, and whenever
+/// its grants are refreshed or sent.
+pub fn issuer_permitted(
+    provider: &CredentialProvider,
+    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Result<(), &'static str> {
+    let Some(issuers) = issuers else {
+        return Ok(());
+    };
+    let Some(issuer) = provider.issuer.as_deref() else {
+        return Err("issuer");
+    };
+    let listed = listed_issuer_origins(issuer, issuers).ok_or("issuer")?;
+    for (field, endpoint) in [
+        (
+            "authorization_endpoint",
+            provider
+                .authorization_endpoint
+                .as_deref(),
+        ),
+        (
+            "token_endpoint",
+            provider
+                .token_endpoint
+                .as_deref(),
+        ),
+        (
+            "revocation_endpoint",
+            provider
+                .revocation_endpoint
+                .as_deref(),
+        ),
+    ] {
+        if endpoint.is_some_and(|endpoint| !endpoint_on_issuer(issuer, endpoint, &listed)) {
+            return Err(field);
+        }
+    }
+    Ok(())
+}
+
+/// Whether gateway.json's `external_consent_issuers` permits the issuer's
+/// metadata: its `jwks_uri`, when it names one, is held to the rule of
+/// [`issuer_permitted`]. The error names the field.
+pub fn metadata_permitted(
+    metadata: &ClientAuthzMetadata,
+    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Result<(), &'static str> {
+    let Some(issuers) = issuers else {
+        return Ok(());
+    };
+    let listed = listed_issuer_origins(&metadata.issuer, issuers).ok_or("issuer")?;
+    match metadata.jwks_uri.as_deref() {
+        Some(jwks_uri) if !endpoint_on_issuer(&metadata.issuer, jwks_uri, &listed) => Err("jwks_uri"),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `entry`, a key of `external_consent_issuers`, is a plain `https`
+/// issuer: one the Strict posture accepts, written exactly, with a plain host.
+fn configured_issuer(entry: &str) -> bool {
+    entry.trim() == entry
+        && crate::authz_metadata::validate_issuer(entry, EgressPosture::Strict).is_ok()
+        && url::Url::parse(entry).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url
+                    .host()
+                    .is_some_and(|host| plain_host(&host))
+        })
+}
+
+/// The entries of gateway.json's `external_consent_issuers` that are not
+/// plain `https` issuers, or origins listed for one that are not plain `https`
+/// origins: they permit nothing, and the gateway names them at startup.
+pub fn invalid_issuer_entries(issuers: &std::collections::HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut invalid: Vec<String> = issuers
+        .iter()
+        .filter(|(issuer, _)| !configured_issuer(issuer))
+        .map(|(issuer, _)| issuer.clone())
+        .chain(
+            issuers
+                .values()
+                .flatten()
+                .filter(|origin| configured_origin(origin).is_none())
+                .cloned(),
+        )
+        .collect();
+    invalid.sort();
+    invalid
+}
+
 /// Whether a Transit Point whose target is `target_endpoint` may carry the
 /// grants of the external consent provider `provider`, and if so the origin
 /// they may be sent to: the origin of the provider's `resource`.
@@ -742,7 +931,7 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    const ISSUER: &str = "https://203.0.113.10";
+    pub(crate) const ISSUER: &str = "https://203.0.113.10";
 
     #[tokio::test]
     async fn a_grant_goes_only_to_a_public_https_target_with_the_origin_of_the_providers_resource() {
@@ -954,6 +1143,133 @@ pub(crate) mod tests {
         assert!(invalid_resource_origin_entries(&plain).is_empty(), "plain origins, ports and IPs are valid");
     }
 
+    fn issuers(entries: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(issuer, origins)| {
+                (
+                    issuer.to_string(),
+                    origins
+                        .iter()
+                        .map(|origin| origin.to_string())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Without `external_consent_issuers` any issuer is permitted, as before.
+    /// With it, only a listed issuer, compared exactly, whose authorization,
+    /// token and revocation endpoints are on its own host or listed for it.
+    #[test]
+    fn only_a_listed_issuer_with_its_endpoints_on_its_host_or_listed_is_permitted() {
+        let provider = external_provider();
+        assert_eq!(issuer_permitted(&provider, None), Ok(()), "no allow-list permits any issuer");
+        assert_eq!(issuer_permitted(&provider, Some(&issuers(&[(ISSUER, &[])]))), Ok(()));
+        assert_eq!(issuer_permitted(&provider, Some(&issuers(&[]))), Err("issuer"), "an empty list permits none");
+        for listed in
+            ["https://203.0.113.11", "https://203.0.113.10/", "https://203.0.113.10/tenant", "https://203.0.113.10:443"]
+        {
+            assert_eq!(
+                issuer_permitted(&provider, Some(&issuers(&[(listed, &[])]))),
+                Err("issuer"),
+                "{listed} is not the issuer {ISSUER}"
+            );
+        }
+
+        let google = "https://accounts.google.com";
+        let mut provider = external_provider();
+        provider.issuer = Some(google.into());
+        provider.authorization_endpoint = Some(format!("{google}/o/oauth2/v2/auth"));
+        provider.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
+        provider.revocation_endpoint = Some("https://oauth2.googleapis.com/revoke".into());
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &[])]))),
+            Err("token_endpoint"),
+            "a token endpoint off the issuer's host must be listed"
+        );
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])]))),
+            Ok(())
+        );
+        provider.token_endpoint = Some("https://collector.example/token".into());
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])]))),
+            Err("token_endpoint")
+        );
+        provider.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
+        provider.authorization_endpoint = Some("https://accounts.google.com.evil.example/auth".into());
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])]))),
+            Err("authorization_endpoint")
+        );
+        provider.authorization_endpoint = Some(format!("{google}/o/oauth2/v2/auth"));
+        provider.revocation_endpoint = Some("https://oauth2.googleapis.com:8443/revoke".into());
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])]))),
+            Err("revocation_endpoint"),
+            "a listed origin is exact, port included"
+        );
+        provider.revocation_endpoint = None;
+        assert_eq!(
+            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])]))),
+            Ok(())
+        );
+
+        let mut subdomain = external_provider();
+        subdomain.issuer = Some("https://login.vendor.example".into());
+        subdomain.authorization_endpoint = Some("https://login.vendor.example/authorize".into());
+        subdomain.token_endpoint = Some("https://api.login.vendor.example/token".into());
+        subdomain.revocation_endpoint = None;
+        assert_eq!(
+            issuer_permitted(&subdomain, Some(&issuers(&[("https://login.vendor.example", &[])]))),
+            Err("token_endpoint"),
+            "only the issuer's own host, not a subdomain"
+        );
+    }
+
+    /// A `jwks_uri` the issuer's metadata names is held to the same rule.
+    #[test]
+    fn a_jwks_uri_off_the_issuers_host_must_be_listed() {
+        let mut metadata = metadata();
+        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])]))), Ok(()));
+        metadata.jwks_uri = Some(format!("{ISSUER}/jwks"));
+        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])]))), Ok(()));
+        metadata.jwks_uri = Some("https://203.0.113.66/jwks".into());
+        assert_eq!(metadata_permitted(&metadata, None), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])]))), Err("jwks_uri"));
+        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &["https://203.0.113.66"])]))), Ok(()));
+    }
+
+    /// Entries that are not plain `https` issuers or origins are named at
+    /// startup and permit nothing.
+    #[test]
+    fn issuer_entries_that_are_not_plain_https_issuers_or_origins_are_named_and_permit_nothing() {
+        let entries = issuers(&[
+            ("https://*.google.com", &[]),
+            ("http://accounts.google.com", &[]),
+            ("https://accounts.google.com?x=1", &[]),
+            ("https://user@accounts.google.com", &[]),
+            (
+                "https://login.microsoftonline.com/tenant/v2.0",
+                &["https://*.microsoft.com", "https://graph.microsoft.com"],
+            ),
+        ]);
+        assert_eq!(
+            invalid_issuer_entries(&entries),
+            [
+                "http://accounts.google.com",
+                "https://*.google.com",
+                "https://*.microsoft.com",
+                "https://accounts.google.com?x=1",
+                "https://user@accounts.google.com",
+            ]
+        );
+        let mut provider = external_provider();
+        provider.issuer = Some("https://*.google.com".into());
+        assert_eq!(issuer_permitted(&provider, Some(&entries)), Err("issuer"));
+    }
+
     pub(crate) fn external_provider() -> CredentialProvider {
         serde_json::from_value(json!({
             "id": "provider", "tenant_id": "tenant-a", "name": "Linear", "provider_id": "boris-0123456789ab",
@@ -1095,6 +1411,10 @@ pub(crate) mod tests {
             |p: &mut CredentialProvider| p.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::None),
             |p: &mut CredentialProvider| p.revocation_endpoint = Some(format!("{ISSUER}/revoke")),
             |p: &mut CredentialProvider| p.allow_unadvertised_pkce = true,
+            |p: &mut CredentialProvider| {
+                p.scope_comparison = crate::credential_providers::scope_comparison::ScopeComparison::Google
+            },
+            |p: &mut CredentialProvider| p.revocation_ends_authorization = true,
         ] {
             let mut provider = legacy.clone();
             change(&mut provider);
@@ -1257,6 +1577,8 @@ pub(crate) mod tests {
             ("consent_identity_strategy_id", json!("strategy")),
             ("api_key_secret_ref", json!("key")),
             ("allow_unadvertised_pkce", json!(true)),
+            ("scope_comparison", json!("google")),
+            ("revocation_ends_authorization", json!(true)),
         ] {
             assert_eq!(
                 refuse_changes(&existing, &update(json!({ field: value }))),
