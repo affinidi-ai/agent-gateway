@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use chrono::{SecondsFormat, Utc};
+use governor::clock::Clock;
 use serde::Serialize;
 use sha2::Digest;
 use tracing::info;
@@ -450,10 +451,13 @@ pub enum PreviewRequest {
     Refresh,
 }
 
-/// The user or the surface started more card fetches than [`FETCHES_PER_MINUTE`],
-/// and there is no preview of the running surface to answer with.
+/// The user or the surface used up its burst of [`FETCHES_PER_MINUTE`] fetches, which refill one
+/// every `60 / FETCHES_PER_MINUTE` seconds, and there is no preview of the running surface to
+/// answer with. `retry_after_secs` is the wait until the next fetch is allowed, at least 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimited;
+pub struct RateLimited {
+    pub retry_after_secs: u64,
+}
 
 /// Who asked for a preview: the management user and, for a tenant token, its tenant.
 pub struct PreviewCaller<'a> {
@@ -488,24 +492,31 @@ impl PreviewMemory {
         }
     }
 
-    /// Whether `user_id` and `surface_id` may each start another fetch. The user is
-    /// checked first, so a user past their own limit takes nothing from the surface.
+    /// Whether `user_id` and `surface_id` may each start another fetch; otherwise how long the
+    /// refused one must wait. The user is checked first, so a user past their own limit takes
+    /// nothing from the surface.
     fn admit(
         &self,
         user_id: &str,
         surface_id: &str,
-    ) -> bool {
+    ) -> Result<(), RateLimited> {
         self.user_fetches
             .retain_recent();
         self.surface_fetches
             .retain_recent();
+        let now = governor::clock::DefaultClock::default().now();
+        let refused = |not_until: governor::NotUntil<governor::clock::QuantaInstant>| {
+            let wait = not_until.wait_time_from(now);
+            RateLimited {
+                retry_after_secs: (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1),
+            }
+        };
         self.user_fetches
             .check_key(&user_id.to_string())
-            .is_ok()
-            && self
-                .surface_fetches
-                .check_key(&surface_id.to_string())
-                .is_ok()
+            .map_err(refused)?;
+        self.surface_fetches
+            .check_key(&surface_id.to_string())
+            .map_err(refused)
     }
 
     async fn kept<T: Clone + Send + Sync + 'static>(
@@ -535,13 +546,13 @@ impl PreviewMemory {
             .surface_id
             .as_str();
         let digest = surface_digest(&state.surface);
-        if !self.admit(caller.user_id, surface_id) {
+        if let Err(limited) = self.admit(caller.user_id, surface_id) {
             if request == PreviewRequest::Refresh {
-                return Err(RateLimited);
+                return Err(limited);
             }
             let mut last = Self::kept(&self.previews, surface_id, digest)
                 .await
-                .ok_or(RateLimited)?;
+                .ok_or(limited)?;
             last.cached = true;
             return Ok(last);
         }
@@ -745,6 +756,18 @@ mod tests {
 
     async fn state(target: serde_json::Value) -> ProxyState {
         running(surface_with("orders", target)).await
+    }
+
+    fn assert_limited(
+        result: Result<AgentCardPreview, RateLimited>,
+        why: &str,
+    ) {
+        let limited = result.expect_err(why);
+        assert!(
+            (1..=60 / FETCHES_PER_MINUTE.get() as u64).contains(&limited.retry_after_secs),
+            "{why}: waits {} s, not a minute",
+            limited.retry_after_secs
+        );
     }
 
     fn caller(user_id: &str) -> PreviewCaller<'_> {
@@ -1218,11 +1241,11 @@ mod tests {
             .load(Ordering::SeqCst);
         assert_eq!(fetched, 10);
 
-        assert_eq!(
+        assert_limited(
             memory
                 .preview(&orders, &caller("u-limit"), PreviewRequest::Refresh)
                 .await,
-            Err(RateLimited)
+            "",
         );
         let cached = memory
             .preview(&orders, &caller("u-limit"), PreviewRequest::Read)
@@ -1231,12 +1254,11 @@ mod tests {
         assert!(cached.cached);
         let last = last.unwrap();
         assert_eq!((cached.fetched_at, cached.after), (last.fetched_at, last.after));
-        assert_eq!(
+        assert_limited(
             memory
                 .preview(&billing, &caller("u-limit"), PreviewRequest::Read)
                 .await,
-            Err(RateLimited),
-            "the user's limit covers every surface, and billing has no preview to answer with"
+            "the user's limit covers every surface, and billing has no preview to answer with",
         );
         assert_eq!(
             target
@@ -1259,11 +1281,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(
+        assert_limited(
             memory
                 .preview(&orders, &caller("u-new"), PreviewRequest::Refresh)
                 .await,
-            Err(RateLimited)
+            "",
         );
         let other = memory
             .preview(&billing, &caller("u-new"), PreviewRequest::Refresh)
@@ -1285,11 +1307,11 @@ mod tests {
                 .unwrap();
         }
         for _ in 0..FETCHES_PER_MINUTE.get() {
-            assert_eq!(
+            assert_limited(
                 memory
                     .preview(&orders, &caller("u-busy"), PreviewRequest::Refresh)
                     .await,
-                Err(RateLimited)
+                "",
             );
         }
         for user in 0..FETCHES_PER_MINUTE.get() {
@@ -1299,12 +1321,11 @@ mod tests {
                 .unwrap();
             assert!(!preview.cached, "refused requests left the surface's whole quota to others");
         }
-        assert_eq!(
+        assert_limited(
             memory
                 .preview(&orders, &caller("u-new"), PreviewRequest::Refresh)
                 .await,
-            Err(RateLimited),
-            "the surface limit still applies once its own quota is used"
+            "the surface limit still applies once its own quota is used",
         );
     }
 

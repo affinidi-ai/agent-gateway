@@ -288,17 +288,20 @@ async fn managed_agent_received_card_fetch(
     }
 }
 
-#[then(expr = "the agent card preview response tells the operator to retry in {int} seconds")]
+#[then(expr = "the agent card preview response tells the operator to retry within {int} seconds")]
 fn preview_response_retry_after(
     world: &mut SurfaceWorld,
     seconds: u64,
 ) {
-    assert_eq!(
-        preview(world)
-            .headers
-            .get("retry-after"),
-        Some(&seconds.to_string())
-    );
+    let header = preview(world)
+        .headers
+        .get("retry-after")
+        .cloned();
+    let wait: u64 = header
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("a numeric retry-after header, got {header:?}"));
+    assert!((1..=seconds).contains(&wait), "retry-after {wait} is not within 1 to {seconds} seconds");
 }
 
 fn audit_lines(world: &SurfaceWorld) -> Vec<String> {

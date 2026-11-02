@@ -1720,7 +1720,7 @@ struct CardPreviewCaller<'a> {
     user_id: &'a str,
 }
 
-const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a minute";
+const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
 
 /// The agent card preview of a surface the caller may read, or for a refresh,
 /// change. A surface of another tenant is `404`, never its card, and a tenant token
@@ -1770,11 +1770,11 @@ async fn agent_card_preview(
         .await
     {
         Ok(preview) => Ok(Json(preview).into_response()),
-        Err(RateLimited) => {
+        Err(RateLimited { retry_after_secs }) => {
             warn!(surface_id = %surface.surface_id, "Agent card preview refused: fetch limit reached");
             Ok((
                 StatusCode::TOO_MANY_REQUESTS,
-                [(axum::http::header::RETRY_AFTER, "60")],
+                [(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())],
                 Json(serde_json::json!({"error": CARD_FETCH_LIMITED, "code": "rate_limited"})),
             )
                 .into_response())

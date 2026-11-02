@@ -705,7 +705,7 @@ describe('AgentCardTab, Refresh', () => {
     await waitFor(() =>
       expect(showToast).toHaveBeenCalledWith(
         'warning',
-        'Too many card refreshes. Try again in a minute.'
+        'Too many card refreshes. Wait a few seconds and try again.'
       )
     );
     expect(screen.getByTestId('agent-card-summary')).toBeInTheDocument();

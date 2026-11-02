@@ -78,13 +78,13 @@ Feature: Agent card preview
     Then the agent card preview answers 403
     And managed agent "bravo" received 0 requests
 
-  Scenario: The eleventh refresh in a minute is refused
+  Scenario: The eleventh refresh in a burst is refused
     Given managed agent "bravo" serves an Agent Card that names its own address
     And the operator has refreshed the agent card preview 10 times, each answered with 200
     When the operator refreshes the agent card preview of the surface
     Then the agent card preview answers 429
     And the agent card preview field "code" is "rate_limited"
-    And the agent card preview response tells the operator to retry in 60 seconds
+    And the agent card preview response tells the operator to retry within 6 seconds
     And managed agent "bravo" received 10 requests
 
   Scenario: A read after the refresh limit answers with the last preview

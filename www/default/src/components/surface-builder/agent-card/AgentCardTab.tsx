@@ -192,7 +192,7 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({
       setAnnouncement(refreshAnnouncement(result.preview));
       onRefreshed?.();
     } else if (result.kind === 'rate_limited') {
-      showToast('warning', 'Too many card refreshes. Try again in a minute.');
+      showToast('warning', 'Too many card refreshes. Wait a few seconds and try again.');
     } else if (result.kind === 'forbidden') {
       showToast('error', 'You need permission to edit surfaces to refresh the card.');
     } else if (result.kind === 'error') {

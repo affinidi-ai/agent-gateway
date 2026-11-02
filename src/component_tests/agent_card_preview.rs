@@ -395,13 +395,13 @@ async fn the_eleventh_refresh_is_refused_and_a_read_answers_with_the_last_previe
         .send(admin.refresh(&admin.client, &surface_id))
         .await;
     assert_eq!(status, 429, "{body}");
-    assert_eq!(body, json!({"error": "Too many card fetches; try again in a minute", "code": "rate_limited"}));
-    assert_eq!(
-        headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok()),
-        Some("60")
-    );
+    assert_eq!(body, json!({"error": "Too many card fetches; try again in a few seconds", "code": "rate_limited"}));
+    let retry_after: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("a numeric Retry-After");
+    assert!((1..=6).contains(&retry_after), "Retry-After is {retry_after}, not the 60 of a full minute");
     let requests = answering
         .request_count
         .load(Ordering::SeqCst);

@@ -124,10 +124,11 @@ When a fetch fails, `after` is the last good card the preview built for the same
 on this replica, for up to 10 minutes after that fetch, and `null` once the surface changed.
 The gateway does not serve that card to callers while the fetch fails.
 
-Each user, and each surface, may start 10 fetches a minute on a replica. Past either limit a
-`GET` answers with the last preview of the same running surface, marked `cached`; a refresh, or
-a `GET` without one, is `429` with `Retry-After: 60` and
-`{"error": "Too many card fetches; try again in a minute", "code": "rate_limited"}`.
+Each user, and each surface, may start a burst of 10 fetches on a replica, then one every 6
+seconds. Past either limit a `GET` answers with the last preview of the same running surface,
+marked `cached`; a refresh, or a `GET` without one, is `429` with `Retry-After` set to the whole
+seconds (1 to 6) until the next fetch is allowed and
+`{"error": "Too many card fetches; try again in a few seconds", "code": "rate_limited"}`.
 
 For payload-derived managed identity, the Gateway reads configured fields from the identity
 extension metadata, sorts them by field path, joins them as `key=value` pairs with `|`, and hashes
