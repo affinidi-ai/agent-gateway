@@ -177,7 +177,7 @@ fn agent_card_credential_did(card: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn forwarded_binding_did(h: &GatewayHarness) -> String {
+pub(super) fn forwarded_binding_did(h: &GatewayHarness) -> String {
     let received = h
         .mock
         .last_request_rx

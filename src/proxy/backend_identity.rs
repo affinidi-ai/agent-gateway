@@ -524,6 +524,27 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
+                if slot == IdentitySlot::Protected && surface.stores_inbound_api_key_of(cfg) {
+                    match vc_issuer
+                        .take_over_legacy_caller_api_key(&identity_hash, &surface.surface_id)
+                        .await
+                    {
+                        Ok(crate::identity::LegacyCallerTakeover::TakenOver) => {
+                            crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                                channel_name,
+                                mode_label,
+                                "legacy_role_restamped",
+                                started
+                                    .elapsed()
+                                    .as_secs_f64(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(channel = channel_name, error = %e, "Failed to take over the legacy inbound API key identity");
+                        }
+                    }
+                }
                 match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
                     .await
                 {
@@ -561,6 +582,8 @@ pub async fn resolve_agent_identity_for_slot(
                             mode_label,
                             if role_clash {
                                 "role_clash"
+                            } else if e.is::<crate::identity::IdentityOriginUnavailable>() {
+                                "identity_origin_unavailable"
                             } else {
                                 "vc_issuer_error"
                             },
@@ -1260,6 +1283,104 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn protected_api_key_whose_role_cannot_be_recorded_is_unavailable() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
+            crate::identity::test_helpers::OriginFailingIdentityStore(
+                crate::identity::test_helpers::MockIdentityStore::new(),
+            ),
+        ))
+        .await;
+        let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_origin".to_string()),
+        };
+        let Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash }) =
+            crate::identity::credential_identity::derive_credential_identity(&config, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("API key identity is derived");
+        };
+        issuer
+            .issue_or_get_credential(identity_fields, Some(identity_hash), None, None)
+            .await
+            .unwrap();
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(config);
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-origin-unavailable",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        let err = resolved.unwrap_err();
+        assert!(matches!(err, IdentityResolutionError::IdentityBackendUnavailable(_)), "{err:?}");
+        assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let count = |result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["bi-origin-unavailable", "from_api_key", result])
+                .get()
+        };
+        assert_eq!(count("identity_origin_unavailable"), 1);
+        assert_eq!(count("vc_issuer_error"), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_api_key_the_inbound_slot_still_names_is_taken_over() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_bi_legacy", true, None)
+            .await
+            .unwrap();
+        let caller = issuer
+            .issue_or_get_caller_credential(fields, Some(hash), None, None)
+            .await
+            .unwrap();
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let legacy_key = crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_legacy".to_string()),
+        };
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(legacy_key.clone());
+        surface.identity_slots.inbound = Some(legacy_key);
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-legacy-restamp",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        match resolved.unwrap() {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, caller.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected the Managed Agent identity"),
+        }
+        let count = |result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["bi-legacy-restamp", "from_api_key", result])
+                .get()
+        };
+        assert_eq!(count("legacy_role_restamped"), 1);
+        assert_eq!(count("role_clash"), 0);
     }
 
     #[test]

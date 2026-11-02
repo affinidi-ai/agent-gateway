@@ -177,6 +177,23 @@ impl IdentityStore for MockIdentityStore {
                 .get_or_insert(origin),
         ))
     }
+
+    async fn replace_origin(
+        &self,
+        identity_hash: &str,
+        surface_id: &str,
+        from: IdentityOrigin,
+        to: IdentityOrigin,
+    ) -> Result<bool> {
+        let mut records = self.records.write().await;
+        match records.get_mut(identity_hash) {
+            Some(record) if record.origin == Some(from) && record.used_only_by(surface_id) => {
+                record.origin = Some(to);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// A [`MockIdentityStore`] that cannot record an identity origin.

@@ -305,9 +305,9 @@ receive does not read this mode; the request body sets the caller there (see
 - `input.extension_identity` and `input.agent.did`, `did_verified` and
   `did_verification` are the key's DID, replacing any DID or identity
   presentation in the request body.
-- When the body asserted a different DID, the trust-registry claims it made about
-  that DID are dropped: `provider_did`, `trust_registry_did`, `authority_did`,
-  `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
+- When the body does not assert the key's own DID, including when it names no DID,
+  the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
+  `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
   preset that reads `input.agent.provider_did` therefore denies unless the body
   asserts the key's own DID.
 - With no caller identity, such as after a failed key, `input.agent.did` is absent.

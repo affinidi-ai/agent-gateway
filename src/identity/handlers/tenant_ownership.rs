@@ -33,6 +33,7 @@ pub enum OwnershipApiError {
     Conflict(OwnershipConflictResponse),
     Refused(String),
     Internal(String),
+    Unavailable(String),
 }
 
 impl IntoResponse for OwnershipApiError {
@@ -56,6 +57,14 @@ impl IntoResponse for OwnershipApiError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": "Tenant ownership operation failed" })),
+                )
+                    .into_response()
+            }
+            Self::Unavailable(message) => {
+                tracing::error!(%message, "Tenant ownership operation unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "Tenant ownership operation unavailable" })),
                 )
                     .into_response()
             }
@@ -943,6 +952,7 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            let legacy_api_key_ids = super::surfaces::legacy_inbound_api_key_ids(&resource, &resource);
             super::surfaces::drop_inbound_api_key_ids(&mut resource);
             if resource.tenant_id != tenant_id {
                 resource.tenant_id = tenant_id;
@@ -958,6 +968,9 @@ async fn persist_tenant_id(
                     super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
                     other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
                 })?;
+            super::surfaces::take_over_legacy_inbound_api_keys(state, id, &legacy_api_key_ids)
+                .await
+                .map_err(OwnershipApiError::Unavailable)?;
             let allowlist = crate::egress::bdd_egress_allowlist();
             super::surface_grants::write_surface(
                 &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),

@@ -20,40 +20,34 @@ changes:
         key it presents." instead of a key picker, and Save never sends an inbound key id. Save
         is blocked unless the first Caller Context method is API Key or API Key Provider. The
         protected and external Identities keep the key picker.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Give concurrent first requests for one identity the same DID
+      description: >-
+        Concurrent first requests for an identity with no record could each mint a different
+        DID. The identity record is now created only if none exists for its hash, under a lock
+        on that record, so every concurrent first request gets the one stored DID and an API
+        key's record keeps the role it was first used in.
   removed: []
   security:
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Stop a body-asserted DID or presentation overriding the API key identity
-      description: >-
-        On a direct request to a surface whose inbound Identity is From API Key, the presented
-        key's DID replaces any identity the request body asserts, so a key holder cannot choose
-        another DID. `input.agent.did` and its verification are the key's DID, and
-        trust-registry claims the body made about another DID are dropped. Fabric receive does
-        not read this mode; the request body sets the caller there.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse plain API Key secret ids that start with the reserved atgk_ prefix
       description: >-
         A plain API Key secret id starting `atgk_` would derive the same caller DID as the API
         Key Provider key with that id. Saving such a surface with an inbound From API Key
         Identity is refused with 400, and a stored one is refused at request time with 500.
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Refuse one API key identifying both a Managed Agent and a caller
-      description: >-
-        A caller could otherwise share a Managed Agent's DID and the trust attached to it. Save
-        refuses a surface that names one key in both roles, and a key used in the other role
-        on any surface is refused at request time with 500 (metric `role_clash`). An API key's
-        identity record keeps the role it was first issued for.
   breaking:
-    - timestamp: '2026-10-31T00:00:00Z'
+    - timestamp: '2026-11-02T00:00:00Z'
       title: Fail closed when an inbound From API Key caller does not use an API key
       description: >-
         An inbound From API Key Identity behind caller authentication that is not API Key or
         API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
         it, on the surface or an enabled variant, is refused with 400, as is combining it with
         `mcp_http.authorization`. A missing VC issuer returns 500 and an issuance failure 502.
-        When an existing API key identity record has no role and the role cannot be stored,
-        the caller and Managed Agent paths both return 503 (metric
-        `identity_origin_unavailable`).
+        When an API key identity record has no role and the role cannot be recorded, the
+        request returns 503 (metric `identity_origin_unavailable`) on the caller path, the
+        Managed Agent fallback, the Managed Agent's response and a Transit Point's outbound
+        request. Find affected surfaces through `agent_gateway_managed_identity_resolve_total`
+        with `mode="from_api_key"` and `result` `api_key_unavailable`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching
       description: >-
@@ -64,27 +58,37 @@ changes:
         Caller Context secret id, callers now get that secret's DID instead of the stored
         key's, and the stored id is dropped on save. Re-grant or update rules for the affected
         keys.
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Refuse surfaces that use one API key as both Managed Agent and caller
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Refuse one API key identifying both a Managed Agent and a caller
       description: >-
-        An existing surface whose Managed Agent `api_key_id` equals a caller key (the external
-        Identity's key or the plain API Key secret id) is refused with 400 on its next save.
-        At request time, whichever role resolves the key second gets 500 (metric
-        `role_clash`), on the caller path and on the Managed Agent path alike.
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Stop a body presentation setting the caller DID on From API Key surfaces
+        A caller could otherwise share a Managed Agent's DID and the trust attached to it.
+        Save refuses with 400 a surface that names one key in both roles, such as a Managed
+        Agent `api_key_id` equal to the external Identity's key or the plain API Key secret
+        id. An API key's identity record keeps the role it was first used in, and whichever
+        role resolves the key second, on any surface, gets 500 (metric `role_clash`), on the
+        caller path and the Managed Agent paths alike. To recover, issue a new API key for the
+        refused role. When a surface still stores an inbound key id that is also its Managed
+        Agent or a Transit Point key, the Managed Agent takes over that key's caller record
+        once, keeping its DID, at request time or when the surface is saved or reassigned,
+        provided no other surface has used the record (metric `legacy_role_restamped`). A save
+        or reassignment returns 503 and keeps the stored id when the identity or secrets store
+        fails during the takeover. Find affected surfaces through
+        `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
+        `role_clash`.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Make the presented API key's DID replace any body-asserted caller identity
       description: >-
-        On a surface whose inbound Identity is From API Key, a presentation or credential
-        extension in the request body no longer sets the caller DID, so policies naming the
-        presentation's DID stop matching.
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Drop body trust-registry claims about another DID on From API Key surfaces
-      description: >-
-        `provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
-        `agent_dna` and trust verifications the body asserts about a DID other than the key's
-        are dropped. Trust Check presets that read `input.agent.provider_did` deny unless the
-        body asserts the key's own DID. Gateway and global policy see no `input.agent.did` on
-        these surfaces.
+        On a direct request to a surface whose inbound Identity is From API Key, the presented
+        key's DID replaces any identity the request body asserts, so a key holder cannot choose
+        another DID. `input.agent.did` and its verification are the key's DID, and a
+        presentation or credential extension in the body no longer sets the caller DID, so
+        policies naming the presentation's DID stop matching. When the body does not assert
+        the key's own DID, the trust-registry claims it made (`provider_did`,
+        `trust_registry_did`, `authority_did`, `identity_issuer_did`, `agent_dna` and trust
+        verifications) are dropped, so Trust Check presets that read
+        `input.agent.provider_did` deny. Gateway and global policy see no `input.agent.did`
+        on these surfaces. Fabric receive does not read this mode; the request body sets the
+        caller there.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse From API Key on an MCP proxy:// surface when it is saved again
       description: >-

@@ -1923,6 +1923,35 @@ allow if {
     }
 
     #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_without_naming_a_did() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_keeps_what_the_body_asserted_when_no_did_is_named_or_resolved() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(None);
+
+        assert_eq!(agent.did, None);
+        assert_eq!(
+            agent
+                .trust_registry_did
+                .as_deref(),
+            Some("did:web:registry.example")
+        );
+        assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
+        assert_eq!(agent.authority_did.as_deref(), Some("did:web:authority.example"));
+    }
+
+    #[test]
     fn bind_caller_did_keeps_what_the_body_asserted_about_the_same_did() {
         let mut agent = agent_with_body_assertions("did:webvh:caller");
 

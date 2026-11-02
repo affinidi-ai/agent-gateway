@@ -160,6 +160,150 @@ pub(crate) fn drop_inbound_api_key_ids(surface: &mut AgentSurface) {
     }
 }
 
+/// The inbound API key ids `stored` still holds that `saved` also uses as its
+/// Managed Agent or a Transit Point key, across the base and every variant.
+pub(crate) fn legacy_inbound_api_key_ids(
+    stored: &AgentSurface,
+    saved: &AgentSurface,
+) -> Vec<String> {
+    use crate::source_auth::ManagedIdentityConfig::FromApiKey;
+    let key_of = |identity: Option<&crate::source_auth::ManagedIdentityConfig>| match identity {
+        Some(FromApiKey { api_key_id: Some(id) }) => Some(id.clone()),
+        _ => None,
+    };
+    let variant_slots = |surface: &AgentSurface| {
+        surface
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .identity_slots
+                    .clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    let variant_points = saved
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+        })
+        .flatten();
+    let managed_keys: Vec<String> = std::iter::once(key_of(
+        saved
+            .managed_identity()
+            .as_ref(),
+    ))
+    .chain(
+        saved
+            .transit_points()
+            .iter()
+            .chain(variant_points)
+            .map(|point| {
+                key_of(
+                    point
+                        .managed_identity
+                        .as_ref(),
+                )
+            }),
+    )
+    .chain(
+        variant_slots(saved)
+            .iter()
+            .map(|slots| key_of(slots.protected.as_ref())),
+    )
+    .flatten()
+    .collect();
+    let mut legacy: Vec<String> = std::iter::once(key_of(
+        stored
+            .identity_slots
+            .inbound
+            .as_ref(),
+    ))
+    .chain(
+        variant_slots(stored)
+            .iter()
+            .map(|slots| key_of(slots.inbound.as_ref())),
+    )
+    .flatten()
+    .filter(|id| managed_keys.contains(id))
+    .collect();
+    legacy.sort_unstable();
+    legacy.dedup();
+    legacy
+}
+
+fn legacy_takeover_unavailable(detail: String) -> SurfaceApiError {
+    error!(error = %detail, "Legacy inbound API key takeover failed");
+    SurfaceApiError::Unavailable("The identity store is unavailable; retry the save".to_string())
+}
+
+/// Re-stamp as managed, once, each API key identity in `api_key_ids` that the
+/// inbound slot of `surface_id` recorded as a caller. Errors when the identity
+/// store or a key's secret cannot be read, so the save keeps the stored id the
+/// runtime takeover reads.
+pub(crate) async fn take_over_legacy_inbound_api_keys(
+    state: &IdentityApiState,
+    surface_id: &str,
+    api_key_ids: &[String],
+) -> Result<(), String> {
+    use crate::identity::LegacyCallerTakeover;
+    for api_key_id in api_key_ids {
+        let started = std::time::Instant::now();
+        let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some(api_key_id.clone()),
+        };
+        let identity_hash = match crate::identity::credential_identity::derive_credential_identity(
+            &config,
+            state
+                .certificate_store
+                .as_ref(),
+            state.secrets_store.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_hash, .. })) => {
+                identity_hash
+            }
+            Ok(_) => continue,
+            Err(e)
+                if e.classify()
+                    == crate::identity::credential_identity::CredentialIdentityErrorClass::BackendUnavailable =>
+            {
+                return Err(format!("legacy inbound API key identity could not be derived: {e}"));
+            }
+            Err(e) => {
+                warn!(surface_id, error = %e, "Legacy inbound API key identity could not be derived — not taken over");
+                continue;
+            }
+        };
+        let outcome = state
+            .vc_issuer
+            .take_over_legacy_caller_api_key(&identity_hash, surface_id)
+            .await
+            .map_err(|e| format!("legacy inbound API key identity could not be taken over: {e}"))?;
+        let result = match outcome {
+            LegacyCallerTakeover::TakenOver => "legacy_role_restamped",
+            LegacyCallerTakeover::SharedWithAnotherSurface => "role_clash",
+            LegacyCallerTakeover::NotApplicable => continue,
+        };
+        crate::metrics::backends::prometheus::track_managed_identity_resolve(
+            surface_id,
+            "from_api_key",
+            result,
+            started
+                .elapsed()
+                .as_secs_f64(),
+        );
+    }
+    Ok(())
+}
+
 fn configured_api_key_id<'a>(
     identity: Option<&'a crate::source_auth::ManagedIdentityConfig>,
     slot: &str,
@@ -3407,6 +3551,11 @@ async fn validate_and_save_surface(
     let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
+    if let Some(stored) = existing {
+        take_over_legacy_inbound_api_keys(state, &surface.surface_id, &legacy_inbound_api_key_ids(stored, &surface))
+            .await
+            .map_err(legacy_takeover_unavailable)?;
+    }
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
         store.clone(),
@@ -7094,6 +7243,14 @@ mod validation_tests {
     }
 
     #[test]
+    fn inbound_from_api_key_refusal_matches_the_dashboard_text() {
+        assert_eq!(
+            INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+            "Identity 'From API Key' needs an API Key or API Key Provider as the first Caller Context method"
+        );
+    }
+
+    #[test]
     fn inbound_from_api_key_is_refused_unless_the_first_caller_method_is_an_api_key() {
         for (case, caller) in [
             ("no caller authentication", vec![]),
@@ -7301,6 +7458,56 @@ mod validation_tests {
             assert_eq!(slots.inbound, from_api_key(None), "{}", variant.alias);
             assert_eq!(slots.protected, from_api_key(Some("variant-managed-key")), "{}", variant.alias);
         }
+    }
+
+    #[test]
+    fn legacy_inbound_api_key_ids_are_the_stored_inbound_keys_the_saved_surface_manages() {
+        let mut stored = base_surface();
+        stored.identity_slots.inbound = from_api_key(Some("managed-key"));
+        let mut variant = variant_with_caller("legacy", false, &[provider_caller()]);
+        variant
+            .overrides
+            .identity_slots = Some(crate::config::agent_surface::SurfaceIdentitySlots {
+            inbound: from_api_key(Some("transit-key")),
+            protected: None,
+            external: None,
+        });
+        stored.variants.push(variant);
+
+        let mut saved = with_transit(
+            base_surface(),
+            serde_json::json!({ "points": [{
+                "alias": "tp",
+                "target_endpoint": "https://partner.example",
+                "managed_identity": { "type": "from_api_key", "api_key_id": "transit-key" }
+            }] }),
+        );
+        saved.identity_slots.protected = from_api_key(Some("managed-key"));
+        assert_eq!(legacy_inbound_api_key_ids(&stored, &saved), vec!["managed-key", "transit-key"]);
+
+        saved.identity_slots.protected = from_api_key(Some("other-key"));
+        let base_points = saved
+            .transit
+            .take()
+            .unwrap()
+            .points;
+        assert!(legacy_inbound_api_key_ids(&stored, &saved).is_empty());
+
+        let mut variant = variant_with_caller("variant-points", true, &[provider_caller()]);
+        variant.overrides.transit = Some(crate::config::agent_surface_variants::TransitOverrides {
+            points: Some(base_points),
+            ..Default::default()
+        });
+        saved.variants.push(variant);
+        assert_eq!(legacy_inbound_api_key_ids(&stored, &saved), vec!["transit-key"]);
+        saved.variants.clear();
+
+        let mut no_stored_id = base_surface();
+        no_stored_id
+            .identity_slots
+            .inbound = from_api_key(None);
+        saved.identity_slots.protected = from_api_key(Some("managed-key"));
+        assert!(legacy_inbound_api_key_ids(&no_stored_id, &saved).is_empty());
     }
 
     /// Attach a transit config (parsed from JSON for brevity) to a surface.

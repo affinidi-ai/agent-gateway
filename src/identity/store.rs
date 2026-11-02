@@ -20,6 +20,22 @@ pub trait IdentityStore: Send + Sync {
         record: filesystem::AgentIdentityRecord,
     ) -> Result<()>;
 
+    /// Create `record` unless a record already exists for its hash. Returns the
+    /// existing record when one does, `None` when `record` was created.
+    async fn create_if_absent(
+        &self,
+        record: filesystem::AgentIdentityRecord,
+    ) -> Result<Option<filesystem::AgentIdentityRecord>> {
+        if let Some(existing) = self
+            .find_by_hash(&record.identity_hash)
+            .await?
+        {
+            return Ok(Some(existing));
+        }
+        self.create(record).await?;
+        Ok(None)
+    }
+
     /// List all stored identities
     async fn list_all(&self) -> Result<Vec<filesystem::AgentIdentityRecord>>;
 
@@ -57,6 +73,19 @@ pub trait IdentityStore: Send + Sync {
         _origin: filesystem::IdentityOrigin,
     ) -> Result<Option<filesystem::IdentityOrigin>> {
         Ok(None)
+    }
+
+    /// Change the record's origin from `from` to `to`, only from `from` and only
+    /// while no surface other than `surface_id` has used the record. Returns
+    /// whether the origin changed.
+    async fn replace_origin(
+        &self,
+        _identity_hash: &str,
+        _surface_id: &str,
+        _from: filesystem::IdentityOrigin,
+        _to: filesystem::IdentityOrigin,
+    ) -> Result<bool> {
+        anyhow::bail!("this identity store cannot change an identity origin")
     }
 
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.
