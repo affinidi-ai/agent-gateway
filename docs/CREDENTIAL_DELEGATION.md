@@ -1348,7 +1348,9 @@ vault removes ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.r
 While `AG_IDENTITY_HASH_PEPPER` is not set, or the grants stored were written under another
 pepper ([Grants by binding](#grants-by-binding)), every grant's id differs from the one the
 gateway derives, so the sweep removes no grant at all and logs a warning: a lost or mistyped
-pepper on one node never deletes or revokes the grants. Restore the pepper they were written
+pepper on one node never deletes or revokes the grants. When the pepper fingerprint file is
+missing while grants are stored, the sweep goes ahead only once a grant it can read has the id
+the gateway's pepper derives for it. Restore the pepper they were written
 under, or [purge them](#removing-grants). Pending connects and kept revocations are still swept.
 
 Each grant removed is revoked, as every removal is. The sweep also decides the revocations a

@@ -656,6 +656,27 @@ impl FileSystemDelegationVaultStore {
         }
     }
 
+    /// With no fingerprint recorded, whether this pepper is the one the grants
+    /// stored were written under: true when none is stored, or one that can be
+    /// read has the id this pepper derives for it. A fingerprint lost with
+    /// grants beside it, under a wrong pepper, then never passes for ours.
+    async fn a_stored_grant_has_this_peppers_id(&self) -> Result<bool> {
+        let ids = self
+            .grant_ids_with_prefix("")
+            .await?;
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        for id in ids {
+            if let Ok(Some(grant)) = self.grants.get(&id).await
+                && grant.key().record_id() == grant.id
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether grants are stored that were written under another pepper.
     async fn pepper_mismatch(&self) -> Result<bool> {
         Ok(self.stored_pepper().await? == StoredPepper::Another
@@ -1447,7 +1468,20 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     }
 
     async fn derives_stored_grant_ids(&self) -> Result<bool> {
-        Ok(self.stable_grant_ids && !self.pepper_mismatch().await?)
+        if !self.stable_grant_ids {
+            return Ok(false);
+        }
+        match self.stored_pepper().await? {
+            StoredPepper::Ours => Ok(true),
+            StoredPepper::Another => Ok(self
+                .grant_ids_with_prefix("")
+                .await?
+                .is_empty()),
+            StoredPepper::Unrecorded => {
+                self.a_stored_grant_has_this_peppers_id()
+                    .await
+            }
+        }
     }
 
     async fn grant_by_id(

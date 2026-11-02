@@ -195,5 +195,7 @@ changes:
         grants of an earlier pepper, so a node started without AG_IDENTITY_HASH_PEPPER, or with
         the wrong one, deleted every grant and revoked its tokens at the vendors ten minutes after
         start, in a shared vault for every node. While the pepper is unset, or grants written
-        under another are stored, the sweep now removes no grant and logs a warning.
+        under another are stored, the sweep now removes no grant and logs a warning. That holds
+        when the pepper fingerprint file is lost too: the sweep then goes ahead only once a stored
+        grant it can read has the id the gateway's pepper derives for it.
   breaking: []

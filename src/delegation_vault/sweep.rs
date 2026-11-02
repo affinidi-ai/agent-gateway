@@ -620,14 +620,16 @@ mod tests {
         assert!(!became_active(&Err(RecvError::Closed)));
     }
 
-    /// While the grants stored were written under another pepper, or no
-    /// pepper is set, every grant's id differs from the one this gateway
-    /// derives: the sweep removes and revokes none of them, whatever else it
-    /// would remove them for. With the pepper restored it sweeps as before.
+    /// While the grants stored were written under another pepper, recorded
+    /// or not, or no pepper is set, every grant's id differs from the one this
+    /// gateway derives: the sweep removes and revokes none of them, whatever
+    /// else it would remove them for. With the pepper restored it sweeps as
+    /// before, with its fingerprint lost or not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_sweep_removes_no_grant_while_the_pepper_is_not_the_grants() {
         let directory = tempfile::tempdir().unwrap();
         let server = RecordingServer::start(200).await;
+        crate::identity::credential_identity::configure_pepper_bytes_for_tests(&[1; 32]);
         let mut sweeper = sweeper(&directory, &server, false).await;
         store(&sweeper, &GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor"), "served", 3600).await;
         store(&sweeper, &GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor"), "unbound", 3600).await;
@@ -668,6 +670,17 @@ mod tests {
             "no pepper set"
         );
 
+        std::fs::remove_file(&fingerprint).unwrap();
+        crate::identity::credential_identity::configure_pepper_bytes_for_tests(&[2; 32]);
+        sweeper.vault = open(true).await;
+        assert_eq!(
+            sweeper
+                .sweep(Utc::now())
+                .await,
+            SweepReport::default(),
+            "another pepper, its fingerprint lost"
+        );
+
         assert_eq!(
             sweeper
                 .vault
@@ -679,11 +692,13 @@ mod tests {
         );
         assert!(server.requests().is_empty(), "nothing was revoked");
 
+        crate::identity::credential_identity::configure_pepper_bytes_for_tests(&[1; 32]);
         sweeper.vault = open(true).await;
         let report = sweeper
             .sweep(Utc::now())
             .await;
-        assert_eq!(report.unbound_grants, 1, "with the pepper restored");
+        assert_eq!(report.unbound_grants, 1, "with the pepper restored, its fingerprint still lost");
+        assert_eq!(report.earlier_pepper_grants, 0);
         assert_eq!(
             sweeper
                 .vault
