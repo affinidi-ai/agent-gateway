@@ -778,6 +778,16 @@ fn validate_transit_points(
     }
     refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface, stored)?;
+    for variant in &mut surface.variants {
+        if let Some(points) = variant
+            .overrides
+            .transit
+            .as_mut()
+            .and_then(|transit| transit.points.as_mut())
+        {
+            identify_transit_points(points, &format!("variant '{}' ", variant.alias))?;
+        }
+    }
     let Some(transit) = surface.transit.as_mut() else {
         return Ok(());
     };
@@ -791,22 +801,29 @@ fn validate_transit_points(
             .validate_transit_token_lifetime(max_lifetime_secs)
             .map_err(SurfaceApiError::BadRequest)?;
     }
-    let mut seen = std::collections::HashSet::with_capacity(transit.points.len());
-    for (idx, tp) in transit
-        .points
-        .iter_mut()
-        .enumerate()
-    {
+    identify_transit_points(&mut transit.points, "")
+}
+
+/// Give each Transit Point of one list, the surface's or a variant's (named by
+/// `place`), an id when it has none, and refuse an alias that is not URL-safe
+/// or that another point of the list has.
+fn identify_transit_points(
+    points: &mut [crate::config::agent_surface::TransitPoint],
+    place: &str,
+) -> Result<(), SurfaceApiError> {
+    let mut seen = std::collections::HashSet::with_capacity(points.len());
+    for (idx, tp) in points.iter_mut().enumerate() {
         if tp.id.is_empty() {
             tp.id = uuid::Uuid::new_v4().to_string();
         }
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
-            return Err(SurfaceApiError::BadRequest(format!("transit.points[{}]: {}", idx, msg)));
+            return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
         if !seen.insert(tp.alias.clone()) {
             return Err(SurfaceApiError::BadRequest(format!(
-                "transit.points[{}]: duplicate alias '{}'. Each transit point alias must be unique within the surface.",
-                idx, tp.alias
+                "{place}transit.points[{idx}]: duplicate alias '{}'. Each transit point alias must be unique within \
+                 the surface.",
+                tp.alias
             )));
         }
     }
@@ -5574,6 +5591,60 @@ mod validation_tests {
                 "require_transit_token": false, "source_auth": caller_key() }]),
         );
         assert!(validate_transit_points(&mut open, 30, None).is_ok());
+    }
+
+    /// A variant's own Transit Points get an id when sent without one, as the
+    /// surface's do, so a grant by binding never sits under an empty id, and
+    /// their aliases follow the same rules within the variant's list.
+    #[test]
+    fn a_variants_transit_points_get_ids_and_checked_aliases() {
+        let point = |alias: &str| {
+            serde_json::json!({ "id": "", "alias": alias, "target_endpoint": "https://partner.example",
+                "require_transit_token": true })
+        };
+        let mut surface = surface_with_transit_points(
+            serde_json::json!([point("partner")]),
+            serde_json::json!([point("partner"), point("vendor")]),
+        );
+        validate_transit_points(&mut surface, 30, None).unwrap();
+        let ids: Vec<&str> = surface.variants[0]
+            .overrides
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect();
+        assert!(
+            ids.iter()
+                .all(|id| !id.is_empty()),
+            "{ids:?}"
+        );
+        assert_ne!(ids[0], ids[1]);
+
+        for (case, variant_points, expected) in [
+            (
+                "a duplicate alias",
+                serde_json::json!([point("vendor"), point("vendor")]),
+                "variant 'candidate' transit.points[1]: duplicate alias 'vendor'",
+            ),
+            (
+                "an alias that is not URL-safe",
+                serde_json::json!([point("no spaces")]),
+                "variant 'candidate' transit.points[0]: ",
+            ),
+        ] {
+            let mut surface = surface_with_transit_points(serde_json::json!([]), variant_points);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.starts_with(expected), "{case}: {message}")
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+        }
     }
 
     /// A save refuses `transit_token_mode: reference`, on the surface or in a

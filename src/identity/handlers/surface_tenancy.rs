@@ -317,6 +317,16 @@ fn check_external_transit_point_ids(surface: &AgentSurface) -> Result<(), Surfac
     for (prefix, points) in &lists {
         let mut seen = HashSet::new();
         for (index, point) in points.iter().enumerate() {
+            let binds_externally = point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external());
+            if binds_externally && point.id.is_empty() {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{index}]: a Transit Point with consent_mode external needs an id, which \
+                     its grants are kept under"
+                )));
+            }
             if !external.contains(point.id.as_str()) {
                 continue;
             }
@@ -1531,6 +1541,18 @@ mod tests {
                 "a second point with the same id",
                 surface_with_points(serde_json::json!([vendor_point(owner.clone()), second]), none.clone(), None),
                 "transit.points[1]: the id of a Transit Point with consent_mode external is used twice".to_string(),
+            ),
+            (
+                "a variant point with an empty id",
+                surface_with_points(
+                    none.clone(),
+                    none.clone(),
+                    Some(serde_json::json!([{
+                    "id": "", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                    "require_transit_token": true, "transit_credentials": owner.clone()}])),
+                ),
+                "variant 'candidate' transit.points[0]: a Transit Point with consent_mode external needs an id"
+                    .to_string(),
             ),
             (
                 "a variant keeping the identical point",
