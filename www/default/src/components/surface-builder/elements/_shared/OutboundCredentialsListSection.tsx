@@ -16,6 +16,7 @@ interface CredentialProviderOption {
   name: string;
   provider_id?: string;
   provider_type?: string;
+  issuer?: string | null;
   callback_url?: string;
   tenant_id?: string | null;
 }

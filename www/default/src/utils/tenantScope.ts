@@ -11,9 +11,14 @@ export type OwnerTenant = string | null | undefined;
 /**
  * An authorization code provider sends the user's own token, so the gateway lets a tenant
  * surface keep using an appliance-wide one; every other type sends the gateway's credential.
+ * A provider with an issuer (external consent) is held to the tenant rule like those: the
+ * gateway refuses an appliance-wide one outside its own tenant.
  */
-export function sendsGatewayCredential(provider: { provider_type?: string }): boolean {
-  return provider.provider_type !== 'oauth2_authorization_code';
+export function sendsGatewayCredential(provider: {
+  provider_type?: string;
+  issuer?: string | null;
+}): boolean {
+  return provider.provider_type !== 'oauth2_authorization_code' || Boolean(provider.issuer);
 }
 
 /** Appliance-wide items a tenant owner may still use, beside its own. */

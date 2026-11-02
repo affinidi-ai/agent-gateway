@@ -17,6 +17,17 @@ const providers = [
   { id: 'wide-cc', provider_type: 'oauth2_client_credentials' },
   { id: 'other-code', provider_type: 'oauth2_authorization_code', tenant_id: 'other' },
   { id: 'acme-cc', provider_type: 'oauth2_client_credentials', tenant_id: 'acme' },
+  {
+    id: 'wide-issuer',
+    provider_type: 'oauth2_authorization_code',
+    issuer: 'https://issuer.example',
+  },
+  {
+    id: 'acme-issuer',
+    provider_type: 'oauth2_authorization_code',
+    issuer: 'https://issuer.example',
+    tenant_id: 'acme',
+  },
 ];
 
 const userTokenProvider = (p: { provider_type?: string }) => !sendsGatewayCredential(p);
@@ -41,8 +52,8 @@ describe('tenantScope', () => {
 
   it('offers a tenant the appliance-wide items the gateway still accepts', () => {
     const { offered, outside } = splitByTenant(providers, 'acme', userTokenProvider);
-    expect(offered.map(p => p.id)).toEqual(['wide-code', 'acme-cc']);
-    expect(outside.map(p => p.id)).toEqual(['wide-cc', 'other-code']);
+    expect(offered.map(p => p.id)).toEqual(['wide-code', 'acme-cc', 'acme-issuer']);
+    expect(outside.map(p => p.id)).toEqual(['wide-cc', 'other-code', 'wide-issuer']);
   });
 
   it('never offers another tenant an item through the appliance-wide allowance', () => {
@@ -55,6 +66,12 @@ describe('tenantScope', () => {
     expect(sendsGatewayCredential({ provider_type: 'oauth2_client_credentials' })).toBe(true);
     expect(sendsGatewayCredential({ provider_type: 'oauth2_jwt_bearer' })).toBe(true);
     expect(sendsGatewayCredential({ provider_type: 'api_key' })).toBe(true);
+    expect(
+      sendsGatewayCredential({
+        provider_type: 'oauth2_authorization_code',
+        issuer: 'https://issuer.example',
+      })
+    ).toBe(true);
   });
 
   it('labels out-of-tenant items by what the gateway does with them', () => {
