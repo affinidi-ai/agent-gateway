@@ -27,6 +27,7 @@ mod mcp_sandbox_e2e;
 mod mcp_subscription_scope;
 mod mtls;
 mod multi_method_source_auth_e2e;
+mod provider_key_gate_e2e;
 mod request_body_bounds_e2e;
 mod stored_reference_transit_token_e2e;
 mod target_auth_provider_e2e;

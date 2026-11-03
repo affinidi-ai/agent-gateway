@@ -979,6 +979,12 @@ async fn outbound_proxy_handler_in_request_scope(
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
     let mut ctx = OutboundPipelineContext::new(addr, req, &state, versions)?;
+    if crate::identity::provider_key_gate::gate()
+        .refuses(&ctx.surface)
+        .await
+    {
+        return Err(OutboundPipelineError::TransitPointUnavailable { mcp_request_id: None });
+    }
     if let Some(refusal) = ctx
         .pending_variant_refusal
         .take()

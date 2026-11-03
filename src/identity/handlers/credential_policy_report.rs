@@ -718,15 +718,22 @@ mod tests {
         assert_eq!(
             warn,
             vec![
-                ("cross".to_string(), "other_tenant", true),
-                ("tenant-key-wide".to_string(), "other_tenant", true),
+                ("cross".to_string(), "other_tenant", false),
+                ("tenant-key-wide".to_string(), "other_tenant", false),
                 ("appliance-key".to_string(), "appliance_key", false),
                 ("missing-key".to_string(), "missing_key", false),
                 ("missing-owner".to_string(), "missing_owner", false),
             ]
         );
         let enforce = provider_key_findings(surfaces(), Some(&owners), RuleMode::Enforce);
-        assert_eq!(enforce[2], ("appliance-key".to_string(), "appliance_key", true));
+        assert_eq!(
+            enforce[..3],
+            [
+                ("cross".to_string(), "other_tenant", true),
+                ("tenant-key-wide".to_string(), "other_tenant", true),
+                ("appliance-key".to_string(), "appliance_key", true),
+            ]
+        );
         assert!(
             provider_key_findings(vec![naming("own", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
                 .is_empty()
@@ -747,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_caller_secret_shaped_like_another_tenants_key_is_reported() {
+    fn a_legacy_caller_secret_shaped_like_a_key_it_may_not_use_is_reported() {
         use crate::config::credential_policy::RuleMode;
         let owners = key_owners();
         assert_eq!(
@@ -762,7 +769,10 @@ mod tests {
                 Some(&owners),
                 RuleMode::Enforce
             ),
-            vec![("legacy-cross".to_string(), "other_tenant", true)]
+            vec![
+                ("legacy-cross".to_string(), "other_tenant", true),
+                ("legacy-wide".to_string(), "appliance_key", true)
+            ]
         );
     }
 

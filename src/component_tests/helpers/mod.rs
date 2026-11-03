@@ -1465,11 +1465,15 @@ fn spawn_gateway_server(
         .spawn(move || {
             let _log = thread_log.capture_on_this_thread();
             crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+            let provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate =
+                Box::leak(Box::default());
+            crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024)
                 .on_thread_start(move || {
-                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone())
+                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+                    crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
                 })
                 .build()
                 .expect("build gateway harness runtime");

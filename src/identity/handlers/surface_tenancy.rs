@@ -1621,16 +1621,42 @@ fn collect_identity_injection_references(
 
 /// The API Key Provider key ids a surface derives a DID from, sorted and without duplicates.
 pub(crate) fn collect_provider_key_references(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
-    use crate::source_auth::ManagedIdentityConfig;
-    let mut keys = Vec::new();
-    let mut push = |identity: Option<&ManagedIdentityConfig>| {
-        if let Some(ManagedIdentityConfig::FromApiKey { api_key_id: Some(id) }) = identity
-            && id.starts_with(crate::api_keys::KEY_ID_PREFIX)
-        {
-            keys.push(id.clone());
-        }
-    };
-    for view in resolved_views(surface)? {
+    Ok(provider_key_ids(surface)?.keys)
+}
+
+/// The API Key Provider key ids a surface, or one of its views, derives a DID from (`keys`),
+/// and the Caller Context API Key `secret_id`s shaped like a key id on a view whose inbound
+/// Identity is From API Key (`legacy_secrets`), which a secret stored before the prefix was
+/// reserved can still carry. Both sorted and without duplicates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderKeyIds {
+    pub keys: Vec<String>,
+    pub legacy_secrets: Vec<String>,
+}
+
+impl ProviderKeyIds {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.legacy_secrets.is_empty()
+    }
+
+    pub(crate) fn all(&self) -> impl Iterator<Item = &String> + Clone {
+        self.keys
+            .iter()
+            .chain(&self.legacy_secrets)
+    }
+
+    fn add_view(
+        &mut self,
+        view: &AgentSurface,
+    ) {
+        use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+        let mut push = |identity: Option<&ManagedIdentityConfig>| {
+            if let Some(ManagedIdentityConfig::FromApiKey { api_key_id: Some(id) }) = identity
+                && id.starts_with(crate::api_keys::KEY_ID_PREFIX)
+            {
+                self.keys.push(id.clone());
+            }
+        };
         push(
             view.identity_slots
                 .protected
@@ -1658,18 +1684,63 @@ pub(crate) fn collect_provider_key_references(surface: &AgentSurface) -> Result<
                     .as_ref(),
             );
         }
+        if matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
+            for method in view
+                .access_point
+                .caller_authentication
+                .iter()
+                .flat_map(|authentication| &authentication.methods)
+            {
+                if let SourceAuthConfig::ApiKey(config) = method
+                    && config
+                        .secret_id
+                        .starts_with(crate::api_keys::KEY_ID_PREFIX)
+                {
+                    self.legacy_secrets
+                        .push(config.secret_id.clone());
+                }
+            }
+        }
     }
-    keys.sort();
-    keys.dedup();
-    Ok(keys)
+
+    fn finish(mut self) -> Self {
+        self.keys.sort();
+        self.keys.dedup();
+        self.legacy_secrets
+            .retain(|id| !self.keys.contains(id));
+        self.legacy_secrets.sort();
+        self.legacy_secrets.dedup();
+        self
+    }
+}
+
+/// [`ProviderKeyIds`] of a surface in its base and every variant.
+pub(crate) fn provider_key_ids(surface: &AgentSurface) -> Result<ProviderKeyIds, SurfaceApiError> {
+    let mut ids = ProviderKeyIds::default();
+    for view in resolved_views(surface)? {
+        ids.add_view(&view);
+    }
+    Ok(ids.finish())
+}
+
+/// [`ProviderKeyIds`] of a surface as served: a resolved view, which has no variants, is read in
+/// place; a surface with variants is read in every view.
+pub(crate) fn served_provider_key_ids(surface: &AgentSurface) -> Result<ProviderKeyIds, SurfaceApiError> {
+    if !surface.variants.is_empty() {
+        return provider_key_ids(surface);
+    }
+    let mut ids = ProviderKeyIds::default();
+    ids.add_view(surface);
+    Ok(ids.finish())
 }
 
 /// Why a stored surface's use of an API Key Provider key id is reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderKeyIssueKind {
     /// The key belongs to a surface the surface may not reference: another tenant's, or a
-    /// tenant's key on a surface with no tenant.
-    OtherTenant,
+    /// tenant's key on a surface with no tenant. A breach only when enforced, as a stored one is
+    /// kept serving under `warn`.
+    OtherTenant { enforced: bool },
     /// A tenant surface names the key of a surface with no tenant; a breach only when enforced.
     ApplianceKey { enforced: bool },
     /// No key has this id; key ids are never reused, so its DID is no other key's.
@@ -1683,7 +1754,7 @@ pub(crate) enum ProviderKeyIssueKind {
 impl ProviderKeyIssueKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::OtherTenant => "other_tenant",
+            Self::OtherTenant { .. } => "other_tenant",
             Self::ApplianceKey { .. } => "appliance_key",
             Self::MissingKey => "missing_key",
             Self::MissingOwner => "missing_owner",
@@ -1693,7 +1764,10 @@ impl ProviderKeyIssueKind {
 
     /// Whether the surface must not serve while it names the key.
     pub(crate) fn is_breach(self) -> bool {
-        matches!(self, Self::OtherTenant | Self::StoreUnavailable | Self::ApplianceKey { enforced: true })
+        matches!(
+            self,
+            Self::StoreUnavailable | Self::OtherTenant { enforced: true } | Self::ApplianceKey { enforced: true }
+        )
     }
 }
 
@@ -1704,45 +1778,33 @@ pub(crate) struct ProviderKeyIssue {
 }
 
 /// Every API Key Provider key id a stored surface derives a DID from that it may not use, or
-/// whose key or owner is gone: the ids [`collect_provider_key_references`] finds, and a Caller
-/// Context API Key `secret_id` shaped like a key id on a view whose inbound Identity is From
-/// API Key, which a secret stored before the prefix was reserved can still carry. Such a secret
-/// is reported only when a key of that id belongs to a surface the surface may not reference.
-/// `owners` is `None` when the API key store is unavailable; `surface_tenants` maps every stored
-/// surface id to its tenant.
+/// whose key or owner is gone ([`judge_provider_keys`] on [`provider_key_ids`]).
 pub(crate) fn provider_key_verdict(
     surface: &AgentSurface,
     owners: Option<&std::collections::HashMap<String, Vec<String>>>,
     surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
-    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
-    let keys = collect_provider_key_references(surface)?;
-    let mut legacy_secrets: Vec<String> = Vec::new();
-    for view in resolved_views(surface)? {
-        if !matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
-            continue;
-        }
-        for method in view
-            .access_point
-            .caller_authentication
-            .iter()
-            .flat_map(|authentication| &authentication.methods)
-        {
-            if let SourceAuthConfig::ApiKey(config) = method
-                && config
-                    .secret_id
-                    .starts_with(crate::api_keys::KEY_ID_PREFIX)
-                && !keys.contains(&config.secret_id)
-            {
-                legacy_secrets.push(config.secret_id.clone());
-            }
-        }
-    }
-    legacy_secrets.sort();
-    legacy_secrets.dedup();
+    Ok(judge_provider_keys(
+        surface.tenant_id.as_deref(),
+        &provider_key_ids(surface)?,
+        owners,
+        surface_tenants,
+        isolation,
+    ))
+}
 
-    let tenant_id = surface.tenant_id.as_deref();
+/// The issues of the key ids `ids` a surface of `tenant_id` names. A legacy secret is reported
+/// only when a key of that id belongs to a surface the surface may not reference, or to a
+/// surface with no tenant. `owners` is `None` when the API key store is unavailable;
+/// `surface_tenants` maps every stored surface id to its tenant.
+pub(crate) fn judge_provider_keys(
+    tenant_id: Option<&str>,
+    ids: &ProviderKeyIds,
+    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    isolation: RuleMode,
+) -> Vec<ProviderKeyIssue> {
     let mut issues = Vec::new();
     let mut issue = |key_id: &str, kind| {
         issues.push(ProviderKeyIssue {
@@ -1751,19 +1813,17 @@ pub(crate) fn provider_key_verdict(
         })
     };
     let Some(owners) = owners else {
-        for key_id in keys
-            .iter()
-            .chain(&legacy_secrets)
-        {
+        for key_id in ids.all() {
             issue(key_id, ProviderKeyIssueKind::StoreUnavailable);
         }
-        return Ok(issues);
+        return issues;
     };
-    for (key_id, legacy) in keys
+    for (key_id, legacy) in ids
+        .keys
         .iter()
         .map(|key_id| (key_id, false))
         .chain(
-            legacy_secrets
+            ids.legacy_secrets
                 .iter()
                 .map(|key_id| (key_id, true)),
         )
@@ -1782,8 +1842,13 @@ pub(crate) fn provider_key_verdict(
                 continue;
             };
             if !can_reference(tenant_id, *owner_tenant) {
-                issue(key_id, ProviderKeyIssueKind::OtherTenant);
-            } else if !legacy && crate::tenancy::breaks_tenant_isolation(tenant_id, *owner_tenant) {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::OtherTenant {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
+            } else if crate::tenancy::breaks_tenant_isolation(tenant_id, *owner_tenant) {
                 issue(
                     key_id,
                     ProviderKeyIssueKind::ApplianceKey {
@@ -1793,17 +1858,26 @@ pub(crate) fn provider_key_verdict(
             }
         }
     }
-    Ok(issues)
+    issues
 }
 
 /// The surfaces owning each API Key Provider key, by key id.
 pub(crate) async fn provider_key_owners(
     state: &IdentityApiState
 ) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    let store = state
-        .api_key_store
-        .as_ref()
-        .ok_or_else(|| unavailable("API key"))?;
+    provider_key_owners_in(
+        state
+            .api_key_store
+            .as_deref()
+            .ok_or_else(|| unavailable("API key"))?,
+    )
+    .await
+}
+
+/// [`provider_key_owners`] read from `store`.
+pub(crate) async fn provider_key_owners_in(
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
     let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for key in store
         .list_all()

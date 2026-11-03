@@ -1413,6 +1413,31 @@ pub async fn run_axum_proxy(
             didwebvh_base_url: None,
         };
 
+        let provider_key_gate = crate::identity::provider_key_gate::gate();
+        provider_key_gate.set_sources(
+            identity_state
+                .api_key_store
+                .clone(),
+            agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+        );
+        if let Some(ref surface_store) = agent_surface_store {
+            match surface_store.list_all().await {
+                Ok(surfaces) => {
+                    for surface in surfaces
+                        .iter()
+                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                    {
+                        provider_key_gate
+                            .admit(surface)
+                            .await;
+                    }
+                }
+                Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
+            }
+        }
+
         // Once changes of channels are detected (FS updated by another node) -> propagate changes to this node
         let pending_surface_events: PendingSurfaceEvents = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         // A dedicated clone kept alive for the boot-time activation drain (see the

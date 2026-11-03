@@ -523,14 +523,18 @@ where
     }
 }
 
-/// Removes the read-only `access_point_status` of a [`SurfaceResponse`] from
-/// a write body, so a client can send back what a read or a save returned.
-/// Whether it was there.
+/// Removes the read-only `access_point_status` and `not_ready_reason` of a
+/// [`SurfaceResponse`] from a write body, so a client can send back what a read
+/// or a save returned. Whether either was there.
 fn drop_access_point_status(body: &mut serde_json::Value) -> bool {
     body.as_object_mut()
         .is_some_and(|body| {
-            body.remove("access_point_status")
+            let status = body
+                .remove("access_point_status")
+                .is_some();
+            body.remove("not_ready_reason")
                 .is_some()
+                || status
         })
 }
 
@@ -3848,6 +3852,9 @@ pub struct SurfaceResponse<T> {
     #[serde(flatten)]
     pub resource: T,
     pub access_point_status: AccessPointStatus,
+    /// The rule a surface whose Access Point is otherwise ready is refused under, while it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_ready_reason: Option<&'static str>,
 }
 
 impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
@@ -3856,6 +3863,7 @@ impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
     fn from(surface: AgentSurface) -> Self {
         Self {
             access_point_status: surface.served_access_point_status(),
+            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&surface),
             resource: surface,
         }
     }
@@ -3873,6 +3881,7 @@ impl SurfaceResponse<SurfaceVariant> {
                 .serve_selected(Some(&variant))
                 .surface
                 .access_point_status(),
+            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(surface),
             resource: variant,
         }
     }
@@ -3954,6 +3963,16 @@ async fn apply_surface_change_while_locked(
     // fails: the next request will then hit either the new snapshots
     // (which match what was just persisted) or a clean miss for a
     // deleted surface.
+    let provider_key_gate = crate::identity::provider_key_gate::gate();
+    match change {
+        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+            provider_key_gate
+                .admit(surface)
+                .await
+        }
+        SurfaceChange::Upsert(surface) => provider_key_gate.forget(&surface.surface_id),
+        SurfaceChange::Delete(id) => provider_key_gate.forget(id),
+    }
     match change {
         SurfaceChange::Upsert(surface) => {
             if surface.status == crate::config::agent_surface::SurfaceStatus::Active {
