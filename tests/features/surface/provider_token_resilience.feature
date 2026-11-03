@@ -16,6 +16,8 @@ Feature: Credential provider token resilience
     Then the response status is 502
     And managed agent "bravo" was not called
     And the credential provider received 1 token request
+    And the token request metric counts 1 "refused" request for provider type "oauth2_client_credentials"
+    And the token request metric counts 0 "success" request for provider type "oauth2_client_credentials"
 
   Scenario: The next request asks for a token again once the backoff has passed
     Given the credential provider is refusing token requests
@@ -41,6 +43,8 @@ Feature: Credential provider token resilience
     Then the response status is 502
     And managed agent "bravo" was not called
     And the credential provider received 1 token request
+    And the token request metric counts 1 "timeout" request for provider type "oauth2_client_credentials"
+    And the token request metric counts 0 "success" request for provider type "oauth2_client_credentials"
 
   Scenario: Editing the provider asks for a new token
     Given the caller has sent a request to the surface and received status 200

@@ -24,6 +24,7 @@ Feature: Credential policy on the request path
     When the caller sends a request to the surface
     Then the response status is 502
     And the credential provider received 0 token requests
+    And the token request metric counts no requests
     And managed agent "bravo" was not called
     And the gateway log has a warning containing "Refusing a credential provider token endpoint that is not https"
     And the gateway log has no warning containing "it will be refused once credential_policy.token_endpoint_https is enforce"
