@@ -38,8 +38,8 @@ Feature: Protected agent card fetch over fabric
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
-    And surface "alpha" has a request policy that allows all requests
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" has a request policy that allows all requests
     When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
     Then the response status is 200
     And managed agent "bravo" received a GET request at path "/.well-known/agent.json"

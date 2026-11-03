@@ -25,9 +25,9 @@ changes:
         HEAD whose normalised path is exactly an agent card path or the configured card
         location. That fetch is a new GET with no body that keeps only Accept, Accept-Language
         and User-Agent from the peer, and carries no delegated credential, transit token or
-        trace id, and its answer reaches the peer with only the headers that describe the card.
-        The card read for policy input now presents the Target credential and is cached per
-        surface for up to 60 seconds.
+        trace id. Its answer reaches the peer with only the headers that describe the card, and
+        a refusal with only its status. The card read for policy input now presents the Target
+        credential and is cached per surface and Target authentication for up to 60 seconds.
   removed: []
   security:
     - timestamp: '2026-11-02T13:54:10Z'
