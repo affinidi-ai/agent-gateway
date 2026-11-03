@@ -2389,6 +2389,7 @@ pub async fn create_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
+    validate_source_auth(&surface, None)?;
     reject_public_predicate_route(&surface)?;
     surface.access_point.public = Some(
         surface

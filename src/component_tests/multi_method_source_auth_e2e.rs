@@ -276,3 +276,60 @@ async fn a_reload_serves_a_rule_breaking_surface_with_its_first_method() {
         "the reload stores the correction"
     );
 }
+
+/// Creating a surface checks its caller authentication methods as an update
+/// does, on the base and on each enabled variant.
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_a_surface_refuses_two_methods_on_one_header() {
+    let mut admin = None;
+    let h = GatewayHarness::start_with_mock(helpers::MockServer::start().await, |_, _, bootstrap| {
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            API_KEY_SECRET_ID,
+            API_KEY,
+        );
+        admin = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let admin = admin.unwrap();
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let mut same_header = api_key_method();
+    same_header["extraction"]["field"] = json!("X-API-KEY");
+    let two_on_one_header = json!([api_key_method(), same_header]);
+    let create = |route: &str, base_methods: serde_json::Value, variants: serde_json::Value| {
+        admin
+            .post(format!("{}/api/v1/surfaces", h.gateway_base))
+            .json(&json!({
+                "name": route.trim_start_matches("/smoke/"), "status": "active",
+                "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": route,
+                                 "protocol": "a2a", "caller_authentication": {"methods": base_methods}},
+                "target": {"endpoint": h.mock.url()},
+                "variants": variants
+            }))
+            .send()
+    };
+
+    let base = create("/smoke/two-on-one-header", two_on_one_header.clone(), json!([]))
+        .await
+        .expect("create surface");
+    assert_eq!(base.status(), 400);
+    let body = base.text().await.unwrap();
+    assert!(body.contains("both read the 'X-API-KEY' header"), "{body}");
+
+    let variant = create(
+        "/smoke/variant-two-on-one-header",
+        json!([api_key_method()]),
+        json!([{"id": "v1", "alias": "partners", "name": "Partners",
+                "overrides": {"access_point": {"caller_authentication": {"methods": two_on_one_header}}}}]),
+    )
+    .await
+    .expect("create surface");
+    assert_eq!(variant.status(), 400);
+    let body = variant.text().await.unwrap();
+    assert!(body.contains("variant 'partners': ") && body.contains("both read the 'X-API-KEY' header"), "{body}");
+}
