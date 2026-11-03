@@ -84,12 +84,9 @@ describe('access-token tenant scope helpers', () => {
       'sts-clients',
       'delegation-vault',
     ];
+    const tenant = 'TENANT:${x-external-account}:';
     for (const kind of kinds) {
-      expect(
-        validateScopeConfig(`TENANT:\${x-external-account}:(?:secrets:demo-.*|${kind}:.*)`, [
-          header,
-        ])
-      ).toEqual([]);
+      expect(validateScopeConfig(`${tenant}(?:secrets:demo-.*|${kind}:.*)`, [header])).toEqual([]);
     }
     expect(
       validateScopeConfig(
