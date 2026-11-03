@@ -5,6 +5,14 @@ changes:
   fixed: []
   removed: []
   security:
+    - timestamp: '2026-11-03T14:00:00Z'
+      title: Stop listeners with different IPv6 external URLs counting as one host
+      description: >-
+        An inbound listener passes /outbound/ requests on to an outbound listener whose external
+        URLs share a host name with its own. The host was cut at the first colon, so every IPv6
+        address URL looked like the same host, and an inbound listener could expose another
+        address's Transit Points. Hosts are now parsed as URLs and an IPv6 address matches only
+        the same address.
     - timestamp: '2026-11-03T13:50:00Z'
       title: Block cloud metadata and private IPv4 addresses inside 6to4 and NAT64 IPv6
       description: >-
