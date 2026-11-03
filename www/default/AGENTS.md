@@ -258,8 +258,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `caller-auth-*`). With several methods the first carries a Primary badge. While authorization
   server discovery is on, the primary stays primary and carries a discovery badge. `methods.ts`
   mirrors the gateway's save rules (each method reads its own credential location, only a sole
-  method reads the request body, at most one DID Auth),
-  shown on each row and on the canvas. With several methods an incomplete one marks the element
+  method reads the request body, at most one DID Auth, and, while authorization server discovery
+  is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
+  primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
   unconfigured as `Method <n>: <reason>`. Loading a surface always replaces `methods`, so a stale
   canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits

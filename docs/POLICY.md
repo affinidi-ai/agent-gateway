@@ -268,10 +268,10 @@ vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
-metadata never reaches policy with a failed JWT bearer credential, direct or over Fabric
-(a failed credential of another method on that Access Point reaches policy as above): a direct
-request is refused with a `401` challenge pointing at that metadata, and a Fabric request
-with a `401` without it, see
+metadata never reaches policy with a failed credential, direct or over Fabric: a failed JWT
+bearer credential is refused with a `401` challenge pointing at that metadata on a direct
+request, and with a `401` without it over Fabric, and a failed credential of another method
+on that Access Point with a plain `401`, see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 A Transit Point's own `source_auth` is different: it refuses a missing or invalid credential
