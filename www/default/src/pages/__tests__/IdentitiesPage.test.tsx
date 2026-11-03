@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import '@testing-library/jest-dom';
 import IdentitiesPage from '../IdentitiesPage';
 import { AppContext } from '../../context/AppContext';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
 import managedFixture from '../../__fixtures__/backend/identity-row-managed.json';
@@ -817,6 +817,23 @@ describe('IdentitiesPage', () => {
       );
     });
 
+    it('lists an API key update as updated, not as a changed value', async () => {
+      const apiKeyRow = {
+        ...managedRotatedFixture,
+        agent_identity: { credential_type: 'api_key', api_key_id: 'key-1' },
+        rotations: [{ rotated_at: '2026-01-02T00:00:00Z' }],
+      };
+      renderWithStats([apiKeyRow]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${apiKeyRow.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      const update = screen.getByTestId('identities-version-2');
+      expect(update).toHaveTextContent('Credential updated');
+      expect(update).toHaveTextContent('The stored credential was updated');
+      expect(update).not.toHaveTextContent('Credential rotated');
+    });
+
     it('says no rotations are recorded yet for a certificate identity, and nothing for a payload one', async () => {
       renderWithStats([{ ...managedRotatedFixture, rotations: [] }, managedFixture]);
 
@@ -839,6 +856,61 @@ describe('IdentitiesPage', () => {
         'true'
       );
       expect(screen.getByTestId('identities-version-2')).not.toHaveAttribute('data-highlighted');
+    });
+
+    it('opens Version History for a link to an earlier DID when its entry is already open', async () => {
+      const GoTo: React.FC<{ to: string }> = ({ to }) => {
+        const navigate = useNavigate();
+        return <button type="button" data-testid="go-to" onClick={() => navigate(to)} />;
+      };
+      const stats = statsWith([gpt4o, gpt41]);
+      const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
+      render(
+        <MemoryRouter initialEntries={[`/identities/${encodeURIComponent(gpt41.did)}`]}>
+          <AppContext.Provider value={context}>
+            <GoTo to={`/identities/${encodeURIComponent(gpt4o.did)}`} />
+            <Routes>
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('go-to'));
+
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
+    });
+
+    it('waits for identities to load before opening a deep-linked earlier DID', async () => {
+      let stats: any = null;
+      const contextFor = () => ({ ...mockAppContext, getCurrentStats: jest.fn(() => stats) });
+      const page = (context: any) => (
+        <MemoryRouter initialEntries={[`/identities/${encodeURIComponent(gpt4o.did)}`]}>
+          <AppContext.Provider value={context}>
+            <Routes>
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+      const { rerender } = render(page(contextFor()));
+
+      stats = statsWith([gpt4o, gpt41]);
+      rerender(page(contextFor()));
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
     });
 
     it('keeps an external caller row without versions', async () => {

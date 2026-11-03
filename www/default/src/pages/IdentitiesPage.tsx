@@ -179,17 +179,23 @@ const IdentitiesPage: React.FC = () => {
 
   const linkedDid = didParam ? decodeURIComponent(didParam) : undefined;
   const linkedPrimaryDid = linkedDid ? primaryDidFor(linkedDid) : undefined;
+  // Grouping needs the dashboard identities; until they load every DID is its own primary.
+  const identitiesLoaded = stats?.identities !== undefined;
 
   // Handle deep linking to a specific identity: an earlier DID opens its surface entry's versions
   useEffect(() => {
-    if (linkedDid && linkedPrimaryDid) {
-      const sections = linkedDid === linkedPrimaryDid ? ['summary'] : ['summary', 'versions'];
+    if (identitiesLoaded && linkedDid && linkedPrimaryDid) {
+      const opensVersions = linkedDid !== linkedPrimaryDid;
       setExpandedIdentityDids(prev =>
         prev.has(linkedPrimaryDid) ? prev : new Set(prev).add(linkedPrimaryDid)
       );
-      setExpandedSections(prev =>
-        prev[linkedPrimaryDid] ? prev : { ...prev, [linkedPrimaryDid]: new Set(sections) }
-      );
+      setExpandedSections(prev => {
+        const current = prev[linkedPrimaryDid];
+        if (current && (!opensVersions || current.has('versions'))) return prev;
+        const next = new Set(current ?? ['summary']);
+        if (opensVersions) next.add('versions');
+        return { ...prev, [linkedPrimaryDid]: next };
+      });
 
       // Scroll to the identity after a short delay to ensure rendering
       setTimeout(() => {
@@ -199,7 +205,7 @@ const IdentitiesPage: React.FC = () => {
         }
       }, 100);
     }
-  }, [linkedDid, linkedPrimaryDid]);
+  }, [identitiesLoaded, linkedDid, linkedPrimaryDid]);
 
   const toggleIdentityDetails = (did: string) => {
     const isOpen = expandedIdentityDids.has(did);

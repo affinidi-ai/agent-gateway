@@ -19,9 +19,12 @@ changes:
         (the protected slot or a Transit Point's own managed_identity), the credential's
         updated_at, and a list of rotations with their time and, for a certificate, the
         fingerprint, subject or issuer they replaced; the record's identity fields follow the
-        current certificate. Identities rows carry the optional slot and rotations fields.
-        Rotations before this release were not recorded; a certificate change found on the
-        first use after it is recorded once, without a time.
+        current certificate. Identities rows carry the optional slot and rotations fields, with
+        only the latest 20 rotations kept. An API key's value is not compared, so any update of
+        the stored key, including an edit of only its tags or type, is listed as "Credential
+        updated". Concurrent requests no longer overwrite each other's usage, origin or rotation
+        updates to the same record. Rotations before this release were not recorded; a
+        certificate change found on the first use after it is recorded once, without a time.
   changed:
     - timestamp: '2026-11-03T12:00:00Z'
       title: Stop offering From API Key on the Managed Agent's response identity

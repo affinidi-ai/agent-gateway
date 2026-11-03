@@ -1616,15 +1616,20 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 | --- | --- |
 | `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
-| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. |
+| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Only the latest 20 are kept (`MAX_ROTATIONS`), since every Identities row and WebSocket identity update carries the list. |
 
 On each use of a credential-derived managed identity, the gateway compares the credential
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer
 changed; editing only its name or tags does not. A secret-store API key counts as rotated
 whenever its `updated_at` changes, because its value is never stored; its rotations have
-no `previous` fields. `atgk_` API keys are never rotated in place: a new key is a new id, so
+no `previous` fields. The secret store also bumps `updated_at` when only the key's tags,
+type or tenant change, so the Identities page lists these entries as "Credential updated"
+rather than as a changed value. `atgk_` API keys are never rotated in place: a new key is a new id, so
 it mints a new DID. The record's `identity_fields` then hold the current certificate's
 values.
+
+Within one gateway process, usage, origin and rotation updates to one record are serialised
+per identity hash, so concurrent requests don't overwrite each other's writes.
 
 Rotations before this tracking began were not recorded. The first use afterwards stores the
 credential's `updated_at` as a baseline; if a certificate's fields differ from the stored
