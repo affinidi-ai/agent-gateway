@@ -32,10 +32,11 @@ fn token_endpoint_breaks_https(
     egress: &TokenEgress,
 ) -> bool {
     provider.provider_type != CredentialProviderType::ApiKey
-        && provider
-            .token_endpoint
-            .as_deref()
-            .is_some_and(|endpoint| !egress.permits_token_endpoint(endpoint))
+        && egress.insecure_endpoint(
+            provider
+                .token_endpoint
+                .as_deref(),
+        )
 }
 
 /// Does a tenant surface send an appliance-wide secret or credential provider upstream, or the
@@ -247,7 +248,7 @@ mod tests {
         TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy,
+            policy: std::borrow::Cow::Owned(policy),
         }
     }
 

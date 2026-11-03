@@ -293,13 +293,29 @@ pub(crate) fn oauth_error_code(error: &str) -> &str {
     }
 }
 
+/// A refreshed token and whether its provider's token endpoint breaks the https rule and was
+/// let through only because the rule is in warn mode.
+pub struct RefreshedToken {
+    pub response: OAuthTokenResponse,
+    pub insecure_endpoint: bool,
+}
+
 /// Refresh an expired access token using a refresh token
 pub async fn refresh_access_token(
     provider: &CredentialProvider,
     refresh_token: &str,
     secrets_store: &Arc<dyn SecretsStore>,
-) -> Result<OAuthTokenResponse> {
-    refresh_access_token_with(provider, refresh_token, secrets_store, &TokenEgress::from_environment()).await
+) -> Result<RefreshedToken> {
+    let egress = TokenEgress::from_environment();
+    let response = refresh_access_token_with(provider, refresh_token, secrets_store, &egress).await?;
+    Ok(RefreshedToken {
+        response,
+        insecure_endpoint: egress.insecure_endpoint(
+            provider
+                .token_endpoint
+                .as_deref(),
+        ),
+    })
 }
 
 async fn refresh_access_token_with(
@@ -658,8 +674,9 @@ pub struct TokenEgress {
     pub timeout: std::time::Duration,
     /// Exact test endpoints admitted under `AG_TEST_MODE=true`; `None` in production.
     pub exact_allowlist: Option<String>,
-    /// The bootstrap `[credential_policy]` the token endpoint is held to.
-    pub policy: crate::config::credential_policy::CredentialPolicyConfig,
+    /// The bootstrap `[credential_policy]` the token endpoint is held to: the process-wide
+    /// policy borrowed, or one a test owns.
+    pub policy: std::borrow::Cow<'static, crate::config::credential_policy::CredentialPolicyConfig>,
 }
 
 /// A local provider setting or key that the token request cannot use, so the request never
@@ -705,12 +722,21 @@ impl TokenEgress {
         if let Ok(egress) = EGRESS_OVERRIDE.try_with(Clone::clone) {
             return egress;
         }
-        let policy = crate::config::credential_policy::credential_policy().clone();
+        let policy = crate::config::credential_policy::credential_policy();
         Self {
             timeout: std::time::Duration::from_secs(policy.token_request_timeout_secs),
             exact_allowlist: crate::url_validation::bdd_oauth_endpoint_allowlist(),
-            policy,
+            policy: std::borrow::Cow::Borrowed(policy),
         }
+    }
+
+    /// Whether a provider's `endpoint` breaks the https rule and is let through only because
+    /// the rule is in warn mode.
+    pub fn insecure_endpoint(
+        &self,
+        endpoint: Option<&str>,
+    ) -> bool {
+        endpoint.is_some_and(|endpoint| !self.permits_token_endpoint(endpoint))
     }
 
     /// Whether `endpoint` meets the https rule: an https URL, or one that
@@ -2053,6 +2079,50 @@ mod tests {
             assert_eq!(form["refresh_token"], "refresh");
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refresh_reports_whether_its_endpoint_breaks_the_https_rule() {
+            let fixture = fixture().await;
+            let endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(
+                &endpoint.url,
+                json!({"provider_type": "oauth2_authorization_code",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+
+            let refreshed = endpoint
+                .egress
+                .clone()
+                .scope(refresh_access_token(&provider, "refresh", &fixture.secrets))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                refreshed
+                    .response
+                    .access_token,
+                "issued-access"
+            );
+            assert!(!refreshed.insecure_endpoint, "an exactly listed endpoint meets the https rule");
+        }
+
+        #[test]
+        fn an_endpoint_breaks_the_https_rule_only_when_it_is_http_and_not_listed() {
+            let egress = TokenEgress {
+                timeout: std::time::Duration::from_secs(5),
+                exact_allowlist: Some("http://idp.test/token".into()),
+                policy: std::borrow::Cow::Owned(crate::config::credential_policy::CredentialPolicyConfig {
+                    insecure_token_endpoints: vec!["http://idp.internal/token".into()],
+                    ..Default::default()
+                }),
+            };
+
+            assert!(!egress.insecure_endpoint(None));
+            assert!(!egress.insecure_endpoint(Some("https://idp.example/token")));
+            assert!(!egress.insecure_endpoint(Some("http://idp.internal/token")));
+            assert!(!egress.insecure_endpoint(Some("http://idp.test/token")));
+            assert!(egress.insecure_endpoint(Some("http://idp.example/token")));
+        }
+
         #[tokio::test]
         async fn a_refused_token_request_logs_and_returns_only_the_oauth_error_code() {
             let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
@@ -2109,14 +2179,14 @@ mod tests {
             TokenEgress {
                 timeout: std::time::Duration::from_secs(5),
                 exact_allowlist: exact_allowlist.map(str::to_string),
-                policy: crate::config::credential_policy::CredentialPolicyConfig {
+                policy: std::borrow::Cow::Owned(crate::config::credential_policy::CredentialPolicyConfig {
                     token_endpoint_https,
                     insecure_token_endpoints: insecure_token_endpoints
                         .iter()
                         .map(|url| url.to_string())
                         .collect(),
                     ..Default::default()
-                },
+                }),
             }
         }
 

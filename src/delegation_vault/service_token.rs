@@ -177,7 +177,7 @@ pub async fn acquire(
         warn!(target: "credential_delegation", provider_id = %provider.provider_id, "Refusing a credential provider token endpoint that is not https");
         return Err(ServiceTokenError::TokenEndpointNotHttps);
     }
-    let insecure_endpoint = endpoint.is_some_and(|endpoint| !egress.permits_token_endpoint(endpoint));
+    let insecure_endpoint = egress.insecure_endpoint(endpoint);
     let identity = cache_identity(
         provider,
         scopes,
@@ -1509,6 +1509,7 @@ mod tests {
             fixture
                 .egress
                 .policy
+                .to_mut()
                 .token_endpoint_https = RuleMode::Enforce;
             assert_eq!(
                 fixture
@@ -1523,6 +1524,7 @@ mod tests {
             fixture
                 .egress
                 .policy
+                .to_mut()
                 .token_endpoint_https = RuleMode::Warn;
             assert_eq!(
                 fixture
@@ -1556,6 +1558,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .token_endpoint_https = RuleMode::Enforce;
         let provider = fixture
             .provider(json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID",
@@ -1578,6 +1581,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .token_endpoint_https = RuleMode::Warn;
         let grandfathered = fixture
             .acquire(&provider, &[], now)
@@ -1589,6 +1593,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .token_endpoint_https = RuleMode::Enforce;
         assert_eq!(
             fixture
@@ -1631,6 +1636,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .tenant_credential_isolation = RuleMode::Enforce;
         for setting in &settings {
             let provider = fixture
@@ -1664,6 +1670,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .tenant_credential_isolation = RuleMode::Warn;
         let provider = fixture
             .provider(settings[0].clone())
@@ -2112,6 +2119,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .tenant_credential_isolation = RuleMode::Enforce;
         assert_eq!(
             fixture
@@ -2676,6 +2684,7 @@ mod tests {
         fixture
             .egress
             .policy
+            .to_mut()
             .tenant_credential_isolation = RuleMode::Enforce;
         assert_eq!(
             fixture

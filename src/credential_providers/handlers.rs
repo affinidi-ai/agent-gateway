@@ -1861,11 +1861,11 @@ mod jwt_provider_tests {
         let egress = |token_endpoint_https, insecure_token_endpoints: Vec<String>| TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy: CredentialPolicyConfig {
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
                 token_endpoint_https,
                 insecure_token_endpoints,
                 ..Default::default()
-            },
+            }),
         };
         let provider = |provider_type: CredentialProviderType, token_endpoint: &str| {
             let mut provider: CredentialProvider = serde_json::from_value(json!({
@@ -1965,10 +1965,10 @@ mod jwt_provider_tests {
         TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy: crate::config::credential_policy::CredentialPolicyConfig {
+            policy: std::borrow::Cow::Owned(crate::config::credential_policy::CredentialPolicyConfig {
                 insecure_token_endpoints: vec!["http://192.0.2.1/token".into()],
                 ..Default::default()
-            },
+            }),
         }
     }
 
@@ -2199,10 +2199,10 @@ mod jwt_provider_tests {
         let egress = |mode| TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy: CredentialPolicyConfig {
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
                 tenant_credential_isolation: mode,
                 ..Default::default()
-            },
+            }),
         };
         let check = |mode| {
             let state = state.clone();
@@ -2250,10 +2250,10 @@ mod jwt_provider_tests {
         let warn = TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy: CredentialPolicyConfig {
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
                 tenant_credential_isolation: RuleMode::Warn,
                 ..Default::default()
-            },
+            }),
         };
         let check = |provider: CredentialProvider| {
             let state = state.clone();

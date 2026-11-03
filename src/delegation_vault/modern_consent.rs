@@ -1291,10 +1291,10 @@ mod tests {
         let egress = |token_endpoint_https| super::super::oauth::TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
-            policy: CredentialPolicyConfig {
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
                 token_endpoint_https,
                 ..Default::default()
-            },
+            }),
         };
         assert!(matches!(
             exchange_code(&provider, &ticket, "code", &secrets, &egress(RuleMode::Enforce)).await,

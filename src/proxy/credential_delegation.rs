@@ -826,7 +826,10 @@ pub async fn resolve_delegation_credentials(
                         )
                         .await
                         {
-                            Ok(refreshed) => {
+                            Ok(oauth::RefreshedToken {
+                                response: refreshed,
+                                insecure_endpoint,
+                            }) => {
                                 token.access_token = refreshed.access_token.clone();
                                 if let Some(rt) = &refreshed.refresh_token {
                                     token.refresh_token = Some(rt.clone());
@@ -870,12 +873,7 @@ pub async fn resolve_delegation_credentials(
                                     "Token refreshed successfully"
                                 );
 
-                                let refresh_detail = if provider
-                                    .token_endpoint
-                                    .as_deref()
-                                    .is_some_and(|endpoint| {
-                                        !oauth::TokenEgress::from_environment().permits_token_endpoint(endpoint)
-                                    }) {
+                                let refresh_detail = if insecure_endpoint {
                                     INSECURE_TOKEN_ENDPOINT_DETAIL
                                 } else {
                                     ""
