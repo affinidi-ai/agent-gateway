@@ -22234,7 +22234,11 @@ allow if {
             .filter(|line| line.contains("No surface route matches path"))
             .collect();
         assert_eq!(misses.len(), 1, "{text}");
-        assert!(misses[0].contains(&loggable::untrusted(&format!("/unknown/{tail}"))), "{}", misses[0]);
+        assert!(
+            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/unknown/{tail}"))),
+            "{}",
+            misses[0]
+        );
         assert!(!text.contains(&tail), "a log holds the whole path: {text}");
         assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
     }
