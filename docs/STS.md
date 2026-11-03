@@ -38,7 +38,9 @@ authenticates as an OAuth client, not a dashboard session.
   host (`Host` is the internal `127.0.0.1:PORT`) nor the public scheme (the local
   hop is plain HTTP), and the tunnel may drop forwarding headers. The
   request-derived fallback reads forwarding headers only from a connecting peer
-  in `client_ip.trusted_proxies` (`StsConfig.trusted_proxies`): host prefers
+  in `client_ip.trusted_proxies`, which the client IP layer marks with
+  `FromTrustedProxy`, so discovery and the throttle use the same list after a
+  reload: host prefers
   `X-Forwarded-Host` (first comma-separated entry), then RFC 7239 `Forwarded
   host=`, else `Host`; scheme prefers `X-Forwarded-Proto`, then `Forwarded
   proto=`, else `https`. Any other caller's forwarding headers are ignored, so
@@ -264,12 +266,19 @@ CRUD is `/v1/sts/clients` (admin-only, RBAC `StsClientsView/Edit/Delete` in
 ## Token-endpoint throttle
 
 In `src/sts/throttle.rs`: `POST /oauth2/token` is rate-limited per client id from
-each source address, and per source address. The source is the caller's IP as
+each source, and per source. The source is the caller's IP as
 `src/source_auth/client_ip.rs` resolves it, so `X-Forwarded-For` and `Forwarded`
-count only from `client_ip.trusted_proxies`; without a resolved source (a server
-not built with `ConnectInfo`) a client id is counted on its own and there is no
-ip key. Counting a client id per source means failed attempts from one source,
-even with a known client id, never lock that client out for its other sources.
+count only from `client_ip.trusted_proxies`, and an IPv6 address counts by its
+/64, since one host usually holds the whole /64. Without a resolved source (a
+server not built with `ConnectInfo`) a client id is counted on its own and there
+is no ip key. Counting a client id per source means failed attempts from one
+source, even with a known client id, never lock that client out for its other
+sources; the flip side is that `per_client` no longer bounds guessing one client's
+secret from many sources, so give each client a long random secret. Behind a load
+balancer that is not in `client_ip.trusted_proxies`, every caller it forwards is
+one source and shares both limits, so a burst of failed client logins through it
+locks every client out for `lockout_secs`; a lockout of a caller that no trusted
+proxy forwarded logs a `WARN` naming `client_ip.trusted_proxies`.
 Every value comes from `gateway.json` (`sts.token_endpoint_throttle`: `enabled`,
 `failed_attempts_only`, `per_client` / `per_ip` each `{requests, window_secs}`,
 `lockout_secs`) — nothing is hardcoded.

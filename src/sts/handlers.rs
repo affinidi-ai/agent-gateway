@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Form};
@@ -21,7 +21,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::identity::VCIssuer;
-use crate::source_auth::client_ip::ClientIp;
+use crate::source_auth::client_ip::{ClientIp, FromTrustedProxy};
 use crate::sts::errors::StsError;
 use crate::sts::id_jag::{IdJagParams, build_id_jag_claims, validate_id_jag};
 use crate::sts::policy::{AllowAllPolicyEvaluator, GatewayPolicyEvaluator, StsPolicyEvaluator, build_policy_input};
@@ -53,10 +53,6 @@ pub struct StsConfig {
     /// terminating HTTP proxy/tunnel that rewrites `Host` to `127.0.0.1` and
     /// drops forwarding headers. `None` ⇒ derive from the request.
     pub public_base_url: Option<String>,
-    /// Proxies (`client_ip.trusted_proxies`) whose forwarded host and scheme the
-    /// request-derived discovery base may use. A request from any other peer is
-    /// described by its own `Host`.
-    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Replay-protection backend name (see `crate::sts::replay`). Defaults to the
     /// built-in in-process backend.
     pub replay_backend: String,
@@ -73,7 +69,6 @@ impl Default for StsConfig {
             max_ttl_secs: 900,
             id_jag_ttl_secs: 120,
             public_base_url: None,
-            trusted_proxies: Vec::new(),
             replay_backend: crate::sts::replay::IN_PROCESS_BACKEND.to_string(),
             throttle: crate::config::types::TokenEndpointThrottleConfig::default(),
             mcp_issuer: None,
@@ -520,15 +515,17 @@ pub struct StsState {
 pub async fn token_endpoint(
     State(state): State<StsState>,
     client_ip: Option<Extension<ClientIp>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
     Form(form): Form<TokenEndpointForm>,
 ) -> Response {
-    serve_token_endpoint(&state, client_ip_of(client_ip), &headers, form, None).await
+    serve_token_endpoint(&state, Caller::from_extensions(client_ip, trusted_proxy), &headers, form, None).await
 }
 
 pub async fn mcp_token_endpoint(
     State(state): State<StsState>,
     client_ip: Option<Extension<ClientIp>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
     crate::sts::mcp_profile::McpTokenForm(form): crate::sts::mcp_profile::McpTokenForm,
 ) -> Response {
@@ -539,18 +536,66 @@ pub async fn mcp_token_endpoint(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_token_endpoint(&state, client_ip_of(client_ip), &headers, form, Some(profile)).await
+    serve_token_endpoint(&state, Caller::from_extensions(client_ip, trusted_proxy), &headers, form, Some(profile)).await
 }
 
-/// The caller's address as [`crate::source_auth::client_ip`] resolved it: forwarded headers
-/// count only from `client_ip.trusted_proxies`.
-fn client_ip_of(client_ip: Option<Extension<ClientIp>>) -> Option<std::net::IpAddr> {
-    client_ip.map(|Extension(ClientIp(ip))| ip)
+/// The caller as [`crate::source_auth::client_ip`] resolved it: forwarded headers count only
+/// from `client_ip.trusted_proxies`.
+#[derive(Debug, Clone, Copy)]
+struct Caller {
+    ip: Option<std::net::IpAddr>,
+    from_trusted_proxy: bool,
+}
+
+impl Caller {
+    fn from_extensions(
+        client_ip: Option<Extension<ClientIp>>,
+        trusted_proxy: Option<Extension<FromTrustedProxy>>,
+    ) -> Self {
+        Self {
+            ip: client_ip.map(|Extension(ClientIp(ip))| ip),
+            from_trusted_proxy: trusted_proxy.is_some(),
+        }
+    }
+
+    /// Whether this caller's lockout should name `client_ip.trusted_proxies`: behind a load
+    /// balancer that is not listed there, every caller shares the balancer's address and so its
+    /// limits.
+    fn lockout_needs_proxy_hint(
+        self,
+        locked_out: bool,
+    ) -> bool {
+        locked_out && self.ip.is_some() && !self.from_trusted_proxy
+    }
+}
+
+const LOCKOUT_PROXY_HINT: &str = "STS token endpoint locked out a caller after repeated attempts; if a load \
+                                  balancer or proxy forwards callers to the gateway, list it in \
+                                  client_ip.trusted_proxies, or every caller it forwards shares this limit";
+
+/// Counts one token-endpoint attempt, and logs [`LOCKOUT_PROXY_HINT`] when it locks out a
+/// caller that did not come through a trusted proxy.
+fn record_attempt(
+    state: &StsState,
+    client_id: Option<&str>,
+    caller: Caller,
+    now: u64,
+) {
+    state
+        .throttle
+        .record(client_id, caller.ip, now);
+    let locked_out = state
+        .throttle
+        .retry_after(client_id, caller.ip, now)
+        .is_some();
+    if caller.lockout_needs_proxy_hint(locked_out) {
+        tracing::warn!("{LOCKOUT_PROXY_HINT}");
+    }
 }
 
 async fn serve_token_endpoint(
     state: &StsState,
-    client_ip: Option<std::net::IpAddr>,
+    caller: Caller,
     headers: &HeaderMap,
     form: TokenEndpointForm,
     profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>,
@@ -560,12 +605,10 @@ async fn serve_token_endpoint(
 
     // Throttle: reject a client / source that is over its configured limit.
     let throttle_client = resolve_client_credentials(headers, &form).0;
-    let throttle_ip = client_ip.map(|ip| ip.to_string());
     let throttle_now = now_secs();
-    if let Some(retry_after) =
-        state
-            .throttle
-            .retry_after(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now)
+    if let Some(retry_after) = state
+        .throttle
+        .retry_after(throttle_client.as_deref(), caller.ip, throttle_now)
     {
         crate::metrics::backends::prometheus::track_sts_token_exchange(
             grant,
@@ -583,9 +626,7 @@ async fn serve_token_endpoint(
                 .throttle
                 .failed_attempts_only()
             {
-                state
-                    .throttle
-                    .record(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now);
+                record_attempt(state, throttle_client.as_deref(), caller, throttle_now);
             }
             crate::metrics::backends::prometheus::track_sts_token_exchange(
                 grant,
@@ -606,9 +647,7 @@ async fn serve_token_endpoint(
                 .failed_attempts_only()
                 || matches!(e, StsError::InvalidClient(_))
             {
-                state
-                    .throttle
-                    .record(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now);
+                record_attempt(state, throttle_client.as_deref(), caller, throttle_now);
             }
             // A server fault is `error`; every client-side rejection (bad client,
             // policy/target/scope/grant denial, malformed request) is `denied`.
@@ -633,7 +672,7 @@ async fn serve_token_endpoint(
 pub async fn authorization_server_metadata(
     State(state): State<StsState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
 ) -> Response {
     let issuer = state
@@ -654,12 +693,7 @@ pub async fn authorization_server_metadata(
             .as_deref(),
         uri.path(),
     )
-    .or_else(|| {
-        let from_trusted_proxy = peer.is_some_and(|Extension(ConnectInfo(peer))| {
-            crate::source_auth::peer_cert::forwarded::ip_in_any(&peer.ip(), &state.config.trusted_proxies)
-        });
-        metadata_base_url(&headers, uri.path(), from_trusted_proxy)
-    });
+    .or_else(|| metadata_base_url(&headers, uri.path(), trusted_proxy.is_some()));
     let token_endpoint = match &base {
         Some(base) => format!("{base}/oauth2/token"),
         None => "/oauth2/token".to_string(),
@@ -2002,6 +2036,7 @@ mod tests {
         let response = mcp_token_endpoint(
             State(state.clone()),
             None,
+            None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
         )
@@ -2010,6 +2045,7 @@ mod tests {
         state.config.mcp_issuer = Some(profile.clone());
         let response = mcp_token_endpoint(
             State(state.clone()),
+            None,
             None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
@@ -2024,7 +2060,7 @@ mod tests {
         let claims: Value = serde_json::from_str(&response.access_token).unwrap();
         assert_eq!(claims["iss"], profile.issuer);
         assert_eq!(claims["aud"], resource);
-        let response = token_endpoint(State(state.clone()), None, HeaderMap::new(), Form(form.clone())).await;
+        let response = token_endpoint(State(state.clone()), None, None, HeaderMap::new(), Form(form.clone())).await;
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
             .unwrap();
@@ -2033,7 +2069,8 @@ mod tests {
         assert_eq!(claims["iss"], "did:webvh:example:gw");
         form.grant_type = Some("authorization_code".into());
         let response =
-            mcp_token_endpoint(State(state), None, HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form)).await;
+            mcp_token_endpoint(State(state), None, None, HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form))
+                .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
@@ -3178,6 +3215,7 @@ mod tests {
             token_endpoint(
                 State(state.clone()),
                 Some(Extension(ClientIp(attacker))),
+                None,
                 spoofed.clone(),
                 Form(wrong_secret.clone()),
             )
@@ -3186,6 +3224,7 @@ mod tests {
         let attacker_retry = token_endpoint(
             State(state.clone()),
             Some(Extension(ClientIp(attacker))),
+            None,
             spoofed.clone(),
             Form(exchange_form()),
         )
@@ -3195,6 +3234,7 @@ mod tests {
         let legitimate_call = token_endpoint(
             State(state.clone()),
             Some(Extension(ClientIp(legitimate))),
+            None,
             HeaderMap::new(),
             Form(exchange_form()),
         )
@@ -3225,39 +3265,94 @@ mod tests {
         );
     }
 
+    /// Sends `request` from `peer` to the STS token and discovery routes behind the real client
+    /// IP layer, trusting `trusted_proxies`.
+    async fn through_client_ip_layer(
+        state: StsState,
+        trusted_proxies: &[&str],
+        peer: &str,
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> Response {
+        use tower::ServiceExt;
+        let config = crate::config::types::ClientIpConfig {
+            trusted_proxies: trusted_proxies
+                .iter()
+                .map(|cidr| cidr.parse().unwrap())
+                .collect(),
+        };
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(peer.parse().unwrap()));
+        axum::Router::new()
+            .route("/oauth2/token", axum::routing::post(token_endpoint))
+            .route("/api/.well-known/oauth-authorization-server", axum::routing::get(authorization_server_metadata))
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(config),
+                crate::source_auth::client_ip::resolve_client_ip_layer,
+            ))
+            .oneshot(request)
+            .await
+            .unwrap()
+    }
+
+    fn token_request(
+        secret: &str,
+        forwarded_for: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", GRANT_TYPE_TOKEN_EXCHANGE)
+            .append_pair("subject_token", "subject-tok")
+            .append_pair("subject_token_type", TOKEN_TYPE_JWT)
+            .append_pair("client_id", "agent-client")
+            .append_pair("client_secret", secret)
+            .finish();
+        axum::http::Request::post("/oauth2/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", forwarded_for)
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn callers_behind_a_trusted_proxy_are_throttled_by_their_own_address() {
+        let claims = HashMap::from([("subject-tok".to_string(), json!({ "sub": "user-1" }))]);
+        let state = state_with(claims, client(base_record(), Some("s3cret")));
+        let proxy = "10.0.0.5:40000";
+        for _ in 0..11 {
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("guess", "203.0.113.9")).await;
+        }
+
+        let attacker =
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("s3cret", "203.0.113.9"))
+                .await;
+        assert_eq!(attacker.status(), StatusCode::TOO_MANY_REQUESTS);
+        let other_caller =
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("s3cret", "198.51.100.7"))
+                .await;
+        assert_eq!(other_caller.status(), StatusCode::OK);
+
+        let untrusted_peer_claiming_the_other_caller = through_client_ip_layer(
+            state,
+            &["10.0.0.0/8"],
+            "203.0.113.9:40000",
+            token_request("s3cret", "198.51.100.7"),
+        )
+        .await;
+        assert_eq!(untrusted_peer_claiming_the_other_caller.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
     async fn advertised_token_endpoint(
         trusted_proxies: &[&str],
         peer: &str,
     ) -> String {
-        let mut state = state_with(HashMap::new(), InMemoryStsClientRegistry::new());
-        state.config.trusted_proxies = trusted_proxies
-            .iter()
-            .map(|cidr| cidr.parse().unwrap())
-            .collect();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::HOST,
-            "127.0.0.1:8080"
-                .parse()
-                .unwrap(),
-        );
-        headers.insert(
-            "x-forwarded-host",
-            "gw.public.example"
-                .parse()
-                .unwrap(),
-        );
-        let response = authorization_server_metadata(
-            State(state),
-            axum::extract::OriginalUri(
-                "/api/.well-known/oauth-authorization-server"
-                    .parse()
-                    .unwrap(),
-            ),
-            Some(Extension(ConnectInfo(peer.parse().unwrap()))),
-            headers,
-        )
-        .await;
+        let state = state_with(HashMap::new(), InMemoryStsClientRegistry::new());
+        let request = axum::http::Request::get("/api/.well-known/oauth-authorization-server")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header("x-forwarded-host", "gw.public.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = through_client_ip_layer(state, trusted_proxies, peer, request).await;
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
             .unwrap();
@@ -3278,6 +3373,29 @@ mod tests {
             "https://127.0.0.1:8080/api/oauth2/token"
         );
         assert_eq!(advertised_token_endpoint(&[], "10.1.2.3:40000").await, "https://127.0.0.1:8080/api/oauth2/token");
+    }
+
+    #[test]
+    fn a_lockout_names_client_ip_trusted_proxies_only_for_a_caller_no_trusted_proxy_forwarded() {
+        let direct = Caller {
+            ip: Some("10.0.0.5".parse().unwrap()),
+            from_trusted_proxy: false,
+        };
+        let forwarded = Caller {
+            from_trusted_proxy: true,
+            ..direct
+        };
+        let unknown = Caller {
+            ip: None,
+            from_trusted_proxy: false,
+        };
+
+        assert!(direct.lockout_needs_proxy_hint(true));
+        assert!(!direct.lockout_needs_proxy_hint(false));
+        assert!(!forwarded.lockout_needs_proxy_hint(true));
+        assert!(!unknown.lockout_needs_proxy_hint(true));
+        assert!(LOCKOUT_PROXY_HINT.contains("client_ip.trusted_proxies"));
+        assert!(!LOCKOUT_PROXY_HINT.contains("  "), "the continued lines join with single spaces");
     }
 
     #[test]

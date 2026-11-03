@@ -1,7 +1,17 @@
 branch: fix/sts-token-verification-hardening
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-03T13:30:00Z'
+      title: Count callers behind an unlisted load balancer as one STS throttle source
+      description: >-
+        The STS token endpoint throttle, on by default, now takes the caller's address from the
+        connection, and from X-Forwarded-For only when the connecting peer is in
+        client_ip.trusted_proxies, which is empty by default. Behind a load balancer that is not
+        listed there, every caller it forwards shares one source, so a burst of failed client
+        logins through it locks every STS client out for lockout_secs. List the balancer in
+        client_ip.trusted_proxies; a lockout of a caller no trusted proxy forwarded logs a
+        warning saying so.
   fixed: []
   removed: []
   security:
@@ -22,11 +32,12 @@ changes:
         The token endpoint throttle keyed its source on the first X-Forwarded-For entry and
         counted a client id across every source, so a caller could pick its own source and lock
         a known client id out everywhere. It now uses the client IP resolved through
-        client_ip.trusted_proxies and counts a client id separately for each source, so the
-        per_client limit applies per client and source. STS discovery now reads
-        X-Forwarded-Host and X-Forwarded-Proto, or Forwarded, only from a peer in
-        client_ip.trusted_proxies when no inbound external_urls is set. Behind a load balancer,
-        list it in client_ip.trusted_proxies.
+        client_ip.trusted_proxies, counts an IPv6 address by its /64, and counts a client id
+        separately for each source, so the per_client limit applies per client and source and
+        no longer bounds guessing one client's secret from many sources; give each client a
+        long random secret. STS discovery now reads X-Forwarded-Host and X-Forwarded-Proto, or
+        Forwarded, only from a peer in client_ip.trusted_proxies when no inbound external_urls
+        is set.
     - timestamp: '2026-11-03T10:32:45Z'
       title: Refuse an Ed25519 JWK whose public key is not 32 bytes
       description: >-

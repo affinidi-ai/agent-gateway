@@ -26,6 +26,12 @@ use crate::config::types::{ClientIpConfig, LoginThrottleConfig};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// Marks a request whose connecting peer is in `client_ip.trusted_proxies`, inserted by
+/// [`resolve_client_ip_layer`] beside [`ClientIp`], so a handler can tell when other forwarded
+/// headers come from such a proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FromTrustedProxy;
+
 /// Middleware that inserts [`ClientIp`] for every request that carries `ConnectInfo`. Install
 /// with `axum::middleware::from_fn_with_state(Arc::new(client_ip_cfg), resolve_client_ip_layer)`
 /// on a server built with `into_make_service_with_connect_info`. Without `ConnectInfo` nothing is
@@ -43,6 +49,10 @@ pub async fn resolve_client_ip_layer(
         let client_ip = resolve_client_ip(peer, req.headers(), &config.trusted_proxies);
         req.extensions_mut()
             .insert(ClientIp(client_ip));
+        if ip_in_any(&peer, &config.trusted_proxies) {
+            req.extensions_mut()
+                .insert(FromTrustedProxy);
+        }
     }
     next.run(req).await
 }
