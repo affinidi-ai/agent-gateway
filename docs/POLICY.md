@@ -728,7 +728,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   resolved yields no card in the policy input; the failure is logged as a
   warning without the credential. Under `target.auth.fallback: passthrough` a
   credential that cannot be resolved reads the card without it. The outcome is
-  cached per surface for 60 seconds (10 seconds for no card) and cleared on
+  cached per surface and `target.auth` for 60 seconds (10 seconds for no card),
+  is not cleared when a secret or credential provider changes, and is cleared on
   configuration reload or a surface save, so the policy input may see a card up
   to a minute old.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and

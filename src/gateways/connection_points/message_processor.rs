@@ -3536,13 +3536,28 @@ fn is_relayed_from_credentialed_card_fetch(name: &str) -> bool {
         .any(|relayed| name.eq_ignore_ascii_case(relayed))
 }
 
+/// The body that answers the peer when the Target refuses the gateway's own
+/// agent card fetch: only the status, as on the direct path, so nothing the
+/// Target said about the gateway's credential reaches the peer.
+fn credentialed_card_fetch_error_body(status: u16) -> String {
+    serde_json::json!({
+        "type": "about:blank",
+        "title": "Upstream error",
+        "status": status,
+        "detail": format!("Upstream error: {status}"),
+    })
+    .to_string()
+}
+
 /// The local Target's agent card for the GW2 policy context: the configured card
 /// location on the Target's origin, or `/.well-known/agent.json` under the Target
 /// endpoint, fetched as the gateway itself with the surface's Target
 /// authentication, resolved from the gateway's secrets store. A credential that
 /// cannot be resolved yields no card, or under `fallback: passthrough` a card
-/// read without it. The outcome is cached per surface for the card cache's TTLs,
-/// so a request neither fetches the card nor resolves the credential again.
+/// read without it. The outcome is cached per surface and Target authentication
+/// for the card cache's TTLs, so a request neither fetches the card nor resolves
+/// the credential again, and a variant with its own Target authentication reads
+/// its own card.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
@@ -3556,11 +3571,14 @@ async fn policy_agent_card(
                 .trim_end_matches('/')
         ),
     };
-    if let Some(card) = crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url) {
+    let target_auth = serde_json::to_string(&surface.target.auth).unwrap_or_default();
+    if let Some(card) =
+        crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url, &target_auth)
+    {
         return card;
     }
     let card = read_policy_agent_card(surface, &card_url, config_id).await;
-    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, card.clone());
+    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, &target_auth, card.clone());
     card
 }
 
@@ -6715,6 +6733,11 @@ async fn process_charged_forward_request(
                 (Some(response), String::new())
             } else {
                 match read_forward_target_body(response, is_sse_response, &body_bytes, fabric_body_limits(&surface), config_id).await {
+                    Ok(_) if credentialed_card_fetch && !(200..300).contains(&status) => {
+                        response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
+                        response_headers.insert("content-type".to_string(), vec!["application/problem+json".to_string()]);
+                        (None, credentialed_card_fetch_error_body(status))
+                    }
                     Ok(body) => (None, body),
                     Err(error) => return ForwardRefusal::from(error).into_forward_response(&body_bytes).await,
                 }

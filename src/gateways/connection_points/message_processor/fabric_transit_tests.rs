@@ -1486,7 +1486,7 @@ impl ProtectedTarget {
                     )
                         .into_response()
                 } else {
-                    axum::http::StatusCode::UNAUTHORIZED.into_response()
+                    (axum::http::StatusCode::UNAUTHORIZED, "key rejected for account acme").into_response()
                 }
             }
         });
@@ -1820,6 +1820,9 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
 
     let unprotected = named(surface("a2a", &target.url, &[]), "unprotected", None);
     assert_eq!(card(unprotected).await, None, "a 401 is no card");
+
+    let variant_without_auth = named(surface("a2a", &target.url, &[]), "protected", None);
+    assert_eq!(card(variant_without_auth).await, None, "a variant without the credential reads its own card");
 }
 
 /// The gateway's own card fetch carries no trace id from the peer's request,
@@ -1904,4 +1907,75 @@ async fn a_card_fetch_over_fabric_relays_only_the_headers_that_describe_the_card
     assert_eq!(response["status"], 200, "{response}");
     let relayed = response_header_names(&response);
     assert!(relayed.contains(&"set-cookie".to_string()), "a caller's request relays {relayed:?}");
+}
+
+/// A Target that refuses the gateway's own card fetch answers the peer with only
+/// its status, as on the direct path, so nothing the Target says about the
+/// gateway's credential reaches the peer.
+#[tokio::test]
+async fn a_refused_card_fetch_over_fabric_answers_only_the_status() {
+    if ran_in_child("ATG_FABRIC_REFUSED_CARD_CHILD").await {
+        return;
+    }
+    use crate::secrets::SecretsStore;
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "stale-key", None)).await;
+    crate::secrets::FilesystemSecretsStore::new_async(
+        root.path()
+            .join("secrets")
+            .to_str()
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .create(crate::secrets::CreateSecretRequest {
+        tenant_id: None,
+        name: "Stale key".to_string(),
+        secret_id: "stale-key".to_string(),
+        description: None,
+        value: "stale".to_string(),
+        secret_type: "ApiKey".to_string(),
+        tags: vec![],
+    })
+    .await
+    .unwrap();
+
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 401, "{response}");
+    assert_eq!(
+        header_values(
+            &target
+                .received()
+                .pop()
+                .unwrap()
+                .headers,
+            TARGET_KEY_HEADER
+        ),
+        ["stale"]
+    );
+    let body = response["body"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!body.contains("acme"), "the Target's answer reached the peer: {body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["detail"], "Upstream error: 401");
+
+    let mut value = serde_json::to_value(protected_surface(&target.url, "stale-key", None)).unwrap();
+    value["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("auth");
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 401, "{response}");
+    assert!(
+        response["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("acme"),
+        "without Target authentication the answer is relayed as before: {response}"
+    );
 }

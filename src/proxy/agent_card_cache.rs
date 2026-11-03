@@ -20,7 +20,8 @@
 //!
 //! The card a Fabric receiving surface reads for its policy input may be read
 //! with the surface's Target credential, so it is kept in its own map keyed on
-//! the surface and the card URL ([`lookup_surface_card`]), with the same TTLs.
+//! the surface, the card URL and the Target authentication it was read with
+//! ([`lookup_surface_card`]), so variants of one surface never share a card.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -62,7 +63,7 @@ fn cache() -> &'static DashMap<CacheKey, CacheEntry> {
     CACHE.get_or_init(DashMap::new)
 }
 
-type SurfaceCardKey = (String, String);
+type SurfaceCardKey = (String, String, String);
 
 fn surface_card_cache() -> &'static DashMap<SurfaceCardKey, CacheEntry> {
     static CACHE: OnceLock<DashMap<SurfaceCardKey, CacheEntry>> = OnceLock::new();
@@ -154,26 +155,30 @@ pub fn insert(
     );
 }
 
-/// [`lookup`] for the card `surface_id` read from `card_url` for its policy
-/// input. No other surface, and no outbound lookup, sees it.
+/// [`lookup`] for the card `surface_id` read from `card_url` with the Target
+/// authentication `target_auth` (its configuration, serialised) for its policy
+/// input. No other surface or Target authentication, and no outbound lookup,
+/// sees it.
 pub fn lookup_surface_card(
     surface_id: &str,
     card_url: &str,
+    target_auth: &str,
 ) -> Option<Option<Value>> {
-    let entry = surface_card_cache().get(&(surface_id.to_string(), card_url.to_string()))?;
+    let entry = surface_card_cache().get(&(surface_id.to_string(), card_url.to_string(), target_auth.to_string()))?;
     entry
         .is_fresh(Instant::now())
         .then(|| entry.payload.clone())
 }
 
-/// [`insert`] for the card `surface_id` read from `card_url`.
+/// [`insert`] for the card `surface_id` read from `card_url` with `target_auth`.
 pub fn insert_surface_card(
     surface_id: &str,
     card_url: &str,
+    target_auth: &str,
     payload: Option<Value>,
 ) {
     surface_card_cache().insert(
-        (surface_id.to_string(), card_url.to_string()),
+        (surface_id.to_string(), card_url.to_string(), target_auth.to_string()),
         CacheEntry {
             fetched_at: Instant::now(),
             payload,
@@ -250,18 +255,20 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_card_is_seen_only_by_its_surface_and_cleared_on_invalidate_all() {
+    fn a_surface_card_is_seen_only_by_its_surface_and_target_auth_and_cleared_on_invalidate_all() {
         let _guard = setup();
         let url = "https://a.example.com/.well-known/agent.json";
-        assert!(lookup_surface_card("orders", url).is_none(), "miss before insert");
-        insert_surface_card("orders", url, Some(json!({"kind": "protected"})));
-        insert_surface_card("billing", url, None);
-        assert_eq!(lookup_surface_card("orders", url), Some(Some(json!({"kind": "protected"}))));
-        assert_eq!(lookup_surface_card("billing", url), Some(None));
-        assert!(lookup_surface_card("orders", "https://b.example.com/.well-known/agent.json").is_none());
+        let key_a = r#"{"method":"a"}"#;
+        assert!(lookup_surface_card("orders", url, key_a).is_none(), "miss before insert");
+        insert_surface_card("orders", url, key_a, Some(json!({"kind": "protected"})));
+        insert_surface_card("billing", url, key_a, None);
+        assert_eq!(lookup_surface_card("orders", url, key_a), Some(Some(json!({"kind": "protected"}))));
+        assert_eq!(lookup_surface_card("billing", url, key_a), Some(None));
+        assert!(lookup_surface_card("orders", url, r#"{"method":"b"}"#).is_none(), "another Target authentication");
+        assert!(lookup_surface_card("orders", "https://b.example.com/.well-known/agent.json", key_a).is_none());
         assert!(lookup("https://a.example.com", None).is_none(), "an outbound lookup never sees it");
         invalidate_all();
-        assert!(lookup_surface_card("orders", url).is_none(), "cleared on invalidate_all");
+        assert!(lookup_surface_card("orders", url, key_a).is_none(), "cleared on invalidate_all");
     }
 
     #[test]
