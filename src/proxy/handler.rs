@@ -10348,8 +10348,8 @@ fn bind_api_key_caller_did(
 /// identified by its key id and reports `source_auth`; a plain API Key by its
 /// `secret_id`, shared by every value in the secret, and reports `unverified`.
 /// A caller-attributable auth failure resolves no identity, leaving the
-/// decision to policy. Any other source auth, an unusable key, or a VC issuer
-/// that is missing or fails refuses the request with a fixed body.
+/// decision to policy, as does a VC issuer that is missing or fails. Any other
+/// source auth or an unusable key refuses the request with a fixed body.
 async fn resolve_presented_api_key_identity(
     state: &ProxyState,
     channel_name: &str,
@@ -10407,12 +10407,9 @@ async fn resolve_presented_api_key_identity(
         .map(|s| s.get_vc_issuer())
         .or_else(|| state.vc_issuer.clone())
     else {
-        warn!(channel = channel_name, leg, "Inbound from_api_key identity without a VC issuer — refused");
+        warn!(channel = channel_name, leg, "Inbound from_api_key identity without a VC issuer — DID issuance skipped");
         track("vc_issuer_missing");
-        return Err(create_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Caller identity requires a configured VC issuer",
-        ));
+        return Ok(None);
     };
     let response = match issuer
         .issue_or_get_caller_credential(
@@ -10433,7 +10430,7 @@ async fn resolve_presented_api_key_identity(
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for the presented API key");
             track("vc_issuer_error");
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, "Caller identity could not be issued"));
+            return Ok(None);
         }
     };
     track(if response.is_new {
@@ -21758,35 +21755,23 @@ allow if {
         }
 
         #[tokio::test]
-        async fn missing_vc_issuer_is_refused() {
+        async fn missing_vc_issuer_resolves_no_identity() {
             let state = state_with(inbound_from_api_key("pak-no-issuer"), None);
 
-            let response = resolve(&state, Some(&provider_key("atgk_pak_no_issuer")), false)
-                .await
-                .unwrap_err();
+            let result = resolve(&state, Some(&provider_key("atgk_pak_no_issuer")), false).await;
 
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(
-                body_text(response)
-                    .await
-                    .contains("Caller identity requires a configured VC issuer")
-            );
+            assert!(matches!(result, Ok(None)));
             assert_eq!(resolve_count("pak-no-issuer", "vc_issuer_missing"), 1);
         }
 
         #[tokio::test]
-        async fn issuance_error_is_a_bad_gateway_without_its_detail() {
+        async fn issuance_error_resolves_no_identity() {
             let (issuer, _dir) = test_vc_issuer_with(Arc::new(FailingIdentityStore)).await;
             let state = state_with(inbound_from_api_key("pak-issuer-error"), Some(issuer));
 
-            let response = resolve(&state, Some(&provider_key("atgk_pak_issuer_error")), false)
-                .await
-                .unwrap_err();
+            let result = resolve(&state, Some(&provider_key("atgk_pak_issuer_error")), false).await;
 
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            let body = body_text(response).await;
-            assert!(body.contains("Caller identity could not be issued"), "{body}");
-            assert!(!body.contains(FailingIdentityStore::DETAIL), "{body}");
+            assert!(matches!(result, Ok(None)));
             assert_eq!(resolve_count("pak-issuer-error", "vc_issuer_error"), 1);
         }
 

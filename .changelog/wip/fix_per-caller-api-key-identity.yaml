@@ -21,8 +21,8 @@ changes:
         shared by everyone holding it and reported as `unverified`. A failed or revoked key
         resolves no caller identity. The inbound slot stores no key id; a stored one is
         ignored and dropped on save. A key that also identifies a Managed Agent resolves to
-        that Managed Agent's DID for its callers, and a surface policy on
-        `input.source_auth.key_name` refuses it.
+        that Managed Agent's DID for its callers; a surface policy can refuse those callers
+        by `input.source_auth.key_name`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Stop asking for an API key on the inbound Identity in the Surface Builder
       description: >-
@@ -49,7 +49,8 @@ changes:
       description: >-
         A plain API Key secret id starting `atgk_` would derive the same caller DID as the API
         Key Provider key with that id. Saving such a surface with an inbound From API Key
-        Identity is refused with 400, and a stored one is refused at request time with 500.
+        Identity is refused with 400, and a stored one is refused at request time with 500
+        (metric `result` `api_key_secret_id_reserved`).
     - timestamp: '2026-11-02T00:00:00Z'
       title: Make the presented API key's DID replace any body-asserted caller identity
       description: >-
@@ -72,25 +73,27 @@ changes:
         An inbound From API Key Identity behind caller authentication that is not API Key or
         API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
         it, on the surface or an enabled variant, is refused with 400, as is combining it with
-        `mcp_http.authorization`. A missing VC issuer returns 500 and an issuance failure 502.
-        Find affected surfaces through `agent_gateway_managed_identity_resolve_total` with
+        `mcp_http.authorization`. A missing VC issuer or a failed DID issuance resolves no
+        caller identity and leaves the decision to policy, as before. Find affected surfaces through `agent_gateway_managed_identity_resolve_total` with
         `mode="from_api_key"` and `result` `api_key_unavailable`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching
       description: >-
-        Callers on an API Key Provider surface no longer share the configured key's DID. Policies,
-        Trust Check entries and Transit Point OAuth grants tied to that DID now match only the
-        key it belongs to, and the Transit token `sub` and Workload Binding `userIdentity.id`
-        are per key. On a plain API Key surface whose stored inbound key id differed from the
-        Caller Context secret id, callers now get that secret's DID instead of the stored
-        key's, and the stored id is dropped on save. Re-grant or update rules for the affected
-        keys.
+        Callers on an API Key Provider surface no longer share the configured key's DID; only
+        callers presenting that key keep it. Every caller on a plain API Key surface gets a new
+        DID, derived from the Caller Context secret id: the dashboard stored an API Key Provider
+        key id there, never a secret id, so no caller keeps its old DID unless an API write had
+        stored the secret id itself. Policies, Trust Check
+        entries and Transit Point OAuth grants tied to an old DID stop matching, and the
+        Transit token `sub` and Workload Binding `userIdentity.id` are per key. The stored
+        inbound key id is dropped on save. Re-grant or update rules for the affected keys.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse From API Key on an MCP proxy:// surface when it is saved again
       description: >-
         The MCP Proxy request path never resolves the caller's key, so saving an MCP surface
         with a `proxy://` target and an inbound From API Key Identity is refused with 400. A
-        stored surface keeps loading but cannot be saved until its inbound Identity changes.
+        stored surface keeps loading and serves its callers with no caller identity, and it
+        cannot be saved until its inbound Identity changes.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Drop downgrade support for surfaces saved without an inbound key id
       description: >-

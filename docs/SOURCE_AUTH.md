@@ -909,8 +909,10 @@ Request-time refusals return a fixed body and log the cause server-side. Each co
 | An API Key secret id starts with `atgk_` | `500` | `api_key_secret_id_reserved` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
-| No VC issuer is configured | `500` | `vc_issuer_missing` |
-| DID issuance fails | `502` | `vc_issuer_error` |
+
+When no VC issuer is configured (`vc_issuer_missing`) or DID issuance fails
+(`vc_issuer_error`), the request is not refused: it resolves no caller identity and policy
+decides, as for a failed key.
 
 ### `from_jwt_claim`
 
