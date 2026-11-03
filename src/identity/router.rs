@@ -661,6 +661,22 @@ pub fn create_identity_api_router(
                 )),
             )
             .route(
+                "/v1/surfaces/{surface_id}/agent-card",
+                get(handlers::get_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/agent-card/refresh",
+                post(handlers::refresh_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesEdit,
+                )),
+            )
+            .route(
                 "/v1/surfaces/{surface_id}",
                 put(handlers::update_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesEdit)),
             )

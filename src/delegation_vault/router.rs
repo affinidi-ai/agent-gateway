@@ -411,6 +411,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_provider_error_on_the_callback_logs_only_the_oauth_error_code() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
+        for query in [
+            "error=access_denied&error_description=description-marker",
+            "error=bad%22quote&error_description=description-marker",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/identity/oauth/callback/github?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let lines: Vec<_> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("OAuth provider returned an error"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("oauth_error=access_denied"), "{}", lines[0]);
+        assert!(lines[1].contains("oauth_error=unrecognized_error"), "{}", lines[1]);
+        assert!(
+            !logs
+                .text()
+                .contains("description-marker"),
+            "{}",
+            logs.text()
+        );
+        assert!(!logs.text().contains("quote"), "{}", logs.text());
+    }
+
     // ── a non-admin principal is denied on every management route ──
 
     #[tokio::test]

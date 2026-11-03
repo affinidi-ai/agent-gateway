@@ -3351,6 +3351,7 @@ pub async fn run_axum_proxy(
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
         identity_state.jwt_verification_strategy_store = Some(source_auth_middleware.provider_store());
+        crate::identity::handlers::report_credential_policy(&identity_state).await;
 
         // Register with the GW2 message processor (global singleton).
         crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(network_config.clone()));
@@ -3641,7 +3642,7 @@ pub async fn run_axum_proxy(
                             source_auth_middleware.jwks_client(),
                         )),
                         continuations: runtime.service.clone(),
-                        provider_http: crate::http_client::external().map_err(|error| anyhow::anyhow!(error))?,
+                        provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
                     },
                 ));
             }

@@ -193,6 +193,36 @@ pub(crate) fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// The static half of [`validate_resolved_cloud_metadata_url`]: an http(s) URL
+/// with a host, no embedded credentials, and a host that is not a cloud-provider
+/// metadata service. Resolves nothing.
+pub(crate) fn validate_url_not_cloud_metadata_host(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("URL must not be empty".into());
+    }
+    let parsed = parse_http_url(trimmed)?;
+    if parsed.host().is_none()
+        || parsed
+            .host_str()
+            .is_some_and(|h| h.is_empty())
+    {
+        return Err("URL must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain embedded credentials".into());
+    }
+    let host = parsed.host().unwrap();
+    if is_cloud_metadata_host(&host) {
+        return Err(format!(
+            "URL host '{}' is blocked: cloud-provider metadata services are not allowed \
+             as target endpoints",
+            host
+        ));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 thread_local! {
     static RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -218,29 +248,7 @@ fn validate_resolved_url_inner(
     let parsed = if block_loopback {
         validate_url_not_cloud_metadata(raw)?
     } else {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err("URL must not be empty".into());
-        }
-        let p = parse_http_url(trimmed)?;
-        if p.host().is_none()
-            || p.host_str()
-                .is_some_and(|h| h.is_empty())
-        {
-            return Err("URL must include a host".into());
-        }
-        if !p.username().is_empty() || p.password().is_some() {
-            return Err("URL must not contain embedded credentials".into());
-        }
-        let host = p.host().unwrap();
-        if is_cloud_metadata_host(&host) {
-            return Err(format!(
-                "URL host '{}' is blocked: cloud-provider metadata services are not allowed \
-                 as target endpoints",
-                host
-            ));
-        }
-        p
+        validate_url_not_cloud_metadata_host(raw)?
     };
 
     // IP literals were already validated statically — no DNS to do.
@@ -332,7 +340,7 @@ pub fn validate_resolved_cloud_metadata_url(raw: &str) -> Result<Url, String> {
     validate_resolved_url_inner(raw, false)
 }
 
-fn bdd_oauth_endpoint_allowlist() -> Option<String> {
+pub(crate) fn bdd_oauth_endpoint_allowlist() -> Option<String> {
     if std::env::var("AG_TEST_MODE").as_deref() != Ok("true") {
         return None;
     }
@@ -578,6 +586,23 @@ mod tests {
     fn must_allow(url: &str) {
         let result = validate_url_not_cloud_metadata(url);
         assert!(result.is_ok(), "Expected '{}' to be allowed, but got error: {}", url, result.unwrap_err());
+    }
+
+    #[test]
+    fn a_resolved_cloud_metadata_address_is_recognised_in_every_form() {
+        use std::net::IpAddr;
+        let metadata: Vec<IpAddr> = CLOUD_METADATA_IPV4
+            .iter()
+            .map(|ip| IpAddr::V4(*ip))
+            .chain(["fd00:ec2::254", "::ffff:169.254.169.254", "::ffff:100.100.100.200"].map(|ip| ip.parse().unwrap()))
+            .collect();
+        assert_eq!(metadata.len(), 7);
+        for ip in metadata {
+            assert!(is_cloud_metadata_resolved_ip(ip), "{ip} must be a metadata address");
+        }
+        for ip in ["127.0.0.1", "::1", "10.0.0.1", "169.254.1.1"] {
+            assert!(!is_cloud_metadata_resolved_ip(ip.parse().unwrap()), "{ip} must not be a metadata address");
+        }
     }
 
     // ── Cloud metadata IPs ──────────────────────────────────────────────

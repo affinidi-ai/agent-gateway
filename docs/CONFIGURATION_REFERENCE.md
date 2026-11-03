@@ -146,6 +146,7 @@ The bootstrap file. Startup only; changes need a restart.
 | --- | --- |
 | top level | `channel_config_source`, AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
+| `[credential_policy]` | How strictly credential providers are held to two rules. `token_endpoint_https` and `tenant_credential_isolation` are each `"warn"` (default) or `"enforce"`; any other value fails startup. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty); an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. Absent section means both rules are `warn`. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
 | `[config_files]` | Where the other configuration files are |
 | `[storage_paths]` | Where each record kind is persisted under `_storage/`. The Trust Recorder status store has no key: it sits beside the identities directory as `trust_recorder_status/`. |

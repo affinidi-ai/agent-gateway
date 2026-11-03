@@ -232,6 +232,32 @@ surfaces on its first start. Upgrade nodes that share storage together, or set
 `cache_refresh_interval_secs` to `0` on the older node until it is upgraded (see
 [A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
 
+## Credential policy
+
+The bootstrap `[credential_policy]` table maps to `CredentialPolicyConfig` in
+[`src/config/credential_policy.rs`](../src/config/credential_policy.rs). It is read once at startup
+and held for the life of the process, so a configuration reload does not change it; changing it
+needs a restart.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
+| `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether credential providers may use only secrets of their own tenant, and tenant surfaces (including their custom metadata and the credential providers they bind) and tenant A2A Proxies only their own tenant's secrets and providers; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant) and [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs). |
+| `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
+| `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants and their refreshes, the legacy delegated refresh, the legacy code exchange and the `2026-07-28` consent exchange. It does not apply to the connect API's grant code exchange and refresh, which keep a fixed 30 seconds. The no-redirect rule is unchanged. |
+
+`"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
+configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. For
+`tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
+credential provider; a reference to another tenant's is refused in both modes (see
+[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
+unknown value fails startup, and an absent section means both rules are `"warn"`. A provider with
+an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
+its issuer metadata and revocation calls have their own 10 second timeouts, not
+`token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and
+needs a restart, see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#gatewayjson).
+
 ## Fabric envelope lifetime
 
 A `forward-request` sent over the fabric carries a DIDComm `expires_time`. The sending gateway

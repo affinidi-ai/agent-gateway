@@ -12,7 +12,7 @@ use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
 use crate::delegation_vault::service_token::{
-    self, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
+    self, Freshness, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
 };
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, oauth, storage::DelegationVaultStorage};
 use crate::secrets::SecretsStore;
@@ -274,6 +274,10 @@ impl DelegationResolution {
     }
 }
 
+/// Appended to an audit detail when the provider's token endpoint breaks the https rule and
+/// is let through only because `credential_policy.token_endpoint_https` is `warn`.
+const INSECURE_TOKEN_ENDPOINT_DETAIL: &str = " insecure_token_endpoint";
+
 /// The grant name used in audit details, and the outcome recorded when it fails.
 fn service_grant(provider_type: &CredentialProviderType) -> (&'static str, DelegationActionOutcome) {
     match provider_type {
@@ -321,6 +325,9 @@ fn enrich_audit_event(
 /// * `user_identity_hash` — SHA-256 hash of the caller's identity claim
 /// * `agent_did` — the DID of the agent this channel proxies to
 /// * `channel_id` — for logging
+/// * `surface_tenancy` — the tenant of the surface the bindings belong to; a provider of
+///   another tenant, or an appliance-wide one that sends the gateway's own credential once
+///   `tenant_credential_isolation` is `enforce`, is refused with `provider_forbidden`
 /// * `mcp_tool_name` — if this is an MCP tool call, the tool name (for `Tools` requirement filter)
 /// * `vault_store` — delegation vault storage
 /// * `provider_store` — credential provider storage
@@ -336,6 +343,7 @@ pub async fn resolve_delegation_credentials(
     user_identity_hash: &str,
     agent_did: &str,
     channel_id: &str,
+    surface_tenancy: crate::tenancy::SurfaceTenancy<'_>,
     mcp_tool_name: Option<&str>,
     vault_store: &Arc<dyn DelegationVaultStorage>,
     provider_store: &Arc<dyn CredentialProviderStorage>,
@@ -439,12 +447,47 @@ pub async fn resolve_delegation_credentials(
             ));
             continue;
         }
+        if !provider.usable_by(surface_tenancy) {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                surface_id = %channel_id,
+                provider_id = %binding.credential_provider_id,
+                "Credential provider is outside the surface's tenant - refusing the request"
+            );
+            results.push(DelegationResolution::new(
+                binding,
+                Some(&provider.name),
+                DelegationActionOutcome::ProviderUnavailable,
+                Some("provider_forbidden".to_string()),
+                DelegationLookupResult::Unavailable,
+            ));
+            continue;
+        }
+        let appliance_wide = provider.breaks_tenant_isolation_for(surface_tenancy.tenant_id);
+        if appliance_wide {
+            warn!(
+                target: "credential_delegation",
+                surface_variant,
+                surface_id = %channel_id,
+                provider_id = %binding.credential_provider_id,
+                tenant_id = ?surface_tenancy.tenant_id,
+                "Credential provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+            );
+        }
+        let with_note = |detail: String| {
+            if appliance_wide {
+                format!("{detail} (appliance_wide_credential)")
+            } else {
+                detail
+            }
+        };
 
         // Route by provider type
         match &provider.provider_type {
             CredentialProviderType::ApiKey => {
                 // Direct secret resolution — no OAuth, no vault
-                match oauth::resolve_api_key(&provider, secrets_store).await {
+                match oauth::resolve_api_key(&provider, secrets_store, oauth::isolation_mode()).await {
                     Ok(api_key) => {
                         debug!(
                             target: "credential_delegation",
@@ -462,7 +505,7 @@ pub async fn resolve_delegation_credentials(
                                 Some(channel_id),
                             );
                             evt.via_fabric = via_fabric;
-                            evt.detail = Some("api_key".to_string());
+                            evt.detail = Some(with_note("api_key".to_string()));
                             enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                             evt
                         });
@@ -471,7 +514,7 @@ pub async fn resolve_delegation_credentials(
                             binding,
                             Some(&provider.name),
                             DelegationActionOutcome::TokenInjected,
-                            Some("api_key".to_string()),
+                            Some(with_note("api_key".to_string())),
                             DelegationLookupResult::Inject(headers),
                         ));
                     }
@@ -508,29 +551,34 @@ pub async fn resolve_delegation_credentials(
                     secrets: secrets_store,
                     providers: provider_store.as_ref(),
                     vault: vault_store.as_ref(),
-                    http: None,
+                    egress: None,
                 };
                 let key = ServiceTokenKey {
                     agent_did,
-                    identity: m2m_user_hash,
+                    purpose: m2m_user_hash,
                 };
                 let acquired = service_token::acquire(&provider, effective_scopes, &context, key, Utc::now())
                     .await
                     .and_then(|mut token| match token.issued.take() {
-                        Some(IssuedToken { id, cached }) => Ok((id, cached, token)),
+                        Some(IssuedToken {
+                            id,
+                            freshness,
+                            insecure_endpoint,
+                        }) => Ok((id, freshness, insecure_endpoint, token)),
                         // Unreachable: acquire issues a vault token for each of these OAuth types.
                         None => Err(ServiceTokenError::Unsupported),
                     });
                 match acquired {
-                    Ok((token_id, cached, token)) => {
-                        let detail = format!(
-                            "{grant}_{}",
-                            if cached {
-                                "cached"
+                    Ok((token_id, freshness, insecure_endpoint, token)) => {
+                        let detail = with_note(format!(
+                            "{grant}_{}{}",
+                            freshness.as_str(),
+                            if insecure_endpoint {
+                                INSECURE_TOKEN_ENDPOINT_DETAIL
                             } else {
-                                "fresh"
+                                ""
                             }
-                        );
+                        ));
                         debug!(
                             target: "credential_delegation",
                             surface_variant,
@@ -539,7 +587,7 @@ pub async fn resolve_delegation_credentials(
                             detail = %detail,
                             "Service token resolved — injecting into upstream request"
                         );
-                        if cached
+                        if freshness != Freshness::Fresh
                             && let Err(e) = vault_store
                                 .mark_used(&token_id)
                                 .await
@@ -778,7 +826,10 @@ pub async fn resolve_delegation_credentials(
                         )
                         .await
                         {
-                            Ok(refreshed) => {
+                            Ok(oauth::RefreshedToken {
+                                response: refreshed,
+                                insecure_endpoint,
+                            }) => {
                                 token.access_token = refreshed.access_token.clone();
                                 if let Some(rt) = &refreshed.refresh_token {
                                     token.refresh_token = Some(rt.clone());
@@ -822,6 +873,12 @@ pub async fn resolve_delegation_credentials(
                                     "Token refreshed successfully"
                                 );
 
+                                let refresh_detail = if insecure_endpoint {
+                                    INSECURE_TOKEN_ENDPOINT_DETAIL
+                                } else {
+                                    ""
+                                };
+
                                 // Audit: token refreshed
                                 audit::emit("token_refreshed", || {
                                     let mut evt = audit::audit_event(
@@ -847,7 +904,7 @@ pub async fn resolve_delegation_credentials(
                                     );
                                     evt.token_id = Some(token.id.clone());
                                     evt.via_fabric = via_fabric;
-                                    evt.detail = Some("after_refresh".to_string());
+                                    evt.detail = Some(format!("after_refresh{refresh_detail}"));
                                     enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
                                     evt
                                 });
@@ -1052,7 +1109,6 @@ async fn refresh_verified_credential(
         .claim_refresh(token, now)
         .await
         .map_err(|_| ())?;
-    let client = crate::http_client::external().map_err(|_| ())?;
     let response = oauth::refresh_scoped_access_token(
         provider,
         claim
@@ -1062,7 +1118,7 @@ async fn refresh_verified_credential(
             .ok_or(())?,
         &claim.token().scopes,
         secrets,
-        &client,
+        &oauth::TokenEgress::from_environment(),
     )
     .await
     .map_err(|_| ())?
@@ -1587,14 +1643,31 @@ mod tests {
         ) -> Result<Option<DelegationToken>> {
             Ok(None)
         }
+        /// A found service token stored under its purpose alone answers every key of that
+        /// purpose, so a test need not compute the hashed identity.
         async fn lookup(
             &self,
             _agent_did: &str,
-            _user_identity_hash: &str,
+            user_identity_hash: &str,
             _provider_id: &str,
         ) -> Result<VaultLookupResult> {
-            let guard = self.result.lock().await;
-            Ok(guard.clone())
+            let mut result = self
+                .result
+                .lock()
+                .await
+                .clone();
+            if let VaultLookupResult::Found(token) = &mut result
+                && user_identity_hash
+                    .strip_prefix(
+                        token
+                            .user_identity_hash
+                            .as_str(),
+                    )
+                    .is_some_and(|rest| rest.starts_with(':'))
+            {
+                token.user_identity_hash = user_identity_hash.to_string();
+            }
+            Ok(result)
         }
         async fn list_all(&self) -> Result<Vec<DelegationToken>> {
             Ok(vec![])
@@ -1648,6 +1721,12 @@ mod tests {
             providers.insert(id.to_string(), make_credential_provider(id, provider_type));
             Arc::new(Self { providers })
         }
+
+        fn with_stored(provider: CredentialProvider) -> Arc<Self> {
+            let mut providers = HashMap::new();
+            providers.insert(provider.id.clone(), provider);
+            Arc::new(Self { providers })
+        }
     }
 
     #[async_trait]
@@ -1697,7 +1776,21 @@ mod tests {
 
     // ── Mock secrets store ────────────────────────────────────────────────
 
-    struct MockSecretsStore;
+    /// Lists the `CLIENT_ID` and `CLIENT_SECRET` references of `make_credential_provider` in
+    /// `tenant_id` and answers a lookup of either with an empty value, or holds no secret at
+    /// all when `empty`.
+    #[derive(Default)]
+    struct MockSecretsStore {
+        tenant_id: Option<String>,
+        empty: bool,
+    }
+
+    fn empty_secrets() -> Arc<dyn SecretsStore> {
+        Arc::new(MockSecretsStore {
+            empty: true,
+            ..Default::default()
+        })
+    }
 
     #[async_trait]
     impl crate::secrets::store::SecretsStore for MockSecretsStore {
@@ -1713,8 +1806,47 @@ mod tests {
         ) -> Result<Option<Secret>> {
             Ok(None)
         }
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> Result<Option<Secret>> {
+            Ok(self
+                .list_all()
+                .await?
+                .into_iter()
+                .find(|secret| secret.secret_id == secret_id)
+                .map(|item| Secret {
+                    id: item.id,
+                    tenant_id: item.tenant_id,
+                    name: item.name,
+                    secret_id: item.secret_id,
+                    description: None,
+                    value: String::new(),
+                    secret_type: item.secret_type,
+                    tags: vec![],
+                    created_at: item.created_at,
+                    updated_at: item.updated_at,
+                }))
+        }
         async fn list_all(&self) -> Result<Vec<SecretListItem>> {
-            Ok(vec![])
+            if self.empty {
+                return Ok(Vec::new());
+            }
+            let at = chrono::DateTime::<Utc>::UNIX_EPOCH;
+            Ok(["CLIENT_ID", "CLIENT_SECRET"]
+                .into_iter()
+                .map(|secret_id| SecretListItem {
+                    id: secret_id.to_lowercase(),
+                    tenant_id: self.tenant_id.clone(),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    secret_type: "General".into(),
+                    tags: vec![],
+                    created_at: at,
+                    updated_at: at,
+                })
+                .collect())
         }
         async fn update(
             &self,
@@ -1981,7 +2113,7 @@ mod tests {
             .claim_refresh(&token, modern::now_secs().unwrap())
             .await
             .unwrap();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_oauth_provider("cp-1");
         let store: Arc<dyn DelegationVaultStorage> = vault.clone();
         let results = resolve_delegation_credentials(
@@ -1989,6 +2121,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &store,
             &providers,
@@ -2033,12 +2166,13 @@ mod tests {
         });
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         resolve_delegation_credentials(
             &[make_binding("cp-1")],
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2090,7 +2224,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2098,6 +2232,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2155,7 +2290,7 @@ mod tests {
     async fn a_binding_whose_provider_is_gone_is_unavailable() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2163,6 +2298,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2193,13 +2329,14 @@ mod tests {
         token.access_token = "cached-service-token".to_string();
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let results = resolve_delegation_credentials(
             &[make_binding("cp-1")],
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2232,26 +2369,176 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_renewal_injects_the_cached_client_credentials_token_as_stale() {
+        let now = Utc::now();
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        token.created_at = now - Duration::seconds(3400);
+        token.expires_at = Some(now + Duration::seconds(200));
+        let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::Found(token));
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        provider.token_endpoint = Some(token_endpoint.clone());
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint),
+            policy: Default::default(),
+        };
+
+        let results = egress
+            .scope(resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
+            ))
+            .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0].result {
+            DelegationLookupResult::Inject(injections) => assert_eq!(
+                injections,
+                &vec![ResolvedCredentialInjection::Header {
+                    name: "Authorization".to_string(),
+                    value: "Bearer cached-service-token".to_string(),
+                }]
+            ),
+            _ => panic!("Expected Inject, got {:?}", result_tag(&results[0].result)),
+        }
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_from_an_http_token_endpoint_is_named_in_the_audit_detail_in_warn_mode() {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        provider.token_endpoint = Some("http://auth.example.com/token".into());
+        let providers = Arc::new(MockProviderStore {
+            providers: HashMap::from([("cp-1".to_string(), provider)]),
+        });
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+
+        let results = resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(result_tag(&results[0].result), "Inject");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached insecure_token_endpoint")
+        );
+    }
+
     #[tokio::test]
     async fn api_key_and_client_credentials_failures_are_unavailable() {
-        for (provider_type, outcome) in [
-            (CredentialProviderType::ApiKey, DelegationActionOutcome::ApiKeyResolutionFailed),
-            (CredentialProviderType::OAuth2ClientCredentials, DelegationActionOutcome::ClientCredentialsFailed),
-            (CredentialProviderType::OAuth2JwtBearer, DelegationActionOutcome::JwtBearerFailed),
+        for (provider_type, outcome, error) in [
+            (
+                CredentialProviderType::ApiKey,
+                DelegationActionOutcome::ApiKeyResolutionFailed,
+                ServiceTokenError::SecretUnavailable,
+            ),
+            (
+                CredentialProviderType::OAuth2ClientCredentials,
+                DelegationActionOutcome::ClientCredentialsFailed,
+                ServiceTokenError::SecretUnavailable,
+            ),
+            (
+                CredentialProviderType::OAuth2JwtBearer,
+                DelegationActionOutcome::JwtBearerFailed,
+                ServiceTokenError::TokenRequestFailed,
+            ),
             (
                 CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
                 DelegationActionOutcome::ClientCredentialsJwtAuthFailed,
+                ServiceTokenError::SecretUnavailable,
             ),
         ] {
             let vault = MockVaultStore::new(VaultLookupResult::NotFound);
             let providers = MockProviderStore::with_provider("cp-1", provider_type.clone());
-            let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+            let secrets = empty_secrets();
 
             let results = resolve_delegation_credentials(
                 &[make_binding("cp-1")],
                 "sha256:user1",
                 "did:web:agent.example",
                 "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
                 None,
                 &(vault as Arc<dyn DelegationVaultStorage>),
                 &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2273,15 +2560,307 @@ mod tests {
                         .action
                         .detail
                         .as_deref(),
-                    Some(
-                        ServiceTokenError::TokenRequestFailed
-                            .to_string()
-                            .as_str()
-                    ),
+                    Some(error.to_string().as_str()),
                     "{provider_type:?}"
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_the_egress_policy_blocks_is_named_in_the_audit_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2ClientCredentials);
+        provider.token_endpoint = Some("http://127.0.0.1:9/token".into());
+        let providers = Arc::new(MockProviderStore {
+            providers: HashMap::from([("cp-1".to_string(), provider)]),
+        });
+        let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::NotFound);
+        let providers: Arc<dyn CredentialProviderStorage> = providers;
+
+        // A refusal starts no backoff, so the second resolve is refused again rather than held back.
+        for _ in 0..2 {
+            let results = resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                None,
+                None,
+            )
+            .await;
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(result_tag(&results[0].result), "Unavailable");
+            assert_eq!(results[0].action.outcome, DelegationActionOutcome::ClientCredentialsFailed);
+            assert_eq!(
+                results[0]
+                    .action
+                    .detail
+                    .as_deref(),
+                Some(
+                    ServiceTokenError::TokenEndpointRefused
+                        .to_string()
+                        .as_str()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_logs_and_audits_only_the_oauth_error_code() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for secret_id in ["CLIENT_ID", "CLIENT_SECRET"] {
+            secrets
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let app = axum::Router::new().fallback(axum::routing::post(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "description-marker",
+                    "error_uri": "https://idp.example/uri-marker"
+                })),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.token_endpoint = Some(token_endpoint.clone());
+        let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
+        let vault: Arc<dyn DelegationVaultStorage> =
+            MockVaultStore::new(VaultLookupResult::ExpiredRefreshable(make_token(true, true)));
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint),
+            policy: Default::default(),
+        };
+
+        let (results, events) = crate::audit::producer::capture(egress.scope(resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
+            None,
+            &vault,
+            &providers,
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )))
+        .await;
+
+        let expected = "Token refresh failed (HTTP 400 Bad Request): invalid_grant";
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::RefreshFailed);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some(expected)
+        );
+        let refresh_failed: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, DelegationAuditAction::RefreshFailed))
+            .collect();
+        assert_eq!(refresh_failed.len(), 1, "{events:?}");
+        assert_eq!(
+            refresh_failed[0]
+                .detail
+                .as_deref(),
+            Some(expected)
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("Token refresh failed — requesting new consent"))
+            .unwrap_or_else(|| panic!("the refused refresh is logged: {text}"));
+        assert!(line.contains("invalid_grant"), "{line}");
+        for marker in ["description-marker", "uri-marker"] {
+            assert!(!text.contains(marker), "{marker} reached the log: {text}");
+            assert!(!format!("{events:?}").contains(marker), "{marker} reached the audit: {events:?}");
+        }
+    }
+
+    async fn resolve_for_tenant(
+        provider_type: CredentialProviderType,
+        provider_tenant: Option<&str>,
+        mode: crate::config::credential_policy::RuleMode,
+    ) -> DelegationResolution {
+        let mut token = make_token(false, false);
+        token.user_identity_hash = "__client_credentials__".to_string();
+        token.access_token = "cached-service-token".to_string();
+        let vault = MockVaultStore::new(VaultLookupResult::Found(token));
+        let mut provider = make_credential_provider("cp-1", provider_type);
+        provider.tenant_id = provider_tenant.map(String::from);
+        let providers = MockProviderStore::with_stored(provider);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore {
+            tenant_id: provider_tenant.map(String::from),
+            empty: false,
+        });
+        resolve_delegation_credentials(
+            &[make_binding("cp-1")],
+            "sha256:user1",
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy {
+                tenant_id: Some("tenant-a"),
+                mode,
+            },
+            None,
+            &(vault as Arc<dyn DelegationVaultStorage>),
+            &(providers as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            None,
+            None,
+        )
+        .await
+        .remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_surface_never_sends_another_tenants_gateway_credential() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        for mode in [Warn, Enforce] {
+            for provider_type in [
+                CredentialProviderType::ApiKey,
+                CredentialProviderType::OAuth2ClientCredentials,
+                CredentialProviderType::OAuth2JwtBearer,
+                CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+            ] {
+                let resolution = resolve_for_tenant(provider_type.clone(), Some("tenant-b"), mode).await;
+                assert_eq!(result_tag(&resolution.result), "Unavailable", "{provider_type:?}");
+                assert_eq!(resolution.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+                assert_eq!(
+                    resolution
+                        .action
+                        .detail
+                        .as_deref(),
+                    Some("provider_forbidden")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_gateway_credential_is_refused_on_a_tenant_surface_only_when_enforced() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        for provider_type in [
+            CredentialProviderType::ApiKey,
+            CredentialProviderType::OAuth2ClientCredentials,
+            CredentialProviderType::OAuth2JwtBearer,
+            CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+        ] {
+            let refused = resolve_for_tenant(provider_type.clone(), None, Enforce).await;
+            assert_eq!(result_tag(&refused.result), "Unavailable", "{provider_type:?}");
+            assert_eq!(refused.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+            assert_eq!(
+                refused
+                    .action
+                    .detail
+                    .as_deref(),
+                Some("provider_forbidden")
+            );
+        }
+
+        let warned = resolve_for_tenant(CredentialProviderType::OAuth2ClientCredentials, None, Warn).await;
+        assert_eq!(result_tag(&warned.result), "Inject");
+        assert_eq!(warned.action.outcome, DelegationActionOutcome::TokenInjected);
+        assert_eq!(
+            warned
+                .action
+                .detail
+                .as_deref(),
+            Some("client_credentials_cached (appliance_wide_credential)")
+        );
+
+        let own = resolve_for_tenant(CredentialProviderType::OAuth2ClientCredentials, Some("tenant-a"), Enforce).await;
+        assert_eq!(result_tag(&own.result), "Inject");
+        assert_eq!(own.action.detail.as_deref(), Some("client_credentials_cached"));
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_authorization_code_provider_stays_usable_on_a_tenant_surface() {
+        let resolution = resolve_for_tenant(
+            CredentialProviderType::OAuth2AuthorizationCode,
+            None,
+            crate::config::credential_policy::RuleMode::Enforce,
+        )
+        .await;
+        assert_ne!(
+            resolution
+                .action
+                .detail
+                .as_deref(),
+            Some("provider_forbidden")
+        );
+        assert_ne!(resolution.action.outcome, DelegationActionOutcome::ProviderUnavailable);
     }
 
     #[tokio::test]
@@ -2290,7 +2869,7 @@ mod tests {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         in_request(RequestScope::new("0123456789abcdef".to_string()), async {
@@ -2300,6 +2879,7 @@ mod tests {
                 "sha256:user1",
                 "did:web:agent.example",
                 "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
                 None,
                 &vault,
                 &providers,
@@ -2327,7 +2907,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         // Call with a different tool name
@@ -2336,6 +2916,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             Some("create_issue"),
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2367,7 +2948,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         let results = resolve_delegation_credentials(
@@ -2375,6 +2956,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             Some("list_repos"),
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2395,7 +2977,7 @@ mod tests {
     async fn test_tool_binding_skips_when_no_tool_name() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_tool_binding("cp-1", vec!["list_repos".to_string()])];
 
         // No tool name (non-MCP request)
@@ -2404,6 +2986,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2433,13 +3016,14 @@ mod tests {
     async fn test_empty_bindings_returns_empty() {
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let results = resolve_delegation_credentials(
             &[],
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2459,7 +3043,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![OutboundCredentialBinding {
             credential_provider_id: "cp-1".to_string(),
             scopes: vec![],
@@ -2478,6 +3062,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2563,7 +3148,7 @@ mod tests {
         // Use a real provider so we reach the vault lookup (instead of
         // short-circuiting on provider_not_found).
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2571,6 +3156,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &vault,
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2593,7 +3179,7 @@ mod tests {
         // Since MockProviderStore is empty, the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::ExpiredNoRefresh(make_token(true, false)));
         let providers = MockProviderStore::empty();
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![make_binding("cp-1")];
 
         let results = resolve_delegation_credentials(
@@ -2601,6 +3187,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2621,7 +3208,7 @@ mod tests {
         let token = make_token(false, false);
         let vault = MockVaultStore::new(VaultLookupResult::Found(token));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
 
         let bindings = vec![make_binding("cp-1"), make_tool_binding("cp-2", vec!["special_tool".to_string()])];
 
@@ -2631,6 +3218,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2679,11 +3267,11 @@ mod tests {
     async fn test_elicit_without_session_id_falls_through_to_consent_required() {
         // ConsentMode::Elicit + NO audit_ctx.mcp_session_id → try_elicit_flow
         // returns None and the caller invokes build_consent_required.
-        // MockSecretsStore cannot resolve the OAuth client_id secret, so no
+        // An empty MockSecretsStore cannot resolve the OAuth client_id secret, so no
         // authorization URL can be built and the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let results = resolve_delegation_credentials(
@@ -2691,6 +3279,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2712,7 +3301,7 @@ mod tests {
         // elicitation capability + fallback = Fail → NotApplicable + audit.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::Fail)];
 
         let ctx = DelegationAuditContext {
@@ -2725,6 +3314,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2754,7 +3344,7 @@ mod tests {
         // OnDemand → falls through to consent_required.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)];
 
         let ctx = DelegationAuditContext {
@@ -2767,6 +3357,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2780,7 +3371,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         // As above: fallthrough → build_consent_required → secret resolution
-        // fails on MockSecretsStore → no authorization URL → Unavailable.
+        // fails on an empty MockSecretsStore → no authorization URL → Unavailable.
         assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
@@ -2804,7 +3395,7 @@ mod tests {
 
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets = empty_secrets();
         let bindings = vec![elicit_binding("cp-1", crate::config::types::ElicitFallback::Fail)];
 
         let ctx = DelegationAuditContext {
@@ -2817,6 +3408,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
@@ -2829,7 +3421,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        // With MockSecretsStore the authorization-URL build fails before we
+        // With an empty MockSecretsStore the authorization-URL build fails before we
         // ever attempt SSE delivery, so try_elicit_flow returns None and the
         // caller falls through to build_consent_required, which also fails
         // on secrets → Unavailable. The no-SSE-stream branch itself is

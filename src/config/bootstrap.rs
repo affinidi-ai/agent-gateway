@@ -320,6 +320,10 @@ impl BootstrapConfig {
             }
         }
 
+        self.credential_policy
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid [credential_policy] config: {e}"))?;
+
         // Validate A2A config (version, expires vs timeout, inflight limits, etc.)
         self.a2a
             .validate()

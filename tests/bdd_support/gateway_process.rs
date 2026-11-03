@@ -74,6 +74,16 @@ impl GatewayProcess {
         Self::start_with_env(config_path, base_folder, SURFACE_TEST_AUTH_TOKEN, OutputMode::Piped, extra_env)
     }
 
+    /// Like [`Self::start_surface_with_env`], but keeps the gateway's output in
+    /// `gateway.log` under `base_folder` for scenarios that read it.
+    pub fn start_surface_logged_with_env(
+        config_path: &Path,
+        base_folder: &Path,
+        extra_env: &HashMap<String, String>,
+    ) -> Self {
+        Self::start_with_env(config_path, base_folder, SURFACE_TEST_AUTH_TOKEN, OutputMode::GatewayLog, extra_env)
+    }
+
     pub fn start_g2g(
         config_path: &Path,
         base_folder: &Path,

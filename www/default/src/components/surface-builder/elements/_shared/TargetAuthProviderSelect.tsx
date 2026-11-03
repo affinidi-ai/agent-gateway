@@ -3,11 +3,14 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import { isTargetAuthProviderType } from './providerTargetAuth';
+import { splitByTenant, outOfTenantLabel } from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface ProviderOption {
   id: string;
   name: string;
   provider_type?: string;
+  tenant_id?: string | null;
 }
 
 interface TargetAuthProviderSelectProps {
@@ -31,6 +34,8 @@ const TargetAuthProviderSelect: React.FC<TargetAuthProviderSelectProps> = ({
 }) => {
   const [providers, setProviders] = useState<ProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const { offered, outside } = splitByTenant(providers, useSurfaceTenant());
+  const storedOutside = outside.find(provider => provider.id === value);
 
   useEffect(() => {
     let alive = true;
@@ -68,13 +73,18 @@ const TargetAuthProviderSelect: React.FC<TargetAuthProviderSelectProps> = ({
         <option value="">
           {loading ? '-- Loading providers... --' : '-- Select a credential provider --'}
         </option>
-        {providers.map(provider => (
+        {offered.map(provider => (
           <option key={provider.id} value={provider.id}>
             {provider.name}
           </option>
         ))}
+        {storedOutside && (
+          <option value={storedOutside.id}>
+            {storedOutside.name} ({outOfTenantLabel(storedOutside)})
+          </option>
+        )}
       </select>
-      {!loading && providers.length === 0 && (
+      {!loading && offered.length === 0 && (
         <div className="form-text">
           No Client Credentials, JWT Bearer, Client Credentials JWT or API Key provider yet.{' '}
           <AddResourceLink to={deepLinks.credentialProvider} testid={`${testId}-add-link`}>

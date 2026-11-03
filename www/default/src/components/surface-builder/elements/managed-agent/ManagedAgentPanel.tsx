@@ -14,6 +14,7 @@ import {
   surfaceMatchesProtocol,
   useGatewaySurfaces,
 } from '../_shared/useGatewaySurfaces';
+import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 
 interface McpProxy {
@@ -361,6 +362,7 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             </div>
             <Form.Select
               size="sm"
+              data-testid="managed-agent-auth-type"
               value={config.target_auth_enabled ? config.target_auth_type || 'bearer' : 'none'}
               onChange={e => {
                 const v = e.target.value;
@@ -402,6 +404,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           )}
         </div>
       )}
+
+      <AgentCardFetchLine />
 
       <div className="config-section">
         <label>Identity Binding VP</label>

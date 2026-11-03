@@ -108,8 +108,9 @@ impl A2aProxyTargetAdapter {
         secrets_store: Option<&Arc<dyn SecretsStore>>,
         channel_name: &str,
         caller: crate::proxy::handler::CallerAssertion,
+        tenancy: crate::tenancy::SurfaceTenancy<'_>,
     ) -> Response {
-        super::runtime::send_prepared(proxy, prepared, secrets_store, channel_name, caller).await
+        super::runtime::send_prepared(proxy, prepared, secrets_store, channel_name, caller, tenancy).await
     }
 
     /// The proxy `proxy_id` names, when it exists and is not disabled.

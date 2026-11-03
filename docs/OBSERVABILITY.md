@@ -179,6 +179,15 @@ name marks a credential, such as `authorization`, `cookie`, `token`, `session_id
 target. [Log redaction](CONFIGURATION_REFERENCE.md#log-redaction) lists the built-in rules and the
 exact credential names.
 
+### Token endpoint errors
+
+Log lines about a credential provider's token request (target `credential_delegation`, and the
+SAML Graph API token request) may carry the provider id, the surface id, the HTTP status and the
+OAuth `error` code, or `unrecognized_error` when the code is missing or not a valid RFC 6749 code
+of at most 64 bytes. They never carry a secret, a client assertion, a token, the response body or
+`error_description`. See
+[Logging token endpoint errors](CREDENTIAL_DELEGATION.md#logging-token-endpoint-errors).
+
 ## Request correlation
 
 HTTP tracing and policy auditing attach correlation data to request spans and structured events.
@@ -288,6 +297,48 @@ default target. Requests refused before the handler runs emit neither event: the
 missing or invalid credential, the `403` it returns to a PAT with a `resource_pattern` because the
 access-token routes are not a resource-scoped path family, a required header that does not
 match, or Terms the token owner has not accepted.
+
+## Agent card preview events
+
+Every card fetch an [agent card preview](PROTOCOLS.md#agent-card-preview) starts emits one
+`INFO` event on the `audit` target, a log event only like the rotation events above. An answer
+from the last preview, or a refused request, emits none.
+
+| Event | Fields |
+| --- | --- |
+| `agent_card.preview_fetch` | `request` (`read` or `refresh`), `caller_user_id`, `tenant_id` (the tenant token's tenant, empty otherwise), `surface_id`, `auth_kind`, `auth_result`, `auth_failure`, `fetch_status`, `cause` |
+
+The values are the preview's wire spellings, empty when absent. The event never carries a URL,
+a credential, a secret or provider id, or card content. A preview records no connection, gateway
+fault, rejected request or Trust Recorder write, so it leaves the dashboard metrics as they were.
+
+## Credential policy report
+
+At startup and on every configuration reload (including the reload that follows a surface
+change) the gateway logs one `WARN` line per credential provider or surface whose stored
+configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
+find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
+(for example a variant that cannot be resolved) is not checked: it logs one `WARN` line naming
+its `id`, `tenant` and the `error`, and the `INFO` line then says the rest are clean and how many
+surfaces could not be inspected.
+Nothing else changes: the report writes no audit record and carries no secret value or token
+endpoint URL.
+
+| Field | Value |
+| --- | --- |
+| `subject` | `credential_provider` or `surface` |
+| `id` | The provider's `id` or the surface's `surface_id` |
+| `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
+| `rule` | `token_endpoint_https` or `tenant_credential_isolation` |
+| `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
+
+An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
+requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
+provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a
+secret outside its own tenant: a tenant provider holding an appliance-wide or another tenant's secret, or an
+appliance-wide provider holding a tenant's secret. A surface breaks `tenant_credential_isolation` when it
+belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
+or provider that no longer exists is not reported.
 
 ## Governance audit forwarding
 

@@ -3,33 +3,55 @@ use std::collections::HashSet;
 use crate::a2a_proxies::A2aProxyStore;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::agent_surface::{AgentSurface, McpToolGatingConfig};
-use crate::config::{TargetAuthConfig, TargetAuthMethod};
+use crate::config::credential_policy::RuleMode;
+use crate::config::{CustomMetadata, TargetAuthConfig, TargetAuthMethod};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::gateways::GatewayStore;
 use crate::identity::state::IdentityApiState;
 use crate::issuers::IssuerStore;
 use crate::mcp_proxies::McpProxyStore;
 use crate::surfaces::AgentSurfaceStore;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_reference, scope_allows_resource};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, SurfaceTenancy, can_reference, can_reference_with_rule, scope_allows_resource,
+};
 use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
+/// Validates the resources a surface references. A tenant surface may not send an
+/// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
+/// credential of a provider holding a secret outside the provider's tenant: a reference that
+/// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
+/// to every destination that it goes to now, and even then when
+/// `tenant_credential_isolation` is `enforce`.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> Result<(), SurfaceApiError> {
+    let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
+    let grandfathered = match stored {
+        Some(stored) if stored.tenant_id == surface.tenant_id => {
+            grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?)
+        }
+        _ => Vec::new(),
+    };
     let authorizer = ReferenceAuthorizer {
         state,
         owner_tenant_id: surface.tenant_id.as_deref(),
         context,
         scope,
         current_surface_id: &surface.surface_id,
+        isolation,
+        grandfathered,
     };
 
     for reference in collect_surface_reference_keys(surface)? {
+        if reference.custom_metadata && surface.tenant_id.is_none() {
+            continue;
+        }
         authorizer
             .validate_reference(&reference)
             .await?;
@@ -420,6 +442,11 @@ async fn credential_provider_has_issuer(
 pub(crate) struct SurfaceReferenceKey {
     pub kind: ResourceKind,
     pub id: String,
+    /// A secret a tenant surface sends upstream, which must not be appliance-wide.
+    pub same_tenant: bool,
+    /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
+    /// any secret there, even one that does not exist.
+    pub custom_metadata: bool,
 }
 
 pub(crate) fn collect_surface_reference_keys(
@@ -438,8 +465,175 @@ pub(crate) fn collect_surface_reference_keys(
             .cmp(right.kind.as_str())
             .then_with(|| left.id.cmp(&right.id))
     });
-    references.dedup_by(|left, right| left.kind == right.kind && left.id == right.id);
+    references.dedup_by(|later, kept| {
+        let duplicate = later.kind == kept.kind && later.id == kept.id;
+        if duplicate {
+            kept.same_tenant |= later.same_tenant;
+            kept.custom_metadata &= later.custom_metadata;
+        }
+        duplicate
+    });
     Ok(references)
+}
+
+/// Where a credential goes: a leg's endpoint, or the caller, which receives response custom
+/// metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Destination {
+    Endpoint(String),
+    Caller,
+}
+
+/// A credential a surface sends, with the leg that sends it: the Target, or a Transit Point
+/// by `id`, of the base surface or of a variant by `id`, and where it goes. Ids, not aliases
+/// or positions, name the legs, so renaming or reordering variants and Transit Points keeps
+/// them. `sent` is false for a secret named only by disabled custom metadata, which the
+/// surface holds but does not send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SentCredential {
+    variant_id: Option<String>,
+    transit_point_id: Option<String>,
+    destination: Destination,
+    kind: ResourceKind,
+    id: String,
+    sent: bool,
+}
+
+impl SentCredential {
+    fn held_by(
+        &self,
+        stored: &SentCredential,
+    ) -> bool {
+        self.variant_id == stored.variant_id
+            && self.transit_point_id == stored.transit_point_id
+            && self.destination == stored.destination
+            && self.kind == stored.kind
+            && self.id == stored.id
+            && (stored.sent || !self.sent)
+    }
+}
+
+/// Every Target authentication secret or provider, every `outbound_credentials` or
+/// `transit_credentials` provider and every custom metadata secret, on each leg that sends
+/// it, or would send it once its disabled custom metadata is enabled. A surface's
+/// `outbound_credentials` are sent on its Target and on each of its Transit Points; the
+/// Target's custom metadata goes to the Target's endpoint, the shared transit custom metadata
+/// to each Transit Point's, and both response custom metadata to the caller.
+fn sent_credentials(surface: &AgentSurface) -> Result<Vec<SentCredential>, SurfaceApiError> {
+    let variant_ids = std::iter::once(None).chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| Some(variant.id.clone())),
+    );
+    let mut sent = Vec::new();
+    for (variant_id, view) in variant_ids.zip(resolved_views(surface)?) {
+        let bindings = view
+            .outbound_credentials
+            .iter()
+            .map(|binding| {
+                binding
+                    .credential_provider_id
+                    .as_str()
+            });
+        let mut legs = vec![(
+            None,
+            Destination::Endpoint(view.target.endpoint.clone()),
+            view.target.auth.as_ref(),
+            None,
+            vec![
+                view.target
+                    .custom_metadata
+                    .as_ref(),
+            ],
+        )];
+        legs.extend(
+            view.transit
+                .iter()
+                .flat_map(|transit| transit.points.iter())
+                .map(|point| {
+                    (
+                        Some(point.id.as_str()),
+                        Destination::Endpoint(point.target_endpoint.clone()),
+                        point.target_auth.as_ref(),
+                        point
+                            .transit_credentials
+                            .as_ref()
+                            .map(|credentials| {
+                                credentials
+                                    .credential_provider_id
+                                    .as_str()
+                            }),
+                        vec![transit_metadata(&view)],
+                    )
+                }),
+        );
+        legs.push((None, Destination::Caller, None, None, response_metadata(&view).to_vec()));
+        for (transit_point_id, destination, authentication, transit_provider, metadata) in legs {
+            let mut references = Vec::new();
+            let mut held = Vec::new();
+            collect_target_auth_reference(authentication, &mut references);
+            for metadata in metadata.into_iter().flatten() {
+                let references = if metadata.enabled {
+                    &mut references
+                } else {
+                    &mut held
+                };
+                collect_custom_metadata_references(Some(metadata), references);
+            }
+            for id in bindings
+                .clone()
+                .chain(transit_provider)
+                .filter(|_| destination != Destination::Caller)
+            {
+                push_reference(&mut references, ResourceKind::CredentialProviders, id);
+            }
+            sent.extend(
+                references
+                    .into_iter()
+                    .map(|reference| (reference, true))
+                    .chain(
+                        held.into_iter()
+                            .map(|reference| (reference, false)),
+                    )
+                    .map(|(reference, is_sent)| SentCredential {
+                        variant_id: variant_id.clone(),
+                        transit_point_id: transit_point_id.map(str::to_string),
+                        destination: destination.clone(),
+                        kind: reference.kind,
+                        id: reference.id,
+                        sent: is_sent,
+                    }),
+            );
+        }
+    }
+    Ok(sent)
+}
+
+/// The references `saved` keeps from `stored`: those that every leg of `saved` sending them
+/// already sent, to the same destination, in `stored`. A reference that `saved` names only
+/// in disabled custom metadata needs `stored` only to have held it there, sent or not.
+fn grandfathered_references(
+    stored: &[SentCredential],
+    saved: &[SentCredential],
+) -> Vec<(ResourceKind, String)> {
+    let mut grandfathered: Vec<(ResourceKind, String)> = Vec::new();
+    for credential in saved {
+        let key = (credential.kind, credential.id.clone());
+        if !grandfathered.contains(&key)
+            && saved
+                .iter()
+                .filter(|other| other.kind == credential.kind && other.id == credential.id)
+                .all(|other| {
+                    stored
+                        .iter()
+                        .any(|held| other.held_by(held))
+                })
+        {
+            grandfathered.push(key);
+        }
+    }
+    grandfathered
 }
 
 pub(crate) fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
@@ -472,9 +666,19 @@ struct ReferenceAuthorizer<'a> {
     context: Option<&'a PatTenantContext>,
     scope: Option<&'a PatResourceScope>,
     current_surface_id: &'a str,
+    isolation: RuleMode,
+    grandfathered: Vec<(ResourceKind, String)>,
 }
 
 impl ReferenceAuthorizer<'_> {
+    fn rule_for(
+        &self,
+        kind: ResourceKind,
+        id: &str,
+    ) -> RuleMode {
+        reference_rule(&self.grandfathered, self.isolation, kind, id)
+    }
+
     async fn validate_reference(
         &self,
         reference: &SurfaceReferenceKey,
@@ -488,10 +692,7 @@ impl ReferenceAuthorizer<'_> {
                 self.policy(&reference.id)
                     .await
             }
-            ResourceKind::Secrets => {
-                self.secret(&reference.id)
-                    .await
-            }
+            ResourceKind::Secrets => self.secret(reference).await,
             ResourceKind::Certificates => {
                 self.certificate(&reference.id)
                     .await
@@ -578,19 +779,32 @@ impl ReferenceAuthorizer<'_> {
 
     async fn secret(
         &self,
-        id: &str,
+        reference: &SurfaceReferenceKey,
     ) -> Result<(), SurfaceApiError> {
+        let id = reference.id.as_str();
         let store = self
             .state
             .secrets_store
             .as_ref()
             .ok_or_else(|| unavailable("Secret"))?;
-        let resource = store
+        let Some(resource) = store
             .get_by_secret_id(id)
             .await
             .map_err(|error| internal("Secret", error))?
-            .ok_or_else(|| inaccessible("Secret"))?;
-        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Secrets, &resource.secret_id, "Secret")
+        else {
+            return Err(inaccessible("Secret"));
+        };
+        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Secrets, &resource.secret_id, "Secret")?;
+        if reference.same_tenant
+            && !can_reference_with_rule(
+                self.owner_tenant_id,
+                resource.tenant_id.as_deref(),
+                self.rule_for(ResourceKind::Secrets, id),
+            )
+        {
+            return Err(inaccessible("Secret"));
+        }
+        Ok(())
     }
 
     async fn certificate(
@@ -646,12 +860,64 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Credential provider", error))?
             .ok_or_else(|| inaccessible("Credential provider"))?;
+        let tenancy = SurfaceTenancy {
+            tenant_id: self.owner_tenant_id,
+            mode: self.rule_for(ResourceKind::CredentialProviders, id),
+        };
+        if !resource.usable_by(tenancy)
+            || self
+                .sends_secret_outside_provider_tenant(&resource, tenancy.mode)
+                .await?
+        {
+            return Err(inaccessible("Credential provider"));
+        }
         self.ensure(
             resource.tenant_id.as_deref(),
             ResourceKind::CredentialProviders,
             &resource.id,
             "Credential provider",
         )
+    }
+
+    /// Would a tenant surface send the gateway credential of a provider holding a secret outside
+    /// the provider's tenant, under `mode`, the provider reference's rule on this surface?
+    async fn sends_secret_outside_provider_tenant(
+        &self,
+        provider: &crate::credential_providers::CredentialProvider,
+        mode: RuleMode,
+    ) -> Result<bool, SurfaceApiError> {
+        if self.owner_tenant_id.is_none()
+            || !mode.is_enforced()
+            || !provider
+                .provider_type
+                .sends_gateway_credential()
+        {
+            return Ok(false);
+        }
+        let references = provider.secret_refs();
+        if references.is_empty() {
+            return Ok(false);
+        }
+        let store = self
+            .state
+            .secrets_store
+            .as_ref()
+            .ok_or_else(|| unavailable("Secret"))?;
+        let mut tenants = Vec::with_capacity(references.len());
+        for secret_ref in references {
+            if let Some(secret) = store
+                .get_by_secret_id(secret_ref)
+                .await
+                .map_err(|error| internal("Secret", error))?
+            {
+                tenants.push((secret_ref, secret.tenant_id));
+            }
+        }
+        let secret_tenants = tenants
+            .iter()
+            .map(|(secret_ref, tenant)| (*secret_ref, tenant.as_deref()))
+            .collect();
+        Ok(provider.uses_secret_outside_tenant(&secret_tenants))
     }
 
     async fn mcp_proxy(
@@ -748,6 +1014,31 @@ impl ReferenceAuthorizer<'_> {
     }
 }
 
+/// How strictly a reference is held to tenant isolation: one the save keeps from the stored
+/// surface (`grandfathered`) is held only to `isolation`, any other is held to `enforce`.
+fn reference_rule(
+    grandfathered: &[(ResourceKind, String)],
+    isolation: RuleMode,
+    kind: ResourceKind,
+    id: &str,
+) -> RuleMode {
+    if is_grandfathered(grandfathered, kind, id) {
+        isolation
+    } else {
+        RuleMode::Enforce
+    }
+}
+
+fn is_grandfathered(
+    grandfathered: &[(ResourceKind, String)],
+    kind: ResourceKind,
+    id: &str,
+) -> bool {
+    grandfathered
+        .iter()
+        .any(|(stored_kind, stored_id)| *stored_kind == kind && stored_id == id)
+}
+
 fn collect_effective_surface_references(
     surface: &AgentSurface,
     references: &mut Vec<SurfaceReferenceKey>,
@@ -804,6 +1095,16 @@ fn collect_effective_surface_references(
     }
 
     collect_target_auth_reference(surface.target.auth.as_ref(), references);
+    for metadata in std::iter::once(
+        surface
+            .target
+            .custom_metadata
+            .as_ref(),
+    )
+    .chain(response_metadata(surface))
+    {
+        collect_custom_metadata_references(metadata, references);
+    }
     collect_identity_injection_references(
         &surface
             .target
@@ -840,6 +1141,7 @@ fn collect_effective_surface_references(
                 push_reference(references, ResourceKind::TrustRegistries, &trust_check.trust_registry_id);
             }
             collect_target_auth_reference(point.target_auth.as_ref(), references);
+            collect_custom_metadata_references(transit_metadata(surface), references);
             if let Some(source_auth) = point.source_auth.as_ref() {
                 collect_source_auth_references(source_auth, references);
             }
@@ -890,13 +1192,72 @@ fn collect_effective_surface_references(
     }
 }
 
+/// The Target's and the Access Point's response custom metadata, both returned to the caller.
+fn response_metadata(surface: &AgentSurface) -> [Option<&CustomMetadata>; 2] {
+    [
+        surface
+            .target
+            .response_custom_metadata
+            .as_ref(),
+        surface
+            .access_point
+            .response_custom_metadata
+            .as_ref(),
+    ]
+}
+
+fn transit_metadata(surface: &AgentSurface) -> Option<&CustomMetadata> {
+    surface
+        .transit
+        .as_ref()
+        .and_then(|transit| {
+            transit
+                .shared
+                .custom_metadata
+                .as_ref()
+        })
+}
+
+fn collect_custom_metadata_references(
+    metadata: Option<&CustomMetadata>,
+    references: &mut Vec<SurfaceReferenceKey>,
+) {
+    if let Some(payload) = metadata.and_then(|metadata| metadata.payload.as_ref()) {
+        collect_secret_helpers(payload, references);
+    }
+}
+
+fn collect_secret_helpers(
+    value: &serde_json::Value,
+    references: &mut Vec<SurfaceReferenceKey>,
+) {
+    match value {
+        serde_json::Value::String(value) => {
+            if let Some(id) = crate::protocols::extensions::secret_helper_id(value) {
+                push_reference_key(references, ResourceKind::Secrets, id, true, true);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_secret_helpers(item, references);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values() {
+                collect_secret_helpers(field, references);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_target_auth_reference(
     authentication: Option<&TargetAuthConfig>,
     references: &mut Vec<SurfaceReferenceKey>,
 ) {
     match authentication.map(|authentication| &authentication.method) {
         Some(TargetAuthMethod::StaticSecret { secret_id, .. }) => {
-            push_reference(references, ResourceKind::Secrets, secret_id)
+            push_reference_with_rule(references, ResourceKind::Secrets, secret_id, true)
         }
         Some(TargetAuthMethod::CredentialProvider { provider_id, .. }) => {
             push_reference(references, ResourceKind::CredentialProviders, provider_id)
@@ -970,8 +1331,32 @@ fn push_reference(
     kind: ResourceKind,
     id: &str,
 ) {
+    push_reference_with_rule(references, kind, id, false);
+}
+
+fn push_reference_with_rule(
+    references: &mut Vec<SurfaceReferenceKey>,
+    kind: ResourceKind,
+    id: &str,
+    same_tenant: bool,
+) {
+    push_reference_key(references, kind, id, same_tenant, false);
+}
+
+fn push_reference_key(
+    references: &mut Vec<SurfaceReferenceKey>,
+    kind: ResourceKind,
+    id: &str,
+    same_tenant: bool,
+    custom_metadata: bool,
+) {
     if !id.trim().is_empty() {
-        references.push(SurfaceReferenceKey { kind, id: id.to_string() });
+        references.push(SurfaceReferenceKey {
+            kind,
+            id: id.to_string(),
+            same_tenant,
+            custom_metadata,
+        });
     }
 }
 
@@ -1154,6 +1539,574 @@ mod tests {
             .collect();
 
         assert_eq!(providers, HashSet::from(["cp-target".to_string(), "cp-partner".to_string()]));
+    }
+
+    fn static_secret_auth(secret_id: &str) -> crate::config::TargetAuthConfig {
+        serde_json::from_value(
+            serde_json::json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "x-key"}}}),
+        )
+        .unwrap()
+    }
+
+    fn key<'a>(
+        keys: &'a [SurfaceReferenceKey],
+        kind: ResourceKind,
+        id: &str,
+    ) -> &'a SurfaceReferenceKey {
+        keys.iter()
+            .find(|key| key.kind == kind && key.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_target_auth_secret_of_the_target_and_each_transit_point_must_be_same_tenant_and_a_caller_secret_need_not() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(static_secret_auth("target-secret"));
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "caller-secret"}
+            ]}))
+            .unwrap(),
+        );
+        let mut point = transit_point("partner", "tr-partner");
+        point.target_auth = Some(static_secret_auth("point-secret"));
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![point],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        assert!(key(&keys, ResourceKind::Secrets, "target-secret").same_tenant);
+        assert!(key(&keys, ResourceKind::Secrets, "point-secret").same_tenant);
+        assert!(!key(&keys, ResourceKind::Secrets, "caller-secret").same_tenant);
+    }
+
+    #[test]
+    fn a_secret_used_as_target_auth_and_elsewhere_stays_same_tenant_after_deduplication() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(static_secret_auth("shared-secret"));
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "shared-secret"}
+            ]}))
+            .unwrap(),
+        );
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        let shared: Vec<_> = keys
+            .iter()
+            .filter(|key| key.kind == ResourceKind::Secrets)
+            .collect();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0].same_tenant);
+    }
+
+    #[test]
+    fn a_stored_reference_is_held_to_the_mode_and_a_new_one_always_to_enforce() {
+        let stored = vec![(ResourceKind::Secrets, "old".to_string())];
+
+        assert_eq!(reference_rule(&stored, RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Warn);
+        assert_eq!(reference_rule(&stored, RuleMode::Enforce, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+        assert_eq!(reference_rule(&stored, RuleMode::Warn, ResourceKind::Secrets, "new"), RuleMode::Enforce);
+        assert_eq!(
+            reference_rule(&stored, RuleMode::Warn, ResourceKind::CredentialProviders, "old"),
+            RuleMode::Enforce
+        );
+        assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    fn legs_surface() -> AgentSurface {
+        let mut surface = AgentSurface::default();
+        surface.target.endpoint = "https://target.example".into();
+        surface.target.auth = Some(static_secret_auth("target-secret"));
+        surface.outbound_credentials =
+            serde_json::from_value(serde_json::json!([{"credential_provider_id": "bound"}])).unwrap();
+        let point = |alias: &str, extra: serde_json::Value| {
+            let mut point = serde_json::json!({
+                "id": format!("{alias}-id"), "alias": alias,
+                "target_endpoint": format!("https://{alias}.example"), "protocol": "a2a"
+            });
+            point
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(point).unwrap()
+        };
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![
+                point(
+                    "partner",
+                    serde_json::json!({"target_auth": {"method": {"credential_provider": {"provider_id": "partner-provider"}}}}),
+                ),
+                point("peer", serde_json::json!({"transit_credentials": {"credential_provider_id": "peer-provider"}})),
+            ],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+        surface.variants = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "staging-id", "alias": "staging", "name": "Staging",
+                "overrides": {"target": {"endpoint": "https://staging.example"}}
+            }))
+            .unwrap(),
+        ];
+        surface
+    }
+
+    fn kept(
+        stored: &AgentSurface,
+        saved: &AgentSurface,
+    ) -> Vec<String> {
+        let mut kept: Vec<String> =
+            grandfathered_references(&sent_credentials(stored).unwrap(), &sent_credentials(saved).unwrap())
+                .into_iter()
+                .map(|(kind, id)| format!("{kind}:{id}"))
+                .collect();
+        kept.sort();
+        kept
+    }
+
+    fn all_kept() -> Vec<String> {
+        let mut all: Vec<String> = [
+            (ResourceKind::CredentialProviders, "bound"),
+            (ResourceKind::CredentialProviders, "partner-provider"),
+            (ResourceKind::CredentialProviders, "peer-provider"),
+            (ResourceKind::Secrets, "target-secret"),
+        ]
+        .into_iter()
+        .map(|(kind, id)| format!("{kind}:{id}"))
+        .collect();
+        all.sort();
+        all
+    }
+
+    fn without(removed: &[&str]) -> Vec<String> {
+        all_kept()
+            .into_iter()
+            .filter(|key| {
+                !removed
+                    .iter()
+                    .any(|id| key.ends_with(&format!(":{id}")))
+            })
+            .collect()
+    }
+
+    fn points(surface: &mut AgentSurface) -> &mut Vec<crate::config::agent_surface::TransitPoint> {
+        &mut surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+    }
+
+    fn destination(credential: &SentCredential) -> &str {
+        match &credential.destination {
+            Destination::Endpoint(endpoint) => endpoint,
+            Destination::Caller => "caller",
+        }
+    }
+
+    #[test]
+    fn a_credential_is_sent_on_each_leg_of_the_base_and_each_variant_with_the_legs_endpoint() {
+        let sent = sent_credentials(&legs_surface()).unwrap();
+        let legs: HashSet<_> = sent
+            .iter()
+            .map(|credential| {
+                (
+                    credential
+                        .variant_id
+                        .as_deref(),
+                    credential
+                        .transit_point_id
+                        .as_deref(),
+                    destination(credential),
+                    credential.id.as_str(),
+                )
+            })
+            .collect();
+
+        let mut expected = HashSet::new();
+        for (variant, target_endpoint) in
+            [(None, "https://target.example"), (Some("staging-id"), "https://staging.example")]
+        {
+            expected.extend([
+                (variant, None, target_endpoint, "target-secret"),
+                (variant, None, target_endpoint, "bound"),
+                (variant, Some("partner-id"), "https://partner.example", "partner-provider"),
+                (variant, Some("partner-id"), "https://partner.example", "bound"),
+                (variant, Some("peer-id"), "https://peer.example", "peer-provider"),
+                (variant, Some("peer-id"), "https://peer.example", "bound"),
+            ]);
+        }
+        assert_eq!(legs, expected);
+        assert_eq!(sent.len(), expected.len());
+        assert!(
+            sent.iter()
+                .all(|credential| (credential.kind == ResourceKind::Secrets) == (credential.id == "target-secret"))
+        );
+    }
+
+    #[test]
+    fn a_stored_credential_is_kept_while_each_leg_that_sends_it_keeps_its_endpoint() {
+        let stored = legs_surface();
+        assert_eq!(kept(&stored, &stored), all_kept());
+
+        let mut renamed = legs_surface();
+        renamed.name = "renamed".into();
+        points(&mut renamed).reverse();
+        for point in points(&mut renamed) {
+            point.alias = format!("{}-renamed", point.alias);
+            point.name = "Renamed".into();
+        }
+        renamed.variants[0].alias = "staging-renamed".into();
+        assert_eq!(kept(&stored, &renamed), all_kept());
+
+        let mut dropped = legs_surface();
+        points(&mut dropped).remove(1);
+        assert_eq!(kept(&stored, &dropped), without(&["peer-provider"]));
+    }
+
+    #[test]
+    fn a_stored_credential_is_not_kept_when_a_leg_that_sends_it_is_redirected_moved_or_new() {
+        let stored = legs_surface();
+
+        let mut target = legs_surface();
+        target.target.endpoint = "https://tenant.example".into();
+        assert_eq!(kept(&stored, &target), without(&["target-secret", "bound"]));
+
+        let mut variant = legs_surface();
+        variant.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint = Some("https://tenant.example".into());
+        assert_eq!(kept(&stored, &variant), without(&["target-secret", "bound"]));
+
+        let mut partner = legs_surface();
+        points(&mut partner)[0].target_endpoint = "https://tenant.example".into();
+        assert_eq!(kept(&stored, &partner), without(&["partner-provider", "bound"]));
+
+        let mut moved = legs_surface();
+        let authentication = points(&mut moved)[0]
+            .target_auth
+            .take();
+        points(&mut moved)[1].target_auth = authentication;
+        assert_eq!(kept(&stored, &moved), without(&["partner-provider"]));
+
+        let mut replaced = legs_surface();
+        points(&mut replaced)[1].id = "peer-replacement-id".into();
+        assert_eq!(kept(&stored, &replaced), without(&["peer-provider", "bound"]));
+
+        let mut added = legs_surface();
+        let mut extra = points(&mut added)[1].clone();
+        extra.id = "extra-id".into();
+        extra.alias = "extra".into();
+        extra.transit_credentials = None;
+        extra.target_endpoint = "https://tenant.example".into();
+        points(&mut added).push(extra);
+        assert_eq!(kept(&stored, &added), without(&["bound"]));
+
+        let mut removed_variant = legs_surface();
+        removed_variant.variants[0].id = "other-variant-id".into();
+        assert_eq!(kept(&stored, &removed_variant), Vec::<String>::new());
+
+        assert_eq!(kept(&AgentSurface::default(), &stored), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_appliance_wide_secret_is_refused_on_a_tenant_surface_when_new_and_when_enforced_but_not_when_stored_in_warn_mode()
+     {
+        let stored = vec![(ResourceKind::Secrets, "old".to_string())];
+        let allowed = |isolation: RuleMode, id: &str, secret_tenant: Option<&str>| {
+            can_reference_with_rule(
+                Some("tenant-a"),
+                secret_tenant,
+                reference_rule(&stored, isolation, ResourceKind::Secrets, id),
+            )
+        };
+
+        assert!(!allowed(RuleMode::Warn, "new", None));
+        assert!(allowed(RuleMode::Warn, "old", None));
+        assert!(!allowed(RuleMode::Enforce, "old", None));
+        assert!(allowed(RuleMode::Warn, "new", Some("tenant-a")));
+        assert!(allowed(RuleMode::Enforce, "new", Some("tenant-a")));
+        assert!(!allowed(RuleMode::Warn, "old", Some("tenant-b")));
+    }
+
+    fn custom_metadata(payload: serde_json::Value) -> Option<crate::config::CustomMetadata> {
+        Some(serde_json::from_value(serde_json::json!({"enabled": true, "payload": payload})).unwrap())
+    }
+
+    fn metadata_surface() -> AgentSurface {
+        let mut surface = legs_surface();
+        surface.target.custom_metadata = custom_metadata(serde_json::json!({"a": {"b": ["$SECRET:target-meta"]}}));
+        surface
+            .target
+            .response_custom_metadata = custom_metadata(serde_json::json!({"x": "$SECRET:target-response"}));
+        surface
+            .access_point
+            .response_custom_metadata = custom_metadata(serde_json::json!({"y": [{"z": "$SECRET:ap-response"}]}));
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .shared
+            .custom_metadata = custom_metadata(serde_json::json!({"t": {"u": "$SECRET:transit-meta"}}));
+        surface
+    }
+
+    fn metadata_secrets(keys: &[SurfaceReferenceKey]) -> Vec<(String, bool, bool)> {
+        keys.iter()
+            .filter(|key| key.kind == ResourceKind::Secrets && key.id != "target-secret")
+            .map(|key| (key.id.clone(), key.same_tenant, key.custom_metadata))
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_helper_nested_in_any_custom_metadata_is_a_same_tenant_custom_metadata_reference() {
+        let keys = collect_surface_reference_keys(&metadata_surface()).unwrap();
+
+        assert_eq!(
+            metadata_secrets(&keys),
+            vec![
+                ("ap-response".to_string(), true, true),
+                ("target-meta".to_string(), true, true),
+                ("target-response".to_string(), true, true),
+                ("transit-meta".to_string(), true, true),
+            ]
+        );
+        assert!(!key(&keys, ResourceKind::Secrets, "target-secret").custom_metadata);
+    }
+
+    #[test]
+    fn only_a_whole_string_secret_helper_in_custom_metadata_is_a_reference() {
+        let mut surface = AgentSurface::default();
+        surface.target.custom_metadata = custom_metadata(serde_json::json!({
+            "timestamp": "$TIMESTAMP", "surface": "$SURFACE_ID", "request": "$REQUEST_ID", "plain": "value",
+            "embedded": "prefix $SECRET:embedded", "empty": "$SECRET:", "number": 7, "list": ["$TIMESTAMP", null]
+        }));
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        assert_eq!(metadata_secrets(&keys), Vec::<(String, bool, bool)>::new());
+    }
+
+    #[test]
+    fn shared_transit_custom_metadata_is_sent_only_through_a_transit_point() {
+        let mut surface = AgentSurface {
+            transit: Some(crate::config::agent_surface::TransitConfig {
+                points: Vec::new(),
+                outbound_listen_address: None,
+                shared: serde_json::from_value(
+                    serde_json::json!({"custom_metadata": {"payload": {"t": "$SECRET:transit-meta"}}}),
+                )
+                .unwrap(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            metadata_secrets(&collect_surface_reference_keys(&surface).unwrap()),
+            Vec::<(String, bool, bool)>::new()
+        );
+
+        points(&mut surface).push(transit_point("partner", "tr-partner"));
+        assert_eq!(
+            metadata_secrets(&collect_surface_reference_keys(&surface).unwrap()),
+            vec![("transit-meta".to_string(), true, true)]
+        );
+    }
+
+    #[test]
+    fn a_secret_in_custom_metadata_and_in_target_auth_must_exist_after_deduplication() {
+        let mut surface = AgentSurface::default();
+        surface.target.auth = Some(static_secret_auth("shared-secret"));
+        surface.target.custom_metadata = custom_metadata(serde_json::json!({"key": "$SECRET:shared-secret"}));
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        let shared = key(&keys, ResourceKind::Secrets, "shared-secret");
+        assert!(shared.same_tenant);
+        assert!(!shared.custom_metadata);
+    }
+
+    #[test]
+    fn a_custom_metadata_secret_is_sent_where_its_metadata_goes() {
+        let sent = sent_credentials(&metadata_surface()).unwrap();
+        let legs: HashSet<_> = sent
+            .iter()
+            .filter(|credential| {
+                credential
+                    .id
+                    .ends_with("-meta")
+                    || credential
+                        .id
+                        .ends_with("-response")
+            })
+            .map(|credential| {
+                (
+                    credential
+                        .variant_id
+                        .as_deref(),
+                    credential
+                        .transit_point_id
+                        .as_deref(),
+                    destination(credential),
+                    credential.id.as_str(),
+                )
+            })
+            .collect();
+
+        let mut expected = HashSet::new();
+        for (variant, target_endpoint) in
+            [(None, "https://target.example"), (Some("staging-id"), "https://staging.example")]
+        {
+            expected.extend([
+                (variant, None, target_endpoint, "target-meta"),
+                (variant, None, "caller", "target-response"),
+                (variant, None, "caller", "ap-response"),
+                (variant, Some("partner-id"), "https://partner.example", "transit-meta"),
+                (variant, Some("peer-id"), "https://peer.example", "transit-meta"),
+            ]);
+        }
+        assert_eq!(legs, expected);
+    }
+
+    #[test]
+    fn a_stored_custom_metadata_secret_is_kept_only_while_its_leg_keeps_its_endpoint() {
+        let stored = metadata_surface();
+        let kept_metadata = |saved: &AgentSurface| -> Vec<String> {
+            kept(&stored, saved)
+                .into_iter()
+                .filter(|key| key.ends_with("-meta") || key.ends_with("-response"))
+                .collect()
+        };
+        let all = vec![
+            "secrets:ap-response".to_string(),
+            "secrets:target-meta".to_string(),
+            "secrets:target-response".to_string(),
+            "secrets:transit-meta".to_string(),
+        ];
+        assert_eq!(kept_metadata(&stored), all);
+
+        let mut target = metadata_surface();
+        target.target.endpoint = "https://tenant.example".into();
+        assert_eq!(
+            kept_metadata(&target),
+            vec![
+                "secrets:ap-response".to_string(),
+                "secrets:target-response".to_string(),
+                "secrets:transit-meta".to_string(),
+            ]
+        );
+
+        let mut partner = metadata_surface();
+        points(&mut partner)[0].target_endpoint = "https://tenant.example".into();
+        assert_eq!(kept_metadata(&partner), all[..3].to_vec());
+
+        let mut moved = metadata_surface();
+        moved.target.custom_metadata = custom_metadata(serde_json::json!({"a": "$SECRET:transit-meta"}));
+        assert_eq!(
+            kept_metadata(&moved),
+            vec!["secrets:ap-response".to_string(), "secrets:target-response".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_secret_newly_in_response_metadata_is_not_kept_from_target_auth_or_request_metadata() {
+        let stored = metadata_surface();
+        let places: [fn(&mut AgentSurface) -> &mut Option<CustomMetadata>; 2] = [
+            |surface| {
+                &mut surface
+                    .target
+                    .response_custom_metadata
+            },
+            |surface| {
+                &mut surface
+                    .access_point
+                    .response_custom_metadata
+            },
+        ];
+        for place in places {
+            for id in ["target-secret", "target-meta"] {
+                let mut saved = metadata_surface();
+                *place(&mut saved) = custom_metadata(serde_json::json!({"k": format!("$SECRET:{id}")}));
+                let kept = kept(&stored, &saved);
+                assert!(!kept.contains(&format!("secrets:{id}")), "{id} kept: {kept:?}");
+                assert!(kept.contains(&"secrets:transit-meta".to_string()), "{kept:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_custom_metadata_is_not_counted_as_sent_but_its_secrets_are_still_checked() {
+        let mut stored = metadata_surface();
+        stored
+            .target
+            .response_custom_metadata
+            .as_mut()
+            .unwrap()
+            .enabled = false;
+
+        assert!(!kept(&stored, &metadata_surface()).contains(&"secrets:target-response".to_string()));
+        assert!(kept(&metadata_surface(), &metadata_surface()).contains(&"secrets:target-response".to_string()));
+        let keys = collect_surface_reference_keys(&stored).unwrap();
+        let disabled = key(&keys, ResourceKind::Secrets, "target-response");
+        assert!(disabled.same_tenant);
+        assert!(disabled.custom_metadata);
+    }
+
+    #[test]
+    fn disabled_custom_metadata_keeps_a_stored_secret_only_until_it_is_enabled() {
+        let disable = |surface: &mut AgentSurface| {
+            surface
+                .target
+                .custom_metadata
+                .as_mut()
+                .unwrap()
+                .enabled = false;
+        };
+        let target_meta = "secrets:target-meta".to_string();
+        let mut stored = metadata_surface();
+        disable(&mut stored);
+
+        assert!(kept(&stored, &stored).contains(&target_meta), "{:?}", kept(&stored, &stored));
+        let mut disabled = metadata_surface();
+        disable(&mut disabled);
+        assert!(kept(&metadata_surface(), &disabled).contains(&target_meta));
+
+        let enabled = metadata_surface();
+        assert!(!kept(&stored, &enabled).contains(&target_meta));
+        assert_eq!(
+            reference_rule(
+                &grandfathered_references(&sent_credentials(&stored).unwrap(), &sent_credentials(&enabled).unwrap()),
+                RuleMode::Warn,
+                ResourceKind::Secrets,
+                "target-meta"
+            ),
+            RuleMode::Enforce
+        );
+        assert_eq!(
+            reference_rule(
+                &grandfathered_references(&sent_credentials(&stored).unwrap(), &sent_credentials(&stored).unwrap()),
+                RuleMode::Warn,
+                ResourceKind::Secrets,
+                "target-meta"
+            ),
+            RuleMode::Warn
+        );
+
+        let mut redirected = stored.clone();
+        redirected.target.endpoint = "https://tenant.example".into();
+        assert!(!kept(&stored, &redirected).contains(&target_meta));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod actors;
 pub mod admin_client;
+pub mod agent_card_preview;
 pub mod assertions;
 pub mod caller;
 pub mod collaborators;

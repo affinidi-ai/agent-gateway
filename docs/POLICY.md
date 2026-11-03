@@ -529,6 +529,16 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_configured_client` also pins the **credential provider
+  token requests** of `src/delegation_vault/oauth.rs`: service-token grants,
+  refreshes, and the legacy and `2026-07-28` authorization-code exchanges (a
+  grant's connect code exchange and refresh go through `pinned_vendor_client`,
+  below). The
+  token endpoint is resolved once, off the async runtime, and the request goes
+  to that address with redirects off; a blocked address is refused before any
+  request. The pin holds when no HTTP proxy is configured: with `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` set, the proxy resolves the host itself. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
+  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
@@ -540,13 +550,20 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
-  (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
+  (`src/proxy/handler/agent_card.rs`), so the
   credential cannot follow a 3xx to another host. A 3xx answers `502`
   "Upstream redirected"; a blocked target answers `403` "Request blocked by
   egress policy". It shares the `pinned_target_client` helper with the
   inbound forward step. Without `target.auth` the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
+- The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
+  but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
+  or without `target.auth`, and records nothing; a blocked target reports
+  `blocked_by_egress` (`403`), and a host that does not resolve reports `unreachable`
+  (`502`). The served card route reports such a host as unreachable only when it fetches
+  without `target.auth`; a served fetch with `target.auth` (`pinned_target_client`) and the
+  proxy forward still answer `403` "Request blocked by egress policy" for it.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
@@ -590,7 +607,9 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   body is never logged or echoed. See
   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
 
-Both helpers share one `pin_and_build` body.
+`pinned_forward_client` and `pinned_strict_client` share one `pin_and_build` body; the
+metadata and vendor clients above build their client with `pinned_direct_client`, which ignores
+proxies.
 
 ### DID resolution host policy
 

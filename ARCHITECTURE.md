@@ -357,7 +357,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
+| [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads, and the agent card preview of the management API (`card_preview.rs`) | [Inbound path](#inbound-path), [Outbound path](#outbound-path), [Agent card preview](docs/PROTOCOLS.md#agent-card-preview) |
 | [`server/`](src/server/) | Startup orchestration, TLS, WebSocket, active/standby mode | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`state/`](src/state/) | Per-surface runtime state shared across handlers | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, header rules, and RFC 9728 protected resource metadata and challenges shared by A2A, MCP, and others (the resource side; the authorization server side is `authz_metadata/`) | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |

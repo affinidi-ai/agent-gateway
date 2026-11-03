@@ -67,6 +67,16 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// The gateway logs its `audit` target events at info level and keeps its log for the
+    /// scenario to read.
+    pub logs_audit_events: bool,
+    /// The tenant that owns the surface; appliance-wide when absent.
+    pub tenant_id: Option<String>,
+    /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
+    pub enforced_credential_rules: Vec<String>,
+    pub token_request_timeout_secs: Option<u64>,
+    /// The gateway logs warnings and keeps its log for the scenario to read.
+    pub keeps_gateway_log: bool,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -119,6 +129,11 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            logs_audit_events: false,
+            tenant_id: None,
+            enforced_credential_rules: Vec::new(),
+            token_request_timeout_secs: None,
+            keeps_gateway_log: false,
         }
     }
 }
@@ -235,6 +250,9 @@ pub struct SurfaceTransitPointConfig {
     /// The surface's delegated credential is this Transit Point's own
     /// `transit_credentials` rather than the surface's `outbound_credentials`.
     pub delegated_credentials: bool,
+    /// The Transit Point authenticates its target with the surface's
+    /// `target_auth_provider`.
+    pub target_auth_provider: bool,
 }
 
 impl SurfaceTransitPointConfig {
@@ -253,6 +271,7 @@ impl SurfaceTransitPointConfig {
             source_auth: None,
             allow_unauthenticated_callers: true,
             delegated_credentials: false,
+            target_auth_provider: false,
         }
     }
 }
@@ -331,6 +350,15 @@ pub struct SurfaceTargetAuthProviderConfig {
     pub token_status: u16,
     pub expires_in: u64,
     pub token_endpoint: Option<String>,
+    /// The test allowlist admits the http token endpoint's origin for egress only, so the
+    /// gateway holds it to the https rule as it would any http token endpoint.
+    pub insecure_token_endpoint: bool,
+    /// The surface's own Target authenticates with this provider; `false` when only a
+    /// Transit Point or a delegated credential binding uses it.
+    pub authenticates_surface_target: bool,
+    /// A JWT Bearer provider's signing-key secret holds a whole service account JSON key
+    /// file whose `private_key_id` names the key, and the provider sets no key id itself.
+    pub signing_key_is_service_account_file: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +375,9 @@ impl SurfaceTargetAuthProviderConfig {
             token_status: 200,
             expires_in: 3600,
             token_endpoint: None,
+            insecure_token_endpoint: false,
+            authenticates_surface_target: true,
+            signing_key_is_service_account_file: false,
         }
     }
 }
@@ -451,6 +482,9 @@ pub enum CredentialProviderKind {
     },
     /// A provider the gateway has no record of, as after it was deleted.
     Unknown,
+    /// The client credentials provider the harness serves as the surface's
+    /// `target_auth_provider`, whose fixture and secrets that config writes.
+    ClientCredentials,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

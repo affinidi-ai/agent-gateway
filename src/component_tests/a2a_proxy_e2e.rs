@@ -1645,3 +1645,72 @@ async fn a_request_an_a2a_proxy_cannot_serve_is_refused_before_it_is_charged() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(gate.calls(), 1, "a request the proxy serves is charged once");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_a2a_proxy_card_preview_has_the_generated_card_and_no_agent_card() {
+    let fake_direct_line = FakeDirectLine::start("should not be called").await;
+    let base_url = fake_direct_line
+        .base_url
+        .clone();
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_a2a_proxy_fixtures(temp_dir, &base_url, "active", true, 5, 100, 3);
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.unwrap();
+    let listener = h
+        .gateway_base
+        .replace("127.0.0.1", "localhost");
+    let created: Value = client
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&json!({
+            "name": "proxy-card-preview", "status": "active",
+            "access_point": {"listen_address": listener, "route": "/proxy-card", "protocol": "a2a"},
+            "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let card_url = format!(
+        "{}/api/v1/surfaces/{}/agent-card",
+        h.gateway_base,
+        created["surface_id"]
+            .as_str()
+            .expect("created surface")
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let preview = loop {
+        let preview: Value = client
+            .get(&card_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if preview["unsupported_reason"] != "not_running" {
+            break preview;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the surface never started running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(preview["fetch"]["status"], "ok", "{preview}");
+    assert_eq!(preview["generated"], true);
+    assert_eq!(preview["after"]["name"], PROXY_ID, "{preview}");
+    for field in ["before", "before_bytes", "source_url"] {
+        assert_eq!(preview[field], Value::Null, "a generated card has no {field}: {preview}");
+    }
+    assert_eq!(preview["auth"]["kind"], "none");
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+}

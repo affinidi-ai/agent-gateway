@@ -5,17 +5,23 @@
 
 use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::credential_providers::{CredentialProvider, JwtSigningAlgorithm};
 
 /// How long an assertion is valid, well under Google's one-hour ceiling.
 pub const ASSERTION_LIFETIME_SECS: i64 = 300;
 
+/// The largest signing key secret accepted, PEM or service account JSON key file.
+pub const MAX_SIGNING_KEY_BYTES: usize = 16 * 1024;
+
+const MAX_KEY_ID_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AssertionError {
-    #[error("signing key must be a PEM private key matching the signing algorithm")]
+    #[error("signing key must be a PEM private key or a service account JSON key matching the signing algorithm")]
     InvalidSigningKey,
     #[error("certificate must be a PEM certificate")]
     InvalidCertificate,
@@ -45,25 +51,86 @@ pub struct AssertionHeader<'a> {
     pub certificate_pem: Option<&'a str>,
 }
 
-/// Sign `claims` with the PEM private key. The caller keeps the PEM in a zeroizing
-/// buffer; neither the key nor anything derived from it appears in an error.
+#[derive(Deserialize)]
+struct ServiceAccountKey {
+    private_key: String,
+    #[serde(default)]
+    private_key_id: Option<String>,
+}
+
+/// A signing key secret unwrapped to its PEM and, for a service account JSON key file,
+/// the key ID the file names. Neither `Debug` nor any error shows the key.
+pub struct SigningKeyMaterial {
+    pem: Zeroizing<String>,
+    embedded_key_id: Option<String>,
+}
+
+impl std::fmt::Debug for SigningKeyMaterial {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("SigningKeyMaterial")
+            .field("embedded_key_id", &self.embedded_key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SigningKeyMaterial {
+    pub fn parse(secret: &str) -> Result<Self, AssertionError> {
+        if secret.len() > MAX_SIGNING_KEY_BYTES {
+            return Err(AssertionError::InvalidSigningKey);
+        }
+        let secret = secret.trim();
+        if !secret.starts_with('{') {
+            return Ok(Self {
+                pem: Zeroizing::new(secret.to_string()),
+                embedded_key_id: None,
+            });
+        }
+        let key: ServiceAccountKey = serde_json::from_str(secret).map_err(|_| AssertionError::InvalidSigningKey)?;
+        let embedded_key_id = key
+            .private_key_id
+            .filter(|id| is_key_id(id));
+        Ok(Self {
+            pem: Zeroizing::new(key.private_key),
+            embedded_key_id,
+        })
+    }
+}
+
+fn is_key_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_KEY_ID_BYTES
+        && id
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// Sign `claims` with the signing key secret: a PEM private key or a service account JSON
+/// key file. A configured `key_id` wins over the file's `private_key_id`. The caller keeps
+/// the secret in a zeroizing buffer; neither the key nor anything derived from it appears
+/// in an error.
 pub fn sign_assertion(
-    key_pem: &str,
+    secret: &str,
     algorithm: JwtSigningAlgorithm,
     header: AssertionHeader<'_>,
     claims: &AssertionClaims,
 ) -> Result<String, AssertionError> {
+    let material = SigningKeyMaterial::parse(secret)?;
+    let pem = material.pem.as_bytes();
     let (algorithm, key) = match algorithm {
-        JwtSigningAlgorithm::RS256 => (Algorithm::RS256, EncodingKey::from_rsa_pem(key_pem.as_bytes())),
-        JwtSigningAlgorithm::PS256 => (Algorithm::PS256, EncodingKey::from_rsa_pem(key_pem.as_bytes())),
-        JwtSigningAlgorithm::ES256 => (Algorithm::ES256, EncodingKey::from_ec_pem(key_pem.as_bytes())),
+        JwtSigningAlgorithm::RS256 => (Algorithm::RS256, EncodingKey::from_rsa_pem(pem)),
+        JwtSigningAlgorithm::PS256 => (Algorithm::PS256, EncodingKey::from_rsa_pem(pem)),
+        JwtSigningAlgorithm::ES256 => (Algorithm::ES256, EncodingKey::from_ec_pem(pem)),
     };
     let key = key.map_err(|_| AssertionError::InvalidSigningKey)?;
     let mut jwt_header = Header::new(algorithm);
     jwt_header.typ = Some("JWT".into());
     jwt_header.kid = header
         .key_id
-        .map(str::to_string);
+        .map(str::to_string)
+        .or(material.embedded_key_id);
     jwt_header.x5t_s256 = header
         .certificate_pem
         .map(certificate_thumbprint)
@@ -71,9 +138,9 @@ pub fn sign_assertion(
     jsonwebtoken::encode(&jwt_header, claims, &key).map_err(|_| AssertionError::InvalidSigningKey)
 }
 
-/// Whether `key_pem` can sign with `algorithm`, checked by signing a probe.
+/// Whether the signing key secret can sign with `algorithm`, checked by signing a probe.
 pub fn check_signing_key(
-    key_pem: &str,
+    secret: &str,
     algorithm: JwtSigningAlgorithm,
 ) -> Result<(), AssertionError> {
     let probe = AssertionClaims {
@@ -86,7 +153,7 @@ pub fn check_signing_key(
         iat: 0,
         exp: ASSERTION_LIFETIME_SECS,
     };
-    sign_assertion(key_pem, algorithm, AssertionHeader::default(), &probe).map(|_| ())
+    sign_assertion(secret, algorithm, AssertionHeader::default(), &probe).map(|_| ())
 }
 
 /// The `x5t#S256` value of a PEM certificate: base64url(SHA-256(DER)), no padding.
@@ -408,6 +475,127 @@ mod tests {
             ),
             Err(AssertionError::InvalidCertificate)
         );
+    }
+
+    fn key_file(
+        private_key: &str,
+        private_key_id: Option<&str>,
+    ) -> String {
+        let mut file = serde_json::json!({
+            "type": "service_account",
+            "client_email": "agent@project.iam.gserviceaccount.com",
+            "private_key": private_key,
+        });
+        if let Some(id) = private_key_id {
+            file["private_key_id"] = id.into();
+        }
+        file.to_string()
+    }
+
+    fn signed_header(
+        secret: &str,
+        algorithm: JwtSigningAlgorithm,
+        key_id: Option<&str>,
+    ) -> jsonwebtoken::Header {
+        let claims = grant_assertion_claims(&provider(CredentialProviderType::OAuth2JwtBearer), &[], 0).unwrap();
+        let token =
+            sign_assertion(secret, algorithm, AssertionHeader { key_id, certificate_pem: None }, &claims).unwrap();
+        decode_header(&token).unwrap()
+    }
+
+    #[test]
+    fn a_service_account_json_key_signs_with_its_private_key_id_as_kid() {
+        let key = rsa_pkcs8();
+        let file = key_file(&key.private_pem, Some("abc123"));
+        let claims = grant_assertion_claims(&provider(CredentialProviderType::OAuth2JwtBearer), &[], 10).unwrap();
+        let token = sign_assertion(&file, JwtSigningAlgorithm::RS256, AssertionHeader::default(), &claims).unwrap();
+        assert_eq!(
+            decode_header(&token)
+                .unwrap()
+                .kid
+                .as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            decoded(&token, &key.public_pem, Algorithm::RS256, "https://oauth2.example/token")["iss"],
+            "agent@project.iam.gserviceaccount.com"
+        );
+        assert_eq!(check_signing_key(&file, JwtSigningAlgorithm::RS256), Ok(()));
+        assert_eq!(check_signing_key(&format!("\n  {file}\n"), JwtSigningAlgorithm::RS256), Ok(()));
+    }
+
+    #[test]
+    fn a_configured_key_id_wins_and_a_missing_or_bad_embedded_id_gives_no_kid() {
+        let key = rsa_pkcs8();
+        let with_id = key_file(&key.private_pem, Some("abc123"));
+        assert_eq!(
+            signed_header(&with_id, JwtSigningAlgorithm::RS256, Some("configured"))
+                .kid
+                .as_deref(),
+            Some("configured")
+        );
+        for id in [None, Some(""), Some("bad\nid"), Some("caf\u{e9}")] {
+            let file = key_file(&key.private_pem, id);
+            assert_eq!(signed_header(&file, JwtSigningAlgorithm::RS256, None).kid, None, "{id:?}");
+        }
+        let long = "k".repeat(257);
+        let file = key_file(&key.private_pem, Some(&long));
+        assert_eq!(signed_header(&file, JwtSigningAlgorithm::RS256, None).kid, None);
+        let longest = "k".repeat(256);
+        let file = key_file(&key.private_pem, Some(&longest));
+        assert_eq!(
+            signed_header(&file, JwtSigningAlgorithm::RS256, None)
+                .kid
+                .as_deref(),
+            Some(longest.as_str())
+        );
+    }
+
+    #[test]
+    fn a_bare_pem_keeps_its_behaviour_and_an_ec_json_key_signs_es256() {
+        let rsa = rsa_pkcs8();
+        assert_eq!(signed_header(&rsa.private_pem, JwtSigningAlgorithm::RS256, None).kid, None);
+        let ec = ec_p256();
+        let file = key_file(&ec.private_pem, Some("ec-1"));
+        let header = signed_header(&file, JwtSigningAlgorithm::ES256, None);
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some("ec-1"));
+    }
+
+    #[test]
+    fn an_unusable_json_key_is_refused_without_echoing_it() {
+        let rsa = rsa_pkcs8();
+        let ec = ec_p256();
+        let truncated = key_file(&rsa.private_pem, Some("id"));
+        let truncated = truncated[..truncated.len() / 2].to_string();
+        let oversized = key_file(&"A".repeat(MAX_SIGNING_KEY_BYTES), None);
+        let oversized_pem = format!("{}{}", rsa.private_pem, " ".repeat(MAX_SIGNING_KEY_BYTES));
+        let cases = [
+            ("{}".to_string(), JwtSigningAlgorithm::RS256),
+            (serde_json::json!({"private_key_id": "id"}).to_string(), JwtSigningAlgorithm::RS256),
+            (serde_json::json!({"private_key": "key-secret-marker"}).to_string(), JwtSigningAlgorithm::RS256),
+            (serde_json::json!({"private_key": 5}).to_string(), JwtSigningAlgorithm::RS256),
+            (truncated, JwtSigningAlgorithm::RS256),
+            (key_file(&ec.private_pem, None), JwtSigningAlgorithm::RS256),
+            (key_file(&rsa.private_pem, None), JwtSigningAlgorithm::ES256),
+            (oversized, JwtSigningAlgorithm::RS256),
+            (oversized_pem, JwtSigningAlgorithm::RS256),
+        ];
+        for (secret, algorithm) in cases {
+            let error = check_signing_key(&secret, algorithm).unwrap_err();
+            assert_eq!(error, AssertionError::InvalidSigningKey);
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains("key-secret-marker") && !shown.contains("PRIVATE"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn signing_key_material_debug_hides_the_key() {
+        let key = rsa_pkcs8();
+        let material = SigningKeyMaterial::parse(&key_file(&key.private_pem, Some("abc123"))).unwrap();
+        let shown = format!("{material:?}");
+        assert!(shown.contains("abc123"));
+        assert!(!shown.contains("PRIVATE") && !shown.contains("BEGIN"), "{shown}");
     }
 
     #[test]

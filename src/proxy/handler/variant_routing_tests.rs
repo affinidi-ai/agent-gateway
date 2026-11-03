@@ -36,7 +36,7 @@ pub(super) fn catalog() -> Value {
     ])
 }
 
-pub(super) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxyState {
+pub(crate) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxyState {
     let config = serde_json::from_value(json!({
         "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
         "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},
@@ -796,5 +796,136 @@ async fn a_surface_with_variants_but_no_default_serves_an_alias_less_request_fro
             .request_count
             .load(Ordering::SeqCst),
         1
+    );
+}
+
+/// A surface whose `prod` variant overrides the Target and whose `off` variant is
+/// disabled.
+fn base_route_surface(default_variant_id: Option<&str>) -> AgentSurface {
+    serde_json::from_value(json!({
+        "surface_id": "orders", "name": "Orders",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+        "target": {"endpoint": "http://127.0.0.1:9/base"},
+        "variants": [
+            {"id": "v-prod", "alias": "prod", "name": "Prod", "overrides": {
+                "target": {"endpoint": "http://127.0.0.1:9/prod"}
+            }},
+            {"id": "v-off", "alias": "off", "name": "Off", "enabled": false}
+        ],
+        "default_variant_id": default_variant_id
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_base_route_state_serves_what_an_alias_less_request_is_served() {
+    let cases = [
+        ("no default: the base surface", None, None, "http://127.0.0.1:9/base"),
+        ("default prod: the prod variant", Some("v-prod"), Some("v-prod"), "http://127.0.0.1:9/prod"),
+    ];
+    for (case, default_variant_id, variant_id, endpoint) in cases {
+        let state = router(base_route_surface(default_variant_id))
+            .base_proxy_state("orders")
+            .await
+            .unwrap();
+
+        assert_eq!(state.surface.surface_id, "orders", "{case}");
+        assert_eq!(state.surface.target.endpoint, endpoint, "{case}");
+        assert_eq!(
+            state
+                .active_variant_id
+                .as_deref(),
+            variant_id,
+            "{case}"
+        );
+        assert_eq!(state.active_variant_alias, None, "{case}");
+        assert_eq!(state.task_id.as_deref(), Some("variant-routing"), "{case}");
+        assert_eq!(
+            state
+                .gateway_base_url
+                .as_deref(),
+            Some("https://gateway.example"),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn there_is_no_base_route_state_where_an_alias_less_request_is_refused() {
+    let mut missing_default = base_route_surface(None);
+    missing_default.default_variant_id = Some("removed".into());
+    let uncompiled = router(base_route_surface(Some("v-prod")));
+    uncompiled
+        .channels
+        .write()
+        .await[0]
+        .variant_engines
+        .clear();
+    let cases = [
+        ("an unknown surface", router(base_route_surface(None)), "unknown"),
+        ("a disabled default variant", router(base_route_surface(Some("v-off"))), "orders"),
+        ("a missing default variant", router(missing_default), "orders"),
+        ("a default variant without compiled engines", uncompiled, "orders"),
+    ];
+    for (case, router, surface_id) in cases {
+        assert!(
+            router
+                .base_proxy_state(surface_id)
+                .await
+                .is_none(),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_card_preview_reads_the_base_route_state_of_a_surface_running_on_this_replica() {
+    let directory = tempfile::tempdir().unwrap();
+    let running = router(base_route_surface(Some("v-prod")));
+    let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(json!({
+        "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+        "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
+    }))
+    .unwrap();
+    let manager = crate::proxy::SurfaceTaskManager::new(
+        running.config.clone(),
+        Arc::new(bootstrap),
+        Arc::new(crate::storage::ConfigCache::new(directory.path())),
+        None,
+        None,
+        None,
+        Arc::new(crate::storage::SettingsStore::new(directory.path())),
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+    );
+    assert!(
+        manager
+            .card_preview_state("orders")
+            .await
+            .is_none(),
+        "no listener runs the surface"
+    );
+
+    manager
+        .port_listener_states
+        .write()
+        .await
+        .insert(8080, Arc::new(running));
+
+    let state = manager
+        .card_preview_state("orders")
+        .await
+        .unwrap();
+    assert_eq!(state.surface.target.endpoint, "http://127.0.0.1:9/prod");
+    assert_eq!(
+        state
+            .active_variant_id
+            .as_deref(),
+        Some("v-prod")
+    );
+    assert!(
+        manager
+            .card_preview_state("unknown")
+            .await
+            .is_none()
     );
 }

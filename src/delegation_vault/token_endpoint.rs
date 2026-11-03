@@ -8,7 +8,8 @@
 //! cap on the answer. It names the provider's `resource` (RFC 8707), and the
 //! client authenticates as its `token_endpoint_auth_method` says
 //! ([`super::revocation::ClientCredential`]), with a secret or signing key
-//! from the provider's own tenant or an untenanted one. The answer must be a
+//! of the provider's own tenant only (an untenanted provider uses untenanted
+//! ones). The answer must be a
 //! `Bearer` token. Nothing the authorization server sends is logged or
 //! echoed: a refusal is reported by its OAuth `error` code alone.
 

@@ -2845,10 +2845,7 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
             )
             .await
             .map_err(|e| {
@@ -2867,10 +2864,7 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
                 ctx.mcp_metadata_context,
                 crate::mcp::meta::McpMetaTarget::TopLevel,
             )
@@ -4932,6 +4926,11 @@ async fn step_inject_credentials(
         &user_hash,
         agent_did,
         channel_id,
+        crate::tenancy::SurfaceTenancy::configured(
+            ctx.surface
+                .tenant_id
+                .as_deref(),
+        ),
         mcp_tool.as_deref(),
         vault_store,
         provider_store,
@@ -12042,6 +12041,99 @@ mod tests {
             Some("staging"),
             "default: X-Gateway-env header should be injected"
         );
+    }
+
+    /// Injects `{"credential": "$SECRET:<secret_id>"}` on a `tenant-a` surface under `mode` and
+    /// returns the injected value, read from the A2A metadata extension or the MCP `_meta`.
+    async fn inject_tenant_secret(
+        protocol: ChannelProtocol,
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Result<serde_json::Value, OutboundPipelineError> {
+        let (_dir, secrets_store) = crate::secrets::test_support::tenant_secrets().await;
+        let mut state = test_outbound_state();
+        state.secrets_store = secrets_store;
+        let is_mcp = protocol == ChannelProtocol::Mcp;
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".into());
+        ctx.protocol = Some(protocol);
+        ctx.body_bytes = Some(if is_mcp {
+            mcp_body()
+        } else {
+            Bytes::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {"parts": []}}})
+                    .to_string(),
+            )
+        });
+        ctx.outbound_shared
+            .custom_metadata = Some(crate::config::CustomMetadata {
+            enabled: true,
+            payload: Some(json!({ "credential": format!("$SECRET:{secret_id}") })),
+            injection_target: Some(crate::config::MetadataInjectionTarget::Meta),
+        });
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, step_inject_custom_metadata(&state, &mut ctx))
+            .await?;
+        let body: serde_json::Value = serde_json::from_slice(
+            ctx.body_bytes
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let pointer = if is_mcp {
+            "/_meta/credential".to_string()
+        } else {
+            format!(
+                "/params/message/metadata/{}/credential",
+                crate::config::AFFINIDI_AGENT_METADATA_EXTENSION.replace('/', "~1")
+            )
+        };
+        Ok(body
+            .pointer(&pointer)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {pointer} in {body}")))
+    }
+
+    #[tokio::test]
+    async fn test_step_inject_custom_metadata_holds_a_secret_to_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        for protocol in [ChannelProtocol::A2a, ChannelProtocol::Mcp] {
+            for mode in [RuleMode::Warn, RuleMode::Enforce] {
+                assert_eq!(
+                    inject_tenant_secret(protocol.clone(), mode, "own")
+                        .await
+                        .ok(),
+                    Some(json!("own-value")),
+                    "{protocol:?} {mode:?}"
+                );
+                assert!(
+                    matches!(
+                        inject_tenant_secret(protocol.clone(), mode, "other").await,
+                        Err(OutboundPipelineError::MetadataInjectionFailed)
+                    ),
+                    "{protocol:?} {mode:?}"
+                );
+            }
+            assert_eq!(
+                inject_tenant_secret(protocol.clone(), RuleMode::Warn, "wide")
+                    .await
+                    .ok(),
+                Some(json!("wide-value")),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(
+                    inject_tenant_secret(protocol.clone(), RuleMode::Enforce, "wide").await,
+                    Err(OutboundPipelineError::MetadataInjectionFailed)
+                ),
+                "{protocol:?}"
+            );
+        }
     }
 
     // ── step_inject_trusted_identity ──────────────────────────────────────
@@ -19606,6 +19698,149 @@ mod tests {
         let received = target.received();
         assert_eq!(received.len(), 1);
         assert_eq!(header_values(&received[0], "authorization"), ["Bearer vendor-access"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_transit_point_refuses_a_delegated_credential_of_another_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let bearer = json!({"type": "bearer_header"});
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("shared", "mcp", binding("provider", bearer.clone())), ("foreign", "mcp", binding("foreign", bearer))],
+        )
+        .await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "foreign", "name": "foreign", "provider_id": "foreign", "tenant_id": "tenant-b",
+                    "resource": "https://provider.example/api",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut channel_state = state
+                .channel_state
+                .write()
+                .unwrap();
+            let mut surface = (*channel_state.surface).clone();
+            surface.tenant_id = Some("tenant-a".into());
+            channel_state.surface = Arc::new(surface);
+        }
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "foreign", &token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], -32603, "{body}");
+        assert!(target.received().is_empty());
+
+        let (status, body) = through_the_pipeline(&state, "shared", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// An opted-in Transit Point releases a Fabric caller's stored grant on a
+    /// tenant surface only from a credential provider of that tenant, as it does
+    /// for a caller an Access Point's token names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_transit_point_releases_a_fabric_callers_grant_only_from_its_own_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _) = delegation_pipeline(directory.path(), "https://partner.example/mcp", &[]).await;
+        let carol_hash = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "carol".to_string(),
+            provider_agent_id: None,
+        }
+        .principal_hash(Some("tenant-a"))
+        .unwrap();
+        let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "dave".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+        };
+        for (provider, tenant) in [("tenant-own", "tenant-a"), ("tenant-foreign", "tenant-b")] {
+            state
+                .credential_provider_store
+                .as_ref()
+                .unwrap()
+                .create(
+                    serde_json::from_value(json!({
+                        "id": provider, "name": provider, "provider_id": provider, "tenant_id": tenant,
+                        "authorization_endpoint": "https://provider.example/authorize",
+                        "client_id_secret_ref": "client-id",
+                        "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .store(
+                    serde_json::from_value(json!({
+                        "id": format!("carol-{provider}"), "agent_did": "did:web:agent.example",
+                        "user_identity_hash": carol_hash, "credential_provider_id": provider,
+                        "provider_id": provider, "access_token": format!("{provider}-access"), "scopes": ["read"],
+                        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                        "consent_granted_at": "2026-10-01T00:00:00Z",
+                        "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let call = |provider: &str| {
+            let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some(provider));
+            point["delegated_credentials_for_fabric_callers"] = json!(true);
+            let mut surface = telling_users_apart(transit_surface(json!([point]), json!([])));
+            surface.tenant_id = Some("tenant-a".into());
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = legacy_delegation_context(resolved, point);
+            ctx.transit_token_claims = Some(verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash));
+            ctx.authenticated_identity = Some(direct_client.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx
+        };
+
+        assert_eq!(
+            injected_credential(&state, call("tenant-own")).await,
+            "tenant-own-access",
+            "a provider of the surface's tenant"
+        );
+
+        let mut foreign = call("tenant-foreign");
+        let refused = step_inject_credentials(&state, &mut foreign)
+            .await
+            .expect_err("another tenant's provider releases nothing");
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("tenant-foreign-access"),
+            "the refusal does not carry the grant"
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                foreign
+                    .body_bytes
+                    .as_ref()
+                    .unwrap()
+            )
+            .contains("tenant-foreign-access"),
+            "nothing was injected into the request"
+        );
     }
 
     /// A public discovery read needs no transit token and names no caller, so

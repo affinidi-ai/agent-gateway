@@ -16,6 +16,7 @@ pub struct AgentSurfaceFixture {
     pub transit_points: HashMap<String, TransitPointFixture>,
     pub mcp_http: Option<Value>,
     pub a2a_settings: Option<Value>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +157,7 @@ impl AgentSurfaceFixture {
             transit_points: HashMap::new(),
             mcp_http: None,
             a2a_settings: None,
+            tenant_id: None,
         }
     }
 
@@ -488,6 +490,9 @@ impl AgentSurfaceFixture {
         if let Some(a2a) = &self.a2a_settings {
             surface["access_point"]["a2a"] = a2a.clone();
         }
+        if let Some(tenant_id) = &self.tenant_id {
+            surface["tenant_id"] = json!(tenant_id);
+        }
         if !self.identity_slots.is_empty() {
             surface["identity_slots"] = Value::Object(
                 self.identity_slots
@@ -588,6 +593,7 @@ impl Default for AgentSurfaceFixture {
             transit_points: HashMap::new(),
             mcp_http: None,
             a2a_settings: None,
+            tenant_id: None,
         }
     }
 }

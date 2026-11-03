@@ -78,11 +78,17 @@ impl FilesystemSecretsStore {
             .list_all()
             .await?;
 
-        self.secret_id_index.clear();
-        for secret in secrets {
+        let fresh: std::collections::HashMap<String, String> = secrets
+            .into_iter()
+            .map(|secret| (secret.secret_id, secret.id))
+            .collect();
+
+        for (secret_id, id) in &fresh {
             self.secret_id_index
-                .insert(secret.secret_id, secret.id);
+                .insert(secret_id.clone(), id.clone());
         }
+        self.secret_id_index
+            .retain(|secret_id, _| fresh.contains_key(secret_id));
 
         Ok(())
     }
@@ -307,6 +313,112 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuilding_the_index_never_hides_a_present_secret_id_from_concurrent_lookups() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            FilesystemSecretsStore::new_async(dir.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        for n in 0..300 {
+            store
+                .create(CreateSecretRequest {
+                    tenant_id: None,
+                    name: format!("Secret {n}"),
+                    secret_id: format!("secret-{n}"),
+                    description: None,
+                    value: "v".to_string(),
+                    secret_type: "General".to_string(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let store = store.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let mut misses = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !store
+                        .secret_id_index
+                        .contains_key("secret-0")
+                    {
+                        misses += 1;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                misses
+            })
+        };
+
+        for _ in 0..300 {
+            store
+                .rebuild_secret_id_index()
+                .await
+                .unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(reader.await.unwrap(), 0);
+        assert_eq!(store.secret_id_index.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn get_by_secret_id_rescans_once_for_unknown_ids_and_drops_deleted_entries() {
+        let dir = tempdir().unwrap();
+        let store = FilesystemSecretsStore::new_async(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let created = store
+            .create(CreateSecretRequest {
+                tenant_id: None,
+                name: "Kept".to_string(),
+                secret_id: "kept".to_string(),
+                description: None,
+                value: "v".to_string(),
+                secret_type: "General".to_string(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .secret_id_index
+            .insert("ghost".to_string(), "no-such-id".to_string());
+
+        assert!(
+            store
+                .get_by_secret_id("unknown")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_by_secret_id("ghost")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .secret_id_index
+                .contains_key("ghost")
+        );
+        assert_eq!(
+            store
+                .get_by_secret_id("kept")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            created.id
+        );
+    }
 
     #[tokio::test]
     async fn test_get_by_secret_id_returns_secret_with_distinct_internal_id() {

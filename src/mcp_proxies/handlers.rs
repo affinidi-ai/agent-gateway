@@ -83,13 +83,17 @@ fn mcp_proxy_writable(
         && scope_allows_resource(scope, context, ResourceKind::McpProxies, &proxy.id)
 }
 
+/// May this caller send the secret to an endpoint it chose? A tenant context may use only its
+/// own tenant's secrets, whatever `tenant_credential_isolation` says, since nothing is stored
+/// that a stricter rule would break.
 fn discovery_secret_allowed(
     tenant_id: Option<&str>,
     secret_id: &str,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> bool {
-    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
+    context.is_none_or(|context| tenant_id == Some(context.tenant_id.as_str()))
+        && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
 }
 
 // Import rmcp-openapi for MCP Server functionality
@@ -4960,6 +4964,69 @@ mod tests {
 
         proxy.tenant_id = Some("tenant-b".to_string());
         assert!(!mcp_proxy_allowed(&proxy, Some(&context), Some(&scope)));
+    }
+
+    fn tenant_a() -> PatTenantContext {
+        PatTenantContext {
+            token_id: "token-a".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_tenant_discovers_only_with_its_own_tenants_secret() {
+        let context = tenant_a();
+        assert!(discovery_secret_allowed(Some("tenant-a"), "secret-a", Some(&context), None));
+        assert!(!discovery_secret_allowed(None, "appliance-secret", Some(&context), None));
+        assert!(!discovery_secret_allowed(Some("tenant-b"), "secret-b", Some(&context), None));
+
+        assert!(discovery_secret_allowed(None, "appliance-secret", None, None));
+        assert!(discovery_secret_allowed(Some("tenant-a"), "secret-a", None, None));
+    }
+
+    #[tokio::test]
+    async fn discovery_headers_never_carry_an_appliance_wide_secret_for_a_tenant() {
+        let secrets: Option<Arc<dyn crate::secrets::SecretsStore>> =
+            Some(Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![
+                ("appliance-secret", None, "appliance-value"),
+                ("secret-a", Some("tenant-a"), "tenant-value"),
+            ])));
+        let auth = |secret_id: &str| {
+            super::to_backend_target_auth_config(&super::DiscoverTargetAuthConfig {
+                enabled: true,
+                method: Some("static_secret".to_string()),
+                secret_id: Some(secret_id.to_string()),
+                header_name: Some("Authorization".to_string()),
+                header_format: Some("Bearer {value}".to_string()),
+                fallback: None,
+            })
+            .expect("target auth")
+        };
+        let context = tenant_a();
+        let headers = |result: Result<Option<super::ReqwestHeaderMap>, (StatusCode, String)>| {
+            result
+                .expect("headers")
+                .expect("auth header")
+                .get("authorization")
+                .expect("authorization")
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let refused =
+            super::build_discovery_headers(Some(&auth("appliance-secret")), &secrets, Some(&context), None, "c")
+                .await
+                .expect_err("an appliance-wide secret is refused to a tenant");
+        assert_eq!(refused, (StatusCode::BAD_REQUEST, "Target auth secret is not accessible".to_string()));
+        assert_eq!(
+            headers(super::build_discovery_headers(Some(&auth("secret-a")), &secrets, Some(&context), None, "c").await),
+            "Bearer tenant-value"
+        );
+        assert_eq!(
+            headers(super::build_discovery_headers(Some(&auth("appliance-secret")), &secrets, None, None, "c").await),
+            "Bearer appliance-value"
+        );
     }
 
     struct ListStore(Vec<McpProxy>);

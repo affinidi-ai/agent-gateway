@@ -2696,10 +2696,7 @@ async fn enrich_and_evaluate_surface_policies(
             custom_metadata,
             channel_id,
             &None,
-            crate::protocols::MetadataRuntimeContext {
-                request_id,
-                surface_id: Some(config_id),
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(surface, request_id),
         )
         .await
         {
@@ -5726,7 +5723,8 @@ async fn process_charged_forward_request(
                     .ok_or(ContinuationError::BindingMismatch)?,
                 profile: network.sts.mcp_issuer.as_ref().ok_or(ContinuationError::Unavailable)?,
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
-                secrets: secrets.as_ref(), provider_http: None,
+                secrets: secrets.as_ref(), provider_egress: None,
+                isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
             }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 modern_payment.as_ref().is_some_and(|(headers, config)| {
                     crate::proxy::handler::surface_payment::LocalPayment::inspect(
@@ -6224,7 +6222,7 @@ async fn process_charged_forward_request(
     {
         let injected = match crate::mcp::metadata::inject_custom_metadata_with_context(
             &body_bytes, custom_metadata, config_id, &get_secrets_store(),
-            crate::protocols::MetadataRuntimeContext { request_id: audit_trace_id, surface_id: Some(config_id) },
+            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
             mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Params,
         ).await {
             Ok(injected) => injected,
@@ -6302,6 +6300,11 @@ async fn process_charged_forward_request(
                     user_hash,
                     surface.target_endpoint(),
                     config_id,
+                    crate::tenancy::SurfaceTenancy::configured(
+                        surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                     // Admission refused batches and ambiguous keys above, so this is
                     // the tool the Target reads. The Target is this gateway's own, so a
                     // tool-scoped binding may apply here, unlike on a Transit Point.
@@ -7065,10 +7068,7 @@ async fn process_charged_forward_request(
                             response_custom_metadata,
                             channel_id,
                             &None,
-                            crate::protocols::MetadataRuntimeContext {
-                                request_id: audit_trace_id,
-                                surface_id: Some(config_id),
-                            },
+                            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
                         )
                         .await
                         {
@@ -7092,7 +7092,7 @@ async fn process_charged_forward_request(
                     crate::config::ChannelProtocol::Mcp => {
                         let injected = match crate::mcp::metadata::inject_custom_metadata_with_context(
                             &bytes::Bytes::from(response_body.clone()), response_custom_metadata, config_id, &get_secrets_store(),
-                            crate::protocols::MetadataRuntimeContext { request_id: audit_trace_id, surface_id: Some(config_id) },
+                            crate::protocols::MetadataRuntimeContext::for_surface(&surface, audit_trace_id),
                             mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Result,
                         ).await {
                             Ok(injected) => injected,
@@ -8591,6 +8591,7 @@ async fn handle_a2a_proxy_forward(
                         secrets_store.as_ref(),
                         &surface.name,
                         caller,
+                        crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
                     )
                     .await
                 }
@@ -9609,6 +9610,9 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 
     ProcessingResult::ProcessedNoResponse
 }
+
+#[cfg(test)]
+mod credential_tenancy_tests;
 
 #[cfg(test)]
 mod mcp_receive_tests;
