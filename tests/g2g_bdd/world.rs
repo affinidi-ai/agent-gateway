@@ -294,6 +294,8 @@ pub struct G2gWorld {
     pub response_status: Option<u16>,
     pub response_body: Option<Value>,
     pub response_content_type: Option<String>,
+    /// Headers of the last surface response, for steps that record them.
+    pub response_headers: HashMap<String, String>,
     /// How long the caller waited for the last surface response.
     pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
@@ -360,6 +362,7 @@ impl G2gWorld {
             response_status: None,
             response_body: None,
             response_content_type: None,
+            response_headers: HashMap::new(),
             response_elapsed: None,
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),

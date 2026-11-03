@@ -74,6 +74,11 @@ pub fn policy_definition_id(surface_id: &str) -> String {
     inbound_policy_definition_id(surface_id)
 }
 
+/// Deterministic surface request policy (`target.policy`) id for a surface.
+fn target_policy_definition_id(surface_id: &str) -> String {
+    format!("{surface_id}-target-request-policy")
+}
+
 /// Deterministic transit-level (outbound) policy-definition id for a surface.
 pub fn transit_policy_definition_id(surface_id: &str) -> String {
     kinded_policy_definition_id(surface_id, PolicyDefinitionFixtureKind::TransitShared)
@@ -107,6 +112,13 @@ fn policy_fixtures(surface: &SurfaceSpec) -> Vec<PolicyDefinitionFixture> {
         policies.push(PolicyDefinitionFixture::new(
             policy_definition_id(&surface.surface_id),
             "g2g BDD inbound policy",
+            rego,
+        ));
+    }
+    if let Some(rego) = &surface.target_policy_rego {
+        policies.push(PolicyDefinitionFixture::new(
+            target_policy_definition_id(&surface.surface_id),
+            "g2g BDD surface request policy",
             rego,
         ));
     }
@@ -153,6 +165,16 @@ fn build_surface_fixture(
     }
     if let Some(public) = surface.access_point_public {
         fixture = fixture.with_public(public);
+    }
+
+    if surface
+        .target_policy_rego
+        .is_some()
+    {
+        fixture = fixture.with_target_policy_definition_id(target_policy_definition_id(&surface.surface_id));
+    }
+    if let Some(path) = &surface.agent_card_path {
+        fixture = fixture.with_agent_card_path(path);
     }
 
     if surface

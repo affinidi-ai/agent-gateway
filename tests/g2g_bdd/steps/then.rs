@@ -1153,6 +1153,45 @@ pub async fn response_says(
     assert!(text.contains(&expected), "response body {text:?} does not contain {expected:?}");
 }
 
+#[then(expr = "the response does not say {string}")]
+pub async fn response_does_not_say(
+    world: &mut G2gWorld,
+    unexpected: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let text = match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    assert!(!text.contains(&unexpected), "response body {text:?} contains {unexpected:?}");
+}
+
+#[then(expr = "the response to the caller carried header {string}")]
+pub async fn response_to_caller_carried_header(
+    world: &mut G2gWorld,
+    header: String,
+) {
+    assert!(
+        world
+            .response_headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&header)),
+        "the caller's response must carry header '{header}'; headers: {:?}",
+        world.response_headers
+    );
+}
+
+#[then(expr = "the response to the caller did not carry header {string}")]
+pub async fn response_to_caller_did_not_carry_header(
+    world: &mut G2gWorld,
+    header: String,
+) {
+    assert_header_absent(&world.response_headers, &header, "the caller's response");
+}
+
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]
 pub async fn all_concurrent_responses_have_status(
     world: &mut G2gWorld,

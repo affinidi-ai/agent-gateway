@@ -308,6 +308,17 @@ async fn method_request_sent_to_surface_path(
     send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new()).await;
 }
 
+#[when(expr = "the caller sends a {word} request without an API key to gateway {int} surface {string} path {string}")]
+async fn method_request_without_api_key_sent_to_surface_path(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+) {
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new()).await;
+}
+
 #[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string} with headers")]
 async fn method_request_sent_to_surface_path_with_headers(
     world: &mut G2gWorld,
@@ -359,9 +370,11 @@ async fn send_method_request_to_surface_path(
         .expect("caller request must succeed at the transport layer");
 
     let status = response.status().as_u16();
-    let content_type = collect_headers(response.headers())
+    let response_headers = collect_headers(response.headers());
+    let content_type = response_headers
         .get("content-type")
         .cloned();
+    world.response_headers = response_headers;
     let raw = response
         .text()
         .await

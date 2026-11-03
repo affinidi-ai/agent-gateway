@@ -23,6 +23,8 @@ pub struct SurfaceSpec {
     pub target_auth: Option<TargetAuthSpec>,
     pub source_auth: Option<SourceAuthSpec>,
     pub inbound_policy_rego: Option<String>,
+    /// Surface-level request policy (`target.policy`) written into the config at boot.
+    pub target_policy_rego: Option<String>,
     pub transit_policy_rego: Option<String>,
     /// Surface-level managed identity derived from the managed agent's
     /// `agent-identity/v1` payload; Transit Points inherit it and mint a VP.
@@ -39,6 +41,8 @@ pub struct SurfaceSpec {
     pub legacy_access_point: bool,
     /// The stored `access_point.public`; `None` stores what the admin API writes.
     pub access_point_public: Option<bool>,
+    /// The Access Point's configured agent card location on the Target's origin.
+    pub agent_card_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +113,7 @@ impl SurfaceSpec {
             target_auth: None,
             source_auth: None,
             inbound_policy_rego: None,
+            target_policy_rego: None,
             transit_policy_rego: None,
             managed_identity: false,
             mcp_tool_policy: None,
@@ -118,6 +123,7 @@ impl SurfaceSpec {
             delegated_credentials: None,
             legacy_access_point: false,
             access_point_public: None,
+            agent_card_path: None,
         }
     }
 }

@@ -688,6 +688,27 @@ fn surface_is_stored_as_a_legacy_surface(
     surface_spec_mut(world, &surface_name).legacy_access_point = true;
 }
 
+/// The fixture sets neither `access_point.public` nor `on_failure`, so the
+/// Access Point forwards a caller whose API key is missing or invalid to policy.
+#[given(
+    regex = r#"^surface "([^"]+)" requires "API Key" source authentication and forwards failed callers to policy$"#
+)]
+pub async fn surface_requires_api_key_and_forwards_failed_callers(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_requires_api_key(world, surface_name).await;
+}
+
+#[given(expr = "surface {string} fetches its agent card from path {string}")]
+pub async fn surface_fetches_its_agent_card_from_path(
+    world: &mut G2gWorld,
+    surface_name: String,
+    path: String,
+) {
+    surface_spec_mut(world, &surface_name).agent_card_path = Some(path);
+}
+
 /// Saves the surface through its gateway's admin API with
 /// `access_point.public: false`, the state a surface created through the
 /// admin API has: its Access Point refuses a caller whose credential is
@@ -1034,14 +1055,6 @@ pub async fn surface_requires_caller_identity_issued_by_gateway(
         .unwrap_or_else(|error| panic!("attach identity issuer policy to surface '{surface_id}': {error:#}"));
 }
 
-#[given(expr = "surface {string} has a request policy that allows all requests")]
-async fn surface_has_allow_all_request_policy(
-    world: &mut G2gWorld,
-    surface_name: String,
-) {
-    attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
-}
-
 #[given(expr = "surface {string} has a request policy that denies all requests")]
 async fn surface_has_deny_all_request_policy(
     world: &mut G2gWorld,
@@ -1078,6 +1091,94 @@ async fn attach_request_policy(
         )
         .await
         .unwrap_or_else(|error| panic!("attach {label} policy to surface '{surface_id}': {error:#}"));
+}
+
+#[given(
+    expr = "surface {string} has a request policy that allows only requests whose Target agent card names DID {string}"
+)]
+async fn surface_has_card_did_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+    did: String,
+) {
+    attach_request_policy(world, &surface_name, "card-did", &card_did_policy_rule(&did)).await;
+}
+
+/// Writes the policy into the gateway's configuration before it boots, since the
+/// admin API refuses to save a surface whose Target authentication secret is missing.
+#[given(
+    expr = "surface {string} starts with a request policy that allows only requests whose Target agent card names DID {string}"
+)]
+async fn surface_starts_with_card_did_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+    did: String,
+) {
+    surface_spec_mut(world, &surface_name).target_policy_rego =
+        Some(format!("package surface.policy\n\n{}\n", card_did_policy_rule(&did)));
+}
+
+fn card_did_policy_rule(did: &str) -> String {
+    format!("default allow := false\n\nallow if input.agent.did == {}", serde_json::json!(did))
+}
+
+/// The managed agent answers every request with its usual result plus an agent
+/// card's identity extension, so a card read and a forwarded call get the same body.
+#[given(expr = "managed agent {string} publishes an agent card naming DID {string}")]
+pub async fn managed_agent_publishes_card_naming_did(
+    world: &mut G2gWorld,
+    agent_name: String,
+    did: String,
+) {
+    let mut response = build_target_ok_response();
+    response["capabilities"] = serde_json::json!({
+        "extensions": [{
+            "uri": "https://fabric.affinidi.io/extensions/agent-identity-credential/v1",
+            "did": did,
+        }],
+    });
+    set_target_response(world, &agent_name, response);
+}
+
+async fn started_mock<'a>(
+    world: &'a mut G2gWorld,
+    agent_name: &str,
+) -> &'a crate::bdd_support::mock_server::MockServer {
+    world.start().await;
+    let (gw_index, surface_id) = world.target(agent_name);
+    world
+        .harness()
+        .gw(gw_index)
+        .mock(&surface_id)
+        .unwrap_or_else(|| panic!("no managed agent backing surface '{surface_id}' on gateway {gw_index}"))
+}
+
+/// Starts the fabric first, so the route probe is answered as usual.
+#[given(expr = "managed agent {string} answers with header {string} set to {string}")]
+pub async fn managed_agent_answers_with_header(
+    world: &mut G2gWorld,
+    agent_name: String,
+    header: String,
+    value: String,
+) {
+    started_mock(world, &agent_name)
+        .await
+        .set_response_header(&header, &value)
+        .await;
+}
+
+/// Starts the fabric first, so the route probe is answered as usual.
+#[given(expr = "managed agent {string} refuses with status {int} saying {string}")]
+pub async fn managed_agent_refuses_with_status(
+    world: &mut G2gWorld,
+    agent_name: String,
+    status: u16,
+    text: String,
+) {
+    let mock = started_mock(world, &agent_name).await;
+    mock.set_response(serde_json::json!({ "error": text }))
+        .await;
+    mock.set_status(status).await;
 }
 
 #[given(expr = "the VP Audit Log of gateway {int} keeps every audit event")]
