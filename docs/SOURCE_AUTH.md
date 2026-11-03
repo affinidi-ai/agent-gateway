@@ -36,17 +36,22 @@ keeps one identity. The first entry is the primary method. The gateway selects o
 per request ([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only
 that method:
 
-1. The method is the one whose credential the request carries: its header is present (for
-   JWT bearer, `token_header` holding a token in `token_scheme`, so an MPP
+1. The method is the one whose credential the request carries: its header is present and not
+   empty (for JWT bearer, `token_header` holding a token in `token_scheme`, so an MPP
    `Authorization: Payment` credential is not a JWT; otherwise `extraction.field`), or, for
-   mTLS, a client certificate reached the gateway. No credential is read from the body, so a method that
-   extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
+   mTLS, a client certificate reached the gateway. No credential is read from the body, so a
+   method that extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
 2. A request that carries no method's credential is checked against the primary method, so
    it fails as a missing credential of that method.
-3. A request that carries credentials for more than one method fails as an invalid credential
-   of the primary method, and neither credential is verified, so a caller can't choose the
-   identity the gateway asserts. This includes a JWT or API key sent over a connection that
-   presents a client certificate, on a surface that also accepts mTLS.
+3. A request that carries credentials for more than one method fails source authentication
+   as the primary method, audited as `ambiguous_credentials`, and neither credential is
+   verified, so a caller can't choose the identity the gateway asserts. Like any failed
+   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
+   protected resource metadata, and otherwise passed to policy as
+   `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
+   connection that presents a client certificate, on a surface that also accepts mTLS, and an
+   MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
+   `Authorization`: the gateway cannot tell whose token it is.
 4. A rejected credential is never retried with another method.
 
 The order of the other methods has no effect.
@@ -71,8 +76,7 @@ For `api_key`, `key_name` is the method's `secret_id`. An `api_key_provider` cal
 reports `method: "api_key"`, with the provider's key id as `key_name`, so a policy tells the
 two API key methods apart by `key_name`.
 
-Saving a surface, and each of its enabled variants as resolved, refuses (and so does loading
-gateway configuration):
+Creating or saving a surface, and each of its enabled variants as resolved, refuses:
 
 - two methods that read the same credential location: the same header, compared without
   regard to case, both `mcp_meta`, both `a2a_extension`, or two mTLS methods;
@@ -81,22 +85,45 @@ gateway configuration):
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
 - a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
   method is `jwt_bearer`;
+- an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
 
-Upgrading turns on every method of a stored surface: earlier releases enforced only the first
-and ignored the rest, so a caller presenting a later method's credential, which failed before,
-is now authenticated. At startup the gateway logs, at `info`, one line per surface and per
-variant with more than one method, naming the methods after the first
-([`additional_source_auth_method_notices`](../src/config/proxy.rs)).
+Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
+`from_api_key` a verified key. So a surface mixing JWT and API key callers takes a stored or
+static inbound identity, and policy tells its callers apart by `input.source_auth.method` and
+`key_name`.
+
+On an Access Point that publishes protected resource metadata, every caller-attributable
+failure is refused before policy: a failed JWT with the discovery challenge, and a failed
+credential of any other method with a plain `401`, so a bad credential never gets further
+than none. This holds directly and over Fabric.
+
+**Upgrading and rolling back.** Upgrading turns on every method of a stored surface: earlier
+releases enforced only the first and ignored the rest, so a caller presenting a later method's
+credential, which failed before, is now authenticated. Audit `caller_authentication.methods`,
+on each surface and each variant override, before upgrading. At startup the gateway logs, at
+`WARN`, one line per surface and per variant with more than one method, naming the methods
+after the first ([`additional_source_auth_method_notices`](../src/config/proxy.rs)); the line
+repeats on every start.
 
 Surfaces stored before these rules may break them, because the gateway then enforced only
-the first method and ignored the rest. At startup, a stored surface whose methods break them
-keeps only its first method, when that method is valid alone, the gateway logs an error naming
-the surface and the rule, and the local store persists the correction
-([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a DynamoDB-sourced
-surface is corrected in memory only. A stored `from_jwt_claim` identity beside a method other
-than `jwt_bearer` is logged as a warning at startup and refused on the next save.
+the first method and ignored the rest. Wherever surfaces load, at startup (from local storage,
+DynamoDB or its cache) and on a configuration or single-surface reload, a stored surface whose
+methods break them keeps only its first method, when that method is valid alone, and so does
+each enabled variant overriding its caller authentication
+([`fall_back_to_first_source_auth_method`](../src/config/proxy.rs)). The gateway logs an error
+naming the surface, the rule and each dropped method by tag, credential location and
+non-secret references (strategy, secret, provider agent, certificates), so it can be rebuilt.
+An active node persists the correction to local storage
+([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby node, and a
+DynamoDB-sourced surface, are corrected in memory only. A stored `from_jwt_claim` identity
+beside a method other than `jwt_bearer`, or an inbound `from_api_key` identity beside a method
+other than an API key, is logged as a warning at startup and refused on the next save.
+
+Before rolling back to a release that enforces only the first method, remove every method but
+the first. That release strips only the first method's header, so it would forward a later
+method's credential, such as a partner's `X-API-Key`, to the Target.
 
 The credential headers of every method are stripped before a request is forwarded, on each
 inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`

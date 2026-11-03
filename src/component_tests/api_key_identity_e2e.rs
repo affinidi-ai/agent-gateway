@@ -605,9 +605,9 @@ allow if {
 /// refuses an authenticated JWT caller with a fixed body instead of resolving a
 /// caller DID.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_jwt_first_stored_surface_refuses_the_caller() {
+async fn a_stored_surface_with_a_jwt_method_refuses_the_jwt_caller() {
     use helpers::jwt::{JwksFixture, now_secs, setup_jwt_claim_inbound_identity, sign_jwt};
-    const SURFACE: &str = "jwt-first-api-key-identity";
+    const SURFACE: &str = "jwt-method-api-key-identity";
 
     let fixture = JwksFixture::start().await;
     let issuer = fixture.issuer.clone();

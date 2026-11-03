@@ -4,50 +4,72 @@ changes:
     - timestamp: '2026-10-30T14:00:00.000Z'
       title: ⭐ Accept more than one source authentication method on one Access Point
       description: >-
-        An Access Point accepted a list of caller authentication methods but enforced only the
-        first, so an agent called by internal users with a JWT and by partner agents with an API
-        key needed two surfaces, and two identities. Every method in
-        `caller_authentication.methods` now works: the gateway verifies each request with the
-        method whose credential the request carries (a header, for JWT bearer one holding a
-        token in its scheme so an MPP `Authorization: Payment` credential is not a JWT, or the
-        client certificate for mTLS), or with the first, primary, method when it carries none, refuses a request
-        carrying credentials for more than one method, and never retries a rejected credential
-        with another method. Policy sees the method that verified the caller as
-        `input.source_auth.method`. Saving a surface now validates every method and refuses two
-        methods reading the same credential location, more than one DID Auth method, a
-        `from_jwt_claim` identity unless every method is JWT bearer, and an inbound
-        `from_api_key` identity unless every method is API Key or API Key Provider. The
-        credential headers of all methods are stripped before forwarding, and a forwarded JWT
-        header reaches the target only when the JWT method verified the request. On an MCP
-        Access Point that publishes protected resource metadata, only a failed JWT bearer
-        credential gets the `401` discovery challenge. The Surface Builder's Caller Context
-        element lists its methods in the sidebar and in its editor, each with whether it is
-        ready, what it reads and a Configure button that opens its settings; methods are added
-        from a menu, and made primary or removed in the editor.
-  changed:
-    - timestamp: '2026-10-30T16:00:00.000Z'
-      title: Keep serving stored surfaces whose source authentication methods break the new rules
-      description: >-
-        A stored surface whose methods break the new rules (two methods on one credential
-        location, a second DID Auth method, a body-extracted method beside another, or an invalid
-        later method) no longer stops the gateway from starting: it keeps only its first method,
-        the gateway logs an error naming the surface and the rule, and local storage persists the
-        correction. A stored `from_jwt_claim` identity beside a method other than JWT bearer, or
-        an inbound `from_api_key` identity beside a method other than an API key, is logged as a
-        warning at startup and refused on the next save; until then a caller verified by that
-        other method is refused.
+        An Access Point accepted a list of caller authentication methods but enforced
+        only the first, so an agent called by internal users with a JWT and by partner
+        agents with an API key needed two surfaces, and two identities. Every method
+        in `caller_authentication.methods` now works: the gateway verifies each
+        request with the method whose credential the request carries (a non-empty
+        header, for JWT bearer one holding a token in its scheme so an MPP
+        `Authorization: Payment` credential is not a JWT, or the client certificate
+        for mTLS), or with the first, primary, method when it carries none, and never
+        retries a rejected credential with another method. A request carrying
+        credentials for more than one method fails source authentication as the
+        primary method, audited as `ambiguous_credentials`: it is refused on a closed
+        Access Point, with `on_failure: reject` or beside protected resource metadata,
+        and otherwise passed to policy as `input.source_auth.method == "failed"`.
+        Policy sees the method that verified the caller as `input.source_auth.method`.
+        Creating or saving a surface now validates every method, on the base and each
+        enabled variant, and refuses two methods reading the same credential location,
+        more than one DID Auth method, a JWT bearer method after the first beside
+        protected resource metadata, a `from_jwt_claim` identity unless every method
+        is JWT bearer, and an inbound `from_api_key` identity unless every method is
+        API Key or API Key Provider. The credential headers of all methods are
+        stripped before forwarding, and a JWT bearer method with `forward_header`
+        forwards its header only when it was the method selected for the request. On
+        an MCP Access Point that publishes protected resource metadata, a failed JWT
+        bearer credential gets the `401` discovery challenge and a failed credential
+        of another method a plain `401`, directly and over Fabric. The Surface
+        Builder's Caller Context element lists its methods in the sidebar and in its
+        editor, each with whether it is ready, what it reads and a Configure button
+        that opens its settings; methods are added from a menu, and made primary or
+        removed in the editor.
+  changed: []
   fixed: []
   removed: []
-  security: []
-  breaking:
-    - timestamp: '2026-11-03T14:40:00.000Z'
-      title: Methods after the first in `caller_authentication.methods` now authenticate callers
+  security:
+    - timestamp: '2026-11-03T16:15:00.000Z'
+      title: Enforce every stored caller authentication method, not only the first
       description: >-
         Earlier releases enforced only the first method in a stored surface's
-        `caller_authentication.methods` and ignored the rest. They now take effect, which widens
-        who reaches the managed agent: a caller presenting only a later method's credential, which
-        failed (refused, or passed to policy as `source_auth.method == "failed"`), is now
-        authenticated by that method. A request carrying credentials for two of the methods, which
-        the first method used to verify, is now refused. At startup the gateway logs, at `info`,
-        one line per surface and per variant with more than one method, naming the methods after
-        the first, so operators can check them before traffic arrives.
+        `caller_authentication.methods` and ignored the rest. On upgrade, with no
+        operator action, they take effect, which widens who reaches the managed agent:
+        a caller presenting only a later method's credential, which failed before
+        (refused, or passed to policy as `source_auth.method == "failed"`), is now
+        authenticated by that method. Audit `caller_authentication.methods`, on each
+        surface and each variant override, before upgrading. At startup the gateway
+        logs, at `WARN`, one line per surface and per variant with more than one
+        method, naming the methods after the first.
+  breaking:
+    - timestamp: '2026-11-03T14:40:00.000Z'
+      title: Fail requests carrying two credentials and trim stored methods breaking the new rules
+      description: >-
+        A request carrying credentials for two of a surface's methods, which the first
+        method used to verify, now fails source authentication: it is refused on a
+        closed Access Point, with `on_failure: reject` or beside protected resource
+        metadata, and otherwise passed to policy as `method: "failed"`. Wherever
+        surfaces load (startup from local storage, DynamoDB or its cache, and
+        configuration or single-surface reloads), a stored surface or enabled variant
+        whose methods break the new rules (two methods on one credential location, a
+        second DID Auth method, a body-extracted method beside another, a JWT bearer
+        method after the first beside protected resource metadata, or an invalid later
+        method) keeps only its first method. An active node persists the trim to local
+        storage, and the gateway logs an error naming each dropped method by tag,
+        credential location and non-secret references, so it can be rebuilt. A stored
+        `from_jwt_claim` identity beside a method other than JWT bearer, or an inbound
+        `from_api_key` identity beside a method other than an API key, is logged as a
+        warning at startup and refused on the next save; until then a caller verified
+        by that other method is refused. Audit `caller_authentication.methods` before
+        upgrading. Before rolling back to a release that enforces only the first
+        method, remove every method but the first: that release strips only the first
+        method's header, so it would forward a later method's credential, such as a
+        partner's `X-API-Key`, to the Target.

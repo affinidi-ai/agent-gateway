@@ -183,8 +183,9 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
 a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
 (`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
-`reject`, and an MCP Access Point that publishes protected resource metadata when its JWT
-Bearer credential is missing or refused (direct requests get the discovery challenge). The
+`reject`, and an MCP Access Point that publishes protected resource metadata (a missing or
+refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
+credential of another method a plain `401`). The
 admin API creates every surface closed unless `access_point.public` is `true`; a closed
 surface without source authentication is not ready and refuses every request with `503`.
 Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is

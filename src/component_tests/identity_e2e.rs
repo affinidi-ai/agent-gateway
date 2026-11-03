@@ -221,9 +221,6 @@ pub(super) fn forwarded_binding_did(h: &GatewayHarness) -> String {
     panic!("forwarded binding VP should expose a DID, got {credential:?}")
 }
 
-/// Returns true if `v` is a valid Verifiable Presentation — either a compact
-/// JWT string (three base64url segments), a JSON string containing a VP object,
-/// or a direct JSON-LD VP object with a `proof`.
 fn is_valid_vp(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => {
