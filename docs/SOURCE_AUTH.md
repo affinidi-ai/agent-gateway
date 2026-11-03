@@ -787,14 +787,16 @@ to 300 seconds.
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
 except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
-`Authorization` and its `Cookie`, the caller-info and `did:webvh` identity headers
+`Authorization` and its `Cookie`, its `Forwarded`, `X-Real-IP` and every `X-Forwarded-*`
+header, the caller-info and `did:webvh` identity headers
 (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
 `x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
 like the Transit Point's `target_auth` header or like the `custom_header` of a credential
 binding that can apply on it, and any header a Header Metadata Mapping is set to strip. Other
 headers, such as an API key header the agent sends for the target itself under another name,
-pass. The credentials the gateway adds
-are described in
+pass. The gateway sets none of the forwarding headers either, so a target that trusts it as its
+proxy never takes a caller's claim about its address, host or scheme. The credentials the gateway
+adds are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
 The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`,

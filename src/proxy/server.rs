@@ -203,21 +203,15 @@ pub(crate) fn join_host_and_route(
     }
 }
 
-/// Run a listener for a specific port that handles multiple channels with different routes
-/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
-/// Extract the hostname (no port, lowercase) from a URL string.
-/// Returns `None` for malformed URLs without `://`.
+/// The host of a URL string, without its port, in lower case and in the form the
+/// URL parser normalises it to: an IPv6 address in brackets and compressed, so
+/// `[2001:DB8:0::1]` and `[2001:db8::1]` are the same host. `None` for a URL
+/// that does not parse or has no host.
 fn extract_hostname(url: &str) -> Option<String> {
-    url.split("://")
-        .nth(1)
-        .and_then(|after| after.split('/').next())
-        .map(|host_port| {
-            host_port
-                .split(':')
-                .next()
-                .unwrap_or(host_port)
-                .to_lowercase()
-        })
+    url::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 /// Find the first outbound listener whose external URLs share a hostname with
@@ -428,6 +422,8 @@ pub(crate) fn open_transit_points(
         .collect()
 }
 
+/// Run a listener for a specific port that handles multiple channels with different routes
+/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
 pub async fn run_port_server(
     port: u16,
     surfaces: Vec<crate::config::agent_surface::AgentSurface>,
@@ -2858,6 +2854,32 @@ mod tests {
         assert_eq!(extract_hostname("http://example.com:8080/foo"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("https://Example.COM"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("no-scheme"), None);
+        assert_eq!(extract_hostname("http://10.0.0.1:8080/x"), Some("10.0.0.1".to_string()));
+        assert_eq!(extract_hostname("https://[2001:db8::1]:8443/x"), Some("[2001:db8::1]".to_string()));
+        assert_eq!(extract_hostname("https://[::1]"), Some("[::1]".to_string()));
+        assert_eq!(extract_hostname("https://[2001:DB8:0:0::1]"), Some("[2001:db8::1]".to_string()));
+        assert_eq!(extract_hostname("https://[2001:db8::1"), None);
+    }
+
+    #[test]
+    fn find_shared_outbound_listener_never_matches_different_ipv6_hosts() {
+        for (inbound, outbound) in [
+            ("https://[2001:db8::1]:8443", "https://[2001:db8::2]:9443"),
+            ("https://[::1]", "https://[::2]"),
+            ("https://[2001:db8::1]", "https://[2001:db9::1]"),
+        ] {
+            let config = make_network_config_with_listeners(vec![inbound], vec![outbound]);
+            assert!(find_shared_outbound_listener(&config, 8080).is_none(), "{inbound} and {outbound}");
+        }
+    }
+
+    #[test]
+    fn find_shared_outbound_listener_matches_one_ipv6_host_however_it_is_written() {
+        let config = make_network_config_with_listeners(
+            vec!["https://[2001:db8::1]:8443"],
+            vec!["https://[2001:DB8:0:0:0:0:0:1]:9443"],
+        );
+        assert!(find_shared_outbound_listener(&config, 8080).is_some());
     }
 
     #[test]

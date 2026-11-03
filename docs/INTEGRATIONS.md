@@ -237,11 +237,11 @@ and reject replays.
 
 Webhook and Slack URLs are checked with `validate_resolved_webhook_url`
 ([`src/url_validation.rs`](../src/url_validation.rs)), which resolves the host and rejects
-cloud metadata addresses, loopback and unspecified addresses, the RFC 1918 private ranges,
-IPv4 and IPv6 link-local, IPv6 unique-local, and IPv4-mapped forms of all of these. This is
-stricter than the forward legs, which allow loopback and RFC 1918 for same-host and
-same-network targets. A DNS failure is an error. The request is then sent through the shared
-external client ([`src/http_client.rs`](../src/http_client.rs)), which has a 30-second
+cloud metadata addresses, loopback and unspecified addresses, the RFC 1918 private ranges, IPv4
+and IPv6 link-local, IPv6 unique-local, and the IPv4-mapped, 6to4 and NAT64 forms of all of
+these. This is stricter than the forward legs, which allow loopback and RFC 1918 for same-host
+and same-network targets. A DNS failure is an error. The request is then sent through the
+shared external client ([`src/http_client.rs`](../src/http_client.rs)), which has a 30-second
 timeout and redirects disabled, so a redirect cannot lead to an internal address.
 
 These sinks do not use the pin-once primitive in [`src/egress.rs`](../src/egress.rs) that

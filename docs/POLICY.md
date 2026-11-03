@@ -485,6 +485,14 @@ blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
 
+Every address check in [`src/url_validation.rs`](../src/url_validation.rs), on a URL literal or
+a resolved address, treats an IPv6 address that carries an IPv4 address like that IPv4
+address: the IPv4-mapped (`::ffff:0:0/96`), 6to4 (`2002::/16`) and NAT64 forms, on the
+well-known prefix (`64:ff9b::/96`) or a `/96` of the local-use prefix (`64:ff9b:1::/96`). So
+`[64:ff9b::a9fe:a9fe]` and `[2002:a9fe:a9fe::1]` are blocked as `169.254.169.254`, and the
+webhook checks block `[2002:a00:1::1]` as `10.0.0.1`. The webhook checks also block the whole
+local-use prefix `64:ff9b:1::/48`, which translates only non-global IPv4 addresses.
+
 A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
 more: the outbound forward sends it only to the origin of its provider's `resource`, through
 `egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See

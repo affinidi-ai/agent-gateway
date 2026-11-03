@@ -9652,7 +9652,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
         handler_invocation_id,
         addr,
         req.method(),
-        req.uri().path()
+        loggable::untrusted(&loggable::path(req.uri().path()))
     );
 
     // Extract path and query before consuming req
@@ -9662,7 +9662,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
         .query()
         .map(|q| q.to_string());
 
-    debug!("Multi-channel handler received request: method={} path={}", req.method(), path);
+    debug!(
+        "Multi-channel handler received request: method={} path={}",
+        req.method(),
+        loggable::untrusted(&loggable::path(&path))
+    );
 
     // Find the matching channel and parse any `$alias` suffix attached to its route.
     // URL grammar: `/route[$alias][/rest]`.
@@ -9877,11 +9881,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
             }
         }
         None => {
-            // No matching channel found for this route
-            warn!("No channel found for path: {} (checked {} channels)", path, channels.len());
-            for ch in channels.iter() {
-                warn!("  Available: surface='{}' route='{}'", ch.surface.name, ch.surface.route());
-            }
+            warn!("No surface route matches path {}", loggable::untrusted(&loggable::path(&path)));
             crate::audit::request_events::request_rejected(
                 &crate::audit::request_events::RequestFacts::unroutable(),
                 crate::audit::request_events::RejectionStage::Routing,
@@ -22311,6 +22311,33 @@ allow if {
         assert!(url.ends_with("?code=<redacted>&<redacted>"), "{url}");
         assert!(!url.contains("oauth-code-value"), "{url}");
         assert!(!url.contains("bare-token-value"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_path_no_surface_serves_logs_one_bounded_line_naming_no_surface() {
+        let surface = mcp_surface("tenant-only-surface", "http://127.0.0.1:9", None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let tail = "a".repeat(1000);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response =
+            send_to_surface(&state, surface, legacy_mcp_request(&format!("/unknown/{tail}"), &serde_json::json!({})))
+                .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = logs.text();
+        let misses: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("No surface route matches path"))
+            .collect();
+        assert_eq!(misses.len(), 1, "{text}");
+        assert!(
+            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/unknown/{tail}"))),
+            "{}",
+            misses[0]
+        );
+        assert!(!text.contains(&tail), "a log holds the whole path: {text}");
+        assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
     }
 
     #[tokio::test]
