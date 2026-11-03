@@ -1613,10 +1613,13 @@ pub(crate) fn collect_provider_key_references(
             push(api_key_id(identity).as_deref(), true);
         }
         push(
-            view.target
-                .identity_injection
-                .api_key_id
-                .as_deref(),
+            api_key_id(
+                crate::config::agent_surface_compat::identity_injection_to_managed_identity(
+                    &view.target.identity_injection,
+                )
+                .as_ref(),
+            )
+            .as_deref(),
             true,
         );
         for point in view
@@ -1631,13 +1634,6 @@ pub(crate) fn collect_provider_key_references(
                         .as_ref(),
                 )
                 .as_deref(),
-                true,
-            );
-            push(
-                point
-                    .identity_injection
-                    .api_key_id
-                    .as_deref(),
                 true,
             );
         }
@@ -1989,8 +1985,8 @@ mod tests {
             .external = Some(from_api_key("plain-secret"));
         surface
             .target
-            .identity_injection
-            .api_key_id = Some("atgk_injected".into());
+            .identity_injection =
+            serde_json::from_value(serde_json::json!({"type": "from_api_key", "api_key_id": "atgk_injected"})).unwrap();
         surface.access_point.caller_authentication = Some(
             serde_json::from_value(serde_json::json!({"methods": [
                 {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "atgk_shared"},
@@ -2002,7 +1998,8 @@ mod tests {
             points: vec![
                 serde_json::from_value(serde_json::json!({
                     "id": "partner-id", "alias": "partner", "target_endpoint": "https://partner.example",
-                    "protocol": "a2a", "managed_identity": {"type": "from_api_key", "api_key_id": "atgk_point"}
+                    "protocol": "a2a", "managed_identity": {"type": "from_api_key", "api_key_id": "atgk_point"},
+                    "identity_injection": {"inject_vp": true, "type": "from_api_key", "api_key_id": "atgk_point_injection"}
                 }))
                 .unwrap(),
             ],
@@ -2027,6 +2024,18 @@ mod tests {
         );
         assert!(
             collect_provider_key_references(&AgentSurface::default())
+                .unwrap()
+                .is_empty()
+        );
+        let mut untyped = AgentSurface::default();
+        untyped
+            .target
+            .identity_injection = serde_json::from_value(
+            serde_json::json!({"type": "from_mtls", "certificate_id": "cert", "api_key_id": "atgk_unread"}),
+        )
+        .unwrap();
+        assert!(
+            collect_provider_key_references(&untyped)
                 .unwrap()
                 .is_empty()
         );
