@@ -53,8 +53,20 @@ In `types.rs`, subject/actor/requested URNs — JWT
 `draft-ietf-oauth-identity-assertion-authz-grant`), and the Affinidi extension
 VP (`urn:affinidi:params:oauth:token-type:vp`).
 
-- **Subject verification**: a JWT/ID-token is verified via the `jwt_bearer`
-  strategy resolved by the token's `iss` (`JwtBearerSubjectVerifier`); a VP is
+- **Subject verification**: a JWT/ID-token is verified via a `jwt_bearer`
+  strategy whose `expected_issuer` is the token's `iss`
+  (`JwtBearerSubjectVerifier`), chosen for the authenticated client's tenant
+  (`strategies_for_client`): the tenant's own strategies for that issuer or, when
+  it has none, the appliance-global ones. An appliance-global client uses only
+  appliance-global strategies, so a tenant's strategy can never shadow another
+  tenant's issuer or the appliance's. The token is accepted when any of those
+  strategies verifies it. The jwt-bearer grant therefore authenticates the client
+  before it verifies the assertion. A token whose `iss` is this gateway is
+  verified against the gateway's own JWKS. Verification itself checks no
+  audience; the grant checks it afterwards: a redeemed ID-JAG's `aud` must be
+  this gateway (`validate_id_jag`), and a token-exchange subject token's `aud`
+  is checked against the client's `allowed_subject_audiences` (opt-in, see
+  below). A VP is
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
   credential-subject DID.

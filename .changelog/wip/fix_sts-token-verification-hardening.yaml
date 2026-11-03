@@ -13,6 +13,17 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-03T10:32:45Z'
+      title: Verify STS subject tokens only with the client tenant's JWT strategies
+      description: >-
+        The token endpoint verified a JWT subject token, actor token or jwt-bearer assertion
+        with the first JWT verification strategy of any tenant whose expected issuer matched,
+        so a tenant could register another tenant's issuer with its own keys and have its
+        tokens accepted for that issuer. It now uses the authenticated client's tenant's
+        strategies for the issuer, or the appliance-global ones when the tenant has none, and an
+        appliance-global client uses only appliance-global strategies. The jwt-bearer grant now
+        authenticates the client before it verifies the assertion, so a bad client is refused
+        with invalid_client before any assertion is checked.
+    - timestamp: '2026-11-03T10:32:45Z'
       title: Stop spoofed forwarded headers from steering the STS throttle and discovery
       description: >-
         The token endpoint throttle keyed its source on the first X-Forwarded-For entry and

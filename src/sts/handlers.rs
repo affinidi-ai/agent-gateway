@@ -140,20 +140,24 @@ pub trait StsSigner: Send + Sync {
     async fn public_jwks(&self) -> Result<Value, StsError>;
 }
 
-/// Verifies a JWT-shaped assertion and returns its verified claims.
+/// Verifies a JWT-shaped assertion for a client of `tenant_id` (`None` for an
+/// appliance-global client) and returns its verified claims.
 #[async_trait::async_trait]
 pub trait StsSubjectVerifier: Send + Sync {
     async fn verify_jwt(
         &self,
         token: &str,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError>;
 
     async fn verify_mcp_jwt(
         &self,
         token: &str,
         _profile: &crate::sts::mcp_profile::McpIssuerProfile,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
-        self.verify_jwt(token).await
+        self.verify_jwt(token, tenant_id)
+            .await
     }
 }
 
@@ -232,8 +236,8 @@ impl StsSigner for VcIssuerSigner {
 }
 
 /// [`StsSubjectVerifier`] backed by `src/jwt_bearer`. Resolves the verification
-/// strategy by matching the token's (unverified) `iss` against a registered
-/// strategy's `expected_issuer`, then verifies the signature and standard claims.
+/// strategies the client may use for the token's (unverified) `iss` (see
+/// [`strategies_for_client`]), then verifies the signature and standard claims.
 pub struct JwtBearerSubjectVerifier {
     verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
     strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
@@ -280,6 +284,7 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
     async fn verify_jwt(
         &self,
         token: &str,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         let iss = decode_unverified_issuer(token)
             .ok_or_else(|| StsError::InvalidGrant("assertion missing a readable iss claim".to_string()))?;
@@ -305,20 +310,14 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             .list()
             .await
             .map_err(|e| StsError::ServerError(format!("strategy store error: {e}")))?;
-        let strategy = strategies
-            .into_iter()
-            .find(|s| s.expected_issuer == iss)
-            .ok_or_else(|| StsError::InvalidGrant(format!("no verification strategy for issuer {iss}")))?;
-        self.verifier
-            .validate(token, &strategy, &[])
-            .await
-            .map_err(|e| StsError::InvalidGrant(format!("assertion verification failed: {e}")))
+        verify_with_client_strategies(&self.verifier, strategies, token, &iss, tenant_id).await
     }
 
     async fn verify_mcp_jwt(
         &self,
         token: &str,
         profile: &crate::sts::mcp_profile::McpIssuerProfile,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         profile.validate()?;
         if decode_unverified_issuer(token).as_deref() == Some(profile.issuer.as_str()) {
@@ -326,8 +325,55 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
                 .verify_local_jwt(token, &profile.issuer)
                 .await;
         }
-        self.verify_jwt(token).await
+        self.verify_jwt(token, tenant_id)
+            .await
     }
+}
+
+/// The strategies a client of `tenant_id` may verify an `issuer`'s tokens with: its
+/// tenant's own strategies for that issuer or, when the tenant has none, the
+/// appliance-global ones. An appliance-global client uses only appliance-global
+/// strategies, so no tenant can shadow another tenant's issuer, or the appliance's.
+fn strategies_for_client(
+    strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+    issuer: &str,
+    tenant_id: Option<&str>,
+) -> Vec<crate::jwt_bearer::models::JwtVerificationStrategy> {
+    let (own, global): (Vec<_>, Vec<_>) = strategies
+        .into_iter()
+        .filter(|strategy| strategy.expected_issuer == issuer)
+        .filter(|strategy| strategy.tenant_id.is_none() || strategy.tenant_id.as_deref() == tenant_id)
+        .partition(|strategy| strategy.tenant_id.is_some());
+    if own.is_empty() {
+        global
+    } else {
+        own
+    }
+}
+
+/// Verifies `token` with each strategy from [`strategies_for_client`] in turn and
+/// returns the claims of the first that accepts it.
+async fn verify_with_client_strategies(
+    verifier: &crate::jwt_bearer::JwtBearerVerifier,
+    strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+    token: &str,
+    issuer: &str,
+    tenant_id: Option<&str>,
+) -> Result<Value, StsError> {
+    let mut failure = None;
+    for strategy in strategies_for_client(strategies, issuer, tenant_id) {
+        match verifier
+            .validate(token, &strategy, &[])
+            .await
+        {
+            Ok(claims) => return Ok(claims),
+            Err(error) => failure = Some(error),
+        }
+    }
+    Err(match failure {
+        Some(error) => StsError::InvalidGrant(format!("assertion verification failed: {error}")),
+        None => StsError::InvalidGrant(format!("no verification strategy for issuer {issuer}")),
+    })
 }
 
 /// A [`StsSubjectVerifier`] that always fails closed. Used when no JWT
@@ -339,6 +385,7 @@ impl StsSubjectVerifier for DisabledSubjectVerifier {
     async fn verify_jwt(
         &self,
         _token: &str,
+        _tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         Err(StsError::InvalidGrant("subject token verification is not configured on this gateway".to_string()))
     }
@@ -901,7 +948,9 @@ async fn handle_token_exchange(
         ));
     }
     let gateway_did = state.signer.issuer().await?;
-    let subject_claims = verify_assertion(state, req.subject_token_type, &req.subject_token, profile).await?;
+    let subject_claims =
+        verify_assertion(state, req.subject_token_type, &req.subject_token, profile, record.tenant_id.as_deref())
+            .await?;
     let mut assertion_expiry = None;
     if req
         .subject_token_type
@@ -939,7 +988,8 @@ async fn handle_token_exchange(
                     "MCP exchange accepts JWT or ID-token actors; redeem ID-JAG through jwt-bearer".into(),
                 ));
             }
-            let actor_claims = verify_assertion(state, actor_type, actor_token, profile).await?;
+            let actor_claims =
+                verify_assertion(state, actor_type, actor_token, profile, record.tenant_id.as_deref()).await?;
             if actor_type.is_jwt_shaped() {
                 reject_self_issued(state, &gateway_did, profile, "actor", actor_token, &actor_claims)?;
                 let actor_expiry = match profile {
@@ -1153,17 +1203,25 @@ async fn handle_jwt_bearer(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| StsError::InvalidRequest("assertion is required".to_string()))?;
 
+    let (client_id, client_secret) = resolve_client_credentials(headers, &form);
+    let client_id = client_id.ok_or_else(|| StsError::InvalidClient("client authentication required".to_string()))?;
+    let record = state
+        .clients
+        .authenticate(&client_id, client_secret.as_deref())
+        .await?;
+
+    let tenant_id = record.tenant_id.as_deref();
     let claims = match profile {
         Some(profile) => {
             state
                 .verifier
-                .verify_mcp_jwt(assertion, profile)
+                .verify_mcp_jwt(assertion, profile, tenant_id)
                 .await?
         }
         None => {
             state
                 .verifier
-                .verify_jwt(assertion)
+                .verify_jwt(assertion, tenant_id)
                 .await?
         }
     };
@@ -1183,13 +1241,6 @@ async fn handle_jwt_bearer(
         Some(profile) => profile.bound_subject(&claims)?,
         None => id_jag.subject.clone(),
     };
-
-    let (client_id, client_secret) = resolve_client_credentials(headers, &form);
-    let client_id = client_id.ok_or_else(|| StsError::InvalidClient("client authentication required".to_string()))?;
-    let record = state
-        .clients
-        .authenticate(&client_id, client_secret.as_deref())
-        .await?;
 
     if id_jag.client_id != client_id {
         return Err(StsError::InvalidGrant("ID-JAG was not issued to this client".to_string()));
@@ -1369,19 +1420,20 @@ async fn verify_assertion(
     token_type: TokenType,
     token: &str,
     profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>,
+    tenant_id: Option<&str>,
 ) -> Result<Value, StsError> {
     if token_type.is_jwt_shaped() {
         match profile {
             Some(profile) => {
                 state
                     .verifier
-                    .verify_mcp_jwt(token, profile)
+                    .verify_mcp_jwt(token, profile, tenant_id)
                     .await
             }
             None => {
                 state
                     .verifier
-                    .verify_jwt(token)
+                    .verify_jwt(token, tenant_id)
                     .await
             }
         }
@@ -1759,6 +1811,7 @@ mod tests {
         async fn verify_jwt(
             &self,
             token: &str,
+            _tenant_id: Option<&str>,
         ) -> Result<Value, StsError> {
             self.claims
                 .get(token)
@@ -3382,6 +3435,228 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.error_code(), "unauthorized_client");
+    }
+
+    /// Verifier mock that records the tenant each verification was asked for.
+    struct TenantRecordingVerifier {
+        claims: HashMap<String, Value>,
+        tenants: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StsSubjectVerifier for TenantRecordingVerifier {
+        async fn verify_jwt(
+            &self,
+            token: &str,
+            tenant_id: Option<&str>,
+        ) -> Result<Value, StsError> {
+            self.tenants
+                .lock()
+                .unwrap()
+                .push(tenant_id.map(str::to_string));
+            self.claims
+                .get(token)
+                .cloned()
+                .ok_or_else(|| StsError::InvalidGrant("unknown test token".to_string()))
+        }
+    }
+
+    fn tenant_recording_state(
+        claims: HashMap<String, Value>,
+        tenant_id: &str,
+    ) -> (StsState, Arc<TenantRecordingVerifier>) {
+        let verifier = Arc::new(TenantRecordingVerifier {
+            claims,
+            tenants: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut record = base_record();
+        record.tenant_id = Some(tenant_id.to_string());
+        let mut state = state_with(HashMap::new(), client(record, Some("s3cret")));
+        state.verifier = verifier.clone();
+        (state, verifier)
+    }
+
+    #[tokio::test]
+    async fn token_exchange_verifies_subject_and_actor_for_the_client_tenant() {
+        let claims = HashMap::from([
+            ("subject-tok".to_string(), json!({ "sub": "did:example:user" })),
+            ("actor-tok".to_string(), json!({ "sub": "did:example:agent" })),
+        ]);
+        let (state, verifier) = tenant_recording_state(claims, "tenant-a");
+        let mut form = exchange_form();
+        form.actor_token = Some("actor-tok".to_string());
+        form.actor_token_type = Some(TOKEN_TYPE_JWT.to_string());
+
+        dispatch(&state, &HeaderMap::new(), form)
+            .await
+            .expect("exchange succeeds");
+
+        assert_eq!(
+            *verifier
+                .tenants
+                .lock()
+                .unwrap(),
+            vec![Some("tenant-a".to_string()), Some("tenant-a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn jwt_bearer_authenticates_the_client_before_verifying_for_its_tenant() {
+        let id_jag = json!({
+            "iss": "did:webvh:example:gw", "sub": "did:example:user", "aud": "did:webvh:example:gw",
+            "client_id": "agent-client", "jti": "grant-tenant", "exp": now_secs() + 120
+        });
+        let assertion = id_jag_assertion(&id_jag);
+        let (state, verifier) = tenant_recording_state(HashMap::from([(assertion.clone(), id_jag)]), "tenant-a");
+        let form = TokenEndpointForm {
+            grant_type: Some(GRANT_TYPE_JWT_BEARER.to_string()),
+            assertion: Some(assertion),
+            client_id: Some("agent-client".to_string()),
+            client_secret: Some("wrong".to_string()),
+            ..Default::default()
+        };
+
+        let err = dispatch(&state, &HeaderMap::new(), form.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_client");
+        assert!(
+            verifier
+                .tenants
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an unauthenticated client's assertion is never verified"
+        );
+
+        let form = TokenEndpointForm {
+            client_secret: Some("s3cret".to_string()),
+            ..form
+        };
+        dispatch(&state, &HeaderMap::new(), form)
+            .await
+            .expect("redeem succeeds");
+        assert_eq!(
+            *verifier
+                .tenants
+                .lock()
+                .unwrap(),
+            vec![Some("tenant-a".to_string())]
+        );
+    }
+
+    #[test]
+    fn strategies_for_client_never_offers_another_tenants_strategy() {
+        use crate::jwt_bearer::test_utils::static_okp_strategy;
+        let issuer = "https://idp.example";
+        let strategies = || {
+            vec![
+                static_okp_strategy("a", Some("tenant-a"), issuer, "k", "x"),
+                static_okp_strategy("b", Some("tenant-b"), issuer, "k", "x"),
+                static_okp_strategy("global", None, issuer, "k", "x"),
+                static_okp_strategy("other-issuer", Some("tenant-a"), "https://other.example", "k", "x"),
+            ]
+        };
+        let ids = |tenant: Option<&str>| {
+            strategies_for_client(strategies(), issuer, tenant)
+                .into_iter()
+                .map(|strategy| strategy.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(Some("tenant-a")), vec!["a"]);
+        assert_eq!(ids(Some("tenant-b")), vec!["b"]);
+        assert_eq!(ids(Some("tenant-c")), vec!["global"]);
+        assert_eq!(ids(None), vec!["global"]);
+    }
+
+    async fn verify_signed_token_for(
+        strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+        issuer: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Value, StsError> {
+        let token = crate::jwt_bearer::test_utils::sign_ed25519_jwt(
+            &json!({ "iss": issuer, "sub": "alice", "exp": now_secs() + 300 }),
+            "k",
+        );
+        let verifier = crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new()));
+        verify_with_client_strategies(&verifier, strategies, &token, issuer, tenant_id).await
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_shadow_another_tenants_issuer() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        const VICTIM_IDP_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+        let issuer = "https://idp.tenant-b.example";
+        let strategies = || {
+            vec![
+                static_okp_strategy("attacker", Some("tenant-a"), issuer, "k", ED25519_JWK_X),
+                static_okp_strategy("victim", Some("tenant-b"), issuer, "k", VICTIM_IDP_KEY),
+            ]
+        };
+
+        let err = verify_signed_token_for(strategies(), issuer, Some("tenant-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(
+            err.to_string()
+                .contains("assertion verification failed"),
+            "{err}"
+        );
+        for tenant in [None, Some("tenant-c")] {
+            let err = verify_signed_token_for(strategies(), issuer, tenant)
+                .await
+                .unwrap_err();
+            assert_eq!(err.error_code(), "invalid_grant");
+            assert!(
+                err.to_string()
+                    .contains("no verification strategy"),
+                "client of {tenant:?}: {err}"
+            );
+        }
+
+        let claims = verify_signed_token_for(strategies(), issuer, Some("tenant-a"))
+            .await
+            .expect("a tenant's own strategy still verifies for its own clients");
+        assert_eq!(claims["sub"], "alice");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_falls_back_to_global_strategies_only_without_its_own() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        let issuer = "https://idp.example";
+        let global = static_okp_strategy("global", None, issuer, "k", ED25519_JWK_X);
+
+        let claims = verify_signed_token_for(vec![global.clone()], issuer, Some("tenant-a"))
+            .await
+            .expect("a tenant without its own strategy uses the global one");
+        assert_eq!(claims["sub"], "alice");
+
+        let own =
+            static_okp_strategy("own", Some("tenant-a"), issuer, "k", "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+        let err = verify_signed_token_for(vec![own, global], issuer, Some("tenant-a"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("assertion verification failed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_of_a_tenants_strategies_for_one_issuer_can_verify() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        let issuer = "https://idp.example";
+        let strategies = vec![
+            static_okp_strategy("old", Some("tenant-a"), issuer, "k", "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"),
+            static_okp_strategy("new", Some("tenant-a"), issuer, "k", ED25519_JWK_X),
+        ];
+        let claims = verify_signed_token_for(strategies, issuer, Some("tenant-a"))
+            .await
+            .expect("the second strategy holds the signing key");
+        assert_eq!(claims["sub"], "alice");
     }
 
     #[test]
