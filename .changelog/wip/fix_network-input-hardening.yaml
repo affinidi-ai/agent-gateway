@@ -1,0 +1,15 @@
+branch: fix/network-input-hardening
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-03T13:50:00Z'
+      title: Block cloud metadata and private IPv4 addresses inside 6to4 and NAT64 IPv6
+      description: >-
+        The SSRF checks on target, webhook, OAuth and JWKS URLs, and on the addresses their hosts
+        resolve to, decoded only the IPv4-mapped form of an IPv6 address. A 6to4 (2002::/16) or
+        NAT64 (64:ff9b::/96) address carrying a cloud metadata, loopback or RFC 1918 IPv4 address
+        passed as a public one. Those forms are now checked as the IPv4 address they carry.
+  breaking: []
