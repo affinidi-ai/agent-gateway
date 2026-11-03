@@ -192,6 +192,13 @@ fn decoding_key_from_jwk(jwk: &crate::jwt_bearer::jwks::Jwk) -> JwtBearerResult<
                 .map_err(|e| JwtBearerError::InvalidToken(format!("Failed to build EC decoding key: {}", e)))
         }
         "OKP" => {
+            if let Some(crv) = jwk
+                .crv
+                .as_deref()
+                .filter(|crv| *crv != "Ed25519")
+            {
+                return Err(JwtBearerError::InvalidToken(format!("OKP JWK curve must be Ed25519, got {crv}")));
+            }
             let x = jwk
                 .x
                 .as_deref()
@@ -683,8 +690,18 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
     // ── OKP key length ────────────────────────────────────────────────────────
 
     async fn validate_with_okp_x(x: &str) -> JwtBearerResult<Claims> {
+        validate_with_okp_key(x, Some("Ed25519")).await
+    }
+
+    async fn validate_with_okp_key(
+        x: &str,
+        crv: Option<&str>,
+    ) -> JwtBearerResult<Claims> {
         use crate::jwt_bearer::test_utils::{sign_ed25519_jwt, static_okp_strategy};
-        let strategy = static_okp_strategy("okp", None, "https://issuer.example.com", "okp-key", x);
+        let mut strategy = static_okp_strategy("okp", None, "https://issuer.example.com", "okp-key", x);
+        if let JwksSource::Static { jwks } = &mut strategy.jwks_source {
+            jwks[0].crv = crv.map(str::to_string);
+        }
         let token = sign_ed25519_jwt(
             &json!({ "iss": "https://issuer.example.com", "sub": "okp-user", "exp": now_secs() + 3600 }),
             "okp-key",
@@ -714,6 +731,23 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
                 x.len()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn okp_jwk_on_another_curve_is_refused_even_with_a_32_byte_x() {
+        let result = validate_with_okp_key(crate::jwt_bearer::test_utils::ED25519_JWK_X, Some("X25519")).await;
+        assert!(
+            matches!(&result, Err(JwtBearerError::InvalidToken(message)) if message.contains("curve must be Ed25519")),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn okp_jwk_without_a_curve_is_read_as_ed25519() {
+        let claims = validate_with_okp_key(crate::jwt_bearer::test_utils::ED25519_JWK_X, None)
+            .await
+            .expect("an Ed25519 key without crv still verifies");
+        assert_eq!(claims["sub"], "okp-user");
     }
 
     #[tokio::test]
