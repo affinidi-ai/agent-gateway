@@ -3116,7 +3116,7 @@ mod tests {
     async fn an_external_consent_binding_is_never_resolved_by_agent() {
         let vault = MockVaultStore::new(VaultLookupResult::Found(make_token(false, false)));
         let providers = MockProviderStore::with_oauth_provider("cp-1");
-        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let mut binding = make_binding("cp-1");
         binding.consent_mode = ConsentMode::External;
         binding.subject = Some(crate::config::agent_surface::GrantSubject::Owner);
@@ -3126,6 +3126,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),
