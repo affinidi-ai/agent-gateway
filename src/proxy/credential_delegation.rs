@@ -3585,6 +3585,7 @@ mod tests {
             "sha256:user1",
             "did:web:agent.example",
             "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
             None,
             &(vault as Arc<dyn DelegationVaultStorage>),
             &(providers as Arc<dyn CredentialProviderStorage>),

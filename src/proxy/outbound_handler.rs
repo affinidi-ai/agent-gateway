@@ -12366,7 +12366,7 @@ mod tests {
                 assert!(
                     matches!(
                         inject_tenant_secret(protocol.clone(), mode, "other").await,
-                        Err(OutboundPipelineError::MetadataInjectionFailed)
+                        Err(OutboundPipelineError::MetadataInjectionFailed { .. })
                     ),
                     "{protocol:?} {mode:?}"
                 );
@@ -12381,7 +12381,7 @@ mod tests {
             assert!(
                 matches!(
                     inject_tenant_secret(protocol.clone(), RuleMode::Enforce, "wide").await,
-                    Err(OutboundPipelineError::MetadataInjectionFailed)
+                    Err(OutboundPipelineError::MetadataInjectionFailed { .. })
                 ),
                 "{protocol:?}"
             );
