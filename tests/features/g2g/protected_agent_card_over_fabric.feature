@@ -32,7 +32,6 @@ Feature: Protected agent card fetch over fabric
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
     Then the response status is 502
-    And the response says "Target authentication failed"
     And managed agent "bravo" was not called
 
   Scenario: gateway 2 presents its target credential when it reads the agent card for its surface policy

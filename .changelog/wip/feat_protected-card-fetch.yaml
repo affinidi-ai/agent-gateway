@@ -10,6 +10,13 @@ changes:
         authentication failed, the same text as the direct path, instead of Target
         authentication configuration error. Clients that match the old text must match the new
         one.
+    - timestamp: '2026-11-03T12:30:00Z'
+      title: Skip the sending gateway's surface policy for every public discovery read
+      description: >-
+        The sending gateway of a Fabric route now skips its surface policy for a GET or HEAD of
+        any public discovery path, as the direct path does: paths ending in agent-card.json,
+        agent.json, .well-known/agent-card, .well-known/ucp or discovery. A policy that denied
+        such reads on the sending gateway no longer applies to them.
   fixed:
     - timestamp: '2026-11-02T11:45:42Z'
       title: Fetch agent cards over Fabric with the same rules as direct requests
@@ -18,15 +25,16 @@ changes:
         HEAD whose normalised path is exactly an agent card path or the configured card
         location. That fetch is a new GET with no body that keeps only Accept, Accept-Language
         and User-Agent from the peer, and carries no delegated credential, transit token or
-        trace id. The card read for policy input now presents the Target credential.
+        trace id, and its answer reaches the peer with only the headers that describe the card.
+        The card read for policy input now presents the Target credential and is cached per
+        surface for up to 60 seconds.
   removed: []
   security:
     - timestamp: '2026-11-02T13:54:10Z'
-      title: Run the surface policy on non-GET requests to agent card paths over Fabric
+      title: Run the surface policy on a POST to an agent card path over Fabric
       description: >-
         The sending gateway of a Fabric route skipped its surface policy for any request whose
         path ended in agent.json or agent-card.json, whatever the method, so a POST to such a
         path passed unevaluated. It now skips the policy only for a GET or HEAD of a public
-        discovery path, as the direct path does, which also covers paths ending in discovery,
-        .well-known/ucp and .well-known/agent-card.
+        discovery path.
   breaking: []
