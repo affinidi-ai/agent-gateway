@@ -291,6 +291,20 @@ describe('Target authentication rules that need the whole surface', () => {
     expect(targetAuthBreaches(surface(), null)).toEqual([]);
   });
 
+  it('counts a forwarded JWT only on the first caller method, as the gateway does', () => {
+    const forwarding = { type: 'jwt_bearer', forward_header: true };
+    const withMethods = (methods: unknown[]) =>
+      surface({
+        access_point: { caller_authentication: { methods } },
+        target: {
+          endpoint: 'https://agent.example.com',
+          auth: staticSecret('Authorization', 'Bearer {value}'),
+        },
+      });
+    expect(targetAuthBreaches(withMethods([forwarding]), null)).toHaveLength(1);
+    expect(targetAuthBreaches(withMethods([{ type: 'api_key' }, forwarding]), null)).toEqual([]);
+  });
+
   it('blocks a header the Access Point maps from metadata, and passes a different one', () => {
     const mapped = (name: string) =>
       surface({

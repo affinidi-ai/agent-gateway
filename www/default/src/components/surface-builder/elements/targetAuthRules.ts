@@ -71,9 +71,9 @@ function legs(surface: unknown): Leg[] {
   const resource = record(payload.mcp_http)?.authorization != null;
   if (target?.auth) {
     const methods = array(record(accessPoint?.caller_authentication)?.methods);
-    const forwarded = methods
-      .map(record)
-      .find(method => method?.type === 'jwt_bearer' && method.forward_header === true);
+    const first = record(methods[0]);
+    const forwarded =
+      first?.type === 'jwt_bearer' && first.forward_header === true ? first : undefined;
     const otherHeaders = [...bindings];
     if (forwarded && !resource) {
       otherHeaders.push({
