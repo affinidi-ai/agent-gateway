@@ -46,7 +46,7 @@ pub(crate) fn identity_injection_to_managed_identity(
                 .api_key_id
                 .clone()
                 .filter(|s| !s.is_empty())?;
-            Some(ManagedIdentityConfig::FromApiKey { api_key_id })
+            Some(ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) })
         }
         "from_mtls" => {
             let certificate_id = ii
@@ -112,7 +112,7 @@ pub(crate) fn managed_identity_into_identity_injection(
         }
         Some(ManagedIdentityConfig::FromApiKey { api_key_id }) => {
             out.identity_type = Some("from_api_key".to_string());
-            out.api_key_id = Some(api_key_id.clone());
+            out.api_key_id = api_key_id.clone();
         }
         Some(ManagedIdentityConfig::FromMtls { certificate_id }) => {
             out.identity_type = Some("from_mtls".to_string());

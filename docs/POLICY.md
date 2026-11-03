@@ -292,9 +292,35 @@ Check flagged an identity mismatch). Both carry how the DID was established:
 | --- | --- | --- |
 | `input.extension_identity.verification`, `input.agent.did_verification` | `vp` | The caller proved control of the DID with an identity presentation that verified and whose issuer is one of the sending connection's issuers. Only the fabric receive path produces it. |
 | | `vp_unanchored` | The caller proved control of the DID with an identity presentation that verified, but no trust anchor vouches for its issuer: the direct A2A path has no authenticated sender, so a self-issued credential ends here too. Trust its identity fields only after checking `input.agent.identity_issuer_did` or a Trust Check. |
-| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request (`from_jwt_claim`). |
-| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms and surface-configured identities (`static`, `from_mtls`, `from_api_key`). |
+| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
+| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
 | `input.extension_identity.verified`, `input.agent.did_verified` | `true` / `false` | Boolean projection: everything but `unverified` is verified. |
+
+On a direct request to a surface whose inbound identity is `from_api_key`, the
+caller is the API key it presents (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). Fabric
+receive does not read this mode; the request body sets the caller there (see
+[`FABRIC.md`](FABRIC.md)). On a direct request:
+
+- `input.extension_identity` and `input.agent.did`, `did_verified` and
+  `did_verification` are the key's DID, replacing any DID or identity
+  presentation in the request body.
+- When the body does not assert the key's own DID, including when it names no DID,
+  the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
+  `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
+  preset that reads `input.agent.provider_did` therefore denies unless the body
+  asserts the key's own DID.
+- With no caller identity, such as after a failed key, `input.agent.did` is absent and
+  those trust-registry claims are always dropped.
+- Gateway-plane policy, including its global policy, runs before the key resolves, so it
+  sees no `input.agent.did` and none of those claims on these surfaces.
+- On a `fabric://` target only `access_point.inbound_policy` sees the key's DID, in
+  `input.extension_identity` (and `input.agent` when the Access Point has a Trust Check).
+  `target.policy` keeps its existing input, the target agent's card and the request body, so
+  a per-caller rule there matches `input.source_auth.key_name`.
+- A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
+  [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
+  refuses it.
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries

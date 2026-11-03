@@ -267,6 +267,13 @@ impl AgentSurface {
         matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
     }
 
+    /// True when slot 1 identifies the caller by the API key it presented
+    /// (`from_api_key`).
+    #[inline]
+    pub fn inbound_identity_from_api_key(&self) -> bool {
+        matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+    }
+
     /// Slot 2 — protected agent identity extracted from response (MA → AP).
     #[inline]
     pub fn protected_identity(&self) -> Option<&crate::source_auth::ManagedIdentityConfig> {

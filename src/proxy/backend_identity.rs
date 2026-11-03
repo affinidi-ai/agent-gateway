@@ -1211,6 +1211,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn protected_api_key_of_a_caller_shares_its_did_and_role() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_bi_caller", true, None)
+            .await
+            .unwrap();
+        let caller = issuer
+            .issue_or_get_caller_credential(fields, Some(hash.clone()), None, None)
+            .await
+            .unwrap();
+        let issuer = Arc::new(issuer);
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), issuer.clone()).unwrap());
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_caller".to_string()),
+        });
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-shared-key",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        match resolved.unwrap() {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, caller.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected the Managed Agent identity"),
+        }
+        let record = issuer
+            .get_identity_store()
+            .find_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(crate::identity::IdentityOrigin::ExternalCaller));
+        let count = |result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["bi-shared-key", "from_api_key", result])
+                .get()
+        };
+        assert_eq!(count("ok_cached"), 1);
+        assert_eq!(count("vc_issuer_error"), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_api_key_resolves_when_its_role_cannot_be_recorded() {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
+            crate::identity::test_helpers::OriginFailingIdentityStore(
+                crate::identity::test_helpers::MockIdentityStore::new(),
+            ),
+        ))
+        .await;
+        let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_bi_origin".to_string()),
+        };
+        let Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash }) =
+            crate::identity::credential_identity::derive_credential_identity(&config, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("API key identity is derived");
+        };
+        let legacy = issuer
+            .issue_or_get_credential(identity_fields, Some(identity_hash), None, None)
+            .await
+            .unwrap();
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(config);
+
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &surface,
+            Some(&selector),
+            None,
+            "bi-origin-unrecorded",
+            IdentityResponseKind::Message,
+            None,
+        )
+        .await;
+
+        match resolved.unwrap() {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, legacy.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected the Managed Agent identity"),
+        }
+    }
+
     #[test]
     fn only_a_payload_extraction_slot_reads_the_response_body() {
         let payload = payload_extraction_surface("https://agent.example");

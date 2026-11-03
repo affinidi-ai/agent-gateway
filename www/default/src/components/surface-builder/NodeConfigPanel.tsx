@@ -205,7 +205,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
         !node.configured &&
         (() => {
           if (def?.suppressIncompleteBanner?.(node.config)) return null;
-          const reason = getIncompleteReason(node.type, node.config);
+          const reason = getIncompleteReason(node.type, node.config, undefined, node);
           return reason ? (
             <div className="config-incomplete-banner">
               <i className="fas fa-exclamation-circle me-2" />

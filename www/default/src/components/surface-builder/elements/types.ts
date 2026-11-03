@@ -366,9 +366,10 @@ export interface NodeDefinition {
    * `registry.isConfigured` is derived from this.
    *
    * For decorative elements (NPCs, actors, surface) return `null`
-   * unconditionally.
+   * unconditionally. `node` is the canvas node when the caller has one, for
+   * elements whose required fields depend on their placement.
    */
-  incompleteReason: (config: any) => string | null;
+  incompleteReason: (config: any, node?: DependencyNode) => string | null;
 
   /**
    * Format / value validators run on the current config. Distinct from

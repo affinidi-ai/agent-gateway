@@ -14,6 +14,7 @@ import {
   makeSurfaceSlotFilter,
 } from './elements/edges/archetypes';
 import type { DerivedEdge, SlotDirection } from './elements/edges/types';
+import type { DependencyNode } from './elements/types';
 import { isSyntheticFabricNodeId } from './elements/synthesizeFabric';
 import { syncTrustCheckReviewBadge } from './elements/trust-check/reviewBadge';
 import { fetchRoutingConfig } from './elements/access-point/defaults';
@@ -296,9 +297,10 @@ export interface SurfaceCanvasProps {
 export function getIncompleteReason(
   type: SurfaceNodeType,
   config: any,
-  surfacePolicyIds?: Set<string> | null
+  surfacePolicyIds?: Set<string> | null,
+  node?: DependencyNode
 ): string | null {
-  const reason = _registry.getFaultReason(type, config);
+  const reason = _registry.getFaultReason(type, config, node);
   if (reason) return reason;
   return policyDefinitionMissingReason({ type, config }, surfacePolicyIds ?? null);
 }
@@ -3301,7 +3303,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         const el = d3.select(this);
         const cn = nodes.find(n => n.id === d.id);
         const incompleteReason = cn
-          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current)
+          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn)
           : null;
         const hasFeatureError = featureErrorIds.has(d.id);
         const policyMissing = policyDefinitionMissing(
@@ -3505,7 +3507,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .text(d => {
         const cn = nodes.find(n => n.id === d.id);
         const reason = cn
-          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current)
+          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn)
           : null;
         if (!reason) return '';
         return reason.length > 38 ? reason.substring(0, 36) + '…' : reason;
@@ -4570,7 +4572,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       // additions/removals shift the reason line correctly.
       const reasonEl = nodeG.select('.node-incomplete-reason');
       const reason =
-        n.type === 'surface' ? null : getIncompleteReason(n.type, n.config, surfacePolicyIds);
+        n.type === 'surface' ? null : getIncompleteReason(n.type, n.config, surfacePolicyIds, n);
       if (!reason) {
         if (!reasonEl.empty()) reasonEl.remove();
       } else {

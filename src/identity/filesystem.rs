@@ -158,7 +158,10 @@ pub struct FilesystemIdentityStore {
     storage: Box<dyn StorageBackend<AgentIdentityRecord>>,
     storage_path: PathBuf,
     ws_state: Option<Arc<crate::server::WsState>>,
+    record_locks: [tokio::sync::Mutex<()>; RECORD_LOCK_STRIPES],
 }
+
+const RECORD_LOCK_STRIPES: usize = 64;
 
 impl FilesystemIdentityStore {
     /// Create a new filesystem-based identity store
@@ -181,7 +184,44 @@ impl FilesystemIdentityStore {
             storage,
             storage_path,
             ws_state,
+            record_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// The lock serialising read-modify-write cycles on the record keyed by
+    /// `identity_hash`. Hold one record lock at a time.
+    fn record_lock(
+        &self,
+        identity_hash: &str,
+    ) -> &tokio::sync::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        identity_hash.hash(&mut hasher);
+        &self.record_locks[(hasher.finish() % RECORD_LOCK_STRIPES as u64) as usize]
+    }
+
+    async fn save_record(
+        &self,
+        record: AgentIdentityRecord,
+        is_new: bool,
+    ) -> Result<()> {
+        self.storage
+            .save(&record)
+            .await?;
+
+        if is_new
+            && let Some(ws) = &self.ws_state
+            && let Ok(identity_json) = serde_json::to_value(&record)
+        {
+            info!(
+                did = %record.did,
+                identity_hash = %record.identity_hash,
+                "📡 Broadcasting identity create via WebSocket"
+            );
+            ws.broadcast(crate::server::WsUpdate::IdentityCreated { identity: identity_json });
+        }
+
+        Ok(())
     }
 
     /// Find by DID
@@ -239,25 +279,28 @@ impl IdentityStore for FilesystemIdentityStore {
             .ok()
             .flatten()
             .is_none();
+        self.save_record(record, is_new)
+            .await
+    }
 
-        let record_for_broadcast = record.clone();
-        self.storage
-            .save(&record)
-            .await?;
-
-        if is_new
-            && let Some(ws) = &self.ws_state
-            && let Ok(identity_json) = serde_json::to_value(&record_for_broadcast)
+    async fn create_if_absent(
+        &self,
+        record: AgentIdentityRecord,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        let _guard = self
+            .record_lock(&record.identity_hash)
+            .lock()
+            .await;
+        if let Some(existing) = self
+            .storage
+            .get(&record.identity_hash)
+            .await?
         {
-            info!(
-                did = %record_for_broadcast.did,
-                identity_hash = %record_for_broadcast.identity_hash,
-                "📡 Broadcasting identity create via WebSocket"
-            );
-            ws.broadcast(crate::server::WsUpdate::IdentityCreated { identity: identity_json });
+            return Ok(Some(existing));
         }
-
-        Ok(())
+        self.save_record(record, true)
+            .await?;
+        Ok(None)
     }
 
     async fn list_all(&self) -> Result<Vec<AgentIdentityRecord>> {
@@ -269,6 +312,10 @@ impl IdentityStore for FilesystemIdentityStore {
         identity_hash: &str,
         channel_config_id: Option<String>,
     ) -> Result<()> {
+        let _guard = self
+            .record_lock(identity_hash)
+            .lock()
+            .await;
         if let Some(mut record) = self
             .storage
             .get(identity_hash)
@@ -356,8 +403,19 @@ impl IdentityStore for FilesystemIdentityStore {
         channel_config_id: Option<String>,
         verified: bool,
     ) -> Result<()> {
-        // Check if we already have this DID
-        if let Some(mut existing) = self.find_by_did(did).await? {
+        let identity_hash = match self.find_by_did(did).await? {
+            Some(found) => found.identity_hash,
+            None => format!("external:{}", did),
+        };
+        let _guard = self
+            .record_lock(&identity_hash)
+            .lock()
+            .await;
+        if let Some(mut existing) = self
+            .storage
+            .get(&identity_hash)
+            .await?
+        {
             let now = chrono::Utc::now();
 
             // Update global usage stats
@@ -409,7 +467,9 @@ impl IdentityStore for FilesystemIdentityStore {
                 info!("Updated identity fields for external DID {}", did);
             }
 
-            return self.create(existing).await;
+            return self
+                .save_record(existing, false)
+                .await;
         }
 
         // Create a record for external DID with identity fields
@@ -439,14 +499,19 @@ impl IdentityStore for FilesystemIdentityStore {
             origin: Some(IdentityOrigin::ExternalCaller),
         };
 
-        self.create(record).await
+        self.save_record(record, true)
+            .await
     }
 
     async fn set_origin(
         &self,
         identity_hash: &str,
         origin: IdentityOrigin,
-    ) -> Result<()> {
+    ) -> Result<Option<IdentityOrigin>> {
+        let _guard = self
+            .record_lock(identity_hash)
+            .lock()
+            .await;
         let Some(mut record) = self
             .storage
             .get(identity_hash)
@@ -454,13 +519,14 @@ impl IdentityStore for FilesystemIdentityStore {
         else {
             anyhow::bail!("identity record not found: {}", identity_hash);
         };
-        if record.origin == Some(origin) {
-            return Ok(());
+        if let Some(existing) = record.origin {
+            return Ok(Some(existing));
         }
         record.origin = Some(origin);
         self.storage
             .save(&record)
-            .await
+            .await?;
+        Ok(Some(origin))
     }
 
     fn base_path(&self) -> Option<std::path::PathBuf> {
@@ -754,6 +820,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn test_set_origin_keeps_the_first_origin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(local_record("h1"))
+            .await
+            .unwrap();
+
+        let first = store
+            .set_origin("h1", IdentityOrigin::Managed)
+            .await
+            .unwrap();
+        let second = store
+            .set_origin("h1", IdentityOrigin::ExternalCaller)
+            .await
+            .unwrap();
+
+        assert_eq!(first, Some(IdentityOrigin::Managed));
+        assert_eq!(second, Some(IdentityOrigin::Managed));
+        let record = store
+            .find_by_hash("h1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn test_create_if_absent_keeps_the_first_record() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let mut first = local_record("h1");
+        first.origin = Some(IdentityOrigin::Managed);
+        let mut second = local_record("h1");
+        second.did = "did:web:example.com:other".to_string();
+        second.origin = Some(IdentityOrigin::ExternalCaller);
+
+        assert!(
+            store
+                .create_if_absent(first.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let kept = store
+            .create_if_absent(second)
+            .await
+            .unwrap()
+            .expect("the first record is returned");
+
+        assert_eq!(kept.did, first.did);
+        let stored = store
+            .find_by_hash("h1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.did, first.did);
+        assert_eq!(stored.origin, Some(IdentityOrigin::Managed));
+    }
+
+    /// Races `write` against `set_origin(Managed)` on fresh origin-less local
+    /// records and returns the records whose origin did not survive.
+    async fn origins_lost_to_concurrent<F, Fut>(write: F) -> Vec<String>
+    where
+        F: Fn(Arc<FilesystemIdentityStore>, AgentIdentityRecord) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FilesystemIdentityStore::new(temp_dir.path())
+                .await
+                .unwrap(),
+        );
+        let mut lost = Vec::new();
+        for round in 0..200 {
+            let record = local_record(&format!("race-{round}"));
+            let hash = record.identity_hash.clone();
+            store
+                .create(record.clone())
+                .await
+                .unwrap();
+            let write = tokio::spawn(write(store.clone(), record));
+            let origin = tokio::spawn({
+                let store = store.clone();
+                let hash = hash.clone();
+                async move {
+                    store
+                        .set_origin(&hash, IdentityOrigin::Managed)
+                        .await
+                }
+            });
+            write.await.unwrap().unwrap();
+            origin.await.unwrap().unwrap();
+            let stored = store
+                .find_by_hash(&hash)
+                .await
+                .unwrap()
+                .unwrap();
+            if stored.origin != Some(IdentityOrigin::Managed) {
+                lost.push(hash);
+            }
+        }
+        lost
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_update_usage_never_drops_a_concurrent_origin() {
+        let lost = origins_lost_to_concurrent(|store, record| async move {
+            store
+                .update_usage(&record.identity_hash, Some("surface-a".into()))
+                .await
+        })
+        .await;
+        assert!(lost.is_empty(), "origin overwritten by a usage update: {lost:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_external_did_never_drops_a_concurrent_origin() {
+        let lost = origins_lost_to_concurrent(|store, record| async move {
+            store
+                .store_external_did(&record.did, std::collections::HashMap::new(), Some("surface-a".into()), true)
+                .await
+        })
+        .await;
+        assert!(lost.is_empty(), "origin overwritten by an external DID update: {lost:?}");
     }
 
     #[tokio::test]

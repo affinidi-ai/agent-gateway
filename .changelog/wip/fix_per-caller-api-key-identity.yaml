@@ -1,0 +1,93 @@
+branch: fix/per-caller-api-key-identity
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Label a Transit Point's managed identity resolve metrics with the surface name
+      description: >-
+        A Transit Point's outbound request labelled
+        `agent_gateway_managed_identity_resolve_total` and its duration histogram with the
+        surface ID, while every other path used the surface name. It now reports the surface
+        name, so one surface counts under one `channel_id`. Update alerts and dashboards that
+        filter these metrics by a Transit Point surface's ID.
+  fixed:
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: ⭐ Identify each caller by the API key it presents
+      description: >-
+        An inbound Identity set to From API Key gave every caller the DID of one stored key.
+        The caller DID now comes from the API key each request presents: one DID per API Key
+        Provider key, reported to policy as `source_auth`, or one per plain API Key secret,
+        shared by its holders and reported as `unverified`; a secret whose id equals a
+        provider key id shares that key's DID. A failed or revoked key resolves
+        no caller identity. A stored inbound key id is ignored and dropped on save. A key that
+        is also a Managed Agent's key gives its callers that Managed Agent's DID; a surface
+        policy can refuse them by `input.source_auth.key_name`.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Stop asking for an API key on the inbound Identity in the Surface Builder
+      description: >-
+        The inbound Identity's From API Key option shows "Each caller is identified by the API
+        key it presents." instead of a key picker, and Save never sends an inbound key id. Save
+        is blocked unless the first Caller Context method is API Key or API Key Provider. The
+        protected and external Identities keep the key picker.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Give concurrent first requests for one identity the same DID
+      description: >-
+        Concurrent first requests for an identity with no record could each mint a different
+        DID. The identity record is now created only if none exists for its hash, under a lock
+        on that record, so every concurrent first request gets the one stored DID.
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Title-case Identity Binding events in the Audit Log
+      description: >-
+        The Audit Log showed `identity_binding_verified` and `identity_binding_failed` records
+        as lowercase raw names. They now show as Identity Binding Verified and Identity
+        Binding Failed, like the other events.
+  removed: []
+  security:
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Make the presented API key's DID replace any body-asserted caller identity
+      description: >-
+        On a direct request to a surface whose inbound Identity is From API Key, the presented
+        key's DID replaces any identity the request body asserts, so a key holder cannot choose
+        another DID, and policies naming a presentation's DID stop matching. Unless the body
+        asserts the key's own DID, its trust-registry claims (`provider_did`,
+        `trust_registry_did`, `authority_did`, `identity_issuer_did`, `agent_dna` and trust
+        verifications) are dropped, so Trust Check presets that read `input.agent.provider_did`
+        deny. Gateway-plane policy runs before the key resolves and sees none of these. On a
+        `fabric://` target only `access_point.inbound_policy` sees the key's DID. Fabric
+        receive does not read this mode.
+  breaking:
+    - timestamp: '2026-11-02T00:00:00Z'
+      title: Fail closed when an inbound From API Key caller does not use an API key
+      description: >-
+        An inbound From API Key Identity whose first Caller Context method is not API Key or
+        API Key Provider gave callers the stored key's DID; it now returns 500 with a fixed
+        body. Find such surfaces through `agent_gateway_managed_identity_resolve_total` with
+        `mode="from_api_key"` and `result` `api_key_unavailable`. Saving one, on the surface
+        or an enabled variant, is refused with 400, as is combining it with
+        `mcp_http.authorization`, or a From API Key Identity on the protected, external or a
+        Transit Point slot without a key id; a stored one answers a fixed 500 (`result`
+        `api_key_id_missing`). A missing VC issuer or a failed DID issuance
+        still resolves no caller identity and leaves the decision to policy.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Give each API key its own DID, so rules tied to the shared DID stop matching
+      description: >-
+        On an API Key Provider surface, only callers presenting the stored key keep its DID;
+        every other key gets its own. On a plain API Key surface, callers get the DID of the
+        Caller Context secret id. That DID is new on every surface made in the dashboard,
+        whose picker stored a provider key id, never a secret id. Policies, Trust Check
+        entries and Transit Point OAuth grants naming an old DID stop matching, and the
+        Transit token `sub` and Workload Binding `userIdentity.id` are per key. Re-grant or
+        update rules for the affected keys.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Refuse From API Key on an MCP proxy:// surface when it is saved again
+      description: >-
+        The MCP Proxy request path never resolves the caller's key, so saving an MCP surface
+        with a `proxy://` target and an inbound From API Key Identity is refused with 400. A
+        stored surface keeps loading and serves its callers with no caller identity, and it
+        cannot be saved until its inbound Identity changes.
+    - timestamp: '2026-10-31T00:00:00Z'
+      title: Drop downgrade support for surfaces saved without an inbound key id
+      description: >-
+        A surface saved with an inbound From API Key Identity has no stored key id, which
+        older binaries require, so they skip it at load. Downgrading after re-saving such a
+        surface is not supported.
