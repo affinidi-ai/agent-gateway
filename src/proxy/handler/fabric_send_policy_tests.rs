@@ -7,8 +7,8 @@ use serde_json::json;
 
 use crate::config::agent_surface::AgentSurface;
 
-/// A surface on a `fabric://` Target, connected to its peer gateway, whose surface policy
-/// denies every request.
+/// A surface on a `fabric://` Target, connected to a peer gateway that never answers, whose
+/// surface policy denies every request: a request the policy lets through fails with `502`.
 async fn denying_router() -> (crate::state::MultiSurfaceProxyState, [tempfile::TempDir; 2]) {
     let directory = tempfile::tempdir().unwrap();
     let peer = crate::gateways::types::Gateway::new(
@@ -95,10 +95,12 @@ async fn a_discovery_read_is_not_refused_by_the_sending_gateways_surface_policy(
     for (method, path) in [
         (axum::http::Method::GET, "/a2a/x/agent.json"),
         (axum::http::Method::HEAD, "/a2a/x/agent-card.json"),
+        (axum::http::Method::HEAD, "/a2a/x/agent.json"),
         (axum::http::Method::GET, "/a2a/x/discovery"),
+        (axum::http::Method::GET, "/a2a/.well-known/ucp"),
     ] {
         let (router, _policies) = denying_router().await;
         let (status, _) = super::variant_routing_tests::send_method(router, method.clone(), path).await;
-        assert_ne!(status, axum::http::StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{method} {path}");
     }
 }
