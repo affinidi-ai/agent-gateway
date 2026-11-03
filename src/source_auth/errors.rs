@@ -210,6 +210,7 @@ pub fn access_point_unavailable(
 pub enum NotReadyReason {
     NoSourceAuthentication,
     ProviderKeyTenant,
+    ApiKeyStoreUnavailable,
 }
 
 impl NotReadyReason {
@@ -217,6 +218,7 @@ impl NotReadyReason {
         match self {
             Self::NoSourceAuthentication => "no source authentication",
             Self::ProviderKeyTenant => crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
+            Self::ApiKeyStoreUnavailable => crate::identity::provider_key_gate::API_KEY_STORE_UNAVAILABLE,
         }
     }
 
@@ -229,7 +231,6 @@ impl NotReadyReason {
         crate::identity::provider_key_gate::gate()
             .refuses(surface)
             .await
-            .then_some(Self::ProviderKeyTenant)
     }
 }
 

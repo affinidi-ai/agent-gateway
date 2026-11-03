@@ -80,6 +80,15 @@ impl Gate {
         isolation: RuleMode,
         key_store: bool,
     ) -> Self {
+        Self::start_with(isolation, key_store, 0).await
+    }
+
+    /// [`Self::start`] with the stores' `cache_refresh_interval_secs`.
+    async fn start_with(
+        isolation: RuleMode,
+        key_store: bool,
+        cache_refresh_interval_secs: u64,
+    ) -> Self {
         let mock = MockServer::start_with_response(
             json!({"jsonrpc": "2.0", "id": "a2a-1", "result": {"kind": "message", "messageId": "r-1", "role": "agent",
                 "parts": []}})
@@ -94,6 +103,7 @@ impl Gate {
                 tenant_credential_isolation: isolation,
                 ..Default::default()
             };
+            bootstrap.cache_refresh_interval_secs = cache_refresh_interval_secs;
             admin = Some(configure_admin_api(bootstrap));
             let gateway: Value =
                 serde_json::from_slice(&std::fs::read(temp_dir.join("gateway.json")).unwrap()).unwrap();
@@ -221,6 +231,15 @@ impl Gate {
         surface_id: &str,
         edit: impl FnOnce(&mut Value),
     ) {
+        self.rewrite(surface_id, edit);
+        self.reload().await;
+    }
+
+    /// The stored file of `surface_id`.
+    fn stored_path(
+        &self,
+        surface_id: &str,
+    ) -> std::path::PathBuf {
         let paths: Vec<_> = std::fs::read_dir(&self.surfaces_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -229,11 +248,19 @@ impl Gate {
             })
             .collect();
         assert_eq!(paths.len(), 1, "{paths:?}");
-        let path = paths[0].clone();
+        paths[0].clone()
+    }
+
+    /// Rewrites the stored file of `surface_id` as another node sharing the store would.
+    fn rewrite(
+        &self,
+        surface_id: &str,
+        edit: impl FnOnce(&mut Value),
+    ) {
+        let path = self.stored_path(surface_id);
         let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         edit(&mut stored);
         std::fs::write(&path, stored.to_string()).unwrap();
-        self.reload().await;
     }
 
     /// Calls `surface_id` until it answers `status`, as a change read from storage is applied
@@ -360,4 +387,63 @@ async fn without_an_api_key_store_a_surface_naming_a_key_is_not_ready() {
     assert_not_ready(gate.call(NAMES_CROSS).await, "another tenant's key, no store");
     let (status, body) = gate.call("owner-a").await;
     assert_eq!(status, 200, "a surface naming no key is served: {body}");
+}
+
+/// Runs `flow` in a child test process, since the cache refresh interval it sets is
+/// process-wide and would make every other gateway in this process poll its storage.
+fn run_in_own_process<F: std::future::Future<Output = ()>>(flow: impl FnOnce() -> F) {
+    if std::env::var_os("ATG_PROVIDER_KEY_GATE_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_PROVIDER_KEY_GATE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {test_name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(flow()));
+}
+
+#[test]
+fn a_change_another_node_writes_is_applied_through_the_refresh_scan_and_a_deleted_surface_forgotten() {
+    run_in_own_process(refresh_scan_flow);
+}
+
+async fn refresh_scan_flow() {
+    crate::storage::filesystem::set_cache_refresh_interval_secs(1);
+    let gate = Gate::start_with(RuleMode::Enforce, true, 1).await;
+    let (status, body) = gate.call(NAMES_OWN).await;
+    assert_eq!(status, 200, "{body}");
+
+    gate.rewrite(NAMES_OWN, |stored| {
+        stored["identity_slots"]["external"]["api_key_id"] = json!(KEY_B);
+    });
+    assert_not_ready(
+        gate.call_until(NAMES_OWN, 503)
+            .await,
+        "rewritten to another tenant's key by another node",
+    );
+    let verdicts = gate.h.provider_key_gate();
+    assert!(verdicts.has_verdict(NAMES_OWN));
+    assert_eq!(gate.status(NAMES_OWN).await["not_ready_reason"], "provider_key_tenant");
+
+    std::fs::remove_file(gate.stored_path(NAMES_OWN)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while verdicts.has_verdict(NAMES_OWN) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!verdicts.has_verdict(NAMES_OWN), "a deleted surface's verdict is dropped");
 }

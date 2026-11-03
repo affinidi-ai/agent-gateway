@@ -9129,10 +9129,14 @@ mod tests {
 
     #[test]
     fn test_write_body_sent_back_from_a_response_loses_only_its_access_point_status() {
-        let mut sent = serde_json::json!({"name": "saved", "access_point_status": "ready"});
+        let mut sent = serde_json::json!({"name": "saved", "access_point_status": "ready",
+            "not_ready_reason": "provider_key_tenant"});
         assert!(drop_access_point_status(&mut sent));
         assert_eq!(sent, serde_json::json!({"name": "saved"}));
         assert!(!drop_access_point_status(&mut sent));
+        let mut reason_only = serde_json::json!({"name": "saved", "not_ready_reason": "api_key_store_unavailable"});
+        assert!(drop_access_point_status(&mut reason_only));
+        assert_eq!(reason_only, serde_json::json!({"name": "saved"}));
         let mut not_an_object = serde_json::json!(["access_point_status"]);
         assert!(!drop_access_point_status(&mut not_an_object));
     }
