@@ -62,6 +62,48 @@ describe('access-token tenant scope helpers', () => {
     }
   });
 
+  it('accepts every resource kind the backend names, the delegation vault included', () => {
+    const kinds = [
+      'secrets',
+      'certificates',
+      'api-keys',
+      'surfaces',
+      'gateways',
+      'connection-points',
+      'mediators',
+      'mcp-proxies',
+      'a2a-proxies',
+      'trust-registries',
+      'issuers',
+      'authorities',
+      'integrations',
+      'policy-definitions',
+      'surface-templates',
+      'credential-providers',
+      'jwt-verification-strategies',
+      'sts-clients',
+      'delegation-vault',
+    ];
+    for (const kind of kinds) {
+      expect(
+        validateScopeConfig(`TENANT:\${x-external-account}:(?:secrets:demo-.*|${kind}:.*)`, [
+          header,
+        ])
+      ).toEqual([]);
+    }
+    expect(
+      validateScopeConfig(
+        'TENANT:${x-external-account}:(?:credential-providers:.*|delegation-vault:boris-.*)',
+        [header]
+      )
+    ).toEqual([]);
+    expect(
+      validateScopeConfig('TENANT:${x-external-account}:(?:secrets:.*|delegation-vaults:.*)', [
+        header,
+      ]).length
+    ).toBeGreaterThan(0);
+  });
+
   it('builds and matches the canonical UUID resource target', () => {
     const preview = evaluateScopePreview(
       'TENANT:${x-external-account}:gateways:.*',

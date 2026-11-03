@@ -1,0 +1,17 @@
+branch: fix/access-token-delegation-vault-kind
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Let the access token form name the delegation vault in a resource pattern
+      description: >-
+        The access token form refused a resource pattern naming `delegation-vault` with "Every
+        resource selector must start with a known resource kind followed by ':'", although the
+        backend accepts it. The dashboard kept its own list of resource kinds, which did not
+        include the delegation vault, so a token that confines the connect API and grants to a
+        tenant's surfaces (`delegation-vault:<surface id>`) could not be made from the form. The
+        list now matches the backend's, and a test keeps every kind the backend names accepted.
+  removed: []
+  security: []
+  breaking: []
