@@ -54,11 +54,18 @@ const TYPE_OPTIONS: ExtractionTypeOption[] = [
   { value: 'from_mtls', label: 'From mTLS certificate', disabled: true },
 ];
 
-const typeOptionsForPlacement = (isTransitPointIdentity: boolean): ExtractionTypeOption[] =>
+const typeOptionsForPlacement = (
+  isTransitPointIdentity: boolean,
+  isProtectedIdentity: boolean
+): ExtractionTypeOption[] =>
   TYPE_OPTIONS.map(option => ({
     ...option,
     disabled:
-      option.disabled || (isTransitPointIdentity && option.value !== 'from_payload') || undefined,
+      option.disabled ||
+      (isTransitPointIdentity && option.value !== 'from_payload') ||
+      // MA → AP response leg: no caller API key identifies the Managed Agent.
+      (isProtectedIdentity && option.value === 'from_api_key') ||
+      undefined,
   }));
 
 const isSelectableExtractionType = (
@@ -212,7 +219,13 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const identityProtocol = parentTransitProtocol ?? protocol;
   const isA2aLikeProtocol = identityProtocol === 'a2a' || identityProtocol === 'ap2';
   const isTransitPointIdentity = parentTransitProtocol !== null;
-  const extractionTypeOptions = typeOptionsForPlacement(isTransitPointIdentity);
+  const isProtectedIdentity =
+    node.slotId === 'response:identity-protected' ||
+    (node.slotId === 'response:identity' && node.id === 'identity-protected');
+  const extractionTypeOptions = typeOptionsForPlacement(
+    isTransitPointIdentity,
+    isProtectedIdentity
+  );
   const isInboundA2aIdentity =
     node.slotId === 'request:identity-inbound' && (protocol === 'a2a' || protocol === 'ap2');
   const isTransitPointA2aIdentity =
