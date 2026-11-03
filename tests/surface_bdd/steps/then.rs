@@ -2957,8 +2957,8 @@ fn assert_actor_received_header(
     expected_value: &str,
 ) {
     let request = get_observed_request_for_actor(world, actor_name, expected_kind);
-    assert_collaborator_header_value(
-        &request.headers,
+    crate::bdd_support::collaborators::assert_single_header_value(
+        request,
         header_name,
         expected_value,
         &format!("{expected_kind:?} '{}'", actor_name),

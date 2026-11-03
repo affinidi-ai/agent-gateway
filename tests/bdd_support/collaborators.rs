@@ -43,6 +43,22 @@ pub fn assert_header_value(
     assert_eq!(actual, expected_value, "{context} header '{header}' value mismatch");
 }
 
+/// The request carried `header` exactly once, with `expected_value`, so a second copy
+/// a caller forged next to the gateway's own cannot pass unseen.
+pub fn assert_single_header_value(
+    request: &ReceivedRequest,
+    header: &str,
+    expected_value: &str,
+    context: &str,
+) {
+    assert_eq!(
+        request.values_of_header(header),
+        [expected_value],
+        "{context} must carry header '{header}' exactly once with value {expected_value:?}; headers: {:?}",
+        request.header_values
+    );
+}
+
 pub fn assert_header_absent(
     headers: &HashMap<String, String>,
     header: &str,
@@ -150,6 +166,10 @@ mod tests {
         ReceivedRequest {
             method: "POST".to_string(),
             headers: HashMap::from([("content-type".to_string(), "application/json; charset=utf-8".to_string())]),
+            header_values: HashMap::from([(
+                "content-type".to_string(),
+                vec!["application/json; charset=utf-8".to_string()],
+            )]),
             raw_body: r#"{"ok":true}"#.to_string(),
             content_type: Some("application/json; charset=utf-8".to_string()),
             path_and_query: "/example".to_string(),
@@ -169,6 +189,27 @@ mod tests {
         let request = request();
 
         super::assert_header_value(&request.headers, "Content-Type", "application/json; charset=utf-8", "request");
+    }
+
+    #[test]
+    fn single_header_value_accepts_one_matching_value_in_any_case() {
+        let request = request();
+
+        super::assert_single_header_value(&request, "Content-Type", "application/json; charset=utf-8", "request");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly once")]
+    fn single_header_value_refuses_a_duplicate_of_the_expected_value() {
+        let request = ReceivedRequest {
+            header_values: HashMap::from([(
+                "x-target-api-key".to_string(),
+                vec!["forged".to_string(), "bdd-target-secret".to_string()],
+            )]),
+            ..request()
+        };
+
+        super::assert_single_header_value(&request, "x-target-api-key", "bdd-target-secret", "request");
     }
 
     #[test]

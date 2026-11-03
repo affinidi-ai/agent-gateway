@@ -252,8 +252,8 @@ pub async fn request_at_path_carried_header(
     expected_value: String,
 ) {
     let request = only_request_matching(world, &target_name, &method, &path).await;
-    assert_header_value(
-        &request.headers,
+    crate::bdd_support::collaborators::assert_single_header_value(
+        &request,
         &header,
         &expected_value,
         &format!("{method} {path} to target collaborator '{target_name}'"),
