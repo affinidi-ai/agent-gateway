@@ -30,4 +30,5 @@ changes:
         Creating, updating or validating an oauth2_jwt_bearer credential provider without
         jwt_subject now answers 400, and so does any update of a stored provider that has none,
         a signing key rotation included, until the request names one. Without domain-wide
-        delegation, a Google service account's subject is its own client_email.
+        delegation, a Google service account's subject is its own client_email. The dashboard's
+        credential provider editor marks Subject as required and refuses to save without it.

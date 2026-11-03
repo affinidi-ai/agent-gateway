@@ -108,6 +108,9 @@ export function missingProviderField(form: ProviderFormValues): string | null {
   if (fields.jwtIssuer && !form.jwt_issuer.trim()) {
     return 'Issuer is required for JWT Bearer providers.';
   }
+  if (fields.jwtIssuer && !form.jwt_subject.trim()) {
+    return 'Subject is required for JWT Bearer providers.';
+  }
   if (fields.jwt && !form.jwt_signing_key_secret_ref) {
     return 'Signing key secret is required.';
   }

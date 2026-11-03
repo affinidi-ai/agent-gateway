@@ -645,8 +645,8 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 `EditCredentialProviderPage/credentialProviderForm.ts` decides which inputs a type uses
 (`providerTypeFields`), the first missing required field, and the request fields.
 
-- **JWT Bearer** asks for Token Endpoint, Issuer, Signing Key, and optionally Key ID, Audience
-  and Subject, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
+- **JWT Bearer** asks for Token Endpoint, Issuer, Subject, Signing Key, and optionally Key ID and
+  Audience, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
   Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
   secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
