@@ -9607,7 +9607,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
         handler_invocation_id,
         addr,
         req.method(),
-        req.uri().path()
+        loggable::untrusted(&loggable::path(req.uri().path()))
     );
 
     // Extract path and query before consuming req
@@ -9617,7 +9617,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
         .query()
         .map(|q| q.to_string());
 
-    debug!("Multi-channel handler received request: method={} path={}", req.method(), path);
+    debug!(
+        "Multi-channel handler received request: method={} path={}",
+        req.method(),
+        loggable::untrusted(&loggable::path(&path))
+    );
 
     // Find the matching channel and parse any `$alias` suffix attached to its route.
     // URL grammar: `/route[$alias][/rest]`.
@@ -9811,7 +9815,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
             }
         }
         None => {
-            warn!("No surface route matches path {}", loggable::untrusted(&path));
+            warn!("No surface route matches path {}", loggable::untrusted(&loggable::path(&path)));
             crate::audit::request_events::request_rejected(
                 &crate::audit::request_events::RequestFacts::unroutable(),
                 crate::audit::request_events::RejectionStage::Routing,
@@ -22231,7 +22235,7 @@ allow if {
             .collect();
         assert_eq!(misses.len(), 1, "{text}");
         assert!(misses[0].contains(&loggable::untrusted(&format!("/unknown/{tail}"))), "{}", misses[0]);
-        assert!(!misses[0].contains(&tail), "{}", misses[0]);
+        assert!(!text.contains(&tail), "a log holds the whole path: {text}");
         assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
     }
 

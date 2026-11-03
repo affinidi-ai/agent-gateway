@@ -2493,9 +2493,11 @@ pub(crate) fn should_forward_outbound_request_header(
 
 /// Whether `name` is a header a proxy sets to tell the next hop who connected to
 /// it, for which host and over what: `Forwarded`, `X-Real-IP` and every
-/// `X-Forwarded-*` header.
+/// `X-Forwarded-*` header, also spelled with `_` for `-`, which CGI-style servers
+/// read as the same header.
 fn is_proxy_forwarding_header(name: &str) -> bool {
     const X_FORWARDED: &str = "x-forwarded-";
+    let name = name.replace('_', "-");
     name.eq_ignore_ascii_case("forwarded")
         || name.eq_ignore_ascii_case("x-real-ip")
         || name
@@ -10951,6 +10953,9 @@ mod tests {
             "forwarded",
             "Forwarded",
             "x-real-ip",
+            "X-Forwarded_For",
+            "x_forwarded_host",
+            "X-Real_IP",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
@@ -19316,6 +19321,9 @@ mod tests {
             ("authorization", "Bearer agent-supplied-token"),
             ("x-vendor-key", "agent-supplied-key"),
             ("cookie", "agent_session=1"),
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x_forwarded_host", "agent.example"),
+            ("forwarded", "for=203.0.113.9"),
         ] {
             ctx.original_headers
                 .insert(name, HeaderValue::from_static(value));
@@ -19324,7 +19332,7 @@ mod tests {
     }
 
     /// A Transit Point context over [`delegation_state`] whose agent sends its
-    /// own credential headers and `accept`, with `delegated` resolved for it and
+    /// own credential and forwarding headers and `accept`, with `delegated` resolved for it and
     /// a `target_auth` static key under `target_auth_header`, for `method` and
     /// `path`.
     async fn credential_header_case(
@@ -19644,7 +19652,9 @@ mod tests {
             let sent = received.last().unwrap();
             assert_eq!(header_values(sent, "authorization"), authorization, "{alias}: {sent:?}");
             assert_eq!(header_values(sent, "x-vendor-key"), vendor_key, "{alias}: {sent:?}");
-            assert!(header_values(sent, "cookie").is_empty(), "{alias}: {sent:?}");
+            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded"] {
+                assert!(header_values(sent, withheld).is_empty(), "{alias} sent {withheld}: {sent:?}");
+            }
         }
         assert_eq!(target.received().len(), 3);
     }

@@ -10,16 +10,17 @@ changes:
       description: >-
         A request to a path no surface serves, which needs no authentication, wrote one warning
         per surface on the listener, naming every tenant's surfaces and routes, so anyone reading
-        the log learned them and any caller could flood the log. It now writes one warning with
-        the path escaped and cut to 256 characters.
+        the log learned them and any caller could flood the log. It now writes one warning, and
+        that line and the two the gateway logs before routing carry the request path escaped and
+        cut to 256 characters.
     - timestamp: '2026-11-03T14:10:00Z'
       title: Stop Transit Points passing a caller's X-Forwarded headers to the target
       description: >-
         A Transit Point forwarded its caller's X-Forwarded-For, X-Forwarded-Host,
         X-Forwarded-Proto and Forwarded headers to its target as if the gateway had set them, so
         a target trusting the gateway as its proxy took the caller's claims about its address,
-        host and scheme. The caller's Forwarded, X-Real-IP and X-Forwarded-* headers are now
-        dropped, over HTTP and Fabric.
+        host and scheme. The caller's Forwarded, X-Real-IP and X-Forwarded-* headers, also when
+        spelled with underscores, are now dropped, over HTTP and Fabric.
     - timestamp: '2026-11-03T14:00:00Z'
       title: Stop listeners with different IPv6 external URLs counting as one host
       description: >-
@@ -33,6 +34,8 @@ changes:
       description: >-
         The SSRF checks on target, webhook, OAuth and JWKS URLs, and on the addresses their hosts
         resolve to, decoded only the IPv4-mapped form of an IPv6 address. A 6to4 (2002::/16) or
-        NAT64 (64:ff9b::/96) address carrying a cloud metadata, loopback or RFC 1918 IPv4 address
-        passed as a public one. Those forms are now checked as the IPv4 address they carry.
+        NAT64 (64:ff9b::/96 or 64:ff9b:1::/96) address carrying a cloud metadata, loopback or
+        RFC 1918 IPv4 address passed as a public one. Those forms are now checked as the IPv4
+        address they carry, and webhook URLs also refuse the NAT64 local-use prefix
+        64:ff9b:1::/48.
   breaking: []

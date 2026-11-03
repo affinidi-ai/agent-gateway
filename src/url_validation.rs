@@ -39,12 +39,13 @@ fn is_cloud_metadata_v4(ip: std::net::Ipv4Addr) -> bool {
 }
 
 /// The IPv4 address an IPv6 address carries in its IPv4-mapped (`::ffff:0:0/96`),
-/// 6to4 (`2002::/16`) or NAT64 well-known prefix (`64:ff9b::/96`) form. The
-/// classifiers below treat such an address like the IPv4 address it carries.
+/// 6to4 (`2002::/16`) or NAT64 form: the well-known prefix (`64:ff9b::/96`), or
+/// a `/96` of the local-use prefix (`64:ff9b:1::/96`). The classifiers below treat
+/// such an address like the IPv4 address it carries.
 fn embedded_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     let [_, _, a, b, c, d, .., w, x, y, z] = ip.octets();
     match ip.segments() {
-        [0, 0, 0, 0, 0, 0xffff, ..] | [0x64, 0xff9b, 0, 0, 0, 0, ..] => Some(std::net::Ipv4Addr::new(w, x, y, z)),
+        [0, 0, 0, 0, 0, 0xffff, ..] | [0x64, 0xff9b, 0 | 1, 0, 0, 0, ..] => Some(std::net::Ipv4Addr::new(w, x, y, z)),
         [0x2002, ..] => Some(std::net::Ipv4Addr::new(a, b, c, d)),
         _ => None,
     }
@@ -410,6 +411,8 @@ fn is_private_or_link_local_v4(ip: std::net::Ipv4Addr) -> bool {
 /// reachable from a webhook-style outbound call:
 /// - Unique-local (fc00::/7)
 /// - Link-local (fe80::/10)
+/// - The NAT64 local-use prefix (64:ff9b:1::/48), which translates only
+///   non-global IPv4 addresses
 /// - Private/link-local IPv4 in a form [`embedded_ipv4`] decodes
 fn is_private_or_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
     let [a, b, ..] = ip.octets();
@@ -419,6 +422,9 @@ fn is_private_or_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
     }
     // fe80::/10 (link-local)
     if a == 0xfe && (b & 0xc0) == 0x80 {
+        return true;
+    }
+    if matches!(ip.segments(), [0x64, 0xff9b, 1, ..]) {
         return true;
     }
     embedded_ipv4(ip).is_some_and(is_private_or_link_local_v4)
@@ -677,7 +683,8 @@ mod tests {
         assert_eq!(decode("2002:a00:1:5::9"), v4(10, 0, 0, 1));
         assert_eq!(decode("64:ff9b::a9fe:a9fe"), v4(169, 254, 169, 254));
         assert_eq!(decode("64:ff9b::c0a8:101"), v4(192, 168, 1, 1));
-        for ip in ["2001:db8::a9fe:a9fe", "64:ff9b:1::a9fe:a9fe", "2003:a9fe:a9fe::1", "::1", "fe80::1"] {
+        assert_eq!(decode("64:ff9b:1::a9fe:a9fe"), v4(169, 254, 169, 254));
+        for ip in ["2001:db8::a9fe:a9fe", "64:ff9b:1:1::a9fe:a9fe", "2003:a9fe:a9fe::1", "::1", "fe80::1"] {
             assert_eq!(decode(ip), None, "{ip} carries no IPv4 address");
         }
     }
@@ -689,6 +696,7 @@ mod tests {
         must_block("http://[64:ff9b::6464:64c8]/");
         must_block("http://[2002:7f00:1::]/");
         must_block("http://[64:ff9b::7f00:1]/");
+        must_block("http://[64:ff9b:1::a9fe:a9fe]/latest/meta-data/");
         forwarding_must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
         forwarding_must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
     }
@@ -1076,6 +1084,8 @@ mod tests {
         webhook_must_block("http://[64:ff9b::ac10:1]/hook");
         webhook_must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
         webhook_must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
+        webhook_must_block("http://[64:ff9b:1::a00:1]/hook");
+        webhook_must_block("http://[64:ff9b:1:ab::102:304]/hook");
         webhook_must_allow("http://[2002:102:304::1]/hook");
         webhook_must_allow("http://[64:ff9b::102:304]/hook");
     }
