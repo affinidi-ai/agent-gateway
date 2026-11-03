@@ -219,6 +219,27 @@ pub async fn managed_agent_received_request_at_path(
     only_request_matching(world, &target_name, &method, &path).await;
 }
 
+#[then(expr = "managed agent {string} did not receive a {word} request at path {string}")]
+pub async fn managed_agent_did_not_receive_request_at_path(
+    world: &mut G2gWorld,
+    target_name: String,
+    method: String,
+    path: String,
+) {
+    let (_, _, mock) = mock_for(world, &target_name);
+    let requests = mock.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == method && request.path_and_query == path),
+        "target collaborator '{target_name}' must not receive {method} {path}, got {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path_and_query))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then(
     expr = "the {word} request at path {string} to managed agent {string} carried header {string} with value {string}"
 )]

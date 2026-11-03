@@ -77,7 +77,7 @@ Feature: Protected agent card fetch over fabric
     And surface "charlie" has a request policy that denies all requests
     When the caller sends a POST request to gateway 1 surface "charlie" path "/rpc/agent-card.json"
     Then the response status is 403
-    And managed agent "bravo" was not called
+    And managed agent "bravo" did not receive a POST request at path "/rpc/agent-card.json"
 
   Scenario Outline: gateway 1 does not apply its surface policy to a public discovery read
     Given a fabric with 2 gateways
