@@ -200,6 +200,32 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
     assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1]);
 }
 
+/// With the forwarding JWT method primary, a request carrying a JWT and an API
+/// key selects that method but is ambiguous, so its JWT, verified by no method,
+/// stays at the gateway; a JWT alone is still forwarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ambiguous_request_forwards_no_jwt_even_when_the_forwarding_method_is_primary() {
+    let fixture = JwksFixture::start().await;
+    let target = RecordingTarget::start(StatusCode::OK, &[]).await;
+    let h =
+        start_gateway(&fixture, &target, |strategy_id| json!([jwt_method(strategy_id, true), api_key_method()]), None)
+            .await;
+    let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
+
+    assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200);
+    assert_eq!(send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await, 200);
+
+    let received = target.received();
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0]["authorization"], jwt.as_str(), "the verified JWT is forwarded");
+    assert!(
+        !received[1].contains_key("authorization"),
+        "an ambiguous request's JWT is verified by no method and stays at the gateway: {:?}",
+        received[1].keys()
+    );
+    assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1].keys());
+}
+
 /// Policy sees the method that verified each caller: on one two-method
 /// surface a policy admitting only API key callers lets the API key caller
 /// through and refuses the JWT caller, though both authenticated.

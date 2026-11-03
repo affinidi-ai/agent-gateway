@@ -3367,8 +3367,8 @@ async fn fabric_multi_method_flow() {
 
     let jwt = send("multi", "/multi", &[("authorization", token("any"))]).await;
     assert_eq!(jwt["status"], 200, "a JWT caller is verified by the JWT method: {jwt}");
-    let api_key = send("multi", "/multi", &[key()]).await;
-    assert_eq!(api_key["status"], 200, "an API key caller is verified by the API key method: {api_key}");
+    let key_caller = send("multi", "/multi", &[key()]).await;
+    assert_eq!(key_caller["status"], 200, "an API key caller is verified by the API key method: {key_caller}");
     let payment = send("multi", "/multi", &[key(), ("authorization", "Payment cred".to_string())]).await;
     assert_eq!(payment["status"], 200, "an Authorization value in another scheme is not the JWT: {payment}");
     assert_eq!(reached(), 3);
