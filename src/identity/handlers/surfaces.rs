@@ -1112,6 +1112,7 @@ async fn save_warnings(
         .chain(fabric_caller_delegation_warnings(surface, &issuers))
         .chain(inherited_external_point_warnings(surface))
         .chain(inherited_target_binding_warnings(surface))
+        .chain(unbound_vendor_view_warnings(surface))
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
@@ -1498,6 +1499,70 @@ fn inherited_external_point_warnings(surface: &AgentSurface) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// Each enabled view of `surface`, its own route or a variant, that sends its
+/// requests to the origin the Access Point Target's binding with
+/// `consent_mode: external` sends its grant to, without that binding or a
+/// credential of its own for the vendor (`target.auth`, another binding or a
+/// forwarded caller credential): such as a variant copied from the one holding
+/// the binding and then enabled. Its callers' own headers reach the vendor
+/// with no grant.
+fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
+    let origin = |endpoint: &str| {
+        url::Url::parse(endpoint)
+            .ok()
+            .map(|url| url.origin())
+            .filter(url::Origin::is_tuple)
+    };
+    let bound: Vec<_> = super::surface_grants::served_external_bindings(surface)
+        .iter()
+        .filter(|binding| binding.hop == crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP)
+        .filter_map(|binding| origin(&binding.target_endpoint))
+        .collect();
+    if bound.is_empty() {
+        return Vec::new();
+    }
+    surface_views(surface)
+        .into_iter()
+        .filter(|(variant, _)| {
+            variant
+                .as_deref()
+                .is_none_or(|alias| {
+                    surface
+                        .variants
+                        .iter()
+                        .any(|candidate| candidate.alias == alias && candidate.enabled)
+                })
+        })
+        .filter(|(_, view)| {
+            view.target_external_credentials()
+                .is_none()
+                && view
+                    .target_auth()
+                    .is_none()
+                && view
+                    .outbound_credentials
+                    .is_empty()
+                && !view
+                    .source_auth()
+                    .is_some_and(|auth| {
+                        matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header)
+                    })
+                && origin(&view.target.endpoint).is_some_and(|view_origin| bound.contains(&view_origin))
+        })
+        .map(|(variant, view)| {
+            let named =
+                variant.map_or_else(|| "The surface's own route".to_string(), |alias| format!("Variant '{alias}'"));
+            format!(
+                "{named} sends its Target requests to {}, where the Access Point Target's binding with \
+                 consent_mode external sends its grant, without that binding or a credential of its own: the vendor \
+                 is sent its callers' own headers and no grant; give it another Target, a credential of its own \
+                 (target.auth, another binding or forward_header), or the binding",
+                view.target.endpoint
+            )
+        })
+        .collect()
 }
 
 /// Each enabled variant that keeps the surface's `outbound_credentials`, and
@@ -4269,7 +4334,7 @@ fn copied_target_binding_warning(alias: &str) -> String {
     format!(
         "Variant '{alias}' is created disabled: the variant it was copied from holds the Access Point Target's \
          consent_mode external binding, which is kept in one place and not copied, so this variant would send its \
-         Target requests without the grant; give it a Target or a binding of its own before enabling it"
+         Target requests without the grant; give it another Target or a credential of its own before enabling it"
     )
 }
 
@@ -5709,6 +5774,81 @@ mod validation_tests {
             ),
         ] {
             assert!(inherited_target_binding_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
+    /// While the Access Point Target's binding is served, a save warns of each
+    /// enabled view that sends requests to its vendor's origin without the
+    /// binding or a credential of its own, as an enabled copy of the variant
+    /// holding it does; a disabled one, one at another origin, or one with a
+    /// credential of its own draws no warning.
+    #[test]
+    fn a_save_warns_of_an_enabled_view_that_reaches_the_bound_vendor_without_the_grant() {
+        let external = serde_json::json!([{ "credential_provider_id": "vendor", "consent_mode": "external",
+            "subject": "owner" }]);
+        let surface_with = |base: serde_json::Value, enabled: bool, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "vendor",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp" },
+                "target": { "endpoint": "https://mcp.vendor.example/mcp" },
+                "outbound_credentials": base,
+                "variants": [{ "id": "copy", "alias": "copy", "name": "Copy", "enabled": enabled,
+                    "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let warning = |named: &str| {
+            format!(
+                "{named} sends its Target requests to https://mcp.vendor.example/mcp, where the Access Point \
+                 Target's binding with consent_mode external sends its grant, without that binding or a credential \
+                 of its own: the vendor is sent its callers' own headers and no grant; give it another Target, a \
+                 credential of its own (target.auth, another binding or forward_header), or the binding"
+            )
+        };
+        assert_eq!(
+            unbound_vendor_view_warnings(&surface_with(
+                external.clone(),
+                true,
+                serde_json::json!({ "outbound_credentials": [] })
+            )),
+            vec![warning("Variant 'copy'")],
+            "an enabled variant that drops the binding"
+        );
+        assert_eq!(
+            unbound_vendor_view_warnings(&surface_with(
+                serde_json::json!([]),
+                true,
+                serde_json::json!({ "outbound_credentials": external.clone() })
+            )),
+            vec![warning("The surface's own route")],
+            "the surface's own route beside a variant that holds it"
+        );
+        for (case, surface) in [
+            (
+                "a disabled variant that drops the binding",
+                surface_with(external.clone(), false, serde_json::json!({ "outbound_credentials": [] })),
+            ),
+            ("a variant that keeps the binding", surface_with(external.clone(), true, serde_json::json!({}))),
+            (
+                "a variant at another origin",
+                surface_with(
+                    external.clone(),
+                    true,
+                    serde_json::json!({ "outbound_credentials": [],
+                        "target": { "endpoint": "https://managed.example/agent" } }),
+                ),
+            ),
+            (
+                "a variant with a credential of its own",
+                surface_with(
+                    external.clone(),
+                    true,
+                    serde_json::json!({ "outbound_credentials": [], "target": { "auth": { "method": {
+                        "static_secret": { "secret_id": "s", "header_name": "X-Api-Key" } } } } }),
+                ),
+            ),
+        ] {
+            assert!(unbound_vendor_view_warnings(&surface).is_empty(), "{case}");
         }
     }
 

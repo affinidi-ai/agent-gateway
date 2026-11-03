@@ -1,0 +1,19 @@
+branch: fix/warn-on-unbound-vendor-view
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-03T16:00:00Z'
+      title: Warn when a view reaches a bound Target's vendor without its grant
+      description: >-
+        While an Access Point Target's consent_mode external binding is served, a save, such as
+        enabling a variant, answers with a Warning header for each enabled view that sends
+        requests to that Target's origin without the binding or a credential of its own
+        (target.auth, another binding or forward_header). Such a view, a variant copied from the
+        one holding the binding and then enabled, one with outbound_credentials set to an empty
+        list, or the surface's own route beside a variant that holds the binding, sends the
+        vendor its callers' own headers and no grant. The dashboard shows the warning in the
+        save-warnings banner. The save itself is not refused.
+  breaking: []
