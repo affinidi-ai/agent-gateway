@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use tracing::{info, warn};
 
-use super::surface_tenancy::collect_surface_reference_keys;
+use super::surface_tenancy::{
+    ProviderKeyIssue, collect_surface_reference_keys, provider_key_owners, provider_key_verdict,
+};
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
@@ -18,6 +20,7 @@ use crate::tenancy::ResourceKind;
 const RULE_TOKEN_ENDPOINT_HTTPS: &str = "token_endpoint_https";
 const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
 const RULE_JWT_SUBJECT: &str = "jwt_subject";
+const RULE_PROVIDER_KEY_TENANT: &str = "provider_key_tenant";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -77,9 +80,19 @@ pub(crate) struct SkippedSurface {
     pub error: String,
 }
 
+/// An API Key Provider key id a stored surface derives a DID from that it may not use, or whose
+/// key or owning surface is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderKeyFinding {
+    pub surface_id: String,
+    pub tenant_id: Option<String>,
+    pub issue: ProviderKeyIssue,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Findings {
     pub breaches: Vec<PolicyBreach>,
+    pub provider_keys: Vec<ProviderKeyFinding>,
     pub skipped: Vec<SkippedSurface>,
 }
 
@@ -87,8 +100,13 @@ pub(crate) fn find_breaches(
     providers: &[CredentialProvider],
     surfaces: &[AgentSurface],
     secret_tenants: &HashMap<&str, Option<&str>>,
+    key_owners: Option<&HashMap<String, Vec<String>>>,
     egress: &TokenEgress,
 ) -> Findings {
+    let surface_tenants: HashMap<&str, Option<&str>> = surfaces
+        .iter()
+        .map(|surface| (surface.surface_id.as_str(), surface.tenant_id.as_deref()))
+        .collect();
     let by_id: HashMap<&str, &CredentialProvider> = providers
         .iter()
         .map(|provider| (provider.id.as_str(), provider))
@@ -116,7 +134,30 @@ pub(crate) fn find_breaches(
         }
     }
     for surface in surfaces {
-        match surface_breaks_isolation(surface, secret_tenants, &by_id) {
+        let verdict = surface_breaks_isolation(surface, secret_tenants, &by_id).and_then(|breaks| {
+            provider_key_verdict(
+                surface,
+                key_owners,
+                &surface_tenants,
+                egress
+                    .policy
+                    .tenant_credential_isolation,
+            )
+            .map(|issues| (breaks, issues))
+        });
+        let breaks = verdict.map(|(breaks, issues)| {
+            findings.provider_keys.extend(
+                issues
+                    .into_iter()
+                    .map(|issue| ProviderKeyFinding {
+                        surface_id: surface.surface_id.clone(),
+                        tenant_id: surface.tenant_id.clone(),
+                        issue,
+                    }),
+            );
+            breaks
+        });
+        match breaks {
             Ok(true) => findings
                 .breaches
                 .push(PolicyBreach {
@@ -176,8 +217,11 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         .iter()
         .map(|secret| (secret.secret_id.as_str(), secret.tenant_id.as_deref()))
         .collect();
+    let key_owners = provider_key_owners(state)
+        .await
+        .ok();
 
-    log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, &egress), policy);
+    log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, key_owners.as_ref(), &egress), policy);
 }
 
 /// The mode a rule runs in; `jwt_subject` has no setting and only warns.
@@ -207,6 +251,18 @@ fn log_findings(
             "Stored configuration breaks a credential policy rule"
         );
     }
+    for finding in &findings.provider_keys {
+        warn!(
+            subject = "surface",
+            id = %finding.surface_id,
+            tenant = finding.tenant_id.as_deref().unwrap_or("appliance"),
+            rule = RULE_PROVIDER_KEY_TENANT,
+            api_key_id = %finding.issue.key_id,
+            issue = finding.issue.kind.as_str(),
+            not_ready = finding.issue.kind.is_breach(),
+            "Stored surface derives a DID from an API key it may not use, or whose key or surface is gone"
+        );
+    }
     for skipped in &findings.skipped {
         warn!(
             id = %skipped.id,
@@ -215,7 +271,11 @@ fn log_findings(
             "Credential policy report could not inspect a surface"
         );
     }
-    if !findings.breaches.is_empty() {
+    if !findings.breaches.is_empty()
+        || !findings
+            .provider_keys
+            .is_empty()
+    {
         return;
     }
     if findings.skipped.is_empty() {
@@ -285,7 +345,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        find_breaches(providers, &[], &secret_tenants, &egress(policy))
+        find_breaches(providers, &[], &secret_tenants, None, &egress(policy))
             .breaches
             .into_iter()
             .map(|breach| (breach.id, breach.rule))
@@ -416,6 +476,7 @@ mod tests {
                     &providers,
                     std::slice::from_ref(surface),
                     &secret_tenants,
+                    None,
                     &egress(CredentialPolicyConfig::default()),
                 )
                 .breaches
@@ -426,12 +487,17 @@ mod tests {
             })
             .collect();
         assert_eq!(reported, vec![true, false, true, false, false, false, true, false]);
-        let breach =
-            find_breaches(&providers, &surfaces[..1], &secret_tenants, &egress(CredentialPolicyConfig::default()))
-                .breaches
-                .into_iter()
-                .find(|breach| breach.subject == "surface")
-                .unwrap();
+        let breach = find_breaches(
+            &providers,
+            &surfaces[..1],
+            &secret_tenants,
+            None,
+            &egress(CredentialPolicyConfig::default()),
+        )
+        .breaches
+        .into_iter()
+        .find(|breach| breach.subject == "surface")
+        .unwrap();
         assert_eq!(breach.id, "s");
         assert_eq!(breach.tenant_id.as_deref(), Some("t1"));
         assert_eq!(breach.rule, RULE_TENANT_CREDENTIAL_ISOLATION);
@@ -458,7 +524,7 @@ mod tests {
             ..Default::default()
         };
         let surfaces = [surface_that_cannot_be_inspected("broken"), healthy];
-        let findings = find_breaches(&[], &surfaces, &secret_tenants, &egress(CredentialPolicyConfig::default()));
+        let findings = find_breaches(&[], &surfaces, &secret_tenants, None, &egress(CredentialPolicyConfig::default()));
         assert_eq!(findings.breaches, vec![]);
         assert_eq!(findings.skipped.len(), 1);
         assert_eq!(findings.skipped[0].id, "broken");
@@ -495,6 +561,7 @@ mod tests {
         log_findings(
             &Findings {
                 breaches: vec![],
+                provider_keys: vec![],
                 skipped: vec![skipped.clone()],
             },
             &policy,
@@ -514,6 +581,7 @@ mod tests {
                     tenant_id: None,
                     rule: RULE_TENANT_CREDENTIAL_ISOLATION,
                 }],
+                provider_keys: vec![],
                 skipped: vec![skipped],
             },
             &policy,
@@ -541,7 +609,7 @@ mod tests {
                 serde_json::from_value(serde_json::json!({"payload": {"key": format!("$SECRET:{secret_id}")}}))
                     .unwrap(),
             );
-            find_breaches(&[], &[surface], &secret_tenants, &egress(CredentialPolicyConfig::default()))
+            find_breaches(&[], &[surface], &secret_tenants, None, &egress(CredentialPolicyConfig::default()))
                 .breaches
                 .iter()
                 .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
@@ -551,5 +619,182 @@ mod tests {
         assert!(!reported(Some("t1"), "S_OWN"));
         assert!(!reported(Some("t1"), "S_GONE"));
         assert!(!reported(None, "S_WIDE"));
+    }
+
+    fn key_surface(
+        id: &str,
+        tenant: Option<&str>,
+        extra: serde_json::Value,
+    ) -> AgentSurface {
+        let mut surface = serde_json::to_value(AgentSurface::default()).unwrap();
+        surface["surface_id"] = serde_json::json!(id);
+        surface["tenant_id"] = serde_json::json!(tenant);
+        for (key, value) in extra.as_object().unwrap() {
+            surface[key] = value.clone();
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    fn naming(
+        id: &str,
+        tenant: Option<&str>,
+        key_id: &str,
+    ) -> AgentSurface {
+        key_surface(
+            id,
+            tenant,
+            serde_json::json!({"identity_slots": {"protected": {"type": "from_api_key", "api_key_id": key_id}}}),
+        )
+    }
+
+    fn legacy_caller(
+        id: &str,
+        tenant: Option<&str>,
+        secret_id: &str,
+        inbound_from_api_key: bool,
+    ) -> AgentSurface {
+        let mut extra = serde_json::json!({"access_point": {
+            "listen_address": "http://localhost:1", "route": "/legacy", "protocol": "a2a",
+            "caller_authentication": {"methods": [{
+                "type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": secret_id
+            }]}
+        }});
+        if inbound_from_api_key {
+            extra["identity_slots"] = serde_json::json!({"inbound": {"type": "from_api_key"}});
+        }
+        key_surface(id, tenant, extra)
+    }
+
+    fn provider_key_findings(
+        naming_surfaces: Vec<AgentSurface>,
+        owners: Option<&HashMap<String, Vec<String>>>,
+        isolation: crate::config::credential_policy::RuleMode,
+    ) -> Vec<(String, &'static str, bool)> {
+        let mut surfaces = vec![
+            key_surface("owner-t1", Some("t1"), serde_json::json!({})),
+            key_surface("owner-t2", Some("t2"), serde_json::json!({})),
+            key_surface("owner-wide", None, serde_json::json!({})),
+        ];
+        surfaces.extend(naming_surfaces);
+        let policy = CredentialPolicyConfig {
+            tenant_credential_isolation: isolation,
+            ..Default::default()
+        };
+        find_breaches(&[], &surfaces, &HashMap::new(), owners, &egress(policy))
+            .provider_keys
+            .into_iter()
+            .map(|finding| (finding.surface_id, finding.issue.kind.as_str(), finding.issue.kind.is_breach()))
+            .collect()
+    }
+
+    fn key_owners() -> HashMap<String, Vec<String>> {
+        [
+            ("atgk_t1", "owner-t1"),
+            ("atgk_t2", "owner-t2"),
+            ("atgk_wide", "owner-wide"),
+            ("atgk_orphan", "deleted-owner"),
+        ]
+        .into_iter()
+        .map(|(key, owner)| (key.to_string(), vec![owner.to_string()]))
+        .collect()
+    }
+
+    #[test]
+    fn a_surface_naming_a_provider_key_it_may_not_use_is_reported_under_its_own_rule() {
+        use crate::config::credential_policy::RuleMode;
+        let owners = key_owners();
+        let surfaces = || {
+            vec![
+                naming("own", Some("t1"), "atgk_t1"),
+                naming("cross", Some("t1"), "atgk_t2"),
+                naming("tenant-key-wide", None, "atgk_t1"),
+                naming("appliance-key", Some("t1"), "atgk_wide"),
+                naming("wide-wide", None, "atgk_wide"),
+                naming("missing-key", Some("t1"), "atgk_gone"),
+                naming("missing-owner", Some("t1"), "atgk_orphan"),
+            ]
+        };
+        let warn = provider_key_findings(surfaces(), Some(&owners), RuleMode::Warn);
+        assert_eq!(
+            warn,
+            vec![
+                ("cross".to_string(), "other_tenant", true),
+                ("tenant-key-wide".to_string(), "other_tenant", true),
+                ("appliance-key".to_string(), "appliance_key", false),
+                ("missing-key".to_string(), "missing_key", false),
+                ("missing-owner".to_string(), "missing_owner", false),
+            ]
+        );
+        let enforce = provider_key_findings(surfaces(), Some(&owners), RuleMode::Enforce);
+        assert_eq!(enforce[2], ("appliance-key".to_string(), "appliance_key", true));
+        assert!(
+            provider_key_findings(vec![naming("own", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_surface_naming_a_provider_key_is_reported_not_ready_while_the_key_store_is_unavailable() {
+        use crate::config::credential_policy::RuleMode;
+        assert_eq!(
+            provider_key_findings(
+                vec![naming("own", Some("t1"), "atgk_t1"), key_surface("plain", Some("t1"), serde_json::json!({}))],
+                None,
+                RuleMode::Warn
+            ),
+            vec![("own".to_string(), "store_unavailable", true)]
+        );
+    }
+
+    #[test]
+    fn a_legacy_caller_secret_shaped_like_another_tenants_key_is_reported() {
+        use crate::config::credential_policy::RuleMode;
+        let owners = key_owners();
+        assert_eq!(
+            provider_key_findings(
+                vec![
+                    legacy_caller("legacy-cross", Some("t1"), "atgk_t2", true),
+                    legacy_caller("legacy-own", Some("t1"), "atgk_t1", true),
+                    legacy_caller("legacy-wide", Some("t1"), "atgk_wide", true),
+                    legacy_caller("legacy-unowned", Some("t1"), "atgk_gone", true),
+                    legacy_caller("legacy-no-identity", Some("t1"), "atgk_t2", false),
+                ],
+                Some(&owners),
+                RuleMode::Enforce
+            ),
+            vec![("legacy-cross".to_string(), "other_tenant", true)]
+        );
+    }
+
+    #[test]
+    fn a_provider_key_finding_logs_its_rule_and_key_id_and_no_secret() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let owners = key_owners();
+        let mut surface = naming("cross", Some("t1"), "atgk_t2");
+        surface.target.auth = Some(TargetAuthConfig {
+            method: TargetAuthMethod::StaticSecret {
+                secret_id: "S_OWN".to_string(),
+                header_name: "Authorization".to_string(),
+                header_format: "{value}".to_string(),
+            },
+            auth_type: None,
+            target_identifier: None,
+            fallback: Default::default(),
+        });
+        let findings = find_breaches(
+            &[],
+            &[key_surface("owner-t2", Some("t2"), serde_json::json!({})), surface],
+            &[("S_OWN", Some("t1"))]
+                .into_iter()
+                .collect(),
+            Some(&owners),
+            &egress(CredentialPolicyConfig::default()),
+        );
+        log_findings(&findings, &CredentialPolicyConfig::default());
+        let text = logs.text();
+        assert!(text.contains(RULE_PROVIDER_KEY_TENANT), "{text}");
+        assert!(text.contains("atgk_t2") && text.contains("other_tenant") && text.contains("cross"), "{text}");
+        assert!(!text.contains("no credential provider or surface breaks a rule"), "{text}");
+        assert!(!text.contains("S_OWN") && !text.contains("atgs_"), "{text}");
     }
 }

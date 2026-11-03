@@ -1664,6 +1664,138 @@ pub(crate) fn collect_provider_key_references(surface: &AgentSurface) -> Result<
     Ok(keys)
 }
 
+/// Why a stored surface's use of an API Key Provider key id is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderKeyIssueKind {
+    /// The key belongs to a surface the surface may not reference: another tenant's, or a
+    /// tenant's key on a surface with no tenant.
+    OtherTenant,
+    /// A tenant surface names the key of a surface with no tenant; a breach only when enforced.
+    ApplianceKey { enforced: bool },
+    /// No key has this id; key ids are never reused, so its DID is no other key's.
+    MissingKey,
+    /// The surface owning the key no longer exists.
+    MissingOwner,
+    /// The API key store is unavailable, so the key's owner cannot be told.
+    StoreUnavailable,
+}
+
+impl ProviderKeyIssueKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OtherTenant => "other_tenant",
+            Self::ApplianceKey { .. } => "appliance_key",
+            Self::MissingKey => "missing_key",
+            Self::MissingOwner => "missing_owner",
+            Self::StoreUnavailable => "store_unavailable",
+        }
+    }
+
+    /// Whether the surface must not serve while it names the key.
+    pub(crate) fn is_breach(self) -> bool {
+        matches!(self, Self::OtherTenant | Self::StoreUnavailable | Self::ApplianceKey { enforced: true })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderKeyIssue {
+    pub key_id: String,
+    pub kind: ProviderKeyIssueKind,
+}
+
+/// Every API Key Provider key id a stored surface derives a DID from that it may not use, or
+/// whose key or owner is gone: the ids [`collect_provider_key_references`] finds, and a Caller
+/// Context API Key `secret_id` shaped like a key id on a view whose inbound Identity is From
+/// API Key, which a secret stored before the prefix was reserved can still carry. Such a secret
+/// is reported only when a key of that id belongs to a surface the surface may not reference.
+/// `owners` is `None` when the API key store is unavailable; `surface_tenants` maps every stored
+/// surface id to its tenant.
+pub(crate) fn provider_key_verdict(
+    surface: &AgentSurface,
+    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    isolation: RuleMode,
+) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
+    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+    let keys = collect_provider_key_references(surface)?;
+    let mut legacy_secrets: Vec<String> = Vec::new();
+    for view in resolved_views(surface)? {
+        if !matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
+            continue;
+        }
+        for method in view
+            .access_point
+            .caller_authentication
+            .iter()
+            .flat_map(|authentication| &authentication.methods)
+        {
+            if let SourceAuthConfig::ApiKey(config) = method
+                && config
+                    .secret_id
+                    .starts_with(crate::api_keys::KEY_ID_PREFIX)
+                && !keys.contains(&config.secret_id)
+            {
+                legacy_secrets.push(config.secret_id.clone());
+            }
+        }
+    }
+    legacy_secrets.sort();
+    legacy_secrets.dedup();
+
+    let tenant_id = surface.tenant_id.as_deref();
+    let mut issues = Vec::new();
+    let mut issue = |key_id: &str, kind| {
+        issues.push(ProviderKeyIssue {
+            key_id: key_id.to_string(),
+            kind,
+        })
+    };
+    let Some(owners) = owners else {
+        for key_id in keys
+            .iter()
+            .chain(&legacy_secrets)
+        {
+            issue(key_id, ProviderKeyIssueKind::StoreUnavailable);
+        }
+        return Ok(issues);
+    };
+    for (key_id, legacy) in keys
+        .iter()
+        .map(|key_id| (key_id, false))
+        .chain(
+            legacy_secrets
+                .iter()
+                .map(|key_id| (key_id, true)),
+        )
+    {
+        let Some(owner_ids) = owners.get(key_id) else {
+            if !legacy {
+                issue(key_id, ProviderKeyIssueKind::MissingKey);
+            }
+            continue;
+        };
+        for owner_id in owner_ids {
+            let Some(owner_tenant) = surface_tenants.get(owner_id.as_str()) else {
+                if !legacy {
+                    issue(key_id, ProviderKeyIssueKind::MissingOwner);
+                }
+                continue;
+            };
+            if !can_reference(tenant_id, *owner_tenant) {
+                issue(key_id, ProviderKeyIssueKind::OtherTenant);
+            } else if !legacy && crate::tenancy::breaks_tenant_isolation(tenant_id, *owner_tenant) {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::ApplianceKey {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(issues)
+}
+
 /// The surfaces owning each API Key Provider key, by key id.
 pub(crate) async fn provider_key_owners(
     state: &IdentityApiState
