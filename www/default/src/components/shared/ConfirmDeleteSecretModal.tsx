@@ -19,9 +19,15 @@ const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
   onCancel,
   onConfirm,
 }) => (
-  <Modal show onHide={onCancel} centered data-testid="confirm-delete-secret-modal">
+  <Modal
+    show
+    onHide={onCancel}
+    centered
+    aria-labelledby="confirm-delete-secret-title"
+    data-testid="confirm-delete-secret-modal"
+  >
     <Modal.Header closeButton>
-      <Modal.Title>Delete secret "{secretName}"?</Modal.Title>
+      <Modal.Title id="confirm-delete-secret-title">Delete secret "{secretName}"?</Modal.Title>
     </Modal.Header>
     <Modal.Body>
       <p>
@@ -35,6 +41,7 @@ const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
         variant="secondary"
         onClick={onCancel}
         disabled={busy}
+        autoFocus
         data-testid="confirm-delete-secret-cancel"
       >
         Cancel

@@ -34,7 +34,14 @@ changes:
         token endpoint's OAuth error code. A request forwarded without the credential because
         the fallback is passthrough is titled Forwarded without Target credential in the warning
         tone instead of Request refused.
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-03T12:30:00Z'
+      title: Stop the dashboard bringing back a Target credential removed through the API
+      description: >-
+        The Surface Builder kept a copy of the Target authentication form fields in the canvas
+        data of a surface, and a later dashboard save rebuilt a credential that had been removed
+        through the API, sending it to a Target that had since changed. The form fields now come
+        only from the stored Target authentication.
   removed:
     - timestamp: '2026-11-02T11:45:38Z'
       title: Remove the OIDC Providers dashboard pages

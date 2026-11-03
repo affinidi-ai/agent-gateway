@@ -1,4 +1,5 @@
 import { registry } from '../index';
+import { buildCanvasBlob } from '../registry';
 import type { SurfaceContext } from '../types';
 import { managedAgentDefinition } from '../managed-agent/definition';
 import {
@@ -427,5 +428,36 @@ describe('lossless Target authentication save', () => {
     });
     expect(none.target.auth).toBeUndefined();
     expect(none.transit.points[0].target_auth).toBeUndefined();
+  });
+
+  it('does not bring back a Target credential that the stored surface no longer has', () => {
+    const first = roundTrip(apiSurface, nodes => {
+      nodes.find(n => n.type === 'target').config.target_auth_header_name = 'X-Edited';
+      const point = nodes.find(n => n.type === 'transit-point-a2a').config;
+      point.auth_type = 'custom_header';
+      point.auth_secret = 's';
+      point.auth_header_name = 'X-Changed';
+      point.auth_header_format = 'Token {value}';
+      point.auth_fallback = 'reject';
+    });
+    expect(first.target.auth).toBeDefined();
+
+    const blob = buildCanvasBlob(registry.nodesFromPayload(first).map(n => ({ ...n })));
+    expect(blob.nodes.length).toBeGreaterThan(0);
+    const moved = {
+      ...first,
+      canvas: blob,
+      target: { ...first.target, endpoint: 'https://new-party.example.com', auth: undefined },
+      transit: {
+        points: first.transit.points.map((point: any) => ({
+          ...point,
+          target_endpoint: 'https://new-partner.example.com',
+          target_auth: undefined,
+        })),
+      },
+    };
+    const saved = registry.buildPayload(makeCtx(registry.nodesFromPayload(moved))) as any;
+    expect(saved.target.auth).toBeUndefined();
+    expect(saved.transit.points[0].target_auth).toBeUndefined();
   });
 });

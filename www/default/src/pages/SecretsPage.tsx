@@ -172,7 +172,7 @@ const SecretsPage: React.FC = () => {
     setDeleteError(null);
     try {
       const response = await apiClient.fetch(
-        `/api/v1/secrets/${secret.id}${force ? '?force=true' : ''}`,
+        `/api/v1/secrets/${encodeURIComponent(secret.id)}${force ? '?force=true' : ''}`,
         { method: 'DELETE' }
       );
 
