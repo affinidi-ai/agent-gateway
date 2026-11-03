@@ -2600,7 +2600,7 @@ pub(crate) fn should_forward_outbound_request_header(
 
 /// The proxy and CDN headers, other than `X-Forwarded-*`, that claim the client's
 /// address, the host it asked for or the scheme it used.
-const PROXY_FORWARDING_HEADERS: [&str; 14] = [
+const PROXY_FORWARDING_HEADERS: &[&str] = &[
     "forwarded",
     "x-real-ip",
     "true-client-ip",
