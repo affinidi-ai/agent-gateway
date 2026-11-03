@@ -77,7 +77,14 @@ pub fn build_access_token_claims(p: AccessTokenParams<'_>) -> Value {
         claims.insert("scope".to_string(), Value::String(p.scopes.join(" ")));
     }
     claims.insert("iat".to_string(), Value::Number(p.issued_at.into()));
-    claims.insert("exp".to_string(), Value::Number((p.issued_at + p.ttl_secs).into()));
+    claims.insert(
+        "exp".to_string(),
+        Value::Number(
+            p.issued_at
+                .saturating_add(p.ttl_secs)
+                .into(),
+        ),
+    );
     claims.insert("jti".to_string(), Value::String(p.jti.to_string()));
     if let Some(act) = compose_delegation_chain(p.subject_act, p.actor_sub) {
         claims.insert("act".to_string(), act);
@@ -301,6 +308,26 @@ mod tests {
         assert_eq!(claims["exp"], 1_300);
         assert_eq!(claims["jti"], "jti-123");
         assert_eq!(claims["act"], json!({ "sub": "did:example:agent" }));
+    }
+
+    #[test]
+    fn build_claims_exp_saturates_at_the_u64_boundary() {
+        let params = |issued_at, ttl_secs| AccessTokenParams {
+            issuer: "iss",
+            subject: "sub",
+            subject_act: None,
+            actor_sub: None,
+            client_id: None,
+            audience: None,
+            scopes: &[],
+            issued_at,
+            ttl_secs,
+            jti: "j",
+        };
+        assert_eq!(build_access_token_claims(params(u64::MAX - 10, 300))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX, u64::MAX))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX - 300, 300))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX - 301, 300))["exp"], u64::MAX - 1);
     }
 
     #[test]

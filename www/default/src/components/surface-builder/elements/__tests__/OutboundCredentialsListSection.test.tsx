@@ -59,6 +59,24 @@ describe('Credential Delegation binding', () => {
     );
   });
 
+  it('offers no second binding, and no gateway callback, beside an external consent binding', async () => {
+    render(<OutboundCredentialsListSection rows={[row('external')]} onChange={() => {}} />);
+    await screen.findByText('Vendor');
+    expect(screen.getByTestId('credential-delegation-add')).toBeDisabled();
+    expect(screen.getByTestId('credential-delegation-add-blocked')).toHaveTextContent(
+      "the Access Point Target's only binding"
+    );
+    expect(screen.queryByText('Gateway-held credential callback URL')).toBeNull();
+  });
+
+  it('offers another binding and the gateway callback beside one without external consent', async () => {
+    render(<OutboundCredentialsListSection rows={[row('on_demand')]} onChange={() => {}} />);
+    await screen.findByText('Vendor');
+    expect(screen.getByTestId('credential-delegation-add')).toBeEnabled();
+    expect(screen.queryByTestId('credential-delegation-add-blocked')).toBeNull();
+    expect(screen.getByText('Gateway-held credential callback URL')).toBeInTheDocument();
+  });
+
   it('leaves a binding without external consent editable', async () => {
     render(<OutboundCredentialsListSection rows={[row('on_demand')]} onChange={() => {}} />);
     await screen.findByText('Vendor');

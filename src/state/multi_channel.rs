@@ -81,12 +81,15 @@ impl MultiSurfaceProxyState {
     /// snapshot in `resolved_surface_cache`, which `apply_surface_change` fills
     /// whenever a surface is saved and which keeps its last good entry when that
     /// fails; otherwise the selected variant is applied to the channel's surface.
+    /// `None` when the cache retired the surface, because it was disabled or
+    /// deleted: the channel may be a stale copy held by a connection kept alive
+    /// across a full reload, and is not served.
     pub fn served_surface(
         &self,
         channel: &SurfaceInfo,
         alias: Option<&str>,
         selected: Option<&crate::config::agent_surface_variants::SurfaceVariant>,
-    ) -> (Arc<crate::config::agent_surface::AgentSurface>, String) {
+    ) -> Option<(Arc<crate::config::agent_surface::AgentSurface>, String)> {
         match channel
             .surface
             .config_id()
@@ -95,12 +98,18 @@ impl MultiSurfaceProxyState {
                     .resolve(surface_id, alias)
                     .ok()
             }) {
-            Some(cached) => (cached.surface, cached.surface_variant),
+            Some(cached) => Some((cached.surface, cached.surface_variant)),
+            None if self
+                .resolved_surface_cache
+                .is_retired(&channel.surface.surface_id) =>
+            {
+                None
+            }
             None => {
                 let served = channel
                     .surface
                     .serve_selected(selected);
-                (Arc::new(served.surface), served.recorded)
+                Some((Arc::new(served.surface), served.recorded))
             }
         }
     }
@@ -198,7 +207,7 @@ impl MultiSurfaceProxyState {
             .ok()?;
         let variant_id = selected.map(|variant| variant.id.clone());
         let engines = channel.engines_for(variant_id.as_deref())?;
-        let (surface, _) = self.served_surface(channel, None, selected);
+        let (surface, _) = self.served_surface(channel, None, selected)?;
         Some(self.proxy_state_for(channel, engines, None, variant_id, surface))
     }
 }

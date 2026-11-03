@@ -48,7 +48,14 @@ pub fn build_id_jag_claims(p: IdJagParams<'_>) -> Value {
         claims.insert("scope".to_string(), Value::String(p.scopes.join(" ")));
     }
     claims.insert("iat".to_string(), Value::Number(p.issued_at.into()));
-    claims.insert("exp".to_string(), Value::Number((p.issued_at + p.ttl_secs).into()));
+    claims.insert(
+        "exp".to_string(),
+        Value::Number(
+            p.issued_at
+                .saturating_add(p.ttl_secs)
+                .into(),
+        ),
+    );
     claims.insert("jti".to_string(), Value::String(p.jti.to_string()));
     if let Some(act) = p.act {
         claims.insert("act".to_string(), act);
@@ -216,6 +223,25 @@ mod tests {
         assert_eq!(claims["exp"], 1_120);
         assert_eq!(claims["jti"], "jti-x");
         assert!(claims.get("act").is_none());
+    }
+
+    #[test]
+    fn build_id_jag_exp_saturates_at_the_u64_boundary() {
+        let params = |issued_at, ttl_secs| IdJagParams {
+            issuer: "did:webvh:example:gw",
+            subject: "user-123",
+            audience: "https://resource.example",
+            client_id: "agent0",
+            scopes: &[],
+            issued_at,
+            ttl_secs,
+            jti: "jti-x",
+            act: None,
+        };
+        assert_eq!(build_id_jag_claims(params(u64::MAX - 10, 120))["exp"], u64::MAX);
+        assert_eq!(build_id_jag_claims(params(u64::MAX, u64::MAX))["exp"], u64::MAX);
+        assert_eq!(build_id_jag_claims(params(u64::MAX - 120, 120))["exp"], u64::MAX);
+        assert_eq!(build_id_jag_claims(params(u64::MAX - 121, 120))["exp"], u64::MAX - 1);
     }
 
     #[test]

@@ -84,7 +84,11 @@ changes:
         a binding with subject caller is refused on a surface whose Access Point takes the
         gateway's resource access tokens (mcp_http.authorization), which name a caller by its
         subject without the identity provider that named it. A surface stored outside the API
-        that breaks one of these rules answers connector_unavailable and reads no grant.
+        that breaks one of these rules answers connector_unavailable and reads no grant, and so
+        does one saved through the API before these rules applied. Its grants are kept, not
+        revoked, and none is released until the caller authentication is tightened
+        (allowed_dids, audiences); removing the binding removes them and revokes them at the
+        vendor.
     - timestamp: '2026-10-30T22:00:00Z'
       title: Send no presentation of the agent through a Transit Point with external consent
       description: >-

@@ -803,7 +803,8 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
 ///
 /// VCs whose effective address can't be mapped to a port, or whose port is
 /// not in `configured_ports`, are skipped with a warning. Channels with no
-/// VCs that resolve to any listener are skipped entirely. Both startup
+/// VCs that resolve to any listener, and surfaces that are not active, are
+/// skipped entirely. Both startup
 /// (orchestrator) and hot-reload (channel_manager) call this so the
 /// bucketing logic stays in lockstep.
 pub fn group_outbound_vcs_by_port(
@@ -819,7 +820,7 @@ pub fn group_outbound_vcs_by_port(
         std::collections::HashMap::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -919,7 +920,7 @@ pub fn find_unresolved_outbound_transit_points(
     let mut problems = Vec::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -1339,8 +1340,8 @@ fn default_replay_backend() -> String {
     "in_process".to_string()
 }
 
-/// Throttle for the token endpoint: bounds repeated attempts per client id and
-/// per source address so credential guessing is rate-limited.
+/// Throttle for the token endpoint: bounds repeated attempts per client id from
+/// each source, and per source, so credential guessing is rate-limited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEndpointThrottleConfig {
     /// Master switch for the throttle.
@@ -1349,10 +1350,11 @@ pub struct TokenEndpointThrottleConfig {
     /// Count only failed client authentications (recommended) rather than every request.
     #[serde(default = "sts_throttle_default_true")]
     pub failed_attempts_only: bool,
-    /// Per-`client_id` limit.
+    /// Per-`client_id` limit, counted separately for each source (an IPv4 address or an IPv6 /64).
     #[serde(default = "default_throttle_per_client")]
     pub per_client: RateLimitConfig,
-    /// Per-source-address limit (source read from `X-Forwarded-For` / `Forwarded`).
+    /// Per-source limit (an IPv4 address or an IPv6 /64; forwarded headers count only from
+    /// `client_ip.trusted_proxies`).
     #[serde(default = "default_throttle_per_ip")]
     pub per_ip: RateLimitConfig,
     /// Seconds a key stays blocked once over its limit (0 = until the window rolls off).
@@ -4081,6 +4083,36 @@ mod unresolved_outbound_tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn only_active_surfaces_are_bucketed_onto_outbound_ports() {
+        let surface = |name: &str, status: &str| {
+            surface_with_transit(json!({
+                "name": name,
+                "status": status,
+                "access_point": { "listen_address": "https://in.example.com", "route": format!("/{name}"), "protocol": "a2a" },
+                "target": { "endpoint": "http://localhost:1/x" },
+                "transit": {
+                    "outbound_listen_address": "https://out.example.com",
+                    "points": [{ "alias": "tp1", "target_endpoint": "http://localhost:2" }]
+                }
+            }))
+        };
+        let surfaces = [surface("live", "active"), surface("gone", "deleted"), surface("off", "disabled")];
+
+        let by_port = group_outbound_vcs_by_port(&surfaces, &[8081], outbound_resolver);
+
+        let bucketed: Vec<&str> = by_port
+            .get(&8081)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(surface, _)| surface.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(bucketed, ["live"]);
     }
 
     #[test]

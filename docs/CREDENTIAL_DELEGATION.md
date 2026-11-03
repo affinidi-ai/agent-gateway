@@ -445,14 +445,28 @@ with `outbound_credentials` ignores `transit_credentials`.
 
 A Transit Point sends its target at most one value of each credential header, by the same
 rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
-`Authorization` and `Cookie` and without a header named like the Transit Point's
-`target_auth` header, whether or not the gateway adds that header to this request. It then
-adds the `target_auth` header, and then the `bearer_header` and `custom_header` credentials of
-its bindings, each replacing any earlier header of the same name. On a `2026-07-28` MCP
-request, the credentials prepared for `outbound_credentials` are applied last in the same
-way. So the managed agent can neither supply nor replace a credential, and a delegated
-credential under the same name as `target_auth` replaces it; give them different names to
-send both.
+`Authorization` and `Cookie`, and without any header, every value of it, compared without
+regard to case, named like the Transit Point's `target_auth` header or like the
+`custom_header` of any credential binding that can apply on it: every binding in the
+surface's `outbound_credentials`, `tools` bindings included, or else its own
+`transit_credentials`. Those headers are withheld whether or not the gateway adds a value to
+this request. It then adds the `target_auth` header, and then the `bearer_header` and
+`custom_header` credentials of its bindings, each replacing any earlier header of the same
+name. On a `2026-07-28` MCP request, the credentials prepared for `outbound_credentials` are
+applied last in the same way. So the managed agent can neither supply nor replace a
+credential, and a delegated credential under the same name as `target_auth` replaces it;
+give them different names to send both.
+
+A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
+target can carry only text header values, so a Transit Point refuses a Fabric request whose
+`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+cannot be carried with `503`, rather than forwarding it without the credential.
+
+An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
+header named like the Target's `target_auth` header is never forwarded, including
+`Authorization` kept by `forward_source_auth_header`, and the `target_auth` header and each
+delegated credential header the gateway adds replace every value of that header already on
+the request, so the target receives one value of each, the gateway's.
 
 ### The caller on a Transit Point
 
@@ -704,7 +718,10 @@ also refused on a surface whose Access Point takes the gateway's resource access
 (`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
 gateway's issuer, so callers of two identity providers with the same subject would share a
 grant. An `owner` binding may be used there. A surface stored outside the API that breaks one
-of these rules answers `connector_unavailable` and reads no grant.
+of these rules answers `connector_unavailable` and reads no grant, and so does one saved through
+the API before these rules applied. Its grants are kept, not revoked: none is released while
+the rule is broken. Tightening the caller authentication (`allowed_dids`, `audiences`) releases
+them again. Removing the binding removes them and revokes them at the vendor.
 
 A request through such a Transit Point needs a caller it identifies, as every delegated
 credential does: a transit token naming one, or a caller its `source_auth` verified; without
@@ -876,7 +893,8 @@ session revision. A request that arrived over Fabric is refused `403` as one who
 gateway did not identify, before any payment is asked for or verified: the caller a peer gateway
 asserts never keys a grant. A public discovery read over Fabric is refused the same way, since
 it would carry the peer's headers, its caller's cookies among them, to the vendor, and no request
-over Fabric can use the Target. A surface whose binding breaks a rule above, as one edited by hand
+over Fabric can use the Target. Each such refusal is audited `request_rejected` at admission, as
+`consent_identity_required`. A surface whose binding breaks a rule above, as one edited by hand
 might, answers `connector_unavailable` before any payment is asked for or settled, and reads no
 grant.
 
@@ -985,29 +1003,33 @@ authenticated caller, the consent mode decides what happens the first time.
 
 `elicit` needs an MCP client that advertised the `elicitation` capability during
 `initialize`, and a capability record for its session. `elicit_fallback` decides
-what happens when either is missing: `on_demand`, the default, degrades to the 401
-response, and `fail` records `elicitation_unsupported` and forwards the tool call without
-the credential. Elicit falls back when:
+what happens when either is missing, or when the client has no open stream to send the
+prompt on: `on_demand`, the default, degrades to the 401 response, and `fail` records
+`elicitation_unsupported` and refuses the tool call as a credential that cannot be resolved
+(see below), never forwarding it without the credential. Elicit falls back when:
 
 - the client did not advertise `elicitation`;
 - the upstream returned a session id already in use on the surface (see "MCP session
   ownership" in `docs/MCP_METADATA.md`);
 - the gateway has no capability record for the session, because the upstream answered
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
-  after the session opened.
+  after the session opened;
+- the session has no open SSE stream to deliver `elicitation/create` on.
 
 A user who declines or cancels the elicitation, or does not answer before
-`elicit_timeout_secs`, also has the call forwarded without it.
+`elicit_timeout_secs`, has the call refused the same way, whatever `elicit_fallback` says;
+the delegation audit records `elicitation_declined`, `elicitation_cancelled` or
+`elicitation_timed_out`.
 
 ### When a credential cannot be resolved
 
 A binding that applies but whose credential cannot be resolved refuses the request rather
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
-error, and consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`. A failed token request
-records `client_credentials_failed`, `jwt_bearer_failed` or `client_credentials_jwt_auth_failed`
-by provider type. An Access Point and
+error, consent that is needed but cannot be asked for because no authorization URL can be
+built, for example when the provider has no `authorization_endpoint`, and an `elicit` prompt
+that fails as described above. A failed token request records `client_credentials_failed`,
+`jwt_bearer_failed` or `client_credentials_jwt_auth_failed` by provider type. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
@@ -1022,14 +1044,17 @@ delegation), or for which neither its managed identity nor the transit token's c
 the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
-`application/problem+json` body. A missing token still gets the consent answer above. A
-Transit Point forwards a `GET` of a public discovery path, such as an agent card, without
-checking a transit token, so it carries no caller, and it is forwarded without a delegated
-credential, as it is without the `target_auth` one.
+`application/problem+json` body. A missing token still gets the consent answer above.
+
+A Transit Point discovery read, a `GET` or `HEAD` of a discovery document directly below the
+Transit Point (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), is forwarded without a
+transit token check, so it carries no caller, and without a delegated credential or the
+`target_auth` one. Any other path, a discovery document below another segment included,
+needs a transit token and carries the credentials.
 
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores
-are not available, and on the `elicit` outcomes above. Fabric receive refuses a request whose
+are not available. Fabric receive refuses a request whose
 caller its surface did not verify, any per-user binding, and consent (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
 A Target bound by external consent is the exception: what cannot be released is refused, never
 forwarded without the grant ([External consent on the Access Point
@@ -1236,9 +1261,17 @@ every change that removes an external consent binding or deletes an external con
 with `503`: it cannot find their grants under its own ids. Restore the pepper the grants were
 written under, or [purge them](#removing-grants). A fingerprint with no grant
 beside it is replaced by the next gateway that stores one. When the fingerprint file is missing
-while grants are stored, the grants decide: unless one the gateway can read has the id its
-pepper derives, the gateway treats them as written under another pepper in every way above, and
-never records its own fingerprint over them.
+while grants are stored, the grants decide, and every one of them is read:
+
+- If any grant does not have the id the gateway's pepper derives, the gateway treats them all as
+  written under another pepper in every way above, and never records its own fingerprint over
+  them. It remembers this until a grant is removed, so a purge takes effect without a restart.
+- If every grant has that id, the gateway records its fingerprint, and later checks read the
+  fingerprint alone.
+- If no grant has another pepper's id but one cannot be read, which pepper they were written
+  under is not known. The startup `ERROR` names the unreadable grant, not the pepper, and a
+  release, removal or provider delete that finds no grant fails as the vault being unavailable
+  until that grant can be read or is purged.
 
 A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
 `ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant

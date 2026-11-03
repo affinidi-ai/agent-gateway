@@ -94,9 +94,12 @@ Gateway process:
    state, and the state of one that no longer has any, because it was deleted, disabled or
    emptied, is retired, so its routes refuse each request with `404`.
 6. Bind new inbound and outbound listeners, retaining each inbound listener's
-   `MultiSurfaceProxyState` for later single-surface updates. An outbound port with no active
-   Transit Points is bound with no proxy routes, as at startup, so its liveness route remains
-   available.
+   `MultiSurfaceProxyState` for later single-surface updates. Only active surfaces' Transit
+   Points are served, so a deleted or disabled surface's never are. An outbound port with no
+   active Transit Points is bound with no proxy routes, as at startup, so its liveness route
+   remains available. The reload returns only once each rebuilt outbound listener has
+   registered its surfaces' outbound state, so a surface deleted right after it is retired
+   there too.
 
 Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services
 that are not owned by those listener tasks continue running, but their routers are attached to the
@@ -105,7 +108,9 @@ new listeners when those listeners are created.
 A plain HTTP listener closes the connections kept alive on it when it stops. A TLS listener's
 connections outlive it, still served by its old routes; because those routes hold the outbound
 state updated in step 5, a removed Transit Point refuses the next request on such a connection
-with `404`, and a changed one is served with its new configuration.
+with `404`, and a changed one is served with its new configuration. Likewise an Access Point
+route held by such a connection refuses with `404` a request to a surface that has since been
+disabled or deleted, rather than serving the copy the connection holds.
 
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
@@ -151,16 +156,17 @@ answers, whichever path applies it:
 
 1. Retire the surface's outbound state: every route still holding it, on a new connection or
    one kept alive, refuses each request with `404`.
-2. Evict the surface's compiled policies, MCP tool gating and rate limiters, its variants' and
-   its Transit Points' included.
+2. Evict the surface's compiled policies, MCP tool gating, rate limiters and circuit breaker,
+   its variants' and its Transit Points' included.
 
 A surface without variants is removed in place: its Access Point leaves the running inbound
 listener and no listener is rebound, so the outbound listener its Transit Points shared with
 other surfaces' keeps serving them without interruption, and its retired routes stay on that
 listener, refusing with `404`, until the listener is next rebuilt. Deleting a surface with
 variants takes a full reload, because its variant routes are baked into the inbound listener.
-Disabling a surface, or removing all of its Transit Points, retires its outbound state the same
-way, but does not evict its compiled policies.
+Disabling a surface retires its outbound state and evicts its compiled policies, MCP tool
+gating, rate limiters and circuit breaker the same way. Removing all of a surface's Transit
+Points retires its outbound state, but does not evict its compiled policies.
 
 A request admitted before the delete has already read the surface, so it can still reach the
 Transit Point's target, with its credentials, until it completes or times out. A `tools/call` to
