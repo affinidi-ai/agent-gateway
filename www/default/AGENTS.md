@@ -111,6 +111,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
+  Managed Agent response identity (`response:identity-protected`), since no caller API key
+  identifies the Managed Agent; the inbound and external slots still offer it. A protected
+  identity already set to From API Key keeps showing its key selector. Transit Point
+  identities offer only From Payload.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -814,7 +819,7 @@ grouping and change log in `identityVersions.ts`, and the row parts `IdentityNam
   (`agent_identity.credential_type`: `mtls` or `api_key`, none for payload extraction) and
   `slot` are versions of one entry (`groupIdentityVersions`). A row without `slot` joins the
   only slot of its surface and source. The row shows the most recently used DID, a summed
-  usage count, the latest last use, and an "N versions" badge; its actions (Trust Score,
+  usage count, and the latest last use; its actions (Trust Score,
   Configure Policy, Copy link) belong to that DID. `from_jwt_claim` DIDs (one per claim
   value), external callers and identities without a surface keep one row per DID.
 - The expanded row's **Version History** section lists the entry's DIDs and the credential
@@ -822,12 +827,15 @@ grouping and change log in `identityVersions.ts`, and the row parts `IdentityNam
   shows its time ("Time unknown" for a rotation found when tracking began), its DID, a
   Current badge on the primary DID's latest version, and its field changes against the version
   before it (a new DID against the previous DID, a rotation against its DID's earlier
-  fields); the first version lists its values. A certificate or API key identity with no
-  versions yet still shows the section, saying none are recorded. Every list ends with a note
-  that rotations are listed only from when the gateway began recording them. The rows' `slot` and `rotations` come from the
-  backend; see `docs/SOURCE_AUTH.md#identity-versions`.
-- `/identities/<did>` expands the entry holding that DID; an earlier DID also opens Version
-  History and marks its versions.
+  fields); the first version lists its values. A rotation with field changes (a certificate)
+  is labelled "Credential rotated"; one without (an API key, whose update may only have
+  edited its details) is labelled "Credential updated". A certificate or API key identity
+  with no versions yet still shows the section, saying none are recorded. The rows' `slot`
+  and `rotations` (the latest 20) come from the backend; see
+  `docs/SOURCE_AUTH.md#identity-versions`.
+- `/identities/<did>` expands the entry holding that DID once the dashboard identities have
+  loaded; an earlier DID also opens Version History and marks its versions, including when
+  the entry is already expanded.
 - Expansion state is a `Set` of primary DIDs. Rows expand and collapse independently, and a
   deep link adds to the set rather than replacing it.
 - Identities page tests prefer the backend-generated rows in `src/__fixtures__/backend/` (a
@@ -874,7 +882,7 @@ grouping and change log in `identityVersions.ts`, and the row parts `IdentityNam
 | Element                                | Test id                                                                                                                                              |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity row (the entry's primary DID) | `identities-row-<did>`                                                                                                                               |
-| Version count, history toggle, version | `identities-version-count`, `identities-version-history-toggle`, `identities-version-<number>` (with `-changes`), `identities-version-history-empty` |
+| History toggle, version                | `identities-version-history-toggle`, `identities-version-<number>` (with `-changes`), `identities-version-history-empty`                             |
 | Name, pending, conflict, verified      | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                                                 |
 | Copy DID                               | `identities-copy-did-button`                                                                                                                         |
 | Origin badge                           | `identities-origin-<origin>`                                                                                                                         |

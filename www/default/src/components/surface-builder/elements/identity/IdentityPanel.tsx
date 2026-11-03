@@ -263,7 +263,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
             </li>
             <li>
               <strong>From API Key</strong>: the caller authenticates with an API key you&apos;ve
-              issued.
+              issued. Not offered on the Managed Agent&apos;s response identity.
             </li>
             <li>
               <strong>From JWT Claims</strong>: the caller sends a signed token; read the identity

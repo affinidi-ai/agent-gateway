@@ -90,6 +90,10 @@ pub enum ManagedSlot {
     TransitPoint { alias: String },
 }
 
+/// Rotations kept per record; older ones are dropped, since every identity row and
+/// WebSocket update carries the list.
+pub const MAX_ROTATIONS: usize = 20;
+
 /// A change of the stored credential behind a credential-derived identity that kept its DID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialRotation {
@@ -193,7 +197,7 @@ pub struct AgentIdentityRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 
-    /// Rotations of that credential, oldest first
+    /// Rotations of that credential, oldest first; at most [`MAX_ROTATIONS`]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotations: Vec<CredentialRotation>,
 }
@@ -219,6 +223,7 @@ impl AgentIdentityRecord {
     /// baseline. After that, an mTLS certificate rotates when its identity fields change, and
     /// any other credential, whose fields don't describe its value, whenever its `updated_at`
     /// changes. A field change seen when the baseline is stored is a rotation of unknown time.
+    /// Only the latest [`MAX_ROTATIONS`] rotations are kept.
     pub fn apply_managed_source(
         &mut self,
         source: &ManagedIdentitySource,
@@ -254,6 +259,11 @@ impl AgentIdentityRecord {
                         .map(|_| updated_at),
                     previous,
                 });
+            let excess = self
+                .rotations
+                .len()
+                .saturating_sub(MAX_ROTATIONS);
+            self.rotations.drain(..excess);
         }
         self.identity_fields = identity_fields.clone();
         self.credential_updated_at = Some(updated_at);
@@ -273,6 +283,8 @@ pub struct FilesystemIdentityStore {
     storage: Box<dyn StorageBackend<AgentIdentityRecord>>,
     storage_path: PathBuf,
     ws_state: Option<Arc<crate::server::WsState>>,
+    /// Serialises read-modify-save of one record, so concurrent requests don't overwrite
+    /// each other's usage, origin or rotation updates.
     record_locks: [tokio::sync::Mutex<()>; RECORD_LOCK_STRIPES],
 }
 
@@ -653,6 +665,10 @@ impl IdentityStore for FilesystemIdentityStore {
         source: &ManagedIdentitySource,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<()> {
+        let _guard = self
+            .record_lock(identity_hash)
+            .lock()
+            .await;
         let Some(mut record) = self
             .storage
             .get(identity_hash)
@@ -1254,6 +1270,20 @@ mod tests {
     }
 
     #[test]
+    fn apply_managed_source_keeps_only_the_latest_rotations() {
+        let mut record = credential_record(api_key_fields(), Some(at(0)));
+        let updates = i64::try_from(MAX_ROTATIONS).unwrap() + 5;
+
+        for updated_at in 1..=updates {
+            record.apply_managed_source(&observed(updated_at), &api_key_fields());
+        }
+
+        assert_eq!(record.rotations.len(), MAX_ROTATIONS);
+        assert_eq!(record.rotations[0].rotated_at, Some(at(6)));
+        assert_eq!(record.rotations[MAX_ROTATIONS - 1].rotated_at, Some(at(updates)));
+    }
+
+    #[test]
     fn rotations_and_slot_serialize_only_when_present() {
         let mut record = local_record("h");
         let empty = serde_json::to_value(&record).unwrap();
@@ -1300,6 +1330,48 @@ mod tests {
         assert_eq!(record.slot, Some(ManagedSlot::Protected));
         assert_eq!(record.rotations.len(), 1);
         assert_eq!(record.identity_fields, mtls_fields("bb"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_usage_and_rotation_updates_are_not_lost() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FilesystemIdentityStore::new(temp_dir.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+
+        let requests = 16;
+        let tasks: Vec<_> = (0..requests)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .update_usage("h", Some("surface-1".to_string()))
+                        .await
+                        .unwrap();
+                    store
+                        .apply_managed_source("h", &observed(60), &api_key_fields())
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.usage_count, requests);
+        assert_eq!(record.rotations.len(), 1);
     }
 
     #[tokio::test]

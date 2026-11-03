@@ -39,8 +39,12 @@ const ChangeLine: React.FC<{ change: FieldChange; first: boolean }> = ({ change,
 
 const emptyChangesText = (version: IdentityVersion): string =>
   version.kind === 'rotation'
-    ? "The credential's value changed; its identity fields did not."
+    ? 'The stored credential was updated, by a new value or an edit to its details; its identity fields did not change.'
     : 'No field changes.';
+
+// A rotation without field changes is an API key update, which may not have changed its value.
+const rotationLabel = (version: IdentityVersion): string =>
+  version.changes.length > 0 ? 'Credential rotated' : 'Credential updated';
 
 export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
   versions,
@@ -80,7 +84,7 @@ export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
               <li className="mb-1">
                 <code>DID</code>: <code className="text-body text-break">{version.did}</code>
                 {version.kind === 'rotation' && (
-                  <span className="text-muted ms-1">(Credential rotated)</span>
+                  <span className="text-muted ms-1">({rotationLabel(version)})</span>
                 )}
               </li>
               {version.changes.map(change => (
