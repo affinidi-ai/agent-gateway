@@ -1,9 +1,12 @@
 /**
  * Target authentication tests
  *
- * Covers a Managed Agent's Target authentication from a credential provider: the gateway's
- * rules shown next to the fields and blocking Save, and a valid setting, scopes included,
- * saving and loading again unchanged.
+ * Covers a Managed Agent's Target authentication from a credential provider: header name and
+ * format problems shown next to the fields and blocking Save, a Target that is not https and an
+ * Access Point that checks no caller shown as advisories that allow Save (the gateway refuses
+ * them only while its `target_https` or `target_source_auth` rule is `enforce`, and answers a
+ * save in `warn` with a `Warning` header), and a valid setting, scopes included, saving and
+ * loading again unchanged.
  *
  * The gateway API is mocked with `page.route`. Line breaks cannot be typed into a text input
  * (the browser removes them), so the CR/LF rule is covered by a stored setting that already
@@ -78,7 +81,12 @@ function surfaceFixture(options: {endpoint?: string; auth?: Json; checkCallers?:
 }
 
 /** Serves the surface and records each save; a later load returns the last saved surface. */
-async function mockSurface(page: Page, initial: Json, saved: Request[]) {
+async function mockSurface(
+    page: Page,
+    initial: Json,
+    saved: Request[],
+    reply?: {status: number; body: Json} | {warning: string},
+) {
     let current = initial;
     await page.route(/\/api\/v1\/credential-providers\/?$/, route =>
         route.fulfill({json: [PROVIDER, CONSENT_PROVIDER]}),
@@ -88,8 +96,15 @@ async function mockSurface(page: Page, initial: Json, saved: Request[]) {
         const request = route.request();
         if (request.method() === 'PUT') {
             saved.push(request);
+            if (reply && 'status' in reply) {
+                await route.fulfill({status: reply.status, json: reply.body});
+                return;
+            }
             current = {...request.postDataJSON(), surface_id: SURFACE_ID};
-            await route.fulfill({json: current});
+            await route.fulfill({
+                json: current,
+                headers: reply ? {Warning: `299 - "${reply.warning}"`} : {},
+            });
         } else if (request.method() === 'GET') {
             await route.fulfill({json: current});
         } else {
@@ -113,7 +128,7 @@ async function pickProvider(page: Page) {
 
 const saveButton = (page: Page) => page.locator('button.btn-primary:has(.fa-save)');
 
-test.describe('Target authentication: credential provider', () => {
+test.describe('Managed Agent Target authentication: credential provider', () => {
     test('a valid setting saves with its scopes and loads unchanged', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture(), saved);
@@ -186,7 +201,7 @@ test.describe('Target authentication: credential provider', () => {
         await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveCount(0);
     });
 
-    test('a stored format with a line break is kept and only warns until it is edited', async ({page}) => {
+    test('an unedited stored format with a line break is kept and saved unchanged, and editing it blocks Save', async ({page}) => {
         const saved: Request[] = [];
         const stored = {
             method: {
@@ -212,20 +227,67 @@ test.describe('Target authentication: credential provider', () => {
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
         expect((saved[0].postDataJSON().target as {auth: Json}).auth).toEqual(stored);
+
+        await page.reload();
+        await page.getByTestId('surface-node-target').click();
+        await page.getByRole('button', {name: /Configure/}).click();
+        await page.locator('#target-auth-header-format').fill('Token');
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
+            'Header format must contain {value} exactly once',
+        );
+        await saveButton(page).click();
+        await page.waitForTimeout(300);
+        expect(saved).toHaveLength(1);
     });
 
-    test('a credential on an http Target is refused and blocks Save', async ({page}) => {
+    test('a Managed Agent credential on an http Target shows an advisory and still saves', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved);
         await openTargetAuth(page);
         await pickProvider(page);
 
-        await expect(page.getByTestId('managed-agent-target-auth-errors')).toContainText(
-            'its Target must be an https URL',
+        await expect(page.getByTestId('managed-agent-target-auth-advisories')).toContainText(
+            'its Target must be an https URL. Save is allowed',
         );
+        await expect(page.getByTestId('managed-agent-target-auth-errors')).toHaveCount(0);
         await saveButton(page).click();
-        await page.waitForTimeout(300);
-        expect(saved).toHaveLength(0);
+        await expect.poll(() => saved.length).toBe(1);
+    });
+
+    test('a Managed Agent credential on an https Target shows no advisory', async ({page}) => {
+        await mockSurface(page, surfaceFixture(), []);
+        await openTargetAuth(page);
+        await pickProvider(page);
+
+        await expect(page.getByTestId('managed-agent-target-auth-advisories')).toHaveCount(0);
+    });
+
+    test('while target_https is warn the gateway saves an http Target and its Warning is shown after the save', async ({page}) => {
+        const saved: Request[] = [];
+        const warning =
+            'target.auth: Target authentication sends a credential, so its Target must be an https URL';
+        await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved, {warning});
+        await openTargetAuth(page);
+        await pickProvider(page);
+
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        await expect(page.getByTestId('surface-save-warnings')).toContainText(warning);
+    });
+
+    test('while target_https is enforce the gateway refuses an http Target and its 400 is shown on the page', async ({page}) => {
+        const saved: Request[] = [];
+        const error = 'target.auth: Target authentication sends a credential, so its Target must be an https URL';
+        await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved, {
+            status: 400,
+            body: {error},
+        });
+        await openTargetAuth(page);
+        await pickProvider(page);
+
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        await expect(page.getByRole('alert').filter({hasText: error}).first()).toBeVisible();
     });
 
     test('a provider method without a provider blocks Save', async ({page}) => {
@@ -258,18 +320,30 @@ test.describe('Target authentication: credential provider', () => {
         await expect(page.getByTestId('managed-agent-target-auth-header-name-error')).toHaveCount(0);
     });
 
-    test('a credential on an Access Point that checks no caller is refused and blocks Save', async ({page}) => {
+    test('a Target credential on a surface whose Access Point authenticates no caller still saves', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture({checkCallers: false}), saved);
         await openTargetAuth(page);
         await pickProvider(page);
 
         await saveButton(page).click();
-        await expect(page.getByText('it needs source authentication on the Access Point').first()).toBeVisible();
-        expect(saved).toHaveLength(0);
+        await expect.poll(() => saved.length).toBe(1);
     });
 
-    test('a credential on an Access Point that checks callers saves', async ({page}) => {
+    test('while target_source_auth is enforce the gateway refuses a Target credential on a surface whose Access Point authenticates no caller', async ({page}) => {
+        const saved: Request[] = [];
+        const error =
+            'target.auth: Target authentication sends a credential, so it needs source authentication on the Access Point';
+        await mockSurface(page, surfaceFixture({checkCallers: false}), saved, {status: 400, body: {error}});
+        await openTargetAuth(page);
+        await pickProvider(page);
+
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        await expect(page.getByRole('alert').filter({hasText: error}).first()).toBeVisible();
+    });
+
+    test('a Target credential on a surface whose Access Point has source authentication saves without a caller warning', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture(), saved);
         await openTargetAuth(page);
@@ -277,6 +351,7 @@ test.describe('Target authentication: credential provider', () => {
 
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
+        await expect(page.getByText('it needs source authentication on the Access Point')).toHaveCount(0);
     });
 
     test('scopes are optional: empty scopes save no scopes', async ({page}) => {

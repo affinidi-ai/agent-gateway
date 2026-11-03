@@ -15,8 +15,11 @@ changes:
       title: Validate Target authentication in the Surface Builder and save it unchanged
       description: >-
         The Surface Builder applies the gateway's Target authentication rules while editing and
-        shows each refusal next to its field. A new or changed breach blocks Save; a stored one
-        the operator did not edit shows a warning. Saving keeps stored fields the editor does
+        shows each problem next to its field. A new or changed header name, header format or header
+        clash blocks Save, and a stored one the operator did not edit shows a warning. A Target
+        that is not https or a leg that authenticates no caller shows an advisory and does not
+        block Save: the gateway refuses it only when its rule is enforce, and a save in warn
+        shows the gateway's warning. Saving keeps stored fields the editor does
         not show, and an unopened Transit Point keeps its Target authentication. The credential
         provider method gains an optional Scopes input, and Subject is required for JWT bearer
         providers.

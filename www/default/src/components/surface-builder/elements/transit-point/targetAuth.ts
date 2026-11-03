@@ -82,14 +82,18 @@ export function transitPointTargetAuth(c: any): Record<string, unknown> | undefi
 export interface TransitPointTargetAuthProblems {
   errors: Record<string, string>;
   warnings: string[];
+  advisories: string[];
 }
 
 /**
- * What is wrong with the Transit Point's Target authentication. A setting the gateway keeps as
- * stored (same auth, same endpoint) only warns; a new or changed one blocks the save.
+ * What is wrong with the Transit Point's Target authentication. A header name or format problem
+ * in a new or changed setting blocks the save; the same problem in a setting the gateway keeps as
+ * stored (same auth, same endpoint) only warns. A Target that is not https, or a Transit Point
+ * that authenticates no caller, is an advisory: the gateway refuses it only while `target_https`
+ * or `target_source_auth` is `enforce`.
  */
 export function transitPointTargetAuthProblems(c: any): TransitPointTargetAuthProblems {
-  const result: TransitPointTargetAuthProblems = { errors: {}, warnings: [] };
+  const result: TransitPointTargetAuthProblems = { errors: {}, warnings: [], advisories: [] };
   const auth = transitPointTargetAuth(c);
   if (!auth) return result;
   const endpoint = typeof c.target_endpoint === 'string' ? c.target_endpoint : '';
@@ -97,9 +101,9 @@ export function transitPointTargetAuthProblems(c: any): TransitPointTargetAuthPr
   const found: Array<[string, string | undefined]> = [
     ['auth_header_name', problems.headerName],
     ['auth_header_format', problems.headerFormat],
-    ['auth_https', problems.endpoint],
-    ['auth_callers', authenticatesCallers(c) ? undefined : TP_CALLER_CHECK_PROBLEM],
   ];
+  if (problems.endpoint) result.advisories.push(problems.endpoint);
+  if (!authenticatesCallers(c)) result.advisories.push(TP_CALLER_CHECK_PROBLEM);
   const kept = isStoredTargetAuth(c[STORED_TARGET_AUTH_KEY], auth, endpoint);
   for (const [field, message] of found) {
     if (!message) continue;

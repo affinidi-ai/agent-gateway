@@ -177,8 +177,13 @@ export function validateSurfacePayload(
   }
 
   if (options.stored !== undefined) {
-    for (const message of targetAuthBreaches(payload, options.stored)) {
-      issues.push({ severity: 'error', message, nodeId: 'target', path: 'target.auth' });
+    for (const { rule, message, nodeId } of targetAuthBreaches(payload, options.stored)) {
+      issues.push({
+        severity: rule === 'callers' ? 'warning' : 'error',
+        message,
+        nodeId,
+        path: 'target.auth',
+      });
     }
   }
 

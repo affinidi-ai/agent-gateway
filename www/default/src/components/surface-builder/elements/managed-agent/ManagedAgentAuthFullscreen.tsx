@@ -40,7 +40,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const source = config.target_auth_source === 'provider' ? 'provider' : 'secret';
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
-  const { errors, warnings } = managedAgentTargetAuthProblems(config);
+  const { errors, warnings, advisories } = managedAgentTargetAuthProblems(config);
 
   useEffect(() => {
     setLoadingSecrets(true);
@@ -92,8 +92,9 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
 
         <TargetAuthProblemNotice
           testId="managed-agent-target-auth"
-          errors={[errors.target_auth_https].filter((m): m is string => !!m)}
+          errors={[]}
           warnings={warnings}
+          advisories={advisories}
         />
 
         <div className="mb-3">

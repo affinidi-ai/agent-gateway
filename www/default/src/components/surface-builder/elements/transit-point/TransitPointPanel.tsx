@@ -384,6 +384,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
           testId="transit-point-target-auth"
           errors={Object.values(targetAuthProblems.errors)}
           warnings={targetAuthProblems.warnings}
+          advisories={targetAuthProblems.advisories}
         />
         <Form.Select
           size="sm"

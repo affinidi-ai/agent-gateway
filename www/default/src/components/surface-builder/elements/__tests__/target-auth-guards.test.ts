@@ -16,6 +16,9 @@ import { staticSecretAuthType, transitPointTargetAuthProblems } from '../transit
 import { targetAuthBreaches } from '../targetAuthRules';
 import { validateSurfacePayload } from '../validateSurface';
 
+const breachMessages = (surface: unknown, stored: unknown) =>
+  targetAuthBreaches(surface, stored).map(breach => breach.message);
+
 function makeCtx(nodes: any[]): SurfaceContext {
   return {
     protocol: 'a2a',
@@ -129,7 +132,11 @@ describe('Transit Point auth type of a stored static secret', () => {
 
 describe('Managed Agent Target authentication validation', () => {
   it('passes a valid setting', () => {
-    expect(managedAgentTargetAuthProblems(maConfig())).toEqual({ errors: {}, warnings: [] });
+    expect(managedAgentTargetAuthProblems(maConfig())).toEqual({
+      errors: {},
+      warnings: [],
+      advisories: [],
+    });
   });
 
   it('blocks a header name that is not a token or is reserved, and passes its twin', () => {
@@ -158,15 +165,17 @@ describe('Managed Agent Target authentication validation', () => {
     ).toEqual({});
   });
 
-  it('blocks a credential on a Target that is not https, and passes its twin', () => {
+  it('advises, without blocking, on a Managed Agent credential for a Target that is not https, and passes its twin', () => {
     for (const endpoint of ['http://agent.example.com', 'fabric://g/s', 'a2a-proxy://p']) {
-      expect(managedAgentTargetAuthProblems(maConfig({ endpoint })).errors).toEqual({
-        target_auth_https: TARGET_AUTH_HTTPS_PROBLEM,
-      });
+      const problems = managedAgentTargetAuthProblems(maConfig({ endpoint }));
+      expect(problems.errors).toEqual({});
+      expect(problems.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
     }
-    expect(
-      managedAgentTargetAuthProblems(maConfig({ endpoint: 'https://agent.example.com' })).errors
-    ).toEqual({});
+    const https = managedAgentTargetAuthProblems(
+      maConfig({ endpoint: 'https://agent.example.com' })
+    );
+    expect(https.errors).toEqual({});
+    expect(https.advisories).toEqual([]);
   });
 
   it('blocks a credential provider method without a provider, and passes its twin', () => {
@@ -179,15 +188,22 @@ describe('Managed Agent Target authentication validation', () => {
     ).toEqual({});
   });
 
-  it('blocks Save through the element validation', () => {
-    const errors = registry.getValidationErrors('target', maConfig({ endpoint: 'http://a.test' }));
-    expect(errors).toContainEqual({
-      field: 'target_auth_https',
-      message: TARGET_AUTH_HTTPS_PROBLEM,
+  it('does not block Save through the element validation for a Target that is not https, and blocks a reserved header', () => {
+    expect(registry.getValidationErrors('target', maConfig({ endpoint: 'http://a.test' }))).toEqual(
+      []
+    );
+    expect(
+      registry.getValidationErrors(
+        'target',
+        maConfig({ endpoint: 'http://a.test', target_auth_header_name: 'Host' })
+      )
+    ).toContainEqual({
+      field: 'target_auth_header_name',
+      message: 'Header name must not be the reserved header Host',
     });
   });
 
-  it('only warns about a stored setting that was not edited', () => {
+  it('keeps an unedited stored header problem non-blocking, and blocks it once the setting is edited', () => {
     const stored = { endpoint: 'http://agent.example.com', auth: staticSecret('Host', 'Bearer') };
     const config: any = managedAgentDefinition.configFromPayload!(
       { endpoint: stored.endpoint, auth: stored.auth },
@@ -195,7 +211,8 @@ describe('Managed Agent Target authentication validation', () => {
     );
     const problems = managedAgentTargetAuthProblems(config);
     expect(problems.errors).toEqual({});
-    expect(problems.warnings).toHaveLength(3);
+    expect(problems.warnings).toHaveLength(2);
+    expect(problems.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
     expect(registry.getValidationErrors('target', config)).toEqual([]);
 
     const edited = managedAgentTargetAuthProblems({
@@ -207,7 +224,11 @@ describe('Managed Agent Target authentication validation', () => {
       ...config,
       endpoint: 'http://other.example.com',
     });
-    expect(moved.errors.target_auth_https).toBe(TARGET_AUTH_HTTPS_PROBLEM);
+    expect(Object.keys(moved.errors).sort()).toEqual([
+      'target_auth_header_format',
+      'target_auth_header_name',
+    ]);
+    expect(moved.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
   });
 });
 
@@ -222,32 +243,36 @@ describe('Transit Point Target authentication validation', () => {
   });
 
   it('passes a valid setting', () => {
-    expect(transitPointTargetAuthProblems(tp())).toEqual({ errors: {}, warnings: [] });
+    expect(transitPointTargetAuthProblems(tp())).toEqual({
+      errors: {},
+      warnings: [],
+      advisories: [],
+    });
   });
 
-  it('blocks a bad header name, a bad format and a non-https Target, each with a passing twin', () => {
+  it('blocks a bad header name and a bad format, and only advises on a Target that is not https', () => {
     expect(transitPointTargetAuthProblems(tp({ auth_header_name: 'Upgrade' })).errors).toEqual({
       auth_header_name: 'Header name must not be the reserved header Upgrade',
     });
     expect(transitPointTargetAuthProblems(tp({ auth_header_format: 'x' })).errors).toEqual({
       auth_header_format: 'Header format must contain {value} exactly once',
     });
-    expect(transitPointTargetAuthProblems(tp({ target_endpoint: 'fabric://g/s' })).errors).toEqual({
-      auth_https: TARGET_AUTH_HTTPS_PROBLEM,
-    });
+    const fabric = transitPointTargetAuthProblems(tp({ target_endpoint: 'fabric://g/s' }));
+    expect(fabric.errors).toEqual({});
+    expect(fabric.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
   });
 
-  it('blocks a Target credential on a Transit Point that checks no caller, and passes its twin', () => {
-    expect(
-      transitPointTargetAuthProblems(
-        tp({ require_transit_token: false, allow_unauthenticated_callers: true })
-      ).errors
-    ).toEqual({ auth_callers: TP_CALLER_CHECK_PROBLEM });
+  it('advises, without blocking, on a Target credential on a Transit Point that checks no caller, and passes its twin', () => {
+    const open = transitPointTargetAuthProblems(
+      tp({ require_transit_token: false, allow_unauthenticated_callers: true })
+    );
+    expect(open.errors).toEqual({});
+    expect(open.advisories).toEqual([TP_CALLER_CHECK_PROBLEM]);
     expect(
       transitPointTargetAuthProblems(
         tp({ require_transit_token: false, source_auth: { type: 'api_key' } })
-      ).errors
-    ).toEqual({});
+      ).advisories
+    ).toEqual([]);
   });
 
   it('blocks Save through the element validation', () => {
@@ -259,7 +284,7 @@ describe('Transit Point Target authentication validation', () => {
     });
   });
 
-  it('only warns about a stored setting that was not edited', () => {
+  it('keeps an unedited stored Transit Point header problem non-blocking', () => {
     const stored = {
       endpoint: 'http://partner.example.com',
       auth: staticSecret('Host', '{value}'),
@@ -271,7 +296,8 @@ describe('Transit Point Target authentication validation', () => {
     };
     expect(transitPointTargetAuthProblems(config)).toEqual({
       errors: {},
-      warnings: ['Header name must not be the reserved header Host', TARGET_AUTH_HTTPS_PROBLEM],
+      warnings: ['Header name must not be the reserved header Host'],
+      advisories: [TARGET_AUTH_HTTPS_PROBLEM],
     });
   });
 });
@@ -288,7 +314,7 @@ describe('Target authentication rules that need the whole surface', () => {
   });
 
   it('passes a valid surface', () => {
-    expect(targetAuthBreaches(surface(), null)).toEqual([]);
+    expect(breachMessages(surface(), null)).toEqual([]);
   });
 
   it('counts a forwarded JWT only on the first caller method, as the gateway does', () => {
@@ -301,8 +327,8 @@ describe('Target authentication rules that need the whole surface', () => {
           auth: staticSecret('Authorization', 'Bearer {value}'),
         },
       });
-    expect(targetAuthBreaches(withMethods([forwarding]), null)).toHaveLength(1);
-    expect(targetAuthBreaches(withMethods([{ type: 'api_key' }, forwarding]), null)).toEqual([]);
+    expect(breachMessages(withMethods([forwarding]), null)).toHaveLength(1);
+    expect(breachMessages(withMethods([{ type: 'api_key' }, forwarding]), null)).toEqual([]);
   });
 
   it('blocks a header the Access Point maps from metadata, and passes a different one', () => {
@@ -316,19 +342,19 @@ describe('Target authentication rules that need the whole surface', () => {
         },
         target: { endpoint: 'https://agent.example.com', auth: staticSecret(name, '{value}') },
       });
-    expect(targetAuthBreaches(mapped('X-Tenant'), null)).toEqual([
+    expect(breachMessages(mapped('X-Tenant'), null)).toEqual([
       'target.auth.header_name X-Tenant is already sent by header metadata mapping',
     ]);
-    expect(targetAuthBreaches(mapped('X-Other'), null)).toEqual([]);
+    expect(breachMessages(mapped('X-Other'), null)).toEqual([]);
   });
 
-  it('blocks a Target credential when the Access Point checks no caller, and passes its twin', () => {
+  it('reports a Target credential on a surface whose Access Point checks no caller, and passes its twin', () => {
     const open = surface({ access_point: {} });
-    expect(targetAuthBreaches(open, null)).toEqual([
+    expect(breachMessages(open, null)).toEqual([
       'target.auth: Target authentication sends a credential, so it needs source authentication on the Access Point',
     ]);
     const resource = surface({ access_point: {}, mcp_http: { authorization: { resource: 'r' } } });
-    expect(targetAuthBreaches(resource, null)).toEqual([]);
+    expect(breachMessages(resource, null)).toEqual([]);
   });
 
   it('blocks a header another credential on the leg already sends, and passes its twin', () => {
@@ -337,7 +363,7 @@ describe('Target authentication rules that need the whole surface', () => {
         { inject_as: { type: 'custom_header', name: 'x-api-key', format: '{value}' } },
       ],
     });
-    expect(targetAuthBreaches(clash, null)).toEqual([
+    expect(breachMessages(clash, null)).toEqual([
       'target.auth.header_name X-Api-Key is already sent by a credential binding',
     ]);
     const bearer = surface({
@@ -347,11 +373,11 @@ describe('Target authentication rules that need the whole surface', () => {
       },
       outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
     });
-    expect(targetAuthBreaches(bearer, null)).toEqual([
+    expect(breachMessages(bearer, null)).toEqual([
       'target.auth.header_name Authorization is already sent by a credential binding',
     ]);
     const other = surface({ outbound_credentials: [{ inject_as: { type: 'bearer_header' } }] });
-    expect(targetAuthBreaches(other, null)).toEqual([]);
+    expect(breachMessages(other, null)).toEqual([]);
   });
 
   it('applies the rules to a Transit Point, where a withheld fabric credential avoids the duplicate', () => {
@@ -372,12 +398,12 @@ describe('Target authentication rules that need the whole surface', () => {
           ],
         },
       });
-    expect(targetAuthBreaches(point('https://p.example.com'), null)).toEqual([
+    expect(breachMessages(point('https://p.example.com'), null)).toEqual([
       "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding",
     ]);
-    expect(targetAuthBreaches(point('fabric://g/s'), null)).toEqual([]);
+    expect(breachMessages(point('fabric://g/s'), null)).toEqual([]);
     expect(
-      targetAuthBreaches(
+      breachMessages(
         point('https://p.example.com', { require_transit_token: false, source_auth: undefined }),
         null
       )
@@ -389,21 +415,25 @@ describe('Target authentication rules that need the whole surface', () => {
 
   it('keeps a breach the stored surface already had on the same leg, setting and endpoint', () => {
     const open = surface({ access_point: {} });
-    expect(targetAuthBreaches(open, open)).toEqual([]);
+    expect(breachMessages(open, open)).toEqual([]);
     const changed = surface({
       access_point: {},
       target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Other', '{value}') },
     });
-    expect(targetAuthBreaches(changed, open)).toHaveLength(1);
+    expect(breachMessages(changed, open)).toHaveLength(1);
     const moved = surface({
       access_point: {},
       target: { endpoint: 'https://moved.example.com', auth: open.target.auth },
     });
-    expect(targetAuthBreaches(moved, open)).toHaveLength(1);
+    expect(breachMessages(moved, open)).toHaveLength(1);
   });
 
-  it('reports a breach as a blocking issue only when the stored surface is given', () => {
-    const open = surface({ access_point: {} });
+  it('reports a header clash as a blocking issue only when the stored surface is given', () => {
+    const open = surface({
+      outbound_credentials: [
+        { inject_as: { type: 'custom_header', name: 'x-api-key', format: '{value}' } },
+      ],
+    });
     expect(validateSurfacePayload(open).filter(i => i.severity === 'error')).toEqual([]);
     expect(
       validateSurfacePayload(open, { stored: null }).filter(i => i.severity === 'error')
@@ -536,5 +566,58 @@ describe('lossless Target authentication save', () => {
     for (const node of blob.nodes) {
       expect(node.config ?? {}).not.toHaveProperty('_stored_target_auth');
     }
+  });
+});
+
+describe('Target authentication whole-surface problems in the Surface Builder', () => {
+  const base = (over: Record<string, unknown> = {}): any => ({
+    name: 's',
+    protocol: 'mcp',
+    access_point: { caller_authentication: { methods: [{ type: 'api_key' }] } },
+    target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Api-Key', '{value}') },
+    ...over,
+  });
+  const issuesFor = (surface: any) =>
+    validateSurfacePayload(surface, { stored: null }).filter(i => i.path === 'target.auth');
+
+  it('warns, without blocking Save, about a Target credential when the Access Point checks no caller', () => {
+    const issues = issuesFor(base({ access_point: {} }));
+    expect(issues).toEqual([expect.objectContaining({ severity: 'warning', nodeId: 'target' })]);
+    expect(issuesFor(base())).toEqual([]);
+  });
+
+  it('blocks Save when a credential binding already sends the Target credential header', () => {
+    const issues = issuesFor(
+      base({
+        outbound_credentials: [
+          { inject_as: { type: 'custom_header', name: 'X-Api-Key', format: '{value}' } },
+        ],
+      })
+    );
+    expect(issues).toEqual([expect.objectContaining({ severity: 'error', nodeId: 'target' })]);
+  });
+
+  it('reports a Transit Point problem on that Transit Point, not on the Managed Agent', () => {
+    const issues = issuesFor(
+      base({
+        target: { endpoint: 'https://agent.example.com' },
+        outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
+        transit: {
+          points: [
+            {
+              id: 'tp',
+              alias: 'partner',
+              protocol: 'mcp',
+              target_endpoint: 'https://p.example.com',
+              require_transit_token: true,
+              target_auth: staticSecret('Authorization', 'Bearer {value}'),
+            },
+          ],
+        },
+      })
+    );
+    expect(issues).toEqual([
+      expect.objectContaining({ severity: 'error', nodeId: 'transit-point-1' }),
+    ]);
   });
 });

@@ -1,8 +1,10 @@
 /**
  * The Target authentication rules that need the whole surface: a header another credential on
  * the same leg already sends, and a Target credential on a leg that does not check its callers.
- * The gateway refuses a new or changed breach on save and keeps one the stored surface already
- * had on the same leg, with the same setting and endpoint; so does this.
+ * The gateway refuses a new or changed header clash on save, and keeps one the stored surface
+ * already had on the same leg, with the same setting and endpoint; so does this. A leg that
+ * checks no callers is refused only while `target_source_auth` is `enforce`, so it is reported
+ * as an advisory.
  */
 import {
   MA_CALLER_CHECK_PROBLEM,
@@ -11,6 +13,7 @@ import {
 } from './_shared/providerTargetAuth';
 
 interface Leg {
+  nodeId: string;
   transitPointId: string | null;
   endpoint: string;
   auth: unknown;
@@ -21,10 +24,11 @@ interface Leg {
 }
 
 interface Breach {
+  nodeId: string;
   transitPointId: string | null;
   endpoint: string;
   auth: string;
-  rule: string;
+  rule: 'duplicate' | 'callers';
   message: string;
 }
 
@@ -85,6 +89,7 @@ function legs(surface: unknown): Leg[] {
       otherHeaders.push(...mappedHeaders(accessPoint?.header_metadata_mapping));
     }
     found.push({
+      nodeId: 'target',
       transitPointId: null,
       endpoint: typeof target?.endpoint === 'string' ? target.endpoint : '',
       auth: target.auth,
@@ -94,9 +99,9 @@ function legs(surface: unknown): Leg[] {
       otherHeaders,
     });
   }
-  for (const entry of array(record(payload.transit)?.points)) {
+  array(record(payload.transit)?.points).forEach((entry, index) => {
     const point = record(entry);
-    if (!point?.target_auth) continue;
+    if (!point?.target_auth) return;
     const endpoint = typeof point.target_endpoint === 'string' ? point.target_endpoint : '';
     const withholds =
       endpoint.startsWith('fabric://') && point.fabric_delegated_credentials !== true;
@@ -108,6 +113,7 @@ function legs(surface: unknown): Leg[] {
     }
     const pointResource = record(point.mcp_http)?.authorization != null;
     found.push({
+      nodeId: `transit-point-${index + 1}`,
       transitPointId: typeof point.id === 'string' ? point.id : null,
       endpoint,
       auth: point.target_auth,
@@ -117,7 +123,7 @@ function legs(surface: unknown): Leg[] {
       callerCheckProblem: TP_CALLER_CHECK_PROBLEM,
       otherHeaders,
     });
-  }
+  });
   return found;
 }
 
@@ -126,6 +132,7 @@ function breaches(surface: unknown): Breach[] {
     const header = targetAuthHeader(leg.auth);
     if (!header) return [];
     const base = {
+      nodeId: leg.nodeId,
       transitPointId: leg.transitPointId,
       endpoint: leg.endpoint,
       auth: JSON.stringify(leg.auth),
@@ -151,10 +158,16 @@ const sameBreach = (a: Breach, b: Breach) =>
   a.auth === b.auth &&
   a.rule === b.rule;
 
-/** The messages of every breach `surface` has that `stored` did not already have. */
-export function targetAuthBreaches(surface: unknown, stored: unknown): string[] {
+export interface TargetAuthBreach {
+  nodeId: string;
+  rule: 'duplicate' | 'callers';
+  message: string;
+}
+
+/** Every breach `surface` has that `stored` did not already have. */
+export function targetAuthBreaches(surface: unknown, stored: unknown): TargetAuthBreach[] {
   const kept = breaches(stored);
   return breaches(surface)
     .filter(breach => !kept.some(old => sameBreach(old, breach)))
-    .map(breach => breach.message);
+    .map(({ nodeId, rule, message }) => ({ nodeId, rule, message }));
 }

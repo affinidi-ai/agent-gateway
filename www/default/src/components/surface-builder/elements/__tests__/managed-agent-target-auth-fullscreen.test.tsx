@@ -63,15 +63,16 @@ describe('Managed Agent Target authentication editor', () => {
     );
   });
 
-  it('shows an https message for a Target that is not https', () => {
+  it('shows an https advisory, not an error, for a Target that is not https', () => {
     renderPanel({
       ...base,
       endpoint: 'http://agent.example.com',
       target_auth_source: 'secret',
       target_auth_secret_id: 's',
     });
-    expect(screen.getByTestId('managed-agent-target-auth-errors')).toHaveTextContent(
-      'its Target must be an https URL'
+    expect(screen.queryByTestId('managed-agent-target-auth-errors')).not.toBeInTheDocument();
+    expect(screen.getByTestId('managed-agent-target-auth-advisories')).toHaveTextContent(
+      'its Target must be an https URL. Save is allowed'
     );
   });
 });

@@ -56,14 +56,17 @@ export function managedAgentTargetAuth(c: any): Record<string, unknown> | undefi
 export interface TargetAuthProblems {
   errors: Record<string, string>;
   warnings: string[];
+  advisories: string[];
 }
 
 /**
- * What is wrong with the Managed Agent's Target authentication. A setting the gateway keeps
- * as stored (same auth, same endpoint) only warns; a new or changed one blocks the save.
+ * What is wrong with the Managed Agent's Target authentication. A header name or format
+ * problem in a new or changed setting blocks the save; the same problem in a setting the
+ * gateway keeps as stored (same auth, same endpoint) only warns. A Target that is not https
+ * is an advisory: the gateway refuses it only while `target_https` is `enforce`.
  */
 export function managedAgentTargetAuthProblems(c: any): TargetAuthProblems {
-  const result: TargetAuthProblems = { errors: {}, warnings: [] };
+  const result: TargetAuthProblems = { errors: {}, warnings: [], advisories: [] };
   if (!c?.target_auth_enabled) return result;
   if (c.target_auth_source === 'provider' && !String(c.target_auth_provider_id || '').trim()) {
     result.errors.target_auth_provider_id =
@@ -76,8 +79,8 @@ export function managedAgentTargetAuthProblems(c: any): TargetAuthProblems {
   const found: Array<[string, string | undefined]> = [
     ['target_auth_header_name', problems.headerName],
     ['target_auth_header_format', problems.headerFormat],
-    ['target_auth_https', problems.endpoint],
   ];
+  if (problems.endpoint) result.advisories.push(problems.endpoint);
   const kept = isStoredTargetAuth(c[STORED_TARGET_AUTH_KEY], auth, endpoint);
   for (const [field, message] of found) {
     if (!message) continue;
