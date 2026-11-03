@@ -209,7 +209,9 @@ describe('Dashboard', () => {
 
     await waitFor(() => expect(mockedApiClient.listSurfaces).toHaveBeenCalledTimes(2));
 
-    expect(screen.getByTestId('dashboard-stat-channels')).toHaveTextContent('1');
+    await waitFor(() =>
+      expect(screen.getByTestId('dashboard-stat-channels')).toHaveTextContent('1')
+    );
   });
 
   it('reloads configured surface count from the error retry path', async () => {

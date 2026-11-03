@@ -767,9 +767,6 @@ describe('IdentitiesPage', () => {
       const newRow = await screen.findByTestId('identities-row-did:key:managed-new');
       expect(screen.queryByTestId('identities-row-did:key:managed-old')).not.toBeInTheDocument();
       expect(within(newRow).getByTitle('did:key:managed-new')).toBeInTheDocument();
-      expect(within(newRow).getByTestId('identities-version-count')).toHaveTextContent(
-        '2 versions'
-      );
       expect(within(newRow).getByTestId('identities-origin-managed')).toHaveTextContent(
         'Managed Agent'
       );
@@ -794,6 +791,7 @@ describe('IdentitiesPage', () => {
 
       const newest = screen.getByTestId('identities-version-2');
       expect(newest).toHaveTextContent('Current');
+      expect(newest).not.toHaveTextContent('v2');
       expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
         'agentIdentity.llmInfo.model: gpt-4o → gpt-4.1'
       );
@@ -846,9 +844,7 @@ describe('IdentitiesPage', () => {
     it('keeps an external caller row without versions', async () => {
       renderWithStats([externalCallerFixture]);
 
-      const row = await screen.findByTestId(`identities-row-${externalCallerFixture.did}`);
-      expect(within(row).queryByTestId('identities-version-count')).not.toBeInTheDocument();
-      fireEvent.click(row);
+      fireEvent.click(await screen.findByTestId(`identities-row-${externalCallerFixture.did}`));
       expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
     });
 

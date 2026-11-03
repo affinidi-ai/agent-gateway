@@ -22,7 +22,14 @@ changes:
         current certificate. Identities rows carry the optional slot and rotations fields.
         Rotations before this release were not recorded; a certificate change found on the
         first use after it is recorded once, without a time.
-  changed: []
+  changed:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Stop offering From API Key on the Managed Agent's response identity
+      description: >-
+        The Identity element on the Managed Agent to Access Point response leg no longer offers
+        From API Key in its Identity Extraction Type dropdown; the inbound and external identity
+        slots still do. Surfaces already using it keep resolving the Managed Agent's DID from the
+        bound API key.
   fixed:
     - timestamp: '2026-11-02T12:00:00Z'
       title: Replace the Identities page version history button, which never appeared

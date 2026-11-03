@@ -550,15 +550,6 @@ const IdentitiesPage: React.FC = () => {
                                             v{identity.version}
                                           </span>
                                         )}
-                                      {versions.length > 0 && (
-                                        <span
-                                          className="badge text-bg-light ms-2"
-                                          title="Earlier DIDs and credential rotations of this surface identity"
-                                          data-testid="identities-version-count"
-                                        >
-                                          {versions.length} versions
-                                        </span>
-                                      )}
                                       {identity.scid && (
                                         <small className="text-muted ml-2" title={identity.scid}>
                                           SCID {identity.scid.slice(0, 10)}...

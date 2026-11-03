@@ -59,43 +59,43 @@ export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
         return (
           <li
             key={`${version.did}-${version.number}`}
-            className={`border rounded px-2 py-1 mb-2${highlighted ? ' border-primary' : ''}`}
+            className={`border rounded px-3 py-2 mb-2${highlighted ? ' border-primary' : ''}`}
             data-testid={`identities-version-${version.number}`}
             data-highlighted={highlighted || undefined}
           >
             <div className="d-flex flex-wrap align-items-center gap-2 small">
-              <span className="badge text-bg-secondary">v{version.number}</span>
-              <strong>{version.kind === 'did' ? 'DID' : 'Credential rotated'}</strong>
-              {version.current && <span className="badge text-bg-success">Current</span>}
+              {version.current ? (
+                <span className="badge text-bg-success">Current</span>
+              ) : (
+                <span className="badge text-bg-secondary">v{version.number}</span>
+              )}
               <span className="text-muted">
                 {version.at ? formatDateTime(version.at, true) : 'Time unknown'}
               </span>
-              <code className="text-truncate" style={{ maxWidth: '28rem' }} title={version.did}>
-                {version.did}
-              </code>
             </div>
-            {version.changes.length === 0 ? (
+            <ul
+              className="small mt-2 mb-0 ps-3"
+              data-testid={`identities-version-${version.number}-changes`}
+            >
+              <li className="mb-1">
+                <code>DID</code>: <code className="text-body text-break">{version.did}</code>
+                {version.kind === 'rotation' && (
+                  <span className="text-muted ms-1">(Credential rotated)</span>
+                )}
+              </li>
+              {version.changes.map(change => (
+                <li key={change.field} className="mb-1 text-break">
+                  <ChangeLine change={change} first={first} />
+                </li>
+              ))}
+            </ul>
+            {version.changes.length === 0 && (
               <div className="small text-muted">{emptyChangesText(version)}</div>
-            ) : (
-              <ul
-                className="small mb-0 ps-3"
-                data-testid={`identities-version-${version.number}-changes`}
-              >
-                {version.changes.map(change => (
-                  <li key={change.field}>
-                    <ChangeLine change={change} first={first} />
-                  </li>
-                ))}
-              </ul>
             )}
           </li>
         );
       })}
     </ol>
-    <p className="small text-muted mb-0">
-      Certificate and API key rotations are listed from the first use after the gateway began
-      recording them; a change found then shows as “Time unknown”.
-    </p>
   </div>
 );
 
