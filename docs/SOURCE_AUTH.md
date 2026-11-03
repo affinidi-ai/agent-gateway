@@ -797,12 +797,14 @@ the target itself under another name, pass.
 
 The proxy forwarding headers are every `X-Forwarded-*` header and `Forwarded`, `X-Real-IP`,
 `True-Client-IP`, `Client-IP`, `X-Client-IP`, `X-Cluster-Client-IP`, `CF-Connecting-IP`,
-`CF-Connecting-IPv6`, `Fastly-Client-IP`, `X-Original-Forwarded-For`, `X-Original-Host`,
-`X-Host`, `X-Url-Scheme` and `Front-End-Https`, matched case-insensitively and also spelled
-with `_` for `-` ([`is_proxy_forwarding_header`](../src/proxy/outbound_handler.rs)). The gateway
-sets none of them either, so a target that trusts it as its proxy never takes a caller's claim
-about its address, host or scheme in one of these headers, though it does in a header of any
-other name. The credentials the gateway adds are described in
+`CF-Connecting-IPv6`, `Fastly-Client-IP`, `Fly-Client-IP`, `X-ARR-ClientIP`,
+`X-Azure-ClientIP`, `X-ProxyUser-Ip`, `X-Original-Forwarded-For`, `X-Original-Host`, `X-Host`,
+`X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Scheme`, `X-Url-Scheme`, `X-ARR-SSL`
+and `Front-End-Https`, matched case-insensitively and also spelled with `_` for `-`
+([`is_proxy_forwarding_header`](../src/proxy/outbound_handler.rs)). The gateway sets none of
+them either, so a target that trusts it as its proxy never takes a caller's claim about its
+address, host, path or scheme in one of these headers, though it does in a header of any other
+name. The credentials the gateway adds are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
 The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`,

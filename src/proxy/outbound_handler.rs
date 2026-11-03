@@ -2599,7 +2599,7 @@ pub(crate) fn should_forward_outbound_request_header(
 }
 
 /// The proxy and CDN headers, other than `X-Forwarded-*`, that claim the client's
-/// address, the host it asked for or the scheme it used.
+/// address, the host or path it asked for or the scheme it used.
 const PROXY_FORWARDING_HEADERS: &[&str] = &[
     "forwarded",
     "x-real-ip",
@@ -2610,15 +2610,24 @@ const PROXY_FORWARDING_HEADERS: &[&str] = &[
     "cf-connecting-ip",
     "cf-connecting-ipv6",
     "fastly-client-ip",
+    "fly-client-ip",
+    "x-arr-clientip",
+    "x-azure-clientip",
+    "x-proxyuser-ip",
     "x-original-forwarded-for",
     "x-original-host",
     "x-host",
+    "x-original-url",
+    "x-original-uri",
+    "x-rewrite-url",
+    "x-scheme",
     "x-url-scheme",
+    "x-arr-ssl",
     "front-end-https",
 ];
 
 /// Whether `name` is a header a proxy or CDN sets to tell the next hop who
-/// connected to it, for which host and over what: [`PROXY_FORWARDING_HEADERS`]
+/// connected to it, for which host and path and over what: [`PROXY_FORWARDING_HEADERS`]
 /// and every `X-Forwarded-*` header, also spelled with `_` for `-`, which
 /// CGI-style servers read as the same header.
 fn is_proxy_forwarding_header(name: &str) -> bool {
@@ -11295,6 +11304,16 @@ mod tests {
             "X-Host",
             "X-Url-Scheme",
             "Front-End-Https",
+            "Fly-Client-IP",
+            "X-ARR-ClientIP",
+            "X-Azure-ClientIP",
+            "X-ProxyUser-Ip",
+            "X-Original-URL",
+            "x_original_url",
+            "X-Original-URI",
+            "X-Rewrite-URL",
+            "X-Scheme",
+            "X-ARR-SSL",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
@@ -11308,6 +11327,8 @@ mod tests {
             "x-hostname",
             "x-original-hosts",
             "client-ipaddress",
+            "x-original-urls",
+            "x-schemes",
         ] {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }

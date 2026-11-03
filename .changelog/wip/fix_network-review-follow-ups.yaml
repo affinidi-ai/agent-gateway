@@ -13,13 +13,14 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-03T20:30:00Z'
-      title: Stop Transit Points passing a caller's client address and host headers
+      title: Stop Transit Points passing a caller's client address, host and path headers
       description: >-
         A Transit Point dropped a caller's Forwarded, X-Real-IP and X-Forwarded headers but passed
-        the other headers proxies and CDNs use to claim the client's address, host or scheme, such
-        as True-Client-IP, CF-Connecting-IP, X-Client-IP and X-Original-Host, so a target that
-        trusts the gateway as its proxy could still take the caller's claim. It now drops those
-        too, in any letter case and with underscores for dashes, and the docs list every header.
+        the other headers proxies and CDNs use to claim the client's address, host, path or scheme,
+        such as True-Client-IP, CF-Connecting-IP, X-Client-IP, X-Original-Host and X-Original-URL,
+        so a target that trusts the gateway as its proxy could still take the caller's claim. It
+        now drops those too, in any letter case and with underscores for dashes, and the docs
+        list every header.
     - timestamp: '2026-11-03T20:35:00Z'
       title: Bound and escape the caller's path on the log lines of a matched route
       description: >-
@@ -28,5 +29,6 @@ changes:
         the surface's handler took it, so a long or crafted path could flood the log or show a
         capability id in full. Those lines now carry the path, its tail and its alias escaped,
         cut to 256 characters and with capability ids shortened, like the unknown path line, and
-        three lines that only repeated others are gone.
+        three lines that only repeated others are gone. The onboarding handler's line does the
+        same.
   breaking: []
