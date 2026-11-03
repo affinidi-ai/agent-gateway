@@ -2,14 +2,7 @@ branch: fix/sts-token-verification-hardening
 changes:
   added: []
   changed: []
-  fixed:
-    - timestamp: '2026-11-03T10:32:45Z'
-      title: Cap the expiry of STS access tokens and ID-JAGs instead of overflowing
-      description: >-
-        The STS computed a token's exp as issued-at plus lifetime with unchecked addition, which
-        panics in a build with overflow checks and wraps around otherwise. It now saturates at
-        the largest value, so exp can never land before iat. The inputs are the gateway clock and
-        a configured lifetime, so callers could not reach this.
+  fixed: []
   removed: []
   security:
     - timestamp: '2026-11-03T10:32:45Z'
