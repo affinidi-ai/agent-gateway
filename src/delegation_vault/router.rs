@@ -450,6 +450,45 @@ mod tests {
         assert!(!logs.text().contains("quote"), "{}", logs.text());
     }
 
+    #[tokio::test]
+    async fn a_callbacks_provider_id_is_logged_escaped_and_bounded() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
+        let padding = "a".repeat(400);
+        for query in ["error=access_denied", "code=c&state=not-a-state"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/identity/oauth/callback/github%0D%0AINFO%20forged{padding}?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let text = logs.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("provider_id="))
+            .collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains(r#"provider_id="github\r\nINFO forgedaaa"#)),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("INFO forged")),
+            "{text}"
+        );
+        assert!(!text.contains(&padding), "{text}");
+    }
+
     // ── a non-admin principal is denied on every management route ──
 
     #[tokio::test]

@@ -31,4 +31,10 @@ changes:
         cut to 256 characters and with capability ids shortened, like the unknown path line, and
         three lines that only repeated others are gone. The onboarding handler's line does the
         same.
+    - timestamp: '2026-11-03T22:10:00Z'
+      title: Escape the provider id on the OAuth consent callback's log lines
+      description: >-
+        The OAuth consent callback, which needs no authentication, logged the provider id from its
+        path as-is on every line, so a caller could put a line break in it and forge log lines. It
+        is now escaped and cut to 256 characters.
   breaking: []
