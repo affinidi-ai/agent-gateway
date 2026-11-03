@@ -1,0 +1,28 @@
+branch: fix/tenant-check-provider-key-references
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-03T00:00:00Z'
+      title: Refuse a surface that takes the DID of another tenant's API key
+      description: >-
+        A surface save skipped the tenant check for an API Key Provider key id (`atgk_`) named
+        by a `from_api_key` identity on the protected, external or a Transit Point slot, or by
+        identity injection, and a plain API Key secret named after a provider key shares that
+        key's DID. A surface could therefore take the DID of another tenant's key. A save now
+        checks each such key against its owning surface by the tenant reference rules,
+        whatever `tenant_credential_isolation` says, and refuses another tenant's key, or a
+        tenant key on a surface with no tenant, with 400. A tenant reassignment that would
+        leave a surface naming such a key is a 409 conflict. The request path is unchanged,
+        so a surface stored with another tenant's key keeps that key's DID until it is next
+        saved or reassigned; re-save tenant surfaces to apply the check.
+  breaking:
+    - timestamp: '2026-11-03T00:00:00Z'
+      title: Refuse saving a surface whose identity names a deleted API key
+      description: >-
+        A `from_api_key` identity or identity injection whose `atgk_` key id names no API key
+        is refused on save with 400 "API key reference is not accessible", where it used to be
+        saved and given a DID derived from the id alone. Issue a new API key and name it before
+        re-saving such a surface.

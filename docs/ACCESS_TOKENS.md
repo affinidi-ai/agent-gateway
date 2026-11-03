@@ -272,8 +272,10 @@ impact reads filter the root and every graph edge by tenant/scope, and
 resource-scoped PATs cannot reassign ownership. Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and the secrets, JWT verification strategies, API-key
-parents and certificates its `source_auth` names, and every Trust Recorder entry,
-on the surface and in every variant. MCP tool discovery
+parents and certificates its `source_auth` names, every Trust Recorder entry, and the
+owning surface of each API Key Provider key a `from_api_key` identity, identity injection or
+same-named API Key secret derives a DID from, on the surface and in every variant; see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot). MCP tool discovery
 requires MCP Proxy edit plus Secret view authority, validates raw endpoints with
 `validate_resolved_url`, dials through a per-request Strict-pinned,
 redirect-disabled client (`egress::pinned_strict_client`), independently

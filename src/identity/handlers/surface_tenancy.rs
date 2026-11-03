@@ -56,6 +56,9 @@ pub async fn validate_surface_references(
             .validate_reference(&reference)
             .await?;
     }
+    authorizer
+        .provider_keys(&collect_provider_key_references(surface)?)
+        .await?;
     validate_target_auth_methods(state, surface).await
 }
 
@@ -948,7 +951,7 @@ impl ReferenceAuthorizer<'_> {
                     .await
             }
             ResourceKind::ApiKeys => {
-                self.api_key_parent(&reference.id)
+                self.api_key_parent(&reference.id, &reference.id)
                     .await
             }
             _ => Err(SurfaceApiError::InternalError(format!("Unsupported Surface reference kind: {}", reference.kind))),
@@ -1214,12 +1217,15 @@ impl ReferenceAuthorizer<'_> {
         self.ensure(resource.tenant_id.as_deref(), ResourceKind::TrustRegistries, &resource.id, "Trust Registry")
     }
 
+    /// The surface `id` owning API keys must be one this surface may reference, and `scope_id`,
+    /// the surface id or a key id, must match the token's API key pattern.
     async fn api_key_parent(
         &self,
         id: &str,
+        scope_id: &str,
     ) -> Result<(), SurfaceApiError> {
         if id == self.current_surface_id {
-            return self.ensure(self.owner_tenant_id, ResourceKind::ApiKeys, id, "API-key parent Surface");
+            return self.ensure(self.owner_tenant_id, ResourceKind::ApiKeys, scope_id, "API-key parent Surface");
         }
         let store = self
             .state
@@ -1231,12 +1237,32 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("API-key parent Surface", error))?
             .ok_or_else(|| inaccessible("API-key parent Surface"))?;
-        self.ensure(
-            resource.tenant_id.as_deref(),
-            ResourceKind::ApiKeys,
-            &resource.surface_id,
-            "API-key parent Surface",
-        )
+        self.ensure(resource.tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
+    }
+
+    /// A provider key a surface derives a DID from must exist, unless it is only a plain
+    /// secret's id, and its owning surface must be one this surface may reference.
+    async fn provider_keys(
+        &self,
+        keys: &[ProviderKeyReference],
+    ) -> Result<(), SurfaceApiError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let owners = provider_key_owners(self.state).await?;
+        for key in keys {
+            match owners.get(&key.key_id) {
+                Some(surface_ids) => {
+                    for surface_id in surface_ids {
+                        self.api_key_parent(surface_id, &key.key_id)
+                            .await?;
+                    }
+                }
+                None if key.required => return Err(inaccessible("API key")),
+                None => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1549,6 +1575,114 @@ fn collect_identity_injection_references(
     }
 }
 
+/// An API Key Provider key id a surface derives a DID from. `required` is false for a plain
+/// API Key `secret_id` shaped like a key id: it needs no provider key, but when one exists the
+/// secret shares that key's DID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderKeyReference {
+    pub key_id: String,
+    pub required: bool,
+}
+
+pub(crate) fn collect_provider_key_references(
+    surface: &AgentSurface
+) -> Result<Vec<ProviderKeyReference>, SurfaceApiError> {
+    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+    let mut keys = Vec::new();
+    let mut push = |id: Option<&str>, required: bool| {
+        if let Some(id) = id.filter(|id| id.starts_with(crate::api_keys::KEY_ID_PREFIX)) {
+            keys.push(ProviderKeyReference {
+                key_id: id.to_string(),
+                required,
+            });
+        }
+    };
+    let api_key_id = |identity: Option<&ManagedIdentityConfig>| match identity {
+        Some(ManagedIdentityConfig::FromApiKey { api_key_id }) => api_key_id.clone(),
+        _ => None,
+    };
+    for view in resolved_views(surface)? {
+        for identity in [
+            view.identity_slots
+                .protected
+                .as_ref(),
+            view.identity_slots
+                .external
+                .as_ref(),
+        ] {
+            push(api_key_id(identity).as_deref(), true);
+        }
+        push(
+            view.target
+                .identity_injection
+                .api_key_id
+                .as_deref(),
+            true,
+        );
+        for point in view
+            .transit
+            .iter()
+            .flat_map(|transit| &transit.points)
+        {
+            push(
+                api_key_id(
+                    point
+                        .managed_identity
+                        .as_ref(),
+                )
+                .as_deref(),
+                true,
+            );
+            push(
+                point
+                    .identity_injection
+                    .api_key_id
+                    .as_deref(),
+                true,
+            );
+        }
+        for method in view
+            .access_point
+            .caller_authentication
+            .iter()
+            .flat_map(|authentication| &authentication.methods)
+        {
+            if let SourceAuthConfig::ApiKey(config) = method {
+                push(Some(&config.secret_id), false);
+            }
+        }
+    }
+    keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    keys.dedup_by(|later, kept| {
+        let duplicate = later.key_id == kept.key_id;
+        kept.required |= duplicate && later.required;
+        duplicate
+    });
+    Ok(keys)
+}
+
+/// The surfaces owning each API Key Provider key, by key id.
+pub(crate) async fn provider_key_owners(
+    state: &IdentityApiState
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
+    let store = state
+        .api_key_store
+        .as_ref()
+        .ok_or_else(|| unavailable("API key"))?;
+    let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for key in store
+        .list_all()
+        .await
+        .map_err(|error| internal("API key", error))?
+    {
+        owners
+            .entry(key.key_id)
+            .or_default()
+            .push(key.agent_id);
+    }
+    Ok(owners)
+}
+
 fn push_reference(
     references: &mut Vec<SurfaceReferenceKey>,
     kind: ResourceKind,
@@ -1839,6 +1973,63 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    #[test]
+    fn provider_key_ids_are_collected_from_every_slot_that_derives_a_did_from_them() {
+        let from_api_key =
+            |id: &str| serde_json::from_value(serde_json::json!({"type": "from_api_key", "api_key_id": id})).unwrap();
+        let mut surface = AgentSurface::default();
+        surface.identity_slots.inbound = Some(from_api_key("atgk_inbound"));
+        surface
+            .identity_slots
+            .protected = Some(from_api_key("atgk_shared"));
+        surface
+            .identity_slots
+            .external = Some(from_api_key("plain-secret"));
+        surface
+            .target
+            .identity_injection
+            .api_key_id = Some("atgk_injected".into());
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "atgk_shared"},
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Other"}, "secret_id": "atgk_secret"}
+            ]}))
+            .unwrap(),
+        );
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "partner-id", "alias": "partner", "target_endpoint": "https://partner.example",
+                    "protocol": "a2a", "managed_identity": {"type": "from_api_key", "api_key_id": "atgk_point"}
+                }))
+                .unwrap(),
+            ],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        let keys = collect_provider_key_references(&surface).unwrap();
+
+        let key = |key_id: &str, required: bool| ProviderKeyReference {
+            key_id: key_id.into(),
+            required,
+        };
+        assert_eq!(
+            keys,
+            vec![
+                key("atgk_injected", true),
+                key("atgk_point", true),
+                key("atgk_secret", false),
+                key("atgk_shared", true),
+            ]
+        );
+        assert!(
+            collect_provider_key_references(&AgentSurface::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn legs_surface() -> AgentSurface {

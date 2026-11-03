@@ -965,8 +965,21 @@ with `400` when:
 
 An API Key Provider key and a plain API Key secret hash the same fields, `credential_type` and
 the key id or `secret_id`. A plain secret whose `secret_id` equals a provider key id (`atgk_`
-plus a UUID) therefore gets that key's identity record and DID. Neither the secrets store nor
-a surface save refuses such an id, so do not name a secret after an API Key Provider key.
+plus a UUID) therefore gets that key's identity record and DID. The secrets store accepts such
+an id, so do not name a secret after an API Key Provider key. A surface save checks each
+provider key a surface derives a DID from against the key's owning surface, by the
+[reference rules](ACCESS_TOKENS.md#references-between-records) and whatever
+`tenant_credential_isolation` says: an `atgk_` `api_key_id` on the protected, external or a
+Transit Point slot, an `atgk_` identity injection `api_key_id`, and a Caller Context API Key
+`secret_id` that equals an existing provider key id. Another tenant's key, or a tenant key on
+a surface with no tenant, is refused with `400` "API-key parent Surface reference is not
+accessible". An `atgk_` `api_key_id` that names no key is refused with `400` "API key
+reference is not accessible", so re-saving a surface whose key was deleted needs a new key.
+A tenant reassignment that would leave a surface naming a key whose owning surface it may not
+reference is a conflict (`409`), whichever of the two surfaces moves. The request path does not
+repeat the check: it derives the DID from an `atgk_` id without looking the key up, so a surface
+stored before this check keeps its key's DID until it is next saved or reassigned. A
+resource-scoped token's pattern is matched against the key id (`api-keys:<key id>`).
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,

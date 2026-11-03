@@ -1443,3 +1443,183 @@ async fn a_tenant_surface_cannot_keep_a_metadata_secret_its_tenant_deleted() {
         NOT_ACCESSIBLE_SECRET,
     );
 }
+
+const NOT_ACCESSIBLE_KEY_OWNER: &str = "API-key parent Surface reference is not accessible";
+
+impl Api {
+    async fn api_key(
+        &self,
+        surface_id: &str,
+    ) -> String {
+        let (status, body) = self
+            .send(
+                self.client
+                    .post(self.url(&format!("api-keys/{surface_id}")))
+                    .json(&json!({"client_id": "client"})),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+        body["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+}
+
+fn from_api_key(key_id: &str) -> Value {
+    json!({"type": "from_api_key", "api_key_id": key_id})
+}
+
+fn transit_point_identity(key_id: &str) -> Value {
+    json!({"points": [{
+        "id": "partner-id", "alias": "partner", "target_endpoint": "http://127.0.0.1:9/partner",
+        "protocol": "a2a", "require_transit_token": false, "allow_unauthenticated_callers": true,
+        "managed_identity": from_api_key(key_id)
+    }]})
+}
+
+fn plain_api_key_caller(secret_id: &str) -> Value {
+    json!({"methods": [{
+        "type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": secret_id
+    }]})
+}
+
+struct OwnedKeys {
+    tenant_a: String,
+    tenant_b: String,
+    appliance: String,
+}
+
+async fn owned_keys(api: &Api) -> OwnedKeys {
+    let mut keys = Vec::new();
+    for (route, tenant) in
+        [("/smoke/keys-a", Some("tenant-a")), ("/smoke/keys-b", Some("tenant-b")), ("/smoke/keys-wide", None)]
+    {
+        let owner = api
+            .created_id(&api.surface(route, tenant, json!({})))
+            .await;
+        keys.push(api.api_key(&owner).await);
+    }
+    let [tenant_a, tenant_b, appliance] = keys.try_into().unwrap();
+    OwnedKeys { tenant_a, tenant_b, appliance }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surface() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let keys = owned_keys(&api).await;
+    let with_slot = |route: &str, tenant: Option<&str>, slot: &str, key_id: &str| {
+        api.surface(route, tenant, json!({"identity_slots": {slot: from_api_key(key_id)}}))
+    };
+
+    for slot in ["protected", "external"] {
+        assert_refused(
+            api.create(&with_slot(&format!("/smoke/{slot}-cross"), Some("tenant-a"), slot, &keys.tenant_b))
+                .await,
+            NOT_ACCESSIBLE_KEY_OWNER,
+        );
+        assert_refused(
+            api.create(&with_slot(&format!("/smoke/{slot}-wide"), None, slot, &keys.tenant_a))
+                .await,
+            NOT_ACCESSIBLE_KEY_OWNER,
+        );
+        assert_saved(
+            api.create(&with_slot(&format!("/smoke/{slot}-own"), Some("tenant-a"), slot, &keys.tenant_a))
+                .await,
+        );
+        assert_saved(
+            api.create(&with_slot(&format!("/smoke/{slot}-appliance"), Some("tenant-a"), slot, &keys.appliance))
+                .await,
+        );
+    }
+    assert_refused(
+        api.create(&api.surface(
+            "/smoke/point-cross",
+            Some("tenant-a"),
+            json!({"transit": transit_point_identity(&keys.tenant_b)}),
+        ))
+        .await,
+        NOT_ACCESSIBLE_KEY_OWNER,
+    );
+    assert_saved(
+        api.create(&api.surface(
+            "/smoke/point-own",
+            Some("tenant-a"),
+            json!({"transit": transit_point_identity(&keys.tenant_a)}),
+        ))
+        .await,
+    );
+    assert_refused(
+        api.create(&with_slot(
+            "/smoke/missing-key",
+            Some("tenant-a"),
+            "protected",
+            "atgk_00000000000000000000000000000000",
+        ))
+        .await,
+        "API key reference is not accessible",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_api_key_secret_cannot_share_the_did_of_another_tenants_provider_key() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let keys = owned_keys(&api).await;
+    let unmatched = "atgk_ffffffffffffffffffffffffffffffff";
+    for secret_id in [&keys.tenant_b, &keys.tenant_a, unmatched] {
+        api.secret(secret_id, Some("tenant-a"), "v")
+            .await;
+    }
+    let caller = |route: &str, secret_id: &str| {
+        api.surface(
+            route,
+            Some("tenant-a"),
+            json!({"access_point": {
+                "listen_address": api.listener, "route": route, "protocol": "a2a",
+                "caller_authentication": plain_api_key_caller(secret_id)
+            }}),
+        )
+    };
+
+    assert_refused(
+        api.create(&caller("/smoke/secret-cross", &keys.tenant_b))
+            .await,
+        NOT_ACCESSIBLE_KEY_OWNER,
+    );
+    assert_saved(
+        api.create(&caller("/smoke/secret-own", &keys.tenant_a))
+            .await,
+    );
+    assert_saved(
+        api.create(&caller("/smoke/secret-unmatched", unmatched))
+            .await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_key_owning_surface_to_another_tenant_is_a_conflict_while_a_surface_names_its_key() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let owner = api
+        .created_id(&api.surface("/smoke/key-owner", Some("tenant-a"), json!({})))
+        .await;
+    let key_id = api.api_key(&owner).await;
+    let naming = api
+        .created_id(&api.surface(
+            "/smoke/key-user",
+            Some("tenant-a"),
+            json!({"identity_slots": {"protected": from_api_key(&key_id)}}),
+        ))
+        .await;
+
+    let (status, body) = api
+        .reassign("surfaces", &owner, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "tenant_reassignment_blocked", "{body}");
+    assert_eq!(api.stored(&owner).await["tenant_id"], "tenant-a", "a blocked reassignment changes nothing");
+
+    let (status, body) = api
+        .reassign("surfaces", &naming, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+}

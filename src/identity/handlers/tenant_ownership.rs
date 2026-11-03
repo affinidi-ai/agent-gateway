@@ -22,7 +22,7 @@ use crate::tenancy::{
 };
 use crate::trust_registries::TrustRegistryStore;
 
-use super::surface_tenancy::collect_surface_reference_keys;
+use super::surface_tenancy::{collect_provider_key_references, collect_surface_reference_keys, provider_key_owners};
 use crate::config::credential_policy::RuleMode;
 
 #[derive(Debug)]
@@ -456,6 +456,7 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
         .agent_surface_store
         .as_ref()
     {
+        let mut key_owners = None;
         for mut surface in store
             .list_all()
             .await
@@ -484,6 +485,44 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                         ..edge
                     });
                 }
+            }
+            let keys = collect_provider_key_references(&surface).map_err(|error| {
+                OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
+            })?;
+            if keys.is_empty() {
+                continue;
+            }
+            if key_owners.is_none() {
+                key_owners = Some(
+                    provider_key_owners(state)
+                        .await
+                        .map_err(|error| {
+                            OwnershipApiError::Internal(format!("Failed to inspect API key owners: {:?}", error))
+                        })?,
+                );
+            }
+            let owners = key_owners
+                .as_ref()
+                .map(|owners| {
+                    keys.iter()
+                        .filter_map(|key| owners.get(&key.key_id))
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for owner in owners {
+                references.extend(
+                    ownership_reference(
+                        state,
+                        source.clone(),
+                        ResourceKind::ApiKeys,
+                        &owner,
+                        "surface identity",
+                        false,
+                    )
+                    .await?,
+                );
             }
         }
     }

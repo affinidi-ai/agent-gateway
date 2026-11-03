@@ -1359,6 +1359,7 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             delegation_vault_store: None,
             sts_client_store: None,
+            api_key_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
@@ -3142,6 +3143,7 @@ pub async fn run_axum_proxy(
                 Ok(store) => {
                     info!("API Keys store initialized at {}", api_keys_storage_path_str);
                     let store_arc = std::sync::Arc::new(store);
+                    identity_state.api_key_store = Some(store_arc.clone());
                     {
                         use crate::api_keys::store::ApiKeyStore as _;
                         let s = store_arc.clone();
