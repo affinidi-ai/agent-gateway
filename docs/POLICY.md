@@ -23,10 +23,12 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
-A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of an
-agent card or `.well-known` discovery path (`paths::is_public_request`). This holds on the
-direct path, Fabric receive, and the sending gateway of a `fabric://` Target, so a `POST` to a
-path that merely ends in `/agent-card.json` or `/agent.json` is evaluated like any other call.
+A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
+ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
+`/discovery` (`paths::is_public_request`). This holds on the direct path, Fabric receive, and the
+sending gateway of a `fabric://` Target, so a `POST` to a path that merely ends in
+`/agent-card.json` or `/agent.json` is evaluated like any other call, and the sending gateway
+skips its policy for a `GET` of `/discovery` or `/.well-known/ucp` as the direct path does.
 
 ### MCP request context (`input.mcp`)
 
@@ -724,7 +726,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   policy input sees the card of a protected Target. A blocked target, a
   redirect, a non-success answer or a `target.auth` credential that cannot be
   resolved yields no card in the policy input; the failure is logged as a
-  warning without the credential.
+  warning without the credential. Under `target.auth.fallback: passthrough` a
+  credential that cannot be resolved reads the card without it.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's

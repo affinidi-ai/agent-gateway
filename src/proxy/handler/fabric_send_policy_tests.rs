@@ -1,5 +1,5 @@
 //! The sending gateway's surface policy on a `fabric://` Target: only a public discovery read
-//! (`GET` or `HEAD` of a card path) skips it; any other method on a card-like path is evaluated.
+//! (`GET` or `HEAD` of a public path) skips it; any other method on a card-like path is evaluated.
 
 use std::sync::Arc;
 
@@ -90,14 +90,15 @@ async fn a_post_to_a_card_like_path_is_evaluated_by_the_surface_policy() {
     }
 }
 
-#[test]
-fn only_a_discovery_read_skips_the_sending_gateways_surface_policy() {
-    for (method, path) in [("GET", "/a2a/.well-known/agent-card.json"), ("HEAD", "/a2a/x/agent.json")] {
-        assert!(crate::proxy::paths::is_public_request(method, path), "{method} {path}");
-    }
-    for (method, path) in
-        [("POST", "/a2a/.well-known/agent-card.json"), ("POST", "/a2a/x/agent.json"), ("PUT", "/a2a/x/agent-card.json")]
-    {
-        assert!(!crate::proxy::paths::is_public_request(method, path), "{method} {path}");
+#[tokio::test]
+async fn a_discovery_read_is_not_refused_by_the_sending_gateways_surface_policy() {
+    for (method, path) in [
+        (axum::http::Method::GET, "/a2a/x/agent.json"),
+        (axum::http::Method::HEAD, "/a2a/x/agent-card.json"),
+        (axum::http::Method::GET, "/a2a/x/discovery"),
+    ] {
+        let (router, _policies) = denying_router().await;
+        let (status, _) = super::variant_routing_tests::send_method(router, method.clone(), path).await;
+        assert_ne!(status, axum::http::StatusCode::FORBIDDEN, "{method} {path}");
     }
 }

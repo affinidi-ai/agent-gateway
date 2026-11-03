@@ -1751,7 +1751,8 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
 /// The card read for the policy input authenticates to the Target as the
 /// gateway, with a credential from the gateway's secrets store, so a protected
 /// Target's card reaches policy; a credential that cannot be resolved leaves the
-/// policy input without a card.
+/// policy input without a card, or under `fallback: passthrough` reads it
+/// without the credential.
 #[tokio::test]
 async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_without_it() {
     let target = ProtectedTarget::start().await;
@@ -1782,6 +1783,63 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
     assert_eq!(card(unresolvable).await, None, "absent secret");
     assert_eq!(target.received().len(), called, "the Target was asked without the credential");
 
+    let mut passthrough = serde_json::to_value(protected_surface(&target.url, "absent-key", None)).unwrap();
+    passthrough["target"]["auth"]["fallback"] = json!("passthrough");
+    assert_eq!(card(serde_json::from_value(passthrough).unwrap()).await, None, "a 401 is no card");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/.well-known/agent.json");
+    assert!(
+        request
+            .headers
+            .get(TARGET_KEY_HEADER)
+            .is_none(),
+        "passthrough reads the card without the credential"
+    );
+
     let unprotected = surface("a2a", &target.url, &[]);
     assert_eq!(card(unprotected).await, None, "a 401 is no card");
+}
+
+/// The gateway's own card fetch carries no trace id from the peer's request,
+/// even where the surface would forward a fresh one; a caller's request still
+/// carries one.
+#[tokio::test]
+async fn a_card_fetch_over_fabric_carries_no_onward_trace_id() {
+    if ran_in_child("ATG_FABRIC_CARD_TRACE_ID_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(protected_surface(&target.url, "target-key", None)).unwrap();
+    value["access_point"]["terminate_trace_id"] = json!(true);
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+    assert!(
+        request
+            .headers
+            .get("x-gateway-trace-id")
+            .is_none(),
+        "the card fetch carried a trace id"
+    );
+
+    let mut authenticated = peer_request(root.path(), "POST", "/rpc");
+    authenticated.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
+    let response = forward_response(&authenticated).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(header_values(&request.headers, "x-gateway-trace-id").len(), 1, "a caller's request carries a trace id");
 }

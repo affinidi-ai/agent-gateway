@@ -470,8 +470,9 @@ fetch is the gateway's own request: a `GET` with no body, sent to the normalised
 configured location on the Target's origin), carrying `target.auth` and only the peer's `Accept`,
 `Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers and body are
 dropped, and the fetch carries no caller's material: no delegated credential from
-`outbound_credentials` (so it never answers `consent_required`) and no transit token, even at a
-configured card location.
+`outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
+configured card location, and no `X-Gateway-Trace-Id`. The client does not follow redirects, so a
+3xx from the Target is answered to the peer as is.
 
 Every other public path, such as `/discovery`, `/.well-known/ucp` or `/x/%2e%2e/discovery`, skips
 caller authentication and is forwarded without the credential. A credential that cannot be resolved
@@ -479,7 +480,9 @@ under `target.auth.fallback: reject` answers `502` "Target authentication failed
 the direct path and the MCP proxy path.
 
 The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
-from the gateway's secrets store rather than opening one per request; see
+from the gateway's secrets store rather than opening one per request. Under
+`target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it;
+see
 [`POLICY.md`](POLICY.md#other-pinned-egress-sinks).
 
 ### Modern MCP activation

@@ -3531,7 +3531,8 @@ fn fabric_body_limits(
 /// location on the Target's origin, or `/.well-known/agent.json` under the Target
 /// endpoint, fetched as the gateway itself with the surface's Target
 /// authentication, resolved from the gateway's secrets store. A credential that
-/// cannot be resolved yields no card.
+/// cannot be resolved yields no card, or under `fallback: passthrough` a card
+/// read without it.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
@@ -3565,6 +3566,14 @@ async fn policy_agent_card(
             .await
             {
                 Ok(credential) => credential,
+                Err(error) if target_auth.fallback == crate::config::TargetAuthFallback::Passthrough => {
+                    channel_warn!(
+                        config_id,
+                        "GW2: Reading the agent card for policy without target authentication: {}",
+                        error
+                    );
+                    None
+                }
                 Err(error) => {
                     channel_warn!(config_id, "GW2: No agent card for policy: target authentication failed: {}", error);
                     return None;
@@ -5767,9 +5776,10 @@ async fn process_charged_forward_request(
     // request, as on the direct path: a bodiless GET of the normalised card path
     // that keeps only content-negotiation headers from the peer, and carries no
     // caller's delegated credential or transit token.
-    let card_fetch_path =
-        crate::proxy::paths::credentialed_agent_card_path(method, path, surface.agent_card_location_path());
-    let credentialed_card_fetch = card_fetch_path.is_some() && surface.target_auth().is_some();
+    let card_fetch_path = surface
+        .target_auth()
+        .and_then(|_| crate::proxy::paths::credentialed_agent_card_path(method, path, surface.agent_card_location_path()));
+    let credentialed_card_fetch = card_fetch_path.is_some();
     if credentialed_card_fetch {
         body_bytes = Default::default();
         outbound_creds.clear();
@@ -5780,35 +5790,11 @@ async fn process_charged_forward_request(
         .filter(|_| credentialed_card_fetch)
         .unwrap_or(path);
 
-    // Build the target URL (path includes query params if present)
-    // When override_agent_card_location is enabled and this is an agent card request,
-    // use the custom path relative to the target's origin (scheme + host + port),
-    // stripping any sub-path from target_endpoint.
-    let target_url = if (is_agent_card_request || credentialed_card_fetch)
-        && surface.override_agent_card_location()
-        && surface.agent_card_location_path().is_some()
-    {
-        let custom_path = surface.agent_card_location_path().unwrap();
-        let target_endpoint = surface.target_endpoint();
-        let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-            let after_scheme = &target_endpoint[scheme_end + 3..];
-            let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            &target_endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            target_endpoint
-        };
-        let url = if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        };
-        channel_info!(
-            config_id,
-            "Agent card location override applied: {} (origin={}, custom_path={})",
-            loggable::url(&url),
-            loggable::origin(origin),
-            custom_path
-        );
+    // An agent card request at a configured card location goes to that path on the
+    // Target's origin, dropping any sub-path of the Target endpoint.
+    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
+        let url = crate::proxy::handler::agent_card::card_target_url(&surface);
+        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
         url
     } else {
         join_endpoint_path(surface.target_endpoint(), forward_path)
@@ -5816,9 +5802,10 @@ async fn process_charged_forward_request(
 
     channel_info!(
         config_id,
-        "🌐 Making HTTP request: {} {}",
+        "🌐 Making HTTP request: {} {}{}",
         method.to_uppercase(),
-        loggable::url(&target_url)
+        loggable::url(&target_url),
+        if credentialed_card_fetch { " as the gateway's own agent card GET" } else { "" }
     );
 
     // Start timer for latency measurement
@@ -6312,8 +6299,10 @@ async fn process_charged_forward_request(
     // trace. Normally this is the request's own trace (`REQUEST_TRACE_ID`); when the
     // surface terminates traces we forward a FRESH id instead, so this gateway's own
     // VP/audit keep the incoming trace (past stays traceable) while the downstream
-    // chain is isolated from it.
-    let onward_trace_id = if surface.access_point.terminate_trace_id {
+    // chain is isolated from it. The gateway's own agent card fetch carries none.
+    let onward_trace_id = if credentialed_card_fetch {
+        None
+    } else if surface.access_point.terminate_trace_id {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
         crate::observability::policy_audit::current_span_trace_id()

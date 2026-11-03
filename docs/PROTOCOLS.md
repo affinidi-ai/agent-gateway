@@ -73,7 +73,7 @@ sequenceDiagram
 | Blocked by egress policy | 403 |
 | Without `target.auth` | The fetch forwards caller headers except `Cookie`, and follows redirects as before. |
 | `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
-| Fabric receive | The receiving gateway applies these rules to a card fetch a peer sends: only an exact card path is credentialed, as a bodiless `GET` with the same three caller headers. See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
+| Fabric receive | The receiving gateway applies these rules to a card fetch a peer sends: only an exact card path is credentialed, as a bodiless `GET` with the same three caller headers, and with the same failure text. Redirects are not followed, but a 3xx is answered to the peer as is rather than as 502. See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
 
 The card fetched with `target.auth` is served to unauthenticated callers as is, so a
 target must not return credential-only content on its card path. A2A's authenticated

@@ -148,6 +148,7 @@ impl Receiver {
         let card: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
             "surface_id": "card-own", "name": "card-own", "tenant_id": "tenant-a",
             "access_point": {"listen_address": "127.0.0.1:8080", "route": "/card-own", "protocol": "a2a",
+                "agent_card_path": "/cards/me",
                 "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
                     "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
             "target": {"endpoint": target.url,
@@ -504,6 +505,13 @@ fn a_credentialed_card_fetch_carries_the_target_credential_and_no_delegated_one(
                 .await,
             (200, sent(Some("own-value"), None), Vec::<String>::new()),
             "the gateway's own card fetch carries only the Target credential"
+        );
+        assert_eq!(
+            receiver
+                .receive_at("card-own", RuleMode::Warn, Some(CALLER_KEY), "GET", "/cards/me")
+                .await,
+            (200, sent(Some("own-value"), None), Vec::<String>::new()),
+            "a card fetch at the configured location carries only the Target credential"
         );
     });
 }
