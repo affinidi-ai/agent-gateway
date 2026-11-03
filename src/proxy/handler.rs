@@ -1718,8 +1718,6 @@ async fn proxy_handler_with_mcp_runtime(
         .unwrap_or(&addr_string)
         .to_string();
 
-    channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
-
     if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
         let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
             Ok(response) | Err(response) => response,
@@ -1741,7 +1739,7 @@ async fn proxy_handler_with_mcp_runtime(
         };
 
         if let Some(cfg) = didauth_cfg {
-            channel_info!(config_id, "DID Auth request detected: {}", path);
+            channel_info!(config_id, "DID Auth request detected: {}", logged_path);
 
             // Read the request body
             let (_parts, body) = req.into_parts();
@@ -9654,13 +9652,8 @@ async fn multi_channel_proxy_handler_in_request_scope(
 ) -> Response {
     // Generate unique ID for this handler invocation to track duplicates
     let handler_invocation_id = uuid::Uuid::new_v4();
-    // Extract path and query before consuming req
     let path = req.uri().path().to_string();
     let logged_path = loggable::untrusted(&loggable::path(&path));
-    let query = req
-        .uri()
-        .query()
-        .map(|q| q.to_string());
     info!(
         "🔵 HANDLER ENTRY: invocation_id={} source={} method={} path={}",
         handler_invocation_id,
@@ -9669,7 +9662,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
         logged_path
     );
 
-    debug!("Multi-channel handler received request: method={} path={}", req.method(), logged_path);
+    // Extract the query before consuming req
+    let query = req
+        .uri()
+        .query()
+        .map(|q| q.to_string());
 
     // Find the matching channel and parse any `$alias` suffix attached to its route.
     // URL grammar: `/route[$alias][/rest]`.
@@ -9717,14 +9714,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
         Some((ch, _route, alias, tail)) => (Some(ch), alias, tail),
         None => (None, None, String::new()),
     };
-
-    if let Some(ref alias) = virtual_channel_alias {
-        debug!(
-            "Variant alias detected: alias={} tail={}",
-            loggable::untrusted(alias),
-            loggable::untrusted(&loggable::path(&stripped_tail))
-        );
-    }
 
     match channel_info {
         Some(ch) => {
@@ -22331,12 +22320,16 @@ allow if {
     async fn a_path_no_surface_serves_logs_one_bounded_line_naming_no_surface() {
         let surface = mcp_surface("tenant-only-surface", "http://127.0.0.1:9", None);
         let state = bare_proxy_state(surface.clone(), None);
+        let capability_id = uuid::Uuid::new_v4().to_string();
         let tail = "a".repeat(1000);
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
 
-        let response =
-            send_to_surface(&state, surface, legacy_mcp_request(&format!("/unknown/{tail}"), &serde_json::json!({})))
-                .await;
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(&format!("/onboard/{capability_id}/{tail}"), &serde_json::json!({})),
+        )
+        .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
         let text = logs.text();
@@ -22345,53 +22338,38 @@ allow if {
             .filter(|line| line.contains("No surface route matches path"))
             .collect();
         assert_eq!(misses.len(), 1, "{text}");
+        let shortened = crate::observability::loggable::secret(&capability_id);
         assert!(
-            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/unknown/{tail}"))),
+            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/onboard/{shortened}/{tail}"))),
             "{}",
             misses[0]
         );
         assert!(!text.contains(&tail), "a log holds the whole path: {text}");
+        assert!(!text.contains(&capability_id), "a log holds the capability id: {text}");
         assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
     }
 
     #[tokio::test]
-    async fn an_unknown_paths_capability_id_is_shortened_on_every_log_line() {
-        let surface = mcp_surface("tenant-only-surface", "http://127.0.0.1:9", None);
-        let state = bare_proxy_state(surface.clone(), None);
-        let capability_id = uuid::Uuid::new_v4().to_string();
-        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
-
-        let response = send_to_surface(
-            &state,
-            surface,
-            legacy_mcp_request(&format!("/onboard/{capability_id}/finish"), &serde_json::json!({})),
-        )
-        .await;
-
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
-        let text = logs.text();
-        let shortened = crate::observability::loggable::secret(&capability_id);
-        let miss = text
-            .lines()
-            .find(|line| line.contains("No surface route matches path"))
-            .unwrap_or_else(|| panic!("no miss line: {text}"));
-        assert!(miss.contains(&format!("/onboard/{shortened}/finish")), "{miss}");
-        assert!(text.contains("HANDLER ENTRY"), "{text}");
-        assert!(!text.contains(&capability_id), "a log holds the capability id: {text}");
-    }
-
-    #[tokio::test]
     async fn a_matched_routes_caller_path_is_logged_bounded_with_capability_ids_shortened() {
-        let mut surface = mcp_surface("closed-surface", "http://127.0.0.1:9", None);
-        surface.access_point.public = Some(false);
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "guarded", "name": "guarded",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/guarded", "protocol": "mcp",
+                "caller_authentication": {"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]}},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
         let state = bare_proxy_state(surface.clone(), None);
         let capability_id = uuid::Uuid::new_v4().to_string();
         let shortened = crate::observability::loggable::secret(&capability_id);
         let padding = "a".repeat(1000);
 
-        for (route, status) in [
-            ("/closed-surface", axum::http::StatusCode::SERVICE_UNAVAILABLE),
-            ("/closed-surface$canary", axum::http::StatusCode::NOT_FOUND),
+        // Without source authentication the surface's handler refuses the
+        // request after logging its entry; an unknown alias is refused at routing.
+        for (route, status, reaches_surface_handler) in [
+            ("/guarded", axum::http::StatusCode::INTERNAL_SERVER_ERROR, true),
+            ("/guarded$canary", axum::http::StatusCode::NOT_FOUND, false),
         ] {
             let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
             let path = format!("{route}/onboard/{capability_id}/{padding}");
@@ -22403,10 +22381,11 @@ allow if {
             let text = logs.text();
             let matched = text
                 .lines()
-                .find(|line| line.contains("Matched channel 'closed-surface'"))
+                .find(|line| line.contains("Matched channel 'guarded'"))
                 .unwrap_or_else(|| panic!("{route}: no match line: {text}"));
             assert!(matched.contains(&format!("{route}/onboard/{shortened}/aaa")), "{matched}");
             assert!(matched.contains("aaa\"..."), "{route}: the path is not cut: {matched}");
+            assert_eq!(text.contains("INNER HANDLER ENTRY"), reaches_surface_handler, "{route}: {text}");
             assert!(!text.contains(&padding), "{route}: a log holds the whole path: {text}");
             assert!(!text.contains(&capability_id), "{route}: a log holds the capability id: {text}");
         }
