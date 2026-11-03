@@ -1,0 +1,16 @@
+branch: fix/network-review-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-03T20:30:00Z'
+      title: Stop Transit Points passing a caller's client address and host headers
+      description: >-
+        A Transit Point dropped a caller's Forwarded, X-Real-IP and X-Forwarded headers but passed
+        the other headers proxies and CDNs use to claim the client's address, host or scheme, such
+        as True-Client-IP, CF-Connecting-IP, X-Client-IP and X-Original-Host, so a target that
+        trusts the gateway as its proxy could still take the caller's claim. It now drops those
+        too, in any case and with underscores for dashes, and the docs list every header dropped.
+  breaking: []
