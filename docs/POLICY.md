@@ -427,10 +427,16 @@ allow if {
 }
 ```
 
+### Fabric callers on a Transit Point
+
 A request a partner gateway sent over Fabric reaches the managed agent with a transit token
-that opens the Transit Points setting `allow_fabric_callers`, so its agent can call them. A rule
-on `verification == "transit_token"` never matches such a request, whichever DID it names. To
-admit one partner's requests on a Transit Point:
+that opens every Transit Point of the surface, so its agent can call them; which partners reach
+a surface is set by peer exposure ([`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)).
+Such a call is a `fabric_peer` caller. A rule on `verification == "transit_token"` never matches
+it, whichever DID it names, but a rule that refuses only anonymous callers admits it, and one
+that admits any `verified` caller admits it whenever the receiving surface verified the
+partner's caller. Review such rules on the Transit Points of surfaces a partner reaches, and match
+`verification` explicitly. To admit one partner's requests on a Transit Point:
 
 ```rego
 package surface.policy

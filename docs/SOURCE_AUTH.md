@@ -398,10 +398,10 @@ Point does not support. The panel applies the rules above before the save: a Tra
 authenticates no caller and is not open, one that is open beside the token or a method, and a
 method that is missing its secret, header, strategy or audience cannot be saved, and the panel
 says why. A refusal from the admin API shows in the same section in plain words. Turning
-caller authentication off sends `"source_auth": null`. The panel shows neither
-`allow_fabric_callers` nor `delegated_credentials_for_fabric_callers`; a dashboard save keeps
-both, the second while the Transit Point still requires the transit token and the surface's
-caller authentication still tells a partner's users apart.
+caller authentication off sends `"source_auth": null`. The panel does not show
+`delegated_credentials_for_fabric_callers`; a dashboard save keeps it while the Transit Point
+still requires the transit token and the surface's caller authentication still tells a
+partner's users apart.
 
 These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
@@ -603,7 +603,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with a Transit Point that sets `allow_fabric_callers`, but not for a public discovery `GET` such as an agent card fetch. The token lists only those Transit Points. When one should be issued and cannot be, the request is refused with `503` |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 
@@ -621,7 +621,7 @@ so its agent gets exactly one. It differs from an Access Point token:
 | --- | --- |
 | `sub` | Never present, so a release that predates the `fabric` claim never reads the peer's caller as one this gateway verified |
 | `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the caller DID, `fabric-asserted` otherwise |
-| `allowed_transit_points` | Only the surface's Transit Points that set `allow_fabric_callers` |
+| `allowed_transit_points` | Every Transit Point of the surface, as in the Access Point's token |
 | `user_identity_hash`, `caller_dna_uai` | Never present. `user_identity_hash` names a caller an Access Point verified; a Fabric token's principal is `fabric.principal_hash` |
 | `caller_context_fields` | The claims the surface's Transit Points allowlist (their enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`), taken from the JWT the receiving surface's own `source_auth` or resource token verified on the request. Never anything the peer's presentation or payload says |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
