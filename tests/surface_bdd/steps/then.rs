@@ -4268,6 +4268,38 @@ fn managed_agent_received_method_request_at_path(
     );
 }
 
+#[then(expr = "managed agent {string} did not receive a {word} request at path {string}")]
+fn managed_agent_did_not_receive_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    path: String,
+) {
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent),
+        &format!("managed agent '{agent_name}'"),
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == method && request.path_and_query == path),
+        "managed agent '{agent_name}' must not receive {method} {path}, got {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path_and_query))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(expr = "the response says {string}")]
+fn response_says(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = get_response_body_value(world).to_string();
+    assert!(body.contains(&expected), "response body {body:?} does not contain {expected:?}");
+}
+
 #[then(expr = "the agent card field {string} points to the gateway listen address")]
 fn agent_card_field_points_to_gateway(
     world: &mut SurfaceWorld,

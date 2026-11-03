@@ -2474,6 +2474,15 @@ async fn caller_sends_method_request_to_route_path(
     request_path_and_record(world, method, &full_path, vec![]).await;
 }
 
+#[when(expr = "the caller sends a {word} request without an API key to the surface route path {string}")]
+async fn caller_sends_method_request_without_api_key_to_route_path(
+    world: &mut SurfaceWorld,
+    method: String,
+    path: String,
+) {
+    caller_sends_method_request_to_route_path(world, method, path).await;
+}
+
 async fn request_path_and_record(
     world: &mut SurfaceWorld,
     method: reqwest::Method,

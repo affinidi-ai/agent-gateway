@@ -2585,6 +2585,13 @@ fn surface_accepts_two_source_auth_methods(
         .additional_source_auth = vec![source_auth_fixture(&second)];
 }
 
+/// The fixture sets neither `access_point.public` nor `on_failure`, so the
+/// Access Point forwards a caller whose API key is missing or invalid to policy.
+#[given(expr = "the surface requires \"API Key\" source authentication and forwards failed callers to policy")]
+fn surface_requires_api_key_and_forwards_failed_callers(world: &mut SurfaceWorld) {
+    surface_requires_source_auth(world, "API Key".to_string());
+}
+
 #[given(expr = "the alternate variant requires {string} source authentication")]
 fn alternate_variant_requires_source_auth(
     world: &mut SurfaceWorld,

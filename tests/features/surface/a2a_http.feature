@@ -261,18 +261,26 @@ Feature: A2A HTTP surface forwarding and identity
       | /.well-known/ucp    | /.well-known/ucp    |
       | /x/%2e%2e/discovery | /discovery          |
 
-  Scenario: A POST to a card-like path runs the surface policy
+  Scenario: A POST to a path that only ends like an agent card runs the surface policy
     Given the surface has a request policy that denies all requests
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller sends a POST request to the surface route path "/rpc/agent-card.json"
     Then the response status is 403
     And managed agent "bravo" was not called
 
+  Scenario: A POST to the well-known agent card path is answered by the gateway's own card GET before policy
+    Given the surface has a request policy that denies all requests
+    When the caller sends a POST request to the surface route path "/.well-known/agent-card.json"
+    Then managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" did not receive a POST request at path "/.well-known/agent-card.json"
+
   Scenario: A path whose case differs is not served as the agent card fetch
-    Given the surface requires "API Key" source authentication
+    Given the surface requires "API Key" source authentication and forwards failed callers to policy
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
-    When the caller sends a GET request to the surface route path "/.well-known/Agent-Card.json"
-    Then managed agent "bravo" did not receive header "x-target-api-key"
+    When the caller sends a GET request without an API key to the surface route path "/.well-known/Agent-Card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
+    And managed agent "bravo" did not receive header "x-target-api-key"
 
   Scenario: A2A agent card URL points to the gateway, not the Target
     Given managed agent "bravo" publishes the agent-identity extension on its agent card
