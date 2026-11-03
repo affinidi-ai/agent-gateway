@@ -894,14 +894,10 @@ A caller using a Managed Agent's key on another surface that accepts it counts a
 surface. The Managed Agent is then treated as shared by several surfaces, and its name is not
 published (see [Managed agents](#managed-agents)).
 
-Find surfaces whose callers do not authenticate with an API key through
-`agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"` and `result`
-`api_key_unavailable`. Its `channel_id` label is the surface name wherever `from_api_key`
-results are counted: the caller path, the Managed Agent's response and a Transit Point's
-outbound request.
-
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
-`agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`:
+`agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`, whose `channel_id`
+label is the surface name on the caller path, the Managed Agent's response and a Transit
+Point's outbound request:
 
 | Condition | Status | `result` |
 | --- | --- | --- |

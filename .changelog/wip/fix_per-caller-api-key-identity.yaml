@@ -14,15 +14,13 @@ changes:
     - timestamp: '2026-10-31T00:00:00Z'
       title: ⭐ Identify each caller by the API key it presents
       description: >-
-        An inbound Identity set to From API Key derived every caller's DID from one
-        operator-picked key, so all callers on a surface shared a DID. The caller DID now
-        comes from the API key each request presents. An API Key Provider gives one DID per
-        key, reported to policy as `source_auth`; a plain API Key gives one DID per secret,
-        shared by everyone holding it and reported as `unverified`. A failed or revoked key
-        resolves no caller identity. The inbound slot stores no key id; a stored one is
-        ignored and dropped on save. A key that also identifies a Managed Agent resolves to
-        that Managed Agent's DID for its callers; a surface policy can refuse those callers
-        by `input.source_auth.key_name`.
+        An inbound Identity set to From API Key gave every caller the DID of one stored key.
+        The caller DID now comes from the API key each request presents: one DID per API Key
+        Provider key, reported to policy as `source_auth`, or one per plain API Key secret,
+        shared by its holders and reported as `unverified`. A failed or revoked key resolves
+        no caller identity. A stored inbound key id is ignored and dropped on save. A key that
+        is also a Managed Agent's key gives its callers that Managed Agent's DID; a surface
+        policy can refuse them by `input.source_auth.key_name`.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Stop asking for an API key on the inbound Identity in the Surface Builder
       description: >-
@@ -56,37 +54,35 @@ changes:
       description: >-
         On a direct request to a surface whose inbound Identity is From API Key, the presented
         key's DID replaces any identity the request body asserts, so a key holder cannot choose
-        another DID. `input.agent.did` and its verification are the key's DID, and a
-        presentation or credential extension in the body no longer sets the caller DID, so
-        policies naming the presentation's DID stop matching. When the body does not assert
-        the key's own DID, or no caller identity resolves, the trust-registry claims it made
-        (`provider_did`, `trust_registry_did`, `authority_did`, `identity_issuer_did`,
-        `agent_dna` and trust verifications) are dropped, so Trust Check presets that read
-        `input.agent.provider_did` deny. Gateway-plane policy, including its global policy,
-        sees no `input.agent.did` and none of those claims on these surfaces. On a `fabric://`
-        target only `access_point.inbound_policy` sees the key's DID; `target.policy` keeps its
-        input. Fabric receive does not read this mode; the request body sets the caller there.
+        another DID, and policies naming a presentation's DID stop matching. Unless the body
+        asserts the key's own DID, its trust-registry claims (`provider_did`,
+        `trust_registry_did`, `authority_did`, `identity_issuer_did`, `agent_dna` and trust
+        verifications) are dropped, so Trust Check presets that read `input.agent.provider_did`
+        deny. Gateway-plane policy runs before the key resolves and sees none of these. On a
+        `fabric://` target only `access_point.inbound_policy` sees the key's DID. Fabric
+        receive does not read this mode.
   breaking:
     - timestamp: '2026-11-02T00:00:00Z'
       title: Fail closed when an inbound From API Key caller does not use an API key
       description: >-
-        An inbound From API Key Identity behind caller authentication that is not API Key or
-        API Key Provider returns 500 with a fixed body (metric `api_key_unavailable`). Saving
-        it, on the surface or an enabled variant, is refused with 400, as is combining it with
-        `mcp_http.authorization`. A missing VC issuer or a failed DID issuance resolves no
-        caller identity and leaves the decision to policy, as before. Find affected surfaces through `agent_gateway_managed_identity_resolve_total` with
-        `mode="from_api_key"` and `result` `api_key_unavailable`.
+        An inbound From API Key Identity whose first Caller Context method is not API Key or
+        API Key Provider gave callers the stored key's DID; it now returns 500 with a fixed
+        body. Find such surfaces through `agent_gateway_managed_identity_resolve_total` with
+        `mode="from_api_key"` and `result` `api_key_unavailable`. Saving one, on the surface
+        or an enabled variant, is refused with 400, as is combining it with
+        `mcp_http.authorization`, or a From API Key Identity on the protected, external or a
+        Transit Point slot without a key id. A missing VC issuer or a failed DID issuance
+        still resolves no caller identity and leaves the decision to policy.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching
       description: >-
-        Callers on an API Key Provider surface no longer share the configured key's DID; only
-        callers presenting that key keep it. Every caller on a plain API Key surface gets a new
-        DID, derived from the Caller Context secret id: the dashboard stored an API Key Provider
-        key id there, never a secret id, so no caller keeps its old DID unless an API write had
-        stored the secret id itself. Policies, Trust Check
-        entries and Transit Point OAuth grants tied to an old DID stop matching, and the
-        Transit token `sub` and Workload Binding `userIdentity.id` are per key. The stored
-        inbound key id is dropped on save. Re-grant or update rules for the affected keys.
+        On an API Key Provider surface, only callers presenting the stored key keep its DID;
+        every other key gets its own. On a plain API Key surface, callers get the DID of the
+        Caller Context secret id. That DID is new on every surface made in the dashboard,
+        whose picker stored a provider key id, never a secret id. Policies, Trust Check
+        entries and Transit Point OAuth grants naming an old DID stop matching, and the
+        Transit token `sub` and Workload Binding `userIdentity.id` are per key. Re-grant or
+        update rules for the affected keys.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Refuse From API Key on an MCP proxy:// surface when it is saved again
       description: >-

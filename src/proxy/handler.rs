@@ -22783,6 +22783,7 @@ mod fabric_extended_card_tests {
         name: &'static str,
         inbound: String,
         target: String,
+        key_failed: bool,
         expected: axum::http::StatusCode,
     }
 
@@ -22841,17 +22842,20 @@ mod fabric_extended_card_tests {
         let card_and_body_target_rule = format!(
             "package surface.policy\ndefault allow = false\nallow if {{\n    input.agent.did == \"{CARD_DID}\"\n    not input.extension_identity\n    input.source_auth.key_name == \"{KEY_ID}\"\n}}"
         );
+        let failed_key_rule = "package surface.policy\ndefault allow = false\nallow if {\n    input.source_auth.method == \"failed\"\n    not input.extension_identity\n}";
         let cases = [
             FabricPolicyCase {
                 name: "inbound sees the key DID, target sees the card DID",
                 inbound: inbound_rule(&key_did),
                 target: card_and_body_target_rule.clone(),
+                key_failed: false,
                 expected: axum::http::StatusCode::OK,
             },
             FabricPolicyCase {
                 name: "inbound rule naming another DID denies",
                 inbound: inbound_rule("did:example:other"),
                 target: card_and_body_target_rule,
+                key_failed: false,
                 expected: axum::http::StatusCode::FORBIDDEN,
             },
             FabricPolicyCase {
@@ -22859,6 +22863,21 @@ mod fabric_extended_card_tests {
                 inbound: inbound_rule(&key_did),
                 target: "package surface.policy\ndefault allow = false\nallow if input.extension_identity.did"
                     .to_string(),
+                key_failed: false,
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+            FabricPolicyCase {
+                name: "a failed key gives the inbound policy no caller identity",
+                inbound: failed_key_rule.to_string(),
+                target: failed_key_rule.to_string(),
+                key_failed: true,
+                expected: axum::http::StatusCode::OK,
+            },
+            FabricPolicyCase {
+                name: "a failed key does not carry the key DID",
+                inbound: inbound_rule(&key_did),
+                target: failed_key_rule.to_string(),
+                key_failed: true,
                 expected: axum::http::StatusCode::FORBIDDEN,
             },
         ];
@@ -22926,8 +22945,15 @@ mod fabric_extended_card_tests {
                 axum::body::Bytes::from(body.to_string()),
                 "trace-1".to_string(),
                 None,
-                Some(key.clone()),
-                Some(crate::surface_context::SourceAuthContext::ApiKey { key_name: KEY_ID.to_string() }),
+                (!case.key_failed).then(|| key.clone()),
+                Some(if case.key_failed {
+                    crate::surface_context::SourceAuthContext::Failed {
+                        attempted_method: "api_key_provider".to_string(),
+                        reason: "Invalid API key".to_string(),
+                    }
+                } else {
+                    crate::surface_context::SourceAuthContext::ApiKey { key_name: KEY_ID.to_string() }
+                }),
                 None,
                 crate::mcp::meta::McpMetadataContext::default(),
                 None,
