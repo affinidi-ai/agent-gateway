@@ -452,24 +452,35 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         )
         .unwrap();
     }
-    let api_keys = std::path::Path::new(
+    seed_api_key(bootstrap, STORED_KEY_OWNER_SURFACE, STORED_APPLIANCE_KEY);
+}
+
+fn api_keys_dir(bootstrap: &crate::config::BootstrapConfig) -> std::path::PathBuf {
+    std::path::Path::new(
         &bootstrap
             .storage_paths
             .secrets,
     )
     .parent()
     .unwrap()
-    .join("api_keys");
+    .join("api_keys")
+}
+
+fn seed_api_key(
+    bootstrap: &crate::config::BootstrapConfig,
+    owner: &str,
+    key_id: &str,
+) {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             use crate::api_keys::store::ApiKeyStore as _;
-            crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+            crate::api_keys::FileSystemApiKeyStore::new(&api_keys_dir(bootstrap).to_string_lossy())
                 .await
                 .unwrap()
                 .create_with_material(
-                    STORED_KEY_OWNER_SURFACE,
-                    STORED_APPLIANCE_KEY.to_string(),
-                    "atgs_stored_appliance_key".to_string(),
+                    owner,
+                    key_id.to_string(),
+                    format!("atgs_{key_id}"),
                     "client",
                     None,
                     "component-test",
@@ -478,6 +489,35 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
                 .unwrap();
         })
     });
+}
+
+fn write_stored_surface(
+    bootstrap: &crate::config::BootstrapConfig,
+    surface_id: &str,
+    extra: Value,
+) {
+    let gateway: Value = serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
+    let port = gateway["listeners"][0]["port"]
+        .as_u64()
+        .unwrap();
+    let mut surface = json!({
+        "surface_id": surface_id, "name": surface_id, "status": "disabled", "tenant_id": "tenant-a",
+        "access_point": {
+            "listen_address": format!("http://localhost:{port}"), "route": format!("/smoke/{surface_id}"),
+            "protocol": "a2a"
+        },
+        "target": {"endpoint": "http://127.0.0.1:9/"}
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        surface[key] = value.clone();
+    }
+    let directory = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .agent_surfaces,
+    );
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(directory.join(format!("{surface_id}.json")), serde_json::to_vec(&surface).unwrap()).unwrap();
 }
 
 async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
@@ -1971,4 +2011,91 @@ async fn moving_a_key_owning_surface_to_another_tenant_is_a_conflict_while_a_sur
         .reassign("surfaces", &naming, Some("tenant-b"))
         .await;
     assert_eq!(status, 409, "{body}");
+}
+
+const SCOPED_KEY_OWNER: &str = "scoped-key-owner";
+const SCOPED_ALLOWED_KEY: &str = "atgk_00000000000000000000000000000a01";
+const SCOPED_EXCLUDED_KEY: &str = "atgk_00000000000000000000000000000e01";
+const SCOPED_GONE_KEY: &str = "atgk_00000000000000000000000000000901";
+const SCOPED_STORED_SURFACE: &str = "scoped-stored-surface";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resource_scoped_token_names_only_the_provider_keys_its_pattern_allows() {
+    let mut client = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        configure_admin_api(bootstrap);
+        write_stored_surface(bootstrap, SCOPED_KEY_OWNER, json!({}));
+        write_stored_surface(
+            bootstrap,
+            SCOPED_STORED_SURFACE,
+            json!({"identity_slots": {"protected": from_api_key(SCOPED_GONE_KEY)}}),
+        );
+        for key_id in [SCOPED_ALLOWED_KEY, SCOPED_EXCLUDED_KEY] {
+            seed_api_key(bootstrap, SCOPED_KEY_OWNER, key_id);
+        }
+        client = Some(super::a2a_flow_e2e::seed_scoped_access_token(
+            bootstrap,
+            Some(&format!("TENANT:${{x-external-account}}:(?:surfaces:.*|api-keys:{SCOPED_ALLOWED_KEY})")),
+        ));
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+    let naming = |route: &str, key_id: &str| {
+        api.surface(route, Some("tenant-a"), json!({"identity_slots": {"protected": from_api_key(key_id)}}))
+    };
+
+    api.assert_create_refused(&naming("/smoke/scoped-excluded", SCOPED_EXCLUDED_KEY), NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+    assert_saved(
+        api.create(&naming("/smoke/scoped-allowed", SCOPED_ALLOWED_KEY))
+            .await,
+    );
+    let stored = api
+        .stored(SCOPED_STORED_SURFACE)
+        .await;
+    api.assert_put_refused(SCOPED_STORED_SURFACE, &stored, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_naming_a_provider_key_is_not_saved_without_an_api_key_store() {
+    let mut client = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        let blocked = api_keys_dir(bootstrap);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+
+    let (status, body) = api
+        .create(&api.surface(
+            "/smoke/no-key-store",
+            Some("tenant-a"),
+            json!({"identity_slots": {"protected": from_api_key(SCOPED_ALLOWED_KEY)}}),
+        ))
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["details"], "API key store is not configured", "{body}");
+    assert_saved(
+        api.create(&api.surface("/smoke/no-key-store-plain", Some("tenant-a"), json!({})))
+            .await,
+    );
 }
