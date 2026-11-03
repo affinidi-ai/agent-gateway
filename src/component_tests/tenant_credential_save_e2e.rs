@@ -20,6 +20,9 @@ const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
 const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface";
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
 const STORED_DISABLED_METADATA_SURFACE: &str = "stored-disabled-metadata-surface";
+const STORED_KEY_OWNER_SURFACE: &str = "stored-key-owner-surface";
+const STORED_APPLIANCE_KEY_SURFACE: &str = "stored-appliance-key-surface";
+const STORED_APPLIANCE_KEY: &str = "atgk_00000000000000000000000000000a11";
 const STORED_PROVIDER: &str = "stored-appliance-provider";
 const STORED_TENANT_PROVIDER: &str = "stored-tenant-provider";
 const STORED_TENANT_JWT_PROVIDER: &str = "stored-tenant-jwt-provider";
@@ -395,6 +398,23 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         (
             &bootstrap
                 .storage_paths
+                .agent_surfaces,
+            STORED_KEY_OWNER_SURFACE,
+            surface(STORED_KEY_OWNER_SURFACE, json!({"tenant_id": null})),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_APPLIANCE_KEY_SURFACE,
+            surface(
+                STORED_APPLIANCE_KEY_SURFACE,
+                json!({"identity_slots": {"protected": from_api_key(STORED_APPLIANCE_KEY)}}),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
                 .credential_providers,
             STORED_PROVIDER,
             provider,
@@ -421,6 +441,32 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         )
         .unwrap();
     }
+    let api_keys = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .unwrap()
+    .join("api_keys");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            use crate::api_keys::store::ApiKeyStore as _;
+            crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+                .await
+                .unwrap()
+                .create_with_material(
+                    STORED_KEY_OWNER_SURFACE,
+                    STORED_APPLIANCE_KEY.to_string(),
+                    "atgs_stored_appliance_key".to_string(),
+                    "client",
+                    None,
+                    "component-test",
+                )
+                .await
+                .unwrap();
+        })
+    });
 }
 
 async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
@@ -1521,8 +1567,13 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
             api.create(&with_slot(&format!("/smoke/{slot}-own"), Some("tenant-a"), slot, &keys.tenant_a))
                 .await,
         );
-        assert_saved(
+        assert_refused(
             api.create(&with_slot(&format!("/smoke/{slot}-appliance"), Some("tenant-a"), slot, &keys.appliance))
+                .await,
+            NOT_ACCESSIBLE_KEY_OWNER,
+        );
+        assert_saved(
+            api.create(&with_slot(&format!("/smoke/{slot}-appliance-wide"), None, slot, &keys.appliance))
                 .await,
         );
     }
@@ -1553,6 +1604,59 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
         .await,
         "API key reference is not accessible",
     );
+}
+
+async fn assert_a_new_appliance_key_on_a_tenant_surface_is_refused(api: &Api) {
+    let protected = json!({"identity_slots": {"protected": from_api_key(STORED_APPLIANCE_KEY)}});
+    assert_refused(
+        api.create(&api.surface("/smoke/new-appliance-key", Some("tenant-a"), protected.clone()))
+            .await,
+        NOT_ACCESSIBLE_KEY_OWNER,
+    );
+    let plain = api
+        .created_id(&api.surface("/smoke/plain-tenant-surface", Some("tenant-a"), json!({})))
+        .await;
+    let mut added = api.stored(&plain).await;
+    added["identity_slots"] = protected["identity_slots"].clone();
+    assert_refused(api.put(&plain, &added).await, NOT_ACCESSIBLE_KEY_OWNER);
+    assert_saved(
+        api.create(&api.surface("/smoke/new-appliance-key-wide", None, protected))
+            .await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_key_on_a_tenant_surface_is_kept_and_a_new_one_refused_in_warn_mode() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let stored = api
+        .stored(STORED_APPLIANCE_KEY_SURFACE)
+        .await;
+
+    assert_saved(
+        api.put(STORED_APPLIANCE_KEY_SURFACE, &stored)
+            .await,
+    );
+    assert_eq!(
+        api.stored(STORED_APPLIANCE_KEY_SURFACE)
+            .await["identity_slots"]["protected"]["api_key_id"],
+        STORED_APPLIANCE_KEY
+    );
+    assert_a_new_appliance_key_on_a_tenant_surface_is_refused(&api).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_appliance_key_on_a_tenant_surface_is_refused_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let stored = api
+        .stored(STORED_APPLIANCE_KEY_SURFACE)
+        .await;
+
+    assert_refused(
+        api.put(STORED_APPLIANCE_KEY_SURFACE, &stored)
+            .await,
+        NOT_ACCESSIBLE_KEY_OWNER,
+    );
+    assert_a_new_appliance_key_on_a_tenant_surface_is_refused(&api).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

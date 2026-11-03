@@ -1233,24 +1233,37 @@ impl ReferenceAuthorizer<'_> {
         id: &str,
         scope_id: &str,
     ) -> Result<(), SurfaceApiError> {
+        let tenant_id = self
+            .api_key_parent_tenant(id)
+            .await?;
+        self.ensure(tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
+    }
+
+    async fn api_key_parent_tenant(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>, SurfaceApiError> {
         if id == self.current_surface_id {
-            return self.ensure(self.owner_tenant_id, ResourceKind::ApiKeys, scope_id, "API-key parent Surface");
+            return Ok(self
+                .owner_tenant_id
+                .map(str::to_string));
         }
         let store = self
             .state
             .agent_surface_store
             .as_ref()
             .ok_or_else(|| unavailable("API-key parent Surface"))?;
-        let resource = store
+        Ok(store
             .get(id)
             .await
             .map_err(|error| internal("API-key parent Surface", error))?
-            .ok_or_else(|| inaccessible("API-key parent Surface"))?;
-        self.ensure(resource.tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
+            .ok_or_else(|| inaccessible("API-key parent Surface"))?
+            .tenant_id)
     }
 
     /// A provider key a surface derives a DID from must exist, unless the stored surface already
-    /// named it, and its owning surface must be one this surface may reference.
+    /// named it, and its owning surface must be one this surface may reference. A tenant surface
+    /// names a key of a surface with no tenant only as it sends an appliance-wide secret upstream.
     async fn provider_keys(
         &self,
         keys: &[String],
@@ -1267,8 +1280,17 @@ impl ReferenceAuthorizer<'_> {
                 return Err(inaccessible("API key"));
             };
             for surface_id in surface_ids {
-                self.api_key_parent(surface_id, key_id)
+                let tenant_id = self
+                    .api_key_parent_tenant(surface_id)
                     .await?;
+                self.ensure(tenant_id.as_deref(), ResourceKind::ApiKeys, key_id, "API-key parent Surface")?;
+                if !can_reference_with_rule(
+                    self.owner_tenant_id,
+                    tenant_id.as_deref(),
+                    self.rule_for(ResourceKind::ApiKeys, key_id),
+                ) {
+                    return Err(inaccessible("API-key parent Surface"));
+                }
             }
         }
         Ok(())
