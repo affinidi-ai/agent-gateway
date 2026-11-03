@@ -117,7 +117,7 @@ describe('reserved header names', () => {
 describe('Transit Point auth type of a stored static secret', () => {
   it('reads a Bearer format as bearer only under the Authorization header', () => {
     expect(staticSecretAuthType('Authorization', 'Bearer {value}')).toBe('bearer');
-    expect(staticSecretAuthType('authorization', 'Bearer {value}')).toBe('bearer');
+    expect(staticSecretAuthType('authorization', 'Bearer {value}')).toBe('custom_header');
     expect(staticSecretAuthType('X-Partner', 'Bearer {value}')).toBe('custom_header');
   });
 
@@ -289,6 +289,23 @@ describe('Target authentication rules that need the whole surface', () => {
 
   it('passes a valid surface', () => {
     expect(targetAuthBreaches(surface(), null)).toEqual([]);
+  });
+
+  it('blocks a header the Access Point maps from metadata, and passes a different one', () => {
+    const mapped = (name: string) =>
+      surface({
+        protocol: undefined,
+        access_point: {
+          protocol: 'a2a',
+          caller_authentication: { methods: [{ type: 'api_key' }] },
+          header_metadata_mapping: { headers: [{ header: 'x-tenant' }] },
+        },
+        target: { endpoint: 'https://agent.example.com', auth: staticSecret(name, '{value}') },
+      });
+    expect(targetAuthBreaches(mapped('X-Tenant'), null)).toEqual([
+      'target.auth.header_name X-Tenant is already sent by header metadata mapping',
+    ]);
+    expect(targetAuthBreaches(mapped('X-Other'), null)).toEqual([]);
   });
 
   it('blocks a Target credential when the Access Point checks no caller, and passes its twin', () => {
@@ -495,5 +512,15 @@ describe('lossless Target authentication save', () => {
     const saved = registry.buildPayload(makeCtx(registry.nodesFromPayload(moved))) as any;
     expect(saved.target.auth).toBeUndefined();
     expect(saved.transit.points[0].target_auth).toBeUndefined();
+  });
+
+  it('keeps the stored Target authentication copy out of the canvas blob', () => {
+    const nodes = registry.nodesFromPayload(apiSurface);
+    const hasCopy = nodes.some(n => n.config && '_stored_target_auth' in n.config);
+    expect(hasCopy).toBe(true);
+    const blob = buildCanvasBlob(nodes.map(n => ({ ...n })));
+    for (const node of blob.nodes) {
+      expect(node.config ?? {}).not.toHaveProperty('_stored_target_auth');
+    }
   });
 });

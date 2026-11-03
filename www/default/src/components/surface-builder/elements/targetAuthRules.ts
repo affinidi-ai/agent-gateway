@@ -81,7 +81,7 @@ function legs(surface: unknown): Leg[] {
         usedBy: 'source authentication',
       });
     }
-    if (supportsMetadataMapping(payload.protocol)) {
+    if (supportsMetadataMapping(accessPoint?.protocol ?? payload.protocol)) {
       otherHeaders.push(...mappedHeaders(accessPoint?.header_metadata_mapping));
     }
     found.push({

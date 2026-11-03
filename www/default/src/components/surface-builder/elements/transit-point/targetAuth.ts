@@ -54,17 +54,12 @@ function editedTargetAuth(c: any): Record<string, unknown> | undefined {
   };
 }
 
-/**
- * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never opened
- * sends the stored one unchanged; an edited one is laid over the stored one, so a field the
- * panel does not show survives. `undefined` when none is set.
- */
 /** The panel's auth type for a stored static secret, so opening the panel keeps its header. */
 export function staticSecretAuthType(
   headerName: string,
   headerFormat: string
 ): 'bearer' | 'api_key' | 'custom_header' {
-  if (headerFormat.startsWith('Bearer ') && headerName.toLowerCase() === 'authorization') {
+  if (headerFormat.startsWith('Bearer ') && headerName === 'Authorization') {
     return 'bearer';
   }
   if (headerName === 'X-API-Key' || headerName.toLowerCase().includes('api-key')) {
@@ -73,6 +68,11 @@ export function staticSecretAuthType(
   return 'custom_header';
 }
 
+/**
+ * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never opened
+ * sends the stored one unchanged; an edited one is laid over the stored one, so a field the
+ * panel does not show survives. `undefined` when none is set.
+ */
 export function transitPointTargetAuth(c: any): Record<string, unknown> | undefined {
   const stored: StoredTargetAuth | undefined = c?.[STORED_TARGET_AUTH_KEY];
   if (!c?.auth_type) return stored?.auth ?? undefined;
