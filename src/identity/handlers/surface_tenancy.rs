@@ -23,7 +23,8 @@ use super::surfaces::SurfaceApiError;
 /// credential of a provider holding a secret outside the provider's tenant: a reference that
 /// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
 /// to every destination that it goes to now, and even then when
-/// `tenant_credential_isolation` is `enforce`.
+/// `tenant_credential_isolation` is `enforce`. An API Key Provider key id `stored` already
+/// derived a DID from is kept the same way, and kept even when the key no longer exists.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -34,7 +35,15 @@ pub async fn validate_surface_references(
     let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
     let grandfathered = match stored {
         Some(stored) if stored.tenant_id == surface.tenant_id => {
-            grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?)
+            let mut grandfathered =
+                grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?);
+            grandfathered.extend(
+                collect_provider_key_references(stored)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|key_id| (ResourceKind::ApiKeys, key_id)),
+            );
+            grandfathered
         }
         _ => Vec::new(),
     };
@@ -1240,8 +1249,8 @@ impl ReferenceAuthorizer<'_> {
         self.ensure(resource.tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
     }
 
-    /// A provider key a surface derives a DID from must exist, and its owning surface must be
-    /// one this surface may reference.
+    /// A provider key a surface derives a DID from must exist, unless the stored surface already
+    /// named it, and its owning surface must be one this surface may reference.
     async fn provider_keys(
         &self,
         keys: &[String],
@@ -1251,9 +1260,12 @@ impl ReferenceAuthorizer<'_> {
         }
         let owners = provider_key_owners(self.state).await?;
         for key_id in keys {
-            let surface_ids = owners
-                .get(key_id)
-                .ok_or_else(|| inaccessible("API key"))?;
+            let Some(surface_ids) = owners.get(key_id) else {
+                if is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, key_id) {
+                    continue;
+                }
+                return Err(inaccessible("API key"));
+            };
             for surface_id in surface_ids {
                 self.api_key_parent(surface_id, key_id)
                     .await?;

@@ -1556,6 +1556,52 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_surface_keeps_a_provider_key_it_already_named_after_the_key_is_deleted_but_cannot_add_one() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let owner = api
+        .created_id(&api.surface("/smoke/deleted-key-owner", Some("tenant-a"), json!({})))
+        .await;
+    let key_id = api.api_key(&owner).await;
+    let protected = json!({"identity_slots": {"protected": from_api_key(&key_id)}});
+    let naming = api
+        .created_id(&api.surface("/smoke/deleted-key-user", Some("tenant-a"), protected.clone()))
+        .await;
+    let other = api
+        .created_id(&api.surface("/smoke/deleted-key-other", Some("tenant-a"), json!({})))
+        .await;
+    let (status, body) = api
+        .send(
+            api.client
+                .delete(api.url(&format!("api-keys/{owner}/{key_id}"))),
+        )
+        .await;
+    assert!(matches!(status, 200 | 204), "{status} {body}");
+    let (status, body) = api
+        .send(
+            api.client
+                .get(api.url(&format!("api-keys/{owner}/{key_id}"))),
+        )
+        .await;
+    assert_eq!(status, 404, "the key is gone: {body}");
+
+    let stored = api.stored(&naming).await;
+    assert_saved(
+        api.put(&naming, &stored)
+            .await,
+    );
+    assert_eq!(api.stored(&naming).await["identity_slots"]["protected"]["api_key_id"], json!(key_id));
+
+    let mut added = api.stored(&other).await;
+    added["identity_slots"] = protected["identity_slots"].clone();
+    assert_refused(api.put(&other, &added).await, "API key reference is not accessible");
+    assert_refused(
+        api.create(&api.surface("/smoke/deleted-key-new", Some("tenant-a"), protected))
+            .await,
+        "API key reference is not accessible",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn moving_a_key_owning_surface_to_another_tenant_is_a_conflict_while_a_surface_names_its_key() {
     let (_harness, api) = harness(RuleMode::Warn).await;
     let owner = api
