@@ -5,6 +5,13 @@ changes:
   fixed: []
   removed: []
   security:
+    - timestamp: '2026-11-03T14:20:00Z'
+      title: Stop logging every surface on the listener for a request to an unknown path
+      description: >-
+        A request to a path no surface serves, which needs no authentication, wrote one warning
+        per surface on the listener, naming every tenant's surfaces and routes, so anyone reading
+        the log learned them and any caller could flood the log. It now writes one warning with
+        the path escaped and cut to 256 characters.
     - timestamp: '2026-11-03T14:10:00Z'
       title: Stop Transit Points passing a caller's X-Forwarded headers to the target
       description: >-
