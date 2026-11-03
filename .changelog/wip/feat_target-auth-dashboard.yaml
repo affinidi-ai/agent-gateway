@@ -1,0 +1,46 @@
+branch: feat/target-auth-dashboard
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-02T11:45:37Z'
+      title: Gate credential provider pages on credential provider permissions
+      description: >-
+        The dashboard uses credential_providers.view, .edit and .delete for credential
+        providers, as the Admin API already did. A user with view but not edit sees a read-only
+        provider editor, and Add and Delete need .edit and .delete. The Credentials page opens
+        with either settings.view or credential_providers.view. Upgrade note: a user who only
+        had settings.edit now needs credential_providers.edit to edit providers in the
+        dashboard.
+    - timestamp: '2026-11-02T11:45:39Z'
+      title: Validate Target authentication in the Surface Builder and save it unchanged
+      description: >-
+        The Surface Builder applies the gateway's Target authentication rules while editing and
+        shows each refusal next to its field. A new or changed breach blocks Save; a stored one
+        the operator did not edit shows a warning. Saving keeps stored fields the editor does
+        not show, and an unopened Transit Point keeps its Target authentication. The credential
+        provider method gains an optional Scopes input, and Subject is required for JWT bearer
+        providers.
+    - timestamp: '2026-11-02T11:45:40Z'
+      title: Warn before deleting a secret that other resources use
+      description: >-
+        When the gateway refuses a secret delete because a surface, credential provider, A2A
+        proxy or STS client uses it, the dashboard names them, says how many more the user
+        cannot view, and offers Delete secret anyway. Refused deletes and retypes show the
+        server message and the references inline instead of an alert or toast.
+    - timestamp: '2026-11-02T12:28:32Z'
+      title: Show Target credential failures in the Audit Log
+      description: >-
+        Audit Log records of a Target credential failure show the credential outcome and the
+        token endpoint's OAuth error code. A request forwarded without the credential because
+        the fallback is passthrough is titled Forwarded without Target credential in the warning
+        tone instead of Request refused.
+  fixed: []
+  removed:
+    - timestamp: '2026-11-02T11:45:38Z'
+      title: Remove the OIDC Providers dashboard pages
+      description: >-
+        The OIDC Providers list and editor called an API the gateway does not serve. The pages
+        are removed, and /oidc-providers and every path under it redirect to the Credential
+        providers tab.
+  security: []
+  breaking: []
