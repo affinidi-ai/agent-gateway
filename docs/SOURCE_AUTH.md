@@ -194,6 +194,11 @@ Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
 has one, otherwise the base. Variant responses carry it for that variant.
 
+They also carry a read-only `not_ready_reason` while the surface is refused for its API Key
+Provider keys: `provider_key_tenant`, or `api_key_store_unavailable` while the API key store
+cannot be read; see [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
+`access_point_status` stays `ready` for such a surface. The field is absent otherwise.
+
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
@@ -209,7 +214,7 @@ in `Warning` headers (code 299), before the Transit Point warnings described bel
 Access Point is public, when it or an enabled variant is not ready (a variant's warning is
 prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
 admits every caller. A write request that sends a response back unchanged has its top-level
-`access_point_status` dropped before parsing.
+`access_point_status` and `not_ready_reason` dropped before parsing.
 
 A gateway rolled back to a release without these fields cannot load the surfaces that store
 them, which is every surface created after the upgrade; see
@@ -964,22 +969,75 @@ with `400` when:
 - the target is an MCP `proxy://` MCP Proxy.
 
 An API Key Provider key and a plain API Key secret hash the same fields, `credential_type` and
-the key id or `secret_id`. A plain secret whose `secret_id` equals a provider key id (`atgk_`
-plus a UUID) therefore gets that key's identity record and DID. The secrets store accepts such
-an id, so do not name a secret after an API Key Provider key. A surface save checks each
-provider key a surface derives a DID from against the key's owning surface, by the
-[reference rules](ACCESS_TOKENS.md#references-between-records) and whatever
-`tenant_credential_isolation` says: an `atgk_` `api_key_id` on the protected, external or a
-Transit Point slot, an `atgk_` identity injection `api_key_id`, and a Caller Context API Key
-`secret_id` that equals an existing provider key id. Another tenant's key, or a tenant key on
-a surface with no tenant, is refused with `400` "API-key parent Surface reference is not
-accessible". An `atgk_` `api_key_id` that names no key is refused with `400` "API key
-reference is not accessible", so re-saving a surface whose key was deleted needs a new key.
-A tenant reassignment that would leave a surface naming a key whose owning surface it may not
-reference is a conflict (`409`), whichever of the two surfaces moves. The request path does not
-repeat the check: it derives the DID from an `atgk_` id without looking the key up, so a surface
-stored before this check keeps its key's DID until it is next saved or reassigned. A
-resource-scoped token's pattern is matched against the key id (`api-keys:<key id>`).
+the key id or `secret_id`. A secret named after a provider key id would get that key's identity
+record and DID, so the `atgk_` prefix is reserved for API key ids: `POST /v1/secrets/new`
+refuses a `secret_id` that starts with it with `400`. An update cannot change a secret's id, and
+a secret stored with such an id before the prefix was reserved keeps loading and serving.
+
+#### Tenant check of provider keys
+
+The request path derives a DID from an `atgk_` key id without looking the key up. Each key id a
+surface derives a DID from is therefore a reference to the surface that owns the key, held to
+the [reference rules](ACCESS_TOKENS.md#references-between-records). These ids are collected, on
+the base and in every variant:
+
+- an `atgk_` `api_key_id` of a `from_api_key` identity on the protected or external slot, or on
+  a Transit Point's `managed_identity`;
+- an `atgk_` `target.identity_injection.api_key_id` when its `type` is `from_api_key`.
+
+A Transit Point's own `identity_injection.api_key_id` is not collected: the request path reads
+only its `inject_vp`.
+
+A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
+
+- another tenant's key, or a tenant's key named by a surface with no tenant: "API-key parent
+  Surface reference is not accessible", whatever `tenant_credential_isolation` says;
+- a tenant surface naming the key of a surface with no tenant, as an appliance-wide secret sent
+  upstream is: a new reference is refused, and one the stored surface already named is kept under
+  `warn` and refused under `enforce`;
+- a key id that names no key: "API key reference is not accessible", and a key whose owning
+  surface was deleted: "API-key parent Surface reference is not accessible". Either is kept when
+  the stored surface already named it, so a GET→PUT of that surface saves;
+- a key id outside a resource-scoped token's pattern (`api-keys:<key id>`), also when the stored
+  surface already named it.
+
+Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
+configured". A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
+when it would leave a surface naming a key whose owning surface it may not reference, or would
+make a tenant surface name the key of a surface with no tenant. Under `warn`, a tenant surface
+that already names such a key may still move. A reassignment whose surface then fails any
+reference check is a `409` too, never a `500`.
+
+#### Provider keys when a surface goes live
+
+A surface goes live without a save at boot, on a configuration reload, when the cache refresh
+scan or another node's write changes it, and on the first request to a version no check has seen.
+Each time, the gateway checks its key ids against their owning surfaces and logs one `WARN` line
+per surface that names a key it may not use, or whose key or owning surface is gone. The line
+names the `surface`, its `tenant`, `rule="provider_key_tenant"`, each key id with its issue
+(`other_tenant`, `appliance_key`, `missing_key` or `missing_owner`) and `not_ready`. It carries
+no secret.
+
+- Under `tenant_credential_isolation: warn` the surface keeps serving.
+- Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
+  tenant, or the key of a surface with no tenant is not ready.
+- A key or owning surface that no longer exists is only reported: key ids are never reused.
+- While the API key store cannot be read, every surface naming an `atgk_` id is not ready. The
+  outage is logged once. Each request checks again, so the surface serves as soon as the store
+  can be read.
+
+The check also covers a Caller Context API Key `secret_id` that starts with `atgk_` on a view
+whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is
+reported like a key id when a key of that id belongs to a surface the surface may not
+reference, or to a surface with no tenant; otherwise it is a plain secret and is not reported.
+
+A not-ready surface refuses every request with `503` before source authentication, policy and
+the target, on direct inbound, Fabric receive and its Transit Points, as a [not ready Access
+Point](#not-ready-access-points) does. The refusal is logged with `reason=provider_key_tenant`,
+or `reason=api_key_store_unavailable` during a store outage, and recorded in the Audit Log as
+`request_rejected` with the reason `access_point_not_ready` (a Transit Point refusal is logged
+only). The agent card preview of such a surface reports `unsupported_reason: not_running` and
+fetches nothing. The surface response's `not_ready_reason` says why.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,

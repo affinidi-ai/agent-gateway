@@ -296,6 +296,13 @@ endpoint URL.
 | `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
+A surface that derives a DID from an API Key Provider key it may not use, or whose key or
+owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
+`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
+`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+is `true` when the surface is refused at runtime; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
 provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a

@@ -186,7 +186,8 @@ another tenant's alike. Deleting a secret does not check the surfaces that name 
 stored before the deletion keeps the reference until its next save. Secret ids are one namespace
 across tenants, so
 `POST /v1/secrets/new` with an id that any tenant already uses answers that the secret already
-exists. An appliance-wide reference the stored surface or provider already held is kept in the
+exists. The `atgk_` prefix is reserved for API key ids: a new `secret_id` that starts with it is
+refused with `400` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). An appliance-wide reference the stored surface or provider already held is kept in the
 default `warn` mode (on a provider, only in the same field and while the provider's type and
 destination are unchanged; on a surface, only while every destination that sends it already
 sent it: the endpoint of each Target and Transit Point, and the caller for response custom
@@ -273,9 +274,9 @@ resource-scoped PATs cannot reassign ownership. Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and the secrets, JWT verification strategies, API-key
 parents and certificates its `source_auth` names, every Trust Recorder entry, and the
-owning surface of each API Key Provider key a `from_api_key` identity, identity injection or
-same-named API Key secret derives a DID from, on the surface and in every variant; see
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot). MCP tool discovery
+owning surface of each API Key Provider key a `from_api_key` identity or identity injection
+derives a DID from, on the surface and in every variant, matched against the token's pattern as
+`api-keys:<key id>`; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys). MCP tool discovery
 requires MCP Proxy edit plus Secret view authority, validates raw endpoints with
 `validate_resolved_url`, dials through a per-request Strict-pinned,
 redirect-disabled client (`egress::pinned_strict_client`), independently
