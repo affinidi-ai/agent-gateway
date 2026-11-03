@@ -766,7 +766,10 @@ to 300 seconds.
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
 except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
-`Authorization` and its `Cookie`, the caller-info and `did:webvh` identity headers
+`Authorization` and its `Cookie`, the caller's proxy forwarding headers (`Forwarded`,
+`X-Real-IP` and every `X-Forwarded-*` header, such as `X-Forwarded-For`, `X-Forwarded-Host`
+and `X-Forwarded-Proto`, which the gateway does not set either, so a target that trusts the
+gateway as its proxy never takes the caller's claim about its address, host or scheme), the caller-info and `did:webvh` identity headers
 (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
 `x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
 like the Transit Point's `target_auth` header, and any header a Header Metadata Mapping is set to

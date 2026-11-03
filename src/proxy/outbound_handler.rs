@@ -2458,9 +2458,10 @@ async fn step_map_transit_point_header_metadata(
 }
 
 /// Whether a Transit Point caller's request header goes on to its target, over
-/// HTTP or Fabric. The caller's `Authorization`, cookies, and caller-info and DID
-/// identity headers ([`crate::proxy::caller_identity::CallerHeaders::NAMES`])
-/// never do; its other headers, such as its own API key header for the target, do.
+/// HTTP or Fabric. The caller's `Authorization`, cookies, proxy forwarding headers
+/// ([`is_proxy_forwarding_header`]), and caller-info and DID identity headers
+/// ([`crate::proxy::caller_identity::CallerHeaders::NAMES`]) never do; its other
+/// headers, such as its own API key header for the target, do.
 pub(crate) fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
@@ -2471,6 +2472,7 @@ pub(crate) fn should_forward_outbound_request_header(
 
     if name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("cookie")
+        || is_proxy_forwarding_header(name)
         || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
     {
         return false;
@@ -2487,6 +2489,19 @@ pub(crate) fn should_forward_outbound_request_header(
     }
 
     true
+}
+
+/// Whether `name` is a header a proxy sets to tell the next hop who connected to
+/// it, for which host and over what: `Forwarded`, `X-Real-IP` and every
+/// `X-Forwarded-*` header. A Transit Point caller's own are its claims, not what
+/// the gateway saw, so none reaches the target.
+fn is_proxy_forwarding_header(name: &str) -> bool {
+    const X_FORWARDED: &str = "x-forwarded-";
+    name.eq_ignore_ascii_case("forwarded")
+        || name.eq_ignore_ascii_case("x-real-ip")
+        || name
+            .get(..X_FORWARDED.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(X_FORWARDED))
 }
 
 /// The headers a Transit Point sends to its target, over HTTP or Fabric: the
@@ -10919,8 +10934,28 @@ mod tests {
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in
-            ["x-api-key", "accept", "content-type", "x-forwarded-for", "mcp-protocol-version", "x-caller-context"]
+        for forwarded in ["x-api-key", "accept", "content-type", "mcp-protocol-version", "x-caller-context"] {
+            assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
+        }
+    }
+
+    #[test]
+    fn a_managed_agents_forwarding_headers_never_reach_a_transit_point_target() {
+        for withheld in [
+            "x-forwarded-for",
+            "X-Forwarded-For",
+            "x-forwarded-host",
+            "X-Forwarded-Proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "X-Forwarded-Client-Cert",
+            "forwarded",
+            "Forwarded",
+            "x-real-ip",
+        ] {
+            assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
+        }
+        for forwarded in ["x-forwarded", "x-forwardedfor", "forwarded-for", "x-real-ip-note", "x-vendor-forwarded-for"]
         {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }

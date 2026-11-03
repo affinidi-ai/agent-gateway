@@ -5,14 +5,22 @@ changes:
   fixed: []
   removed: []
   security:
+    - timestamp: '2026-11-03T14:10:00Z'
+      title: Stop Transit Points passing a caller's X-Forwarded headers to the target
+      description: >-
+        A Transit Point forwarded its caller's X-Forwarded-For, X-Forwarded-Host,
+        X-Forwarded-Proto and Forwarded headers to its target as if the gateway had set them, so
+        a target trusting the gateway as its proxy took the caller's claims about its address,
+        host and scheme. The caller's Forwarded, X-Real-IP and X-Forwarded-* headers are now
+        dropped, over HTTP and Fabric.
     - timestamp: '2026-11-03T14:00:00Z'
       title: Stop listeners with different IPv6 external URLs counting as one host
       description: >-
         An inbound listener passes /outbound/ requests on to an outbound listener whose external
-        URLs share a host name with its own. The host was cut at the first colon, so every IPv6
-        address URL looked like the same host, and an inbound listener could expose another
-        address's Transit Points. Hosts are now parsed as URLs and an IPv6 address matches only
-        the same address.
+        URLs share a host name with its own. The host was cut at the first colon, so IPv6 address
+        URLs such as https://[2001:db8::1] and https://[2001:db8::2] looked like one host, and an
+        inbound listener could expose another address's Transit Points. Hosts are now parsed as
+        URLs and an IPv6 address matches only the same address.
     - timestamp: '2026-11-03T13:50:00Z'
       title: Block cloud metadata and private IPv4 addresses inside 6to4 and NAT64 IPv6
       description: >-
