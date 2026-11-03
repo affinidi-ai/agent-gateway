@@ -13,14 +13,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Form;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Form};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::identity::VCIssuer;
+use crate::source_auth::client_ip::ClientIp;
 use crate::sts::errors::StsError;
 use crate::sts::id_jag::{IdJagParams, build_id_jag_claims, validate_id_jag};
 use crate::sts::policy::{AllowAllPolicyEvaluator, GatewayPolicyEvaluator, StsPolicyEvaluator, build_policy_input};
@@ -52,6 +53,10 @@ pub struct StsConfig {
     /// terminating HTTP proxy/tunnel that rewrites `Host` to `127.0.0.1` and
     /// drops forwarding headers. `None` ⇒ derive from the request.
     pub public_base_url: Option<String>,
+    /// Proxies (`client_ip.trusted_proxies`) whose forwarded host and scheme the
+    /// request-derived discovery base may use. A request from any other peer is
+    /// described by its own `Host`.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Replay-protection backend name (see `crate::sts::replay`). Defaults to the
     /// built-in in-process backend.
     pub replay_backend: String,
@@ -68,6 +73,7 @@ impl Default for StsConfig {
             max_ttl_secs: 900,
             id_jag_ttl_secs: 120,
             public_base_url: None,
+            trusted_proxies: Vec::new(),
             replay_backend: crate::sts::replay::IN_PROCESS_BACKEND.to_string(),
             throttle: crate::config::types::TokenEndpointThrottleConfig::default(),
             mcp_issuer: None,
@@ -454,7 +460,7 @@ pub struct StsState {
     pub trust_checker: Arc<dyn StsTrustChecker>,
     /// Single-use guard: rejects a replayed ID-JAG within its validity window.
     pub replay: Arc<dyn crate::sts::replay::ReplayProtection>,
-    /// Throttle: bounds repeated attempts per client id and source address.
+    /// Throttle: bounds repeated attempts per client id per source, and per source.
     pub throttle: Arc<crate::sts::throttle::TokenEndpointThrottle>,
     /// Which tenants declare an MCP resource, checked before minting for it.
     pub resource_owners: Arc<dyn crate::sts::resource_owners::StsResourceOwners>,
@@ -466,14 +472,16 @@ pub struct StsState {
 /// `POST /oauth2/token` — RFC 8693 token exchange and RFC 7523 ID-JAG redemption.
 pub async fn token_endpoint(
     State(state): State<StsState>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
     Form(form): Form<TokenEndpointForm>,
 ) -> Response {
-    serve_token_endpoint(&state, &headers, form, None).await
+    serve_token_endpoint(&state, client_ip_of(client_ip), &headers, form, None).await
 }
 
 pub async fn mcp_token_endpoint(
     State(state): State<StsState>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
     crate::sts::mcp_profile::McpTokenForm(form): crate::sts::mcp_profile::McpTokenForm,
 ) -> Response {
@@ -484,11 +492,18 @@ pub async fn mcp_token_endpoint(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_token_endpoint(&state, &headers, form, Some(profile)).await
+    serve_token_endpoint(&state, client_ip_of(client_ip), &headers, form, Some(profile)).await
+}
+
+/// The caller's address as [`crate::source_auth::client_ip`] resolved it: forwarded headers
+/// count only from `client_ip.trusted_proxies`.
+fn client_ip_of(client_ip: Option<Extension<ClientIp>>) -> Option<std::net::IpAddr> {
+    client_ip.map(|Extension(ClientIp(ip))| ip)
 }
 
 async fn serve_token_endpoint(
     state: &StsState,
+    client_ip: Option<std::net::IpAddr>,
     headers: &HeaderMap,
     form: TokenEndpointForm,
     profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>,
@@ -498,7 +513,7 @@ async fn serve_token_endpoint(
 
     // Throttle: reject a client / source that is over its configured limit.
     let throttle_client = resolve_client_credentials(headers, &form).0;
-    let throttle_ip = client_source_ip(headers);
+    let throttle_ip = client_ip.map(|ip| ip.to_string());
     let throttle_now = now_secs();
     if let Some(retry_after) =
         state
@@ -571,6 +586,7 @@ async fn serve_token_endpoint(
 pub async fn authorization_server_metadata(
     State(state): State<StsState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     let issuer = state
@@ -591,7 +607,12 @@ pub async fn authorization_server_metadata(
             .as_deref(),
         uri.path(),
     )
-    .or_else(|| metadata_base_url(&headers, uri.path()));
+    .or_else(|| {
+        let from_trusted_proxy = peer.is_some_and(|Extension(ConnectInfo(peer))| {
+            crate::source_auth::peer_cert::forwarded::ip_in_any(&peer.ip(), &state.config.trusted_proxies)
+        });
+        metadata_base_url(&headers, uri.path(), from_trusted_proxy)
+    });
     let token_endpoint = match &base {
         Some(base) => format!("{base}/oauth2/token"),
         None => "/oauth2/token".to_string(),
@@ -616,21 +637,27 @@ pub async fn authorization_server_metadata(
 /// request, so `token_endpoint` / `jwks_uri` are absolute and reflect the actual
 /// mount prefix (e.g. `/api`).
 ///
-/// The public host is resolved from the proxy-forwarded value first —
-/// `X-Forwarded-Host`, then the RFC 7239 `Forwarded host=` directive — and only
-/// falls back to the request `Host` when neither is present. Behind a
-/// terminating proxy or tunnel the direct `Host` is the gateway's *internal*
-/// address (e.g. `127.0.0.1:8080`), so the forwarded value is authoritative. The
-/// scheme comes from `X-Forwarded-Proto`, then `Forwarded proto=`, else defaults
-/// to `https`. Returns `None` when no host can be resolved, in which case the
-/// caller falls back to relative paths.
+/// From a trusted proxy (`from_trusted_proxy`), the public host is resolved from
+/// the forwarded value first — `X-Forwarded-Host`, then the RFC 7239
+/// `Forwarded host=` directive — and only falls back to the request `Host` when
+/// neither is present, since behind a terminating proxy or tunnel the direct
+/// `Host` is the gateway's *internal* address (e.g. `127.0.0.1:8080`). The scheme
+/// comes from `X-Forwarded-Proto`, then `Forwarded proto=`, else defaults to
+/// `https`. Any other caller's forwarded headers are ignored: its `Host` and
+/// `https` are used. Returns `None` when no host can be resolved, in which case
+/// the caller falls back to relative paths.
 fn metadata_base_url(
     headers: &HeaderMap,
     request_path: &str,
+    from_trusted_proxy: bool,
 ) -> Option<String> {
     let prefix = metadata_mount_prefix(request_path)?;
-    let host = first_forwarded_token(headers, "x-forwarded-host")
-        .or_else(|| forwarded_directive(headers, "host"))
+    let forwarded = |header_name: &str, directive: &str| {
+        from_trusted_proxy
+            .then(|| first_forwarded_token(headers, header_name).or_else(|| forwarded_directive(headers, directive)))
+            .flatten()
+    };
+    let host = forwarded("x-forwarded-host", "host")
         .or_else(|| {
             headers
                 .get(header::HOST)
@@ -638,9 +665,7 @@ fn metadata_base_url(
                 .map(|s| s.trim().to_string())
         })
         .filter(|s| !s.is_empty())?;
-    let scheme = first_forwarded_token(headers, "x-forwarded-proto")
-        .or_else(|| forwarded_directive(headers, "proto"))
-        .unwrap_or_else(|| "https".to_string());
+    let scheme = forwarded("x-forwarded-proto", "proto").unwrap_or_else(|| "https".to_string());
     Some(format!("{scheme}://{host}{prefix}"))
 }
 
@@ -1624,12 +1649,6 @@ fn grant_label(grant_type: Option<&str>) -> &'static str {
     }
 }
 
-/// The client source address for throttling, resolved from proxy-forwarded
-/// headers (`X-Forwarded-For` first entry, then RFC 7239 `Forwarded for=`).
-fn client_source_ip(headers: &HeaderMap) -> Option<String> {
-    first_forwarded_token(headers, "x-forwarded-for").or_else(|| forwarded_directive(headers, "for"))
-}
-
 /// A `429 Too Many Requests` response carrying `Retry-After` for a throttled caller.
 fn throttled_response(retry_after: u64) -> Response {
     let body = json!({
@@ -1929,6 +1948,7 @@ mod tests {
         form.resource = Some(resource.into());
         let response = mcp_token_endpoint(
             State(state.clone()),
+            None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
         )
@@ -1937,6 +1957,7 @@ mod tests {
         state.config.mcp_issuer = Some(profile.clone());
         let response = mcp_token_endpoint(
             State(state.clone()),
+            None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
         )
@@ -1950,7 +1971,7 @@ mod tests {
         let claims: Value = serde_json::from_str(&response.access_token).unwrap();
         assert_eq!(claims["iss"], profile.issuer);
         assert_eq!(claims["aud"], resource);
-        let response = token_endpoint(State(state.clone()), HeaderMap::new(), Form(form.clone())).await;
+        let response = token_endpoint(State(state.clone()), None, HeaderMap::new(), Form(form.clone())).await;
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
             .unwrap();
@@ -1959,7 +1980,7 @@ mod tests {
         assert_eq!(claims["iss"], "did:webvh:example:gw");
         form.grant_type = Some("authorization_code".into());
         let response =
-            mcp_token_endpoint(State(state), HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form)).await;
+            mcp_token_endpoint(State(state), None, HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
@@ -2992,7 +3013,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", false).as_deref(),
             Some("https://gw.example:8443/api")
         );
     }
@@ -3003,7 +3024,7 @@ mod tests {
         headers.insert(header::HOST, "gw.example".parse().unwrap());
         headers.insert("x-forwarded-proto", "http".parse().unwrap());
         assert_eq!(
-            metadata_base_url(&headers, "/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/.well-known/oauth-authorization-server", true).as_deref(),
             Some("http://gw.example")
         );
     }
@@ -3011,7 +3032,7 @@ mod tests {
     #[test]
     fn metadata_base_url_none_without_host() {
         assert!(
-            metadata_base_url(&HeaderMap::new(), "/.well-known/oauth-authorization-server").is_none(),
+            metadata_base_url(&HeaderMap::new(), "/.well-known/oauth-authorization-server", true).is_none(),
             "no Host ⇒ fall back to relative paths"
         );
     }
@@ -3033,9 +3054,9 @@ mod tests {
         );
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example/api"),
-            "X-Forwarded-Host must win over the tunnel's internal Host",
+            "X-Forwarded-Host from a trusted proxy must win over the tunnel's internal Host",
         );
     }
 
@@ -3055,7 +3076,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example"),
         );
     }
@@ -3076,9 +3097,134 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example/api"),
         );
+    }
+
+    #[tokio::test]
+    async fn failed_client_logins_lock_out_only_their_own_source_whatever_x_forwarded_for_says() {
+        let mut claims = HashMap::new();
+        claims.insert("subject-tok".to_string(), json!({ "sub": "user-1" }));
+        let state = state_with(claims, client(base_record(), Some("s3cret")));
+        let attacker = "203.0.113.9".parse().unwrap();
+        let legitimate = "198.51.100.7"
+            .parse()
+            .unwrap();
+        let mut wrong_secret = exchange_form();
+        wrong_secret.client_secret = Some("guess".to_string());
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert(
+            "x-forwarded-for",
+            "198.51.100.7"
+                .parse()
+                .unwrap(),
+        );
+
+        for _ in 0..11 {
+            token_endpoint(
+                State(state.clone()),
+                Some(Extension(ClientIp(attacker))),
+                spoofed.clone(),
+                Form(wrong_secret.clone()),
+            )
+            .await;
+        }
+        let attacker_retry = token_endpoint(
+            State(state.clone()),
+            Some(Extension(ClientIp(attacker))),
+            spoofed.clone(),
+            Form(exchange_form()),
+        )
+        .await;
+        assert_eq!(attacker_retry.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let legitimate_call = token_endpoint(
+            State(state.clone()),
+            Some(Extension(ClientIp(legitimate))),
+            HeaderMap::new(),
+            Form(exchange_form()),
+        )
+        .await;
+        assert_eq!(legitimate_call.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn metadata_base_url_ignores_forwarded_headers_from_an_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "gw.example".parse().unwrap());
+        headers.insert(
+            "x-forwarded-host",
+            "attacker.example"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        headers.insert(
+            "forwarded",
+            "proto=http;host=other.attacker.example"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", false).as_deref(),
+            Some("https://gw.example/api"),
+        );
+    }
+
+    async fn advertised_token_endpoint(
+        trusted_proxies: &[&str],
+        peer: &str,
+    ) -> String {
+        let mut state = state_with(HashMap::new(), InMemoryStsClientRegistry::new());
+        state.config.trusted_proxies = trusted_proxies
+            .iter()
+            .map(|cidr| cidr.parse().unwrap())
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            "127.0.0.1:8080"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "x-forwarded-host",
+            "gw.public.example"
+                .parse()
+                .unwrap(),
+        );
+        let response = authorization_server_metadata(
+            State(state),
+            axum::extract::OriginalUri(
+                "/api/.well-known/oauth-authorization-server"
+                    .parse()
+                    .unwrap(),
+            ),
+            Some(Extension(ConnectInfo(peer.parse().unwrap()))),
+            headers,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["token_endpoint"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_x_forwarded_host_only_from_a_trusted_proxy() {
+        assert_eq!(
+            advertised_token_endpoint(&["10.0.0.0/8"], "10.1.2.3:40000").await,
+            "https://gw.public.example/api/oauth2/token"
+        );
+        assert_eq!(
+            advertised_token_endpoint(&["10.0.0.0/8"], "203.0.113.9:40000").await,
+            "https://127.0.0.1:8080/api/oauth2/token"
+        );
+        assert_eq!(advertised_token_endpoint(&[], "10.1.2.3:40000").await, "https://127.0.0.1:8080/api/oauth2/token");
     }
 
     #[test]

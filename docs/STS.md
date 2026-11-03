@@ -37,11 +37,13 @@ authenticates as an OAuth client, not a dashboard session.
   behind a terminating HTTP proxy/tunnel the request carries neither the public
   host (`Host` is the internal `127.0.0.1:PORT`) nor the public scheme (the local
   hop is plain HTTP), and the tunnel may drop forwarding headers. The
-  request-derived fallback is itself **proxy-aware**: host prefers
+  request-derived fallback reads forwarding headers only from a connecting peer
+  in `client_ip.trusted_proxies` (`StsConfig.trusted_proxies`): host prefers
   `X-Forwarded-Host` (first comma-separated entry), then RFC 7239 `Forwarded
   host=`, else `Host`; scheme prefers `X-Forwarded-Proto`, then `Forwarded
-  proto=`, else `https`. Deployments with no inbound `external_urls` and no
-  forwarding headers behave as `Host`-derived.
+  proto=`, else `https`. Any other caller's forwarding headers are ignored, so
+  it gets its own `Host` and `https`. Deployments with no inbound
+  `external_urls` and no trusted proxy behave as `Host`-derived.
 
 ## Token types
 
@@ -249,11 +251,16 @@ CRUD is `/v1/sts/clients` (admin-only, RBAC `StsClientsView/Edit/Delete` in
 
 ## Token-endpoint throttle
 
-In `src/sts/throttle.rs`: `POST /oauth2/token` is rate-limited per client id and
-per source address (proxy-forwarded `X-Forwarded-For` first entry, then RFC 7239
-`Forwarded for=`, else no ip key). Every value comes from `gateway.json`
-(`sts.token_endpoint_throttle`: `enabled`, `failed_attempts_only`, `per_client` /
-`per_ip` each `{requests, window_secs}`, `lockout_secs`) — nothing is hardcoded.
+In `src/sts/throttle.rs`: `POST /oauth2/token` is rate-limited per client id from
+each source address, and per source address. The source is the caller's IP as
+`src/source_auth/client_ip.rs` resolves it, so `X-Forwarded-For` and `Forwarded`
+count only from `client_ip.trusted_proxies`; without a resolved source (a server
+not built with `ConnectInfo`) a client id is counted on its own and there is no
+ip key. Counting a client id per source means failed attempts from one source,
+even with a known client id, never lock that client out for its other sources.
+Every value comes from `gateway.json` (`sts.token_endpoint_throttle`: `enabled`,
+`failed_attempts_only`, `per_client` / `per_ip` each `{requests, window_secs}`,
+`lockout_secs`) — nothing is hardcoded.
 A caller over its window limit is locked out for `lockout_secs` and receives
 `429 Too Many Requests` with `Retry-After` + `Cache-Control: no-store` **before**
 any dispatch (the token-exchange metric increments `result=denied` for that

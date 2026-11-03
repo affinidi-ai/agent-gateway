@@ -1349,10 +1349,10 @@ pub struct TokenEndpointThrottleConfig {
     /// Count only failed client authentications (recommended) rather than every request.
     #[serde(default = "sts_throttle_default_true")]
     pub failed_attempts_only: bool,
-    /// Per-`client_id` limit.
+    /// Per-`client_id` limit, counted separately for each source address.
     #[serde(default = "default_throttle_per_client")]
     pub per_client: RateLimitConfig,
-    /// Per-source-address limit (source read from `X-Forwarded-For` / `Forwarded`).
+    /// Per-source-address limit (forwarded headers count only from `client_ip.trusted_proxies`).
     #[serde(default = "default_throttle_per_ip")]
     pub per_ip: RateLimitConfig,
     /// Seconds a key stays blocked once over its limit (0 = until the window rolls off).

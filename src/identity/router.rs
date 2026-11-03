@@ -2124,6 +2124,11 @@ pub fn create_identity_api_router(
                 .get_inbound_external_urls()
                 .into_iter()
                 .next(),
+            trusted_proxies: state
+                .network_config
+                .client_ip
+                .trusted_proxies
+                .clone(),
             replay_backend: state
                 .network_config
                 .sts

@@ -1,5 +1,6 @@
-//! Throttle for the token endpoint: bounds repeated attempts per client id and
-//! per source address so credential guessing is rate-limited. SAML and CLI login
+//! Throttle for the token endpoint: bounds repeated attempts per client id from
+//! each source address, and per source address, so credential guessing is
+//! rate-limited without letting one source lock a client id out for every other. SAML and CLI login
 //! reuse it per client IP only, with a bound on tracked addresses; their IP comes
 //! from [`crate::source_auth::client_ip`], which trusts forwarded headers only from
 //! `client_auth.trusted_proxies`.
@@ -45,7 +46,7 @@ struct KeyState {
     locked_until: u64,
 }
 
-/// Per-endpoint throttle keyed by client id and source address.
+/// Per-endpoint throttle keyed by client id per source address, and by source address.
 pub struct TokenEndpointThrottle {
     enabled: bool,
     failed_attempts_only: bool,
@@ -183,7 +184,7 @@ impl TokenEndpointThrottle {
         }
         let mut wait = 0u64;
         if let Some(c) = client_id {
-            wait = wait.max(self.blocked_for(&client_key(c), now));
+            wait = wait.max(self.blocked_for(&client_key(c, ip), now));
         }
         if let Some(i) = ip {
             wait = wait.max(self.blocked_for(&ip_key(i), now));
@@ -203,7 +204,7 @@ impl TokenEndpointThrottle {
             return;
         }
         if let Some(c) = client_id {
-            self.bump(client_key(c), self.per_client, now);
+            self.bump(client_key(c, ip), self.per_client, now);
         }
         if let Some(i) = ip {
             self.bump(ip_key(i), self.per_ip, now);
@@ -289,8 +290,16 @@ impl TokenEndpointThrottle {
     }
 }
 
-fn client_key(client_id: &str) -> String {
-    format!("c:{client_id}")
+/// A client id is counted per source address, so failed attempts from one source never lock it
+/// out for another. Without a source it is counted on its own.
+fn client_key(
+    client_id: &str,
+    ip: Option<&str>,
+) -> String {
+    match ip {
+        Some(ip) => format!("s:{ip} {client_id}"),
+        None => format!("c:{client_id}"),
+    }
 }
 
 fn ip_key(ip: &str) -> String {
@@ -505,6 +514,44 @@ mod tests {
             t.retry_after(None, Some("2001:db8:1:2::2"), 1_000)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_client_id_locked_out_from_one_source_is_still_served_from_another() {
+        let t = TokenEndpointThrottle::from_config(&cfg(3, 60, 300));
+        for i in 0..4 {
+            t.record(Some("c1"), Some("203.0.113.9"), 10 + i);
+        }
+
+        assert!(
+            t.retry_after(Some("c1"), Some("203.0.113.9"), 15)
+                .is_some(),
+            "the source that failed is locked out for that client id"
+        );
+        assert_eq!(t.retry_after(Some("c1"), Some("198.51.100.7"), 15), None);
+        assert_eq!(t.retry_after(Some("c2"), Some("203.0.113.9"), 15), None);
+    }
+
+    #[test]
+    fn the_per_ip_limit_still_spans_every_client_id_a_source_tries() {
+        let mut config = cfg(1000, 60, 300);
+        config.per_ip.requests = 3;
+        let t = TokenEndpointThrottle::from_config(&config);
+        for i in 0..4 {
+            t.record(Some(&format!("guess-{i}")), Some("203.0.113.9"), 10);
+        }
+
+        assert!(
+            t.retry_after(Some("fresh"), Some("203.0.113.9"), 11)
+                .is_some()
+        );
+        assert_eq!(t.retry_after(Some("fresh"), Some("198.51.100.7"), 11), None);
+    }
+
+    #[test]
+    fn client_keys_with_and_without_a_source_never_collide() {
+        assert_ne!(client_key("1.2.3.4 c1", None), client_key("c1", Some("1.2.3.4")));
+        assert_ne!(client_key("c1", Some("1.2.3.4")), client_key("c1", Some("1.2.3.40")));
     }
 
     #[test]
