@@ -1008,12 +1008,16 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   `warn` and refused under `enforce`. An id no key has is a plain secret.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
-configured". A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
+configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
+inbound Identity is From API Key counts. A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
 when it would leave a surface naming a key whose owning surface it may not reference, or would
 make a tenant surface name the key of a surface with no tenant. Under `warn`, a tenant surface
 that already names such a key may still move. A reassignment whose surface then fails any
-reference check is a `409` too, never a `500`, and so is one made while a surface names an
-`atgk_` id and no API key store is configured ("API key store is not configured").
+reference check is a `409` too, never a `500`. While a surface names an `atgk_` id, such a
+secret included, and no API key store is configured, every reassignment and every ownership
+impact read (`GET /v1/tenant-ownership/{kind}/{id}/impact`) answers `409` "API key store is
+not configured". A key a surface names as such a secret counts as named, so moving its owning
+surface is checked like moving the owner of any named key.
 
 #### Provider keys when a surface goes live
 

@@ -256,7 +256,7 @@ impl ProviderKeyGate {
             .get(&surface.surface_id)?;
         match entry.decides(surface.tenant_id.as_deref(), &ids) {
             Some(true) => Some(PROVIDER_KEY_TENANT_RULE),
-            _ if entry.store_unavailable => Some(API_KEY_STORE_UNAVAILABLE),
+            None if entry.store_unavailable => Some(API_KEY_STORE_UNAVAILABLE),
             _ => None,
         }
     }
@@ -716,6 +716,53 @@ mod tests {
                 .touch_usage(agent_id, key_id)
                 .await
         }
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_reported_only_for_a_view_it_left_unchecked() {
+        let enforced = gate().await;
+        let mut surface = naming("partly", "tenant-a", external(KEY_A));
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "late-id", "alias": "late", "name": "Late", "enabled": true,
+            "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_gate_late"}}}
+        }]))
+        .unwrap();
+        let base = base_view(&surface);
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&base)
+                .await,
+            None
+        );
+
+        enforced
+            .gate
+            .set_sources(None, Some(enforced.surfaces.clone()));
+        let late = surface
+            .resolve_variant(Some("late"))
+            .unwrap();
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&late)
+                .await,
+            Some(NotReadyReason::ApiKeyStoreUnavailable)
+        );
+
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&base),
+            None,
+            "the base was checked before the outage"
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&late),
+            Some(API_KEY_STORE_UNAVAILABLE)
+        );
     }
 
     #[tokio::test]

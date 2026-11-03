@@ -22,7 +22,7 @@ use crate::tenancy::{
 };
 use crate::trust_registries::TrustRegistryStore;
 
-use super::surface_tenancy::{collect_provider_key_references, collect_surface_reference_keys, provider_key_owners};
+use super::surface_tenancy::{collect_surface_reference_keys, provider_key_ids, provider_key_owners};
 use crate::config::credential_policy::RuleMode;
 
 #[derive(Debug)]
@@ -486,10 +486,10 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                     });
                 }
             }
-            let keys = collect_provider_key_references(&surface).map_err(|error| {
+            let ids = provider_key_ids(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })?;
-            if keys.is_empty() {
+            if ids.is_empty() {
                 continue;
             }
             if state.api_key_store.is_none() {
@@ -507,7 +507,7 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             let owners = key_owners
                 .as_ref()
                 .map(|owners| {
-                    keys.iter()
+                    ids.all()
                         .filter_map(|key_id| owners.get(key_id))
                         .flatten()
                         .cloned()

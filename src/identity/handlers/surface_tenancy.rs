@@ -1654,11 +1654,6 @@ fn collect_identity_injection_references(
     }
 }
 
-/// The API Key Provider key ids a surface derives a DID from, sorted and without duplicates.
-pub(crate) fn collect_provider_key_references(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
-    Ok(provider_key_ids(surface)?.keys)
-}
-
 /// The API Key Provider key ids a surface, or one of its views, derives a DID from (`keys`),
 /// and the Caller Context API Key `secret_id`s shaped like a key id on a view whose inbound
 /// Identity is From API Key (`legacy_secrets`), which a secret stored before the prefix was
@@ -2261,11 +2256,13 @@ mod tests {
         }]))
         .unwrap();
 
-        let keys = collect_provider_key_references(&surface).unwrap();
+        let keys = provider_key_ids(&surface)
+            .unwrap()
+            .keys;
 
         assert_eq!(keys, ["atgk_injected", "atgk_point", "atgk_shared", "atgk_variant"]);
         assert!(
-            collect_provider_key_references(&AgentSurface::default())
+            provider_key_ids(&AgentSurface::default())
                 .unwrap()
                 .is_empty()
         );
@@ -2277,7 +2274,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            collect_provider_key_references(&untyped)
+            provider_key_ids(&untyped)
                 .unwrap()
                 .is_empty()
         );

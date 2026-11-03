@@ -47,16 +47,18 @@ changes:
       description: >-
         A tenant reassignment of a key-owning surface, or of a surface naming a key, that would
         leave a surface naming another tenant's key, or make a tenant surface name the key of a
-        surface with no tenant, is now a conflict (`409`). A reassignment whose surface then fails
-        any reference check, or made while a surface names an API key id and the API key store is
-        not configured, answers `409` instead of `500`.
+        surface with no tenant, is now a conflict (`409`), also for a key a surface names as a
+        legacy Caller Context secret. A reassignment whose surface then fails any reference check
+        answers `409` instead of `500`, and so do a reassignment and an ownership impact read
+        made while a surface names an API key id and the API key store is not configured.
   breaking:
     - timestamp: '2026-11-03T18:00:00Z'
       title: Answer 500 to a surface save naming an API key id without an API key store
       description: >-
         Without an API key store the gateway cannot tell whose key an `atgk_` id is, so saving a
-        surface that names one now answers `500` "API key store is not configured" instead of
-        saving it. Fix the API key store before saving such surfaces.
+        surface that names one, including as a Caller Context API Key secret on a view whose
+        inbound Identity is From API Key, now answers `500` "API key store is not configured"
+        instead of saving it. Fix the API key store before saving such surfaces.
     - timestamp: '2026-11-03T17:00:00Z'
       title: Refuse a new reference to an API key that does not exist
       description: >-

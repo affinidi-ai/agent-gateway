@@ -2198,3 +2198,92 @@ async fn a_stored_legacy_secret_named_like_another_tenants_key_is_refused_when_e
     api.assert_put_refused(STORED_LEGACY_SECRET_SURFACE, &stored, NOT_ACCESSIBLE_KEY_OWNER)
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_the_owner_of_a_key_a_surface_names_as_a_legacy_secret_is_a_conflict() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+
+    let (status, body) = api
+        .reassign("surfaces", STORED_TENANT_B_KEY_OWNER, None)
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "tenant_reassignment_blocked", "{body}");
+    assert_eq!(
+        api.stored(STORED_TENANT_B_KEY_OWNER)
+            .await["tenant_id"],
+        "tenant-b",
+        "a blocked reassignment changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_caller_secret_named_like_a_key_needs_the_api_key_store() {
+    const LEGACY_ONLY: &str = "legacy-only-surface";
+    const LEGACY_SECRET: &str = "atgk_00000000000000000000000000000c11";
+    let mut client = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        let gateway: Value = serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
+        let port = gateway["listeners"][0]["port"]
+            .as_u64()
+            .unwrap();
+        write_stored_surface(
+            bootstrap,
+            LEGACY_ONLY,
+            json!({
+                "identity_slots": {"inbound": {"type": "from_api_key"}},
+                "access_point": {
+                    "listen_address": format!("http://localhost:{port}"), "route": format!("/smoke/{LEGACY_ONLY}"),
+                    "protocol": "a2a", "caller_authentication": legacy_caller(LEGACY_SECRET)
+                }
+            }),
+        );
+        super::helpers::write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            LEGACY_SECRET,
+            "legacy-secret-value",
+        );
+        let blocked = api_keys_dir(bootstrap);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+
+    let stored = api.stored(LEGACY_ONLY).await;
+    let (status, body) = api
+        .put(LEGACY_ONLY, &stored)
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["details"], "API key store is not configured", "{body}");
+    assert_eq!(api.stored(LEGACY_ONLY).await, stored, "a refused save stores nothing");
+
+    let plain = api
+        .created_id(&api.surface("/smoke/legacy-only-plain", Some("tenant-a"), json!({})))
+        .await;
+    let (status, body) = api
+        .reassign("surfaces", &plain, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body, json!({"error": "API key store is not configured"}));
+    assert_eq!(api.stored(&plain).await["tenant_id"], "tenant-a", "a refused reassignment changes nothing");
+
+    let (status, body) = api
+        .send(
+            api.client
+                .get(api.url(&format!("tenant-ownership/surfaces/{plain}/impact"))),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body, json!({"error": "API key store is not configured"}));
+}
