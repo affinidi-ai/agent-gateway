@@ -95,7 +95,7 @@ the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage
 `agent_gateway_credential_provider_token_requests_total{provider_type,outcome}` is a Prometheus
 counter incremented once for each service token request the gateway sends to a credential
 provider's token endpoint: a client credentials, JWT Bearer or Client Credentials JWT grant for
-[target authentication](CREDENTIAL_DELEGATION.md). A cached token served without a request, a
+[target authentication](CREDENTIAL_DELEGATION.md) or for a delegated credential binding. A cached token served without a request, a
 request held back by the retry backoff, and a request refused before it is sent (a missing
 secret, an endpoint the egress policy or the https rule refuses, or whose host does not resolve in time) are not counted. Refreshes and
 code exchanges of delegated user tokens are not counted either.
@@ -269,7 +269,7 @@ fault, rejected request or Trust Recorder write, so it leaves the dashboard metr
 At startup and on every configuration reload (including the reload that follows a surface
 change) the gateway logs one `WARN` line per credential provider or surface whose stored
 configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
-find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
+find what to fix before the rules are enforced. The `jwt_subject` rule, which names a stored JWT Bearer provider without a subject, is report-only: it always warns and has no setting. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
 (for example a variant that cannot be resolved) is not checked: it logs one `WARN` line naming
 its `id`, `tenant` and the `error`, and the `INFO` line then says the rest are clean and how many
 surfaces could not be inspected.

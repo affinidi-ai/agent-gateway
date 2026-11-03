@@ -78,6 +78,42 @@ async fn create_jwt_bearer_provider(
     world.admin_response = Some(response);
 }
 
+async fn validate_jwt_bearer_provider(
+    world: &mut SurfaceWorld,
+    signing_key_secret: &str,
+    subject: Option<&str>,
+) {
+    let mut body = json!({
+        "provider_type": "oauth2_jwt_bearer",
+        "token_endpoint": "https://192.0.2.1/token",
+        "jwt_issuer": "bdd-issuer@example.com",
+        "jwt_signing_key_secret_ref": signing_key_secret,
+        "jwt_key_id": "bdd-key-id",
+    });
+    if let Some(subject) = subject {
+        body["jwt_subject"] = json!(subject);
+    }
+    let response = send(world, Method::POST, "/v1/credential-providers/validate", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+#[when(expr = "the operator validates a JWT Bearer provider using the secret {string} without a subject")]
+async fn operator_validates_jwt_bearer_without_subject(
+    world: &mut SurfaceWorld,
+    secret: String,
+) {
+    validate_jwt_bearer_provider(world, &secret, None).await;
+}
+
+#[when(expr = "the operator validates a JWT Bearer provider using the secret {string} with subject {string}")]
+async fn operator_validates_jwt_bearer_with_subject(
+    world: &mut SurfaceWorld,
+    secret: String,
+    subject: String,
+) {
+    validate_jwt_bearer_provider(world, &secret, Some(&subject)).await;
+}
+
 fn static_secret(secret_id: &str) -> Value {
     json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "Authorization"}}})
 }

@@ -182,7 +182,8 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
               </label>
               <FieldHelp ariaLabel="About Subject" testId="field-help-jwt-subject">
                 The <code>sub</code> claim: the user the assertion is for, such as the user a Google
-                service account acts for with domain-wide delegation.
+                service account acts for with domain-wide delegation. Without it, use the service
+                account's own <code>client_email</code>.
               </FieldHelp>
             </div>
             <input

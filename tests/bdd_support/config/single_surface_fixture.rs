@@ -380,7 +380,7 @@ impl SurfaceTargetAuthProviderConfig {
             insecure_token_endpoint: false,
             authenticates_surface_target: true,
             signing_key_is_service_account_file: false,
-            jwt_subject: None,
+            jwt_subject: Some("bdd-subject@example.com".to_string()),
         }
     }
 }

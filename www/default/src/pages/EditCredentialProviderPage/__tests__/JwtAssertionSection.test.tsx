@@ -37,6 +37,17 @@ describe('JwtAssertionSection', () => {
     expect(algorithms()).toEqual(['RS256', 'ES256']);
   });
 
+  it('marks the Subject of a JWT Bearer provider as required', () => {
+    renderSection('oauth2_jwt_bearer');
+    expect(screen.getByText(/^Subject/, { selector: 'label' })).toHaveTextContent('*');
+    expect(screen.getByTestId('credential-provider-jwt-subject-input')).toBeRequired();
+  });
+
+  it('does not ask a Client Credentials JWT provider for a subject', () => {
+    renderSection('oauth2_client_credentials_jwt_auth');
+    expect(screen.queryByTestId('credential-provider-jwt-subject-input')).not.toBeInTheDocument();
+  });
+
   it('asks a Client Credentials JWT provider for its certificate, offering PS256 first', () => {
     renderSection('oauth2_client_credentials_jwt_auth');
     expect(
