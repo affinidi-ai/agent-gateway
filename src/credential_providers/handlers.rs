@@ -1580,7 +1580,7 @@ mod jwt_provider_tests {
         assert!(
             state
                 .store
-                .find_by_provider_id("blank")
+                .find_by_provider_id(None, "blank")
                 .await
                 .unwrap()
                 .is_none()

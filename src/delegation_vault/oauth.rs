@@ -1007,9 +1007,7 @@ async fn request_token(
             return Err(failure.into());
         }
     };
-    let refused = !answer
-        .status
-        .is_success();
+    let refused = !answer.status.is_success();
     let result = read_token_answer(provider, answer, refresh);
     if !refresh && result.is_err() {
         record_token_request(
