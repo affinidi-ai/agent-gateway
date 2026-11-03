@@ -1,6 +1,7 @@
 //! An Access Point with more than one caller authentication method, proven at
 //! the wire: each request is verified by the method whose credential it
-//! carries, and no method's credential reaches the target.
+//! carries, a request carrying several credentials fails, and no method's
+//! credential reaches the target.
 
 use super::helpers::jwt::{JwksFixture, now_secs, sign_jwt, write_jwt_strategy};
 use super::helpers::{self, GatewayHarness, RecordingTarget, write_api_key_secret};
@@ -54,6 +55,7 @@ async fn start_gateway(
     fixture: &JwksFixture,
     target: &RecordingTarget,
     methods: impl Fn(&str) -> serde_json::Value,
+    deny_failed: bool,
 ) -> GatewayHarness {
     let target_url = target.url.clone();
     GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
@@ -72,7 +74,7 @@ async fn start_gateway(
             .caller_authentication =
             Some(serde_json::from_value(json!({ "methods": methods(strategy_id) })).expect("caller authentication"));
         surface.target.endpoint = target_url.clone();
-        surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+        surface.target.policy = deny_failed.then(|| crate::config::agent_surface::PolicyRef {
             policy_definition_id: DENY_FAILED_POLICY_ID.to_string(),
             require_agent_context: false,
         });
@@ -118,7 +120,8 @@ async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
     let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()])).await;
+        start_gateway(&fixture, &target, |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]), true)
+            .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200, "a JWT caller is authenticated");
@@ -128,16 +131,16 @@ async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
     assert_eq!(
         send(&h, &[("authorization", "Bearer not-a-jwt".to_string()), ("x-api-key", API_KEY.to_string())]).await,
         403,
-        "the first configured method among the presented credentials decides, with no fallback"
+        "a valid API key does not rescue a request whose JWT fails"
     );
     assert_eq!(
         send(&h, &[("authorization", jwt), ("x-api-key", API_KEY.to_string())]).await,
-        200,
-        "the JWT, configured first, authenticates a caller presenting both"
+        403,
+        "a caller presenting two valid credentials fails, so it can't choose the identity"
     );
 
     let received = target.received();
-    assert_eq!(received.len(), 3, "only authenticated callers are forwarded");
+    assert_eq!(received.len(), 2, "only authenticated callers are forwarded");
     for sent in &received {
         assert!(!sent.contains_key("authorization"), "{sent:?}");
         assert!(!sent.contains_key("x-api-key"), "{sent:?}");
@@ -149,7 +152,8 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
     let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)])).await;
+        start_gateway(&fixture, &target, |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)]), false)
+            .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200);
@@ -160,7 +164,7 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
     assert_eq!(received[0]["authorization"], jwt.as_str(), "the selected JWT method forwards its token");
     assert!(
         !received[1].contains_key("authorization"),
-        "the API key, configured first, verified the request, so the JWT stays at the gateway: {:?}",
+        "a request carrying two credentials is verified by neither method, so the JWT stays at the gateway: {:?}",
         received[1]
     );
     assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1]);

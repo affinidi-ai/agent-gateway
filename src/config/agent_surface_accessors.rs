@@ -90,13 +90,13 @@ impl AgentSurface {
             .is_empty()
     }
 
-    /// The caller-authentication method that verifies this request; see
+    /// The caller-authentication method chosen for this request; see
     /// [`crate::source_auth::models::select_source_auth_method`].
     pub fn source_auth_for_request(
         &self,
         headers: &axum::http::HeaderMap,
         peer_cert: Option<&crate::source_auth::models::PeerCertInfo>,
-    ) -> Option<&crate::source_auth::SourceAuthConfig> {
+    ) -> Option<crate::source_auth::models::SourceAuthSelection<'_>> {
         crate::source_auth::models::select_source_auth_method(self.source_auth_methods(), headers, peer_cert.is_some())
     }
 

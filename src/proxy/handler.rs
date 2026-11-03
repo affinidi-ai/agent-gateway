@@ -1946,8 +1946,9 @@ async fn proxy_handler_with_mcp_runtime(
                 }
             }
         } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-            && let (Some(auth_config), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
+            && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
         {
+            let auth_config = selection.method;
             let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
                 Ok(middleware) => middleware,
                 Err(e) => {
@@ -2007,10 +2008,14 @@ async fn proxy_handler_with_mcp_runtime(
                     .active_variant_id
                     .as_deref(),
             };
-            match sa_middleware
-                .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
-                .await
-            {
+            let verified = if selection.ambiguous {
+                Err(crate::source_auth::errors::SourceAuthError::ambiguous_credentials())
+            } else {
+                sa_middleware
+                    .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
+                    .await
+            };
+            match verified {
                 Ok(identity) => Some(identity),
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
@@ -6237,7 +6242,10 @@ async fn proxy_handler_with_mcp_runtime(
         .surface
         .access_point
         .header_metadata_mapping_if_supported();
-    let forwarded_source_auth_header = match selected_source_auth {
+    let forwarded_source_auth_header = match selected_source_auth
+        .filter(|selection| !selection.ambiguous)
+        .map(|selection| selection.method)
+    {
         Some(crate::source_auth::SourceAuthConfig::JwtBearer(config))
             if config.forward_header && resource_authorization.is_none() =>
         {

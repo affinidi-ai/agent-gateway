@@ -243,18 +243,25 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
-- **Caller Context methods**: the caller-auth element's own config is the first method, and
-  `additional_methods` (`caller-auth/CallerAuthAdditionalMethods.tsx`) holds methods 2..n in
-  order; together they save as `caller_authentication.methods`. Each method's fields render
-  through `CallerAuthMethodFields.tsx` with an id prefix: `caller-auth` for the first method (its
-  ids are unchanged) and `caller-auth-extra-<index>` for additional ones, whose radio groups are
-  named from the same prefix. Method 2 moves up into the first place by swapping with the
-  element's own method, except while authorization server discovery is on. `methods.ts` mirrors
-  the gateway's save rules (each method reads its own credential location, only a sole method
-  reads the request body, at most one DID Auth), shown in the editor and on the canvas. An
-  incomplete additional method marks the element unconfigured as `Method <n>: <reason>`. The
-  sidebar lists the additional methods. Loading a surface always replaces `additional_methods`,
-  so a stale canvas copy never brings back a removed method.
+- **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
+  `caller_authentication.methods`, the first being the primary method, and `protected_resource`,
+  which belongs to the primary;
+  `readMethods` in `caller-auth/methods.ts` also reads an older canvas that kept the first method
+  on the element and the rest as `additional_methods`. The sidebar and the fullscreen editor show
+  the same list (`CallerAuthMethodList.tsx`): one row per method with a ready or problem icon, its
+  short name, what it reads (or its problem), and a **Configure ↗** button, then **Add method**,
+  a menu of method types that adds one and opens it. Configure in the sidebar opens the
+  fullscreen editor on that method (`selectedMethod.ts`, never saved); the editor's list adds
+  **Make primary** (which moves a method first and keeps the rest in order) and remove buttons
+  (a sole method cannot be removed) and shows the selected method's
+  settings below it (`CallerAuthMethodFields.tsx`, one method at a time, so its ids stay
+  `caller-auth-*`). With several methods the first carries a Primary badge. While authorization
+  server discovery is on, the primary stays primary and carries a discovery badge. `methods.ts`
+  mirrors the gateway's save rules (each method reads its own credential location, only a sole
+  method reads the request body, at most one DID Auth),
+  shown on each row and on the canvas. With several methods an incomplete one marks the element
+  unconfigured as `Method <n>: <reason>`. Loading a surface always replaces `methods`, so a stale
+  canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   first method is JWT Bearer; additional methods never show it. Turning it on prefills the
@@ -332,12 +339,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Cards heading when the sidebar is collapsed); a click on a sidebar view button leaves focus where
   it is.
 
-| Caller Context methods element                   | Test id                                                                                                                        |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| Additional methods section, add, selection error | `caller-auth-additional-methods`, `caller-auth-add-method-button`, `caller-auth-method-selection-error`                        |
-| One additional method and its method select      | `caller-auth-extra-<index>`, `caller-auth-extra-<index>-mode-select`                                                           |
-| Its move and remove buttons                      | `caller-auth-extra-<index>-move-up-button`, `caller-auth-extra-<index>-move-down-button`, `caller-auth-extra-<index>-remove-button` |
-| Sidebar list of additional methods               | `caller-auth-panel-additional-methods`                                                                                         |
+Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `caller-auth-editor`
+(fullscreen editor):
+
+| Caller Context methods element      | Test id                                                                                 |
+| ----------------------------------- | --------------------------------------------------------------------------------------- |
+| Method list, one method row         | `<area>-methods`, `<area>-method-<index>`                                               |
+| A row's status icon and Configure   | `<area>-method-<index>-status`, `<area>-method-<index>-configure-button`                |
+| A row's Make primary and remove     | `<area>-method-<index>-make-primary-button`, `-remove-button` (editor)                  |
+| Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
+| Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
 
 ## Trust Check
 

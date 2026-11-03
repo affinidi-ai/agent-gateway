@@ -3,28 +3,30 @@ import { Form } from 'react-bootstrap';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
-import { CALLER_AUTH_METHOD_OPTIONS, isSelectableCallerAuthMethod } from './methodOptions';
 import { discoverySaveError, readProtectedResource } from './protectedResource';
-import { readAdditionalMethods } from './methods';
+import { readMethods } from './methods';
+import CallerAuthMethodList from './CallerAuthMethodList';
+import { selectMethod } from './selectedMethod';
 
 /**
- * Compact sidebar panel for the Caller Auth element. Picks the method
- * and defers all method-specific configuration (JWT strategy dropdown,
- * audience chips, mTLS certificate dropdown, etc.) to the fullscreen
- * editor — same pattern the Access Point used before caller-auth was
- * promoted to its own canvas element.
+ * Compact sidebar panel for the Caller Auth element: its methods, one row
+ * each, and the authorization server discovery status. Configure on a row
+ * opens that method's settings in the fullscreen editor.
  */
 const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
+  node,
   config,
   updateFields,
   protocol,
   openFullscreenEditor,
 }) => {
-  const method = config.method_type || 'jwt_bearer';
   const meta = useOptionalSurfaceMeta();
   const discovery = readProtectedResource(config.protected_resource);
-  const additionalMethods = readAdditionalMethods(config);
-  const showsDiscovery = protocol === 'mcp' && method === 'jwt_bearer';
+  const showsDiscovery = protocol === 'mcp' && readMethods(config)[0]?.method_type === 'jwt_bearer';
+  const configure = (position: number) => {
+    selectMethod(node.id, position);
+    openFullscreenEditor?.();
+  };
   const discoveryError = showsDiscovery
     ? discoverySaveError(meta?.saveError, discovery?.resource)
     : null;
@@ -59,53 +61,18 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
       />
 
       <div className="config-section">
-        <label htmlFor="caller-auth-panel-mode-select">Authentication Method</label>
-        <Form.Select
-          id="caller-auth-panel-mode-select"
-          size="sm"
-          value={method}
-          onChange={e => {
-            const nextMethod = e.target
-              .value as (typeof CALLER_AUTH_METHOD_OPTIONS)[number]['value'];
-            if (isSelectableCallerAuthMethod(nextMethod)) {
-              updateFields({
-                method_type: nextMethod,
-                ...(nextMethod === 'jwt_bearer' ? {} : { protected_resource: null }),
-              });
-            }
-          }}
-        >
-          {CALLER_AUTH_METHOD_OPTIONS.map(option => (
-            <option key={option.value} value={option.value} disabled={option.disabled}>
-              {option.label}
-            </option>
-          ))}
-        </Form.Select>
+        <label>Authentication methods</label>
+        <CallerAuthMethodList
+          config={config}
+          updateFields={updateFields}
+          onConfigure={configure}
+          area="caller-auth-panel"
+        />
         <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '10px' }}>
-          Choose how the gateway checks the identity of whoever calls this agent. Click
-          &quot;Configure…&quot; below for details on each option, or to accept more than one
-          method. Default: JWT Bearer, the standard choice unless you specifically need an API key
-          or client certificate.
+          Each caller is verified by the method its credential belongs to; a caller presenting
+          credentials for more than one is refused. Default: JWT Bearer, the standard choice unless
+          you specifically need an API key or client certificate.
         </Form.Text>
-        {additionalMethods.length > 0 && (
-          <Form.Text
-            className="text-muted d-block mt-2"
-            style={{ fontSize: '10px' }}
-            data-testid="caller-auth-panel-additional-methods"
-          >
-            Also accepts:{' '}
-            <strong>
-              {additionalMethods
-                .map(
-                  m =>
-                    CALLER_AUTH_METHOD_OPTIONS.find(option => option.value === m.method_type)
-                      ?.label ?? m.method_type
-                )
-                .join(', ')}
-            </strong>
-            . Each request is verified by the method its credential belongs to.
-          </Form.Text>
-        )}
         {showsDiscovery && (
           <Form.Text
             className="text-muted d-block mt-2"
@@ -132,13 +99,6 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
             {discoveryError}
           </div>
         )}
-        <button
-          className="btn btn-outline-primary btn-sm w-100 mt-2"
-          onClick={() => openFullscreenEditor?.()}
-          disabled={!openFullscreenEditor}
-        >
-          <i className="fas fa-pen-to-square me-1" /> Configure…
-        </button>
       </div>
     </>
   );

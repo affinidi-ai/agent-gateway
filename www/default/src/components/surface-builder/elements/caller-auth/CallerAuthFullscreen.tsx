@@ -6,37 +6,53 @@ import {
   isSelectableCallerAuthMethod,
 } from './methodOptions';
 import CallerAuthMethodFields from './CallerAuthMethodFields';
-import CallerAuthAdditionalMethods from './CallerAuthAdditionalMethods';
-import { defaultMethodConfig } from './methods';
+import CallerAuthMethodList from './CallerAuthMethodList';
+import { defaultMethodConfig, readMethods } from './methods';
+import { useSelectedMethod } from './selectedMethod';
 
 /**
- * Fullscreen editor for the Caller Auth canvas element. Mirrors the
- * field layout the AP-side "Caller Authentication" editor used to
- * provide — JWT strategy dropdown, audience chips, HTTP/protocol
- * extraction radios, mTLS certificate dropdown — but writes to the
- * caller-auth element's flat config shape (`method_type`,
- * `jwt_strategy_id`, `audiences`, `extraction_source`,
- * `extraction_field`, `api_key_secret_id`, `mtls_certificate_id`), with
- * further methods under `additional_methods`. `buildPayload` in
- * `./definition.ts` reshapes those into the runtime `SourceAuthConfig`
- * wire format.
+ * Fullscreen editor for the Caller Auth canvas element: the method list,
+ * and below it the settings of the method selected there (JWT strategy,
+ * audiences, token header and discovery; API key location and secret; DID
+ * Auth session token; mTLS certificate). Each method keeps the flat shape
+ * `buildMethod` in `./methods.ts` turns into the runtime `SourceAuthConfig`;
+ * the discovery setting stays on the element, with the first method.
  */
 const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
+  node,
   config,
-  updateField,
   updateFields,
   protocol,
   allNodes,
   closeFullscreenEditor,
   hasAttemptedSave,
 }) => {
-  const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
+  const methods = readMethods(config);
+  const [requested, select] = useSelectedMethod(node.id);
+  const position = Math.min(requested, Math.max(methods.length - 1, 0));
+  const method = methods[position] ?? {};
+  const type: CallerAuthMethodType = method.method_type || 'jwt_bearer';
+  const isFirst = position === 0;
+  const fieldsConfig = isFirst
+    ? { ...method, protected_resource: config.protected_resource }
+    : method;
 
+  const patchMethod = (patch: Record<string, unknown>) => {
+    const { protected_resource, ...fields } = patch;
+    updateFields({
+      methods: methods.map((current, index) =>
+        index === position ? { ...current, ...fields } : current
+      ),
+      ...(isFirst && 'protected_resource' in patch ? { protected_resource } : {}),
+    });
+  };
   const setType = (newType: CallerAuthMethodType) => {
     if (!isSelectableCallerAuthMethod(newType)) return;
     updateFields({
-      ...defaultMethodConfig(newType, config),
-      ...(newType === 'jwt_bearer' ? {} : { protected_resource: null }),
+      methods: methods.map((current, index) =>
+        index === position ? defaultMethodConfig(newType, current) : current
+      ),
+      ...(isFirst && newType !== 'jwt_bearer' ? { protected_resource: null } : {}),
     });
   };
 
@@ -59,46 +75,59 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
         </div>
       </div>
       <div className="card-body">
-        <div className="mb-4">
-          <label htmlFor="caller-auth-mode-select" className="form-label fw-bold">
-            Authentication Method
-          </label>
-          <select
-            id="caller-auth-mode-select"
-            className="form-control dropdown-styling"
-            value={method}
-            onChange={e => setType(e.target.value as CallerAuthMethodType)}
-          >
-            {CALLER_AUTH_METHOD_OPTIONS.map(option => (
-              <option key={option.value} value={option.value} disabled={option.disabled}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <small className="form-text text-muted">
-            Select how the Gateway should authenticate incoming requests.
-          </small>
-        </div>
-
-        <CallerAuthMethodFields
+        <h6 className="fw-bold">Authentication methods</h6>
+        <p className="text-muted small">
+          Accept more than one kind of credential, for example a JWT for internal users and an API
+          key for partner agents. The gateway verifies each request with the method whose credential
+          it carries. The primary method checks a request that carries none, and a request carrying
+          credentials for several methods is refused. Each method must read its own header. Policy
+          sees which method verified the caller as <code>input.source_auth.method</code>.
+        </p>
+        <CallerAuthMethodList
           config={config}
-          updateField={updateField}
           updateFields={updateFields}
-          protocol={protocol}
-          allNodes={allNodes}
-          hasAttemptedSave={hasAttemptedSave}
-          idPrefix="caller-auth"
-          allowDiscovery
+          onConfigure={select}
+          area="caller-auth-editor"
+          selected={position}
+          editable
         />
 
-        <CallerAuthAdditionalMethods
-          config={config}
-          updateField={updateField}
-          updateFields={updateFields}
-          protocol={protocol}
-          allNodes={allNodes}
-          hasAttemptedSave={hasAttemptedSave}
-        />
+        {methods.length > 0 && (
+          <div className="mt-4 pt-3 border-top" data-testid="caller-auth-editor-method-settings">
+            <h6 className="fw-bold mb-3">Method {position + 1} settings</h6>
+            <div className="mb-4">
+              <label htmlFor="caller-auth-mode-select" className="form-label fw-bold">
+                Authentication Method
+              </label>
+              <select
+                id="caller-auth-mode-select"
+                className="form-control dropdown-styling"
+                value={type}
+                onChange={e => setType(e.target.value as CallerAuthMethodType)}
+              >
+                {CALLER_AUTH_METHOD_OPTIONS.map(option => (
+                  <option key={option.value} value={option.value} disabled={option.disabled}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <small className="form-text text-muted">
+                Select how the Gateway should authenticate incoming requests.
+              </small>
+            </div>
+
+            <CallerAuthMethodFields
+              key={position}
+              config={fieldsConfig}
+              updateField={(field, value) => patchMethod({ [field]: value })}
+              updateFields={patchMethod}
+              protocol={protocol}
+              allNodes={allNodes}
+              hasAttemptedSave={hasAttemptedSave}
+              allowDiscovery={isFirst}
+            />
+          </div>
+        )}
       </div>
     </div>
   );

@@ -162,10 +162,7 @@ describe('identity From API Key — Caller Context dependency', () => {
   it('is an error when a further Caller Context method is not an API key', () => {
     const mixed = {
       ...callerAuth('api_key'),
-      config: {
-        ...callerAuth('api_key').config,
-        additional_methods: [{ method_type: 'jwt_bearer', jwt_strategy_id: 'idp' }],
-      },
+      config: { methods: [{ method_type: 'api_key' }, { method_type: 'jwt_bearer' }] },
     };
     expect(fromApiKeyErrors([accessPoint, mixed, inbound], inbound)).toEqual([
       INBOUND_API_KEY_NEEDS_API_KEY_CALLER,

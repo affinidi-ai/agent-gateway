@@ -10,16 +10,18 @@ import {
   resourceMissesRoute,
 } from './protectedResource';
 import {
-  allMethodConfigs,
   buildMethod,
+  defaultMethodConfig,
+  firstMethodWithDiscovery,
   methodConfigFromPayload,
   methodIncompleteReason,
   methodSelectionProblems,
-  readAdditionalMethods,
+  readMethods,
 } from './methods';
 
 const usesDiscovery = (c: Record<string, unknown>): boolean =>
-  c.method_type === 'jwt_bearer' && readProtectedResource(c.protected_resource) !== null;
+  readMethods(c)[0]?.method_type === 'jwt_bearer' &&
+  readProtectedResource(c.protected_resource) !== null;
 
 const isOnFailure = (v: unknown): v is 'reject' | 'continue' => v === 'reject' || v === 'continue';
 
@@ -28,10 +30,10 @@ const isOnFailure = (v: unknown): v is 'reject' | 'continue' => v === 'reject' |
  * sub-editor to a first-class canvas element so it shows up next to the
  * Access Point and is countable in the surface summary.
  *
- * Writes `access_point.caller_authentication.methods`: the element's own
- * config is the first method and `additional_methods` the rest, in order.
- * The gateway verifies each request with the first method whose credential
- * it carries, so each method reads its own credential location.
+ * Writes `access_point.caller_authentication.methods` from the element's
+ * `methods`, in order, and `protected_resource` with the first method. The
+ * gateway verifies each request with the first method whose credential it
+ * carries, so each method reads its own credential location.
  */
 export const callerAuthDefinition: NodeDefinition = {
   type: 'caller-auth',
@@ -67,11 +69,12 @@ export const callerAuthDefinition: NodeDefinition = {
       payment gate runs. Drops on the caller → access-point arrow.
       Singleton: one element per Surface, holding one or more methods.</p>
       <p>With several methods, each caller uses the one its credential
-      belongs to: the gateway verifies a request with the first method, in
-      the configured order, whose credential the request carries, and never
-      retries a rejected credential with another method. Each method must
-      read its own header (or the client certificate). Policy sees which
-      method verified the caller as <code>input.source_auth.method</code>.</p>
+      belongs to. The first, primary, method checks a request that carries
+      no credential, and a request carrying credentials for more than one
+      method is refused; a rejected credential is never retried with another
+      method. Each method must read its own header (or the client
+      certificate). Policy sees which method verified the caller as
+      <code>input.source_auth.method</code>.</p>
       <p>A closed Access Point (<strong>Public access</strong> off) is not
       ready for external access until it has this element, or on an MCP
       surface an authorization resource (<code>mcp_http.authorization</code>):
@@ -111,16 +114,18 @@ export const callerAuthDefinition: NodeDefinition = {
     `,
   },
   incompleteReason: c => {
-    const primary = methodIncompleteReason(c);
-    if (primary) return primary;
-    const extras = readAdditionalMethods(c);
-    for (const [position, extra] of extras.entries()) {
-      const reason = methodIncompleteReason(extra);
-      if (reason) return `Method ${position + 2}: ${reason}`;
+    const methods = readMethods(c);
+    if (methods.length === 0) return 'Authentication method must be selected';
+    for (const [position, method] of methods.entries()) {
+      const reason = methodIncompleteReason(method);
+      if (reason) return methods.length > 1 ? `Method ${position + 1}: ${reason}` : reason;
     }
     return null;
   },
-  validate: c => [...discoveryProblems(c ?? {}), ...methodSelectionProblems(c)],
+  validate: c => [
+    ...discoveryProblems(firstMethodWithDiscovery(c) as Record<string, unknown>),
+    ...methodSelectionProblems(c),
+  ],
   featureDependencies: [
     {
       description: 'Authorization server discovery requires an MCP Access Point',
@@ -144,16 +149,9 @@ export const callerAuthDefinition: NodeDefinition = {
   ConfigPanel: CallerAuthPanel,
   FullscreenPanel: CallerAuthFullscreen,
   payloadPath: 'access_point.caller_authentication',
-  defaultConfig: () => ({
-    method_type: 'jwt_bearer',
-    extraction_source: 'http_header',
-    extraction_field: 'Authorization',
-    jwt_token_header: 'Authorization',
-    jwt_token_scheme: 'Bearer',
-    jwt_forward_header: false,
-  }),
+  defaultConfig: () => ({ methods: [defaultMethodConfig('jwt_bearer')] }),
   summary: c => {
-    const methods = allMethodConfigs(c);
+    const methods = readMethods(c);
     return methods.length > 0
       ? methods.map(m => String(m.method_type).replace(/_/g, ' ')).join(' + ')
       : null;
@@ -162,13 +160,16 @@ export const callerAuthDefinition: NodeDefinition = {
     const node = ctx.firstNodeOfType('caller-auth');
     if (!node) return undefined;
     const c = node.config ?? {};
-    if (!c.method_type) return undefined;
+    const configured = readMethods(c);
+    if (configured.length === 0) return undefined;
 
-    const methods = allMethodConfigs(c).map(m => buildMethod(m, ctx.surfaceMeta.surface_id));
+    const methods = configured.map(m => buildMethod(m, ctx.surfaceMeta.surface_id));
     if (methods.some(m => m === undefined)) return undefined;
 
     const discovery =
-      c.method_type === 'jwt_bearer' ? readProtectedResource(c.protected_resource) : null;
+      configured[0].method_type === 'jwt_bearer'
+        ? readProtectedResource(c.protected_resource)
+        : null;
     const slices: PayloadSlice[] = [
       {
         path: 'access_point.caller_authentication',
@@ -182,20 +183,19 @@ export const callerAuthDefinition: NodeDefinition = {
     return slices;
   },
   /**
-   * Reverse the wire shape into the flat panel fields: the first method on
-   * the element itself, the rest as `additional_methods`.
-   * `protected_resource` is always set, to `null` when the payload has none,
-   * so a stale copy in the canvas blob never brings back a removed setting.
+   * Reverse the wire shape into the panel's `methods`, each in the flat
+   * method shape. `protected_resource` is always set, to `null` when the
+   * payload has none, so a stale copy in the canvas blob never brings back a
+   * removed setting.
    */
   configFromPayload: slice => {
-    const [first, ...rest] = Array.isArray(slice?.methods) ? slice.methods : [];
-    if (!first) return slice ?? {};
+    const stored = Array.isArray(slice?.methods) ? slice.methods : [];
+    if (stored.length === 0) return slice ?? {};
     return {
-      ...methodConfigFromPayload(first),
+      methods: stored.map(methodConfigFromPayload),
       protected_resource:
-        first.type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null,
+        stored[0].type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null,
       on_failure: isOnFailure(slice.on_failure) ? slice.on_failure : undefined,
-      additional_methods: rest.map(methodConfigFromPayload),
     };
   },
 };

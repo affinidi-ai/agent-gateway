@@ -314,19 +314,39 @@ impl CredentialSource<'_> {
     }
 }
 
-/// The caller authentication method that verifies a request: the first
-/// configured method whose credential the request carries, or the first
-/// method when it carries none. Only that method is verified; a failure never
-/// falls through to the next one.
+/// The caller authentication method chosen for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceAuthSelection<'a> {
+    /// The method whose credential the request carries, or the primary
+    /// (first) method when the request carries none or several.
+    pub method: &'a SourceAuthConfig,
+    /// The request carries credentials for more than one method. It then
+    /// fails without any method being verified.
+    pub ambiguous: bool,
+}
+
+/// Chooses the caller authentication method that verifies a request: the
+/// method whose credential the request carries, or the primary (first) method
+/// when it carries none. A request carrying credentials for several methods is
+/// ambiguous, so the caller can't pick the identity the gateway asserts. Only
+/// the chosen method is verified; a failure never falls through to another.
 pub fn select_source_auth_method<'a>(
     methods: &'a [SourceAuthConfig],
     headers: &axum::http::HeaderMap,
     has_client_certificate: bool,
-) -> Option<&'a SourceAuthConfig> {
-    methods
+) -> Option<SourceAuthSelection<'a>> {
+    let mut presented = methods
         .iter()
-        .find(|method| method.is_presented(headers, has_client_certificate))
-        .or_else(|| methods.first())
+        .filter(|method| method.is_presented(headers, has_client_certificate));
+    match (presented.next(), presented.next()) {
+        (Some(method), None) => Some(SourceAuthSelection { method, ambiguous: false }),
+        (Some(_), Some(_)) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: true }),
+        (None, _) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: false }),
+    }
 }
 
 // ── Credential extraction ────────────────────────────────────────────────────
@@ -1276,46 +1296,41 @@ mod tests {
             .collect()
     }
 
+    fn selected_tag(
+        methods: &[SourceAuthConfig],
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> (&'static str, bool) {
+        let selection = select_source_auth_method(methods, headers, has_client_certificate).unwrap();
+        (selection.method.method_tag(), selection.ambiguous)
+    }
+
     #[test]
     fn selection_picks_the_method_whose_credential_the_request_carries() {
         let methods = jwt_and_api_key();
 
-        let selected = select_source_auth_method(&methods, &headers(&[("x-api-key", "k")]), false).unwrap();
-        assert_eq!(selected.method_tag(), "api_key");
-
-        let selected = select_source_auth_method(&methods, &headers(&[("authorization", "Bearer t")]), false).unwrap();
-        assert_eq!(selected.method_tag(), "jwt_bearer");
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("authorization", "Bearer t")]), false), ("jwt_bearer", false));
     }
 
     #[test]
-    fn selection_prefers_configured_order_when_several_credentials_are_present() {
+    fn selection_is_ambiguous_on_the_primary_method_when_several_credentials_are_present() {
         let methods = jwt_and_api_key();
         let both = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
 
-        assert_eq!(
-            select_source_auth_method(&methods, &both, false)
-                .unwrap()
-                .method_tag(),
-            "jwt_bearer"
-        );
+        assert_eq!(selected_tag(&methods, &both, false), ("jwt_bearer", true));
 
         let reversed: Vec<_> = methods
             .into_iter()
             .rev()
             .collect();
-        assert_eq!(
-            select_source_auth_method(&reversed, &both, false)
-                .unwrap()
-                .method_tag(),
-            "api_key"
-        );
+        assert_eq!(selected_tag(&reversed, &both, false), ("api_key", true));
     }
 
     #[test]
-    fn selection_falls_back_to_the_first_method_when_no_credential_is_present() {
+    fn selection_falls_back_to_the_primary_method_when_no_credential_is_present() {
         let methods = jwt_and_api_key();
-        let selected = select_source_auth_method(&methods, &headers(&[("x-other", "v")]), false).unwrap();
-        assert_eq!(selected.method_tag(), "jwt_bearer");
+        assert_eq!(selected_tag(&methods, &headers(&[("x-other", "v")]), false), ("jwt_bearer", false));
     }
 
     #[test]
@@ -1328,18 +1343,9 @@ mod tests {
                 "identity_binding": {"type": "fingerprint"}
             })),
         ];
-        assert_eq!(
-            select_source_auth_method(&methods, &headers(&[]), true)
-                .unwrap()
-                .method_tag(),
-            "mtls"
-        );
-        assert_eq!(
-            select_source_auth_method(&methods, &headers(&[]), false)
-                .unwrap()
-                .method_tag(),
-            "api_key"
-        );
+        assert_eq!(selected_tag(&methods, &headers(&[]), true), ("mtls", false));
+        assert_eq!(selected_tag(&methods, &headers(&[]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), true), ("api_key", true));
     }
 
     #[test]

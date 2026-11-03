@@ -4763,7 +4763,8 @@ async fn process_forward_request_in_request_scope(
                 .map(to_header_iter)
                 .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
 
-            if let Some(auth_config) = surface.source_auth_for_request(&axum_headers, None) {
+            if let Some(selection) = surface.source_auth_for_request(&axum_headers, None) {
+                let auth_config = selection.method;
                 let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
                     Ok(middleware) => middleware,
                     Err(e) => {
@@ -4804,10 +4805,14 @@ async fn process_forward_request_in_request_scope(
                     surface_id: &surface.surface_id,
                     variant_id: active_variant_id.as_deref(),
                 };
-                match sa_middleware
-                    .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
-                    .await
-                {
+                let verified = if selection.ambiguous {
+                    Err(crate::source_auth::errors::SourceAuthError::ambiguous_credentials())
+                } else {
+                    sa_middleware
+                        .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
+                        .await
+                };
+                match verified {
                     Ok(identity) => Some(identity),
                     // Caller-attributable failure. An Access Point that
                     // publishes protected resource metadata, or whose caller

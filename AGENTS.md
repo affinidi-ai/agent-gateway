@@ -134,9 +134,9 @@ The Agent Cards view of an A2A or AP2 surface shows the managed agent's card bes
 and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
-The Caller Context editor edits an ordered list of caller authentication methods, the first
-on the element's own config and the rest under `additional_methods`; see _Caller Context
-methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+The Caller Context element lists its caller authentication methods in order, in the sidebar and
+in the fullscreen editor, each row with a Configure button that opens that method's settings;
+see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
 authorization server discovery (`caller_authentication.protected_resource`), and Save removes

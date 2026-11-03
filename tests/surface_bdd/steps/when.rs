@@ -2051,10 +2051,10 @@ async fn request_with_expired_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
-#[when("the caller sends a request to the surface with an expired token and a valid API key")]
-async fn request_with_expired_token_and_valid_api_key(world: &mut SurfaceWorld) {
+#[when("the caller sends a request to the surface with a valid token and a valid API key")]
+async fn request_with_valid_token_and_valid_api_key(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
+    let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
     let api_key = build_valid_api_key_source_auth_header(world);
     send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), api_key]).await;
 }

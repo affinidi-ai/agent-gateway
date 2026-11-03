@@ -1140,6 +1140,15 @@ async fn no_grant_goes_to_callers_who_name_themselves() {
     };
     let jwt = |audiences: &[&str]| json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy-1", "audiences": audiences});
     let target = format!("{}/mcp", fixture.vendor.origin());
+    // The JWT method reads `Authorization`, so a caller sending its own token
+    // there beside the API key would carry two credentials and be refused.
+    let api_key_call = || {
+        let mut request = mcp_call(Some(KEY));
+        request
+            .headers_mut()
+            .remove("authorization");
+        request
+    };
     for (case, checked) in
         [("DID Auth with an allow-list", did_auth(&["did:example:a"])), ("JWT with an audience", jwt(&["https://gw"]))]
     {
@@ -1147,7 +1156,7 @@ async fn no_grant_goes_to_callers_who_name_themselves() {
             .serve(authenticating(vendor_surface("mcp", &target, "owner"), json!([api_key, checked])))
             .await;
         let (status, _, body) = fixture
-            .send(mcp_call(Some(KEY)))
+            .send(api_key_call())
             .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{case}: {body}");
     }
@@ -1157,7 +1166,7 @@ async fn no_grant_goes_to_callers_who_name_themselves() {
             .serve(authenticating(vendor_surface("mcp", &target, "owner"), json!([api_key, unchecked])))
             .await;
         let (status, _, body) = fixture
-            .send(mcp_call(Some(KEY)))
+            .send(api_key_call())
             .await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
         assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}), "{case}");

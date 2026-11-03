@@ -2,9 +2,7 @@ import type { CallerAuthMethodType } from './methodOptions';
 
 /**
  * One caller authentication method in the caller-auth element's flat panel
- * shape (`method_type`, `jwt_strategy_id`, `extraction_field`, …). The
- * element's own config is the first method; `additional_methods` holds the
- * rest, in the order the gateway breaks ties between presented credentials.
+ * shape (`method_type`, `jwt_strategy_id`, `extraction_field`, …).
  */
 export interface CallerAuthMethodConfig {
   method_type?: CallerAuthMethodType;
@@ -18,16 +16,46 @@ export interface CallerAuthMethodConfig {
   api_key_secret_id?: string;
   mtls_certificate_id?: string;
   protected_resource?: unknown;
+}
+
+/**
+ * The caller-auth element's config: its methods, in the order the gateway
+ * breaks ties between presented credentials, and the authorization server
+ * discovery setting, which belongs to the first method. An older canvas
+ * stored the first method's fields on the element itself and the rest as
+ * `additional_methods`; {@link readMethods} still reads that shape.
+ */
+export interface CallerAuthConfig extends CallerAuthMethodConfig {
+  methods?: CallerAuthMethodConfig[];
   additional_methods?: CallerAuthMethodConfig[];
 }
 
-export function readAdditionalMethods(config: CallerAuthMethodConfig | undefined) {
-  return Array.isArray(config?.additional_methods) ? config.additional_methods : [];
+export function readMethods(config: CallerAuthConfig | undefined): CallerAuthMethodConfig[] {
+  if (Array.isArray(config?.methods)) return config.methods;
+  if (!config?.method_type) return [];
+  const {
+    methods: _methods,
+    additional_methods,
+    protected_resource: _discovery,
+    ...first
+  } = config;
+  return [first, ...(Array.isArray(additional_methods) ? additional_methods : [])];
 }
 
-export function allMethodConfigs(config: CallerAuthMethodConfig | undefined) {
-  return config?.method_type ? [config, ...readAdditionalMethods(config)] : [];
+/** The first method with the discovery setting, as the discovery rules read it. */
+export function firstMethodWithDiscovery(
+  config: CallerAuthConfig | undefined
+): CallerAuthMethodConfig {
+  return { ...readMethods(config)[0], protected_resource: config?.protected_resource };
 }
+
+export const CALLER_AUTH_METHOD_SHORT_LABEL: Record<CallerAuthMethodType, string> = {
+  jwt_bearer: 'JWT',
+  api_key: 'API Key',
+  api_key_provider: 'API Key provider',
+  did_auth: 'DID Auth',
+  mtls: 'mTLS',
+};
 
 export function defaultMethodConfig(
   type: CallerAuthMethodType,
@@ -91,31 +119,43 @@ const readsRequestBody = (method: CallerAuthMethodConfig) =>
   method.method_type !== 'mtls' &&
   (method.extraction_source === 'mcp_meta' || method.extraction_source === 'a2a_extension');
 
-export function methodSelectionProblems(config: CallerAuthMethodConfig | undefined) {
-  const methods = allMethodConfigs(config);
-  const problems: Array<{ field: string; message: string }> = [];
-  methods.forEach((method, position) => {
-    const location = credentialLocation(method);
-    if (methods.length > 1 && readsRequestBody(method)) {
-      problems.push({
-        field: 'additional_methods',
-        message: `Method ${position + 1} reads ${location}; with more than one method, each must read a header or the client certificate`,
-      });
-    }
-    const earlier = methods
-      .slice(0, position)
-      .findIndex(other => credentialLocation(other) === location);
-    if (earlier >= 0) {
-      problems.push({
-        field: 'additional_methods',
-        message: `Methods ${earlier + 1} and ${position + 1} both read ${location}; each method needs its own credential location`,
-      });
-    }
-  });
-  if (methods.filter(method => method.method_type === 'did_auth').length > 1) {
-    problems.push({ field: 'additional_methods', message: 'At most one DID Auth method' });
+/**
+ * Why the method at `position` cannot be saved beside the others, or `null`:
+ * the gateway selects a method by the credential a request carries, so each
+ * method reads its own location and only a sole method reads the body.
+ */
+export function methodConflict(methods: CallerAuthMethodConfig[], position: number): string | null {
+  const method = methods[position];
+  const location = credentialLocation(method);
+  if (methods.length > 1 && readsRequestBody(method)) {
+    return `Method ${position + 1} reads ${location}; with more than one method, each must read a header or the client certificate`;
   }
-  return problems;
+  const earlier = methods
+    .slice(0, position)
+    .findIndex(other => credentialLocation(other) === location);
+  if (earlier >= 0) {
+    return `Methods ${earlier + 1} and ${position + 1} both read ${location}; each method needs its own credential location`;
+  }
+  if (
+    method.method_type === 'did_auth' &&
+    methods.slice(0, position).some(other => other.method_type === 'did_auth')
+  ) {
+    return 'At most one DID Auth method';
+  }
+  return null;
+}
+
+/** The first problem of the method at `position`: incomplete, or in conflict. */
+export function methodProblem(methods: CallerAuthMethodConfig[], position: number): string | null {
+  return methodIncompleteReason(methods[position]) ?? methodConflict(methods, position);
+}
+
+export function methodSelectionProblems(config: CallerAuthConfig | undefined) {
+  const methods = readMethods(config);
+  return methods
+    .map((_, position) => methodConflict(methods, position))
+    .filter((message): message is string => message !== null)
+    .map(message => ({ field: 'methods', message }));
 }
 
 /** The runtime `SourceAuthConfig` for one method, or `undefined` while incomplete. */

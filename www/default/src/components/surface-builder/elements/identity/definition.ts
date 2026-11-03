@@ -6,7 +6,7 @@ import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
 import { isInboundIdentity } from './placement';
 import { DOCS_URL } from '../../../../config/docs';
-import { allMethodConfigs } from '../caller-auth/methods';
+import { readMethods } from '../caller-auth/methods';
 
 export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
   "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
@@ -112,13 +112,16 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
-        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate the caller with JWT Bearer',
+        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
       condition: c => c.type === 'from_jwt_claim',
       check: (_c, ctx) =>
-        ctx.allNodes.some(n => n.type === 'caller-auth' && n.config?.method_type === 'jwt_bearer'),
+        ctx.allNodes.some(n => {
+          const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
+          return methods.length > 0 && methods.every(m => m.method_type === 'jwt_bearer');
+        }),
       severity: 'error',
       message:
-        'From JWT Claims requires a Caller Context using JWT Bearer. Switch it back, or change this extraction type.',
+        'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
     },
     {
       description:
@@ -126,7 +129,7 @@ export const identityDefinition: NodeDefinition = {
       condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
       check: (_c, ctx) => {
         const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
-        const methods = callerAuth ? allMethodConfigs(callerAuth.config) : [];
+        const methods = callerAuth ? readMethods(callerAuth.config) : [];
         return (
           methods.length > 0 &&
           methods.every(method => INBOUND_API_KEY_CALLER_METHODS.has(method.method_type))

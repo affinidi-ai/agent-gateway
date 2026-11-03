@@ -60,6 +60,14 @@ impl From<JwtBearerError> for SourceAuthError {
 }
 
 impl SourceAuthError {
+    /// The failure for a request carrying credentials for more than one
+    /// source authentication method; no method verifies it.
+    pub fn ambiguous_credentials() -> Self {
+        SourceAuthError::InvalidCredential {
+            reason: "the request carries credentials for more than one source authentication method".to_string(),
+        }
+    }
+
     /// Whether this failure is attributable to the caller's credential (missing
     /// or invalid) rather than a server-side problem (config resolution, JWKS
     /// fetch, storage). Caller-attributable failures are handed to the policy

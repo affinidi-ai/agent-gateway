@@ -24,14 +24,16 @@ type CallerAuthMethodFieldsProps = Pick<
   ConfigPanelProps,
   'config' | 'updateField' | 'updateFields' | 'protocol' | 'allNodes' | 'hasAttemptedSave'
 > & {
-  /** Prefix for element ids and test ids; radio group names derive from it. */
-  idPrefix: string;
   /** Authorization server discovery belongs to the first method only. */
   allowDiscovery: boolean;
 };
 
+const idPrefix = 'caller-auth';
+const namePrefix = 'caller_auth';
+
 /**
- * The fields of one caller authentication method, below its method picker:
+ * The fields of one caller authentication method, below its method picker,
+ * for the one method the editor shows at a time:
  * JWT strategy, audiences and token header; API key location and secret;
  * DID Auth session token location; mTLS certificate. Writes the flat
  * method shape that `buildMethod` in `./methods.ts` turns into the runtime
@@ -44,10 +46,8 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
   protocol,
   allNodes,
   hasAttemptedSave,
-  idPrefix,
   allowDiscovery,
 }) => {
-  const namePrefix = idPrefix.replace(/-/g, '_');
   const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
   const { surfaceId } = useParams<{ surfaceId: string }>();
   const jwtStrategies = useJwtStrategies();

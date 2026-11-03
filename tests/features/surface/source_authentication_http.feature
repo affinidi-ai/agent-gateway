@@ -111,11 +111,11 @@ Feature: HTTP surface source authentication
       | with a valid token   |
       | with a valid API key |
 
-  Scenario: A rejected credential is not retried with another source authentication method
+  Scenario: A request carrying credentials for two source authentication methods is refused
     Given an A2A surface targeting managed agent "bravo"
     And the surface accepts "JWT Bearer" and "API Key" source authentication
     And the surface has a policy denying callers whose source authentication failed
-    When the caller sends a request to the surface with an expired token and a valid API key
+    When the caller sends a request to the surface with a valid token and a valid API key
     Then the response status is 403
     And managed agent "bravo" was not called
 

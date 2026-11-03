@@ -30,20 +30,25 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 
 ### Several methods on one Access Point
 
-`methods` is an ordered list, so one surface can accept callers with different
-credentials, for example a JWT for internal users and an API key for partner agents, and
-the managed agent keeps one identity. The gateway selects one method per request
-([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only that
-method:
+`methods` is a list, so one surface can accept callers with different credentials, for
+example a JWT for internal users and an API key for partner agents, and the managed agent
+keeps one identity. The first entry is the primary method. The gateway selects one method
+per request ([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only
+that method:
 
-1. The method is the first, in configured order, whose credential the request carries: its
-   header is present (for JWT bearer, `token_header`; otherwise `extraction.field`), or, for
-   mTLS, a client certificate reached the gateway. No credential is read from the body, so a
-   method that extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
-2. A request that carries no method's credential is checked against the first method, so it
-   fails as a missing credential of that method.
-3. A rejected credential is never retried with another method. A request with an expired JWT
-   and a valid API key, on a surface listing JWT bearer first, fails.
+1. The method is the one whose credential the request carries: its header is present (for
+   JWT bearer, `token_header`; otherwise `extraction.field`), or, for mTLS, a client
+   certificate reached the gateway. No credential is read from the body, so a method that
+   extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
+2. A request that carries no method's credential is checked against the primary method, so
+   it fails as a missing credential of that method.
+3. A request that carries credentials for more than one method fails as an invalid credential
+   of the primary method, and neither credential is verified, so a caller can't choose the
+   identity the gateway asserts. This includes a JWT or API key sent over a connection that
+   presents a client certificate, on a surface that also accepts mTLS.
+4. A rejected credential is never retried with another method.
+
+The order of the other methods has no effect.
 
 Policy sees the method that verified the caller as `input.source_auth.method`, so a rule can
 treat callers differently by method:
@@ -76,7 +81,7 @@ gateway configuration):
 - a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
   method is `jwt_bearer`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
-  than the first: the discovery audience and challenge belong to the first method.
+  than the primary: the discovery audience and challenge belong to the primary method.
 
 Surfaces stored before these rules may break them, because the gateway then enforced only
 the first method and ignored the rest. At startup, a stored surface whose methods break them
@@ -88,7 +93,8 @@ than `jwt_bearer` is logged as a warning at startup and refused on the next save
 
 The credential headers of every method are stripped before a request is forwarded, on each
 inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
-forwards its header only when it was the method selected for that request.
+forwards its header only when it was the method selected for that request, so a request
+carrying several credentials forwards none.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
