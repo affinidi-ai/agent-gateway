@@ -708,9 +708,13 @@ impl TargetCardFetch<'_> {
             .surface
             .source_auth()
             .and_then(|sa| sa.credential_header_name());
+        let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
         for (key, value) in headers.iter() {
             let forward = match credential {
                 Some(_) => super::is_forwarded_on_credentialed_card_fetch(key.as_str()),
+                None if bound_target => {
+                    crate::proxy::target_grant::forwards_caller_header(key.as_str(), source_cred_header, None)
+                }
                 None => super::should_forward_header(key.as_str(), source_cred_header),
             };
             if forward {

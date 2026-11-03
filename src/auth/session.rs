@@ -311,6 +311,21 @@ impl SessionManager {
         Some(result)
     }
 
+    /// Whether `token` names a session that exists and has not expired. Unlike
+    /// [`Self::validate_session_record`], it does not extend the session.
+    pub async fn is_live(
+        &self,
+        token: &str,
+    ) -> bool {
+        if token.starts_with(crate::access_tokens::TOKEN_PREFIX) {
+            return false;
+        }
+        matches!(
+            self.storage.get(token).await,
+            Ok(Some(session)) if chrono::Utc::now() < session.expires_at
+        )
+    }
+
     /// Remove a session (logout)
     pub async fn remove_session(
         &self,
@@ -437,6 +452,55 @@ mod tests {
         assert!(rendered.contains(r#"token: "0f2c9d7e...""#), "{rendered}");
         assert!(rendered.contains(r#"user_id: "user-a""#), "{rendered}");
         assert!(!rendered.contains(TOKEN), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn is_live_accepts_only_an_unexpired_session_and_does_not_extend_it() {
+        let manager = SessionManager::new();
+        let token = manager
+            .create_session("alice".into(), "user-a".into())
+            .await;
+        let expires_at = |session: Option<Session>| {
+            session
+                .expect("session")
+                .expires_at
+        };
+        let before = expires_at(
+            manager
+                .storage
+                .get(&token)
+                .await
+                .unwrap(),
+        );
+
+        assert!(manager.is_live(&token).await);
+        assert_eq!(
+            expires_at(
+                manager
+                    .storage
+                    .get(&token)
+                    .await
+                    .unwrap()
+            ),
+            before
+        );
+
+        manager
+            .storage
+            .save(&session_with_token(TOKEN, "user-a", -1))
+            .await
+            .unwrap();
+        assert!(!manager.is_live(TOKEN).await);
+        assert!(
+            !manager
+                .is_live(&format!("{}{}", crate::access_tokens::TOKEN_PREFIX, TOKEN))
+                .await
+        );
+
+        manager
+            .remove_session(&token)
+            .await;
+        assert!(!manager.is_live(&token).await);
     }
 
     #[tokio::test]

@@ -480,7 +480,10 @@ and Fabric receive `403` "Request blocked by egress policy"; outbound
 A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
 more: the outbound forward sends it only to the origin of its provider's `resource`, through
 `egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point).
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point). So
+is an Access Point request to a Target bound by external consent: the inbound forward uses that
+client in place of the operator-policy one, for every request but a public discovery read
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)).
 
 The vendor clients of external consent, which carry a client's credentials or a person's token,
 ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always

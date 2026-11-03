@@ -1,18 +1,19 @@
 //! A grant by binding lives only as long as its binding.
 //!
-//! A surface change that removes a `consent_mode: external` binding (a surface
-//! deleted, a Transit Point removed, its binding removed, its `subject` or
-//! provider changed, the surface moved to another tenant, or the only variant
-//! that holds it disabled) deletes that binding's grants while the change is
+//! A binding is a Transit Point's, kept under its id, or the Access Point
+//! Target's, kept under the hop [`ACCESS_POINT_TARGET_HOP`]. A surface change
+//! that removes a `consent_mode: external` binding (a surface deleted, a
+//! Transit Point removed, its binding removed, its `subject` or provider
+//! changed, the surface moved to another tenant, or the only variant that
+//! holds it disabled) deletes that binding's grants while the change is
 //! saved, then, once it is saved, revokes at the vendor what it deleted; a
 //! change that is not saved puts them back. Both run on one task of their
 //! own, so a write dropped part way, as when its client disconnects, still
 //! settles, and audits, every one of them. A change that
 //! adds a binding deletes any grant already stored under it, left from an
-//! earlier binding of the same surface, Transit Point id and provider, so
-//! re-adding a binding never re-arms an old grant: it needs a new consent.
-//! When the grants cannot be removed, the change is refused, so no grant
-//! outlives its binding.
+//! earlier binding of the same surface, hop and provider, so re-adding a
+//! binding never re-arms an old grant: it needs a new consent. When the grants
+//! cannot be removed, the change is refused, so no grant outlives its binding.
 //!
 //! The grants of a binding are found by their record ids, so a change reads
 //! and decrypts only the grants of the bindings it changes: a grant that cannot
@@ -36,7 +37,8 @@ use crate::config::agent_surface::{AgentSurface, GrantSubject, TransitPoint};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::AuditCallerContext;
 use crate::delegation_vault::grants::{
-    DelegatedGrant, GrantBinding, OWNER_PRINCIPAL, PepperMismatch, Principals, StoredGrant, UnreadableGrant,
+    ACCESS_POINT_TARGET_HOP, DelegatedGrant, GrantBinding, OWNER_PRINCIPAL, PepperMismatch, Principals, StoredGrant,
+    UnreadableGrant,
 };
 use crate::delegation_vault::storage::DelegationVaultStorage;
 use crate::secrets::SecretsStore;
@@ -138,20 +140,70 @@ fn live_transit_point_lists(surface: &AgentSurface) -> Vec<&[TransitPoint]> {
     lists
 }
 
-/// The binding `credentials` of `point` on `surface`, as its grants are keyed.
+/// The `outbound_credentials` lists of the Access Point Target that `surface`
+/// serves: its own, and each enabled variant's replacement list, with the
+/// endpoint of the Target the variant points at. A disabled variant's list is
+/// not served, so it keeps no grants.
+fn live_target_binding_lists(
+    surface: &AgentSurface
+) -> Vec<(&[crate::config::types::OutboundCredentialBinding], String)> {
+    let mut lists = vec![(
+        surface
+            .outbound_credentials
+            .as_slice(),
+        surface
+            .target
+            .endpoint
+            .clone(),
+    )];
+    for variant in surface
+        .variants
+        .iter()
+        .filter(|variant| variant.enabled)
+    {
+        if let Some(bindings) = variant
+            .overrides
+            .outbound_credentials
+            .as_deref()
+        {
+            lists.push((
+                bindings,
+                surface
+                    .variant_target(variant)
+                    .endpoint,
+            ));
+        }
+    }
+    lists
+}
+
+/// One `consent_mode: external` binding a surface serves: a Transit Point's,
+/// under the Transit Point's id, or the Access Point Target's, under
+/// [`ACCESS_POINT_TARGET_HOP`], with the endpoint its grants are sent to.
+#[derive(Clone, Debug)]
+pub(crate) struct ServedBinding<'a> {
+    pub hop: &'a str,
+    pub target_endpoint: String,
+    pub credential_provider_id: &'a str,
+    /// The scopes the binding names; empty for one that names none, which
+    /// permits its provider's default scopes.
+    pub scopes: &'a [String],
+    pub subject: Option<GrantSubject>,
+}
+
+/// The binding `served` on `surface`, as its grants are keyed.
 fn external_binding(
     surface: &AgentSurface,
-    point: &TransitPoint,
-    credentials: &crate::config::agent_surface::TransitCredentials,
+    served: &ServedBinding<'_>,
 ) -> ExternalBinding {
     ExternalBinding {
         tenant_id: surface.tenant_id.clone(),
         surface_id: surface.surface_id.clone(),
-        hop: point.id.clone(),
-        credential_provider_id: credentials
+        hop: served.hop.to_string(),
+        credential_provider_id: served
             .credential_provider_id
-            .clone(),
-        subject: credentials
+            .to_string(),
+        subject: served
             .subject
             .map(|subject| subject == GrantSubject::Owner),
     }
@@ -161,24 +213,24 @@ fn external_binding(
 /// enabled variant.
 fn external_bindings(surface: &AgentSurface) -> HashSet<ExternalBinding> {
     served_external_bindings(surface)
-        .into_iter()
-        .map(|(point, credentials)| external_binding(surface, point, credentials))
+        .iter()
+        .map(|served| external_binding(surface, served))
         .collect()
 }
 
 /// The scopes each external consent binding `surface` serves names, in every
 /// place that serves it: the base, and each enabled variant that lists the
-/// Transit Point, as a surface stored outside the API may. Each place's list
-/// is sorted, and empty for one that names none, which permits its
-/// provider's default scopes.
+/// Transit Point, or holds the Access Point Target's binding, as a surface
+/// stored outside the API may. Each place's list is sorted, and empty for one
+/// that names none, which permits its provider's default scopes.
 fn binding_scopes(surface: &AgentSurface) -> HashMap<ExternalBinding, Vec<Vec<String>>> {
     let mut scopes: HashMap<ExternalBinding, Vec<Vec<String>>> = HashMap::new();
-    for (point, credentials) in served_external_bindings(surface) {
-        let mut named = credentials.scopes.clone();
+    for served in served_external_bindings(surface) {
+        let mut named = served.scopes.to_vec();
         named.sort();
         named.dedup();
         scopes
-            .entry(external_binding(surface, point, credentials))
+            .entry(external_binding(surface, &served))
             .or_default()
             .push(named);
     }
@@ -207,36 +259,36 @@ fn within(
         .all(|scope| permitted.contains(scope))
 }
 
-/// Whether `binding`, as saved now, permits every scope `grant` was asked
-/// for: its own scopes, or `default_scopes`, its provider's, when it names
-/// none. A grant left by a binding later narrowed is not released beyond it.
+/// Whether a binding whose own scopes are `scopes`, as saved now, permits
+/// every scope `grant` was asked for: `scopes`, or `default_scopes`, its
+/// provider's, when it names none. A grant left by a binding later narrowed is
+/// not released beyond it.
 pub(crate) fn binding_permits(
-    binding: &crate::config::agent_surface::TransitCredentials,
+    scopes: &[String],
     default_scopes: &[String],
     grant: &DelegatedGrant,
 ) -> bool {
-    within(grant, &binding.scopes, default_scopes)
+    within(grant, scopes, default_scopes)
 }
 
-/// Every binding of `surface` that holds `grant`: each place that serves its
-/// Transit Point with its tenant, provider and subject.
+/// Every binding of `surface` that holds `grant`: each place that serves it at
+/// its hop with its tenant, provider and subject.
 fn holding_bindings<'a>(
     surface: &'a AgentSurface,
     grant: &DelegatedGrant,
-) -> Vec<&'a crate::config::agent_surface::TransitCredentials> {
+) -> Vec<ServedBinding<'a>> {
     served_external_bindings(surface)
         .into_iter()
-        .filter(|(point, credentials)| external_binding(surface, point, credentials).holds(grant))
-        .map(|(_, credentials)| credentials)
+        .filter(|served| external_binding(surface, served).holds(grant))
         .collect()
 }
 
-/// Whether `surface` serves the binding `grant` is kept for: its tenant,
-/// Transit Point, provider and subject, with the scopes the grant was asked
-/// for within the binding's, or `default_scopes`, its provider's, when it
-/// names none, in every place that serves it. Storing a grant, its release and
-/// the sweep all decide by this, so where the surface serves one Transit Point
-/// with other scopes in two places, the narrower decides for all three.
+/// Whether `surface` serves the binding `grant` is kept for: its tenant, hop,
+/// provider and subject, with the scopes the grant was asked for within the
+/// binding's, or `default_scopes`, its provider's, when it names none, in
+/// every place that serves it. Storing a grant, its release and the sweep all
+/// decide by this, so where the surface serves one binding with other scopes
+/// in two places, the narrower decides for all three.
 pub(crate) fn serves_grant(
     surface: &AgentSurface,
     grant: &DelegatedGrant,
@@ -246,17 +298,17 @@ pub(crate) fn serves_grant(
     !holding.is_empty()
         && holding
             .iter()
-            .all(|binding| binding_permits(binding, default_scopes, grant))
+            .all(|binding| binding_permits(binding.scopes, default_scopes, grant))
 }
 
 /// The `consent_mode: external` bindings `surface` serves, in its base and
-/// every enabled variant: each Transit Point that has one, with its
-/// credentials. A Transit Point id with such a binding names one Transit
-/// Point in one place, so each hop appears once.
-pub(crate) fn served_external_bindings(
-    surface: &AgentSurface
-) -> Vec<(&TransitPoint, &crate::config::agent_surface::TransitCredentials)> {
-    live_transit_point_lists(surface)
+/// every enabled variant: each Transit Point that has one, under its id, and
+/// the Access Point Target's, under [`ACCESS_POINT_TARGET_HOP`]. A Transit
+/// Point id with such a binding names one Transit Point in one place, the
+/// Target's binding is held in one place, and no such Transit Point takes the
+/// Target's hop as its id, so each hop appears once.
+pub(crate) fn served_external_bindings(surface: &AgentSurface) -> Vec<ServedBinding<'_>> {
+    let points = live_transit_point_lists(surface)
         .into_iter()
         .flatten()
         .filter_map(|point| {
@@ -264,9 +316,29 @@ pub(crate) fn served_external_bindings(
                 .transit_credentials
                 .as_ref()
                 .filter(|binding| binding.is_external())
-                .map(|binding| (point, binding))
-        })
-        .collect()
+                .map(|binding| ServedBinding {
+                    hop: &point.id,
+                    target_endpoint: point.target_endpoint.clone(),
+                    credential_provider_id: &binding.credential_provider_id,
+                    scopes: &binding.scopes,
+                    subject: binding.subject,
+                })
+        });
+    let target = live_target_binding_lists(surface)
+        .into_iter()
+        .flat_map(|(bindings, target_endpoint)| {
+            bindings
+                .iter()
+                .filter(|binding| binding.is_external())
+                .map(move |binding| ServedBinding {
+                    hop: ACCESS_POINT_TARGET_HOP,
+                    target_endpoint: target_endpoint.clone(),
+                    credential_provider_id: &binding.credential_provider_id,
+                    scopes: &binding.scopes,
+                    subject: binding.subject,
+                })
+        });
+    points.chain(target).collect()
 }
 
 fn unavailable() -> SurfaceApiError {
@@ -283,12 +355,17 @@ fn refusal(
     error: &anyhow::Error,
 ) -> SurfaceApiError {
     if let Some(unreadable) = error.downcast_ref::<UnreadableGrant>() {
+        let place = if binding.hop == ACCESS_POINT_TARGET_HOP {
+            "the Access Point's Target".to_string()
+        } else {
+            format!("Transit Point '{}'", binding.hop)
+        };
         return SurfaceApiError::Unavailable(format!(
-            "The delegated grant {} of Transit Point '{}' cannot be read ({}), so this change, which removes or adds \
-             its binding, is refused: the grant could be neither revoked nor deleted. Make it readable again (for \
+            "The delegated grant {} of {place} cannot be read ({}), so this change, which removes or adds its \
+             binding, is refused: the grant could be neither revoked nor deleted. Make it readable again (for \
              at-rest encryption, enable [encryption] with the key it was written under), or have an operator purge \
              it with DELETE /api/v1/delegation-vault/grants/{}, which leaves it unrevoked at the vendor",
-            unreadable.grant_id, binding.hop, unreadable.reason, unreadable.grant_id
+            unreadable.grant_id, unreadable.reason, unreadable.grant_id
         ));
     }
     if error.is::<PepperMismatch>() {
@@ -600,16 +677,15 @@ pub(crate) enum GrantNotStored {
 }
 
 /// Store `grant` only while its binding is saved: under the surface's lock,
-/// the stored surface must serve the binding, with the grant's tenant,
-/// Transit Point, provider and subject
-/// ([`GrantNotStored::BindingRemoved`] otherwise), and the scopes the grant
-/// was asked for must lie within the binding's, or `default_scopes`, its
-/// provider's, when it names none, in every place that serves it, as
-/// [`serves_grant`] decides ([`GrantNotStored::BindingNarrowed`] otherwise).
-/// Nothing is stored when it is refused, so no grant outlives a binding a
-/// concurrent write removed, or reaches beyond one it narrowed. The provider
-/// lock is held shared, so no provider delete reads the provider's grants
-/// while one is being stored.
+/// the stored surface must serve the binding, with the grant's tenant, hop,
+/// provider and subject ([`GrantNotStored::BindingRemoved`] otherwise), and
+/// the scopes the grant was asked for must lie within the binding's, or
+/// `default_scopes`, its provider's, when it names none, in every place that
+/// serves it, as [`serves_grant`] decides ([`GrantNotStored::BindingNarrowed`]
+/// otherwise). Nothing is stored when it is refused, so no grant outlives a
+/// binding a concurrent write removed, or reaches beyond one it narrowed. The
+/// provider lock is held shared, so no provider delete reads the provider's
+/// grants while one is being stored.
 pub(crate) async fn store_grant_while_bound(
     vault: &Arc<dyn DelegationVaultStorage>,
     surfaces: &dyn AgentSurfaceStore,
@@ -698,12 +774,9 @@ mod tests {
 
         async fn with_server(server: RecordingServer) -> Self {
             let directory = tempfile::tempdir().unwrap();
-            unsafe {
-                std::env::set_var("SURFACE_GRANTS_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-            }
             crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
                 enabled: true,
-                key_env_var: "SURFACE_GRANTS_TEST_MASTER_KEY".to_string(),
+                key_env_var: "AG_TEST_MASTER_KEY".to_string(),
                 ..Default::default()
             })
             .unwrap();
@@ -2122,5 +2195,219 @@ mod tests {
                 .is_empty(),
             "and never revoked"
         );
+    }
+
+    const TARGET: &str = crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP;
+
+    /// A surface whose Access Point Target holds `outbound_credentials`, with
+    /// `variants`.
+    fn target_surface(
+        outbound_credentials: serde_json::Value,
+        variants: serde_json::Value,
+    ) -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://203.0.113.30/mcp"},
+            "outbound_credentials": outbound_credentials,
+            "variants": variants
+        }))
+        .unwrap()
+    }
+
+    /// The Access Point Target binds `vendor` for its owner.
+    fn target_bound() -> AgentSurface {
+        target_surface(json!([external("vendor", "owner")]), json!([]))
+    }
+
+    fn target_variant(
+        enabled: bool,
+        overrides: serde_json::Value,
+    ) -> serde_json::Value {
+        json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": enabled, "overrides": overrides}])
+    }
+
+    /// The Access Point Target's binding is served under the hop `target`,
+    /// with the endpoint of the Target its grants go to, by the surface or the
+    /// one enabled variant that holds it.
+    #[test]
+    fn the_access_point_targets_binding_is_served_under_the_hop_target() {
+        let served = |surface: &AgentSurface| {
+            served_external_bindings(surface)
+                .into_iter()
+                .map(|binding| {
+                    (
+                        binding.hop.to_string(),
+                        binding.target_endpoint,
+                        binding
+                            .credential_provider_id
+                            .to_string(),
+                        binding.subject,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let owner = Some(GrantSubject::Owner);
+        let base = || (TARGET.to_string(), "https://203.0.113.30/mcp".to_string(), "vendor".to_string(), owner);
+        assert_eq!(served(&target_bound()), [base()]);
+        let in_variant = target_surface(
+            json!([]),
+            target_variant(
+                true,
+                json!({"outbound_credentials": [external("vendor", "owner")],
+                    "target": {"endpoint": "https://203.0.113.30/variant"}}),
+            ),
+        );
+        assert_eq!(
+            served(&in_variant),
+            [(TARGET.to_string(), "https://203.0.113.30/variant".to_string(), "vendor".to_string(), owner)]
+        );
+        let disabled = target_surface(
+            json!([]),
+            target_variant(false, json!({"outbound_credentials": [external("vendor", "owner")]})),
+        );
+        assert!(served(&disabled).is_empty(), "a disabled variant's binding is not served");
+        let kept_by_a_variant = target_surface(
+            json!([external("vendor", "owner")]),
+            target_variant(true, json!({"outbound_credentials": []})),
+        );
+        assert_eq!(served(&kept_by_a_variant), [base()]);
+        let agent_keyed = target_surface(json!([{"credential_provider_id": "vendor"}]), json!([]));
+        assert!(served(&agent_keyed).is_empty());
+    }
+
+    /// The Access Point Target's grants live only as long as its binding, as a
+    /// Transit Point's do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_access_point_targets_grants_live_only_as_long_as_its_binding() {
+        let owner = GrantKey::owner(Some("tenant-a"), "surface", TARGET, "vendor");
+        let caller = GrantKey::caller(Some("tenant-a"), "surface", TARGET, "vendor", CALLER).unwrap();
+        let mut moved = target_bound();
+        moved.tenant_id = Some("tenant-b".into());
+        let by_caller = target_surface(json!([external("vendor", "caller")]), json!([]));
+        for (case, before, after, owner_kept, caller_kept) in [
+            ("the binding removed", target_bound(), target_surface(json!([]), json!([])), false, true),
+            ("the surface deleted", target_bound(), target_surface(json!([]), json!([])), false, true),
+            ("its subject changed", target_bound(), by_caller.clone(), false, false),
+            (
+                "its provider changed",
+                target_bound(),
+                target_surface(json!([external("vendor-2", "owner")]), json!([])),
+                false,
+                true,
+            ),
+            (
+                "another consent mode",
+                target_bound(),
+                target_surface(json!([{"credential_provider_id": "vendor"}]), json!([])),
+                false,
+                true,
+            ),
+            ("the surface moved to another tenant", target_bound(), moved.clone(), false, true),
+            (
+                "only a disabled variant holding it",
+                target_bound(),
+                target_surface(
+                    json!([]),
+                    target_variant(false, json!({"outbound_credentials": [external("vendor", "owner")]})),
+                ),
+                false,
+                true,
+            ),
+            (
+                "an enabled variant holding it",
+                target_bound(),
+                target_surface(
+                    json!([]),
+                    target_variant(true, json!({"outbound_credentials": [external("vendor", "owner")]})),
+                ),
+                true,
+                true,
+            ),
+            ("nothing changed", target_bound(), target_bound(), true, true),
+            ("the caller binding unchanged", by_caller.clone(), by_caller.clone(), true, true),
+        ] {
+            let fixture = Fixture::new().await;
+            fixture
+                .store(&owner, "owner-access")
+                .await;
+            fixture
+                .store(&caller, "caller-access")
+                .await;
+            let after = (case != "the surface deleted").then_some(&after);
+            fixture
+                .change(Some(&before), after)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            assert_eq!(fixture.kept(&owner).await, owner_kept, "{case}: the owner grant");
+            assert_eq!(fixture.kept(&caller).await, caller_kept, "{case}: the caller grant");
+            let revoked = fixture
+                .server
+                .revoked_tokens();
+            assert_eq!(revoked.contains(&"owner-access-refresh".to_string()), !owner_kept, "{case}: {revoked:?}");
+            assert_eq!(revoked.contains(&"caller-access-refresh".to_string()), !caller_kept, "{case}: {revoked:?}");
+        }
+
+        let fixture = Fixture::new().await;
+        fixture
+            .store(&owner, "owner-access")
+            .await;
+        fixture
+            .change(Some(&target_surface(json!([]), json!([]))), Some(&target_bound()))
+            .await
+            .unwrap();
+        assert!(!fixture.kept(&owner).await, "a binding added again needs a new consent");
+
+        let fixture = Fixture::new().await;
+        fixture
+            .vault
+            .store_grant(asked_for(&owner, "wide", &["read", "write"]))
+            .await
+            .unwrap();
+        let scoped = |scopes: &[&str]| {
+            target_surface(
+                json!([{"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner",
+                    "scopes": scopes}]),
+                json!([]),
+            )
+        };
+        fixture
+            .change(Some(&scoped(&["read", "write"])), Some(&scoped(&["read"])))
+            .await
+            .unwrap();
+        assert!(!fixture.kept(&owner).await, "narrowing the Target's binding removes the wider grant");
+        assert_eq!(
+            fixture
+                .server
+                .revoked_tokens(),
+            ["wide", "wide-refresh"]
+        );
+    }
+
+    /// A grant of the Access Point Target is stored only while the surface
+    /// serves the Target's binding, never by a Transit Point's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_of_the_access_point_target_is_stored_only_while_its_binding_is_saved() {
+        use crate::delegation_vault::grants::tests::grant;
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", TARGET, "vendor");
+        surfaces
+            .save(&bound())
+            .await
+            .unwrap();
+        let refused = store_grant_while_bound(&fixture.vault, &*surfaces, grant(&key, "access"), &read()).await;
+        assert!(matches!(refused, Err(GrantNotStored::BindingRemoved)), "{refused:?}");
+        surfaces
+            .save(&target_bound())
+            .await
+            .unwrap();
+        store_grant_while_bound(&fixture.vault, &*surfaces, grant(&key, "access"), &read())
+            .await
+            .expect("the Target's binding is saved");
+        assert!(fixture.kept(&key).await);
+        let caller = GrantKey::caller(Some("tenant-a"), "surface", TARGET, "vendor", CALLER).unwrap();
+        let refused = store_grant_while_bound(&fixture.vault, &*surfaces, grant(&caller, "access"), &read()).await;
+        assert!(matches!(refused, Err(GrantNotStored::BindingRemoved)), "the binding's other subject: {refused:?}");
     }
 }

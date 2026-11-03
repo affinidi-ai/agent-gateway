@@ -186,8 +186,7 @@ async fn authorize_ticket(
         return Err(ContinuationError::BindingMismatch);
     }
     if !surface
-        .outbound_credentials
-        .iter()
+        .agent_keyed_outbound_credentials()
         .any(|binding| binding.credential_provider_id == provider_id)
     {
         return Err(ContinuationError::BindingMismatch);

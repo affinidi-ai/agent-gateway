@@ -487,12 +487,9 @@ mod tests {
         server: &RecordingServer,
         refresh: bool,
     ) -> Sweeper {
-        unsafe {
-            std::env::set_var("SWEEP_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "SWEEP_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();
@@ -951,12 +948,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_sweep_removes_what_can_never_be_released_and_revokes_it() {
         let directory = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("SWEEP_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "SWEEP_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();

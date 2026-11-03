@@ -96,14 +96,11 @@ mod tests {
 
     #[test]
     fn test_init_with_raw_key() {
-        use std::env;
-
-        unsafe { env::set_var("TEST_ENCRYPTION_KEY", "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=") };
-
+        // `AG_TEST_ENCRYPTION_KEY` is set by `.cargo/config.toml` `[env]`.
         let config = EncryptionConfig {
             enabled: true,
             key_source: crate::config::KeySourceConfig::Environment,
-            key_env_var: "TEST_ENCRYPTION_KEY".to_string(),
+            key_env_var: "AG_TEST_ENCRYPTION_KEY".to_string(),
             key_file: None,
             kms_key_id: None,
             kms_max_concurrent_ops: 16,
@@ -112,14 +109,11 @@ mod tests {
 
         let service = init_encryption_service(&config).unwrap();
         assert!(service.is_enabled());
-
-        unsafe { env::remove_var("TEST_ENCRYPTION_KEY") };
     }
 
     #[test]
     fn test_init_missing_env_var_fails_closed() {
         let absent_var = "AG_TEST_ABSENT_MEK_49F2A";
-        unsafe { std::env::remove_var(absent_var) };
 
         let config = EncryptionConfig {
             enabled: true,
@@ -134,8 +128,8 @@ mod tests {
 
     #[test]
     fn test_init_invalid_env_var_fails_closed() {
-        let bad_var = "AG_TEST_BAD_MEK_49F2A";
-        unsafe { std::env::set_var(bad_var, "tooshort") };
+        // Set to "tooshort" by `.cargo/config.toml` `[env]`.
+        let bad_var = "AG_TEST_INVALID_ENCRYPTION_KEY";
 
         let config = EncryptionConfig {
             enabled: true,
@@ -146,7 +140,6 @@ mod tests {
 
         let result = init_encryption_service(&config);
         assert!(result.is_err(), "must fail closed when the KEK env var is too short / invalid");
-        unsafe { std::env::remove_var(bad_var) };
     }
 
     #[test]

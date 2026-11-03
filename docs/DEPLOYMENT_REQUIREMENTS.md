@@ -175,7 +175,8 @@ The gateway only calls out to what you configure. Allow egress to:
 ignore `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy settings: reading an
 external consent provider's authorization server metadata, exchanging a connect's code and
 refreshing its grants at the provider's token endpoint, revoking its grants (RFC 7009), and
-forwarding a Transit Point request that carries a grant by binding to the provider's
+forwarding a Transit Point request, or an Access Point's request to its Target, that carries a
+grant by binding to the provider's
 `resource`. A proxy would resolve each vendor's host again and connect to an address the
 gateway never vetted, so the gateway pins these calls to the addresses it checked. On a network
 where egress goes only through a proxy, allow direct egress to those vendors, including each

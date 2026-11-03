@@ -193,14 +193,20 @@ sequenceDiagram
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `allowed_dids` | empty | Empty means any DID is accepted |
+| `allowed_dids` | empty | Empty means any DID is accepted, so a surface with it takes no binding with external consent ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point)) |
 | `challenge_ttl_seconds` | 300 | Capped at 3600. A longer challenge widens the replay window. |
-| `session_ttl_seconds` | 86400 | |
+| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. A save that sets a value above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds, and a save that keeps it is accepted. |
 | `allowed_algorithms` | `["EdDSA"]` | The verifier recognises `EdDSA` and `ES256`; a value outside that set is rejected at validation time |
 
 `IAT_SKEW_SECONDS` is 120 ([`verify.rs`](../src/didauth/verify.rs)). A JWS is rejected
 when its `iat` is more than 120 seconds in the future. The backdating allowance is
 wider, at 30 times that value.
+
+A session authenticates only at the view it was minted on: the surface, and the variant
+whose `/authenticate` minted it, or the base surface. Every request it carries is checked
+again against that view's `allowed_dids` as they are then, so a DID removed from the list,
+or left out of a list added since, is refused at once, not when its session expires. No
+session authenticates more than 86400 seconds after it was minted.
 
 Sessions are kept in the `didauth` subdirectory of `[storage_paths] sessions`, apart
 from dashboard sessions. At startup the gateway moves any DID Auth session files it

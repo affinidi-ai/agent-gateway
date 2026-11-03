@@ -369,13 +369,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_key_from_env_uri() {
-        let var = "AG_TEST_BACKUP_KEY_RESOLVE";
-        // SAFETY: dedicated test-only var, set and read within this test.
-        unsafe { std::env::set_var(var, "bb".repeat(32)) };
-        let key = resolve_backup_key(&format!("env://{var}"))
+        // Set by `.cargo/config.toml` `[env]`.
+        let key = resolve_backup_key("env://AG_TEST_BACKUP_KEY_RESOLVE")
             .await
             .unwrap();
-        unsafe { std::env::remove_var(var) };
         assert_eq!(key, [0xBB; 32]);
     }
 

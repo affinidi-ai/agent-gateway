@@ -208,7 +208,14 @@ enum A2aProxyRuntimeError {
 /// server. Cloud-metadata endpoints stay blocked and redirects are still
 /// re-validated even when the hatch is on. Default off; never set in production.
 fn allow_local_a2a_dial() -> bool {
-    let enabled = std::env::var("AG_ALLOW_LOCAL_A2A_PROXY")
+    let value = std::env::var("AG_ALLOW_LOCAL_A2A_PROXY").ok();
+    #[cfg(test)]
+    let value = value.or_else(|| {
+        ALLOW_LOCAL_A2A_DIAL_IN_TESTS
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| "1".to_string())
+    });
+    let enabled = value
         .map(|v| {
             matches!(
                 v.to_ascii_lowercase()
@@ -225,6 +232,12 @@ fn allow_local_a2a_dial() -> bool {
     }
     enabled
 }
+
+/// Turns the local dial hatch on for the rest of the test process, as
+/// `AG_ALLOW_LOCAL_A2A_PROXY=1` does, without changing the process environment.
+#[cfg(test)]
+pub(crate) static ALLOW_LOCAL_A2A_DIAL_IN_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Dial a Direct Line endpoint through the shared SSRF egress guard.
 ///

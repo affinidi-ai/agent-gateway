@@ -1249,12 +1249,9 @@ mod tests {
         // The test encryption service lives in a thread-local (test builds), so it must be
         // initialized on every test's own thread — a `std::sync::Once` would only set it on the
         // single winning thread and leave sibling tests without a service.
-        unsafe {
-            std::env::set_var("OAUTH_TEST_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         let config = crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "OAUTH_TEST_ENCRYPTION_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         };
         crate::encryption::global::init_global_encryption(config).expect("failed to init test encryption");

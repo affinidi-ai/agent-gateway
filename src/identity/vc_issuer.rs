@@ -2483,29 +2483,18 @@ mod tests {
         );
     }
 
-    /// Run `future` with `AG_TEST_MODE=true` in the process environment,
-    /// serialized against the `test_auth` tests that mutate the same variable.
-    /// The guard must span the await so no other test mutates the variable
-    /// while `future` runs.
-    #[allow(clippy::await_holding_lock)]
-    async fn with_ag_test_mode_env<F: std::future::Future<Output = T>, T>(future: F) -> T {
-        let _guard = crate::auth::test_auth::tests::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var("AG_TEST_MODE").ok();
-        unsafe { std::env::set_var("AG_TEST_MODE", "true") };
-        let out = future.await;
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("AG_TEST_MODE", value),
-                None => std::env::remove_var("AG_TEST_MODE"),
-            }
-        }
-        out
+    /// Runs the calling test again in a process of its own started with
+    /// `AG_TEST_MODE=true`. Returns `true` in that process, where the test body
+    /// should run.
+    fn run_with_ag_test_mode_env() -> bool {
+        crate::a2a::version::run_isolated_from_other_tests_with_env(&[("AG_TEST_MODE", "true")], &[])
     }
 
     #[tokio::test]
     async fn test_mode_does_not_accept_unverifiable_presentation() {
+        if !run_with_ag_test_mode_env() {
+            return;
+        }
         let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
         let vp = json!({
             "@context": ["https://www.w3.org/2018/credentials/v1"],
@@ -2520,7 +2509,9 @@ mod tests {
         })
         .to_string();
 
-        let result = with_ag_test_mode_env(issuer.verify_agent_presentation_full(&vp)).await;
+        let result = issuer
+            .verify_agent_presentation_full(&vp)
+            .await;
 
         let err = result.expect_err("an unsigned presentation must never verify, whatever the environment says");
         assert!(format!("{err:#}").contains("VP verification failed"), "unexpected error: {err:#}");
@@ -2528,16 +2519,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_mode_does_not_mint_for_unknown_agent_did() {
+        if !run_with_ag_test_mode_env() {
+            return;
+        }
         let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
         let identity_fields = HashMap::from([("name".to_string(), json!("agent"))]);
 
-        let result = with_ag_test_mode_env(issuer.create_agent_identity_presentation(
-            "did:example:no-key",
-            &identity_fields,
-            None,
-            None,
-        ))
-        .await;
+        let result = issuer
+            .create_agent_identity_presentation("did:example:no-key", &identity_fields, None, None)
+            .await;
 
         let err = result.expect_err("minting without a provisioned agent key must fail, whatever the environment says");
         assert!(

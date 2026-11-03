@@ -57,8 +57,11 @@ example, sets both intermediate fields to `None` because it does not forward the
 
 For each dashboard connection, the handler subscribes to the broadcast channel and multiplexes
 outbound updates with periodic ping frames. An incoming JSON `subscribe` command replaces the set
-of dashboard sections included in subsequent `DashboardDelta` events. Any broadcast receive error,
-including lag, ends the connection; socket closure does likewise.
+of dashboard sections included in subsequent `DashboardDelta` events. A connection whose session
+has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
+every `LogEntry` update; it checks the session and the user's role and status on connect and on
+each keep-alive ping, and an unauthenticated connection never gets log lines (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
+receive error, including lag, ends the connection; socket closure does likewise.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
@@ -426,9 +429,14 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
     `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), and on Fabric
-    receive `delegation_not_enabled_for_partners` (a per-user delegated credential binding
-    applies, which a partner's request never gets); the peer is answered `403` with that reason (see
+    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    external consent refused before anything is sent `target_path_refused` (`400`, a path the
+    grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
+    rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
+    ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
+    and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
+    binding applies, which a partner's request never gets); the peer is answered `403` with that
+    reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,

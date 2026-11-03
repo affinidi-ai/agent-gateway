@@ -2004,12 +2004,9 @@ pub(crate) mod tests {
         directory: &tempfile::TempDir,
         count: usize,
     ) -> (Arc<dyn DelegationVaultStorage>, Vec<DelegatedGrant>) {
-        unsafe {
-            std::env::set_var("REVOCATION_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "REVOCATION_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();

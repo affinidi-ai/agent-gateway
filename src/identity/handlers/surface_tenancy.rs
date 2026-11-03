@@ -111,17 +111,22 @@ async fn validate_target_auth_methods(
 /// Check the credential bindings of a surface, its base and each variant, for
 /// external consent:
 ///
-/// - `consent_mode: external` is a Transit Point's `transit_credentials` only;
-///   surface-level `outbound_credentials` cannot say it, and a surface with
-///   `outbound_credentials` has no Transit Point that does.
+/// - `consent_mode: external` is a Transit Point's `transit_credentials`, or
+///   the Access Point Target's binding: the only binding of surface-level
+///   `outbound_credentials`, on a surface without Transit Points. A surface
+///   with `outbound_credentials` has no Transit Point that says it.
 /// - Such a binding names a `subject`, and no other binding does.
 /// - Its provider has an issuer and the surface's own tenant, exactly; a
 ///   provider with an issuer is bound by no other consent mode.
-/// - Its Transit Point sends the grants only to the provider's `resource`: a
-///   public `https` target with that origin, never a `fabric://` route, and
-///   that resource is permitted for the provider's issuer.
+/// - Its Transit Point, or the Target, sends the grants only to the provider's
+///   `resource`: a public `https` target with that origin, never a `fabric://`
+///   route, and that resource is permitted for the provider's issuer.
+/// - The Target's grant goes in a header, in place of the caller's credential
+///   and of any `target.auth` credential of the Target's own.
 /// - Its Transit Point id names one Transit Point in one place: it appears
-///   once, in the surface's own points or in one variant's, and nowhere else.
+///   once, in the surface's own points or in one variant's, and nowhere else;
+///   and the Target's binding is held in one place, the surface's
+///   `outbound_credentials` or one variant's.
 /// - At-rest encryption is active and the identity hash pepper is configured,
 ///   since its grants are kept only then.
 pub async fn validate_external_consent_bindings(
@@ -165,6 +170,7 @@ async fn check_external_consent_bindings(
     issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
+    check_access_point_target_places(surface)?;
     let mut views = vec![(String::new(), surface.clone())];
     for (variant, resolved) in surface.variants.iter().zip(
         resolved_views(surface)?
@@ -173,18 +179,38 @@ async fn check_external_consent_bindings(
     ) {
         views.push((format!("variant '{}' ", variant.alias), resolved));
     }
+    let rules = GrantRules {
+        providers,
+        tenant_id: surface.tenant_id.as_deref(),
+        storage,
+        resource_origins,
+        issuers,
+    };
     for (prefix, view) in &views {
         for (index, binding) in view
             .outbound_credentials
             .iter()
             .enumerate()
         {
-            if credential_provider_has_issuer(providers, &binding.credential_provider_id).await? {
-                return Err(SurfaceApiError::BadRequest(format!(
-                    "{prefix}outbound_credentials[{index}]: a credential provider with an issuer is bound only by a \
-                     Transit Point's transit_credentials with consent_mode external"
-                )));
+            let refuse =
+                |reason: &str| SurfaceApiError::BadRequest(format!("{prefix}outbound_credentials[{index}]: {reason}"));
+            if !binding.is_external() {
+                if binding.subject.is_some() {
+                    return Err(refuse("subject is set only with consent_mode external"));
+                }
+                if credential_provider_has_issuer(providers, &binding.credential_provider_id).await? {
+                    return Err(refuse("a credential provider with an issuer needs consent_mode external"));
+                }
+                continue;
             }
+            let Some(subject) = binding.subject else {
+                return Err(refuse("consent_mode external needs a subject: owner or caller"));
+            };
+            check_callers(&views, subject).map_err(refuse)?;
+            check_access_point_target_binding(view, binding).map_err(refuse)?;
+            rules
+                .check(&binding.credential_provider_id, &view.target.endpoint, &refuse)
+                .await?;
         }
         for (index, point) in view
             .transit_points()
@@ -209,9 +235,10 @@ async fn check_external_consent_bindings(
                 }
                 continue;
             }
-            if binding.subject.is_none() {
+            let Some(subject) = binding.subject else {
                 return Err(refuse("consent_mode external needs a subject: owner or caller"));
-            }
+            };
+            check_callers(&views, subject).map_err(refuse)?;
             if !view
                 .outbound_credentials
                 .is_empty()
@@ -221,45 +248,292 @@ async fn check_external_consent_bindings(
                      every Transit Point",
                 ));
             }
-            if !storage.encrypted {
+            if point.presents_the_agent() {
                 return Err(refuse(
-                    "consent_mode external needs at-rest encryption: enable [encryption] with a key from the \
-                     environment, a file or AWS KMS",
+                    "consent_mode external sends the vendor no presentation of the agent: turn off the Transit \
+                     Point's identity_injection.inject_vp and workload_binding, and remove its managed_identity",
                 ));
             }
-            if !storage.stable_ids {
-                return Err(refuse(
-                    "consent_mode external needs a configured identity hash pepper: set AG_IDENTITY_HASH_PEPPER, the \
-                     same on every node, since grant ids derive from it",
-                ));
-            }
-            let provider = providers
-                .ok_or_else(|| unavailable("Credential provider"))?
-                .get(&binding.credential_provider_id)
-                .await
-                .map_err(|error| internal("Credential provider", error))?
-                .ok_or_else(|| inaccessible("Credential provider"))?;
-            if !provider.is_external_consent() {
-                return Err(refuse("consent_mode external needs a credential provider with an issuer"));
-            }
-            if provider.tenant_id != surface.tenant_id {
-                return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
-            }
-            crate::credential_providers::external::check_grant_destination(&provider, &point.target_endpoint, None)
-                .await
-                .map_err(refuse)?;
-            if !crate::credential_providers::external::resource_permitted(&provider, resource_origins) {
-                return Err(refuse(
-                    "the credential provider's resource is not permitted for its issuer: on the issuer's host or one \
-                     of its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
-                ));
-            }
-            if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, issuers) {
-                return Err(refuse(&format!(
-                    "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
-                )));
-            }
+            rules
+                .check(&binding.credential_provider_id, &point.target_endpoint, &refuse)
+                .await?;
         }
+    }
+    check_inherited_owner_binding(surface, &views)
+}
+
+/// Every caller of an owner binding acts as the owner, so a variant that keeps
+/// the surface's `outbound_credentials`, and with them the Access Point
+/// Target's owner binding, keeps what of the surface's chooses those callers:
+/// its caller authentication, its Access Point's `inbound_policy` and
+/// `trust_check_list`, and its Target's `policy`. One of its own could let
+/// through callers the surface's would not, and which is wider cannot be told,
+/// so any other is refused, in every variant, enabled or not. The Target's own
+/// `trust_check_list` is not among them: it applies to `a2a-proxy://` and
+/// Fabric targets, never to the `https` Target such a binding has.
+fn check_inherited_owner_binding(
+    surface: &AgentSurface,
+    views: &[(String, AgentSurface)],
+) -> Result<(), SurfaceApiError> {
+    if !surface
+        .target_external_credentials()
+        .is_some_and(|binding| binding.subject == Some(crate::config::agent_surface::GrantSubject::Owner))
+    {
+        return Ok(());
+    }
+    let held = |view: &AgentSurface| {
+        [
+            (
+                "access_point.caller_authentication",
+                "caller authentication",
+                serde_json::to_value(
+                    &view
+                        .access_point
+                        .caller_authentication,
+                )
+                .ok(),
+            ),
+            (
+                "access_point.inbound_policy",
+                "inbound policy",
+                serde_json::to_value(
+                    &view
+                        .access_point
+                        .inbound_policy,
+                )
+                .ok(),
+            ),
+            ("target.policy", "Target policy", serde_json::to_value(&view.target.policy).ok()),
+            (
+                "access_point.trust_check_list",
+                "caller trust checks",
+                serde_json::to_value(
+                    &view
+                        .access_point
+                        .trust_check_list,
+                )
+                .ok(),
+            ),
+        ]
+    };
+    let surfaces = held(surface);
+    for (variant, (prefix, view)) in surface
+        .variants
+        .iter()
+        .zip(views.iter().skip(1))
+    {
+        if variant
+            .overrides
+            .outbound_credentials
+            .is_some()
+        {
+            continue;
+        }
+        if let Some((field, name, _)) = held(view)
+            .into_iter()
+            .zip(&surfaces)
+            .find_map(|(variants, surfaces)| (variants.2 != surfaces.2).then_some(variants))
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{prefix}overrides.{field}: a variant that keeps the Access Point Target's owner binding keeps the \
+                 surface's {name}, since every caller it lets through acts as the owner; keep the surface's, or \
+                 give the variant outbound_credentials of its own"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The callers of a surface, in any of its views, are authenticated by
+/// something the gateway can check, as every `consent_mode: external` binding
+/// for `subject` needs ([`crate::proxy::target_grant::unchecked_callers`]). A
+/// caller of one view's Access Point may hold a transit token any Transit
+/// Point of the surface takes, so every view's callers count.
+fn check_callers(
+    views: &[(String, AgentSurface)],
+    subject: crate::config::agent_surface::GrantSubject,
+) -> Result<(), &'static str> {
+    match views
+        .iter()
+        .find_map(|(_, view)| crate::proxy::target_grant::unchecked_callers(view, subject))
+    {
+        Some(unchecked) => Err(unchecked.refusal()),
+        None => Ok(()),
+    }
+}
+
+/// What every `consent_mode: external` binding needs, wherever it is.
+struct GrantRules<'a> {
+    providers: Option<&'a std::sync::Arc<dyn CredentialProviderStorage>>,
+    tenant_id: Option<&'a str>,
+    storage: GrantStorage,
+    resource_origins: &'a std::collections::HashMap<String, Vec<String>>,
+    issuers: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+}
+
+impl GrantRules<'_> {
+    /// The vault can keep the binding's grants, and its provider, of the
+    /// surface's own tenant and with an issuer, sends them only to
+    /// `destination`, the origin of its permitted `resource`, under an issuer
+    /// the operator permits.
+    async fn check(
+        &self,
+        provider_id: &str,
+        destination: &str,
+        refuse: &(dyn Fn(&str) -> SurfaceApiError + Sync),
+    ) -> Result<(), SurfaceApiError> {
+        if !self.storage.encrypted {
+            return Err(refuse(
+                "consent_mode external needs at-rest encryption: enable [encryption] with a key from the \
+                 environment, a file or AWS KMS",
+            ));
+        }
+        if !self.storage.stable_ids {
+            return Err(refuse(
+                "consent_mode external needs a configured identity hash pepper: set AG_IDENTITY_HASH_PEPPER, the \
+                 same on every node, since grant ids derive from it",
+            ));
+        }
+        let provider = self
+            .providers
+            .ok_or_else(|| unavailable("Credential provider"))?
+            .get(provider_id)
+            .await
+            .map_err(|error| internal("Credential provider", error))?
+            .ok_or_else(|| inaccessible("Credential provider"))?;
+        if !provider.is_external_consent() {
+            return Err(refuse("consent_mode external needs a credential provider with an issuer"));
+        }
+        if provider.tenant_id.as_deref() != self.tenant_id {
+            return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
+        }
+        crate::credential_providers::external::check_grant_destination(&provider, destination, None)
+            .await
+            .map_err(refuse)?;
+        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins) {
+            return Err(refuse(
+                "the credential provider's resource is not permitted for its issuer: on the issuer's host or one of \
+                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
+            ));
+        }
+        if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, self.issuers) {
+            return Err(refuse(&format!(
+                "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The Access Point Target's `consent_mode: external` binding sends the
+/// grant, in a header, in place of every other credential: it is the only
+/// binding of `outbound_credentials`, which would otherwise apply on every
+/// Transit Point too, so the surface has none; and neither the caller's
+/// credential (`forward_header`) nor a `target.auth` credential of the
+/// Target's own goes with it.
+fn check_access_point_target_binding(
+    view: &AgentSurface,
+    binding: &crate::config::types::OutboundCredentialBinding,
+) -> Result<(), &'static str> {
+    if view
+        .outbound_credentials
+        .len()
+        != 1
+    {
+        return Err("consent_mode external binds the Access Point's Target alone: outbound_credentials can hold no \
+                    other binding");
+    }
+    if !view
+        .transit_points()
+        .is_empty()
+    {
+        return Err("consent_mode external in outbound_credentials binds the Access Point's Target, on a surface \
+                    without Transit Points: outbound_credentials apply on every Transit Point");
+    }
+    if matches!(binding.inject_as, crate::config::types::CredentialInjection::Meta { .. }) {
+        return Err("consent_mode external injects the grant as a header: bearer_header or custom_header");
+    }
+    if crate::proxy::target_grant::sends_the_grant_across_the_origin(view) {
+        return Err("consent_mode external on an A2A or AP2 Access Point sends the grant at or under the Target's \
+                    endpoint path, so target.endpoint cannot be the root of its origin, where that is every path \
+                    of the vendor's: give it the agent's own path");
+    }
+    if view.target_auth().is_some() {
+        return Err("consent_mode external sends the grant in place of the Target's own credential: remove \
+                    target.auth");
+    }
+    if view
+        .source_auth()
+        .is_some_and(
+            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+        )
+    {
+        return Err("consent_mode external sends the grant in place of the caller's credential: turn the Access \
+                    Point's forward_header off");
+    }
+    if view.charges_callers() {
+        return Err("consent_mode external charges callers nothing: a payment is settled before the grant is \
+                    released, and the release can still be refused; remove target.payment_policy");
+    }
+    if view.presents_the_agent_to_the_target() {
+        return Err("consent_mode external sends the vendor no presentation of the agent: turn off \
+                    target.identity_injection.inject_vp and target.workload_binding, remove \
+                    identity_slots.inbound, and inject the surface's DID in a header, not protocol_native");
+    }
+    if view.injects_custom_metadata() {
+        return Err("consent_mode external sends the vendor nothing of the gateway's beside the grant: turn \
+                    target.custom_metadata off");
+    }
+    Ok(())
+}
+
+/// The Access Point Target's `consent_mode: external` binding is held in one
+/// place: the surface's `outbound_credentials` or one variant's. Its grants
+/// are kept under the hop `target`, so they are used only under that one
+/// place's settings, never under another variant's copy of the binding. A
+/// variant that keeps the surface's `outbound_credentials` serves the
+/// surface's binding.
+fn check_access_point_target_places(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let places = std::iter::once((
+        String::new(),
+        Some(
+            surface
+                .outbound_credentials
+                .as_slice(),
+        ),
+    ))
+    .chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| {
+                (
+                    format!("variant '{}' ", variant.alias),
+                    variant
+                        .overrides
+                        .outbound_credentials
+                        .as_deref(),
+                )
+            }),
+    );
+    let mut held = false;
+    for (prefix, bindings) in places {
+        let Some(index) = bindings
+            .unwrap_or_default()
+            .iter()
+            .position(crate::config::types::OutboundCredentialBinding::is_external)
+        else {
+            continue;
+        };
+        if held {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{prefix}outbound_credentials[{index}]: the Access Point Target's consent_mode external binding is \
+                 held in more than one place, the surface's outbound_credentials and a variant's, or two variants'; \
+                 its grants are kept under the hop `{}` and used under one place's settings, so keep it in one",
+                crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP
+            )));
+        }
+        held = true;
     }
     Ok(())
 }
@@ -361,7 +635,7 @@ pub(crate) fn bound_credential_provider_ids(surface: &AgentSurface) -> HashSet<&
 /// The hop that names the grants of a surface's Access Point Target, which no
 /// Transit Point with `consent_mode: external` may take as its id: its grants
 /// are kept under its id, and would share the Target's.
-pub(crate) const RESERVED_TARGET_HOP: &str = "target";
+pub(crate) const RESERVED_TARGET_HOP: &str = crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP;
 
 /// A Transit Point id with a `consent_mode: external` binding anywhere in the
 /// surface names one Transit Point in one place: it appears once, in the
@@ -2504,7 +2778,7 @@ mod tests {
                     None,
                 ),
                 true,
-                "outbound_credentials[0]: a credential provider with an issuer is bound only by",
+                "outbound_credentials[0]: a credential provider with an issuer needs consent_mode external",
             ),
             (
                 "a variant without a subject",
@@ -2687,10 +2961,860 @@ mod tests {
     }
 
     #[test]
-    fn surface_level_outbound_credentials_cannot_ask_for_external_consent() {
-        let parsed = serde_json::from_value::<crate::config::types::OutboundCredentialBinding>(
-            serde_json::json!({"credential_provider_id": "external-a", "consent_mode": "external"}),
+    fn surface_level_outbound_credentials_take_external_consent_with_a_subject() {
+        let binding = serde_json::json!({"credential_provider_id": "external-a", "consent_mode": "external",
+            "subject": "caller"});
+        let parsed = serde_json::from_value::<crate::config::types::OutboundCredentialBinding>(binding).unwrap();
+        assert!(parsed.is_external());
+        assert_eq!(parsed.subject, Some(crate::config::agent_surface::GrantSubject::Caller));
+        let saved = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(saved["consent_mode"], "external");
+        assert_eq!(saved["subject"], "caller");
+        let legacy = serde_json::to_value(
+            serde_json::from_value::<crate::config::types::OutboundCredentialBinding>(
+                serde_json::json!({"credential_provider_id": "legacy-a"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            legacy
+                .get("subject")
+                .is_none(),
+            "{legacy}"
         );
-        assert!(parsed.is_err());
+    }
+
+    /// A surface whose Access Point Target is the vendor at the resource of
+    /// `external-a`, with `outbound_credentials`, and `extra` set on top.
+    fn target_surface(
+        outbound_credentials: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> AgentSurface {
+        let mut surface = serde_json::json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://203.0.113.30/mcp"},
+            "outbound_credentials": outbound_credentials
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            surface[name] = value.clone();
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    fn variant(overrides: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"variants": [{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+            "overrides": overrides}]})
+    }
+
+    #[tokio::test]
+    async fn the_access_point_target_binds_its_own_tenants_provider_by_external_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let none = serde_json::json!({});
+        for subject in ["owner", "caller"] {
+            let surface = target_surface(serde_json::json!([external("external-a", Some(subject))]), none.clone());
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{subject}");
+        }
+        for (case, surface) in [
+            (
+                "a header of its own",
+                target_surface(
+                    serde_json::json!([{"credential_provider_id": "external-a", "consent_mode": "external",
+                        "subject": "owner", "inject_as": {"type": "custom_header", "name": "X-Vendor-Token",
+                        "format": "token {value}"}}]),
+                    none.clone(),
+                ),
+            ),
+            (
+                "a variant that holds it alone",
+                target_surface(
+                    serde_json::json!([]),
+                    variant(serde_json::json!({"outbound_credentials": [external("external-a", Some("owner"))]})),
+                ),
+            ),
+            (
+                "a variant that keeps the surface's",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("owner"))]),
+                    variant(serde_json::json!({"access_point": {"rate_limit": {"requests": 5, "window_secs": 60}}})),
+                ),
+            ),
+            (
+                "a variant that drops it",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("owner"))]),
+                    variant(serde_json::json!({"outbound_credentials": [],
+                        "target": {"endpoint": "https://managed.example/agent"}})),
+                ),
+            ),
+            (
+                "the surface's DID in a header, which the vendor is not sent",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("owner"))]),
+                    serde_json::json!({"access_point": {"listen_address": "https://gateway.example", "route": "/mcp",
+                        "protocol": "mcp", "didwebvh_identity": {"injection_mode": "signed_header"}},
+                        "target": {"endpoint": "https://203.0.113.30/mcp", "workload_binding": {"enabled": false}}}),
+                ),
+            ),
+            (
+                "a payment policy turned off",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("owner"))]),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "x402", "enabled": false}}}),
+                ),
+            ),
+        ] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+    }
+
+    /// The Access Point Target's grant goes only to its provider's resource,
+    /// in place of every credential of the caller's and the Target's own, and
+    /// is kept under one binding of the surface, in one place.
+    #[tokio::test]
+    async fn access_point_target_bindings_that_break_a_rule_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let none = serde_json::json!({});
+        let owner = external("external-a", Some("owner"));
+        let only = serde_json::json!([owner.clone()]);
+        let at = |endpoint: &str| serde_json::json!({"target": {"endpoint": endpoint}});
+        let binding = "outbound_credentials[0]: ";
+        for (case, surface, expected) in [
+            (
+                "without a subject",
+                target_surface(serde_json::json!([external("external-a", None)]), none.clone()),
+                format!("{binding}consent_mode external needs a subject"),
+            ),
+            (
+                "a provider without an issuer",
+                target_surface(serde_json::json!([external("legacy-a", Some("owner"))]), none.clone()),
+                format!("{binding}consent_mode external needs a credential provider with an issuer"),
+            ),
+            (
+                "another tenant's provider",
+                target_surface(serde_json::json!([external("external-b", Some("owner"))]), none.clone()),
+                format!("{binding}consent_mode external needs a credential provider of the surface's own tenant"),
+            ),
+            (
+                "another binding beside it",
+                target_surface(
+                    serde_json::json!([owner.clone(), {"credential_provider_id": "legacy-a"}]),
+                    none.clone(),
+                ),
+                format!("{binding}consent_mode external binds the Access Point's Target alone"),
+            ),
+            (
+                "two of them",
+                target_surface(
+                    serde_json::json!([owner.clone(), external("external-a", Some("caller"))]),
+                    none.clone(),
+                ),
+                format!("{binding}consent_mode external binds the Access Point's Target alone"),
+            ),
+            (
+                "a surface with Transit Points",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"transit": {"points": [{"id": "tp-1", "alias": "partner",
+                        "target_endpoint": "https://partner.example/mcp", "require_transit_token": true}]}}),
+                ),
+                format!("{binding}consent_mode external in outbound_credentials binds the Access Point's Target"),
+            ),
+            (
+                "a Target at another host",
+                target_surface(only.clone(), at("https://203.0.113.66/mcp")),
+                format!("{binding}consent_mode external needs a target_endpoint with the origin of"),
+            ),
+            (
+                "an http Target",
+                target_surface(only.clone(), at("http://203.0.113.30/mcp")),
+                format!("{binding}consent_mode external needs a target_endpoint that is a public https URL"),
+            ),
+            (
+                "a Fabric Target",
+                target_surface(only.clone(), at("fabric://gateway-b/channel")),
+                format!("{binding}consent_mode external never forwards over Fabric"),
+            ),
+            (
+                "an MCP proxy Target",
+                target_surface(only.clone(), at("proxy://mcp-proxy")),
+                format!("{binding}consent_mode external needs a target_endpoint that is a public https URL"),
+            ),
+            (
+                "the grant in the body",
+                target_surface(
+                    serde_json::json!([{"credential_provider_id": "external-a", "consent_mode": "external",
+                        "subject": "owner", "inject_as": {"type": "meta", "field": "vendor/token"}}]),
+                    none.clone(),
+                ),
+                format!("{binding}consent_mode external injects the grant as a header"),
+            ),
+            (
+                "a Target credential of its own",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp", "auth": {
+                        "method": {"static_secret": {"secret_id": "vendor-key", "header_name": "X-Api-Key"}}}}}),
+                ),
+                format!("{binding}consent_mode external sends the grant in place of the Target's own credential"),
+            ),
+            (
+                "the caller's credential forwarded",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"access_point": {"listen_address": "https://gateway.example", "route": "/mcp",
+                        "protocol": "mcp", "caller_authentication": {"methods": [{"type": "jwt_bearer",
+                        "jwt_verification_strategy_id": "strategy", "audiences": ["https://gateway.example/mcp"],
+                        "forward_header": true}]}}}),
+                ),
+                format!("{binding}consent_mode external sends the grant in place of the caller's credential"),
+            ),
+            (
+                "a provider whose resource is not permitted for its issuer",
+                target_surface(serde_json::json!([external("external-elsewhere", Some("owner"))]), none.clone()),
+                format!("{binding}the credential provider's resource is not permitted for its issuer"),
+            ),
+            (
+                "an identity VP for the vendor",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "identity_injection": {"inject_vp": true}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor no presentation of the agent"),
+            ),
+            (
+                "an inbound identity slot, which injects an identity VP",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"identity_slots": {"inbound": {"type": "static", "did": "did:example:agent"}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor no presentation of the agent"),
+            ),
+            (
+                "a workload binding for the vendor",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "workload_binding": {"enabled": true}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor no presentation of the agent"),
+            ),
+            (
+                "the surface's DID in the body",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"access_point": {"listen_address": "https://gateway.example", "route": "/mcp",
+                        "protocol": "mcp", "didwebvh_identity": {"injection_mode": "protocol_native"}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor no presentation of the agent"),
+            ),
+            (
+                "an x402 payment",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "x402", "enabled": true}}}),
+                ),
+                format!("{binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "an MPP payment",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "mpp", "enabled": true, "realm": "vendor",
+                        "secret_key": "$MPP_SECRET_KEY"}}}),
+                ),
+                format!("{binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "an agent-pay payment",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "agent_pay", "payment_gateway_id": "pay-gw",
+                        "payment_surface_id": "pay-1"}}}),
+                ),
+                format!("{binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "a variant that keeps it and charges its callers",
+                target_surface(
+                    only.clone(),
+                    variant(serde_json::json!({"target": {"payment_policy": {"type": "x402", "enabled": true}}})),
+                ),
+                format!("variant 'candidate' {binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "custom metadata for the vendor",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "custom_metadata": {"enabled": true, "payload": {"tenant": "acme"}}}}),
+                ),
+                format!("{binding}consent_mode external sends the vendor nothing of the gateway's"),
+            ),
+            (
+                "a variant that keeps it and adds custom metadata",
+                target_surface(
+                    only.clone(),
+                    variant(serde_json::json!({"target": {"custom_metadata": {"enabled": true,
+                        "payload": {"tenant": "acme"}}}})),
+                ),
+                format!("variant 'candidate' {binding}consent_mode external sends the vendor nothing of the gateway's"),
+            ),
+            (
+                "a subject on another consent mode",
+                target_surface(
+                    serde_json::json!([{"credential_provider_id": "legacy-a", "subject": "owner"}]),
+                    none.clone(),
+                ),
+                format!("{binding}subject is set only with consent_mode external"),
+            ),
+            (
+                "a provider with an issuer on another consent mode",
+                target_surface(serde_json::json!([{"credential_provider_id": "external-a"}]), none.clone()),
+                format!("{binding}a credential provider with an issuer needs consent_mode external"),
+            ),
+            (
+                "the surface and a variant each holding one",
+                target_surface(only.clone(), variant(serde_json::json!({"outbound_credentials": only.clone()}))),
+                format!("variant 'candidate' {binding}the Access Point Target's consent_mode external binding is"),
+            ),
+            (
+                "a variant that keeps it and repoints the Target",
+                target_surface(
+                    only.clone(),
+                    variant(serde_json::json!({"target": {"endpoint": "https://203.0.113.66/mcp"}})),
+                ),
+                format!(
+                    "variant 'candidate' {binding}consent_mode external needs a target_endpoint with the origin of"
+                ),
+            ),
+            (
+                "a variant that keeps it and adds Transit Points",
+                target_surface(
+                    only.clone(),
+                    variant(serde_json::json!({"transit": {"points": [{"id": "tp-1", "alias": "partner",
+                        "target_endpoint": "https://partner.example/mcp", "require_transit_token": true}]}})),
+                ),
+                format!("variant 'candidate' {binding}consent_mode external in outbound_credentials binds"),
+            ),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&expected), "{case}: {message}");
+        }
+
+        let without_encryption = checked(&providers, target_surface(only.clone(), none.clone()), false)
+            .await
+            .expect_err("without at-rest encryption");
+        assert!(
+            without_encryption.starts_with(&format!("{binding}consent_mode external needs at-rest encryption")),
+            "{without_encryption}"
+        );
+        let ephemeral = checked_with(
+            &providers,
+            target_surface(only.clone(), none.clone()),
+            GrantStorage {
+                encrypted: true,
+                stable_ids: false,
+            },
+        )
+        .await
+        .expect_err("an ephemeral pepper");
+        assert!(
+            ephemeral.starts_with(&format!("{binding}consent_mode external needs a configured identity hash pepper")),
+            "{ephemeral}"
+        );
+        let unlisted = check_external_consent_bindings(
+            Some(&providers),
+            &target_surface(only.clone(), none.clone()),
+            GrantStorage {
+                encrypted: true,
+                stable_ids: true,
+            },
+            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
+        )
+        .await;
+        match unlisted {
+            Err(SurfaceApiError::BadRequest(message)) => assert!(
+                message.starts_with(&format!(
+                    "{binding}the credential provider's issuer is not permitted by the gateway's \
+                     external_consent_issuers"
+                )),
+                "{message}"
+            ),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    /// On A2A and AP2 the grant goes at or under the Target's endpoint path,
+    /// so a Target at the root of its origin would be sent the grant on every
+    /// path of the vendor's: such an endpoint is refused, in the surface or a
+    /// variant. An MCP Target, sent the grant at its endpoint path alone, may
+    /// be at the root.
+    #[tokio::test]
+    async fn an_a2a_target_at_the_root_of_its_origin_is_refused_external_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let owner = serde_json::json!([external("external-a", Some("owner"))]);
+        let on = |protocol: &str, endpoint: &str| {
+            serde_json::json!({"access_point": {"listen_address": "https://gateway.example", "route": "/agent",
+                "protocol": protocol}, "target": {"endpoint": endpoint}})
+        };
+        for (case, extra) in [
+            ("A2A under a path", on("a2a", "https://203.0.113.30/a2a")),
+            ("AP2 under a path", on("ap2", "https://203.0.113.30/agents/shop/")),
+            ("MCP at the root", on("mcp", "https://203.0.113.30/")),
+        ] {
+            assert_eq!(checked(&providers, target_surface(owner.clone(), extra), true).await, Ok(()), "{case}");
+        }
+
+        let refused = "outbound_credentials[0]: consent_mode external on an A2A or AP2 Access Point sends the grant \
+                       at or under the Target's endpoint path";
+        let mut at_the_root_in_a_variant = on("a2a", "https://203.0.113.30/a2a");
+        at_the_root_in_a_variant["variants"] = variant(serde_json::json!({"target": {"endpoint":
+            "https://203.0.113.30"}}))["variants"]
+            .clone();
+        for (case, extra) in [
+            ("A2A at the root", on("a2a", "https://203.0.113.30/")),
+            ("A2A at the origin", on("a2a", "https://203.0.113.30")),
+            ("AP2 at the root", on("ap2", "https://203.0.113.30//")),
+            ("A2A at the root with a query", on("a2a", "https://203.0.113.30/?tenant=a")),
+            ("a variant at the root", at_the_root_in_a_variant),
+        ] {
+            let message = checked(&providers, target_surface(owner.clone(), extra), true)
+                .await
+                .expect_err(case);
+            assert!(message.contains(refused), "{case}: {message}");
+        }
+    }
+
+    /// An Access Point's caller authentication with `methods`.
+    fn access_point_authenticating(methods: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+            "caller_authentication": {"methods": methods}})
+    }
+
+    /// DID Auth accepting the DIDs in `allowed_dids`, or any DID when empty.
+    fn did_auth(allowed_dids: &[&str]) -> serde_json::Value {
+        serde_json::json!({"type": "did_auth", "extraction": {"source": "http_header", "field": "X-DID-Auth-Session"},
+            "allowed_dids": allowed_dids})
+    }
+
+    /// A binding with external consent, on the Target or a Transit Point, in
+    /// the surface or a variant, needs callers authenticated by something the
+    /// gateway can check: DID Auth without `allowed_dids`, in any view and
+    /// among any of the methods, accepts whoever mints a DID, so it is refused
+    /// beside an owner's grant or a caller's.
+    #[tokio::test]
+    async fn external_consent_needs_callers_the_gateway_can_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let api_key = serde_json::json!({"type": "api_key",
+            "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "caller-key"});
+        let open = access_point_authenticating(serde_json::json!([api_key.clone(), did_auth(&[])]));
+        let listed = access_point_authenticating(serde_json::json!([did_auth(&["did:example:alice"])]));
+        let with_access_point = |mut surface: AgentSurface, access_point: &serde_json::Value| {
+            surface.access_point = serde_json::from_value(access_point.clone()).unwrap();
+            surface
+        };
+        let target = |subject: &str| {
+            target_surface(serde_json::json!([external("external-a", Some(subject))]), serde_json::json!({}))
+        };
+        let point = |subject: &str| surface_binding(external("external-a", Some(subject)), serde_json::json!([]), None);
+
+        for (case, surface) in [
+            ("the Target, with an allow-list", with_access_point(target("owner"), &listed)),
+            ("a Transit Point, with an allow-list", with_access_point(point("owner"), &listed)),
+            ("open DID Auth without a binding with external consent", {
+                with_access_point(
+                    target_surface(serde_json::json!([{"credential_provider_id": "legacy-a"}]), serde_json::json!({})),
+                    &open,
+                )
+            }),
+        ] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+
+        let needs = "consent_mode external needs callers authenticated by something the gateway can check";
+        for (case, surface, expected) in [
+            (
+                "the Target's owner",
+                with_access_point(target("owner"), &open),
+                format!("outbound_credentials[0]: {needs}"),
+            ),
+            (
+                "the Target's callers",
+                with_access_point(target("caller"), &open),
+                format!("outbound_credentials[0]: {needs}"),
+            ),
+            (
+                "a Transit Point's owner",
+                with_access_point(point("owner"), &open),
+                format!("transit.points[0].transit_credentials: {needs}"),
+            ),
+            (
+                "a Transit Point's callers",
+                with_access_point(point("caller"), &open),
+                format!("transit.points[0].transit_credentials: {needs}"),
+            ),
+            (
+                "a variant that opens the Access Point",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("owner"))]),
+                    variant(serde_json::json!({"access_point": {"caller_authentication": {
+                        "methods": [did_auth(&[])]}}})),
+                ),
+                format!("outbound_credentials[0]: {needs}"),
+            ),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&expected), "{case}: {message}");
+        }
+    }
+
+    /// A binding with external consent, on the Target or a Transit Point, in
+    /// the surface or a variant, is refused beside a JWT bearer method without
+    /// `audiences` on an Access Point that publishes no protected resource:
+    /// it accepts a token its issuer minted for any other service. With an
+    /// audience, or a protected resource, which binds one, it is accepted.
+    #[tokio::test]
+    async fn external_consent_needs_caller_tokens_minted_for_the_access_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let jwt = |audiences: &[&str]| {
+            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy-1",
+                "audiences": audiences})
+        };
+        let with_access_point = |mut surface: AgentSurface, access_point: serde_json::Value| {
+            surface.access_point = serde_json::from_value(access_point).unwrap();
+            surface
+        };
+        let any_audience = access_point_authenticating(serde_json::json!([jwt(&[])]));
+        let audience = access_point_authenticating(serde_json::json!([jwt(&["https://gateway.example/mcp"])]));
+        let mut published = any_audience.clone();
+        published["caller_authentication"]["protected_resource"] = serde_json::json!({
+            "resource": "https://gateway.example/mcp", "authorization_servers": ["https://issuer.example"]});
+        let target = |subject: &str| {
+            target_surface(serde_json::json!([external("external-a", Some(subject))]), serde_json::json!({}))
+        };
+        let point = |subject: &str| surface_binding(external("external-a", Some(subject)), serde_json::json!([]), None);
+
+        for (case, surface) in [
+            ("the Target, with an audience", with_access_point(target("owner"), audience.clone())),
+            ("a Transit Point, with an audience", with_access_point(point("caller"), audience)),
+            ("the Target, with a protected resource", with_access_point(target("owner"), published)),
+        ] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+
+        let needs = "consent_mode external needs callers authenticated by something the gateway can check: the \
+                     Access Point's jwt_bearer has no audiences";
+        for (case, surface, expected) in [
+            ("the Target's owner", with_access_point(target("owner"), any_audience.clone()), "outbound_credentials[0]"),
+            (
+                "the Target's callers",
+                with_access_point(target("caller"), any_audience.clone()),
+                "outbound_credentials[0]",
+            ),
+            (
+                "a Transit Point's owner",
+                with_access_point(point("owner"), any_audience.clone()),
+                "transit.points[0].transit_credentials",
+            ),
+            (
+                "a variant without audiences",
+                target_surface(
+                    serde_json::json!([external("external-a", Some("caller"))]),
+                    variant(serde_json::json!({"access_point": {"caller_authentication": {
+                        "methods": [jwt(&[])]}}})),
+                ),
+                "outbound_credentials[0]",
+            ),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&format!("{expected}: {needs}")), "{case}: {message}");
+        }
+    }
+
+    /// A Transit Point with external consent sends its vendor no presentation
+    /// of the agent, as the Access Point Target does not: an identity VP, from
+    /// `identity_injection.inject_vp` or a `managed_identity` of its own, or an
+    /// enabled workload binding, is refused, on the surface's Transit Point or
+    /// a variant's. One without them, or with the workload binding off, is
+    /// accepted, and so is a Transit Point with them that takes no grant by
+    /// external consent.
+    #[tokio::test]
+    async fn a_transit_point_with_external_consent_sends_no_presentation_of_the_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let presenting = |field: &str, value: serde_json::Value, binding: serde_json::Value| {
+            let mut point = vendor_point(binding);
+            point[field] = value;
+            serde_json::json!([point])
+        };
+        let owner = external("external-a", Some("owner"));
+        let vp = ("an identity VP", "identity_injection", serde_json::json!({"inject_vp": true}));
+        let own_identity = (
+            "a managed identity of its own",
+            "managed_identity",
+            serde_json::json!({"type": "static", "did": "did:example:agent"}),
+        );
+        let workload = ("a workload binding", "workload_binding", serde_json::json!({"enabled": true}));
+
+        for (case, surface) in [
+            (
+                "a workload binding turned off",
+                surface_with_points(
+                    presenting("workload_binding", serde_json::json!({"enabled": false}), owner.clone()),
+                    serde_json::json!([]),
+                    None,
+                ),
+            ),
+            (
+                "an identity VP without external consent",
+                surface_with_points(
+                    presenting(vp.1, vp.2.clone(), serde_json::json!({"credential_provider_id": "legacy-a"})),
+                    serde_json::json!([]),
+                    None,
+                ),
+            ),
+        ] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+
+        let refused = "transit.points[0].transit_credentials: consent_mode external sends the vendor no \
+                       presentation of the agent";
+        for (case, field, value) in [vp, own_identity, workload] {
+            let on_the_surface =
+                surface_with_points(presenting(field, value.clone(), owner.clone()), serde_json::json!([]), None);
+            let message = checked(&providers, on_the_surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(refused), "{case}: {message}");
+            let in_a_variant = surface_with_points(
+                serde_json::json!([]),
+                serde_json::json!([]),
+                Some(presenting(field, value, owner.clone())),
+            );
+            let message = checked(&providers, in_a_variant, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&format!("variant 'candidate' {refused}")), "{case}, a variant: {message}");
+        }
+    }
+
+    /// A caller's grant is kept by the caller's identity hash, which needs the
+    /// issuer that named the caller. The gateway's own resource access tokens
+    /// (`mcp_http.authorization`) name a caller by its subject under the
+    /// gateway's issuer, so two identity providers' callers with the same
+    /// subject would share a grant: a `caller` binding, on the Target or a
+    /// Transit Point, is refused beside them. An `owner` binding is not.
+    #[tokio::test]
+    async fn a_callers_grant_needs_callers_named_with_their_issuer() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let with_resource_tokens = |surface: AgentSurface| {
+            let mut surface = serde_json::to_value(surface).unwrap();
+            surface["mcp_http"] =
+                serde_json::json!({"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}});
+            serde_json::from_value::<AgentSurface>(surface).unwrap()
+        };
+        let target = |subject: &str| {
+            with_resource_tokens(target_surface(
+                serde_json::json!([external("external-a", Some(subject))]),
+                serde_json::json!({}),
+            ))
+        };
+        let point = |subject: &str| {
+            with_resource_tokens(surface_binding(external("external-a", Some(subject)), serde_json::json!([]), None))
+        };
+        for (case, surface) in [("the Target's owner", target("owner")), ("a Transit Point's owner", point("owner"))] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+        let needs = "consent_mode external with subject caller needs callers named with the issuer that named them";
+        for (case, surface, expected) in [
+            ("the Target's callers", target("caller"), format!("outbound_credentials[0]: {needs}")),
+            ("a Transit Point's callers", point("caller"), format!("transit.points[0].transit_credentials: {needs}")),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&expected), "{case}: {message}");
+        }
+    }
+
+    /// Every caller of an owner binding acts as the owner, so a variant that
+    /// keeps the surface's owner binding for the Access Point Target keeps the
+    /// surface's caller authentication: one of its own, which could admit
+    /// callers the surface's would not, is refused, enabled or not, and so is
+    /// one that a complete override clears. A variant that holds no such
+    /// binding, or keeps a caller binding, may have its own.
+    #[tokio::test]
+    async fn a_variant_that_keeps_the_owners_grant_keeps_the_surfaces_caller_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let key = |secret_id: &str| {
+            serde_json::json!({"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"},
+                "secret_id": secret_id})
+        };
+        let base =
+            serde_json::json!({"access_point": access_point_authenticating(serde_json::json!([key("owner-key")]))});
+        let with_variant = |subject: &str, enabled: bool, overrides: serde_json::Value| {
+            let mut extra = base.clone();
+            extra["variants"] = serde_json::json!([{"id": "v-1", "alias": "candidate", "name": "candidate",
+                "enabled": enabled, "overrides": overrides}]);
+            target_surface(serde_json::json!([external("external-a", Some(subject))]), extra)
+        };
+        let own_keys = serde_json::json!({"access_point": {"caller_authentication": {"methods": [key("team-keys")]}}});
+
+        for (case, surface) in [
+            (
+                "a variant that names the same caller authentication",
+                with_variant(
+                    "owner",
+                    true,
+                    serde_json::json!({"access_point": {"caller_authentication": {"methods": [key("owner-key")]}}}),
+                ),
+            ),
+            (
+                "a variant with other Access Point settings",
+                with_variant(
+                    "owner",
+                    true,
+                    serde_json::json!({"access_point": {"rate_limit": {"requests": 5, "window_secs": 60}}}),
+                ),
+            ),
+            ("a variant that drops the binding", {
+                let mut overrides = own_keys.clone();
+                overrides["outbound_credentials"] = serde_json::json!([]);
+                with_variant("owner", true, overrides)
+            }),
+            ("a variant that keeps a caller binding", with_variant("caller", true, own_keys.clone())),
+        ] {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+
+        let refused = "variant 'candidate' overrides.access_point.caller_authentication: a variant that keeps the \
+                       Access Point Target's owner binding keeps the surface's caller authentication";
+        for (case, surface) in [
+            ("a variant with its own caller authentication", with_variant("owner", true, own_keys.clone())),
+            ("a disabled variant with its own caller authentication", with_variant("owner", false, own_keys.clone())),
+            (
+                "a complete variant that clears it",
+                with_variant(
+                    "owner",
+                    true,
+                    serde_json::json!({"complete": true, "access_point": {"rate_limit": {"requests": 5,
+                        "window_secs": 60}}}),
+                ),
+            ),
+        ] {
+            let message = checked(&providers, surface, true)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(refused), "{case}: {message}");
+        }
+    }
+
+    /// The policies and trust checks that narrow which callers reach the
+    /// Target, the Access Point's `inbound_policy` and `trust_check_list` and
+    /// the Target's `policy`, choose who acts as the owner too: a variant that
+    /// keeps the surface's owner binding keeps the surface's, as it keeps its
+    /// caller authentication. One of its own, or one a complete override
+    /// clears, is refused, enabled or not. A variant that holds no such
+    /// binding, or keeps a caller binding, may have its own.
+    #[tokio::test]
+    async fn a_variant_that_keeps_the_owners_grant_keeps_the_surfaces_policies_and_trust_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let policy = |id: &str| serde_json::json!({"policy_definition_id": id});
+        let trust_check = |id: &str| {
+            serde_json::json!([{"id": id, "trust_registry_id": "tr-1", "query_type": "authorization",
+                "query": {"authority_id": "did:web:authority.example", "entity_id": "{{ caller.did }}",
+                    "action": "invoke"}}])
+        };
+        let mut access_point = access_point_authenticating(serde_json::json!([{"type": "api_key",
+            "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "team-keys"}]));
+        access_point["inbound_policy"] = policy("only-the-owner");
+        access_point["trust_check_list"] = trust_check("owner-is-recognised");
+        let base = serde_json::json!({"access_point": access_point,
+            "target": {"endpoint": "https://203.0.113.30/mcp", "policy": policy("owner-tools")}});
+        let with_variant = |subject: &str, enabled: bool, overrides: serde_json::Value| {
+            let mut extra = base.clone();
+            extra["variants"] = serde_json::json!([{"id": "v-1", "alias": "candidate", "name": "candidate",
+                "enabled": enabled, "overrides": overrides}]);
+            target_surface(serde_json::json!([external("external-a", Some(subject))]), extra)
+        };
+        let loosening = [
+            (
+                "access_point.inbound_policy",
+                "inbound policy",
+                serde_json::json!({"access_point": {"inbound_policy": policy("everyone")}}),
+            ),
+            ("target.policy", "Target policy", serde_json::json!({"target": {"policy": policy("every-tool")}})),
+            (
+                "access_point.trust_check_list",
+                "caller trust checks",
+                serde_json::json!({"access_point": {"trust_check_list": trust_check("anyone")}}),
+            ),
+        ];
+
+        let mut accepted = vec![(
+            "a variant naming the same policies",
+            with_variant(
+                "owner",
+                true,
+                serde_json::json!({"access_point": {"inbound_policy": policy("only-the-owner")},
+                    "target": {"policy": policy("owner-tools")}}),
+            ),
+        )];
+        for (_, _, overrides) in &loosening {
+            let mut dropping = overrides.clone();
+            dropping["outbound_credentials"] = serde_json::json!([]);
+            accepted.push(("a variant that drops the binding", with_variant("owner", true, dropping)));
+            accepted.push(("a variant that keeps a caller binding", with_variant("caller", true, overrides.clone())));
+        }
+        for (case, surface) in accepted {
+            assert_eq!(checked(&providers, surface, true).await, Ok(()), "{case}");
+        }
+
+        for (field, name, overrides) in loosening {
+            for enabled in [true, false] {
+                let message = checked(&providers, with_variant("owner", enabled, overrides.clone()), true)
+                    .await
+                    .expect_err(field);
+                let refused = format!(
+                    "variant 'candidate' overrides.{field}: a variant that keeps the Access Point Target's owner \
+                     binding keeps the surface's {name}"
+                );
+                assert!(message.starts_with(&refused), "{field}, enabled {enabled}: {message}");
+            }
+        }
+        let message = checked(
+            &providers,
+            with_variant(
+                "owner",
+                true,
+                serde_json::json!({"complete": true, "target": {"endpoint": "https://203.0.113.30/mcp"}}),
+            ),
+            true,
+        )
+        .await
+        .expect_err("a complete variant that clears the Target policy");
+        assert!(message.starts_with("variant 'candidate' overrides.target.policy: "), "{message}");
     }
 }

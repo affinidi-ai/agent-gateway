@@ -701,6 +701,50 @@ impl RbacGuard {
     {
         mr.layer(require_feature(self.storage.clone(), self.rbac_config.clone(), feature))
     }
+
+    /// Whether `user_id` holds `feature` under its role and, for a request
+    /// made with an access token, under the token's scopes. An unknown user,
+    /// a user who is not Approved, or a failed lookup counts as no.
+    pub async fn allows(
+        &self,
+        user_id: &str,
+        pat: Option<&crate::auth_manager::pat::PatContext>,
+        feature: &crate::rbac::Feature,
+    ) -> bool {
+        match self
+            .storage
+            .load_user_by_id(user_id)
+            .await
+        {
+            Ok(Some(user)) => {
+                user.status == UserStatus::Approved
+                    && self
+                        .rbac_config
+                        .has_permission(&user.role, feature)
+                    && pat_scope_allows(pat, feature)
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!(user_id = %user_id, feature = ?feature, error = %e, "RbacGuard::allows: failed to load user");
+                false
+            }
+        }
+    }
+}
+
+/// Whether the caller holds `feature`. A missing guard or caller counts as no.
+pub(crate) async fn caller_allows(
+    guard: Option<&RbacGuard>,
+    user_id: Option<&str>,
+    pat: Option<&crate::auth_manager::pat::PatContext>,
+    feature: &crate::rbac::Feature,
+) -> bool {
+    let (Some(guard), Some(user_id)) = (guard, user_id) else {
+        return false;
+    };
+    guard
+        .allows(user_id, pat, feature)
+        .await
 }
 
 /// Refuses every request to a protected route that was mounted without an RBAC
@@ -1294,6 +1338,23 @@ mod tests {
         let app = test_app_with_storage(sess_mgr, storage);
         let status = get_status_with_bearer(&app, "/v1/settings", &token).await;
         assert_eq!(status, 200, "Approved user with valid session must pass");
+    }
+
+    #[tokio::test]
+    async fn rbac_guard_allows_only_an_approved_user() {
+        for (status, expected) in
+            [(UserStatus::Approved, true), (UserStatus::New, false), (UserStatus::Disabled, false)]
+        {
+            let (storage, _tmp) = make_storage_with_user(mk_user_data("user-1", "alice", status)).await;
+            let guard = RbacGuard::new(storage, Arc::new(crate::rbac::RbacConfig::default()));
+
+            assert_eq!(
+                guard
+                    .allows("user-1", None, &crate::rbac::Feature::LogsView)
+                    .await,
+                expected
+            );
+        }
     }
 
     async fn audit_context_handler() -> axum::Json<serde_json::Value> {

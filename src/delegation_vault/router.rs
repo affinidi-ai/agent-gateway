@@ -485,12 +485,9 @@ mod tests {
         use crate::delegation_vault::grants::GrantKey;
         use crate::delegation_vault::grants::tests::grant;
         let directory = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("PURGE_ROUTE_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "PURGE_ROUTE_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();
@@ -615,12 +612,9 @@ mod tests {
         use crate::delegation_vault::grants::tests::grant;
         use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
         let directory = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("PURGE_ROUTE_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "PURGE_ROUTE_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();

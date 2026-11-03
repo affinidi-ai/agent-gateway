@@ -85,7 +85,9 @@ describe('EditAccessTokenPage', () => {
     expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
 
     await userEvent.click(screen.getByTestId('access-token-done-button'));
-    expect(screen.getByTestId('location')).toHaveTextContent('/secrets?tab=access-tokens');
+    await waitFor(() =>
+      expect(screen.getByTestId('location')).toHaveTextContent('/secrets?tab=access-tokens')
+    );
   });
 
   it('presets the create form from the query string without saving', async () => {
