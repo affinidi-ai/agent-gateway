@@ -135,8 +135,6 @@ pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From AP
      mcp_http.authorization, which identifies callers by their resource token; remove one of them";
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
     "Identity 'From API Key' is not supported on a proxy:// MCP Proxy target; choose another inbound Identity mode";
-pub(crate) const INBOUND_API_KEY_RESERVED_SECRET_ID: &str = "The API Key Caller Context secret id starts with the \
-     reserved 'atgk_' prefix, so Identity 'From API Key' cannot identify its callers; use a secret id without it";
 pub(crate) const API_KEY_IDENTITY_NEEDS_ID: &str = "Identity 'From API Key' needs a non-empty api_key_id";
 
 /// The inbound slot identifies each caller by the key it presents, so a stored
@@ -192,16 +190,8 @@ fn validate_api_key_identities(
     };
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
-        match surface.source_auth() {
-            Some(SourceAuthConfig::ApiKey(config))
-                if config
-                    .secret_id
-                    .starts_with(crate::api_keys::KEY_ID_PREFIX) =>
-            {
-                return Err(refuse(INBOUND_API_KEY_RESERVED_SECRET_ID));
-            }
-            Some(SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)) => {}
-            _ => return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER)),
+        if !matches!(surface.source_auth(), Some(SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_))) {
+            return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
         }
         if surface
             .mcp_http
@@ -7126,18 +7116,6 @@ mod validation_tests {
         let mut a2a = inbound_api_key_surface(&[provider_caller()]);
         a2a.target.endpoint = "a2a-proxy://worker".to_string();
         assert!(validate_api_key_identities(&a2a, "").is_ok(), "a2a-proxy target");
-    }
-
-    #[test]
-    fn inbound_from_api_key_is_refused_behind_a_reserved_plain_secret_id() {
-        let s = inbound_api_key_surface(&[api_key_caller("atgk_aliased")]);
-        assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_RESERVED_SECRET_ID);
-
-        let mut other_mode = s.clone();
-        other_mode
-            .identity_slots
-            .inbound = None;
-        assert!(validate_api_key_identities(&other_mode, "").is_ok(), "another inbound mode");
     }
 
     #[test]

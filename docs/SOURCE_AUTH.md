@@ -834,9 +834,12 @@ with `400` when:
 
 - the first Caller Context method is not API Key or API Key Provider;
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
-- the target is an MCP `proxy://` MCP Proxy;
-- the API Key secret id starts with `atgk_`, the prefix of API Key Provider key ids, so its
-  DID would equal that provider key's.
+- the target is an MCP `proxy://` MCP Proxy.
+
+An API Key Provider key and a plain API Key secret hash the same fields, `credential_type` and
+the key id or `secret_id`. A plain secret whose `secret_id` equals a provider key id (`atgk_`
+plus a UUID) therefore gets that key's identity record and DID. Neither the secrets store nor
+a surface save refuses such an id, so do not name a secret after an API Key Provider key.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`. A surface with no inbound identity whose protected slot is `from_api_key`,
@@ -902,7 +905,6 @@ Point's outbound request:
 | Condition | Status | `result` |
 | --- | --- | --- |
 | Caller authentication is not API Key or API Key Provider | `500` | `api_key_unavailable` |
-| An API Key secret id starts with `atgk_` | `500` | `api_key_secret_id_reserved` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 

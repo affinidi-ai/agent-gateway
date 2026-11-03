@@ -241,8 +241,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
   Save unless the first Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
-  apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`, an
-  `atgk_` secret id) and rules on inactive variants show as the save-error banner.
+  apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
+  and rules on inactive variants show as the save-error banner.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener

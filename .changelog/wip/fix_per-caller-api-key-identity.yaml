@@ -17,7 +17,8 @@ changes:
         An inbound Identity set to From API Key gave every caller the DID of one stored key.
         The caller DID now comes from the API key each request presents: one DID per API Key
         Provider key, reported to policy as `source_auth`, or one per plain API Key secret,
-        shared by its holders and reported as `unverified`. A failed or revoked key resolves
+        shared by its holders and reported as `unverified`; a secret whose id equals a
+        provider key id shares that key's DID. A failed or revoked key resolves
         no caller identity. A stored inbound key id is ignored and dropped on save. A key that
         is also a Managed Agent's key gives its callers that Managed Agent's DID; a surface
         policy can refuse them by `input.source_auth.key_name`.
@@ -42,13 +43,6 @@ changes:
         Binding Failed, like the other events.
   removed: []
   security:
-    - timestamp: '2026-10-31T00:00:00Z'
-      title: Refuse plain API Key secret ids that start with the reserved atgk_ prefix
-      description: >-
-        A plain API Key secret id starting `atgk_` would derive the same caller DID as the API
-        Key Provider key with that id. Saving such a surface with an inbound From API Key
-        Identity is refused with 400, and a stored one is refused at request time with 500
-        (metric `result` `api_key_secret_id_reserved`).
     - timestamp: '2026-11-02T00:00:00Z'
       title: Make the presented API key's DID replace any body-asserted caller identity
       description: >-

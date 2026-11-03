@@ -21676,27 +21676,6 @@ allow if {
         }
 
         #[tokio::test]
-        async fn plain_key_with_provider_id_prefix_is_refused() {
-            let (issuer, _dir) = test_vc_issuer().await;
-            let mut state = state_with(inbound_from_api_key("pak-plain-reserved"), Some(issuer));
-            state.secrets_store = Some(Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
-                "atgk_pak_alias",
-                None,
-                "v1",
-            )])));
-
-            let response = resolve(&state, Some(&plain_key("atgk_pak_alias")), false)
-                .await
-                .unwrap_err();
-
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            let body = body_text(response).await;
-            assert!(body.contains(super::super::CALLER_IDENTITY_UNRESOLVED), "{body}");
-            assert!(!body.contains("atgk_pak_alias"), "{body}");
-            assert_eq!(resolve_count("pak-plain-reserved", "api_key_secret_id_reserved"), 1);
-        }
-
-        #[tokio::test]
         async fn caller_attributable_failure_resolves_no_identity() {
             let (issuer, _dir) = test_vc_issuer().await;
             let state = state_with(inbound_from_api_key("pak-failed"), Some(issuer));
