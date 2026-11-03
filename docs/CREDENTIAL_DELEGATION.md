@@ -718,7 +718,10 @@ also refused on a surface whose Access Point takes the gateway's resource access
 (`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
 gateway's issuer, so callers of two identity providers with the same subject would share a
 grant. An `owner` binding may be used there. A surface stored outside the API that breaks one
-of these rules answers `connector_unavailable` and reads no grant.
+of these rules answers `connector_unavailable` and reads no grant, and so does one saved through
+the API before these rules applied. Its grants are kept, not revoked: none is released while
+the rule is broken. Tightening the caller authentication (`allowed_dids`, `audiences`) releases
+them again. Removing the binding removes them and revokes them at the vendor.
 
 A request through such a Transit Point needs a caller it identifies, as every delegated
 credential does: a transit token naming one, or a caller its `source_auth` verified; without
