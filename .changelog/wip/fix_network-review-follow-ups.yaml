@@ -2,7 +2,14 @@ branch: fix/network-review-follow-ups
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-03T20:40:00Z'
+      title: Warn when a listener's external URL has no host that parses
+      description: >-
+        An external URL that does not parse, such as one with an out-of-range port, quietly
+        stopped its listener sharing the outbound proxy with another listener of the same host.
+        The gateway now logs a warning naming the listener's id and the URL's position in its
+        list, never the URL, so a credential in it stays out of the log.
   removed: []
   security:
     - timestamp: '2026-11-03T20:30:00Z'

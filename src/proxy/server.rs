@@ -214,6 +214,27 @@ fn extract_hostname(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// The hosts of `listener`'s external URLs ([`extract_hostname`]). A URL without
+/// one is logged, by its position so a credential in it never reaches the log,
+/// and shares a host with no other listener.
+fn listener_hostnames(listener: &crate::config::network::Listener) -> impl Iterator<Item = String> + '_ {
+    listener
+        .external_urls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, url)| {
+            let host = extract_hostname(url);
+            if host.is_none() {
+                warn!(
+                    listener = %listener.id,
+                    external_url_index = index,
+                    "Listener external URL has no host that parses, so no listener shares /outbound through it"
+                );
+            }
+            host
+        })
+}
+
 /// Find the first outbound listener whose external URLs share a hostname with
 /// the inbound listener on `inbound_port`. Returns `None` when no overlap exists
 /// (i.e. inbound and outbound have fully separate domains).
@@ -228,20 +249,14 @@ pub(crate) fn find_shared_outbound_listener(
         .listeners
         .iter()
         .filter(|l| l.listener_type == "inbound" && l.port == inbound_port)
-        .flat_map(|l| l.external_urls.iter())
-        .filter_map(|url| extract_hostname(url))
+        .flat_map(listener_hostnames)
         .collect();
 
     network_config
         .listeners
         .iter()
         .filter(|l| l.listener_type == "outbound")
-        .find(|l| {
-            l.external_urls
-                .iter()
-                .filter_map(|url| extract_hostname(url))
-                .any(|h| inbound_hostnames.contains(&h))
-        })
+        .find(|l| listener_hostnames(l).any(|h| inbound_hostnames.contains(&h)))
 }
 
 /// Whether the inbound listener's `/outbound` proxy passes `header` to the
@@ -2879,6 +2894,26 @@ mod tests {
             vec!["https://[2001:DB8:0:0:0:0:0:1]:9443"],
         );
         assert!(find_shared_outbound_listener(&config, 8080).is_some());
+    }
+
+    #[test]
+    fn an_external_url_without_a_host_shares_nothing_and_is_logged_by_its_position() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let config = make_network_config_with_listeners(
+            vec!["https://secret-user:secret-pass@shared.example.com:99999", "https://inbound.example.com"],
+            vec!["https://shared.example.com"],
+        );
+
+        assert!(find_shared_outbound_listener(&config, 8080).is_none());
+        let text = logs.text();
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Listener external URL has no host that parses"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{text}");
+        assert!(warnings[0].contains("inbound-http"), "{}", warnings[0]);
+        assert!(warnings[0].contains("external_url_index=0"), "{}", warnings[0]);
+        assert!(!text.contains("secret-pass"), "a log holds the URL: {text}");
     }
 
     #[test]

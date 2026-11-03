@@ -223,7 +223,9 @@ included), makes them so, and so does the same on an inbound listener that share
 with it, because that inbound listener passes `/outbound/...` requests on to it. Two external
 URLs share a host name when their hosts match, ignoring case and port; an IPv6 address matches
 only the same address, however it is written (`[2001:db8::1]` and `[2001:DB8:0::1]` match,
-`[2001:db8::1]` and `[2001:db8::2]` do not). A Transit Point that serves callers it does not
+`[2001:db8::1]` and `[2001:db8::2]` do not). An external URL that does not parse, or has no
+host, shares a host name with none and is named in a `WARN` by its listener's `id` and its
+position in `external_urls`. A Transit Point that serves callers it does not
 authenticate and is reachable that way is reported in the admin API's answer and the log. A
 Transit Point that authenticates callers by client certificate takes the certificate from the
 outbound listener's own TLS handshake or from a proxy in `tls.client_auth.trusted_proxies`,
