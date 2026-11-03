@@ -2,12 +2,44 @@ import React from 'react';
 import AddResourceLink from '../../components/shared/AddResourceLink';
 import FieldHelp from '../../components/shared/FieldHelp';
 import { deepLinks } from '../../utils/deepLinks';
+import { outOfTenantLabel, splitByTenant, type OwnerTenant } from '../../utils/tenantScope';
 
 export interface SecretOption {
   id: string;
   name: string;
   secret_id: string;
+  tenant_id?: string | null;
 }
+
+interface SecretOptionsProps {
+  secrets: SecretOption[];
+  ownerTenant: OwnerTenant;
+  value: string;
+}
+
+/**
+ * The options of a secret picker: the secrets of the provider's tenant, plus the stored choice
+ * when it lies outside that tenant, labelled so it can be replaced before it stops working.
+ */
+export const SecretOptions: React.FC<SecretOptionsProps> = ({ secrets, ownerTenant, value }) => {
+  const { offered, outside } = splitByTenant(secrets, ownerTenant);
+  return (
+    <>
+      {offered.map(secret => (
+        <option key={secret.id} value={secret.secret_id}>
+          {secret.name} ({secret.secret_id})
+        </option>
+      ))}
+      {outside
+        .filter(secret => secret.secret_id === value)
+        .map(secret => (
+          <option key={secret.id} value={secret.secret_id}>
+            {secret.name} ({secret.secret_id}, {outOfTenantLabel(secret)})
+          </option>
+        ))}
+    </>
+  );
+};
 
 interface SecretSelectProps {
   id: string;
@@ -17,6 +49,7 @@ interface SecretSelectProps {
   hint: React.ReactNode;
   value: string;
   secrets: SecretOption[];
+  ownerTenant: OwnerTenant;
   loading: boolean;
   onChange: (event: React.ChangeEvent<HTMLSelectElement>) => void;
 }
@@ -30,6 +63,7 @@ const SecretSelect: React.FC<SecretSelectProps> = ({
   hint,
   value,
   secrets,
+  ownerTenant,
   loading,
   onChange,
 }) => (
@@ -55,16 +89,14 @@ const SecretSelect: React.FC<SecretSelectProps> = ({
       disabled={loading}
     >
       <option value="">{loading ? '-- Loading secrets... --' : '-- Select a secret --'}</option>
-      {secrets.map(secret => (
-        <option key={secret.id} value={secret.secret_id}>
-          {secret.name} ({secret.secret_id})
-        </option>
-      ))}
+      <SecretOptions secrets={secrets} ownerTenant={ownerTenant} value={value} />
     </select>
     <small className="form-text text-muted">{hint}</small>
     {!loading && (
       <div className="form-text">
-        {secrets.length === 0 ? 'No secrets configured yet. ' : "Don't see the one you need? "}
+        {splitByTenant(secrets, ownerTenant).offered.length === 0
+          ? 'No secrets configured yet. '
+          : "Don't see the one you need? "}
         <AddResourceLink to={deepLinks.secret} testid={`credential-provider-add-${id}-link`}>
           Add secret
         </AddResourceLink>

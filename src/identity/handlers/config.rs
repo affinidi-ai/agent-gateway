@@ -131,6 +131,8 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     let new_config_result = load_base_gateway_config(state).await;
     let (new_config_result, surfaces_count) = inject_surfaces_into_config(state, new_config_result).await;
 
+    super::report_credential_policy(state).await;
+
     let (channels_count, is_fallback, warning) = state
         .channel_manager
         .reload_channels_with_fallback(

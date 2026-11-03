@@ -2979,6 +2979,12 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub tenancy: crate::tenancy::TenancyConfig,
 
+    /// Credential provider rules (`[credential_policy]`): https token endpoints,
+    /// tenant credential isolation, and the exact http endpoints allowed.
+    /// Startup-only; every rule defaults to `warn`.
+    #[serde(default)]
+    pub credential_policy: super::credential_policy::CredentialPolicyConfig,
+
     /// Directory the bootstrap config.toml was loaded from. Populated
     /// by `BootstrapConfig::from_file` and used by services that need
     /// to resolve sibling resource folders (e.g. the agent surface

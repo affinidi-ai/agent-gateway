@@ -10,7 +10,8 @@ import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
-import { SecretOption as Secret } from './EditCredentialProviderPage/SecretSelect';
+import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
+import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import {
   CredentialProviderType,
   EMPTY_JWT_FIELDS,
@@ -79,6 +80,9 @@ const EditCredentialProviderPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [secrets, setSecrets] = useState<Secret[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(true);
+  const [ownerTenant, setOwnerTenant] = useState<OwnerTenant>(undefined);
+  const tokenEndpointIsHttp = /^http:\/\//i.test(form.token_endpoint.trim());
+  const offeredSecretCount = splitByTenant(secrets, ownerTenant).offered.length;
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
@@ -140,6 +144,7 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       }
 
+      setOwnerTenant(data.tenant_id ?? null);
       setForm({
         name: data.name ?? '',
         provider_id: data.provider_id ?? '',
@@ -509,6 +514,20 @@ const EditCredentialProviderPage: React.FC = () => {
                         onChange={handleChange}
                         required
                       />
+                      {tokenEndpointIsHttp && (
+                        <div
+                          className="alert alert-warning py-2 mt-2"
+                          role="status"
+                          data-testid="credential-provider-token-endpoint-https-warning"
+                        >
+                          <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                          This token endpoint uses http. New or changed http token endpoints are
+                          refused unless listed by exact URL in{' '}
+                          <code>credential_policy.insecure_token_endpoints</code> in the gateway
+                          bootstrap config. A stored endpoint that is unchanged is still accepted
+                          while token_endpoint_https is warn.
+                        </div>
+                      )}
                       <small className="form-text text-muted">
                         {form.provider_type === 'oauth2_client_credentials_jwt_auth'
                           ? 'The tenant-specific token URL (login.microsoftonline.com/<tenant>/oauth2/v2.0/token), not the common one.'
@@ -661,18 +680,18 @@ const EditCredentialProviderPage: React.FC = () => {
                         <option value="">
                           {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
                         </option>
-                        {secrets.map(secret => (
-                          <option key={secret.id} value={secret.secret_id}>
-                            {secret.name} ({secret.secret_id})
-                          </option>
-                        ))}
+                        <SecretOptions
+                          secrets={secrets}
+                          ownerTenant={ownerTenant}
+                          value={form.client_id_secret_ref}
+                        />
                       </select>
                       <small className="form-text text-muted">
                         Pick the secret holding your OAuth app's client ID.
                       </small>
                       {!loadingSecrets && (
                         <div className="form-text">
-                          {secrets.length === 0
+                          {offeredSecretCount === 0
                             ? 'No secrets configured yet. '
                             : "Don't see the one you need? "}
                           <AddResourceLink
@@ -712,18 +731,18 @@ const EditCredentialProviderPage: React.FC = () => {
                           <option value="">
                             {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
                           </option>
-                          {secrets.map(secret => (
-                            <option key={secret.id} value={secret.secret_id}>
-                              {secret.name} ({secret.secret_id})
-                            </option>
-                          ))}
+                          <SecretOptions
+                            secrets={secrets}
+                            ownerTenant={ownerTenant}
+                            value={form.client_secret_secret_ref}
+                          />
                         </select>
                         <small className="form-text text-muted">
                           Pick the secret holding your OAuth app's client secret.
                         </small>
                         {!loadingSecrets && (
                           <div className="form-text">
-                            {secrets.length === 0
+                            {offeredSecretCount === 0
                               ? 'No secrets configured yet. '
                               : "Don't see the one you need? "}
                             <AddResourceLink
@@ -743,6 +762,7 @@ const EditCredentialProviderPage: React.FC = () => {
                   providerType={form.provider_type}
                   form={form}
                   secrets={secrets}
+                  ownerTenant={ownerTenant}
                   loadingSecrets={loadingSecrets}
                   onChange={handleChange}
                 />
@@ -771,11 +791,11 @@ const EditCredentialProviderPage: React.FC = () => {
                         <option value="">
                           {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
                         </option>
-                        {secrets.map(secret => (
-                          <option key={secret.id} value={secret.secret_id}>
-                            {secret.name} ({secret.secret_id})
-                          </option>
-                        ))}
+                        <SecretOptions
+                          secrets={secrets}
+                          ownerTenant={ownerTenant}
+                          value={form.api_key_secret_ref}
+                        />
                       </select>
                       <small className="form-text text-muted">
                         Secret containing the API key value. Injected directly into upstream
@@ -783,7 +803,7 @@ const EditCredentialProviderPage: React.FC = () => {
                       </small>
                       {!loadingSecrets && (
                         <div className="form-text">
-                          {secrets.length === 0
+                          {offeredSecretCount === 0
                             ? 'No secrets configured yet. '
                             : "Don't see the one you need? "}
                           <AddResourceLink

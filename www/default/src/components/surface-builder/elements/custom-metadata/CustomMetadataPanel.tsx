@@ -5,12 +5,21 @@ import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import FieldHelp from '../../../shared/FieldHelp';
 import type { ConfigPanelProps } from '../types';
+import { splitByTenant } from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 const CustomMetadataPanel: React.FC<ConfigPanelProps> = ({ config, updateField, node }) => {
   const entries: Array<{ key: string; value: string; target?: string }> = config.entries || [];
-  const [secrets, setSecrets] = useState<
-    Array<{ id: string; name: string; secret_id: string; description?: string }>
+  const [allSecrets, setSecrets] = useState<
+    Array<{
+      id: string;
+      name: string;
+      secret_id: string;
+      description?: string;
+      tenant_id?: string | null;
+    }>
   >([]);
+  const secrets = splitByTenant(allSecrets, useSurfaceTenant()).offered;
   const [openSecretsIdx, setOpenSecretsIdx] = useState<number | null>(null);
 
   useEffect(() => {

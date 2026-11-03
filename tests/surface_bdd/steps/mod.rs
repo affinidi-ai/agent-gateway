@@ -1,7 +1,10 @@
+pub mod agent_card_preview;
+pub mod credential_save;
 pub mod given;
 pub mod identities;
 pub mod names;
 pub mod policy_changes;
+pub mod provider_token;
 pub mod sts;
 pub mod terms;
 pub mod then;

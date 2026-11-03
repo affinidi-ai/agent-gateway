@@ -4,8 +4,10 @@ mod a2a_proxy_e2e;
 mod a2a_streaming_e2e;
 mod access_point_closed_e2e;
 mod access_tokens_pat;
+mod agent_card_preview;
 mod channel_e2e;
 mod connection_point_integration_events_e2e;
+mod custom_metadata_tenancy_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
 mod event_hook_e2e;
@@ -25,6 +27,7 @@ mod mcp_subscription_scope;
 mod mtls;
 mod stored_reference_transit_token_e2e;
 mod target_auth_provider_e2e;
+mod tenant_credential_save_e2e;
 mod tr_naming_e2e;
 mod transit_caller_auth_e2e;
 mod transit_caller_policy_e2e;

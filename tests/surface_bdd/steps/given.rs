@@ -2541,6 +2541,48 @@ fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
 }
 
+/// Serves a client credentials provider that the surface's own Target does not use, for a
+/// Transit Point or a delegated credential binding to use instead.
+fn serve_client_credentials_provider_off_the_surface_target(world: &mut SurfaceWorld) {
+    let mut provider = SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials);
+    provider.authenticates_surface_target = false;
+    world
+        .surface_config
+        .target_auth_provider = Some(provider);
+}
+
+#[given(expr = "Transit Point {string} authenticates its target with a client credentials provider")]
+fn transit_point_authenticates_target_with_client_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).target_auth_provider = true;
+    serve_client_credentials_provider_off_the_surface_target(world);
+}
+
+#[given(expr = "the surface requires delegated credentials from a client credentials provider")]
+fn surface_requires_client_credentials_delegated_credentials(world: &mut SurfaceWorld) {
+    serve_client_credentials_provider_off_the_surface_target(world);
+    world
+        .surface_config
+        .credential_delegation = Some(SurfaceCredentialDelegationConfig {
+        provider_id: crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_ID.to_string(),
+        provider_kind: CredentialProviderKind::ClientCredentials,
+        required_tool: None,
+        inject_as: DelegatedCredentialInjection::BearerHeader,
+        scopes: Vec::new(),
+    });
+}
+
+#[given(expr = "Transit Point {string} injects delegated credentials from a client credentials provider")]
+fn transit_point_injects_client_credentials_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    surface_requires_client_credentials_delegated_credentials(world);
+}
+
 #[given(expr = "the surface authenticates its target with a JWT Bearer provider")]
 fn surface_authenticates_target_with_jwt_bearer(world: &mut SurfaceWorld) {
     world
@@ -2567,6 +2609,45 @@ fn target_credential_provider_token_lifetime(
     expires_in: u64,
 ) {
     target_auth_provider(world).expires_in = expires_in;
+}
+
+#[given("the target's credential provider has a plain http token endpoint")]
+fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
+    target_auth_provider(world).insecure_token_endpoint = true;
+}
+
+#[given("the gateway keeps its log of warnings")]
+fn gateway_keeps_its_log_of_warnings(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+}
+
+#[given(expr = "the surface belongs to tenant {string}")]
+fn surface_belongs_to_tenant(
+    world: &mut SurfaceWorld,
+    tenant_id: String,
+) {
+    world.surface_config.tenant_id = Some(tenant_id);
+}
+
+#[given(expr = "the gateway enforces the credential rule {string}")]
+fn gateway_enforces_credential_rule(
+    world: &mut SurfaceWorld,
+    rule: String,
+) {
+    assert!(
+        matches!(rule.as_str(), "token_endpoint_https" | "tenant_credential_isolation"),
+        "unknown credential rule {rule:?}"
+    );
+    assert!(
+        world.infra.is_none(),
+        "the credential rule must be set before the gateway starts, which reads it once at boot"
+    );
+    world
+        .surface_config
+        .enforced_credential_rules
+        .push(rule);
 }
 
 /// Fetches the card once and checks it succeeded, then clears only managed agent "bravo"'s

@@ -16,9 +16,10 @@ use crate::bdd_support::config::single_surface_fixture::{
     TargetAuthProviderGrant,
 };
 use crate::bdd_support::config::target_auth::{
-    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
-    TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET, credential_provider_target_auth_json,
-    static_secret_target_auth_json, target_auth_signing_key,
+    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
+    TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET,
+    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_service_account_key_file,
+    target_auth_signing_key,
 };
 
 struct SingleSurfaceOptions<'a> {
@@ -111,6 +112,9 @@ fn transit_point_json(
         && transit_point.delegated_credentials
     {
         transit_point_json["transit_credentials"] = binding.clone();
+    }
+    if transit_point.target_auth_provider {
+        transit_point_json["target_auth"] = credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, "reject");
     }
     if !transit_point
         .header_metadata_mapping
@@ -235,6 +239,9 @@ fn write_single_surface_config_inner(
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         surface_fixture = surface_fixture.with_a2a_proxy_id(&proxy.proxy_id);
     }
+    surface_fixture.tenant_id = surface_config
+        .tenant_id
+        .clone();
     if let Some(requests) = surface_config.rate_limit_per_minute {
         surface_fixture = surface_fixture.with_rate_limit(requests, 60);
     }
@@ -260,7 +267,9 @@ fn write_single_surface_config_inner(
             &target_auth.fallback,
         ));
     }
-    if let Some(provider) = &surface_config.target_auth_provider {
+    if let Some(provider) = &surface_config.target_auth_provider
+        && provider.authenticates_surface_target
+    {
         surface_fixture = surface_fixture
             .with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
     }
@@ -524,6 +533,54 @@ fn write_single_surface_config_inner(
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
+    write_credential_policy(
+        base_dir,
+        &surface_config.enforced_credential_rules,
+        surface_config.token_request_timeout_secs,
+    );
+    if surface_config.logs_audit_events {
+        log_info(base_dir);
+    } else if surface_config.keeps_gateway_log {
+        log_warnings(base_dir);
+    }
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `info`.
+fn log_info(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"info\"", 1)).unwrap();
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `warn`.
+fn log_warnings(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
+}
+
+/// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when
+/// given, the token request timeout.
+fn write_credential_policy(
+    base_dir: &Path,
+    rules: &[String],
+    token_request_timeout_secs: Option<u64>,
+) {
+    if rules.is_empty() && token_request_timeout_secs.is_none() {
+        return;
+    }
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[credential_policy]\n");
+    for rule in rules {
+        config.push_str(&format!("{rule} = \"enforce\"\n"));
+    }
+    if let Some(secs) = token_request_timeout_secs {
+        config.push_str(&format!("token_request_timeout_secs = {secs}\n"));
+    }
+    std::fs::write(&path, config).unwrap();
 }
 
 fn set_transit_token_max_lifetime(
@@ -609,14 +666,20 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     match surface_config
         .target_auth_provider
         .as_ref()
-        .map(|provider| provider.grant)
     {
-        Some(TargetAuthProviderGrant::ClientCredentials) => {
+        Some(provider) if provider.grant == TargetAuthProviderGrant::ClientCredentials => {
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, "bdd-target-client-secret"));
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
         }
-        Some(TargetAuthProviderGrant::JwtBearer) => {
-            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &target_auth_signing_key().private_pem));
+        Some(provider) => {
+            let signing_key = if provider.signing_key_is_service_account_file {
+                target_auth_service_account_key_file()
+            } else {
+                target_auth_signing_key()
+                    .private_pem
+                    .clone()
+            };
+            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
         }
         None => {}
     }
@@ -632,7 +695,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
             }
-            CredentialProviderKind::Unknown => {}
+            CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => {}
         }
     }
     secrets
@@ -693,7 +756,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
-                "jwt_key_id": "bdd-target-key-id",
+                "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
             })
         }),
         created_at: now,
@@ -708,7 +771,7 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
     let provider = match &delegation.provider_kind {
-        CredentialProviderKind::Unknown => return Vec::new(),
+        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => return Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
             let base_url = surface_config
                 .oauth_provider_base_url

@@ -36,6 +36,66 @@ A provider carries its authorization and token endpoints and its default scopes.
 client ID, client secret, signing key and certificate are **references** into the secrets
 store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
 
+### https token endpoints
+
+Every type except `api_key` sends its client secret, assertion or code to the token endpoint,
+so the endpoint must be an https URL. An http endpoint meets the rule only when the bootstrap
+`[credential_policy] insecure_token_endpoints` lists it exactly (compared as parsed URLs, so
+another port or path does not match), or, under `AG_TEST_MODE=true`, when
+`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `credential_policy.token_endpoint_https`
+sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
+
+| | `warn` (default) | `enforce` |
+| --- | --- | --- |
+| Create, or an update that sets a new token endpoint or turns an `api_key` provider into an OAuth type | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint | Saved | 400 |
+| `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
+| Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
+
+The check runs before the provider's secrets are read. In `warn` mode every use of a stored
+http provider logs a warning, and a legacy binding's audit detail gains
+` insecure_token_endpoint` (for example `client_credentials_cached insecure_token_endpoint`,
+`after_refresh insecure_token_endpoint`). In `enforce` mode a service token reports
+`TokenEndpointNotHttps` ("credential provider token endpoint is not https"), even for a token
+already cached, the legacy code exchange and refresh fail with `token_endpoint must be an https
+URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
+https, or list a deliberate http endpoint, before switching to `enforce`.
+
+### Provider secrets belong to the provider's tenant
+
+Every secret a provider references (client ID, client secret, API key, signing key,
+certificate) must belong to the provider's own tenant: a tenant provider uses its tenant's
+secrets, an appliance-wide provider uses appliance-wide secrets. `credential_policy.tenant_credential_isolation`
+sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
+
+| | `warn` (default) | `enforce` |
+| --- | --- | --- |
+| Create, or an update that sets a reference to another tenant's or an appliance-wide secret on a tenant provider | 400 `Secret reference is not accessible` | The same |
+| Update that keeps a stored reference in the same field, with the type, token and authorization endpoints, `resource`, `additional_params`, `default_scopes` and JWT issuer, subject and audience unchanged | Saved, except on a provider with an `issuer`, which never keeps a secret outside its own tenant | 400 |
+| `POST /api/v1/credential-providers/validate` | 400 for a signing key or certificate outside the provider's tenant (another tenant's or, for a tenant provider, an appliance-wide one), before the key is read | The same |
+| Authorization URL, code exchange, refresh, service token grant or API key read | The secret is read, with a warning log naming the provider and secret id | Refused before the secret's value is used |
+
+A stored reference is kept only while it goes where it went before. An update that changes one
+of those settings, or moves a stored reference to another field (a client secret becoming the
+signing key, say), treats every such reference as new and answers 400, so a tenant cannot send
+an appliance-wide secret, or an assertion signed with an appliance-wide key, to an endpoint or
+audience of its choosing. A kept reference pins that destination, `default_scopes` included, but
+not the scopes a surface's Target authentication requests, which replace the default scopes on
+that leg.
+
+In `enforce` mode a service token or API key whose secret is outside the provider's tenant
+reports `SecretUnavailable`, and no token request is sent. A cached service token is checked
+against the same rule on every use, reading each secret the type sends by id, so it stops being
+served as soon as the rule is enforced. Move such secrets into the provider's tenant before
+switching to `enforce`.
+
+The save rule above covers every reference the provider stores. A leftover reference in a field
+the provider's type does not send, such as an `api_key_secret_ref` kept after a provider changed
+from `api_key`, is ignored at runtime (see [Service tokens](#service-tokens)), but it still counts
+for the provider save rule, for the surface save rule in
+[Tenant isolation on a surface's upstream legs](#tenant-isolation-on-a-surfaces-upstream-legs)
+and for the startup credential policy report.
+
 ### Providers that sign a JWT
 
 The two JWT types share the settings in `JwtAssertionSettings`; create and update refuse a
@@ -43,7 +103,7 @@ record that misses a required one.
 
 | Field | `oauth2_jwt_bearer` | `oauth2_client_credentials_jwt_auth` |
 | --- | --- | --- |
-| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) | Required |
+| `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC), or a Google service account JSON key file, whose `private_key` is used | Required |
 | `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
@@ -51,11 +111,12 @@ record that misses a required one.
 | `client_id_secret_ref` | Not used | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
-| `jwt_key_id` | Optional `kid` header, a Google key's `private_key_id` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
+| `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
 Create and update resolve the referenced key and certificate after checking the caller may
 use them, and refuse with 400 a key that cannot sign with the algorithm or a certificate that
-is not PEM, so a wrong format fails the save rather than the first token request.
+is not PEM, so a wrong format fails the save rather than the first token request. A JSON key
+file is checked the same way; the key secret may be at most 16 KiB.
 `POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
 credential provider edit permission, applies the caller's tenant to the secrets it names, and
 answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
@@ -78,10 +139,51 @@ reads an empty reference as none.
 that needs one: legacy and `2026-07-28` delegation bindings, and target authentication.
 
 - An API key is read from the secrets store on every use and never cached.
-- An issued token is cached in the delegation vault until 60 seconds before its `expires_at`,
-  then a new one is requested. A token response without `expires_in`, with an empty token, or
+- Every token request (Client Credentials, JWT Bearer, `private_key_jwt` and refresh) is sent
+  on a client pinned to the addresses the token endpoint resolved to when it was checked, with
+  redirects off. The pin holds when no HTTP proxy is configured: a client that honours
+  `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` lets the proxy resolve the host
+  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving to loopback, an unspecified address or cloud metadata is
+  refused before any request, reported as `TokenEndpointRefused` ("credential provider token
+  endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
+  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
+  (never cloud metadata).
+- An issued token is cached in the delegation vault and renewed half its lifetime before its
+  `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
+  renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the
+  others keep using the cached token. When the renewal fails at the token endpoint
+  (`TokenRequestFailed`, `ScopeMismatch`) or is held back by the retry backoff, the cached token
+  is still used, marked stale, until 60 seconds before it expires; after that the request fails.
+  A legacy binding's audit detail then reads `<grant>_stale` (for example
+  `client_credentials_stale`) in place of `<grant>_cached` or `<grant>_fresh`, and each use
+  logs a warning.
+  A changed provider, a missing secret, a provider setting or signing key the grant cannot use
+  (`ProviderMisconfigured`, reported as a failed token request), a secrets store or vault error, or a token endpoint the
+  egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
+  of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
+  of each secret the provider's type sends: the client ID and secret of `oauth2_client_credentials`,
+  the signing key and certificate of `oauth2_jwt_bearer`, and the client ID, signing key and
+  certificate of `oauth2_client_credentials_jwt_auth`. Editing the provider, rotating one of
+  those secrets or moving one to another tenant therefore requests a new token instead of
+  reusing one issued under the old settings. A reference the type does not send, such as an
+  `api_key_secret_ref` kept after a provider changed from `api_key`, is neither read nor part of
+  the key, so rotating or deleting its secret changes nothing at runtime; it still counts for the
+save rules and the startup report ([Provider secrets belong to the provider's
+tenant](#provider-secrets-belong-to-the-providers-tenant)).
+  Each use looks up only those secrets, one read each (decrypted when
+  encryption at rest is on), and a token request reads each secret it sends once more by its
+  id; neither asks the store for a listing, though the filesystem store rescans its directory to
+  rebuild its id index when it is asked for an id it does not know. A secret the type sends that
+  no longer exists reports `SecretUnavailable` and a secrets store error `StoreUnavailable`;
+  neither serves the cached token nor sends a request.
+- The expired tokens of the same agent, provider and purpose (those left by earlier
+  settings, scopes or secret versions) are removed from the vault in the same step that
+  stores the new token, under the same vault lock and the same read of the vault, so a fresh
+  token costs one scan of the vault, not two. Unexpired tokens, user grants and pending
+  consents are kept, and so are the refresh claims of the tokens that are kept. A failure to remove them is logged as a warning only and does
+  not fail the store. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
-  than 30 seconds; only the response's OAuth `error` fields are logged.
+  than `credential_policy.token_request_timeout_secs` (30 by default); only the response's OAuth `error` code is logged (see _Logging token endpoint errors_ below).
 - When scopes were requested, the issued `scope` must name the same set, or the token is
   refused; when none were requested, the issued scopes are kept.
 - The provider is read again after the token request, and a provider changed meanwhile
@@ -91,7 +193,37 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
   list when an Entra v2.0 provider sets `resource`.
 
-Concurrent requests that all miss the cache each request a token; the last one stored wins.
+Each replica sends one token request per cache key at a time. Requests that miss the cache
+meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
+another replica stored, instead of requesting their own. Requests for other scopes, providers or
+surfaces do not wait. A key's place in this queue is kept while any request holds or waits for it,
+however many keys are in use. Replicas do not coordinate, so each may request one token for the same key.
+
+After a token request fails, or its issued scopes do not match (`TokenRequestFailed`,
+`ScopeMismatch`), the next request for the same cache key (surface, provider, scopes and secret
+versions) waits 1 second from the end of the failed request, doubling after each further failure
+up to 60 seconds. A request arriving before then fails at once with `TokenRequestFailed`, without
+contacting the provider. A successful request clears the wait, and editing the provider or
+rotating a secret the provider's type sends starts a new key with no wait. Failures found before any request is sent never start a wait: a
+missing or refused secret (`SecretUnavailable`), a secrets store or vault error
+(`StoreUnavailable`), a token endpoint the egress or https rule refuses (`TokenEndpointRefused`,
+`TokenEndpointNotHttps`), a provider changed during the request (`ProviderChanged`) or an
+unsupported provider type. The wait is kept in memory on each replica and resets on restart, and the
+count of failures is forgotten 10 minutes after the retry time, so the next failure waits 1 second again.
+
+### Logging token endpoint errors
+
+A credential provider's token endpoint can answer an error response that echoes the request or
+explains it in free text. The gateway keeps only its OAuth `error` code (RFC 6749 section 5.2):
+1 to 64 bytes of `%x20-21 / %x23-5B / %x5D-7E`, or `unrecognized_error` when the code is missing or
+breaks that rule. `error_description`, `error_uri` and the rest of the body are never logged,
+returned in an error message or written to a delegation audit detail. This holds for code
+exchange, refresh, service token grants, the Microsoft Graph API token used for SAML avatars and
+the `error` an authorization callback carries.
+
+Logs about a token request may name the provider id, the surface id, the HTTP status and the
+OAuth error code. They never carry a secret, a client assertion, a token, the response body or
+`error_description`.
 
 A provider's `provider_id` slug is unique per tenant, and among the untenanted providers. The
 slug is compared as stored, trimmed and in lower case.
@@ -122,8 +254,9 @@ An external consent provider uses its own tenant's secrets only, for its client 
 signing key and its certificate: never an untenanted secret, nor another tenant's, since its
 client authenticates at endpoints its tenant chose. An untenanted provider uses untenanted
 secrets only. Both are checked when the provider is created and again on every use, so a
-provider moved to another tenant stops using the secrets of the one it left. A provider without
-an `issuer` may use its own tenant's secrets or untenanted ones.
+provider moved to another tenant stops using the secrets of the one it left. For the rule on
+other providers, and when a stored reference is kept, see
+[Provider secrets belong to the provider's tenant](#provider-secrets-belong-to-the-providers-tenant).
 
 Every endpoint, and `resource`, must be an `https` URL without credentials or fragment whose
 host is no literal loopback, private, link-local or cloud-metadata address (the Strict egress
@@ -493,20 +626,24 @@ cannot be deleted, or moved to another tenant, while a surface uses it ([Deletin
 provider](#deleting-a-provider)).
 
 The token is a service token (see above), cached in the vault under the agent half
-`surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
-the scope hash is the SHA-256 (hex) of the sorted, deduplicated scopes joined by spaces.
-Changing the provider changes the digest, so a token issued under the old settings is never
-reused; a Target and a Transit Point that use one provider with different scopes each keep
-their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
+`surface:<surface_id>` and the user half `__target_auth__:<hash>` of the provider, its scopes
+and its secret versions. Changing the provider or one of the secrets its type sends changes the hash, so a
+token issued under the old settings is never reused; a Target and a Transit Point that use one
+provider with different scopes each keep their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
 `passthrough` forwards without the credential, and the cause is logged only. A `401` from the
 target does not evict the cached token.
+The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
+Authentication and reports whether the credential was sent or why it could not be obtained, never
+the token.
 
-`POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
-only `static_secret` target authentication, so listing the tools of an MCP server behind an
-OAuth-protected endpoint needs a static secret for now.
+`POST /v1/mcp-proxies/discover-tools`, the Surface Builder's design-time tool listing, still
+accepts only `static_secret` target authentication, so listing the tools of an MCP server behind
+an OAuth-protected endpoint needs a static secret for now. A tenant caller may use only its own
+tenant's secret there: an appliance-wide one is refused with `400` in `warn` mode too, since the
+request goes to an endpoint the caller chose and nothing is stored to keep working.
 ### External consent on a Transit Point
 
 A Transit Point's `transit_credentials` with `consent_mode: external` binds an
@@ -627,6 +764,97 @@ addresses, redirects returned rather than followed, and no proxy. It is never fo
 Fabric. A `fabric://` Transit Point withholds delegated credentials unless
 `fabric_delegated_credentials` is set, and with it set the grant is refused, so a grant never
 reaches a stored surface that predates these rules.
+
+## Tenant isolation on a surface's upstream legs
+
+A surface owned by a tenant sends only credentials of its own tenant. The check covers
+`static_secret` and `credential_provider` Target authentication on a Target, a Transit Point,
+Fabric receive and the agent card fetch, `outbound_credentials` and `transit_credentials`
+bindings on the legacy and modern delegation paths, and every whole-string `$SECRET:<id>` value
+in custom metadata: the Target's `custom_metadata` and `response_custom_metadata`, the Access
+Point's `response_custom_metadata` and the Transit Points' shared `custom_metadata`, at any depth
+of the payload. Response custom metadata is returned to the caller, so it follows the same rule.
+The gateway does not inject the Access Point's `response_custom_metadata`, but a save still checks
+it as response metadata sent to the caller.
+A custom metadata secret that cannot be sent fails its injection as a secret that does not exist
+does, and the outcome depends on the path:
+
+| Path | Outcome |
+| --- | --- |
+| Direct MCP request, and an MCP request a gateway receives over Fabric | `500` "MCP metadata injection failed" |
+| Transit Point request, A2A or MCP | `500` (`MetadataInjectionFailed`) |
+| MCP request a gateway forwards over Fabric | Forwarded without the metadata, and logged |
+| MCP response, direct, Fabric or gateway-to-gateway | `502` "MCP response metadata injection failed" |
+| A2A request, direct or over Fabric | Forwarded without the metadata, and logged |
+| A2A response, direct or gateway-to-gateway, and A2A stream event | Forwarded without the metadata, and logged |
+| A2A response received over Fabric | Payload added as configured, with `$SECRET:` helpers left unresolved: the caller receives the helper string, no secret value is sent, and nothing is logged |
+
+- A secret or provider of another tenant is always refused.
+- An appliance-wide secret or provider is refused according to the bootstrap
+  `tenant_credential_isolation` rule (see
+  [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)). With `"warn"` (default) it
+  keeps working and logs a warning, and a delegation audit detail gains the note
+  `(appliance_wide_credential)`. With `"enforce"` it is refused.
+- For delegation, only providers that send the gateway's own credential are held to the rule:
+  `api_key`, `oauth2_client_credentials`, `oauth2_client_credentials_jwt_auth` and
+  `oauth2_jwt_bearer`. An appliance-wide `oauth2_authorization_code` provider sends the end
+  user's token and stays usable on a tenant surface, except a provider with an `issuer`
+  ([External consent providers](#external-consent-providers)), which must be of the surface's
+  own tenant exactly.
+- Appliance-wide surfaces are unaffected. Their custom metadata may name a secret of any
+  tenant, at runtime and on save, until a reassignment gives the surface a tenant.
+
+Saving a surface applies the same rule: a save that adds a reference breaking it is refused
+with `400` "reference is not accessible", while a reference the stored surface already held
+is kept in `warn` mode and refused in `enforce` mode. A stored reference is kept only on the
+legs that already sent it and only while each keeps its endpoint: the Target of the base
+surface or of a variant, or a Transit Point, identified by the variant's and the Transit Point's
+`id`, so renaming or reordering them keeps it. Surface `outbound_credentials` are sent on the
+Target and every Transit Point. A secret in the Target's custom metadata belongs to the Target's
+leg, and one in the shared transit custom metadata to every Transit Point. A secret in either
+response custom metadata goes to the caller, a destination of its own for the base surface and
+for each variant, so a secret the Target leg already sent as Target authentication or request
+metadata is not kept when it is moved or copied into response metadata, while one already stored
+in response metadata is kept there when the Target's endpoint changes. Only enabled custom
+metadata counts as already sent, so enabling stored metadata is checked as a new reference; a
+save still checks every reference in disabled metadata, and keeps one named only there when the
+stored surface held it at the same destination, in enabled or disabled metadata. A save that
+changes the endpoint of a leg that sends a kept appliance-wide reference, moves the reference to
+another leg, or adds a leg that would send it is refused with `400` in `warn` mode too. On a
+tenant surface a `$SECRET:` that names no existing secret is refused like another tenant's secret, whether it is new or already
+stored, in `warn` mode too, so a save never keeps a reference to a secret that was deleted.
+Deleting a secret does not check the surfaces that name it, so a surface stored before the
+deletion keeps the reference until its next save. A surface with no tenant may still name a
+missing secret. A tenant reassignment that would create a reference breaking the rule answers
+`409`, and so does giving a surface whose custom metadata names a missing secret a different
+tenant. See [Access tokens](ACCESS_TOKENS.md#what-a-tenant-pat-may-do-with-global-records).
+
+A tenant provider that sends the gateway's own credential and still holds a secret outside its
+tenant, kept from before in `warn` mode, is held to the same rule on a tenant surface as an
+appliance-wide provider: a save keeps it only on the legs that already sent it at the same
+endpoint, refuses it on a new or redirected leg with `400` "Credential provider reference is not
+accessible", and refuses it everywhere in `enforce` mode. The startup credential policy report
+names such a surface. A provider holding only its own tenant's secrets attaches freely.
+
+A2A Proxies hold their own secret. An MCP Proxy holds no credential of its own: its upstream
+authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
+Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
+another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
+accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with
+a warning in `warn` mode and refused in `enforce` mode, where a request through the proxy also
+fails as target unavailable, as for a missing secret, before its value is used. An
+appliance-wide A2A Proxy that an operator published stays usable by tenant surfaces in both
+modes, with its appliance-wide secret, as a shared bot: a tenant can neither change where it
+sends the secret nor read it. A tenant reassignment that would give a tenant proxy an
+appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
+secret becomes appliance-wide.
+
+A refused Target authentication follows the usual 502 "Target authentication failed" (or
+`fallback`), and the cause is logged only. A refused legacy binding records
+`provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
+or grant is requested, and answers as in
+[When a credential cannot be resolved](#when-a-credential-cannot-be-resolved). On a modern MCP
+request the binding is refused as a binding mismatch.
 
 ## When a token is missing
 
@@ -752,6 +980,10 @@ lives, so a restart or a different gateway instance does not know about them. A 
 used up only when its credential is stored, so a callback that fails before then, for
 example at the token exchange, can be retried with the same state.
 
+The code exchange, the legacy and `2026-07-28` refresh, and the `2026-07-28` consent exchange
+use the same pinned client as service tokens (see _Service tokens_): redirects are not
+followed, and a token endpoint resolving to a blocked address is refused before any request.
+
 The callback lands on `/v1/identity/oauth/callback` unless `gateway.json` sets
 `oauth_callback_route`. On success the gateway stores the
 token and issues a `DelegationCredential`, a verifiable credential recording the
@@ -807,13 +1039,17 @@ hash are never looked up again, but their access and refresh tokens stay in the 
 they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
 Credential Tokens tab on the dashboard's Credentials page) and revoke each entry created before
 the upgrade (`DELETE /api/v1/delegation-vault/{id}`, or its delete button), except service tokens (those under
-`__client_credentials__`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
+`__client_credentials__:`, `__mcp_client_credentials__:` or `__target_auth__:`), which are unchanged. Users connect their accounts again the next time
 a credential is needed.
 
-Service tokens have no user, so a legacy binding caches them under the fixed user hash
-`__client_credentials__`, a `2026-07-28` binding under `__mcp_client_credentials__:<provider
-digest>`, and target authentication under `__target_auth__:<provider digest>:<scope hash>` with
-the agent half `surface:<surface_id>`.
+Service tokens have no user, so a legacy binding caches them under the user hash
+`__client_credentials__:<hash>`, a `2026-07-28` binding under `__mcp_client_credentials__:<hash>`,
+and target authentication under `__target_auth__:<hash>` with the agent half
+`surface:<surface_id>`, where the hash covers the provider, the scopes and the secret versions
+(see [Service tokens](#service-tokens)). Service tokens cached by an earlier release, under
+`__client_credentials__` alone or an identity without secret versions, are not looked up again:
+each binding requests one new token after the upgrade, and the old entries are removed once they
+have expired and a new token for the same provider is stored.
 
 A lookup has four outcomes.
 
@@ -825,7 +1061,8 @@ A lookup has four outcomes.
 | Not found | Applies the consent mode |
 
 For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
-fresh one, since no user is involved.
+fresh one, since no user is involved. It is renewed up to 5 minutes before that and, while the
+renewal fails, served stale until then (see [Service tokens](#service-tokens)).
 
 ### Grants by binding
 
@@ -929,9 +1166,9 @@ compares them ([Granted scopes](#granted-scopes)), so a grant the person consent
 narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
 provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
 (a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
-the scopes the grant held. The request is sent and read by the token request every
-credential provider shares, the service tokens' included, with a 30-second timeout and a 64 KiB
-cap on the answer, which must be a `Bearer` token. The rotated tokens are written
+the scopes the grant held. The request is sent and read by `post_token_request`, with a fixed
+30-second timeout and a 64 KiB cap on the answer, which must be a `Bearer` token. The service
+token requests use the same routine, but within `credential_policy.token_request_timeout_secs`. The rotated tokens are written
 under the lock, for the version the claim was made for, before the new access token is sent,
 however late the answer comes, as long as no other call took the claim over. Once the grant is
 written the refresh is done, even if its claim cannot be cleared afterwards. A refresh that
@@ -1409,7 +1646,7 @@ Before the [identity hash](#the-callers-identity-hash) took the method, issuer a
 was the lowercase hex SHA-256 of the subject alone. A grant stored under that hash is never
 found again: the user connects the account again, and the old entry stays in the vault, with
 its refresh token, until it is revoked. Both hashes are 64 hex characters, so the vault list
-does not show which entries are old. Entries under `__client_credentials__` are not affected.
+does not show which entries are old. Service token entries (under `__client_credentials__`) are not affected.
 
 For each user who connected an account before the upgrade, compute the old hash from the
 subject (the JWT `sub`, the API key `secret_id` or key id, the DID, or the mTLS principal) and
@@ -1421,7 +1658,7 @@ curl -X DELETE "$GATEWAY/api/v1/delegation-vault/by-user/$OLD_HASH" -H "Authoriz
 ```
 
 When the subjects are not known, list the vault and revoke by `id` every entry, other than
-`__client_credentials__`, whose `created_at` is before the upgrade. Do this after every
+service tokens (under `__client_credentials__`), whose `created_at` is before the upgrade. Do this after every
 instance runs the new release, as an instance still on the old one writes the old hash.
 
 Credential providers have their own management routes in

@@ -283,8 +283,7 @@ pub async fn oauth_callback(
         warn!(
             target: "credential_delegation",
             provider_id = %provider_id,
-            oauth_error = %error,
-            description = %desc,
+            oauth_error = %oauth::oauth_error_code(error),
             "OAuth provider returned an error"
         );
         return Html(format!(

@@ -4,9 +4,11 @@ use std::sync::Arc;
 use super::A2aProxyStore;
 use super::types::{A2aProxy, A2aProxyBackend, CreateA2aProxyRequest, UpdateA2aProxyRequest};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::config::credential_policy::RuleMode;
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, breaks_tenant_isolation, can_access, can_mutate, can_reference_with_rule,
+    scope_allows_resource, tenant_for_create,
 };
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -21,10 +23,26 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
+/// Does `backend` send the secret `previous` named to the same base URL?
+fn keeps_secret_destination(
+    previous: &A2aProxyBackend,
+    backend: &A2aProxyBackend,
+) -> bool {
+    match (previous, backend) {
+        (A2aProxyBackend::CopilotDirectLine(previous), A2aProxyBackend::CopilotDirectLine(backend)) => {
+            previous.secret_id == backend.secret_id && previous.base_url == backend.base_url
+        }
+    }
+}
+
+/// The backend secret must belong to the proxy's tenant. A tenant proxy that `previous`, the
+/// stored backend, already sent an appliance-wide secret to the same base URL keeps it while
+/// `tenant_credential_isolation` is `warn`.
 async fn validate_backend_secret(
     secrets_store: Option<&Arc<dyn SecretsStore>>,
     tenant_id: Option<&str>,
     backend: &A2aProxyBackend,
+    previous: Option<&A2aProxyBackend>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), (StatusCode, String)> {
@@ -33,12 +51,17 @@ async fn validate_backend_secret(
     let secret_id = match backend {
         A2aProxyBackend::CopilotDirectLine(config) => config.secret_id.as_str(),
     };
+    let mode = if previous.is_some_and(|previous| keeps_secret_destination(previous, backend)) {
+        crate::config::credential_policy::credential_policy().tenant_credential_isolation
+    } else {
+        RuleMode::Enforce
+    };
     let secret = secrets_store
         .get_by_secret_id(secret_id)
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "A2A proxy secret is not accessible".to_string()))?;
-    if !can_reference(tenant_id, secret.tenant_id.as_deref())
+    if !can_reference_with_rule(tenant_id, secret.tenant_id.as_deref(), mode)
         || !scope_allows_resource(
             resource_scope(scope),
             tenant_context(context),
@@ -47,6 +70,13 @@ async fn validate_backend_secret(
         )
     {
         return Err((StatusCode::BAD_REQUEST, "A2A proxy secret is not accessible".to_string()));
+    }
+    if breaks_tenant_isolation(tenant_id, secret.tenant_id.as_deref()) {
+        tracing::warn!(
+            tenant_id = ?tenant_id,
+            secret_id = %secret.secret_id,
+            "A2A proxy keeps an appliance-wide Direct Line secret; refused once tenant_credential_isolation is enforce"
+        );
     }
     Ok(())
 }
@@ -107,7 +137,7 @@ pub async fn create_a2a_proxy<S: A2aProxyStore>(
         return Err((StatusCode::FORBIDDEN, "A2A Proxy is outside this token's permitted scope".into()));
     }
     proxy.agent_identity = request.agent_identity;
-    validate_backend_secret(secrets_store.as_ref(), proxy.tenant_id.as_deref(), &proxy.backend, &context, &scope)
+    validate_backend_secret(secrets_store.as_ref(), proxy.tenant_id.as_deref(), &proxy.backend, None, &context, &scope)
         .await?;
     proxy
         .validate()
@@ -144,6 +174,7 @@ pub async fn update_a2a_proxy<S: A2aProxyStore>(
         return Err((StatusCode::FORBIDDEN, "A2A Proxy is outside this token's permitted scope".into()));
     }
 
+    let previous_backend = proxy.backend.clone();
     if let Some(name) = request.name {
         proxy.name = name;
     }
@@ -164,8 +195,15 @@ pub async fn update_a2a_proxy<S: A2aProxyStore>(
     }
     proxy.updated_at = chrono::Utc::now();
 
-    validate_backend_secret(secrets_store.as_ref(), proxy.tenant_id.as_deref(), &proxy.backend, &context, &scope)
-        .await?;
+    validate_backend_secret(
+        secrets_store.as_ref(),
+        proxy.tenant_id.as_deref(),
+        &proxy.backend,
+        Some(&previous_backend),
+        &context,
+        &scope,
+    )
+    .await?;
 
     proxy
         .validate()
@@ -229,6 +267,190 @@ mod tests {
             poll_interval_ms: DEFAULT_DIRECT_LINE_POLL_INTERVAL_MS,
             max_poll_attempts: DEFAULT_DIRECT_LINE_MAX_POLL_ATTEMPTS,
         })
+    }
+
+    fn backend_with(
+        secret_id: &str,
+        base_url: &str,
+    ) -> A2aProxyBackend {
+        let A2aProxyBackend::CopilotDirectLine(mut config) = backend();
+        config.secret_id = secret_id.to_string();
+        config.base_url = base_url.to_string();
+        A2aProxyBackend::CopilotDirectLine(config)
+    }
+
+    fn direct_line_secrets() -> Option<Arc<dyn SecretsStore>> {
+        Some(Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![
+            ("appliance-direct-line", None, "appliance"),
+            ("tenant-a-direct-line", Some("tenant-a"), "tenant-a"),
+            ("tenant-b-direct-line", Some("tenant-b"), "tenant-b"),
+        ])))
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "agat_test".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    async fn in_mode<T>(
+        mode: crate::config::credential_policy::RuleMode,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, future)
+            .await
+    }
+
+    async fn create_for_tenant_a(
+        store: &Arc<FileSystemA2aProxyStore>,
+        secret_id: &str,
+    ) -> Result<Json<A2aProxy>, (StatusCode, String)> {
+        let request: CreateA2aProxyRequest = serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "backend": {"kind": "copilot_direct_line", "secret_id": secret_id, "base_url": "https://203.0.113.7/v3/directline"}
+        }))
+        .expect("request");
+        create_a2a_proxy(
+            Extension(store.clone()),
+            Extension(direct_line_secrets()),
+            None,
+            tenant_a(),
+            None,
+            Json(request),
+        )
+        .await
+    }
+
+    async fn stored_tenant_a_proxy(
+        store: &Arc<FileSystemA2aProxyStore>,
+        secret_id: &str,
+    ) -> String {
+        let mut proxy = A2aProxy::new(
+            "worker".to_string(),
+            "before".to_string(),
+            backend_with(secret_id, DEFAULT_DIRECT_LINE_BASE_URL),
+            None,
+        );
+        proxy.tenant_id = Some("tenant-a".to_string());
+        store
+            .create(&proxy)
+            .await
+            .expect("create");
+        proxy.id
+    }
+
+    async fn update_for_tenant_a(
+        store: &Arc<FileSystemA2aProxyStore>,
+        id: &str,
+        update: serde_json::Value,
+    ) -> Result<Json<A2aProxy>, (StatusCode, String)> {
+        let request: UpdateA2aProxyRequest = serde_json::from_value(update).expect("request");
+        update_a2a_proxy(
+            Extension(store.clone()),
+            Extension(direct_line_secrets()),
+            Path(id.to_string()),
+            tenant_a(),
+            None,
+            Json(request),
+        )
+        .await
+    }
+
+    fn refused(result: Result<Json<A2aProxy>, (StatusCode, String)>) {
+        let error = result.expect_err("refused");
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "A2A proxy secret is not accessible".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_new_tenant_proxy_names_only_its_own_tenants_direct_line_secret() {
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = Arc::new(
+                FileSystemA2aProxyStore::new(dir.path().to_path_buf())
+                    .await
+                    .expect("store"),
+            );
+            in_mode(mode, async {
+                refused(create_for_tenant_a(&store, "appliance-direct-line").await);
+                refused(create_for_tenant_a(&store, "tenant-b-direct-line").await);
+                let Json(created) = create_for_tenant_a(&store, "tenant-a-direct-line")
+                    .await
+                    .expect("own tenant's secret");
+                assert_eq!(created.tenant_id.as_deref(), Some("tenant-a"));
+
+                refused(
+                    update_for_tenant_a(
+                        &store,
+                        &created.id,
+                        serde_json::json!({"backend": {"kind": "copilot_direct_line", "secret_id": "appliance-direct-line"}}),
+                    )
+                    .await,
+                );
+            })
+            .await;
+            assert_eq!(
+                store
+                    .list_all()
+                    .await
+                    .expect("list")
+                    .len(),
+                1,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_appliance_wide_direct_line_secret_is_kept_only_in_warn_mode_and_at_its_base_url() {
+        use crate::config::credential_policy::RuleMode;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemA2aProxyStore::new(dir.path().to_path_buf())
+                .await
+                .expect("store"),
+        );
+        let id = stored_tenant_a_proxy(&store, "appliance-direct-line").await;
+
+        in_mode(RuleMode::Warn, async {
+            let Json(renamed) = update_for_tenant_a(&store, &id, serde_json::json!({"name": "renamed"}))
+                .await
+                .expect("a kept reference saves in warn mode");
+            assert_eq!(renamed.name, "renamed");
+            refused(
+                update_for_tenant_a(
+                    &store,
+                    &id,
+                    serde_json::json!({"backend": {"kind": "copilot_direct_line", "secret_id": "appliance-direct-line", "base_url": "https://203.0.113.7/v3/directline"}}),
+                )
+                .await,
+            );
+        })
+        .await;
+        in_mode(RuleMode::Enforce, async {
+            refused(update_for_tenant_a(&store, &id, serde_json::json!({"name": "enforced"})).await);
+        })
+        .await;
+        let kept = store
+            .get(&id)
+            .await
+            .expect("get")
+            .expect("stored");
+        assert_eq!(kept.name, "renamed");
+        assert_eq!(kept.backend, backend_with("appliance-direct-line", DEFAULT_DIRECT_LINE_BASE_URL));
+
+        let other = stored_tenant_a_proxy(&store, "tenant-b-direct-line").await;
+        in_mode(RuleMode::Warn, async {
+            refused(update_for_tenant_a(&store, &other, serde_json::json!({"name": "renamed"})).await);
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -130,3 +130,36 @@ pub struct SurfaceInfo {
     /// Pre-compiled engines for each virtual channel variant (keyed by variant_id)
     pub variant_engines: HashMap<String, VariantEngines>,
 }
+
+impl SurfaceInfo {
+    /// The engines a request runs with: the channel-level engines in base mode
+    /// (`variant_id` `None`), else the selected variant's pre-compiled engines,
+    /// `None` when that variant has none.
+    pub fn engines_for(
+        &self,
+        variant_id: Option<&str>,
+    ) -> Option<VariantEngines> {
+        match variant_id {
+            Some(id) => self
+                .variant_engines
+                .get(id)
+                .cloned(),
+            None => Some(VariantEngines {
+                identity_rules_engine: self
+                    .identity_rules_engine
+                    .clone(),
+                identity_selector: self.identity_selector.clone(),
+                protected_rules_engine: self
+                    .protected_rules_engine
+                    .clone(),
+                protected_selector: self
+                    .protected_selector
+                    .clone(),
+                external_rules_engine: self
+                    .external_rules_engine
+                    .clone(),
+                external_selector: self.external_selector.clone(),
+            }),
+        }
+    }
+}

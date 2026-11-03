@@ -8,6 +8,7 @@ import ElementPalette from './ElementPalette';
 import SurfaceMonitoringPanel from './SurfaceMonitoringPanel';
 import TemplatesPanel from './templates/TemplatesPanel';
 import TemplateConflictModal from './templates/TemplateConflictModal';
+import AgentCardTab from './agent-card/AgentCardTab';
 import { applyPlan, planTemplate } from './templates/placement';
 import { autoApplyFullSurfaceTemplate } from './templates/applyFullTemplate';
 import { nodeToTemplateItem } from './templates/serializeTemplate';
@@ -31,6 +32,7 @@ export type SurfaceFormView =
   | 'elements'
   | 'monitoring'
   | 'config'
+  | 'agent-card'
   | 'editor';
 
 export interface SurfaceMetaState {
@@ -89,6 +91,7 @@ export interface SurfaceFormShellProps {
   onCloseFullscreenEditor: () => void;
   canvasOverlay?: React.ReactNode;
   surfaceId?: string;
+  tenantId?: string | null;
   lastActivity?: string | null;
   /**
    * Page-specific Save / Delete / etc. buttons rendered as a 'Manage'
@@ -152,6 +155,12 @@ export interface SurfaceFormShellProps {
   saveError?: string | null;
   /** Warnings the last successful save answered with; panels show the ones naming them. */
   saveWarnings?: readonly string[] | null;
+  /** True while the form differs from the saved surface; the Agent Cards view says it shows the saved one. */
+  isDirty?: boolean;
+  /** Changes whenever the saved surface changes, so the Agent Cards view reads the cards again. */
+  agentCardRefreshKey?: unknown;
+  /** True when the saved surface has enabled Surface Variants. */
+  hasVariants?: boolean;
   /**
    * Readiness notice shown under the Access Point URL, decided by the page;
    * absent while the Access Point is ready.
@@ -258,18 +267,28 @@ async function prepareTemplatePolicyDefinitions(
   return { ...template, items: preparedItems };
 }
 
+export const AGENT_CARD_PROTOCOLS: ReadonlyArray<Protocol> = ['a2a', 'ap2'];
+
 const SIDEBAR_VIEWS: ReadonlyArray<{
   key: SurfaceFormView;
   label: string;
   icon: string;
   editOnly?: boolean;
+  protocols?: ReadonlyArray<Protocol>;
 }> = [
   { key: 'surface', label: 'Surface', icon: 'fa-project-diagram' },
   { key: 'templates', label: 'Templates', icon: 'fa-layer-group' },
   { key: 'elements', label: 'Elements', icon: 'fa-list' },
+  { key: 'agent-card', label: 'Agent Cards', icon: 'fa-id-card', protocols: AGENT_CARD_PROTOCOLS },
   { key: 'monitoring', label: 'Monitoring', icon: 'fa-chart-line', editOnly: true },
   { key: 'config', label: 'Config', icon: 'fa-code' },
 ];
+
+export function visibleSidebarViews(mode: SurfaceFormMode, protocol: Protocol) {
+  return SIDEBAR_VIEWS.filter(
+    v => (!v.editOnly || mode === 'edit') && (!v.protocols || v.protocols.includes(protocol))
+  );
+}
 
 const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   mode,
@@ -290,6 +309,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   onCloseFullscreenEditor,
   canvasOverlay,
   surfaceId,
+  tenantId,
   lastActivity,
   manageActions,
   surfaceSizeRef,
@@ -303,6 +323,9 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   hasAttemptedSave,
   saveError,
   saveWarnings,
+  isDirty = false,
+  agentCardRefreshKey,
+  hasVariants = false,
   accessPointNotice,
   legacyAccessPoint,
 }) => {
@@ -471,6 +494,18 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
             surfaceName={meta.name || 'Agent Surface'}
           />
         );
+      case 'agent-card':
+        return (
+          <AgentCardTab
+            surfaceId={surfaceId}
+            isCreate={mode === 'create'}
+            isDirty={isDirty}
+            canEdit={canEdit}
+            hasVariants={hasVariants}
+            refreshKey={agentCardRefreshKey}
+            onRefreshed={handleAgentCardRefreshed}
+          />
+        );
       case 'config':
         return (
           <div className="card shadow-sm mb-0">
@@ -588,6 +623,37 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
       setActiveTab('surface');
     }
   }, [activeTab, editorNode, editorDef, setActiveTab]);
+
+  const agentCardShown = AGENT_CARD_PROTOCOLS.includes(meta.protocol);
+  React.useEffect(() => {
+    if (activeTab === 'agent-card' && !agentCardShown) setActiveTab('surface');
+  }, [activeTab, agentCardShown, setActiveTab]);
+
+  const [agentCardRefreshTick, setAgentCardRefreshTick] = React.useState(0);
+  const agentCardFetchRevision = React.useMemo(
+    () => [agentCardRefreshKey, agentCardRefreshTick],
+    [agentCardRefreshKey, agentCardRefreshTick]
+  );
+  const handleAgentCardRefreshed = React.useCallback(() => setAgentCardRefreshTick(t => t + 1), []);
+
+  const shellRef = React.useRef<HTMLDivElement>(null);
+  const pendingViewFocus = React.useRef<SurfaceFormView | null>(null);
+  const openViewFromContent = React.useCallback(
+    (view: SurfaceFormView) => {
+      pendingViewFocus.current = view;
+      setActiveTab(view);
+    },
+    [setActiveTab]
+  );
+  React.useEffect(() => {
+    if (pendingViewFocus.current !== activeTab) return;
+    pendingViewFocus.current = null;
+    const root = shellRef.current;
+    const target =
+      root?.querySelector<HTMLElement>(`[data-testid="surface-view-${activeTab}"]`) ??
+      root?.querySelector<HTMLElement>('[data-testid="agent-card-heading"]');
+    target?.focus();
+  }, [activeTab]);
 
   React.useEffect(() => {
     if (!pendingTemplateEditorNodeId) return;
@@ -780,6 +846,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         isCreate: mode === 'create',
         lastActivity,
         surfaceId,
+        tenantId,
         activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
         activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
         saveError,
@@ -802,9 +869,12 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
               setTemplatesCreateMode(true);
             }
           : undefined,
+        onOpenAgentCard: agentCardShown ? () => openViewFromContent('agent-card') : undefined,
+        onOpenSurfaceView: () => openViewFromContent('surface'),
+        agentCardFetchRevision,
       }}
     >
-      <div className="card shadow mb-4 channel-editor-card">
+      <div className="card shadow mb-4 channel-editor-card" ref={shellRef}>
         <div className="card-body p-0">
           <div
             className={`surface-form-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}
@@ -844,7 +914,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                   <div className="surface-form-sidebar-scroll">
                     <div className="surface-form-sidebar-section">
                       <div className="surface-form-sidebar-heading">Views</div>
-                      {SIDEBAR_VIEWS.filter(v => !v.editOnly || mode === 'edit').map(v => (
+                      {visibleSidebarViews(mode, meta.protocol).map(v => (
                         <div
                           key={v.key}
                           className={`surface-form-sidebar-item${activeTab === v.key ? ' active' : ''}`}
@@ -853,6 +923,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                           <button
                             type="button"
                             className="surface-form-sidebar-item-main"
+                            data-testid={`surface-view-${v.key}`}
+                            aria-current={activeTab === v.key ? 'page' : undefined}
                             onClick={() => setActiveTab(v.key)}
                             style={{
                               flex: 1,

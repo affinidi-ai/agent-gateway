@@ -28,6 +28,7 @@ use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
 mod a2a_stream;
+pub(crate) mod agent_card;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -610,9 +611,10 @@ pub(crate) struct TargetAuthContext<'a> {
     pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
     pub providers: Option<&'a dyn crate::credential_providers::storage::CredentialProviderStorage>,
     pub vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
-    /// The client for token requests; the external client when `None`.
-    pub http: Option<&'a reqwest::Client>,
+    /// How token requests reach the provider; the environment's egress when `None`.
+    pub egress: Option<&'a crate::delegation_vault::oauth::TokenEgress>,
     pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub isolation: crate::config::credential_policy::RuleMode,
 }
 
 impl<'a> TargetAuthContext<'a> {
@@ -626,8 +628,9 @@ impl<'a> TargetAuthContext<'a> {
             secrets,
             providers: providers.map(|providers| providers.as_ref()),
             vault: vault.map(|vault| vault.as_ref()),
-            http: None,
+            egress: None,
             surface,
+            isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
         }
     }
 
@@ -696,6 +699,28 @@ pub(crate) async fn inject_target_auth_header(
                 })?
                 .ok_or(TargetAuthError::SecretNotFound)?;
 
+            let surface_tenant = context
+                .surface
+                .tenant_id
+                .as_deref();
+            if !crate::tenancy::can_reference_with_rule(surface_tenant, secret.tenant_id.as_deref(), context.isolation)
+            {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    "Refusing target auth secret outside the surface's tenant"
+                );
+                return Err(TargetAuthError::SecretNotFound);
+            }
+            if crate::tenancy::breaks_tenant_isolation(surface_tenant, secret.tenant_id.as_deref()) {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    tenant_id = ?surface_tenant,
+                    "Target auth secret is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                );
+            }
+
             // Format the header value
             let header_value = header_format.replace("{value}", &secret.value);
 
@@ -722,16 +747,15 @@ pub(crate) async fn inject_target_auth_header(
 }
 
 /// The service token of `provider_id` for target authentication, cached in the vault
-/// under the surface (`surface:<id>`) and `__target_auth__:<provider digest>:<scope hash>`,
-/// so a changed provider never reuses a token issued under its old settings and two
-/// sets of scopes on one surface keep a token each.
+/// under the surface (`surface:<id>`) and the purpose `__target_auth__`, so two sets of
+/// scopes on one surface keep a token each.
 async fn target_provider_token(
     context: &TargetAuthContext<'_>,
     provider_id: &str,
     scopes: &[String],
 ) -> Result<String, TargetAuthError> {
     use crate::credential_providers::CredentialProviderType;
-    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenError, ServiceTokenKey};
+    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenKey};
 
     let (Some(secrets), Some(providers), Some(vault)) = (context.secrets, context.providers, context.vault) else {
         return Err(TargetAuthError::StoreUnavailable);
@@ -741,15 +765,28 @@ async fn target_provider_token(
         .await
         .map_err(|_| TargetAuthError::StoreUnavailable)?
         .filter(|provider| {
-            crate::tenancy::can_reference(
-                context
+            provider.usable_by(crate::tenancy::SurfaceTenancy {
+                tenant_id: context
                     .surface
                     .tenant_id
                     .as_deref(),
-                provider.tenant_id.as_deref(),
-            )
+                mode: context.isolation,
+            })
         })
         .ok_or(TargetAuthError::ProviderNotFound)?;
+    if provider.breaks_tenant_isolation_for(
+        context
+            .surface
+            .tenant_id
+            .as_deref(),
+    ) {
+        warn!(
+            surface_id = %context.surface.surface_id,
+            provider_id = %provider_id,
+            tenant_id = ?context.surface.tenant_id,
+            "Target auth provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+        );
+    }
     if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
         return Err(TargetAuthError::ProviderNeedsConsent);
     }
@@ -762,20 +799,16 @@ async fn target_provider_token(
     };
     scopes.sort_unstable();
     scopes.dedup();
-    let digest = crate::mcp::continuations::delegation::provider_digest(&provider)
-        .map_err(|_| ServiceTokenError::ProviderChanged)?;
     let agent_did = format!("surface:{}", context.surface.surface_id);
-    let scope_hash = <sha2::Sha256 as sha2::Digest>::digest(scopes.join(" ").as_bytes());
-    let identity = format!("__target_auth__:{}:{}", hex::encode(digest), hex::encode(scope_hash));
     let service = ServiceTokenContext {
         secrets,
         providers,
         vault,
-        http: context.http,
+        egress: context.egress,
     };
     let key = ServiceTokenKey {
         agent_did: &agent_did,
-        identity: &identity,
+        purpose: "__target_auth__",
     };
     let token = service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?;
     Ok(token.value().to_string())
@@ -860,6 +893,33 @@ fn inject_did_headers(
     }
 }
 
+/// The payments the card route asks a caller for before it serves the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CardPaymentGates {
+    pub x402: bool,
+    pub mpp: bool,
+}
+
+impl CardPaymentGates {
+    pub(crate) fn any(self) -> bool {
+        self.x402 || self.mpp
+    }
+}
+
+/// The payment gates of the card route. A delegated (Model B) x402 policy has no
+/// local price/verify config to check there and is never routed through the
+/// delegation relay on that endpoint, so it does not paywall the card.
+pub(crate) fn card_payment_gates(surface: &crate::config::agent_surface::AgentSurface) -> CardPaymentGates {
+    CardPaymentGates {
+        x402: surface
+            .x402_config()
+            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay),
+        mpp: surface
+            .mpp_config()
+            .is_some_and(|p| crate::mpp::should_require_payment(p, &surface.channel_protocol(), b"", None)),
+    }
+}
+
 /// Handle agent card requests - intercept and potentially modify
 #[allow(dead_code)]
 pub async fn handle_agent_card(
@@ -899,29 +959,10 @@ pub async fn handle_agent_card(
             .surface_id
             .as_str();
         let resource_url = "/.well-known/agent-card.json";
-        let empty_body: &[u8] = b""; // Agent card is a GET request
-
-        // A delegated (Model B) x402 policy has no local price/verify config to
-        // check here and is never routed through the delegation relay on this
-        // endpoint — skip it so an agent-card fetch isn't paywalled against an
-        // empty local challenge.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay);
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    empty_body,
-                    None,
-                )
-            });
+        let CardPaymentGates {
+            x402: x402_required,
+            mpp: mpp_required,
+        } = card_payment_gates(&state.surface);
 
         if x402_required || mpp_required {
             let payment_signature = crate::x402::extract_payment_signature(
@@ -1001,291 +1042,16 @@ pub async fn handle_agent_card(
         }
     }
 
-    let prepared_a2a_proxy_agent_card = prepare_a2a_proxy_agent_card(&state, &channel_name).await?;
-    let agent_card_was_synthesized = prepared_a2a_proxy_agent_card.is_some();
-
-    // Build target URL, respecting override_agent_card_location if configured
-    let target_url = if prepared_a2a_proxy_agent_card.is_none()
-        && state
-            .surface
-            .override_agent_card_location()
-        && state
-            .surface
-            .agent_card_location_path()
-            .is_some()
-    {
-        let custom_path = state
-            .surface
-            .agent_card_location_path()
-            .unwrap();
-        let endpoint = &state.surface.target.endpoint;
-        let origin = if let Some(scheme_end) = endpoint.find("://") {
-            let after_scheme = &endpoint[scheme_end + 3..];
-            let authority_end = after_scheme
-                .find('/')
-                .unwrap_or(after_scheme.len());
-            &endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            endpoint.as_str()
-        };
-        if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        }
-    } else {
-        crate::proxy::protocol_router::join_endpoint_path(
-            &state.surface.target.endpoint,
-            "/.well-known/agent-card.json",
-        )
-    };
-
-    let (mut agent_card, prepared_identity) = if let Some(prepared) = prepared_a2a_proxy_agent_card {
-        (prepared.card, prepared.identity)
-    } else {
-        (fetch_agent_card_from_surface_target(&state, &headers, &source_addr, &channel_name, &target_url).await?, None)
-    };
-
-    let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-    let resolved_identity = if let Some(identity) = prepared_identity {
-        identity
-    } else {
-        let card_identity_selector = state
-            .protected_selector
-            .as_ref()
-            .or(state
-                .identity_selector
-                .as_ref());
-        let card_identity_rules = state
-            .protected_rules_engine
-            .as_ref()
-            .or(state
-                .identity_rules_engine
-                .as_ref());
-        match crate::proxy::backend_identity::resolve_protected_agent_identity(
-            &card_bytes,
-            &state.surface,
-            card_identity_selector,
-            card_identity_rules,
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None,
-        )
+    let card = agent_card::build_public_card(&state, &headers, &source_addr, agent_card::CardMode::Serve)
         .await
-        {
-            Ok(identity) => identity,
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    error = %e,
-                    code = %e.code(),
-                    "Protected agent identity resolution failed for agent card intercept"
-                );
-                return Err(crate::a2a::create_identity_error_response(
-                    e.http_status(),
-                    e.code(),
-                    "protected_identity",
-                    &channel_name,
-                    &e.to_string(),
-                ));
-            }
-        }
-    };
-
-    // External slot resolution (Surface Builder external identity node).
-    // Side-effect: issues DID for the external counterparty via vc_issuer.
-    if state
-        .external_selector
-        .is_some()
-        && let Err(e) = crate::proxy::backend_identity::resolve_external_agent_identity(
-            &card_bytes,
-            &state.surface,
-            state
-                .external_selector
-                .as_ref(),
-            state
-                .external_rules_engine
-                .as_ref(),
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None, // agent-card fetch has no inbound caller token
-        )
-        .await
-    {
-        warn!(
-            channel = channel_name,
-            error = %e,
-            code = %e.code(),
-            "External agent identity resolution failed for agent card intercept"
-        );
-        return Err(crate::a2a::create_identity_error_response(
-            e.http_status(),
-            e.code(),
-            "external_identity",
-            &channel_name,
-            &e.to_string(),
-        ));
-    }
-
-    // Rewrite upstream cards to point back to the proxy; synthesized A2A Proxy
-    // cards already derive their URL from the exposing Access Point.
-    if !agent_card_was_synthesized {
-        let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-        let rewritten = rewrite_agent_card_urls(
-            &card_bytes,
-            &state.surface,
-            &state.config,
-            &state.network_config,
-            &resolved_identity,
-            crate::a2a::AgentCardKind::Public,
-        )
-        .await
-        .map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs");
-            create_error_response(StatusCode::BAD_GATEWAY, "Failed to rewrite agent card URLs")
-        })?;
-        agent_card = serde_json::from_slice(rewritten.as_ref()).map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to parse rewritten agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid rewritten agent card JSON")
-        })?;
-    }
-
-    // Replace agent-identity/v1 with agent-identity-credential/v1 (signed VP)
-    if let Some(selector) = state
-        .identity_selector
-        .as_ref()
-    {
-        let vc_issuer = selector.get_vc_issuer();
-        if let Err(e) = crate::a2a::inject_credential_into_agent_card(
-            &mut agent_card,
-            &resolved_identity,
-            &vc_issuer,
-            &channel_name,
-        )
-        .await
-        {
-            error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
-            return Err(create_error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Agent card identity credential injection failed: {}", e),
-            ));
-        }
-    }
-
-    // Inject Agent DNA + DID from the channel's did:webvh identity into the agent card.
-    // Per the February demo design: DNA is randomly generated at identity creation time
-    // and surfaced here so callers (other agents, UI clients) can observe the UAI / DNA
-    // without needing to resolve the did.jsonl separately.
-    #[cfg(feature = "didwebvh")]
-    if let (Some(did_config), Some(identity_store)) = (
-        state
-            .surface
-            .didwebvh_identity_legacy(),
-        state
-            .didwebvh_identity_store
-            .as_ref(),
-    ) {
-        match identity_store
-            .get(&did_config.identity_id)
-            .await
-        {
-            Ok(Some(identity)) => {
-                if let Some(obj) = agent_card.as_object_mut() {
-                    obj.insert("agentDid".to_string(), JsonValue::String(identity.did.clone()));
-                    if let Some(dna_value) = identity
-                        .metadata
-                        .get("agentDNA")
-                    {
-                        obj.insert("agentDNA".to_string(), dna_value.clone());
-                        info!(
-                            channel = channel_name,
-                            did = %identity.did,
-                            "Injected agentDNA into agent card"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    "Configured did:webvh identity not found — skipping DNA injection"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    error = %e,
-                    "Failed to load did:webvh identity for agent card — skipping DNA injection"
-                );
-            }
-        }
-    }
-
-    info!(channel = channel_name, "Successfully fetched and parsed agent card");
-
-    // Trust Recorder — writes TrAdmin records to configured TRs on the
-    // discovery (agent-card) fetch, so a fresh surface populates its trust
-    // registry on the first `.well-known/agent-card.json` request instead of
-    // waiting for the first real message. Fire-and-forget; idempotent —
-    // duplicate records log at DEBUG (`apply_trust_recorder`), so firing on
-    // every discovery is safe.
-    if let ProtectedAgentIdentity::Managed { did, .. } = &resolved_identity {
-        crate::trust_registry_verification::spawn_trust_recorder(
-            &state.surface,
-            did,
-            state
-                .trust_registry_listener_manager
-                .clone(),
-        );
-    }
-
-    // Record successful connection in metrics
-    // Only tag as UCP "discovery" when the channel is actually a UCP channel
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.clone();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let ucp_operation = if state.surface.is_ucp() {
-            Some("discovery".to_string())
-        } else {
-            None
-        };
-        crate::observability::policy_audit::spawn_in_request(async move {
-            metrics
-                .record_connection_with_ucp(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::Success,
-                    None,
-                    None,
-                    crate::metrics::ConnectionDirection::Request,
-                    uuid::Uuid::new_v4().to_string(),
-                    ucp_operation,
-                    None,
-                    None,
-                    0,
-                )
-                .await;
-        });
-    }
+        .map_err(|failure| failure.response)?;
 
     // Negotiate the agent-card media type: A2A 1.0.1 prefers
     // `application/a2a+json`, but it is only served to callers that signalled 1.0
     // (via `A2A-Version` or `Accept`) so 0.3 clients and tools that strict-check
     // `application/json` are unaffected.
     Ok(agent_card_response(
-        agent_card,
+        card.served,
         &headers,
         state
             .surface
@@ -5344,10 +5110,10 @@ async fn proxy_handler_with_mcp_runtime(
                     custom_metadata,
                     &channel_name,
                     &state.secrets_store,
-                    crate::protocols::MetadataRuntimeContext {
-                        request_id: Some(egress_trace_id.as_str()),
-                        surface_id: Some(config_id),
-                    },
+                    crate::protocols::MetadataRuntimeContext::for_surface(
+                        &state.surface,
+                        Some(egress_trace_id.as_str()),
+                    ),
                 )
                 .await
                 {
@@ -6546,10 +6312,7 @@ async fn proxy_handler_with_mcp_runtime(
             custom_metadata,
             &channel_name,
             &state.secrets_store,
-            crate::protocols::MetadataRuntimeContext {
-                request_id: Some(egress_trace_id.as_str()),
-                surface_id: Some(config_id),
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             mcp_metadata_context,
             crate::mcp::meta::McpMetaTarget::Params,
         )
@@ -6756,6 +6519,12 @@ async fn proxy_handler_with_mcp_runtime(
                     user_hash,
                     agent_did_for_vault,
                     config_id,
+                    crate::tenancy::SurfaceTenancy::configured(
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                     mcp_tool,
                     vault_store,
                     provider_store,
@@ -8559,10 +8328,10 @@ async fn proxy_handler_with_mcp_runtime(
                                 response_custom_metadata,
                                 &channel_name,
                                 &state.secrets_store,
-                                crate::protocols::MetadataRuntimeContext {
-                                    request_id: Some(trace_id.as_str()),
-                                    surface_id: Some(config_id),
-                                },
+                                crate::protocols::MetadataRuntimeContext::for_surface(
+                                    &state.surface,
+                                    Some(trace_id.as_str()),
+                                ),
                             )
                             .await
                             {
@@ -8582,10 +8351,10 @@ async fn proxy_handler_with_mcp_runtime(
                                 response_custom_metadata,
                                 &channel_name,
                                 &state.secrets_store,
-                                crate::protocols::MetadataRuntimeContext {
-                                    request_id: Some(trace_id.as_str()),
-                                    surface_id: Some(config_id),
-                                },
+                                crate::protocols::MetadataRuntimeContext::for_surface(
+                                    &state.surface,
+                                    Some(trace_id.as_str()),
+                                ),
                                 mcp_metadata_context,
                                 crate::mcp::meta::McpMetaTarget::Result,
                             )
@@ -9747,160 +9516,35 @@ async fn multi_channel_proxy_handler_in_request_scope(
             };
             let variant_id = selected.map(|variant| variant.id.clone());
 
-            // Prefer the pre-resolved snapshot from
-            // `MultiSurfaceProxyState.resolved_surface_cache`, which is
-            // populated by `apply_surface_change` whenever a surface is
-            // saved and keeps its last good entry when that fails. Falls back
-            // to serving the selected variant from the channel's surface when
-            // the cache has no entry for it. The variant recorded comes from
-            // the same place as the surface served.
-            let (resolved_surface, recorded_variant) = match ch
-                .surface
-                .config_id()
-                .and_then(|sid| {
-                    state
-                        .resolved_surface_cache
-                        .resolve(sid, virtual_channel_alias.as_deref())
-                        .ok()
-                }) {
-                Some(cached) => (cached.surface, cached.surface_variant),
-                None => {
-                    let served = ch
-                        .surface
-                        .serve_selected(selected);
-                    (Arc::new(served.surface), served.recorded)
-                }
-            };
+            let (resolved_surface, recorded_variant) =
+                state.served_surface(ch, virtual_channel_alias.as_deref(), selected);
             crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.
             // Otherwise we use the pre-compiled per-variant engines.
-            let (
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-            ) = if let Some(ref vid) = variant_id {
-                if let Some(variant_engines) = ch.variant_engines.get(vid) {
-                    info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name);
-                    (
-                        variant_engines
-                            .identity_rules_engine
-                            .clone(),
-                        variant_engines
-                            .identity_selector
-                            .clone(),
-                        variant_engines
-                            .protected_rules_engine
-                            .clone(),
-                        variant_engines
-                            .protected_selector
-                            .clone(),
-                        variant_engines
-                            .external_rules_engine
-                            .clone(),
-                        variant_engines
-                            .external_selector
-                            .clone(),
-                    )
-                } else {
-                    error!(
-                        surface = %ch.surface.name,
-                        config_id = ?ch.surface.config_id(),
-                        variant_id = %vid,
-                        compiled_variants = ?ch.variant_engines.keys().collect::<Vec<_>>(),
-                        "❌ ENGINE LOOKUP FAILED: Variant selected but not found in pre-compiled variant engines. This should never happen if channel validation passed."
-                    );
-                    return create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Selected virtual channel variant has no compiled engines. This is a configuration error.",
-                    );
+            let Some(engines) = ch.engines_for(variant_id.as_deref()) else {
+                error!(
+                    surface = %ch.surface.name,
+                    config_id = ?ch.surface.config_id(),
+                    variant_id = %variant_id.as_deref().unwrap_or_default(),
+                    compiled_variants = ?ch.variant_engines.keys().collect::<Vec<_>>(),
+                    "❌ ENGINE LOOKUP FAILED: Variant selected but not found in pre-compiled variant engines. This should never happen if channel validation passed."
+                );
+                return create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected virtual channel variant has no compiled engines. This is a configuration error.",
+                );
+            };
+            match &variant_id {
+                Some(vid) => {
+                    info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name)
                 }
-            } else {
-                info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name);
-                (
-                    ch.identity_rules_engine
-                        .clone(),
-                    ch.identity_selector.clone(),
-                    ch.protected_rules_engine
-                        .clone(),
-                    ch.protected_selector.clone(),
-                    ch.external_rules_engine
-                        .clone(),
-                    ch.external_selector.clone(),
-                )
-            };
+                None => info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name),
+            }
 
-            // Create single-channel ProxyState for this request with effective channel and variant engines
-            let proxy_state = ProxyState {
-                config: state.config.clone(),
-                network_config: state.network_config.clone(),
-                client: state.client.clone(),
-                metrics_store: state.metrics_store.clone(),
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-                task_monitor: state.task_monitor.clone(),
-                task_id: Some(ch.task_id.clone()),
-                ws_state: state.ws_state.clone(),
-                listener_manager: state.listener_manager.clone(),
-                secrets_store: state.secrets_store.clone(),
-                certificates_store: state
-                    .certificates_store
-                    .clone(),
-                policy_manager: state.policy_manager.clone(),
-                gateway_policy_manager: state
-                    .gateway_policy_manager
-                    .clone(),
-                didauth_session_store: state
-                    .didauth_session_store
-                    .clone(),
-                transaction_store: state
-                    .transaction_store
-                    .clone(),
-                mpp_transaction_store: state
-                    .mpp_transaction_store
-                    .clone(),
-                trust_registry_listener_manager: state
-                    .trust_registry_listener_manager
-                    .clone(),
-                source_auth_middleware: state
-                    .source_auth_middleware
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_identity_store: state
-                    .didwebvh_identity_store
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_log_manager: state
-                    .didwebvh_log_manager
-                    .clone(),
-
-                credential_provider_store: state
-                    .credential_provider_store
-                    .clone(),
-                delegation_vault_store: state
-                    .delegation_vault_store
-                    .clone(),
-                gateway_base_url: state.gateway_base_url.clone(),
-                transit_token_issuer: state
-                    .transit_token_issuer
-                    .clone(),
-                mcp_proxy_store: state.mcp_proxy_store.clone(),
-                a2a_proxy_store: state.a2a_proxy_store.clone(),
-                vc_issuer: state.vc_issuer.clone(),
-                active_variant_alias: virtual_channel_alias.clone(),
-                active_variant_id: variant_id,
-                surface: resolved_surface,
-            };
+            let proxy_state =
+                state.proxy_state_for(ch, engines, virtual_channel_alias.clone(), variant_id, resolved_surface);
 
             // The route + optional `$alias` suffix have already been stripped
             // by `parse_route_with_variant` above; `stripped_tail` is the
@@ -11986,10 +11630,7 @@ async fn handle_fabric_request(
                 custom_metadata,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(egress_trace_id.as_str()),
-                    surface_id: Some(config_id),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             )
             .await
             {
@@ -12021,10 +11662,7 @@ async fn handle_fabric_request(
                     .unwrap_or(&serde_json::json!({})),
                 &state.secrets_store,
                 channel_name,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(egress_trace_id.as_str()),
-                    surface_id: Some(config_id),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             )
             .await
             {
@@ -13723,7 +13361,7 @@ async fn handle_fabric_request(
                             crate::config::ChannelProtocol::Mcp => {
                                 let injected = crate::mcp::metadata::inject_custom_metadata_with_context(
                                     &bytes::Bytes::from(response_body.clone()), response_custom_metadata, channel_name, &state.secrets_store,
-                                    crate::protocols::MetadataRuntimeContext { request_id: Some(trace_id.as_str()), surface_id: Some(config_id) },
+                                    crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(trace_id.as_str())),
                                     mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Result,
                                 ).await.map_err(|error| {
                                     channel_warn!(config_id, "MCP response metadata injection failed: {}", error);
@@ -14700,43 +14338,6 @@ fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentS
     }
 }
 
-fn record_agent_card_gateway_fault(
-    state: &ProxyState,
-    source_addr: &str,
-) {
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.to_string();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        crate::observability::policy_audit::spawn_in_request(async move {
-            metrics
-                .record_connection(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::GatewayFault,
-                    None,
-                    Some("Anonymous".to_string()),
-                    crate::metrics::ConnectionDirection::Request,
-                    trace_id,
-                    None,
-                    None,
-                    0,
-                )
-                .await;
-        });
-    }
-}
-
 /// Put the gateway-issued identity credential on an agent card. A public card
 /// keeps a credential an upstream gateway already put there; an extended card
 /// has every credential its sender put there removed and gets the gateway's own.
@@ -14764,194 +14365,6 @@ fn agent_card_kind(is_extended_card_response: bool) -> crate::a2a::AgentCardKind
 
 fn extended_agent_card_refusal(rpc_request_id: Option<&serde_json::Value>) -> Response {
     crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id)
-}
-
-async fn fetch_agent_card_from_surface_target(
-    state: &ProxyState,
-    headers: &HeaderMap,
-    source_addr: &str,
-    channel_name: &str,
-    target_url: &str,
-) -> Result<JsonValue, Response> {
-    debug!(channel = channel_name, target = %loggable::url(target_url), "Fetching agent card from upstream");
-
-    let source_cred_header = state
-        .surface
-        .source_auth()
-        .and_then(|sa| sa.credential_header_name());
-
-    if state
-        .surface
-        .target
-        .endpoint
-        .starts_with("fabric://")
-    {
-        let mut forwarded_headers = headers
-            .iter()
-            .filter(|(key, _)| should_forward_header(key.as_str(), source_cred_header))
-            .filter_map(|(key, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (key.as_str().to_string(), value.to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        let path = agent_card_fabric_forward_path(&state.surface);
-        let response = crate::proxy::fabric_forward::forward_via_fabric(
-            &state.listener_manager,
-            crate::proxy::fabric_forward::FabricForwardRequest {
-                fabric_target: &state.surface.target.endpoint,
-                method: &Method::GET,
-                path: &path,
-                headers: forwarded_headers,
-                body: bytes::Bytes::new(),
-                timeout: std::time::Duration::from_secs(30),
-                trace_id: &trace_id,
-                log_label: channel_name,
-            },
-        )
-        .await
-        .map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to fetch agent card from fabric upstream - bad gateway");
-            record_agent_card_gateway_fault(state, source_addr);
-            create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
-        })?;
-
-        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        if !status.is_success() {
-            error!(channel = channel_name, status = %status, "Fabric upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(status, &format!("Upstream error: {status}")));
-        }
-
-        serde_json::from_slice(&response.body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse fabric agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    } else {
-        let credential = agent_card_target_credential(state, source_addr, channel_name).await?;
-        let mut req = match credential {
-            Some(_) => pinned_target_client(
-                state,
-                channel_name,
-                target_url,
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &state.surface.surface_id,
-                    channel_name,
-                    trace_id: None,
-                    via_fabric: false,
-                },
-            )
-            .await
-            .inspect_err(|_| record_agent_card_gateway_fault(state, source_addr))?
-            .get(target_url),
-            None => state.client.get(target_url),
-        };
-
-        for (key, value) in headers.iter() {
-            let forward = match credential {
-                Some(_) => is_forwarded_on_credentialed_card_fetch(key.as_str()),
-                None => should_forward_header(key.as_str(), source_cred_header),
-            };
-            if forward {
-                req = req.header(key.as_str(), value.as_bytes());
-            }
-        }
-        if let Some((header_name, header_value)) = &credential {
-            req = req.header(header_name.as_str(), header_value.as_str());
-            debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
-        }
-
-        let response = req
-            .send()
-            .await
-            .map_err(|e| {
-                error!(
-                    channel = channel_name,
-                    error = %e.without_url(),
-                    "Failed to fetch agent card from upstream - bad gateway"
-                );
-                record_agent_card_gateway_fault(state, source_addr);
-                create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
-            })?;
-
-        if response
-            .status()
-            .is_redirection()
-        {
-            error!(channel = channel_name, status = %response.status(), "Upstream redirected the agent card fetch - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, "Upstream redirected"));
-        }
-        if !response.status().is_success() {
-            error!(channel = channel_name, status = %response.status(), "Upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(response.status(), &format!("Upstream error: {}", response.status())));
-        }
-
-        let limits = crate::proxy::upstream_body::UpstreamBodyLimits::new(
-            state.config.a2a.max_body_size,
-            state.surface.timeout(),
-            state
-                .config
-                .a2a
-                .timeout_seconds,
-        );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
-            .await
-            .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
-                record_agent_card_gateway_fault(state, source_addr);
-                let (status, message) = e.status_and_message();
-                create_error_response(status, message)
-            })?;
-        serde_json::from_slice(&body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    }
-}
-
-/// The surface's target credential for the gateway's own agent-card fetch, or
-/// `None` when the surface has none. Honours `target.auth.fallback` exactly as
-/// the forwarded path does: `reject` fails the card with 502 rather than asking
-/// the target without the credential it requires.
-async fn agent_card_target_credential(
-    state: &ProxyState,
-    source_addr: &str,
-    channel_name: &str,
-) -> Result<Option<(String, String)>, Response> {
-    let Some(target_auth) = state.surface.target_auth() else {
-        return Ok(None);
-    };
-    match inject_target_auth_header(
-        target_auth,
-        &TargetAuthContext::of_proxy(state),
-        channel_name,
-        CallerAssertion::GatewayOriginated,
-    )
-    .await
-    {
-        Ok(credential) => Ok(credential),
-        Err(e) => {
-            error!(channel = channel_name, error = %e, "Failed to resolve target authentication for agent card fetch");
-            match target_auth.fallback {
-                crate::config::TargetAuthFallback::Reject => {
-                    record_agent_card_gateway_fault(state, source_addr);
-                    Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
-                }
-                crate::config::TargetAuthFallback::Passthrough => {
-                    warn!(
-                        channel = channel_name,
-                        "Target auth failed but passthrough enabled, fetching agent card without credentials"
-                    );
-                    Ok(None)
-                }
-            }
-        }
-    }
 }
 
 /// A redirect-disabled client pinned to the vetted address of `target_url`, or
@@ -15063,7 +14476,19 @@ async fn handle_a2a_proxy_target_request(
     };
 
     adapter
-        .dispatch_message_send(proxy_id, body_bytes, state.secrets_store.as_ref(), channel_name, caller)
+        .dispatch_message_send(
+            proxy_id,
+            body_bytes,
+            state.secrets_store.as_ref(),
+            channel_name,
+            caller,
+            crate::tenancy::SurfaceTenancy::configured(
+                state
+                    .surface
+                    .tenant_id
+                    .as_deref(),
+            ),
+        )
         .await
 }
 
@@ -16588,7 +16013,7 @@ pub(crate) fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
-mod variant_routing_tests;
+pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
 mod forward_response_log_tests {
@@ -16691,15 +16116,16 @@ mod target_auth_tests {
     use crate::secrets::SecretsStore;
     use serde_json::{Value, json};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
     struct Fixture {
         surface: crate::config::agent_surface::AgentSurface,
         secrets: Arc<dyn SecretsStore>,
         providers: FileSystemCredentialProviderStore,
         vault: FileSystemDelegationVaultStore,
-        client: reqwest::Client,
+        egress: crate::delegation_vault::oauth::TokenEgress,
         token_requests: Arc<AtomicUsize>,
+        token_status: Arc<AtomicU16>,
         _server: tokio::task::JoinSet<()>,
         _directory: tempfile::TempDir,
     }
@@ -16708,12 +16134,15 @@ mod target_auth_tests {
         async fn new(token_status: u16) -> Self {
             let token_requests = Arc::new(AtomicUsize::new(0));
             let counter = token_requests.clone();
+            let token_status = Arc::new(AtomicU16::new(token_status));
+            let status = token_status.clone();
             let app = axum::Router::new().fallback(axum::routing::post(move || {
                 let counter = counter.clone();
+                let status = status.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     (
-                        axum::http::StatusCode::from_u16(token_status).unwrap(),
+                        axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap(),
                         axum::Json(
                             json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600}),
                         ),
@@ -16723,11 +16152,7 @@ mod target_auth_tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-                .build()
-                .unwrap();
+            let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
             let mut server = tokio::task::JoinSet::new();
             server.spawn(async move {
                 axum::serve(listener, app)
@@ -16745,10 +16170,16 @@ mod target_auth_tests {
                 )
                 .unwrap(),
             );
-            for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", "secret")] {
+            for (secret_id, value, tenant) in [
+                ("CLIENT_ID", "client", None),
+                ("CLIENT_SECRET", "secret", None),
+                ("WIDE_KEY", "wide-value", None),
+                ("OWN_KEY", "own-value", Some("tenant-a")),
+                ("OTHER_KEY", "other-value", Some("tenant-b")),
+            ] {
                 secrets
                     .create(crate::secrets::CreateSecretRequest {
-                        tenant_id: None,
+                        tenant_id: tenant.map(String::from),
                         name: secret_id.into(),
                         secret_id: secret_id.into(),
                         description: None,
@@ -16770,12 +16201,13 @@ mod target_auth_tests {
                 ("machine", "oauth2_client_credentials", Value::Null),
                 ("consent", "oauth2_authorization_code", Value::Null),
                 ("other-tenant", "oauth2_client_credentials", json!("tenant-b")),
+                ("own", "oauth2_client_credentials", json!("tenant-a")),
             ] {
                 providers
                     .create(
                         serde_json::from_value(json!({
                             "id": id, "name": id, "provider_id": id, "provider_type": provider_type, "tenant_id": tenant,
-                            "token_endpoint": "http://192.0.2.1/token", "client_id_secret_ref": "CLIENT_ID",
+                            "token_endpoint": token_endpoint, "client_id_secret_ref": "CLIENT_ID",
                             "client_secret_secret_ref": "CLIENT_SECRET", "default_scopes": ["read"],
                             "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
                         }))
@@ -16796,8 +16228,13 @@ mod target_auth_tests {
                 vault: FileSystemDelegationVaultStore::new(directory.path().join("vault"))
                     .await
                     .unwrap(),
-                client,
+                egress: crate::delegation_vault::oauth::TokenEgress {
+                    timeout: std::time::Duration::from_secs(5),
+                    exact_allowlist: Some(token_endpoint),
+                    policy: Default::default(),
+                },
                 token_requests,
+                token_status,
                 _server: server,
                 _directory: directory,
             }
@@ -16808,8 +16245,9 @@ mod target_auth_tests {
                 secrets: Some(&self.secrets),
                 providers: Some(&self.providers),
                 vault: Some(&self.vault),
-                http: Some(&self.client),
+                egress: Some(&self.egress),
                 surface: &self.surface,
+                isolation: crate::config::credential_policy::RuleMode::Warn,
             }
         }
 
@@ -16852,6 +16290,40 @@ mod target_auth_tests {
         );
         assert_eq!(stored[0].credential_provider_id, "machine");
         assert_eq!(stored[0].scopes, vec!["read"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_provider_token_is_still_injected_when_its_renewal_fails() {
+        let fixture = Fixture::new(200).await;
+        let auth = provider_auth("machine");
+        let context = fixture.context();
+        let inject = || inject_target_auth_header(&auth, &context, "surface", CallerAssertion::GatewayOriginated);
+        inject().await.unwrap();
+        let mut stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .remove(0);
+        let now = chrono::Utc::now();
+        stored.created_at = now - chrono::Duration::seconds(3400);
+        stored.expires_at = Some(now + chrono::Duration::seconds(200));
+        fixture
+            .vault
+            .delete(&stored.id)
+            .await
+            .unwrap();
+        fixture
+            .vault
+            .store(stored)
+            .await
+            .unwrap();
+        fixture
+            .token_status
+            .store(500, Ordering::SeqCst);
+        let header = inject().await.unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 2, "the renewal was attempted");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16960,8 +16432,112 @@ mod target_auth_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refused_token_request_fails_without_detail() {
+    async fn a_refused_token_request_fails_without_detail_and_holds_back_the_next() {
         let fixture = Fixture::new(401).await;
+        for _ in 0..2 {
+            let error = inject_target_auth_header(
+                &provider_auth("machine"),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
+            assert_eq!(error.to_string(), "credential provider token request failed");
+        }
+        assert_eq!(fixture.requests(), 1);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn secret_auth(secret_id: &str) -> TargetAuthConfig {
+        serde_json::from_value(json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "x-key"}}}))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_provider_is_refused_on_a_tenant_surface_only_when_enforced() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &enforced,
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ProviderNotFound);
+        assert_eq!(fixture.requests(), 0);
+
+        let header =
+            inject_target_auth_header(&provider_auth("own"), &enforced, "surface", CallerAssertion::GatewayOriginated)
+                .await
+                .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 1);
+
+        let header = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_static_secret_must_belong_to_the_surface_tenant() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        for (case, (context, secret_id, expected)) in [
+            (&enforced, "OWN_KEY", Ok(Some(("x-key".to_string(), "own-value".to_string())))),
+            (&enforced, "WIDE_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&enforced, "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&fixture.context(), "WIDE_KEY", Ok(Some(("x-key".to_string(), "wide-value".to_string())))),
+            (&fixture.context(), "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result =
+                inject_target_auth_header(&secret_auth(secret_id), context, "surface", CallerAssertion::Authenticated)
+                    .await;
+            assert_eq!(result, expected, "case {case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_surface_may_use_an_appliance_wide_secret() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.surface.tenant_id = None;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let result =
+            inject_target_auth_header(&secret_auth("WIDE_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Ok(Some(("x-key".to_string(), "wide-value".to_string()))));
+        let result =
+            inject_target_auth_header(&secret_auth("OWN_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Err(TargetAuthError::SecretNotFound));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_the_egress_policy_blocks_is_refused_without_a_request() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.egress.exact_allowlist = None;
         let error = inject_target_auth_header(
             &provider_auth("machine"),
             &fixture.context(),
@@ -16970,8 +16546,8 @@ mod target_auth_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
-        assert_eq!(error.to_string(), "credential provider token request failed");
+        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused));
+        assert_eq!(fixture.requests(), 0);
         assert!(
             fixture
                 .vault

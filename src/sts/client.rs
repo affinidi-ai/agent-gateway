@@ -55,8 +55,9 @@ pub enum StsClientError {
     InvalidEndpoint(String),
     #[error("token exchange transport error: {0}")]
     Transport(String),
-    #[error("token exchange rejected ({status}): {body}")]
-    Rejected { status: u16, body: String },
+    /// The STS refused the exchange. `error` is only its OAuth error code.
+    #[error("token exchange rejected ({status}): {error}")]
+    Rejected { status: u16, error: String },
     #[error("malformed token response: {0}")]
     Malformed(String),
 }
@@ -99,6 +100,17 @@ pub fn parse_token_response(body: &str) -> Result<ExternalTokenResponse, StsClie
     Ok(resp)
 }
 
+/// The error for a refused exchange, keeping only the OAuth error code of `body`.
+fn rejection(
+    status: u16,
+    body: &str,
+) -> StsClientError {
+    StsClientError::Rejected {
+        status,
+        error: crate::delegation_vault::oauth::token_error_code(body),
+    }
+}
+
 /// Exchange a subject assertion for a downstream access token at an external STS.
 pub async fn exchange_token(
     client: &reqwest::Client,
@@ -127,7 +139,7 @@ pub async fn exchange_token(
         .map_err(|e| StsClientError::Transport(e.to_string()))?;
 
     if !status.is_success() {
-        return Err(StsClientError::Rejected { status: status.as_u16(), body });
+        return Err(rejection(status.as_u16(), &body));
     }
     parse_token_response(&body)
 }
@@ -222,6 +234,14 @@ mod tests {
     fn parse_response_rejects_empty_access_token() {
         let err = parse_token_response(r#"{"access_token":""}"#).unwrap_err();
         assert!(matches!(err, StsClientError::Malformed(_)));
+    }
+
+    #[test]
+    fn a_rejection_keeps_only_the_oauth_error_code() {
+        let error = rejection(400, r#"{"error":"invalid_target","error_description":"description-marker"}"#);
+        assert_eq!(error.to_string(), "token exchange rejected (400): invalid_target");
+        let error = rejection(502, "<html>upstream echoed subject-token-marker</html>");
+        assert_eq!(error.to_string(), "token exchange rejected (502): unrecognized_error");
     }
 
     #[test]

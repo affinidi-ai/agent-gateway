@@ -2,13 +2,21 @@ import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
+import {
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
   id: string;
   name: string;
   provider_id?: string;
   provider_type?: string;
+  issuer?: string | null;
   callback_url?: string;
+  tenant_id?: string | null;
 }
 
 /** The consent modes the panel's select sets; a stored `elicit` or `external` is kept. */
@@ -130,6 +138,11 @@ interface Props {
 const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const { offered, outside } = splitByTenant(
+    providers,
+    useSurfaceTenant(),
+    provider => !sendsGatewayCredential(provider)
+  );
 
   useEffect(() => {
     let alive = true;
@@ -190,12 +203,19 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               disabled={loading || readOnly}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {offered.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
+              {outside
+                .filter(p => p.id === value.credential_provider_id)
+                .map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({outOfTenantLabel(p)})
+                  </option>
+                ))}
             </Form.Select>
             {(() => {
               const selected = providers.find(p => p.id === value.credential_provider_id);

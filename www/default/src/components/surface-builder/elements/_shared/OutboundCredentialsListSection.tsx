@@ -4,13 +4,21 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import FieldHelp from '../../../shared/FieldHelp';
+import {
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
   id: string;
   name: string;
   provider_id?: string;
   provider_type?: string;
+  issuer?: string | null;
   callback_url?: string;
+  tenant_id?: string | null;
 }
 
 /**
@@ -139,6 +147,11 @@ interface Props {
 const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const { offered, outside } = splitByTenant(
+    providers,
+    useSurfaceTenant(),
+    provider => !sendsGatewayCredential(provider)
+  );
 
   useEffect(() => {
     let alive = true;
@@ -213,12 +226,19 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
               disabled={loading}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {offered.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
+              {outside
+                .filter(p => p.id === row.credential_provider_id)
+                .map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({outOfTenantLabel(p)})
+                  </option>
+                ))}
               {row.credential_provider_id &&
                 !providers.some(p => p.id === row.credential_provider_id) && (
                   <option value={row.credential_provider_id}>
@@ -228,7 +248,7 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
             </Form.Select>
             {!loading && (
               <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-                {providers.length === 0
+                {offered.length === 0
                   ? 'No credential providers configured yet. '
                   : "Don't see the one you need? "}
                 <AddResourceLink

@@ -243,15 +243,10 @@ impl AccessPointEvents {
             custom_metadata,
             &self.request.channel_name,
             &self.state.secrets_store,
-            crate::protocols::MetadataRuntimeContext {
-                request_id: Some(self.request.trace_id.as_str()),
-                surface_id: Some(
-                    self.state
-                        .surface
-                        .surface_id
-                        .as_str(),
-                ),
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(
+                &self.state.surface,
+                Some(self.request.trace_id.as_str()),
+            ),
         )
         .await
         {
@@ -777,5 +772,52 @@ allow := false if contains(input.response.body.result.text, "SECRET")
 
         assert_eq!(events.recorded_dids, HashSet::from([AGENT_DID.to_string()]));
         assert_eq!(events.event_did, None);
+    }
+
+    /// The `credential` a stream event carries after a `tenant-a` surface injects
+    /// `{"credential": "$SECRET:<secret_id>"}` as response custom metadata under `mode`.
+    async fn stream_event_tenant_secret(
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Option<Value> {
+        let (_dir, secrets_store) = crate::secrets::test_support::tenant_secrets().await;
+        let mut events = events_with_a_static_agent_and_a_response_policy();
+        events.state.secrets_store = secrets_store;
+        let surface = std::sync::Arc::make_mut(&mut events.state.surface);
+        surface.tenant_id = Some("tenant-a".into());
+        surface
+            .target
+            .response_custom_metadata = Some(crate::config::CustomMetadata {
+            enabled: true,
+            payload: Some(serde_json::json!({ "credential": format!("$SECRET:{secret_id}") })),
+            injection_target: None,
+        });
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        let event = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "text": "done" } });
+        let injected = crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, events.inject_custom_metadata(bytes::Bytes::from(event.to_string())))
+            .await;
+        serde_json::from_slice::<Value>(&injected)
+            .unwrap()
+            .pointer(&format!(
+                "/result/metadata/{}/credential",
+                crate::config::AFFINIDI_AGENT_METADATA_EXTENSION.replace('/', "~1")
+            ))
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn a_stream_event_carries_a_metadata_secret_only_within_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(stream_event_tenant_secret(mode, "own").await, Some(serde_json::json!("own-value")));
+            assert_eq!(stream_event_tenant_secret(mode, "other").await, None, "{mode:?}");
+        }
+        assert_eq!(stream_event_tenant_secret(RuleMode::Warn, "wide").await, Some(serde_json::json!("wide-value")));
+        assert_eq!(stream_event_tenant_secret(RuleMode::Enforce, "wide").await, None);
     }
 }

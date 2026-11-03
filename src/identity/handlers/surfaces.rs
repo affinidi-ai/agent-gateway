@@ -1829,6 +1829,113 @@ pub async fn get_trust_recorder_status(
     Ok(Json(TrustRecorderStatusResponse { status }))
 }
 
+/// `GET /v1/surfaces/{id}/agent-card`
+///
+/// The base route's agent card beside the agent's own card, with how the gateway's
+/// fetch went. Every fetch result is a `200`. Past the per-user or per-surface fetch
+/// limit the last preview of the same running surface answers, or `429` without one.
+pub async fn get_surface_agent_card(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Extension(AuthGuardOk(user_id)): Extension<AuthGuardOk>,
+) -> Result<Response, SurfaceApiError> {
+    let caller = CardPreviewCaller {
+        context: tenant_context(&context),
+        scope: resource_scope(&scope),
+        user_id: &user_id,
+    };
+    agent_card_preview(&state, &surface_id, &caller, crate::proxy::card_preview::PreviewRequest::Read).await
+}
+
+/// `POST /v1/surfaces/{id}/agent-card/refresh`
+///
+/// Fetch the base route's agent card again, as [`get_surface_agent_card`] reports
+/// it. The request body is ignored. Past the per-user or per-surface fetch limit, `429`.
+pub async fn refresh_surface_agent_card(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Extension(AuthGuardOk(user_id)): Extension<AuthGuardOk>,
+) -> Result<Response, SurfaceApiError> {
+    let caller = CardPreviewCaller {
+        context: tenant_context(&context),
+        scope: resource_scope(&scope),
+        user_id: &user_id,
+    };
+    agent_card_preview(&state, &surface_id, &caller, crate::proxy::card_preview::PreviewRequest::Refresh).await
+}
+
+struct CardPreviewCaller<'a> {
+    context: Option<&'a PatTenantContext>,
+    scope: Option<&'a PatResourceScope>,
+    user_id: &'a str,
+}
+
+const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
+
+/// The agent card preview of a surface the caller may read, or for a refresh,
+/// change. A surface of another tenant is `404`, never its card, and a tenant token
+/// never makes the gateway fetch an appliance-wide surface's card.
+async fn agent_card_preview(
+    state: &IdentityApiState,
+    surface_id: &str,
+    caller: &CardPreviewCaller<'_>,
+    request: crate::proxy::card_preview::PreviewRequest,
+) -> Result<Response, SurfaceApiError> {
+    use crate::proxy::card_preview::{
+        AgentCardPreview, PreviewCaller, PreviewRequest, RateLimited, UnsupportedReason, preview_memory,
+        unsupported_reason,
+    };
+
+    let access = match request {
+        PreviewRequest::Read => SurfaceAccess::Read,
+        PreviewRequest::Refresh => SurfaceAccess::Mutate,
+    };
+    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
+    let unsupported = |reason| Ok(Json(AgentCardPreview::unsupported(&surface.surface_id, reason)).into_response());
+    if let Some(reason) = unsupported_reason(&surface, caller.context.is_some(), crate::server::mode::is_standby()) {
+        return unsupported(reason);
+    }
+    let Some(proxy_state) = state
+        .channel_manager
+        .card_preview_state(&surface.surface_id)
+        .await
+    else {
+        return unsupported(UnsupportedReason::NotRunning);
+    };
+    if !proxy_state
+        .surface
+        .uses_a2a_settings()
+    {
+        return unsupported(UnsupportedReason::NotA2a);
+    }
+
+    let preview_caller = PreviewCaller {
+        user_id: caller.user_id,
+        tenant_id: caller
+            .context
+            .map(|context| context.tenant_id.as_str()),
+    };
+    match preview_memory()
+        .preview(&proxy_state, &preview_caller, request)
+        .await
+    {
+        Ok(preview) => Ok(Json(preview).into_response()),
+        Err(RateLimited { retry_after_secs }) => {
+            warn!(surface_id = %surface.surface_id, "Agent card preview refused: fetch limit reached");
+            Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())],
+                Json(serde_json::json!({"error": CARD_FETCH_LIMITED, "code": "rate_limited"})),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// Validate (and resolve) every x402 payment policy attached to the
 /// surface: the base `target.payment_policy` plus every variant
 /// override. Reuses the channel-handler validator so behaviour stays
@@ -2068,6 +2175,7 @@ pub async fn create_surface(
     super::surface_tenancy::validate_surface_references(
         &state,
         &surface,
+        None,
         tenant_context(&context),
         resource_scope(&scope),
     )
@@ -3075,7 +3183,7 @@ async fn validate_and_save_surface(
             .transit_token_max_lifetime_secs,
         existing,
     )?;
-    super::surface_tenancy::validate_surface_references(state, &surface, context, scope).await?;
+    super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;

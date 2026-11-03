@@ -66,6 +66,19 @@ pub trait DelegationVaultStorage: Send + Sync {
         user_identity_hash: &str,
     ) -> Result<usize>;
 
+    /// Store `token`, and in the same step delete the expired tokens of its agent and
+    /// provider whose user hash starts with `user_hash_prefix`. Unlike a revoke, it leaves
+    /// pending consents alone: it removes only records that can no longer be used. A failure
+    /// to remove them is logged and does not fail the store. A vault that does not prune
+    /// stores the token alone.
+    async fn store_replacing_expired(
+        &self,
+        token: DelegationToken,
+        _user_hash_prefix: &str,
+    ) -> Result<DelegationToken> {
+        self.store(token).await
+    }
+
     /// Update a token (e.g. after refresh)
     async fn update(
         &self,
@@ -889,7 +902,22 @@ impl FileSystemDelegationVaultStore {
 
     async fn store_locked(
         &self,
+        token: DelegationToken,
+    ) -> Result<DelegationToken> {
+        let rows = self
+            .storage
+            .list_all()
+            .await?;
+        self.store_among(token, &rows)
+            .await
+    }
+
+    /// Stores `token` given `rows`, every token in the vault as read under the
+    /// mutation lock the caller holds.
+    async fn store_among(
+        &self,
         mut token: DelegationToken,
+        rows: &[DelegationToken],
     ) -> Result<DelegationToken> {
         if let Some(current) = self
             .storage
@@ -898,12 +926,10 @@ impl FileSystemDelegationVaultStore {
         {
             anyhow::ensure!(same_owner(&current, &token), "Delegation token ID belongs to another identity");
         }
-        let mut existing = self
-            .storage
-            .list_all()
-            .await?
-            .into_iter()
+        let mut existing = rows
+            .iter()
             .filter(|current| same_owner(current, &token))
+            .cloned()
             .collect::<Vec<_>>();
         // Keep the newest and remove the rest, so storing a credential never
         // fails on duplicates.
@@ -946,6 +972,50 @@ impl FileSystemDelegationVaultStore {
         );
         Ok(token)
     }
+
+    /// Removes the expired tokens among `rows` that `stored` replaces: those of its
+    /// agent and provider whose user hash starts with `user_hash_prefix`. Rows of
+    /// `stored`'s own identity are left to `store_among`.
+    async fn remove_expired(
+        &self,
+        rows: &[DelegationToken],
+        stored: &DelegationToken,
+        user_hash_prefix: &str,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let expired = rows
+            .iter()
+            .filter(|token| {
+                !same_owner(token, stored)
+                    && token.agent_did == stored.agent_did
+                    && token.credential_provider_id == stored.credential_provider_id
+                    && token
+                        .user_identity_hash
+                        .starts_with(user_hash_prefix)
+                    && token
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at <= now)
+            })
+            .collect::<Vec<_>>();
+        for token in &expired {
+            self.refreshes
+                .delete(&token.id)
+                .await?;
+            self.storage
+                .delete(&token.id)
+                .await?;
+        }
+        if !expired.is_empty() {
+            info!(
+                target: "credential_delegation",
+                agent_did = %stored.agent_did,
+                provider_id = %stored.provider_id,
+                count = expired.len(),
+                "Removed expired service tokens"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -958,6 +1028,36 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
             store
                 .store_locked(token)
                 .await
+        })
+        .await
+    }
+
+    async fn store_replacing_expired(
+        &self,
+        token: DelegationToken,
+        user_hash_prefix: &str,
+    ) -> Result<DelegationToken> {
+        let user_hash_prefix = user_hash_prefix.to_string();
+        self.mutate(move |store| async move {
+            let rows = store
+                .storage
+                .list_all()
+                .await?;
+            let stored = store
+                .store_among(token, &rows)
+                .await?;
+            if let Err(error) = store
+                .remove_expired(&rows, &stored, &user_hash_prefix)
+                .await
+            {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %stored.provider_id,
+                    %error,
+                    "Could not remove expired service tokens"
+                );
+            }
+            Ok(stored)
         })
         .await
     }
@@ -1986,6 +2086,307 @@ fn newest_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storing_a_token_removes_only_the_expired_rows_of_one_agent_provider_and_purpose() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let row = |id: &str, agent_did: &str, provider: &str, user_hash: &str, expires_in: i64| {
+            let mut token = super::super::tests::make_token(Some(expires_in), true);
+            token.id = id.into();
+            token.agent_did = agent_did.into();
+            token.credential_provider_id = provider.into();
+            token.user_identity_hash = user_hash.into();
+            token
+        };
+        let rows = [
+            row("expired-old-settings", "surface:a", "cp-1", "__target_auth__:old", -10),
+            row("live-other-scopes", "surface:a", "cp-1", "__target_auth__:other", 3600),
+            row("expired-other-provider", "surface:a", "cp-2", "__target_auth__:old", -10),
+            row("expired-other-agent", "surface:b", "cp-1", "__target_auth__:old", -10),
+            row("expired-user-consent", "surface:a", "cp-1", "sha256:user", -10),
+        ];
+        let new_token = row("kept-new-token", "surface:a", "cp-1", "__target_auth__:new", -10);
+        let mut stored = Vec::new();
+        for token in rows {
+            stored.push(
+                store
+                    .store(token)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let now = Utc::now().timestamp() as u64;
+        for claimed in [&stored[0], &stored[3], &stored[4]] {
+            store
+                .claim_refresh(claimed, now)
+                .await
+                .unwrap();
+        }
+        let pending = super::super::tests::make_token(Some(3600), true);
+        let consent = StagedConsent {
+            id: uuid::Uuid::new_v4().to_string(),
+            binding_digest: [1; 32],
+            issued_at: now,
+            expires_at: now + 300,
+            snapshot: store
+                .consent_snapshot(&pending.agent_did, &pending.user_identity_hash, &pending.credential_provider_id)
+                .await
+                .unwrap(),
+            credential: pending,
+        };
+        let consent_id = uuid::Uuid::parse_str(&consent.id).unwrap();
+        store
+            .stage_consent(consent, now)
+            .await
+            .unwrap();
+
+        let kept = store
+            .store_replacing_expired(new_token, "__target_auth__:")
+            .await
+            .unwrap();
+        assert_eq!(kept.id, "kept-new-token");
+
+        let mut left: Vec<String> = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "expired-other-agent",
+                "expired-other-provider",
+                "expired-user-consent",
+                "kept-new-token",
+                "live-other-scopes"
+            ]
+        );
+        for kept_claim in ["expired-user-consent", "expired-other-agent"] {
+            assert!(
+                store
+                    .refreshes
+                    .get(kept_claim)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refresh claim of {kept_claim} is kept"
+            );
+        }
+        assert!(
+            store
+                .refreshes
+                .get("expired-old-settings")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refresh claim of a removed token goes with it"
+        );
+        assert!(
+            store
+                .staged_consent(consent_id, [1; 32], now)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    struct ObservedStorage {
+        inner: std::sync::Arc<dyn StorageBackend<DelegationToken>>,
+        listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        deletes_fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl StorageBackend<DelegationToken> for ObservedStorage {
+        async fn save(
+            &self,
+            token: &DelegationToken,
+        ) -> Result<()> {
+            self.inner
+                .save_atomic(token)
+                .await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<DelegationToken>> {
+            self.inner.get(id).await
+        }
+        async fn list_all(&self) -> Result<Vec<DelegationToken>> {
+            self.listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list_all().await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<()> {
+            anyhow::ensure!(
+                !self
+                    .deletes_fail
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the disk refused the delete"
+            );
+            self.inner.delete(id).await
+        }
+    }
+
+    fn observed(
+        store: &FileSystemDelegationVaultStore
+    ) -> (
+        FileSystemDelegationVaultStore,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let listings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deletes_fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = FileSystemDelegationVaultStore {
+            storage: std::sync::Arc::new(ObservedStorage {
+                inner: store.storage.clone(),
+                listings: listings.clone(),
+                deletes_fail: deletes_fail.clone(),
+            }),
+            ..store.clone()
+        };
+        (observed, listings, deletes_fail)
+    }
+
+    fn service_row(
+        id: &str,
+        user_hash: &str,
+        expires_in: i64,
+    ) -> DelegationToken {
+        let mut token = super::super::tests::make_token(Some(expires_in), true);
+        token.id = id.into();
+        token.agent_did = "surface:a".into();
+        token.credential_provider_id = "cp-1".into();
+        token.user_identity_hash = user_hash.into();
+        token
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storing_a_token_and_removing_expired_ones_reads_the_vault_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        for token in [
+            service_row("expired-one", "__target_auth__:one", -10),
+            service_row("expired-two", "__target_auth__:two", -10),
+            service_row("live", "__target_auth__:live", 3600),
+        ] {
+            base.store(token)
+                .await
+                .unwrap();
+        }
+        let (store, listings, _) = observed(&base);
+
+        let stored = store
+            .store_replacing_expired(service_row("new", "__target_auth__:new", 3600), "__target_auth__:")
+            .await
+            .unwrap();
+
+        assert_eq!(stored.id, "new");
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one scan of the vault stores the token and finds the expired ones"
+        );
+        let mut left: Vec<String> = base
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["live", "new"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_removal_of_expired_tokens_does_not_fail_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        base.store(service_row("expired", "__target_auth__:old", -10))
+            .await
+            .unwrap();
+        let (store, _, deletes_fail) = observed(&base);
+        deletes_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stored = store
+            .store_replacing_expired(service_row("new", "__target_auth__:new", 3600), "__target_auth__:")
+            .await
+            .expect("the token is stored even when an expired one cannot be removed");
+
+        assert_eq!(stored.id, "new");
+        assert!(
+            base.get("new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            base.get("expired")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        deletes_fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        store
+            .store_replacing_expired(service_row("newer", "__target_auth__:newer", 3600), "__target_auth__:")
+            .await
+            .unwrap();
+        assert!(
+            base.get("expired")
+                .await
+                .unwrap()
+                .is_none(),
+            "the next store removes it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storing_over_expired_rows_of_the_same_identity_keeps_one_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut older = service_row("older", "__target_auth__:same", -20);
+        older.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        let mut newer = service_row("newer", "__target_auth__:same", -10);
+        newer.updated_at = Utc::now() - chrono::Duration::seconds(30);
+        for token in [older, newer, service_row("elsewhere", "__target_auth__:else", -10)] {
+            store
+                .storage
+                .save_atomic(&token)
+                .await
+                .unwrap();
+        }
+
+        let stored = store
+            .store_replacing_expired(service_row("fresh", "__target_auth__:same", 3600), "__target_auth__:")
+            .await
+            .expect("an identity with expired duplicates must still be stored");
+
+        assert_eq!(stored.id, "newer");
+        let left = store
+            .storage
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].id, "newer");
+        assert_eq!(left[0].access_token, stored.access_token);
+        assert_eq!(left[0].expires_at, stored.expires_at);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_vault_updates_hold_the_lock_until_their_write_finishes() {

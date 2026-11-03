@@ -5,7 +5,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::auth::auth_config::GraphApiConfig;
-use crate::delegation_vault::oauth::token_error_reason;
+use crate::delegation_vault::oauth::token_error_code;
 
 /// OAuth token response from Azure AD
 #[derive(Debug, Deserialize)]
@@ -59,14 +59,14 @@ impl GraphApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let reason = token_error_reason(
+            let error_code = token_error_code(
                 &response
                     .text()
                     .await
                     .unwrap_or_default(),
             );
-            warn!("Token request failed - Status: {}, Reason: {}", status, reason);
-            anyhow::bail!("Token request failed with status {}: {}", status, reason);
+            warn!("Token request failed - Status: {}, OAuth error: {}", status, error_code);
+            anyhow::bail!("Token request failed with status {}: {}", status, error_code);
         }
 
         let token_response: TokenResponse = response

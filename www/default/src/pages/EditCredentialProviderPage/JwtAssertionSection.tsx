@@ -1,6 +1,7 @@
 import React from 'react';
 import FieldHelp from '../../components/shared/FieldHelp';
 import SecretSelect, { SecretOption } from './SecretSelect';
+import type { OwnerTenant } from '../../utils/tenantScope';
 import {
   CredentialProviderType,
   JWT_ALGORITHMS,
@@ -13,6 +14,7 @@ interface JwtAssertionSectionProps {
   providerType: CredentialProviderType;
   form: JwtFormFields;
   secrets: SecretOption[];
+  ownerTenant: OwnerTenant;
   loadingSecrets: boolean;
   onChange: (
     event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
@@ -27,6 +29,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
   providerType,
   form,
   secrets,
+  ownerTenant,
   loadingSecrets,
   onChange,
 }) => {
@@ -68,10 +71,11 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
         id="jwt_signing_key_secret_ref"
         label="Signing Key"
         required
-        help="Create the secret on the Secrets page and paste the PEM private key, with its BEGIN and END lines, as its value. A Google service account's key is the private_key of its JSON key file."
-        hint="Secret holding a PEM private key: PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC."
+        help="Create the secret on the Secrets page and paste either the PEM private key, with its BEGIN and END lines, or the whole JSON key file of a Google service account, as its value. The key file is at most 16 KiB."
+        hint="Secret holding a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) or a Google service account JSON key file."
         value={form.jwt_signing_key_secret_ref}
         secrets={secrets}
+        ownerTenant={ownerTenant}
         loading={loadingSecrets}
         onChange={onChange}
       />
@@ -84,6 +88,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
           hint="Secret holding the PEM certificate (BEGIN CERTIFICATE) of the signing key."
           value={form.jwt_certificate_secret_ref}
           secrets={secrets}
+          ownerTenant={ownerTenant}
           loading={loadingSecrets}
           onChange={onChange}
         />
@@ -97,7 +102,8 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
           <FieldHelp ariaLabel="About Key ID" testId="field-help-jwt-key-id">
             Optional <code>kid</code> header: the ID of the public key registered with the OAuth
             server, such as the <code>kid</code> of a key in an Ory client&apos;s JWKS. For a Google
-            service account, the <code>private_key_id</code> of its JSON key file.
+            service account JSON key file, leave it empty to send the file&apos;s{' '}
+            <code>private_key_id</code>; a value here overrides it.
           </FieldHelp>
         </div>
         <input

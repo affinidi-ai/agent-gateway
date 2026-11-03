@@ -59,6 +59,19 @@ impl CredentialProviderType {
         }
     }
 
+    /// Does a request authenticated by a provider of this type carry the gateway's own
+    /// credential (an API key, or a token granted to the gateway's own client)? An
+    /// authorization code provider sends the end user's token instead.
+    pub fn sends_gateway_credential(&self) -> bool {
+        match self {
+            Self::OAuth2ClientCredentials
+            | Self::ApiKey
+            | Self::OAuth2JwtBearer
+            | Self::OAuth2ClientCredentialsJwtAuth => true,
+            Self::OAuth2AuthorizationCode => false,
+        }
+    }
+
     /// The algorithm a provider of this type signs with: `configured`, else the default.
     pub fn jwt_signing_algorithm(
         &self,
@@ -95,7 +108,8 @@ pub enum JwtSigningAlgorithm {
 /// references; the PEM values never leave the secrets store except to sign.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JwtAssertionSettings {
-    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC)
+    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) or a
+    /// Google service account JSON key file
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_signing_key_secret_ref: Option<String>,
     /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`;
@@ -348,6 +362,137 @@ impl StorableEntity for CredentialProvider {
 }
 
 impl CredentialProvider {
+    /// The secret ids this provider reads: client, API key, signing key and certificate.
+    pub fn secret_refs(&self) -> Vec<&str> {
+        self.secret_ref_fields()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The secret ids a service token of this provider's type reads: the API key; the client
+    /// ID and secret; a JWT Bearer grant's signing key and certificate; or the client ID,
+    /// signing key and certificate of a client authenticating with a JWT. A reference left
+    /// from another type is not among them, and an authorization code provider issues no
+    /// service token.
+    pub fn service_token_secret_refs(&self) -> Vec<&str> {
+        let [client_id, client_secret, api_key, signing_key, certificate] = self.secret_ref_fields();
+        match self.provider_type {
+            CredentialProviderType::ApiKey => vec![api_key],
+            CredentialProviderType::OAuth2ClientCredentials => vec![client_id, client_secret],
+            CredentialProviderType::OAuth2JwtBearer => vec![signing_key, certificate],
+            CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![client_id, signing_key, certificate],
+            CredentialProviderType::OAuth2AuthorizationCode => Vec::new(),
+        }
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The secret reference of each field, in the order of [`Self::secret_refs`].
+    fn secret_ref_fields(&self) -> [Option<&str>; 5] {
+        [
+            self.client_id_secret_ref
+                .as_deref(),
+            self.client_secret_secret_ref
+                .as_deref(),
+            self.api_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+        ]
+    }
+
+    /// Each secret reference, paired with whether `previous` held it in the same field while
+    /// this provider keeps the type and sends it to the same place: the token and
+    /// authorization endpoints, resource, additional parameters, default scopes and JWT issuer,
+    /// subject and audience.
+    fn secret_refs_kept_from(
+        &self,
+        previous: Option<&Self>,
+    ) -> Vec<(&str, bool)> {
+        let stored = previous
+            .filter(|previous| {
+                self.provider_type == previous.provider_type
+                    && self.token_endpoint == previous.token_endpoint
+                    && self.authorization_endpoint == previous.authorization_endpoint
+                    && self.resource == previous.resource
+                    && self.additional_params == previous.additional_params
+                    && self.default_scopes == previous.default_scopes
+                    && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
+                    && self.jwt.jwt_subject == previous.jwt.jwt_subject
+                    && self.jwt.jwt_audience == previous.jwt.jwt_audience
+            })
+            .map(Self::secret_ref_fields)
+            .unwrap_or_default();
+        self.secret_ref_fields()
+            .into_iter()
+            .zip(stored)
+            .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
+            .collect()
+    }
+
+    /// Is a secret of `secret_tenant` outside this provider's own tenant? A tenant provider
+    /// may use only its own tenant's secrets and an appliance-wide provider only appliance-wide
+    /// ones.
+    pub fn secret_is_outside_tenant(
+        &self,
+        secret_tenant: Option<&str>,
+    ) -> bool {
+        self.tenant_id.as_deref() != secret_tenant
+    }
+
+    /// Does the provider name a secret outside its own tenant? `secret_tenants` maps a secret id
+    /// to its tenant; a secret missing from it no longer exists and does not count.
+    pub fn uses_secret_outside_tenant(
+        &self,
+        secret_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    ) -> bool {
+        self.secret_refs()
+            .into_iter()
+            .any(|secret_ref| {
+                secret_tenants
+                    .get(secret_ref)
+                    .is_some_and(|tenant| self.secret_is_outside_tenant(*tenant))
+            })
+    }
+
+    /// Does the provider send the gateway's own credential on a tenant surface from an
+    /// appliance-wide provider? Only that credential is held to tenant isolation.
+    pub fn breaks_tenant_isolation_for(
+        &self,
+        surface_tenant_id: Option<&str>,
+    ) -> bool {
+        self.provider_type
+            .sends_gateway_credential()
+            && crate::tenancy::breaks_tenant_isolation(surface_tenant_id, self.tenant_id.as_deref())
+    }
+
+    /// May a surface use this provider? A provider of another tenant never; an
+    /// appliance-wide one that sends the gateway's own credential only while the surface's
+    /// mode is `Warn`.
+    pub fn usable_by(
+        &self,
+        surface_tenancy: crate::tenancy::SurfaceTenancy<'_>,
+    ) -> bool {
+        if self
+            .provider_type
+            .sends_gateway_credential()
+        {
+            crate::tenancy::can_reference_with_rule(
+                surface_tenancy.tenant_id,
+                self.tenant_id.as_deref(),
+                surface_tenancy.mode,
+            )
+        } else {
+            crate::tenancy::can_reference(surface_tenancy.tenant_id, self.tenant_id.as_deref())
+        }
+    }
+
     /// The algorithm this provider signs its JWT with: the configured one, or its
     /// type's default, or for an external consent provider whose client
     /// authenticates with `private_key_jwt` the default of
@@ -372,7 +517,9 @@ impl CredentialProvider {
     /// external consent provider uses its own tenant's secrets only, an
     /// untenanted one untenanted secrets only, since its client authenticates
     /// at endpoints its tenant chose; any other provider its own tenant's or
-    /// an untenanted one.
+    /// an untenanted one. This is the runtime and kept-reference check: a save
+    /// also needs an exact tenant match unless the reference is kept in warn
+    /// mode.
     pub fn may_use_secret(
         &self,
         secret_tenant_id: Option<&str>,
@@ -606,6 +753,185 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
+        let provider = |provider_type: &str, certificate: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET", "api_key_secret_ref": "KEY",
+                "jwt_signing_key_secret_ref": "SIGNING", "jwt_certificate_secret_ref": certificate,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for (provider_type, certificate, expected) in [
+            ("api_key", Some("CERT"), vec!["KEY"]),
+            ("oauth2_client_credentials", Some("CERT"), vec!["ID", "SECRET"]),
+            ("oauth2_jwt_bearer", Some("CERT"), vec!["SIGNING", "CERT"]),
+            ("oauth2_jwt_bearer", None, vec!["SIGNING"]),
+            ("oauth2_client_credentials_jwt_auth", Some("CERT"), vec!["ID", "SIGNING", "CERT"]),
+            ("oauth2_authorization_code", Some("CERT"), vec![]),
+        ] {
+            let provider = provider(provider_type, certificate);
+            assert_eq!(provider.service_token_secret_refs(), expected, "{provider_type}");
+            assert_eq!(provider.secret_refs().len(), 4 + usize::from(certificate.is_some()), "{provider_type}");
+        }
+    }
+
+    #[test]
+    fn an_external_provider_uses_its_own_tenants_secrets_only_and_any_other_may_also_use_untenanted_ones() {
+        let provider = |tenant: Option<&str>, issuer: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": "api_key",
+                "api_key_secret_ref": "KEY", "tenant_id": tenant, "issuer": issuer,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let issuer = Some("https://issuer.example");
+
+        let external = provider(Some("tenant-a"), issuer);
+        assert!(external.may_use_secret(Some("tenant-a")));
+        assert!(!external.may_use_secret(None));
+        assert!(!external.may_use_secret(Some("tenant-b")));
+
+        let untenanted_external = provider(None, issuer);
+        assert!(untenanted_external.may_use_secret(None));
+        assert!(!untenanted_external.may_use_secret(Some("tenant-a")));
+
+        let tenant = provider(Some("tenant-a"), None);
+        assert!(tenant.may_use_secret(Some("tenant-a")));
+        assert!(tenant.may_use_secret(None));
+        assert!(!tenant.may_use_secret(Some("tenant-b")));
+
+        let untenanted = provider(None, None);
+        assert!(untenanted.may_use_secret(None));
+        assert!(!untenanted.may_use_secret(Some("tenant-a")));
+    }
+
+    #[test]
+    fn a_reference_is_kept_only_in_its_own_field_while_the_destination_is_unchanged() {
+        let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://idp.example/token", "jwt_signing_key_secret_ref": "KEY",
+            "jwt_certificate_secret_ref": "CERT", "jwt_issuer": "iss", "jwt_subject": "sub",
+            "jwt_audience": "https://idp.example/token",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(stored.secret_refs_kept_from(None), vec![("KEY", false), ("CERT", false)]);
+        let mut renamed = stored.clone();
+        renamed.name = "renamed".into();
+        renamed.jwt.jwt_key_id = Some("kid".into());
+        assert_eq!(renamed.secret_refs_kept_from(Some(&stored)), vec![("KEY", true), ("CERT", true)]);
+
+        let mut swapped = stored.clone();
+        swapped
+            .jwt
+            .jwt_signing_key_secret_ref = Some("CERT".into());
+        swapped
+            .jwt
+            .jwt_certificate_secret_ref = Some("KEY".into());
+        assert_eq!(swapped.secret_refs_kept_from(Some(&stored)), vec![("CERT", false), ("KEY", false)]);
+
+        let redirected: [fn(&mut CredentialProvider); 9] = [
+            |p| p.provider_type = CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+            |p| p.token_endpoint = Some("https://tenant.example/token".into()),
+            |p| p.authorization_endpoint = Some("https://tenant.example/authorize".into()),
+            |p| p.resource = Some("https://tenant.example/".into()),
+            |p| {
+                p.additional_params
+                    .insert("audience".into(), "tenant".into());
+            },
+            |p| p.jwt.jwt_issuer = Some("tenant".into()),
+            |p| p.jwt.jwt_subject = None,
+            |p| p.jwt.jwt_audience = Some("https://tenant.example/token".into()),
+            |p| p.default_scopes = vec!["admin".into()],
+        ];
+        for change in redirected {
+            let mut changed = stored.clone();
+            change(&mut changed);
+            assert_eq!(changed.secret_refs_kept_from(Some(&stored)), vec![("KEY", false), ("CERT", false)]);
+        }
+    }
+
+    #[test]
+    fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        use crate::tenancy::SurfaceTenancy;
+
+        let types = [
+            (CredentialProviderType::OAuth2AuthorizationCode, false),
+            (CredentialProviderType::OAuth2ClientCredentials, true),
+            (CredentialProviderType::OAuth2ClientCredentialsJwtAuth, true),
+            (CredentialProviderType::OAuth2JwtBearer, true),
+            (CredentialProviderType::ApiKey, true),
+        ];
+        for (provider_type, sends_gateway_credential) in types {
+            assert_eq!(provider_type.sends_gateway_credential(), sends_gateway_credential, "{provider_type:?}");
+            let provider = |tenant: Option<&str>| {
+                let mut provider = make_provider("p", "p");
+                provider.provider_type = provider_type.clone();
+                provider.tenant_id = tenant.map(String::from);
+                provider
+            };
+            for mode in [Warn, Enforce] {
+                let surface = |tenant: Option<&'static str>| SurfaceTenancy { tenant_id: tenant, mode };
+                assert!(provider(Some("a")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("b")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("a")).usable_by(surface(None)));
+                assert!(provider(None).usable_by(surface(None)));
+            }
+            let wide = provider(None);
+            assert!(wide.usable_by(SurfaceTenancy {
+                tenant_id: Some("a"),
+                mode: Warn
+            }));
+            assert_eq!(
+                wide.usable_by(SurfaceTenancy {
+                    tenant_id: Some("a"),
+                    mode: Enforce
+                }),
+                !sends_gateway_credential,
+                "{provider_type:?}"
+            );
+            assert_eq!(wide.breaks_tenant_isolation_for(Some("a")), sends_gateway_credential);
+            assert!(!wide.breaks_tenant_isolation_for(None));
+        }
+    }
+
+    #[test]
+    fn a_provider_uses_a_secret_outside_its_tenant_only_when_a_secret_it_names_lies_elsewhere() {
+        let secret_tenants: std::collections::HashMap<&str, Option<&str>> =
+            [("WIDE", None), ("OWN", Some("a")), ("OTHER", Some("b"))]
+                .into_iter()
+                .collect();
+        let provider = |tenant: Option<&str>, client_secret: &str| {
+            let mut provider = make_provider("p", "p");
+            provider.tenant_id = tenant.map(String::from);
+            provider.client_secret_secret_ref = Some(client_secret.into());
+            provider
+        };
+        assert!(provider(Some("a"), "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(Some("a"), "OTHER").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(None, "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(None, "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "GONE").uses_secret_outside_tenant(&secret_tenants));
+    }
+
+    #[test]
+    fn a_secret_is_outside_a_provider_tenant_unless_both_name_the_same_one() {
+        let mut provider = make_provider("p", "p");
+        assert!(!provider.secret_is_outside_tenant(None));
+        assert!(provider.secret_is_outside_tenant(Some("a")));
+        provider.tenant_id = Some("a".into());
+        assert!(!provider.secret_is_outside_tenant(Some("a")));
+        assert!(provider.secret_is_outside_tenant(Some("b")));
+        assert!(provider.secret_is_outside_tenant(None));
+    }
 
     fn make_provider(
         name: &str,

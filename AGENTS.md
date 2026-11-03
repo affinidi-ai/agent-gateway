@@ -125,6 +125,10 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
+The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
+and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
+
 The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
 discovery (`caller_authentication.protected_resource`), and Save removes a setting the
 operator switched off in the same PUT; see _Authorization server discovery_ in
