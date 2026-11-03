@@ -4053,8 +4053,10 @@ async fn refresh_surface_policies(
 /// The surface reload lock is held from the read until the change is applied, so a
 /// change raised before a configuration reload cannot overwrite what that reload
 /// applied. An A2A surface stored without its own settings is served with the
-/// carried-over ones, as a load gives them; nothing is written back, because the
-/// load that gives the settings also stores them.
+/// carried-over ones, as a load gives them, and one whose caller authentication
+/// methods break the rules for several methods with its first method alone, as
+/// a load trims it; nothing is written back, because the load that gives the
+/// settings or the trim also stores them.
 pub(crate) async fn apply_surface_from_storage(
     state: &IdentityApiState,
     surface_id: &str,
@@ -4089,6 +4091,7 @@ pub(crate) async fn apply_surface_from_storage(
         crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
     })
     .await;
+    crate::config::fall_back_to_first_source_auth_methods_in_memory(&mut surfaces);
     for surface in &surfaces {
         apply_surface_change_while_locked(state, SurfaceChange::Upsert(surface)).await;
     }

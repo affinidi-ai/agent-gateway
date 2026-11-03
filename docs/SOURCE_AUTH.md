@@ -107,19 +107,20 @@ on each surface and each variant override, before upgrading. At startup the gate
 after the first ([`additional_source_auth_method_notices`](../src/config/proxy.rs)); the line
 repeats on every start.
 
-Surfaces stored before these rules may break them, because the gateway then enforced only
-the first method and ignored the rest. Wherever surfaces load, at startup (from local storage,
-DynamoDB or its cache) and on a configuration or single-surface reload, a stored surface whose
-methods break them keeps only its first method, when that method is valid alone, and so does
-each enabled variant overriding its caller authentication
-([`fall_back_to_first_source_auth_method`](../src/config/proxy.rs)). The gateway logs an error
-naming the surface, the rule and each dropped method by tag, credential location and
-non-secret references (strategy, secret, provider agent, certificates), so it can be rebuilt.
-An active node persists the correction to local storage
-([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby node, and a
-DynamoDB-sourced surface, are corrected in memory only. A stored `from_jwt_claim` identity
-beside a method other than `jwt_bearer`, or an inbound `from_api_key` identity beside a method
-other than an API key, is logged as a warning at startup and refused on the next save.
+Surfaces stored before these rules may break them, because the gateway then enforced only the
+first method and ignored the rest. Wherever surfaces load, at startup (from local storage,
+DynamoDB or its cache), on a configuration or single-surface reload, and when a storage event
+applies a surface another process wrote, a stored surface whose methods break them keeps only
+its first method, when that method is valid alone, and so does each enabled variant overriding
+its caller authentication ([`fall_back_to_first_source_auth_method`](../src/config/proxy.rs)).
+The gateway logs an error naming the surface, the rule and each dropped method by tag,
+credential location and non-secret references (strategy, secret, provider agent,
+certificates), so it can be rebuilt. An active node's load persists the correction to local
+storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
+node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
+`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_api_key` identity beside a method other than an API key, is logged as a warning at
+startup and refused on the next save.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later

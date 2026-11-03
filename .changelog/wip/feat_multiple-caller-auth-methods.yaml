@@ -57,19 +57,20 @@ changes:
         method used to verify, now fails source authentication: it is refused on a
         closed Access Point, with `on_failure: reject` or beside protected resource
         metadata, and otherwise passed to policy as `method: "failed"`. Wherever
-        surfaces load (startup from local storage, DynamoDB or its cache, and
-        configuration or single-surface reloads), a stored surface or enabled variant
-        whose methods break the new rules (two methods on one credential location, a
-        second DID Auth method, a body-extracted method beside another, a JWT bearer
-        method after the first beside protected resource metadata, or an invalid later
-        method) keeps only its first method. An active node persists the trim to local
-        storage, and the gateway logs an error naming each dropped method by tag,
-        credential location and non-secret references, so it can be rebuilt. A stored
-        `from_jwt_claim` identity beside a method other than JWT bearer, or an inbound
-        `from_api_key` identity beside a method other than an API key, is logged as a
-        warning at startup and refused on the next save; until then a caller verified
-        by that other method is refused. Audit `caller_authentication.methods` before
-        upgrading. Before rolling back to a release that enforces only the first
-        method, remove every method but the first: that release strips only the first
-        method's header, so it would forward a later method's credential, such as a
-        partner's `X-API-Key`, to the Target.
+        surfaces load (startup from local storage, DynamoDB or its cache,
+        configuration or single-surface reloads, and storage events applying a surface
+        another process wrote), a stored surface or enabled variant whose methods
+        break the new rules (two methods on one credential location, a second DID Auth
+        method, a body-extracted method beside another, a JWT bearer method after the
+        first beside protected resource metadata, or an invalid later method) keeps
+        only its first method. An active node's load persists the trim to local
+        storage, a storage event serves it from memory, and the gateway logs an error
+        naming each dropped method by tag, credential location and non-secret
+        references, so it can be rebuilt. A stored `from_jwt_claim` identity beside a
+        method other than JWT bearer, or an inbound `from_api_key` identity beside a
+        method other than an API key, is logged as a warning at startup and refused on
+        the next save; until then a caller verified by that other method is refused.
+        Audit `caller_authentication.methods` before upgrading. Before rolling back to
+        a release that enforces only the first method, remove every method but the
+        first: that release strips only the first method's header, so it would forward
+        a later method's credential, such as a partner's `X-API-Key`, to the Target.
