@@ -106,7 +106,7 @@ record that misses a required one.
 | `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC), or a Google service account JSON key file, whose `private_key` is used | Required |
 | `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
-| `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, and its next update must name one | Not used |
+| `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
 | `client_id_secret_ref` | Not used | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
@@ -125,8 +125,7 @@ their references too.
 
 Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, a random
 UUID `jti` so the issuer can refuse a replayed assertion, and for a client assertion `nbf`);
-only the issued access token is cached. A JWT
-Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
 `common`. An update that sends a reference or JWT field as an empty string clears it, which
 is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create

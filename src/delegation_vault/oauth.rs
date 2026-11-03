@@ -947,14 +947,13 @@ pub(crate) fn record_token_request(
     provider: &CredentialProvider,
     outcome: TokenRequestOutcome,
 ) {
+    use crate::credential_providers::CredentialProviderType as Type;
     let provider_type = match provider.provider_type {
-        crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials => "oauth2_client_credentials",
-        crate::credential_providers::CredentialProviderType::OAuth2JwtBearer => "oauth2_jwt_bearer",
-        crate::credential_providers::CredentialProviderType::OAuth2ClientCredentialsJwtAuth => {
-            "oauth2_client_credentials_jwt_auth"
-        }
-        crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode => "oauth2_authorization_code",
-        crate::credential_providers::CredentialProviderType::ApiKey => "api_key",
+        Type::OAuth2ClientCredentials => "oauth2_client_credentials",
+        Type::OAuth2JwtBearer => "oauth2_jwt_bearer",
+        Type::OAuth2ClientCredentialsJwtAuth => "oauth2_client_credentials_jwt_auth",
+        Type::OAuth2AuthorizationCode => "oauth2_authorization_code",
+        Type::ApiKey => "api_key",
     };
     crate::metrics::backends::prometheus::track_credential_provider_token_request(provider_type, outcome.label());
     #[cfg(test)]

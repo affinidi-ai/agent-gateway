@@ -103,7 +103,7 @@ code exchanges of delegated user tokens are not counted either.
 | Label | Value |
 | --- | --- |
 | `provider_type` | `oauth2_client_credentials`, `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` |
-| `outcome` | `success`; `refused` (the endpoint answered with an error status or OAuth error, or refused the connection); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (an answer that is not valid JSON, is over 64 KiB, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
+| `outcome` | `success`; `refused` (the endpoint answered with a non-2xx status, or the connection failed before any answer; a connection that times out is `timeout`); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (a 2xx answer that is not valid JSON, carries an OAuth `error`, is over 64 KiB, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
 
 No label carries a URL, provider id, secret or tenant.
 

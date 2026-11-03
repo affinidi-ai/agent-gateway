@@ -1605,7 +1605,7 @@ mod jwt_provider_tests {
     async fn a_stored_jwt_bearer_provider_without_a_subject_is_refused_on_update_until_it_names_one() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let mut stored: CredentialProvider = serde_json::from_value(json!({
+        let stored: CredentialProvider = serde_json::from_value(json!({
             "id": "stored-vertex", "name": "Vertex", "provider_id": "stored-vertex",
             "provider_type": "oauth2_jwt_bearer", "token_endpoint": "https://oauth2.googleapis.com/token",
             "jwt_issuer": "agent@project.iam.gserviceaccount.com", "jwt_signing_key_secret_ref": "SA_KEY",
@@ -1621,12 +1621,60 @@ mod jwt_provider_tests {
         let (status, response) = update(&state, "stored-vertex", json!({"name": "Renamed"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        let unchanged = state
+            .store
+            .find_by_provider_id(None, "stored-vertex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.name, "Vertex");
+        assert!(unchanged.lacks_jwt_subject());
         let (status, response) =
             update(&state, "stored-vertex", json!({"name": "Renamed", "jwt_subject": "admin@example.com"})).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["jwt_subject"], "admin@example.com");
-        stored.jwt.jwt_subject = Some("admin@example.com".into());
-        assert!(!stored.lacks_jwt_subject());
+        let updated = state
+            .store
+            .find_by_provider_id(None, "stored-vertex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(
+            updated
+                .jwt
+                .jwt_subject
+                .as_deref(),
+            Some("admin@example.com")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_the_subject_of_a_jwt_bearer_provider_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, response) = create(&state, jwt_bearer("named")).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let id = response["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id = id.as_str();
+        let (status, response) = update(&state, id, json!({"jwt_subject": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        let kept = state
+            .store
+            .find_by_provider_id(None, "named")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.jwt
+                .jwt_subject
+                .as_deref(),
+            Some("admin@example.com")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

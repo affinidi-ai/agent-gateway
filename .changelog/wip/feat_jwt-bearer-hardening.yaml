@@ -25,4 +25,11 @@ changes:
         can refuse a replayed assertion. Creating, updating or validating an oauth2_jwt_bearer
         credential provider without jwt_subject is refused with 400. A stored provider without
         it keeps working. Upgrade note: the next update of such a provider must set jwt_subject.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-03T09:00:00Z'
+      title: Refuse JWT bearer credential providers saved without a subject
+      description: >-
+        Creating, updating or validating an oauth2_jwt_bearer credential provider without
+        jwt_subject now answers 400, and so does any update of a stored provider that has none,
+        a signing key rotation included, until the request names one. Without domain-wide
+        delegation, a Google service account's subject is its own client_email.

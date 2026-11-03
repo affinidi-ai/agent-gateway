@@ -409,6 +409,7 @@ async fn token_request_metric_counts_nothing(world: &mut SurfaceWorld) {
 
 #[then("the token request metric is labelled only by provider type and outcome")]
 async fn token_request_metric_labels_are_bounded(world: &mut SurfaceWorld) {
+    let endpoint = token_endpoint(world).url();
     let exposition = crate::steps::then::scrape_prometheus(world).await;
     let samples: Vec<&str> = exposition
         .lines()
@@ -428,7 +429,9 @@ async fn token_request_metric_labels_are_bounded(world: &mut SurfaceWorld) {
                 .trim();
             assert!(matches!(key, "provider_type" | "outcome"), "unexpected label in {sample}");
         }
-        for leaked in [TARGET_AUTH_PROVIDER_ID, "http", TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN] {
+        for leaked in
+            [TARGET_AUTH_PROVIDER_ID, endpoint.as_str(), TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN]
+        {
             assert!(!labels.contains(leaked), "the labels of {sample} hold {leaked}");
         }
     }
