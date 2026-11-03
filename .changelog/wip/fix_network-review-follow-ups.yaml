@@ -8,8 +8,8 @@ changes:
       description: >-
         An external URL that does not parse, such as one with an out-of-range port, quietly
         stopped its listener sharing the outbound proxy with another listener of the same host.
-        The gateway now logs a warning naming the listener's id and the URL's position in its
-        list, never the URL, so a credential in it stays out of the log.
+        Each load of the configuration now logs a warning naming the listener's id and the URL's
+        position in its list, never the URL, so a credential in it stays out of the log.
   removed: []
   security:
     - timestamp: '2026-11-03T20:30:00Z'
@@ -19,7 +19,7 @@ changes:
         the other headers proxies and CDNs use to claim the client's address, host or scheme, such
         as True-Client-IP, CF-Connecting-IP, X-Client-IP and X-Original-Host, so a target that
         trusts the gateway as its proxy could still take the caller's claim. It now drops those
-        too, in any case and with underscores for dashes, and the docs list every header dropped.
+        too, in any letter case and with underscores for dashes, and the docs list every header.
     - timestamp: '2026-11-03T20:35:00Z'
       title: Bound and escape the caller's path on the log lines of a matched route
       description: >-
@@ -27,5 +27,6 @@ changes:
         INFO when the route matched, and again on the route matching and rewriting lines and when
         the surface's handler took it, so a long or crafted path could flood the log or show a
         capability id in full. Those lines now carry the path, its tail and its alias escaped,
-        cut to 256 characters and with capability ids shortened, like the unknown path line.
+        cut to 256 characters and with capability ids shortened, like the unknown path line, and
+        three lines that only repeated others are gone.
   breaking: []
