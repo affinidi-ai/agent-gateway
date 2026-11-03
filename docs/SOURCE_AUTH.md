@@ -37,8 +37,9 @@ per request ([`select_source_auth_method`](../src/source_auth/models.rs)) and ve
 that method:
 
 1. The method is the one whose credential the request carries: its header is present (for
-   JWT bearer, `token_header`; otherwise `extraction.field`), or, for mTLS, a client
-   certificate reached the gateway. No credential is read from the body, so a method that
+   JWT bearer, `token_header` holding a token in `token_scheme`, so an MPP
+   `Authorization: Payment` credential is not a JWT; otherwise `extraction.field`), or, for
+   mTLS, a client certificate reached the gateway. No credential is read from the body, so a method that
    extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
 2. A request that carries no method's credential is checked against the primary method, so
    it fails as a missing credential of that method.

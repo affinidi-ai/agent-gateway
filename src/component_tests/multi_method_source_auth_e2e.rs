@@ -138,9 +138,14 @@ async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
         403,
         "a caller presenting two valid credentials fails, so it can't choose the identity"
     );
+    assert_eq!(
+        send(&h, &[("authorization", "Payment cred".to_string()), ("x-api-key", API_KEY.to_string())]).await,
+        200,
+        "an Authorization value in another scheme, such as an MPP payment, is not the JWT credential"
+    );
 
     let received = target.received();
-    assert_eq!(received.len(), 2, "only authenticated callers are forwarded");
+    assert_eq!(received.len(), 3, "only authenticated callers are forwarded");
     for sent in &received {
         assert!(!sent.contains_key("authorization"), "{sent:?}");
         assert!(!sent.contains_key("x-api-key"), "{sent:?}");

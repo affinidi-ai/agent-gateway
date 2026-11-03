@@ -8,8 +8,9 @@ changes:
         first, so an agent called by internal users with a JWT and by partner agents with an API
         key needed two surfaces, and two identities. Every method in
         `caller_authentication.methods` now works: the gateway verifies each request with the
-        method whose credential the request carries (a header, or the client certificate for
-        mTLS), or with the first, primary, method when it carries none, refuses a request
+        method whose credential the request carries (a header, for JWT bearer one holding a
+        token in its scheme so an MPP `Authorization: Payment` credential is not a JWT, or the
+        client certificate for mTLS), or with the first, primary, method when it carries none, refuses a request
         carrying credentials for more than one method, and never retries a rejected credential
         with another method. Policy sees the method that verified the caller as
         `input.source_auth.method`. Saving a surface now validates every method and refuses two

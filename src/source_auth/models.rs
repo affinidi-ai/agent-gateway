@@ -268,11 +268,22 @@ impl SourceAuthConfig {
         }
     }
 
+    /// Whether the request carries this method's credential. A JWT bearer
+    /// header counts only when it holds a token in the method's scheme, as its
+    /// verifier reads it, so another scheme on the same header, such as an MPP
+    /// `Authorization: Payment` credential, is not taken for the JWT.
     fn is_presented(
         &self,
         headers: &axum::http::HeaderMap,
         has_client_certificate: bool,
     ) -> bool {
+        if let SourceAuthConfig::JwtBearer(config) = self {
+            let header_value = headers
+                .get(config.token_header.as_str())
+                .and_then(|value| value.to_str().ok());
+            return crate::jwt_bearer::validator::extract_bearer_with_scheme(header_value, &config.token_scheme)
+                .is_ok();
+        }
         match self.credential_source() {
             CredentialSource::Header(name) => headers.contains_key(name),
             CredentialSource::ClientCertificate => has_client_certificate,
@@ -1325,6 +1336,28 @@ mod tests {
             .rev()
             .collect();
         assert_eq!(selected_tag(&reversed, &both, false), ("api_key", true));
+    }
+
+    #[test]
+    fn selection_counts_a_jwt_header_only_in_the_methods_scheme() {
+        let methods: Vec<_> = jwt_and_api_key()
+            .into_iter()
+            .rev()
+            .collect();
+        for other_scheme in ["Payment cred", "bearer t", "Bearer "] {
+            let request = headers(&[("x-api-key", "k"), ("authorization", other_scheme)]);
+            assert_eq!(selected_tag(&methods, &request, false), ("api_key", false), "{other_scheme}");
+        }
+        let request = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+        assert_eq!(selected_tag(&methods, &request, false), ("api_key", true));
+
+        let any_scheme = method(serde_json::json!({
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": [], "token_scheme": ""
+        }));
+        assert!(
+            any_scheme.is_presented(&headers(&[("authorization", "Payment cred")]), false),
+            "a method without a scheme reads any value"
+        );
     }
 
     #[test]
