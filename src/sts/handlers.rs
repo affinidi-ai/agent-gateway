@@ -342,7 +342,7 @@ fn strategies_for_client(
     let (own, global): (Vec<_>, Vec<_>) = strategies
         .into_iter()
         .filter(|strategy| strategy.expected_issuer == issuer)
-        .filter(|strategy| strategy.tenant_id.is_none() || strategy.tenant_id.as_deref() == tenant_id)
+        .filter(|strategy| crate::tenancy::can_reference(tenant_id, strategy.tenant_id.as_deref()))
         .partition(|strategy| strategy.tenant_id.is_some());
     if own.is_empty() {
         global
