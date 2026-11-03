@@ -1097,6 +1097,14 @@ async fn scrape_trust_check_counter(
     query_type: &str,
     result: &str,
 ) -> u64 {
+    sum_labeled_counter(
+        &scrape_prometheus(world).await,
+        "agent_gateway_trust_check_total",
+        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
+    )
+}
+
+pub(crate) async fn scrape_prometheus(world: &SurfaceWorld) -> String {
     let infra = world
         .infra
         .as_ref()
@@ -1113,14 +1121,10 @@ async fn scrape_trust_check_counter(
         .await
         .unwrap_or_else(|error| panic!("read prometheus body from {url}: {error}"));
     assert!(status.is_success(), "prometheus scrape at {url} returned {status}; body: {body}");
-    sum_labeled_counter(
-        &body,
-        "agent_gateway_trust_check_total",
-        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
-    )
+    body
 }
 
-fn sum_labeled_counter(
+pub(crate) fn sum_labeled_counter(
     exposition: &str,
     metric_name: &str,
     required_labels: &[(&str, &str)],

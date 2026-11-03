@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::bdd_support::caller::post_json;
 use crate::bdd_support::config::target_auth::{
-    TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_TOKEN,
-    target_auth_signing_key,
+    TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
+    TARGET_AUTH_PROVIDER_TOKEN, target_auth_signing_key,
 };
 use crate::bdd_support::json_rpc::build_a2a_message_send_body;
 use crate::bdd_support::mock_server::{MockResponse, MockServer};
@@ -319,4 +319,117 @@ async fn delegation_audit_trail_has_no_record_containing(
     assert_eq!(response.status, 200, "reading the delegation audit trail answered {}", response.body);
     let trail = response.body.to_string();
     assert!(!trail.contains(&text), "the delegation audit trail contains {text:?}: {trail}");
+}
+
+#[given(expr = "the provider's JWT subject is {string}")]
+fn provider_jwt_subject_is(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    world
+        .surface_config
+        .target_auth_provider
+        .as_mut()
+        .expect("the surface must authenticate its target with a credential provider first")
+        .jwt_subject = Some(subject);
+}
+
+#[given("the target's credential provider answers token requests with no access token")]
+async fn target_credential_provider_answers_without_access_token(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    token_endpoint(world)
+        .set_response(MockResponse::json(json!({ "token_type": "Bearer" })))
+        .await;
+}
+
+fn assertion_claims(assertion: &str) -> Value {
+    use base64::Engine as _;
+    let payload = assertion
+        .split('.')
+        .nth(1)
+        .expect("an assertion has a payload");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("the assertion payload is base64url");
+    serde_json::from_slice(&bytes).expect("the assertion payload is JSON")
+}
+
+#[then(expr = "every JWT Bearer assertion the target's credential provider received has subject {string}")]
+async fn every_assertion_has_subject(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    let requests = token_requests(world).await;
+    assert!(!requests.is_empty(), "the token endpoint received no grant");
+    for request in requests {
+        let claims = assertion_claims(&request["assertion"]);
+        assert_eq!(claims["sub"], json!(subject), "the assertion's claims: {claims}");
+    }
+}
+
+#[then("no two JWT Bearer assertions the target's credential provider received share a jti")]
+async fn assertions_have_distinct_jti(world: &mut SurfaceWorld) {
+    let requests = token_requests(world).await;
+    assert!(requests.len() >= 2, "the token endpoint received {} grants", requests.len());
+    let mut seen = std::collections::HashSet::new();
+    for request in requests {
+        let claims = assertion_claims(&request["assertion"]);
+        let jti = claims["jti"]
+            .as_str()
+            .filter(|jti| !jti.is_empty())
+            .unwrap_or_else(|| panic!("the assertion carries no jti: {claims}"))
+            .to_string();
+        assert!(seen.insert(jti.clone()), "the jti {jti} was used twice");
+    }
+}
+
+const TOKEN_REQUEST_METRIC: &str = "agent_gateway_credential_provider_token_requests_total";
+
+#[then(expr = "the token request metric counts {int} {string} request(s) for provider type {string}")]
+async fn token_request_metric_counts(
+    world: &mut SurfaceWorld,
+    expected: u64,
+    outcome: String,
+    provider_type: String,
+) {
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    let counted = crate::steps::then::sum_labeled_counter(
+        &exposition,
+        TOKEN_REQUEST_METRIC,
+        &[("provider_type", provider_type.as_str()), ("outcome", outcome.as_str())],
+    );
+    assert_eq!(counted, expected, "{TOKEN_REQUEST_METRIC} for {provider_type} {outcome}");
+}
+
+#[then("the token request metric counts no requests")]
+async fn token_request_metric_counts_nothing(world: &mut SurfaceWorld) {
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    assert_eq!(crate::steps::then::sum_labeled_counter(&exposition, TOKEN_REQUEST_METRIC, &[]), 0);
+}
+
+#[then("the token request metric is labelled only by provider type and outcome")]
+async fn token_request_metric_labels_are_bounded(world: &mut SurfaceWorld) {
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    let samples: Vec<&str> = exposition
+        .lines()
+        .filter(|line| line.starts_with(TOKEN_REQUEST_METRIC))
+        .collect();
+    assert!(!samples.is_empty(), "the metric has no sample");
+    for sample in samples {
+        let labels = sample
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map_or("", |(labels, _)| labels);
+        for pair in labels.split(',') {
+            let key = pair
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            assert!(matches!(key, "provider_type" | "outcome"), "unexpected label in {sample}");
+        }
+        for leaked in [TARGET_AUTH_PROVIDER_ID, "http", TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN] {
+            assert!(!labels.contains(leaked), "the labels of {sample} hold {leaked}");
+        }
+    }
 }
