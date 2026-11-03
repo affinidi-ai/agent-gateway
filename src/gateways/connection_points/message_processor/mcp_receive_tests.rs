@@ -3192,3 +3192,215 @@ async fn fabric_tool_call_batch_flow() {
         );
     }
 }
+
+#[test]
+fn fabric_receive_selects_the_method_each_credential_belongs_to() {
+    run_in_own_process(fabric_multi_method_flow);
+}
+
+/// Fabric receive selects the caller authentication method as the direct path
+/// does. On a JWT + API key Access Point each credential alone is verified by
+/// its own method, a request carrying both fails as ambiguous, and an
+/// `Authorization` value in another scheme is not the JWT. Beside protected
+/// resource metadata a missing credential gets the discovery refusal and a
+/// failed API key a plain one, both before policy.
+async fn fabric_multi_method_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    const PARTNER_KEY: &str = "partner-key";
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        FilesystemSecretsStore::new_async(
+            temp_dir
+                .path()
+                .join("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    secrets
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "partners".into(),
+            secret_id: "partners".into(),
+            description: None,
+            value: PARTNER_KEY.into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let methods = json!([
+        {"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []},
+        {"type": "api_key", "secret_id": "partners", "extraction": {"source": "http_header", "field": "x-api-key"}}
+    ]);
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for surface in [
+        json!({
+            "surface_id": "multi", "name": "multi",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/multi", "protocol": "mcp",
+                "caller_authentication": {"methods": methods, "on_failure": "reject"}},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }),
+        json!({
+            "surface_id": "multi-discovery", "name": "multi-discovery",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+                "caller_authentication": {"methods": methods,
+                    "protected_resource": {"resource": "https://gateway.example/mcp",
+                        "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}}},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }),
+    ] {
+        store
+            .save(&serde_json::from_value::<AgentSurface>(surface).unwrap())
+            .await
+            .unwrap();
+    }
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        Some(secrets),
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str, path: &str, credentials: &[(&str, String)]| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        for (name, value) in credentials {
+            headers[*name] = json!(value);
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": path, "headers": headers,
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let body = |response: &Value| -> Value {
+        serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let token = |audience: &str| {
+        format!(
+            "Bearer {}",
+            sign_jwt(
+                json!({"iss": fixture.issuer, "sub": "user-1", "aud": audience, "exp": now_secs() + 300}),
+                &fixture.kid
+            )
+        )
+    };
+    let key = || ("x-api-key", PARTNER_KEY.to_string());
+
+    let jwt = send("multi", "/multi", &[("authorization", token("any"))]).await;
+    assert_eq!(jwt["status"], 200, "a JWT caller is verified by the JWT method: {jwt}");
+    let api_key = send("multi", "/multi", &[key()]).await;
+    assert_eq!(api_key["status"], 200, "an API key caller is verified by the API key method: {api_key}");
+    let payment = send("multi", "/multi", &[key(), ("authorization", "Payment cred".to_string())]).await;
+    assert_eq!(payment["status"], 200, "an Authorization value in another scheme is not the JWT: {payment}");
+    assert_eq!(reached(), 3);
+
+    let both = send("multi", "/multi", &[key(), ("authorization", token("any"))]).await;
+    assert_eq!(both["status"], 401, "a caller carrying two credentials fails as ambiguous: {both}");
+    assert_eq!(body(&both)["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{both}");
+    assert_eq!(reached(), 3, "an ambiguous caller never reaches the Target");
+
+    let missing = send("multi-discovery", "/mcp", &[]).await;
+    assert_eq!(missing["status"], 401, "{missing}");
+    assert!(
+        missing["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Bearer realm=\"agent-gateway\""),
+        "a missing credential gets the discovery refusal: {missing}"
+    );
+    assert_ne!(body(&missing)["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{missing}");
+    let wrong_key = send("multi-discovery", "/mcp", &[("x-api-key", "wrong".to_string())]).await;
+    assert_eq!(wrong_key["status"], 401, "a failed API key is refused before policy: {wrong_key}");
+    assert_eq!(
+        body(&wrong_key)["error"]["message"],
+        crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED,
+        "a failed API key gets the plain refusal, not the challenge: {wrong_key}"
+    );
+    assert_eq!(reached(), 3, "a refused caller never reaches the Target");
+
+    let discovery_key = send("multi-discovery", "/mcp", &[key()]).await;
+    assert_eq!(discovery_key["status"], 200, "{discovery_key}");
+    let discovery_jwt =
+        send("multi-discovery", "/mcp", &[("authorization", token("https://gateway.example/mcp"))]).await;
+    assert_eq!(discovery_jwt["status"], 200, "{discovery_jwt}");
+    assert_eq!(reached(), 5);
+}

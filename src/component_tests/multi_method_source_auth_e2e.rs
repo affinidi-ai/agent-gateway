@@ -11,24 +11,45 @@ use serde_json::json;
 const API_KEY_SECRET_ID: &str = "multi-method-source-key";
 const API_KEY: &str = "partner-key";
 const DENY_FAILED_POLICY_ID: &str = "deny-failed-source-auth";
+const API_KEY_ONLY_POLICY_ID: &str = "allow-api-key-callers";
 
-fn write_deny_failed_policy(temp_dir: &std::path::Path) {
+fn write_policy(
+    temp_dir: &std::path::Path,
+    id: &str,
+    description: &str,
+    policy: &str,
+) {
     let dir = temp_dir.join("policy_definitions");
     std::fs::create_dir_all(&dir).expect("create policy_definitions dir");
     let definition = json!({
-        "id": DENY_FAILED_POLICY_ID,
-        "name": DENY_FAILED_POLICY_ID,
-        "description": "Refuses callers whose source authentication failed",
+        "id": id,
+        "name": id,
+        "description": description,
         "policy_type": "agent_surface",
-        "policy": "package surface.policy\n\ndefault allow := false\n\nallow if not deny\n\ndeny if input.source_auth.method == \"failed\"\n",
+        "policy": policy,
         "enabled": true,
         "created_at": "2026-01-01T00:00:00Z"
     });
     std::fs::write(
-        dir.join(format!("{DENY_FAILED_POLICY_ID}.json")),
+        dir.join(format!("{id}.json")),
         serde_json::to_string_pretty(&definition).expect("serialize policy definition"),
     )
     .expect("write policy definition fixture");
+}
+
+fn write_policies(temp_dir: &std::path::Path) {
+    write_policy(
+        temp_dir,
+        DENY_FAILED_POLICY_ID,
+        "Refuses callers whose source authentication failed",
+        "package surface.policy\n\ndefault allow := false\n\nallow if not deny\n\ndeny if input.source_auth.method == \"failed\"\n",
+    );
+    write_policy(
+        temp_dir,
+        API_KEY_ONLY_POLICY_ID,
+        "Admits only callers an API key method verified",
+        "package surface.policy\n\ndefault allow := false\n\nallow if input.source_auth.method == \"api_key\"\n",
+    );
 }
 
 fn jwt_method(
@@ -55,7 +76,7 @@ async fn start_gateway(
     fixture: &JwksFixture,
     target: &RecordingTarget,
     methods: impl Fn(&str) -> serde_json::Value,
-    deny_failed: bool,
+    policy: Option<&'static str>,
 ) -> GatewayHarness {
     let target_url = target.url.clone();
     GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
@@ -67,15 +88,15 @@ async fn start_gateway(
             API_KEY_SECRET_ID,
             API_KEY,
         );
-        write_deny_failed_policy(temp_dir);
+        write_policies(temp_dir);
         let mut surface = helpers::build_minimal_channel();
         surface
             .access_point
             .caller_authentication =
             Some(serde_json::from_value(json!({ "methods": methods(strategy_id) })).expect("caller authentication"));
         surface.target.endpoint = target_url.clone();
-        surface.target.policy = deny_failed.then(|| crate::config::agent_surface::PolicyRef {
-            policy_definition_id: DENY_FAILED_POLICY_ID.to_string(),
+        surface.target.policy = policy.map(|id| crate::config::agent_surface::PolicyRef {
+            policy_definition_id: id.to_string(),
             require_agent_context: false,
         });
         gw_config.surfaces = vec![surface];
@@ -119,9 +140,13 @@ async fn send(
 async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
-    let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]), true)
-            .await;
+    let h = start_gateway(
+        &fixture,
+        &target,
+        |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]),
+        Some(DENY_FAILED_POLICY_ID),
+    )
+    .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200, "a JWT caller is authenticated");
@@ -157,7 +182,7 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
     let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)]), false)
+        start_gateway(&fixture, &target, |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)]), None)
             .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
@@ -173,6 +198,27 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
         received[1]
     );
     assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1]);
+}
+
+/// Policy sees the method that verified each caller: on one two-method
+/// surface a policy admitting only API key callers lets the API key caller
+/// through and refuses the JWT caller, though both authenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_sees_the_method_that_verified_the_caller() {
+    let fixture = JwksFixture::start().await;
+    let target = RecordingTarget::start(StatusCode::OK, &[]).await;
+    let h = start_gateway(
+        &fixture,
+        &target,
+        |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]),
+        Some(API_KEY_ONLY_POLICY_ID),
+    )
+    .await;
+    let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
+
+    assert_eq!(send(&h, &[("x-api-key", API_KEY.to_string())]).await, 200, "the API key caller is admitted");
+    assert_eq!(send(&h, &[("authorization", jwt)]).await, 403, "the verified JWT caller is not an API key caller");
+    assert_eq!(target.received().len(), 1);
 }
 
 /// A config reload runs the boot fallback: a stored surface whose methods break
