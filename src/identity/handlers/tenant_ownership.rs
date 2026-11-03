@@ -5,7 +5,8 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::a2a_proxies::A2aProxyStore;
-use crate::auth_manager::pat::PatResourceScope;
+use crate::auth_manager::middleware::AuthGuardOk;
+use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::authorities::AuthorityStore;
 use crate::gateways::GatewayStore;
 use crate::gateways::connection_points::ConnectionPointStore;
@@ -180,6 +181,8 @@ pub async fn reassign_ownership(
     Path((raw_kind, id)): Path<(String, String)>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(request): Json<ReassignOwnershipRequest>,
 ) -> Result<Json<OwnershipReassignmentResponse>, OwnershipApiError> {
     if context.is_some() || scope.is_some() {
@@ -216,7 +219,15 @@ pub async fn reassign_ownership(
     }
 
     let previous_tenant_id = resource.tenant_id;
-    persist_tenant_id(&state, kind, &id, request.tenant_id.clone()).await?;
+    let actor = crate::delegation_vault::audit::management_caller_context(
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        delegation
+            .as_ref()
+            .map(|Extension(delegation)| delegation.token_id.as_str()),
+    );
+    persist_tenant_id(&state, kind, &id, request.tenant_id.clone(), actor.as_ref()).await?;
 
     Ok(Json(OwnershipReassignmentResponse {
         kind: kind.to_string(),
@@ -229,7 +240,7 @@ pub async fn reassign_ownership(
 fn parse_owned_kind(raw: &str) -> Result<ResourceKind, OwnershipApiError> {
     let kind = ResourceKind::from_path_family(raw)
         .ok_or_else(|| OwnershipApiError::BadRequest(format!("Unsupported resource kind: {}", raw)))?;
-    if matches!(kind, ResourceKind::ApiKeys | ResourceKind::ConnectionPoints) {
+    if matches!(kind, ResourceKind::ApiKeys | ResourceKind::ConnectionPoints | ResourceKind::DelegationVault) {
         return Err(OwnershipApiError::BadRequest(format!(
             "{} ownership is inherited from its parent and cannot be reassigned directly",
             kind
@@ -279,6 +290,7 @@ async fn load_owned_resource(
             .map_err(internal)?
             .map(|resource| owned(kind, resource.id, resource.name, resource.tenant_id)),
         ResourceKind::Integrations => return Err(appliance_wide(kind)),
+        ResourceKind::DelegationVault => return Err(inherited(kind)),
         ResourceKind::Mediators => state
             .mediator_store
             .as_ref()
@@ -774,6 +786,7 @@ async fn persist_tenant_id(
     kind: ResourceKind,
     id: &str,
     tenant_id: Option<String>,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<(), OwnershipApiError> {
     match kind {
         ResourceKind::Gateways => {
@@ -818,10 +831,31 @@ async fn persist_tenant_id(
                 .map_err(|error| {
                     OwnershipApiError::Internal(format!("Surface reference validation failed: {:?}", error))
                 })?;
-            store
-                .save(&resource)
+            super::surface_tenancy::validate_external_consent_bindings(state, &resource)
                 .await
-                .map_err(internal)?;
+                .map_err(|error| match error {
+                    super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
+                    other => OwnershipApiError::Internal(format!("External consent validation failed: {other:?}")),
+                })?;
+            let allowlist = crate::egress::bdd_egress_allowlist();
+            super::surface_grants::write_surface(
+                &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
+                store.clone(),
+                id,
+                super::surface_grants::Stored::Any,
+                Some(&resource),
+                || async {
+                    store
+                        .save(&resource)
+                        .await
+                        .map_err(|error| super::surfaces::SurfaceApiError::InternalError(error.to_string()))
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                super::surfaces::SurfaceApiError::Unavailable(message) => OwnershipApiError::Refused(message),
+                other => OwnershipApiError::Internal(format!("Saving the surface failed: {other:?}")),
+            })?;
             super::surfaces::apply_surface_from_storage(state, id).await;
         }
         ResourceKind::Issuers => {
@@ -842,6 +876,7 @@ async fn persist_tenant_id(
                 .map_err(internal)?;
         }
         ResourceKind::Integrations => return Err(appliance_wide(kind)),
+        ResourceKind::DelegationVault => return Err(inherited(kind)),
         ResourceKind::Mediators => {
             let store = state
                 .mediator_store
@@ -865,17 +900,17 @@ async fn persist_tenant_id(
                 .trust_registry_store
                 .as_ref()
                 .ok_or_else(|| unavailable(kind))?;
-            let mut resource = store
-                .get(id)
+            store
+                .modify(
+                    id,
+                    Box::new(move |resource| {
+                        resource.tenant_id = tenant_id;
+                        resource.updated_at = chrono::Utc::now();
+                    }),
+                )
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
-            resource.tenant_id = tenant_id;
-            resource.updated_at = chrono::Utc::now();
-            store
-                .update(&resource)
-                .await
-                .map_err(internal)?;
         }
         ResourceKind::Authorities => {
             let store = state
@@ -956,6 +991,20 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            // Held until the provider is saved, so no surface write binds it
+            // after the check below found it unbound.
+            let _bindings = super::surface_grants::hold_provider_bindings_exclusively().await;
+            if resource.tenant_id != tenant_id {
+                let surfaces = state
+                    .agent_surface_store
+                    .as_ref()
+                    .ok_or_else(|| unavailable(ResourceKind::Surfaces))?
+                    .list_all()
+                    .await
+                    .map_err(internal)?;
+                refuse_moving_a_bound_provider(&surfaces, &resource.id)?;
+                refuse_a_taken_slug(store.as_ref(), tenant_id.as_deref(), &resource).await?;
+            }
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
             store
@@ -1114,12 +1163,62 @@ fn conflict_response(
 }
 
 /// Integrations, their endpoints and event sets belong to the whole appliance.
+/// Grants by binding belong to the surface they serve and move with it.
+fn inherited(kind: ResourceKind) -> OwnershipApiError {
+    OwnershipApiError::BadRequest(format!(
+        "{kind} ownership is inherited from its parent and cannot be reassigned directly"
+    ))
+}
+
 fn appliance_wide(kind: ResourceKind) -> OwnershipApiError {
     OwnershipApiError::BadRequest(format!("{kind} belong to the whole appliance and cannot be reassigned"))
 }
 
 /// A mediator the directory provides belongs to the whole appliance: its record is found
 /// by its owner, so a new owner would make the directory entry unusable.
+/// A credential provider that any surface binds, of any tenant, in its base or
+/// a variant, through `outbound_credentials` or a Transit Point's
+/// `transit_credentials`, cannot move to another tenant: its bindings would
+/// name another tenant's provider, and moving it back would serve the grants
+/// kept for them again. Remove the bindings first.
+fn refuse_moving_a_bound_provider(
+    surfaces: &[crate::config::agent_surface::AgentSurface],
+    credential_provider_id: &str,
+) -> Result<(), OwnershipApiError> {
+    if surfaces
+        .iter()
+        .any(|surface| super::surface_tenancy::bound_credential_provider_ids(surface).contains(credential_provider_id))
+    {
+        return Err(OwnershipApiError::Refused(
+            "The credential provider is bound by an agent surface, so it cannot move to another tenant; remove the \
+             binding first"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A provider's slug is unique within its tenant, so a provider cannot move
+/// into a tenant that already has another provider with its slug: both would
+/// answer the same callback path.
+async fn refuse_a_taken_slug(
+    store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+    tenant_id: Option<&str>,
+    provider: &crate::credential_providers::CredentialProvider,
+) -> Result<(), OwnershipApiError> {
+    match store
+        .find_by_provider_id(tenant_id, &provider.provider_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(other) if other.id != provider.id => Err(OwnershipApiError::Refused(format!(
+            "The tenant already has a credential provider with provider_id '{}', so this one cannot move to it",
+            provider.provider_id
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn refuse_provided_mediator(mediator: &crate::mediators::types::Mediator) -> Result<(), OwnershipApiError> {
     if mediator.provided {
         return Err(OwnershipApiError::Refused(
@@ -1199,6 +1298,90 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn a_provider_that_any_surface_binds_cannot_move_to_another_tenant() {
+        let surface = |tenant: &str, binding: serde_json::Value| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "surface_id": format!("surface-{tenant}"), "name": "surface", "tenant_id": tenant,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "https://managed.example/agent"},
+                "transit": {"points": [{"id": "tp-1", "alias": "vendor", "target_endpoint": "https://203.0.113.30/mcp",
+                    "require_transit_token": true, "transit_credentials": binding}]}
+            }))
+            .unwrap()
+        };
+        let external =
+            serde_json::json!({"credential_provider_id": "provider", "consent_mode": "external", "subject": "owner"});
+        let other = serde_json::json!({"credential_provider_id": "other-provider"});
+        for surfaces in [
+            vec![surface("tenant-a", external.clone())],
+            vec![surface("tenant-b", other.clone()), surface("tenant-c", external)],
+        ] {
+            let refused = refuse_moving_a_bound_provider(&surfaces, "provider").unwrap_err();
+            assert!(matches!(&refused, OwnershipApiError::Refused(message) if message.contains("bound")));
+            assert_eq!(
+                refused
+                    .into_response()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        assert!(refuse_moving_a_bound_provider(&[surface("tenant-a", other)], "provider").is_ok());
+        assert!(refuse_moving_a_bound_provider(&[], "provider").is_ok());
+    }
+
+    /// Slugs are unique per tenant, so a provider moves only into a tenant
+    /// with no other provider of its slug.
+    #[tokio::test]
+    async fn a_provider_cannot_move_into_a_tenant_that_has_its_slug() {
+        use crate::credential_providers::storage::CredentialProviderStorage;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+            directory
+                .path()
+                .join("providers"),
+        )
+        .await
+        .unwrap();
+        let provider = |id: &str, tenant: &str| -> crate::credential_providers::CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "tenant_id": tenant, "name": "GitHub", "provider_id": "github",
+                "provider_type": "oauth2_client_credentials", "token_endpoint": "https://github.example/token",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let moving = provider("moving", "tenant-a");
+        for stored in [moving.clone(), provider("taken", "tenant-b")] {
+            store
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let refused = refuse_a_taken_slug(&store, Some("tenant-b"), &moving)
+            .await
+            .unwrap_err();
+        assert!(matches!(&refused, OwnershipApiError::Refused(message) if message.contains("github")));
+        assert_eq!(
+            refused
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(
+            refuse_a_taken_slug(&store, Some("tenant-c"), &moving)
+                .await
+                .is_ok(),
+            "a tenant without the slug takes it"
+        );
+        assert!(
+            refuse_a_taken_slug(&store, Some("tenant-a"), &moving)
+                .await
+                .is_ok(),
+            "the provider's own slug does not count against it"
         );
     }
 

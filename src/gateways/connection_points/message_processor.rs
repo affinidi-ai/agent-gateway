@@ -4217,6 +4217,17 @@ pub(super) fn fabric_receive_transit_token(
     }
 }
 
+/// The `id` an Access Point refusal of a Fabric request answers: the JSON-RPC
+/// request's on an MCP surface, else none.
+fn refused_mcp_request_id(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body_bytes: &[u8],
+) -> Option<Value> {
+    (surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp)
+        .then(|| crate::mcp::request_validation::request_id_from_bytes(body_bytes))
+        .flatten()
+}
+
 pub(crate) async fn process_forward_request(message: &ReceivedMessage) -> ProcessingResult {
     process_forward_request_inner(message, None).await
 }
@@ -4929,9 +4940,10 @@ async fn process_charged_forward_request(
 
     // ── Unified source authentication ──────────────────────────────────────────
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable failures are non-blocking: the outcome is handed to the
-    // policy layer via `source_auth_context` below. Only server-side failures
-    // (setup/config resolution, internal errors) still block here (now 500).
+    // Caller-attributable failures are refused with 401 on an Access Point that
+    // publishes protected resource metadata or rejects failed callers; otherwise
+    // the outcome is handed to the policy layer via `source_auth_context` below.
+    // Server-side failures (setup/config resolution, internal errors) block with 500.
     // The caller connected to the sending gateway, so its address is not known here.
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
@@ -4939,6 +4951,20 @@ async fn process_charged_forward_request(
         trace_id: audit_trace_id,
         via_fabric: true,
     };
+
+    // A closed Access Point without source authentication is not ready: it
+    // refuses every request before source authentication, policy and the
+    // Target, as the direct path does.
+    if surface.refuses_every_request() {
+        return axum_response_to_forward_result(crate::source_auth::errors::refuse_unavailable_access_point(
+            &surface,
+            &audit_facts,
+            resolved_alias,
+            refused_mcp_request_id(&surface, &body_bytes),
+        ))
+        .await;
+    }
+
     let token_refused = |error| crate::audit::request_events::resource_token_failed(&audit_facts, error, None);
     // The protected resource the route publishes binds the caller's token
     // audience here as on the direct path, and its challenge answers a token
@@ -5083,26 +5109,35 @@ async fn process_charged_forward_request(
                 {
                     Ok(identity) => Some(identity),
                     // Caller-attributable failure. An Access Point that
-                    // publishes protected resource metadata answers it with
-                    // its challenge; otherwise record the outcome for the
-                    // policy layer and continue with no asserted caller identity.
+                    // publishes protected resource metadata, or whose caller
+                    // authentication rejects failures, refuses it; otherwise
+                    // record the outcome for the policy layer and continue with
+                    // no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
-                        let challenged = protected_resource.is_some();
+                        let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(
                             config_id,
                             "GW2: Source authentication failed (reason={}) — {}",
                             e,
-                            if challenged { "refusing before policy" } else { "deferring to policy" }
+                            if refused { "refusing before policy" } else { "deferring to policy" }
                         );
                         crate::audit::request_events::auth_failed(
                             &audit_facts,
                             crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
                             crate::audit::request_events::source_auth_reason(&e),
-                            challenged,
+                            refused,
                             None,
                         );
                         if let Some(protected_resource) = &protected_resource {
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                        }
+                        if refused {
+                            let refusal = crate::source_auth::errors::caller_refusal(
+                                &surface.access_point.protocol,
+                                &resolved_auth_config,
+                                refused_mcp_request_id(&surface, &body_bytes),
+                            );
+                            return axum_response_to_forward_result(refusal).await;
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),

@@ -43,6 +43,15 @@ pub struct DelegationVaultState {
     /// finish (set by orchestrator at startup; `None` only in test contexts).
     #[allow(dead_code)] // set on OAuth success paths; optional in tests
     pub vault_population_notifier: Option<SharedVaultPopulationNotifier>,
+
+    /// The test allow-list of authorization server and vendor fixtures the
+    /// connect API's token requests and revocations may reach; `None` in
+    /// production.
+    pub egress_allowlist: Option<String>,
+    /// gateway.json's `external_consent_resource_origins`.
+    pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
+    /// gateway.json's `external_consent_issuers`.
+    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// GET /api/v1/delegation-vault

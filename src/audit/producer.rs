@@ -179,6 +179,27 @@ where
     held.take()
 }
 
+/// Run `future` on a task of its own, in the request being served when there
+/// is one ([`crate::observability::policy_audit::spawn_in_request`]). Under
+/// [`capture`] in a test the task keeps the capture, so the records it submits
+/// are captured too; otherwise it holds no deferred scope, and its records are
+/// submitted as they come.
+pub fn spawn_audited<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if CAPTURING
+        .try_with(|_| ())
+        .is_ok()
+        && let Ok(held) = DEFERRED.try_with(Arc::clone)
+    {
+        return crate::observability::policy_audit::spawn_in_request(CAPTURING.scope((), DEFERRED.scope(held, future)));
+    }
+    crate::observability::policy_audit::spawn_in_request(future)
+}
+
 /// Holds the records submitted inside [`DeferredAudit::scope`] until the
 /// request's identity VP is known. Whatever has not been flushed when the
 /// guard is dropped is submitted without a VP, so no return path loses them.

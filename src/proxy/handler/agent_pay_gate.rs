@@ -6348,6 +6348,7 @@ pub(crate) mod tests {
                 secret_id: "key".to_string(),
             })],
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
         });
         assert!(!held_payments_unpollable(&paid), "a paid surface with source authentication");
         paid.target.payment_policy = None;

@@ -549,8 +549,86 @@ fn validated_token_endpoint(provider: &CredentialProvider) -> Result<&str> {
     Ok(endpoint)
 }
 
-/// POST a token request and read its JSON response, at most 64 KiB within 30 seconds.
-/// The access token must be a non-empty Bearer with an `expires_in` of up to 366 days.
+/// The largest answer a token endpoint may give.
+pub(crate) const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// How long a token request may take, from sending it to reading the last byte.
+pub(crate) const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a token endpoint answered: its status and its body.
+pub(crate) struct TokenEndpointAnswer {
+    pub status: reqwest::StatusCode,
+    pub body: zeroize::Zeroizing<Vec<u8>>,
+}
+
+/// Why a token request has no answer to read.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TokenPostFailure {
+    #[error("Provider token request failed")]
+    Unreachable(#[source] reqwest::Error),
+    #[error("Provider token response failed")]
+    ResponseFailed(#[source] reqwest::Error),
+    #[error("Provider token response too large")]
+    TooLarge,
+    #[error("Provider token request timed out")]
+    TimedOut,
+}
+
+/// POST `params` to the token endpoint `endpoint` through `client`, asking for
+/// JSON, with `authorization` as the `Authorization` header when one is given,
+/// and read the answer: at most [`MAX_TOKEN_RESPONSE_BYTES`] within
+/// [`TOKEN_REQUEST_TIMEOUT`]. Every token request the gateway sends goes
+/// through it, a service token's, a delegated token's refresh and the code
+/// exchange and refresh of external consent; each caller judges the answer.
+pub(crate) async fn post_token_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    params: &[(&str, &str)],
+    authorization: Option<&str>,
+) -> std::result::Result<TokenEndpointAnswer, TokenPostFailure> {
+    let operation = async {
+        let mut request = client
+            .post(endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .form(params);
+        if let Some(authorization) = authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, authorization);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(TokenPostFailure::Unreachable)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
+        {
+            return Err(TokenPostFailure::TooLarge);
+        }
+        let status = response.status();
+        let mut body = zeroize::Zeroizing::new(Vec::new());
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(TokenPostFailure::ResponseFailed)?
+        {
+            if body
+                .len()
+                .saturating_add(chunk.len())
+                > MAX_TOKEN_RESPONSE_BYTES
+            {
+                return Err(TokenPostFailure::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(TokenEndpointAnswer { status, body })
+    };
+    tokio::time::timeout(TOKEN_REQUEST_TIMEOUT, operation)
+        .await
+        .map_err(|_| TokenPostFailure::TimedOut)?
+}
+
+/// POST a token request ([`post_token_request`]) and read its JSON response. The
+/// access token must be a non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
 /// an error, and only its OAuth `error` fields are logged.
 async fn request_token(
@@ -560,30 +638,8 @@ async fn request_token(
     refresh: bool,
     client: &reqwest::Client,
 ) -> Result<Option<OAuthTokenResponse>> {
-    let operation = async {
-        let mut response = client
-            .post(endpoint)
-            .header("accept", "application/json")
-            .form(params)
-            .send()
-            .await
-            .context("Provider token request failed")?;
-        let status = response.status();
-        let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("Provider token response failed")?
-        {
-            anyhow::ensure!(
-                bytes
-                    .len()
-                    .saturating_add(chunk.len())
-                    <= 64 * 1024,
-                "Provider token response too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
+    {
+        let TokenEndpointAnswer { status, body: bytes } = post_token_request(client, endpoint, params, None).await?;
         if !status.is_success() {
             warn!(
                 target: "credential_delegation",
@@ -622,10 +678,7 @@ async fn request_token(
             "Invalid provider token credential"
         );
         Ok(Some(response))
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(30), operation)
-        .await
-        .context("Provider token request timed out")?
+    }
 }
 
 /// Build a consent-required payload for protocol-aware signaling
@@ -1433,6 +1486,14 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         };
 
         let consent =
@@ -1476,6 +1537,14 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         };
 
         // Test without signer (unsigned fallback)
@@ -1643,6 +1712,14 @@ mod tests {
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         };
 
         let vc = build_delegation_vc(

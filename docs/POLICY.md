@@ -271,13 +271,16 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid. The
-request continues with no caller identity, `input.source_auth` is
+A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
+it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
+refuse a missing or invalid credential with `401` before policy, see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
+does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A surface that
+vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -293,7 +296,7 @@ itself, with `401`, before any policy runs, so an outbound policy never sees
 Over Fabric, the sending Gateway strips the credential header its own surface consumed
 before forwarding. A receiving surface without protected resource metadata that requires
 source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
+forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input
@@ -474,6 +477,20 @@ blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
 
+A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
+more: the outbound forward sends it only to the origin of its provider's `resource`, through
+`egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point).
+
+The vendor clients of external consent, which carry a client's credentials or a person's token,
+ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
+connect directly: the fetch of an external consent provider's authorization server metadata,
+the code exchange and refresh, RFC 7009 revocation, and the forward of a request that carries a
+grant by binding. A proxy would resolve the host again and connect to an address nobody vetted,
+voiding the pin. The gateway warns at startup when a proxy variable is set. Every other pinned client, the authorization
+server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
+before; the proxy then resolves the host itself, so the pin does not hold through it.
+
 ```mermaid
 flowchart LR
     F[Forward step] --> V{"Target passes<br/>egress policy?"}
@@ -555,6 +572,23 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirects. The fetch has a 5-second timeout and a 64 KiB limit and runs in the
   background, off the request path. A blocked URL or a failed fetch yields no
   name; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#external-callers).
+- An **external consent provider's issuer metadata** is read when the provider
+  is created (`src/credential_providers/external.rs`), through
+  `authz_metadata::discover_client` under the Strict posture
+  (`egress::pinned_metadata_client`): `https` only, internal addresses blocked,
+  redirects refused, no proxy, a 64 KiB body and a 10-second timeout per step. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+- A grant's **RFC 7009 revocation** (`src/delegation_vault/revocation.rs`) goes
+  through `egress::pinned_vendor_client`: the Strict policy, `https`
+  only, pinned, redirects refused, no proxy, a 10-second timeout, and the response body is
+  never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
+  exact `http` or loopback fixture, never cloud metadata. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
+- A grant's **code exchange and refresh** (`src/delegation_vault/token_endpoint.rs`)
+  go to its provider's token endpoint through `egress::pinned_vendor_client` as
+  revocation does, with a 30-second timeout and a 64 KiB cap on the answer, whose
+  body is never logged or echoed. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
 
 Both helpers share one `pin_and_build` body.
 

@@ -84,6 +84,20 @@ fails closed with `403` at auth time unless the deployment configures
 and overwrites/strips the header before it reaches the gateway. UUID-backed
 resources are matched as `TENANT:<tenant>:<resource-kind>:<resource-id>`.
 
+`delegation-vault` is a resource kind for the connect API and the grants by binding only:
+`POST /api/v1/delegation-vault/connects`, `POST .../connects/{id}/complete`, and `GET` and
+`DELETE /api/v1/delegation-vault/grants[/{id}]`. Their handlers enforce it, naming a binding's
+grants by the surface they serve (`TENANT:<tenant>:delegation-vault:<surface id>`), and a
+tenant's token reaches only its own tenant's surfaces. Starting and completing a connect, and
+the report of a surface's grants, need the `delegation_vault.connect` feature scope, so a PAT
+provisioned for the connect API needs no `delegation_vault.view`; removing grants needs
+`delegation_vault.delete`. The removal routes refuse a resource-scoped token that names no
+tenant, as the vault's other writes do: only an operator purges a grant it cannot read. The
+vault's other routes (the agent-keyed tokens, the mass revoke and the delegation audit) are not
+a resource-scoped family, and a PAT with a `resource_pattern` is still refused there for
+anything but a read. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
+
 Header validation patterns are fully anchored and must match the entire sample
 value (`\d` matches one digit; use `\d{4}` for four).
 
@@ -161,6 +175,11 @@ Agent Surfaces and appliance-wide ones over Fabric, whatever its exposure mode s
 API keys and Connection Points take their ownership from their Agent Surface or Gateway
 parent, and every child ID is checked against the PAT pattern independently.
 
+A Credential Provider's `provider_id` slug is unique per tenant, and among the global
+providers. A provider with an `issuer` keeps its endpoints and client fields for
+life, so a PAT that may edit it can rename it but not repoint it; see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+
 MCP Proxy creation accepts an optional caller-chosen `id`, so a PAT's resource pattern can
 confine it to a prefix such as `mcp-proxies:boris-.*`. The value is 1 to 128 letters,
 digits, `-`, or `_`, starting with a letter or digit; a UUID is assigned when it is
@@ -223,7 +242,9 @@ Ownership changes are administrator-only: `GET
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
 reference would become incompatible. The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
-child API keys and Connection Points move with their parent.
+child API keys and Connection Points move with their parent. A credential provider that any
+surface binds, of any tenant, cannot move to another tenant (`409`); remove the bindings first
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#deleting-a-provider)).
 
 ## Dashboard
 

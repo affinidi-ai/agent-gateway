@@ -64,10 +64,35 @@ function MockSurfaceFormShell(props: any) {
       <button onClick={() => props.onApplyJsonPayload(JSON.parse(props.configEditorValue))}>
         Apply config
       </button>
+      <button
+        onClick={() => {
+          const ap = props.builder.state.nodes.find((n: any) => n.id === 'access-point');
+          props.builder.handleNodeUpdate('access-point', { ...ap.config, public: true });
+        }}
+      >
+        Turn on Public access
+      </button>
+      <button
+        onClick={() => {
+          const target = props.builder.state.nodes.find((n: any) => n.id === 'target');
+          props.builder.handleNodeUpdate('target', {
+            ...target.config,
+            endpoint: 'https://agent.example',
+          });
+        }}
+      >
+        Set target
+      </button>
+      <output data-testid="access-point-notice">{props.accessPointNotice ?? ''}</output>
       {props.manageActions}
     </div>
   );
 }
+
+jest.mock('../../utils/toaster', () => ({
+  ...jest.requireActual('../../utils/toaster'),
+  showToast: jest.fn(),
+}));
 
 if (typeof globalThis.crypto?.randomUUID !== 'function') {
   Object.defineProperty(globalThis, 'crypto', {
@@ -229,6 +254,90 @@ describe('AddSurfacePage default name and unsaved changes', () => {
   });
 });
 
+describe('AddSurfacePage caller access on create', () => {
+  const toast = showToast as jest.Mock;
+  let createSurface: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+    routingConfig.mockReset();
+    routingConfig.mockResolvedValue({
+      available_listen_addresses: ['https://gw.example'],
+      channel_path_prefix: [{ id: 'agents', name: 'Agents', prefix: '/agents' }],
+    });
+    jest.spyOn(apiClient, 'listSurfaces').mockResolvedValue([]);
+    createSurface = jest
+      .spyOn(apiClient, 'createSurface')
+      .mockResolvedValue({} as unknown as AgentSurface);
+  });
+
+  const create = () => {
+    fireEvent.click(screen.getByText('Set target'));
+    const button = screen.getByTestId('add-surface-create-button');
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+  };
+
+  const answeringWith = (warnings: string[]) =>
+    createSurface.mockImplementation(async (_payload, options) => {
+      options?.onWarnings?.(warnings);
+      return {} as AgentSurface;
+    });
+
+  it("creates a surface with no Caller Context and shows the response's not-ready warning", async () => {
+    const notReady =
+      'This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.';
+    answeringWith([notReady]);
+    renderPage();
+    await routeSeeded();
+
+    create();
+
+    await waitFor(() => expect(createSurface).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining(`created, with warnings:\n${notReady}`),
+        expect.anything()
+      )
+    );
+    expect(toast.mock.calls.filter(c => c[0] === 'error')).toEqual([]);
+    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toHaveLength(1);
+  });
+
+  it('shows the not-ready notice from the draft until Public access is on', async () => {
+    renderPage();
+    await routeSeeded();
+
+    expect(screen.getByTestId('access-point-notice')).toHaveTextContent(/^not_ready$/);
+    fireEvent.click(screen.getByText('Turn on Public access'));
+    expect(screen.getByTestId('access-point-notice')).toHaveTextContent(/^$/);
+  });
+
+  it("creates a public surface and shows the response's public warning once", async () => {
+    const publicMessage =
+      'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
+    answeringWith([publicMessage]);
+    renderPage();
+    await routeSeeded();
+    fireEvent.click(screen.getByText('Turn on Public access'));
+
+    create();
+
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining(`created, with warnings:\n${publicMessage}`),
+        expect.anything()
+      )
+    );
+    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toHaveLength(1);
+    expect(createSurface).toHaveBeenCalledTimes(1);
+    expect(createSurface.mock.calls[0][0].access_point.public).toBe(true);
+  });
+});
+
 function LocationProbe() {
   const location = useLocation();
   return (
@@ -286,7 +395,7 @@ describe('AddSurfacePage create warnings', () => {
 
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(showToast).toHaveBeenCalledWith(
-      'error',
+      'warning',
       expect.stringContaining(`created, with warnings:\n${warning}`),
       expect.objectContaining({ autoRemove: true })
     );

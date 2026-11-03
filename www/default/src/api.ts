@@ -1338,6 +1338,8 @@ export interface CallerAuthentication {
   methods: unknown[];
   /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
   protected_resource?: ProtectedResourceConfig | null;
+  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed`. */
+  on_failure?: 'reject' | 'continue';
 }
 
 export interface AgentSurface {
@@ -1356,6 +1358,8 @@ export interface AgentSurface {
     route: string;
     protocol: 'a2a' | 'ap2' | 'mcp';
     caller_authentication?: CallerAuthentication;
+    /** `true` admits callers without credentials. Absent on surfaces created before it existed. */
+    public?: boolean;
     caller_context?: { mode: 'required' | 'optional' | 'anonymous' };
     identity_resolution?: any;
     inbound_policy?: { policy_definition_id: string };
@@ -1431,6 +1435,12 @@ export interface AgentSurface {
    * callers with `source_auth`. Derived on every save; a write's value is ignored.
    */
   transit_point_source_auth?: boolean;
+  /**
+   * Read-only, set by the gateway on every surface response. `not_ready`: the
+   * Access Point is closed (`public: false`) with no caller authentication, so
+   * callers get 503 until one is added or Public access is turned on.
+   */
+  access_point_status?: AccessPointStatus;
 
   /** Non-blocking notes returned by a save; never sent back. */
   warnings?: SurfaceSaveWarning[];
@@ -1440,6 +1450,8 @@ export interface SurfaceSaveWarning {
   code: string;
   message: string;
 }
+
+export type AccessPointStatus = 'ready' | 'not_ready';
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
@@ -1604,12 +1616,17 @@ function withoutServerWrittenCanvases<S extends Partial<AgentSurface>>(surface: 
 }
 
 /**
- * Drops fields the server writes and refuses on input: save `warnings`, `transit_point_source_auth`
- * and `manifest_snapshot`, from the policies and from the canvas blobs.
+ * Drops fields the server writes and refuses on input: save `warnings`, the derived
+ * `access_point_status`, `transit_point_source_auth` and `manifest_snapshot`, from the
+ * policies and from the canvas blobs.
  */
 export function stripServerWrittenFields(surface: Partial<AgentSurface>): Partial<AgentSurface> {
   if (!surface || typeof surface !== 'object') return surface;
-  const { warnings: _warnings, ...rest } = withoutDerivedMarks(surface);
+  const {
+    warnings: _warnings,
+    access_point_status: _status,
+    ...rest
+  } = withoutDerivedMarks(surface);
   const out: Partial<AgentSurface> = withoutServerWrittenCanvases(rest);
   if (out.target) out.target = withoutServerWrittenPayment(out.target);
   if (Array.isArray(out.variants)) {

@@ -115,6 +115,16 @@ fn get_global_storage_config() -> StorageConfig {
         .unwrap_or_default()
 }
 
+/// Whether the stores created from now on encrypt what they write: at-rest
+/// encryption is enabled with a key from the environment, a file or KMS, not
+/// the development `local` key source, which writes plaintext.
+pub fn at_rest_encryption_active() -> bool {
+    get_global_storage_config()
+        .encryption_service
+        .as_ref()
+        .is_some_and(EncryptionService::encrypts_at_rest)
+}
+
 // ============================================================================
 // Core Traits
 // ============================================================================
@@ -1996,6 +2006,28 @@ impl<T: StorableEntity> StorageBackend<T> for CachedFilesystemStorage<T> {
 // Non-Cached Implementation (Always Read from Disk)
 // ============================================================================
 
+/// A stored record that cannot be read whenever it is asked again: it does not
+/// decrypt under the current key, or does not parse. Reading it failed because
+/// of the record, not because the disk or the key service failed, which the
+/// uncached store reports as other errors. Carries the failure's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UnreadableRecord(pub String);
+
+/// The error for a record that failed to decrypt with `error`: the key
+/// service's unavailability stays so, with `message`; anything else is an
+/// [`UnreadableRecord`].
+fn decryption_failure(
+    error: &anyhow::Error,
+    message: String,
+) -> anyhow::Error {
+    if error.is::<crate::encryption::EncryptionUnavailable>() {
+        anyhow::Error::new(crate::encryption::EncryptionUnavailable(message))
+    } else {
+        anyhow::Error::new(UnreadableRecord(message))
+    }
+}
+
 /// Filesystem storage without caching - always reads from disk
 ///
 /// This implementation does not maintain an in-memory cache and reads
@@ -2225,7 +2257,9 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 .context("File is encrypted but no encryptor available")?;
             {
                 // File was encrypted with encrypt_string, so read as UTF-8 string
-                let encrypted_str = String::from_utf8(content.clone()).context("Encrypted data is not valid UTF-8")?;
+                let encrypted_str = String::from_utf8(content.clone()).map_err(|_| {
+                    anyhow::Error::new(UnreadableRecord("Encrypted data is not valid UTF-8".to_string()))
+                })?;
                 encryption_service
                     .decrypt_file(&logged_file_to_load, &encrypted_str)
                     .map_err(|err| {
@@ -2237,12 +2271,12 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                             logged_file_to_load,
                             content.len(),
                         );
-                        anyhow::anyhow!(
-                            "Failed to decrypt entity {} {} from {:?}: {}",
-                            self.entity_name,
-                            logged_id,
-                            logged_file_to_load,
-                            err
+                        decryption_failure(
+                            &err,
+                            format!(
+                                "Failed to decrypt entity {} {} from {:?}: {}",
+                                self.entity_name, logged_id, logged_file_to_load, err
+                            ),
                         )
                     })?
                     .into_bytes()
@@ -2260,13 +2294,10 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 logged_file_to_load,
                 json_content.len(),
             );
-            anyhow::anyhow!(
+            anyhow::Error::new(UnreadableRecord(format!(
                 "Failed to deserialize {} {} from {:?}: {}",
-                self.entity_name,
-                logged_id,
-                logged_file_to_load,
-                serde_err
-            )
+                self.entity_name, logged_id, logged_file_to_load, serde_err
+            )))
         })?;
 
         entity.on_load(); // Allow post-load processing
@@ -3118,6 +3149,19 @@ mod tests {
     use base64::Engine;
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
+
+    /// A record that fails to decrypt because the key service is unavailable
+    /// stays so; one that fails by itself is unreadable.
+    #[test]
+    fn only_a_record_that_fails_by_itself_is_unreadable() {
+        let unavailable = anyhow::Error::new(crate::encryption::EncryptionUnavailable("KMS throttled".into()));
+        let failure = decryption_failure(&unavailable, "Failed to decrypt entity".into());
+        assert!(failure.is::<crate::encryption::EncryptionUnavailable>());
+        assert!(!failure.is::<UnreadableRecord>());
+        assert_eq!(failure.to_string(), "Failed to decrypt entity");
+        let refused = decryption_failure(&anyhow::anyhow!("AES-256-GCM decrypt failed"), "Failed to decrypt".into());
+        assert!(refused.is::<UnreadableRecord>());
+    }
 
     /// Helper to create an EncryptionService from a random key for tests
     fn test_encryption_service() -> (EncryptionService, [u8; 32]) {

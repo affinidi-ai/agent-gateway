@@ -7,6 +7,7 @@ import RouteListenerSection, {
 } from '../_shared/RouteListenerSection';
 import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCardLocationHelp';
 import FieldHelp from '../../../shared/FieldHelp';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import {
   A2A_PROXY_0_3_REASON,
   A2A_PROXY_SETTINGS,
@@ -16,6 +17,15 @@ import {
   isA2aValidation,
   selectedA2aValidation,
 } from './a2aSettings';
+
+const PUBLIC_ACCESS_HELP =
+  'Let anyone call this Access Point without credentials. Leave this off unless your agent is meant to be public.';
+
+export const LEGACY_ACCESS_POINT_TEXT =
+  'Not enforced (legacy): this Access Point is neither closed nor public, so a caller whose credential is missing or invalid reaches your policies.';
+export const CLOSE_ACCESS_POINT_LABEL = 'Close Access Point';
+export const CLOSING_ACCESS_POINT_TEXT =
+  'Closed when you save: a caller whose credential is missing or invalid is refused, and without a Caller Context every caller is refused.';
 
 const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   config,
@@ -34,6 +44,11 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   const a2aValidation = a2aView.envelopeOnly
     ? A2A_PROXY_SETTINGS.validation
     : selectedA2aValidation(config);
+  // A surface stored without `public` keeps its rules until the operator
+  // closes it, or turns Public access on; turning the switch off again
+  // returns it to the stored, legacy state.
+  const meta = useOptionalSurfaceMeta();
+  const legacy = meta?.legacyAccessPoint === true;
 
   return (
     <>
@@ -46,6 +61,71 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
         bannerLabel={ENTRY_POINT_URL_LABEL}
         bannerHelp={ENTRY_POINT_URL_HELP}
         bannerTestId="access-point-entry-point-url"
+        bannerFooter={
+          <div className="config-section access-point-public-access">
+            <Form.Check
+              type="switch"
+              id="ap-public-access"
+              className="access-point-public-switch"
+              data-testid="access-point-public-switch"
+              label={
+                <span className="d-flex align-items-center gap-1">
+                  Public access
+                  <FieldHelp
+                    testId="field-help-access-point-public"
+                    ariaLabel="About Public access"
+                  >
+                    {PUBLIC_ACCESS_HELP}
+                  </FieldHelp>
+                </span>
+              }
+              checked={config.public === true}
+              onChange={e =>
+                updateField('public', e.target.checked ? true : legacy ? undefined : false)
+              }
+            />
+            {legacy && typeof config.public !== 'boolean' && (
+              <Form.Text
+                className="d-block text-warning"
+                style={{ fontSize: '10px' }}
+                data-testid="access-point-legacy-notice"
+              >
+                <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
+                {LEGACY_ACCESS_POINT_TEXT}
+                {!meta?.readOnly && (
+                  <button
+                    type="button"
+                    className="btn btn-link btn-sm p-0 ms-1 align-baseline"
+                    style={{ fontSize: '10px' }}
+                    data-testid="access-point-close-button"
+                    onClick={() => updateField('public', false)}
+                  >
+                    {CLOSE_ACCESS_POINT_LABEL}
+                  </button>
+                )}
+              </Form.Text>
+            )}
+            {legacy && config.public === false && (
+              <Form.Text
+                className="d-block text-muted"
+                style={{ fontSize: '10px' }}
+                data-testid="access-point-closing-notice"
+              >
+                {CLOSING_ACCESS_POINT_TEXT}
+              </Form.Text>
+            )}
+            {config.public === true && (
+              <Form.Text
+                className="d-block text-warning"
+                style={{ fontSize: '10px' }}
+                data-testid="access-point-public-warning"
+              >
+                <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
+                Anyone who can reach this Access Point can call your agent without credentials.
+              </Form.Text>
+            )}
+          </div>
+        }
         replaceCommit={replaceCommit}
         hasAttemptedSave={hasAttemptedSave}
       />

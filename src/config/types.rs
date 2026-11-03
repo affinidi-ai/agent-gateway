@@ -155,7 +155,7 @@ fn default_pending_expiry_hours() -> u64 {
     1
 }
 
-/// Reconnect policy for connection-point DIDComm links (proposal section C).
+/// Reconnect policy for connection-point DIDComm links and trust registry connections.
 ///
 /// A failed connection is retried with exponential backoff up to
 /// `max_backoff_seconds`, after which it retries at that fixed interval
@@ -3029,7 +3029,7 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub oob_connection: OobConnectionConfig,
 
-    /// Reconnect policy for connection-point DIDComm links
+    /// Reconnect policy for connection-point DIDComm links and trust registry connections
     #[serde(default)]
     pub reconnect_policy: ReconnectPolicyConfig,
 
@@ -3135,6 +3135,20 @@ pub struct BootstrapConfig {
     /// `gateway.json` takes this value instead of the file's.
     #[serde(skip)]
     pub pinned_transit_token_max_lifetime_secs: Option<u64>,
+
+    /// `gateway.json`'s `external_consent_resource_origins` as the gateway
+    /// started with it ([`Self::pin_external_consent_resource_origins`]).
+    /// Every later load of `gateway.json` takes this value instead of the
+    /// file's.
+    #[serde(skip)]
+    pub pinned_external_consent_resource_origins: Option<std::collections::HashMap<String, Vec<String>>>,
+
+    /// `gateway.json`'s `external_consent_issuers` as the gateway started with
+    /// it, set or not ([`Self::pin_external_consent_issuers`]); `None` until
+    /// pinned. Every later load of `gateway.json` takes this value instead of
+    /// the file's.
+    #[serde(skip)]
+    pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// DID document cache configuration

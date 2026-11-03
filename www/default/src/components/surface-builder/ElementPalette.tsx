@@ -1,4 +1,4 @@
-import React, { useCallback, useState, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useState, useMemo, useRef } from 'react';
 import type { SurfaceNodeType } from './nodeTypes';
 import { registry } from './elements';
 import type { NodeDefinition, PaletteCategory } from './elements/types';
@@ -17,7 +17,14 @@ interface ElementPaletteProps {
   /** Called once when the user starts dragging any item. Used by the
    *  shell to auto-switch to the Surface view so the drop target appears. */
   onAnyDragStart?: () => void;
+  /**
+   * Points the user at one element: opens its section, scrolls to it and
+   * highlights it for a moment. Pass a new object for each request.
+   */
+  highlight?: { type: SurfaceNodeType } | null;
 }
+
+const HIGHLIGHT_MS = 2400;
 
 const CATEGORY_ORDER: PaletteCategory[] = [
   'transitPoints',
@@ -43,6 +50,7 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
   protocol,
   variant = 'overlay',
   onAnyDragStart,
+  highlight,
 }) => {
   const [hidden, setHidden] = useState(false);
   const [filter, setFilter] = useState('');
@@ -66,6 +74,30 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
       ),
     [protocol, agentPayOn]
   );
+
+  const [highlightedType, setHighlightedType] = useState<SurfaceNodeType | null>(null);
+  const itemRefs = useRef(new Map<SurfaceNodeType, HTMLDivElement>());
+
+  useEffect(() => {
+    if (!highlight) return;
+    const category = CATEGORY_ORDER.find(cat =>
+      (itemsByCategory[cat] || []).some(d => d.type === highlight.type)
+    );
+    if (!category) return;
+    setFilter('');
+    setExpanded(prev => ({ ...prev, [category]: true }));
+    setHighlightedType(highlight.type);
+    const timer = window.setTimeout(() => setHighlightedType(null), HIGHLIGHT_MS);
+    return () => window.clearTimeout(timer);
+  }, [highlight, itemsByCategory]);
+
+  useEffect(() => {
+    if (!highlightedType) return;
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+    itemRefs.current
+      .get(highlightedType)
+      ?.scrollIntoView?.({ block: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
+  }, [highlightedType]);
 
   const filterLower = filter.trim().toLowerCase();
 
@@ -151,9 +183,14 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
     return (
       <div
         key={def.type}
+        ref={el => {
+          if (el) itemRefs.current.set(def.type, el);
+          else itemRefs.current.delete(def.type);
+        }}
+        data-testid={`palette-item-${def.type}`}
         className={`palette-item ${disabled ? 'disabled' : ''} ${
           help?.type === def.type ? 'palette-item--help-open' : ''
-        }`}
+        } ${highlightedType === def.type ? 'palette-item--highlight' : ''}`}
         draggable={!disabled}
         onDragStart={e => handleDragStart(e, def)}
         onMouseDown={e => handleMouseDown(e, def)}

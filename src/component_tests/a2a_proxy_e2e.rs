@@ -1032,7 +1032,7 @@ async fn surface_api_settles_a2a_settings_on_a2a_proxy_surfaces() {
     let create = |route: &str, target: &str, variant_target: Option<&str>| {
         let mut body = json!({
             "name": route.trim_start_matches('/'), "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a", "public": true},
             "target": {"endpoint": target}
         });
         if target.starts_with("a2a-proxy://") {
@@ -1211,16 +1211,27 @@ const SOURCE_API_KEY_SECRET_ID: &str = "a2a-proxy-source-key";
 const SOURCE_API_KEY: &str = "valid-caller-key";
 
 async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
+    start_a2a_proxy_harness_with_caller_auth(fake_direct_line, crate::config::agent_surface::OnFailure::Continue).await
+}
+
+async fn start_a2a_proxy_harness_with_caller_auth(
+    fake_direct_line: &FakeDirectLine,
+    on_failure: crate::config::agent_surface::OnFailure,
+) -> GatewayHarness {
     let direct_line_base_url = fake_direct_line
         .base_url
         .clone();
     GatewayHarness::start(move |temp_dir, gw_config, _| {
         let mut surface = helpers::build_minimal_channel();
         surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
+        if on_failure == crate::config::agent_surface::OnFailure::Reject {
+            surface.access_point.public = Some(false);
+        }
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
             protected_resource: None,
+            on_failure,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
@@ -1298,6 +1309,43 @@ async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_sour
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_closed_a2a_proxy_access_point_refuses_a_failed_caller_before_the_proxy() {
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h =
+        start_a2a_proxy_harness_with_caller_auth(&fake_direct_line, crate::config::agent_surface::OnFailure::Reject)
+            .await;
+
+    for key in [None, Some("wrong-key")] {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "Hello, worker!" })]));
+        if let Some(key) = key {
+            request = request.header("x-api-key", key);
+        }
+        let response = request
+            .send()
+            .await
+            .expect("send request through gateway");
+        assert_eq!(response.status(), 401, "{key:?}");
+        let body: Value = response
+            .json()
+            .await
+            .expect("problem JSON");
+        assert_eq!(body["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{body}");
+    }
+    assert!(
+        fake_direct_line
+            .requests()
+            .is_empty(),
+        "a refused caller never reaches the proxy"
+    );
+
+    let body = send_a2a_text(&h, SOURCE_API_KEY).await;
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "unexpected response {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller() {
     let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
     let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
@@ -1338,7 +1386,7 @@ async fn an_undeclared_a2a_proxy_create_with_a_target_list_keeps_its_fixed_versi
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&json!({
             "name": "proxy-with-checks", "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a",
+            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a", "public": true,
                              "a2a": {"validation": "envelope"}},
             "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID,
                        "trust_check_list": [super::trust_check_e2e::api_trust_check("proxy-target")]},

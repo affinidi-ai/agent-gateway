@@ -107,22 +107,13 @@ impl TrqpClient for TrqpListenerClient {
         query_type: TrqpQueryType,
         params: &TrqpQueryParams,
     ) -> Result<TrqpOutcome, TrqpClientError> {
-        let connection = self
+        let registry_did = self
             .manager
-            .get_connection_clone(registry_id)
+            .registry_did_for(registry_id)
             .await
             .ok_or_else(|| {
-                TrqpClientError::Unreachable(format!("no active trust registry connection for id '{}'", registry_id))
+                TrqpClientError::Unreachable(format!("trust registry '{}' has no DID to query", registry_id))
             })?;
-
-        let registry_did = connection
-            .main_did
-            .clone()
-            .unwrap_or_else(|| {
-                connection
-                    .registry_did
-                    .clone()
-            });
 
         let request = build_request(query_type, params);
 

@@ -172,6 +172,9 @@ impl Default for RbacConfig {
         // every user's/agent's delegated OAuth grants gateway-wide, so both are admin-only.
         permissions.insert("delegation_vault.view".to_string(), "administrator".to_string());
         permissions.insert("delegation_vault.delete".to_string(), "administrator".to_string());
+        // Starting and completing external consent connects, and listing and removing grants by
+        // binding, for the surfaces a token may manage - Admin only.
+        permissions.insert("delegation_vault.connect".to_string(), "administrator".to_string());
         permissions.insert("notifications.view".to_string(), "user".to_string());
         permissions.insert("notifications.edit".to_string(), "poweruser".to_string());
         permissions.insert("notifications.delete".to_string(), "poweruser".to_string());
@@ -243,6 +246,8 @@ pub enum Feature {
     // Delegation Vault Management - admin only (enumerate / mass-revoke delegated OAuth grants)
     DelegationVaultView,
     DelegationVaultDelete,
+    /// Start and complete external consent connects, and list grants by binding.
+    DelegationVaultConnect,
 
     // Notification Management
     NotificationsView,
@@ -365,6 +370,7 @@ impl Feature {
             Feature::SecretsDelete => "secrets.delete",
             Feature::DelegationVaultView => "delegation_vault.view",
             Feature::DelegationVaultDelete => "delegation_vault.delete",
+            Feature::DelegationVaultConnect => "delegation_vault.connect",
             Feature::NotificationsView => "notifications.view",
             Feature::NotificationsEdit => "notifications.edit",
             Feature::NotificationsDelete => "notifications.delete",
@@ -571,6 +577,7 @@ mod tests {
             // Delegation-vault enumerate + mass-revoke of delegated OAuth grants
             Feature::DelegationVaultView,
             Feature::DelegationVaultDelete,
+            Feature::DelegationVaultConnect,
             // H10, H11
             Feature::ApiKeysView,
             Feature::ApiKeysEdit,

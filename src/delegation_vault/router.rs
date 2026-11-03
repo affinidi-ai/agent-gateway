@@ -7,22 +7,28 @@ use crate::{
 };
 use axum::{
     Router,
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 
 /// Create the delegation vault management API router.
 /// Management routes only — must be mounted inside the session-auth boundary.
 ///
-/// Every route is RBAC-gated when `gate` is `Some`: the two reads (list/get,
-/// which enumerate every user's/agent's grants) require `DelegationVaultView`
-/// and the two revokes (single + mass by-user) require `DelegationVaultDelete`
-/// — both admin-only by default. When `gate` is `None` (auth backend not
-/// configured) routes are returned ungated, matching the other management
-/// routers' pre-RBAC behaviour.
+/// Every route is RBAC-gated when `gate` is `Some`: the reads (list/get, which
+/// enumerate every user's/agent's tokens) require `DelegationVaultView`; the
+/// revokes (single + mass by-user) and the removals of grants by binding (one
+/// grant, or one binding's) require `DelegationVaultDelete`; starting and
+/// completing an external consent connect, and the report of a surface's
+/// grants by binding, require `DelegationVaultConnect`, so a token provisioned
+/// for the connect API never needs `DelegationVaultView`, whose reads are not
+/// filtered by tenant; all are admin-only by default. The connect API and the
+/// grants by binding also admit a tenant's token, for its own tenant's
+/// surfaces only. When `gate` is `None` (auth backend not configured) every
+/// route refuses.
 pub fn create_delegation_vault_router(
     state: DelegationVaultState,
     gate: Option<RbacGuard>,
 ) -> Router {
+    use super::connect_api;
     let g = gate.as_ref();
     let router = Router::new()
         .route("/api/v1/delegation-vault", maybe_gate(g, get(handlers::list_tokens), Feature::DelegationVaultView))
@@ -34,6 +40,26 @@ pub fn create_delegation_vault_router(
         .route(
             "/api/v1/delegation-vault/by-user/{user_hash}",
             maybe_gate(g, delete(handlers::revoke_user_tokens), Feature::DelegationVaultDelete),
+        )
+        .route(
+            "/api/v1/delegation-vault/connects",
+            maybe_gate(g, post(connect_api::start_connect), Feature::DelegationVaultConnect),
+        )
+        .route(
+            "/api/v1/delegation-vault/connects/{connect_id}/complete",
+            maybe_gate(g, post(connect_api::complete_connect), Feature::DelegationVaultConnect),
+        )
+        .route(
+            "/api/v1/delegation-vault/grants",
+            maybe_gate(g, get(connect_api::list_grants), Feature::DelegationVaultConnect),
+        )
+        .route(
+            "/api/v1/delegation-vault/grants",
+            maybe_gate(g, delete(connect_api::delete_binding_grants), Feature::DelegationVaultDelete),
+        )
+        .route(
+            "/api/v1/delegation-vault/grants/{grant_id}",
+            maybe_gate(g, delete(connect_api::delete_grant), Feature::DelegationVaultDelete),
         );
 
     let router = if let Some(gate) = gate {
@@ -196,6 +222,7 @@ mod tests {
         }
         async fn find_by_provider_id(
             &self,
+            _tenant_id: Option<&str>,
             _provider_id: &str,
         ) -> anyhow::Result<Option<CredentialProvider>> {
             unimplemented!()
@@ -275,6 +302,9 @@ mod tests {
             vc_signer: None,
             vc_issuer: None,
             vault_population_notifier: None,
+            egress_allowlist: None,
+            resource_origins: Default::default(),
+            issuers: Default::default(),
         }
     }
 
@@ -393,12 +423,223 @@ mod tests {
             ("GET", "/api/v1/delegation-vault/t1"),
             ("DELETE", "/api/v1/delegation-vault/t1"),
             ("DELETE", "/api/v1/delegation-vault/by-user/sha256:user-1"),
+            ("DELETE", "/api/v1/delegation-vault/grants/grant-1"),
+            ("DELETE", "/api/v1/delegation-vault/grants?surface_id=s&transit_point_id=tp&credential_provider_id=p"),
+            ("GET", "/api/v1/delegation-vault/grants?surface_id=s"),
+            ("POST", "/api/v1/delegation-vault/connects"),
+            ("POST", "/api/v1/delegation-vault/connects/connect-1/complete"),
         ] {
             let app = create_delegation_vault_router(state_with(vec![seed_token("t1")]), Some(gate.clone()))
                 .layer(Extension(AuthGuardOk("user-1".to_string())));
             let status = status_of(app, method, uri).await;
             assert_eq!(status, StatusCode::FORBIDDEN.as_u16(), "{method} {uri} must be 403 for a non-admin");
         }
+    }
+
+    /// A binding's grants are removed by binding or one by one. A readable one
+    /// is deleted and revoked; one that cannot be read is purged, unrevoked,
+    /// only for an operator, and the audit says so with its binding. A tenant's
+    /// token removes only its own tenant's grants, and none while one of them
+    /// cannot be read.
+    #[tokio::test]
+    async fn grants_are_removed_by_id_or_binding_and_unreadable_ones_only_by_an_operator() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::grants::tests::grant;
+        let directory = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PURGE_ROUTE_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        }
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "PURGE_ROUTE_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        let owner = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        let readable = GrantKey::caller(Some("tenant-a"), "surface", "tp-1", "provider", &"c".repeat(64)).unwrap();
+        let unreadable = GrantKey::caller(Some("tenant-a"), "surface", "tp-1", "provider", &"d".repeat(64)).unwrap();
+        for key in [&owner, &readable, &unreadable] {
+            vault
+                .store_grant(grant(key, "access"))
+                .await
+                .unwrap();
+        }
+        for key in [&owner, &unreadable] {
+            std::fs::write(
+                directory
+                    .path()
+                    .join("vault/delegated_grants")
+                    .join(format!("{}.json.enc", key.record_id())),
+                "not a grant",
+            )
+            .unwrap();
+        }
+        let mut state = state_with(Vec::new());
+        state.vault_store = vault.clone();
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = || {
+            create_delegation_vault_router(state.clone(), Some(gate_for(storage.clone())))
+                .layer(Extension(AuthGuardOk("admin-1".to_string())))
+        };
+        let tenant = |tenant_id: &str| {
+            app().layer(Extension(crate::tenancy::PatTenantContext {
+                token_id: "pat-t".to_string(),
+                tenant_id: tenant_id.to_string(),
+            }))
+        };
+
+        let by_id = format!("/api/v1/delegation-vault/grants/{}", owner.record_id());
+        assert_eq!(status_of(tenant("tenant-a"), "DELETE", &by_id).await, StatusCode::CONFLICT.as_u16());
+        let (status, events) = capture(async { status_of(app(), "DELETE", &by_id).await }).await;
+        assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].token_id.as_deref(), Some(owner.record_id().as_str()));
+        assert_eq!(events[0].detail.as_deref(), Some("vendor_revocation:skipped,reason:purged"));
+        assert_eq!(
+            events[0]
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.sub.as_deref()),
+            Some("admin-1")
+        );
+        assert_eq!(status_of(app(), "DELETE", &by_id).await, StatusCode::NOT_FOUND.as_u16());
+        assert_eq!(
+            status_of(app(), "DELETE", "/api/v1/delegation-vault/grants/pepper-fingerprint").await,
+            StatusCode::BAD_REQUEST.as_u16()
+        );
+
+        let by_binding = "/api/v1/delegation-vault/grants?surface_id=surface&transit_point_id=tp-1\
+                          &credential_provider_id=provider";
+        assert_eq!(
+            status_of(tenant("tenant-b"), "DELETE", &format!("{by_binding}&tenant_id=tenant-a")).await,
+            StatusCode::NOT_FOUND.as_u16(),
+            "another tenant's token never names this tenant"
+        );
+        let (status, body) = response_of(tenant("tenant-a"), "DELETE", by_binding).await;
+        assert_eq!(status, StatusCode::CONFLICT.as_u16(), "{body}");
+        assert_eq!(
+            vault
+                .binding_grant_ids(&owner.binding())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a tenant's request deletes nothing while one of the grants cannot be read"
+        );
+        let ((status, body), events) =
+            capture(async { response_of(app(), "DELETE", &format!("{by_binding}&tenant_id=tenant-a")).await }).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["removed"], 1);
+        assert_eq!(body["grant_ids"], serde_json::json!([readable.record_id()]));
+        assert_eq!(body["purged"], serde_json::json!([unreadable.record_id()]));
+        let purge = events
+            .iter()
+            .find(|event| {
+                event.token_id.as_deref()
+                    == Some(
+                        unreadable
+                            .record_id()
+                            .as_str(),
+                    )
+            })
+            .expect("the purge is audited");
+        assert_eq!(purge.surface_id.as_deref(), Some("surface"), "the audit names the binding's surface");
+        assert_eq!(purge.provider_id.as_deref(), Some("provider"), "and its provider");
+        assert_eq!(
+            purge.detail.as_deref(),
+            Some(r#"vendor_revocation:skipped,reason:purged,tenant:"tenant-a",transit_point:"tp-1""#),
+            "and its tenant and Transit Point"
+        );
+        assert!(
+            vault
+                .binding_grant_ids(&owner.binding())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// After the identity hash pepper changed, a binding's grants are filed
+    /// under ids the gateway can no longer derive: the purge by binding says
+    /// so with `409` and purges nothing, rather than answering that there was
+    /// nothing to purge.
+    #[tokio::test]
+    async fn a_binding_purge_under_another_pepper_answers_409_and_purges_nothing() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::grants::tests::grant;
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let directory = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PURGE_ROUTE_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        }
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "PURGE_ROUTE_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        let owner = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+            .await
+            .unwrap()
+            .store_grant(grant(&owner, "access"))
+            .await
+            .unwrap();
+        let stored = directory
+            .path()
+            .join("vault/delegated_grants")
+            .join(format!("{}.json.enc", owner.record_id()));
+        assert!(stored.exists());
+
+        configure_pepper_bytes_for_tests(&[2; 32]);
+        let mut state = state_with(Vec::new());
+        state.vault_store = Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        let by_binding = "/api/v1/delegation-vault/grants?tenant_id=tenant-a&surface_id=surface&transit_point_id=tp-1\
+                          &credential_provider_id=provider";
+        let ((status, body), events) = capture(async { response_of(app, "DELETE", by_binding).await }).await;
+        assert_eq!(status, StatusCode::CONFLICT.as_u16(), "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "identity_hash_pepper_mismatch", "{body}");
+        let error = body["error"]
+            .as_str()
+            .unwrap();
+        assert!(error.contains("another identity hash pepper"), "{error}");
+        assert!(error.contains("delegated_grants"), "the answer says where the ids are: {error}");
+        assert!(stored.exists(), "nothing is purged");
+        assert!(events.is_empty(), "nothing is audited as purged");
+    }
+
+    /// The report of grants by binding needs `delegation_vault.connect`, which
+    /// a token provisioned for the connect API holds, not
+    /// `delegation_vault.view`, which also opens the legacy reads of every
+    /// tenant's agent-keyed tokens.
+    #[tokio::test]
+    async fn the_grants_report_needs_the_connect_permission_not_the_legacy_view() {
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = |scope: &str| {
+            create_delegation_vault_router(state_with(Vec::new()), Some(gate_for(storage.clone())))
+                .layer(Extension(PatContext(Some(vec![scope.to_string()]))))
+                .layer(Extension(AuthGuardOk("admin-1".to_string())))
+        };
+        let report = "/api/v1/delegation-vault/grants?surface_id=surface";
+        assert_eq!(status_of(app("delegation_vault.view"), "GET", report).await, StatusCode::FORBIDDEN.as_u16());
+        assert_ne!(status_of(app("delegation_vault.connect"), "GET", report).await, StatusCode::FORBIDDEN.as_u16());
     }
 
     // ── A PAT whose scopes exclude the feature is denied even for an admin ──

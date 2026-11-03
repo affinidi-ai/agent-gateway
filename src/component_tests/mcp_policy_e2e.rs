@@ -33,7 +33,7 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .json(&json!({
             "name": "protocol-mode", "status": "disabled", "mcp_protocol_mode": "dual",
             "mcp_http": {"allowed_origins": ["https://console.example"], "max_request_bytes": 4096},
-            "access_point": {"listen_address": harness.gateway_base, "route": "/protocol-mode", "protocol": "mcp"},
+            "access_point": {"listen_address": harness.gateway_base, "route": "/protocol-mode", "protocol": "mcp", "public": true},
             "target": {"endpoint": harness.mock.url()},
             "transit": {"points": [point.clone()]},
             "variants": [{"id": "mode-variant", "alias": "test", "name": "test", "enabled": true,
@@ -113,6 +113,16 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .await
         .unwrap();
     assert_eq!(ignored.status(), 200);
+    assert!(
+        ignored
+            .headers()
+            .get_all("warning")
+            .iter()
+            .any(|value| value
+                .to_str()
+                .is_ok_and(|value| value.contains(crate::config::agent_surface::PUBLIC_ACCESS_POINT_WARNING))),
+        "a save of a public Access Point says so in a Warning header"
+    );
     let ignored: serde_json::Value = ignored.json().await.unwrap();
     assert!(
         ignored
@@ -133,7 +143,15 @@ async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropp
         .json(&json!({"mcp_protocol_mode": null, "mcp_http": null, "transit": original["transit"], "variants": original["variants"]}))
         .send().await.unwrap();
     assert_eq!(response.status(), 200);
-    let removed: serde_json::Value = response.json().await.unwrap();
+    let mut removed: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        removed
+            .as_object_mut()
+            .unwrap()
+            .remove("access_point_status"),
+        Some(json!("ready")),
+        "the status is derived, never stored"
+    );
     for path in mode_paths {
         assert!(
             removed
@@ -831,7 +849,7 @@ async fn mcp_metadata_patch_null_removes_persisted_preference() {
     let created = client.post(&collection).json(&json!({
         "name": "metadata-rollback", "status": "disabled",
         "mcp_legacy_metadata_output": "canonical",
-        "access_point": { "listen_address": harness.gateway_base, "route": "/metadata-rollback", "protocol": "mcp" },
+        "access_point": { "listen_address": harness.gateway_base, "route": "/metadata-rollback", "protocol": "mcp", "public": true },
         "target": { "endpoint": harness.mock.url() }
     })).send().await.unwrap();
     assert_eq!(created.status(), 201);
@@ -905,7 +923,7 @@ async fn mcp_metadata_response_keeps_snapshot_during_reload() {
         .unwrap();
     let response = client.post(&collection).json(&json!({
         "name": "metadata-snapshot", "mcp_legacy_metadata_output": "canonical",
-        "access_point": { "listen_address": listener.origin().ascii_serialization(), "route": "/smoke/metadata-snapshot", "protocol": "mcp" },
+        "access_point": { "listen_address": listener.origin().ascii_serialization(), "route": "/smoke/metadata-snapshot", "protocol": "mcp", "public": true },
         "target": { "endpoint": harness.mock.url() }
     })).send().await.unwrap();
     assert_eq!(response.status(), 201);
@@ -1515,6 +1533,7 @@ async fn access_point_tool_scoped_credentials_flow() {
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
             protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),

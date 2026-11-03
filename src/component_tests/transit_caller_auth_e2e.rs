@@ -596,12 +596,15 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
         .unwrap();
     assert_eq!(
         warnings,
-        vec![format!(
-            "299 - \"Transit Point 'open' serves callers it does not authenticate and is reachable from other \
-             hosts: 0.0.0.0:{inbound_port}, {PUBLIC_OUTBOUND_URL}\""
-        )],
-        "the outbound listener's public URL, and the inbound listener that binds every address and passes \
-         /outbound on because it shares the outbound listener's host"
+        vec![
+            format!("299 - \"{}\"", crate::config::agent_surface::ACCESS_POINT_NOT_READY_WARNING),
+            format!(
+                "299 - \"Transit Point 'open' serves callers it does not authenticate and is reachable from other \
+                 hosts: 0.0.0.0:{inbound_port}, {PUBLIC_OUTBOUND_URL}\""
+            )
+        ],
+        "the closed Access Point's own warning first, then the outbound listener's public URL, and the inbound \
+         listener that binds every address and passes /outbound on because it shares the outbound listener's host"
     );
 
     let before = requests_seen(&h);

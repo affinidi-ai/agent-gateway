@@ -23,6 +23,10 @@ pub enum RefreshError {
     NotRefreshable,
     #[error("Credential refresh response is invalid")]
     InvalidResponse,
+    /// The refreshed credential may or may not have been written: the write
+    /// itself failed, or the task that ran it.
+    #[error("Credential refresh outcome is unconfirmed")]
+    Unconfirmed,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -93,6 +93,190 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
 
 Concurrent requests that all miss the cache each request a token; the last one stored wins.
 
+A provider's `provider_id` slug is unique per tenant, and among the untenanted providers. The
+slug is compared as stored, trimmed and in lower case.
+
+### External consent providers
+
+A provider with an `issuer` is an external consent provider: one OAuth client of one
+authorization server, whose grants another system obtains through the browser with the
+[connect API](#the-connect-api) and the gateway keeps in the vault by binding. Its fields:
+
+| Field | Rule |
+| --- | --- |
+| `provider_type` | `oauth2_authorization_code` |
+| `issuer` | An `https` issuer without credentials, query or fragment |
+| `authorization_endpoint`, `token_endpoint` | Required |
+| `revocation_endpoint` | The RFC 7009 endpoint, exactly when the issuer's metadata names one |
+| `client_id` | Required, a plain value: a client id is not a secret. `client_id_secret_ref` is refused |
+| `token_endpoint_auth_method` | `none`, `client_secret_basic`, `client_secret_post` or `private_key_jwt`. `client_secret_secret_ref` is required for `client_secret_basic` and `client_secret_post` and refused for the others |
+| `jwt_signing_key_secret_ref`, `jwt_certificate_secret_ref`, `jwt_key_id`, `jwt_signing_algorithm` | Only with `private_key_jwt`, the [signed-JWT settings](#providers-that-sign-a-jwt) of an `oauth2_client_credentials_jwt_auth` provider: the signing key is required and the algorithm is `PS256` (the default) or `RS256`. The key and certificate are checked when the provider is created. `jwt_audience` is refused, since the assertion is always addressed to the issuer, and so are `jwt_issuer` and `jwt_subject`, since the client is the issuer and subject of its assertion. Without `private_key_jwt` all are refused |
+| `callback_url` | Required, `https`: the redirect URI the other system registered |
+| `resource` | Required, a canonical public `https` URI (RFC 8707): the protected resource the grants are for. Its origin is the only one a Transit Point sends the provider's grants to ([External consent on a Transit Point](#external-consent-on-a-transit-point)), and it must be permitted for the issuer (below). The API returns it as `resource_origin`, so a client can show the person where the grant will go |
+| `allow_unadvertised_pkce` | Optional, `false` by default. `true` admits an issuer whose metadata does not list `code_challenge_methods_supported`; see below |
+| `scope_comparison` | Optional, `exact` by default: how the scopes the token endpoint grants are compared with those asked for ([Granted scopes](#granted-scopes)) |
+| `revocation_ends_authorization` | Optional, `false` by default. `true` for a vendor whose revocation of any one token ends the person's whole authorization of the client, as Google's does ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)) |
+| `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
+
+An external consent provider uses its own tenant's secrets only, for its client secret, its
+signing key and its certificate: never an untenanted secret, nor another tenant's, since its
+client authenticates at endpoints its tenant chose. An untenanted provider uses untenanted
+secrets only. Both are checked when the provider is created and again on every use, so a
+provider moved to another tenant stops using the secrets of the one it left. A provider without
+an `issuer` may use its own tenant's secrets or untenanted ones.
+
+Every endpoint, and `resource`, must be an `https` URL without credentials or fragment whose
+host is no literal loopback, private, link-local or cloud-metadata address (the Strict egress
+posture's static check). At create only the issuer's metadata fetch resolves a name; a vendor
+name that resolves to a blocked address is refused when the gateway calls it, since every call
+to a vendor endpoint goes through pinned Strict egress. A provider without an `issuer` cannot
+set `revocation_endpoint`, `token_endpoint_auth_method`, `client_id`, `allow_unadvertised_pkce`,
+`scope_comparison` or `revocation_ends_authorization`, the last three of which are fixed for the
+provider's life.
+
+A provider's resource must be permitted for its issuer. By default its host must be the
+issuer's host or one of its subdomains: for the issuer `https://mcp.notion.com`, a resource on
+`mcp.notion.com` or `api.mcp.notion.com`, but not `api.notion.com`, `evil-notion.com`,
+`mcp.notion.com.evil.example` or a look-alike name. Hosts are compared as the URL parser
+normalises them, in lower case and with international names in punycode, label by label; an IP
+address permits only itself. Any other resource origin must be listed for the issuer's origin
+in `external_consent_resource_origins` in `gateway.json`, which only the operator's file sets:
+
+```json
+"external_consent_resource_origins": {
+  "https://accounts.google.com": ["https://www.googleapis.com"]
+}
+```
+
+Each key and value is an exact `https` origin: no wildcard, path, userinfo, query or fragment,
+and a host that is an IP address or a plain DNS name (letters, digits and `-` in each label).
+List each host on its own: `https://*.googleapis.com` is not a wildcard. An entry that is not
+such an origin permits nothing, not even the literal origin it spells, and is named in an `ERROR`
+at startup. The value is read once, when the gateway starts: provider create, surface save and
+every request use it, and a configuration reload keeps it, with a `WARN` when the file says
+otherwise, so a change takes a restart.
+The rule is checked when the provider is created (`400`, `provider_resource_not_permitted`),
+when a surface binds the provider (`400`), and again whenever a grant is released: a provider
+whose resource is no longer permitted, because its entry was removed, releases nothing, and the
+log names the reason `resource_not_permitted_for_issuer`. The default compares hosts rather
+than registrable domains, so an issuer and a resource on sibling subdomains of one site need an
+entry: telling a site's own subdomains from other customers' on a shared suffix needs the public
+suffix list, which the gateway does not carry.
+
+When the provider is created, the gateway reads the issuer's authorization server metadata
+(RFC 8414, then OpenID Connect discovery) under the client profile of
+[`authz_metadata`](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference),
+through a pinned, bounded fetch under the Strict posture, and refuses the provider unless:
+
+- the metadata's `issuer` equals the provider's byte for byte;
+- the authorization, token and revocation endpoints are the ones the metadata names, byte for
+  byte, a revocation endpoint included exactly when the metadata names one;
+- `token_endpoint_auth_methods_supported` lists the provider's method, or, when the metadata
+  lists none, the method is `client_secret_basic` (the RFC 8414 default), so `private_key_jwt`
+  needs a server that lists it;
+- `code_challenge_methods_supported` includes `S256`. A document that does not list the methods
+  is refused too: the MCP authorization specification (`2025-11-25` and later) tells clients to
+  refuse to proceed with such a server, and a server that ignores `code_challenge` would void
+  the PKCE verifier. The one exception is a provider that sets `allow_unadvertised_pkce: true`,
+  for a server known to enforce S256 without listing it, such as Microsoft Entra ID. The
+  exception never admits a list without `S256`.
+
+The gateway records the metadata's `authorization_response_iss_parameter_supported` (RFC 9207)
+on the provider; a request cannot set it. A connect for such a provider is completed only with
+the `iss` the authorization response carried ([The connect API](#the-connect-api)). So is a
+connect for a provider created before the gateway recorded it: nothing says its issuer omits
+`iss`. Recreate such a provider for an issuer that sends none.
+
+#### Granted scopes
+
+A token answer's `scope` names what the token holds, in the vendor's own words. Vendors add
+standard identity scopes nobody asked for, and rename the ones asked for, so a byte-for-byte
+comparison would refuse grants that are no wider. A provider names its vendor's habits with
+`scope_comparison` ([`src/credential_providers/scope_comparison.rs`](../src/credential_providers/scope_comparison.rs)):
+
+| `scope_comparison` | Compared as | Not taken for a wider grant |
+| --- | --- | --- |
+| `exact` (default) | Written, case included (RFC 6749 scope tokens are case-sensitive) | Nothing |
+| `oidc` | Written | `openid`, `offline_access` |
+| `google` | Written | `openid`, `email`, `profile`, and Google's spelling of the last two, `https://www.googleapis.com/auth/userinfo.email` and `.../userinfo.profile` |
+| `microsoft` | Without case, and without the resource that qualifies a name: `https://graph.microsoft.com/Mail.Read` is `mail.read`, as is `Mail.Read` (an Entra token is for one resource) | `openid`, `profile`, `email`, `offline_access`, `User.Read`, which reads the signed-in person's own profile and which Entra gives every app registration by default |
+
+Whatever the comparison, a granted scope that is neither one asked for nor one of those is a
+wider grant, and refused (`scope_widened` on a connect, `connect_required` on a refresh, the
+tokens revoked). That includes a scope the person consented to the same client for another
+connect, which Entra reports with every grant and Google with `include_granted_scopes`. The
+default is the safe one: a vendor whose habits nobody vouched for gets nothing beyond what was
+asked for, in the very words asked for. The grant keeps both: `scopes`, as the vendor named
+them, and the scopes the connect asked for, which every refresh asks for again.
+
+`microsoft` is for Microsoft Entra ID only. It takes `https://outlook.office.com/Mail.Read` and
+`https://graph.microsoft.com/Mail.Read` for one scope, which is safe at Entra, whose token is for
+the one resource the provider pins; at a vendor whose scopes are URL paths it would take
+different scopes, such as `.../projects/read` and `.../admin/read`, for one.
+
+#### Permitted issuers
+
+The checks above show that a provider matches its issuer's metadata, not that the issuer is a
+vendor anyone meant to trust: whoever creates a provider can name an issuer whose metadata it
+serves itself, with its own token endpoint, which would then receive the authorization code and
+the PKCE verifier, and with a resource on its own host. On a gateway whose provider creators
+are not the operator, such as a pool gateway that another system provisions, the operator lists
+the issuers it trusts in `external_consent_issuers` in `gateway.json`, which only the
+operator's file sets:
+
+```json
+"external_consent_issuers": {
+  "https://mcp.linear.app": [],
+  "https://mcp.notion.com": [],
+  "https://accounts.google.com": ["https://oauth2.googleapis.com"]
+}
+```
+
+Each key is an issuer identifier, compared with the provider's `issuer` exactly, as RFC 8414
+compares issuers; it must be an `https` issuer with a plain host and no credentials, query or
+fragment. Its value lists the origins, exact as in `external_consent_resource_origins`, that the
+issuer's authorization, token and revocation endpoints and its metadata's `jwks_uri` may use
+when they are not on the issuer's own host (any port of that host; a subdomain is another host).
+With the setting, a provider is permitted only when its issuer is listed and each of those
+endpoints is on the issuer's host or has a listed origin. An empty object permits no issuer.
+Without the setting, an operator's token may name any issuer whose metadata the provider
+matches, as before, but a tenant's token cannot create a provider with an issuer at all (`400`,
+`external_consent_issuers_required`, telling the operator to set the list), since the tenant
+would choose the endpoints its client authenticates at. An
+entry that is not a plain `https` issuer or origin permits nothing and is named in an `ERROR` at
+startup; the startup log says whether the setting is on. The value is read once, when the
+gateway starts: provider create, surface save, the connect API and every request use it, and a
+configuration reload keeps it, with a `WARN` when the file says otherwise, so a change takes a
+restart.
+
+The rule is checked when a provider is created, before its issuer's metadata is fetched, so an
+unlisted issuer is never called (`400`, `provider_issuer_not_permitted`, `field` naming the
+issuer or the endpoint); when a surface binds the provider (`400`); when a connect starts and
+when it completes; and whenever a grant is refreshed or released. A provider that is no longer
+permitted, because its entry was removed, connects, refreshes and releases nothing, and the log
+names the reason `issuer_not_permitted`. Set it on every gateway whose providers another
+system creates: it is what keeps a compromised provisioner from naming an issuer of its own. It
+cannot help an issuer whose own host serves content its users control.
+
+| Refusal (`400`) | `code` | Also |
+| --- | --- | --- |
+| A rule in the table above | `invalid_provider` | |
+| The metadata could not be read or is not acceptable | `provider_metadata_unavailable` | `reason`: `invalid_url`, `unreachable`, `http_status`, `too_large`, `invalid_document` or `issuer_mismatch`. A failure before the server answered is always `unreachable`, so the answer never says whether a name resolves to a blocked address; the log has the detail |
+| The provider differs from the metadata | `provider_metadata_mismatch` | `field` names the field |
+| An update changes a fixed field | `provider_field_immutable` | `field` names the field |
+| The resource is not permitted for the issuer | `provider_resource_not_permitted` | |
+| `external_consent_issuers` does not permit the issuer or an endpoint | `provider_issuer_not_permitted` | `field`: `issuer`, `authorization_endpoint`, `token_endpoint`, `revocation_endpoint` or `jwks_uri` |
+| A tenant's token creates a provider with an issuer while `external_consent_issuers` is unset | `external_consent_issuers_required` | |
+
+`issuer`, the endpoints, `client_id`, `token_endpoint_auth_method`, the secret references, the
+signed-JWT settings, `callback_url`, `resource`, `allow_unadvertised_pkce`, `provider_type` and
+the refused fields never change: an update that
+sends another value is refused, and one that sends the stored value, such as a round trip of
+the whole record, is accepted. The name, description, default scopes and
+`token_refresh_enabled` stay editable. A change to the client or its server is a new
+provider. An existing provider without an `issuer` cannot take one. So a token that can edit
+providers cannot point a provider whose grants are stored at an endpoint of its choosing.
+
 ## Binding a provider to a surface
 
 Each entry in `AgentSurface.outbound_credentials`
@@ -101,7 +285,7 @@ Each entry in `AgentSurface.outbound_credentials`
 | Field | Options | Default |
 | --- | --- | --- |
 | `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Fabric receive, never on Transit Points | `all` |
-| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit` | `on_demand` |
+| `consent_mode` | `on_demand`, `pre_authorize`, or `elicit`; `external` only on a Transit Point's `transit_credentials` ([external consent](#external-consent-on-a-transit-point)) | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |
 
@@ -305,7 +489,8 @@ to the provider's default scopes. The provider can be any type but
 `oauth2_authorization_code`, which needs a user's consent; a surface save refuses that type, a
 provider the surface's tenant cannot reference, and the never-implemented `credential_lookup`
 method, which still loads from storage. The provider is a reference of the surface, so it
-cannot be deleted while a surface uses it.
+cannot be deleted, or moved to another tenant, while a surface uses it ([Deleting a
+provider](#deleting-a-provider)).
 
 The token is a service token (see above), cached in the vault under the agent half
 `surface:<surface_id>` and the user half `__target_auth__:<provider digest>:<scope hash>`, where
@@ -322,6 +507,126 @@ target does not evict the cached token.
 `POST /v1/mcp-proxies/discover`, the Surface Builder's design-time tool listing, still accepts
 only `static_secret` target authentication, so listing the tools of an MCP server behind an
 OAuth-protected endpoint needs a static secret for now.
+### External consent on a Transit Point
+
+A Transit Point's `transit_credentials` with `consent_mode: external` binds an
+[external consent provider](#external-consent-providers) and releases the
+[grant the vault keeps for that binding](#grants-by-binding). Another system obtains the grant
+through the browser with the [connect API](#the-connect-api); the gateway never builds an
+authorization URL for such a binding.
+
+| Field | Rule |
+| --- | --- |
+| `consent_mode` | `external` |
+| `subject` | Required: `owner` for one grant every caller of the Transit Point uses, or `caller` for one grant per caller, selected by the caller's [identity hash](#the-callers-identity-hash). Refused with every other consent mode |
+| `credential_provider_id` | A provider with an `issuer` and the surface's own tenant, exactly: an untenanted provider for an untenanted surface |
+| `scopes`, `inject_as` | As for any binding |
+
+The Transit Point itself must send the grant only where it belongs:
+
+| Field | Rule |
+| --- | --- |
+| `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
+| `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. The exception is a variant that lists no Transit Points of its own: it serves the surface's under the same ids, and so releases the same grants, even when it overrides `transit.shared` (transit policy, rate limit, OPA policy, source auth) or the Access Point. Only a surface editor can set this up, and could weaken the surface itself just as well, so it is allowed: a save answers with a `Warning` header for each Transit Point with `consent_mode: external` that an enabled variant, with transit on, keeps this way. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
+
+A variant that does not list its own Transit Points (`overrides.transit.points`) keeps the
+surface's, and so uses their grants under its own shared transit settings (`transit_policy`,
+`rate_limit`, `opa_policy_definition_id`, `source_auth` and the extension rules in
+`overrides.transit.shared`) and its own Access Point. Only a surface editor can set this up, and
+they could weaken the surface's own settings just as well, so it is not refused. A save adds a
+`Warning` header (`299`) for each Transit Point with `consent_mode: external` that an enabled
+variant keeps while it overrides `transit.shared` or its Access Point, unless the variant turns
+transit off. To keep a variant's callers apart, give the variant its own Transit Points, with
+new ids and so their own grants.
+
+A save of the surface, its base or a variant, is refused with `400` when the binding or its
+Transit Point breaks a rule above, when the surface also has `outbound_credentials` (which apply
+on every Transit Point), or while the vault cannot keep grants: [at-rest
+encryption](#grants-by-binding) is not active, or `AG_IDENTITY_HASH_PEPPER` is not set. The same
+checks run on every write: `POST /surfaces`, `PUT`, `PATCH`, the variant routes, and a surface's
+tenant reassignment (refused there with `409`). Surface-level `outbound_credentials` cannot ask
+for `external`, and a provider with an `issuer` is bound by no other consent mode, on a Transit
+Point or in `outbound_credentials`. A save gives a Transit Point sent without an `id` a new one,
+in a variant's list as in the surface's, and refuses a Transit Point with `consent_mode:
+external` whose id is empty.
+
+A surface with such a binding cannot move to another tenant: the binding's provider must be of
+the surface's own tenant, and a bound provider cannot move ([Deleting a
+provider](#deleting-a-provider)), so the reassignment answers `409`. Remove the binding, which
+removes and revokes its grants, move the surface and the provider, then bind it again.
+
+A request through such a Transit Point needs a caller it identifies, as every delegated
+credential does: a transit token naming one, or a caller its `source_auth` verified; without
+one it is refused with `403` (`-32001` on MCP), so an anonymous caller never acts as the owner.
+No managed agent identity is needed: the grant is keyed by the binding, not by an agent DID. The
+grant is injected as `inject_as` says, in place of any `Authorization` the agent sent. A grant
+whose access token is due a refresh is refreshed first ([Refreshing a grant](#refreshing-a-grant)).
+
+A call whose grant cannot be released is refused before it is forwarded, with a fixed reason and
+never a URL or the vendor's words. On an MCP Transit Point the answer is a JSON-RPC error for
+the request's id, with the reason in its `data`; on any other (`http`, A2A) it is an
+`application/problem+json` body (RFC 9457) whose members carry the same reason. Both are
+`no-store`, and the log names the cause.
+
+| `reason` | Status, JSON-RPC code | When | Also |
+| --- | --- | --- | --- |
+| `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
+| `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource`, the binding names no subject, the surface also has `outbound_credentials`, at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+
+A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
+identity hash. A binding that some other path reached with a provider that has an `issuer`, the
+agent-keyed bindings of the legacy and the `2026-07-28` paths included, is refused with `503`
+"Delegated credentials unavailable", so such a provider's grants are reached only by binding. A `2026-07-28` MCP request to such a Transit Point is refused with `-32022`
+(`Unsupported protocol version`): its vendor is reached over a session revision.
+
+When the vendor answers `401` with a `Bearer` challenge that rejects the token
+(`error="invalid_token"`), the gateway refreshes the grant, single-flight, and sends the call
+once more with the new token; an MCP server checks the token before it acts, so a `401` means
+nothing ran. When another call has refreshed the grant, or the person has connected again,
+meanwhile, that grant is used without a refresh. A grant that cannot be refreshed, or a refresh
+token the authorization server refuses (`invalid_grant`), removes the grant, revoking it at the
+vendor, and the call answers `connect_required`; but only while the grant still holds the token
+the vendor refused, so a grant refreshed or connected again meanwhile is kept, and the call
+answers `connector_unavailable` instead. A second `401`, to the call sent again with a token the
+authorization server has just issued or another call or a reconnect has just stored, refuses
+that request, not the connection: the grant is kept, nothing is revoked, and the call answers
+`connector_unavailable`. Any caller of an owner binding can send a request a resource refuses,
+so no such answer ends the owner's grant; a dead authorization shows at the next refresh. A
+`401` without such a challenge, as a front proxy, a firewall or a path that is not the vendor's
+answers, or with one that names no `error`, which RFC 6750 keeps for a request that carried no
+token, is not taken for a refused token: the grant is kept and the call answers
+`connector_unavailable`. Nor is a refresh that fails for a reason a new connect would not fix,
+the client refused (`invalid_client`), its secret unresolved, the token endpoint unreachable or
+failing: the grant is kept, its refresh retried after a wait, and the call answers
+`connector_unavailable`, until the authorization server has refused it often enough to ask for
+a new connect ([Refreshing a grant](#refreshing-a-grant)). A body
+larger than 1 MiB, such as an upload, is not sent twice: the grant is refreshed for the next
+call, and this one answers `connector_unavailable`, so the agent tries again. The vendor's
+`WWW-Authenticate` and `Set-Cookie` never reach the agent. An MCP Transit Point asks its target
+for an uncompressed answer (`Accept-Encoding: identity`), whatever the agent accepts, since the
+gateway reads the body as sent for tool gating, and refuses one compressed all the same with
+`502`.
+
+A grant is released only while the scopes its connect asked for lie within its binding's
+`scopes` as saved now, or its provider's `default_scopes` when the binding names none: a grant
+left by a binding narrowed since answers `connect_required`, since a new connect asks within the
+binding ([When a binding is removed](#when-a-binding-is-removed)). A surface stored outside the
+API may serve one Transit Point id in its base and in an enabled variant, with other scopes; the
+grant must then lie within the binding in every place, the narrower deciding. A connect, the
+release and the sweep all decide by this one rule.
+
+A release records the grant's last use on a task of its own, and only when the last use
+recorded is an hour old or more, so a busy Transit Point does not rewrite its grant on every
+call.
+
+The destination is checked again when the request is sent. A request carrying a grant by
+binding is forwarded only to the origin of its provider's `resource`, through pinned Strict
+egress: `https` only, internal addresses refused, the connection pinned to the vetted
+addresses, redirects returned rather than followed, and no proxy. It is never forwarded over
+Fabric. A `fabric://` Transit Point withholds delegated credentials unless
+`fabric_delegated_credentials` is set, and with it set the grant is refused, so a grant never
+reaches a stored surface that predates these rules.
 
 ## When a token is missing
 
@@ -522,6 +827,548 @@ A lookup has four outcomes.
 For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
 fresh one, since no user is involved.
 
+### Grants by binding
+
+The grants of [external consent providers](#external-consent-providers) are kept apart from
+the agent-keyed tokens above, in the vault's `delegated_grants` directory. A grant
+([`src/delegation_vault/grants.rs`](../src/delegation_vault/grants.rs)) is keyed by the binding
+it serves and whose account it is:
+
+| Key | Source |
+| --- | --- |
+| `tenant_id` | The surface's tenant, `null` for an untenanted surface |
+| `surface_id` | The surface |
+| `hop` | The Transit Point's `id` |
+| `credential_provider_id` | The provider's record id |
+| `principal` | `owner` for the one grant every caller of the binding uses, or a caller's [identity hash](#the-callers-identity-hash) |
+
+No agent DID is involved, so a grant is never released on another surface, another Transit
+Point or another tenant, even when two Transit Points share a managed identity. A record's id is
+`grant-<provider>-<binding>-<key>`, three lowercase hex values under keys derived from
+`AG_IDENTITY_HASH_PEPPER`:
+
+| Part | Value |
+| --- | --- |
+| `<provider>` | The first 32 hex digits of an HMAC-SHA256 of the provider's record id |
+| `<binding>` | The first 32 hex digits of an HMAC-SHA256 of the RFC 8785 JSON array `[tenant, surface, hop, provider]` |
+| `<key>` | The HMAC-SHA256 of the RFC 8785 JSON array `[tenant, surface, hop, provider, principal]` |
+
+The id reveals nothing of the key beyond which grants share a provider or a binding. A lookup
+is one read and one decrypt, never a scan, and the grants of one binding, or of one provider,
+are found by their file names: removing them reads and decrypts no other grant. A record whose
+own key is not the one its id was derived from is never released. Storing a grant for a key that
+has one replaces it, and the replaced grant is handed back so its tokens can be revoked.
+
+Grants are kept only while at-rest encryption is active: `[encryption] enabled = true` with a
+key from the environment, a file or AWS KMS. The development `local` key source writes
+plaintext, so it does not count. They are also kept only while `AG_IDENTITY_HASH_PEPPER` is set:
+a grant's id derives from the pepper, and a pepper generated for one process changes on
+restart, which would orphan every grant. Set the same value on every node. Without either, the
+vault refuses to store or release a grant and logs a warning at startup, and the admin API
+refuses a binding that needs one.
+
+The vault writes a fingerprint of the pepper, a keyed hash that reveals nothing of it, to
+`delegated_grants/pepper-fingerprint` beside the first grant it stores. A gateway whose pepper
+does not match the fingerprint while grants are stored logs an `ERROR` at startup naming the
+cause, and then stores no grant, releases none (`identity_hash_pepper_mismatch`), and refuses
+every change that removes an external consent binding or deletes an external consent provider
+with `503`: it cannot find their grants under its own ids. Restore the pepper the grants were
+written under, or [purge them](#removing-grants). A fingerprint with no grant
+beside it is replaced by the next gateway that stores one. When the fingerprint file is missing
+while grants are stored, the grants decide: unless one the gateway can read has the id its
+pepper derives, the gateway treats them as written under another pepper in every way above, and
+never records its own fingerprint over them.
+
+A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
+`ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant
+operation that needs the fingerprint reads it again, so while it cannot be read no grant is
+stored, and a release, a removal or a provider delete that finds no grant fails rather than
+answering none. A grant found under the current pepper's id is released and removed as usual. A
+`delegated_grants` directory that cannot be opened at all, or whose plaintext records cannot be
+encrypted, is named the same way, and then every grant read and write fails until it is fixed
+and the gateway restarted; so are the directories of pending connects, claimed connects and
+deferred revocations, whose connects, or revocations, then fail the same way. Without `AG_IDENTITY_HASH_PEPPER` the startup `ERROR` about grants
+written under another pepper says the pepper was generated for the process: such grants can be
+neither found nor listed after a restart, so set the variable and restore the pepper, or purge
+them.
+
+Grants and agent-keyed tokens restored in plaintext, from a portable backup, are encrypted when
+the vault starts. Storage exports leave the `delegated_grants` and `pending_connects`
+directories out, and `delegated_grant_refreshes` and `delegated_grant_revocations`. Grants are
+made only through [the connect API](#the-connect-api).
+
+A grant records, beside its tokens and scopes, when it was created, when its access token was
+obtained (`refreshed_at`), when it was last used, and, after a refresh failed, when and how many
+times in a row, how many of those the authorization server refused, and when it may be tried
+again. A connect whose token answer carries an OpenID Connect ID token of the provider's issuer
+for its client records the vendor account it names (its `sub`), never shown by the API
+([Revoking grants at the vendor](#revoking-grants-at-the-vendor)). The management API reports
+its `state`: `live`, or `refresh_failed` once a refresh has failed since its access token was
+obtained.
+
+### Refreshing a grant
+
+A grant is refreshed when its access token has less than a minute, or less than a tenth of its
+life, left, whichever comes first; a grant with no expiry never is. The refresh is claimed once
+across every node that shares the vault, under the vault's lock, for the grant's current version
+and refresh token, and recorded in `delegated_grant_refreshes`; only the claim's holder sends it.
+The claim is timed when the lock is held, and is another call's refresh in progress until its
+45-second window ends, whatever clock read its start: two calls falling due together, or nodes
+whose clocks differ a little, never take a running refresh for a dead one. A claim of an earlier
+version of the grant, left by a crash or a delete that failed, ended when the grant was written
+since, and the next claim replaces it. The refresh runs on a task of its own, so a call dropped
+while it waits, as when its client gives up, leaves the refresh to finish and write what it
+obtained. A call that finds a refresh running uses the current token while it is valid, and
+otherwise waits up to ten seconds for the refreshed one: a refresh on the same node wakes it as
+soon as it ends, and one on another node is seen when it reads the grant again, after a wait
+that grows from a quarter of a second to two seconds. The request
+([`src/delegation_vault/token_endpoint.rs`](../src/delegation_vault/token_endpoint.rs)) goes to
+the provider's `token_endpoint` with the refresh token, the scopes the connect asked for (in the
+spelling the person consented to, not the vendor's) that the grant still holds, as its provider
+compares them ([Granted scopes](#granted-scopes)), so a grant the person consented to more
+narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
+provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
+(a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
+the scopes the grant held. The request is sent and read by the token request every
+credential provider shares, the service tokens' included, with a 30-second timeout and a 64 KiB
+cap on the answer, which must be a `Bearer` token. The rotated tokens are written
+under the lock, for the version the claim was made for, before the new access token is sent,
+however late the answer comes, as long as no other call took the claim over. Once the grant is
+written the refresh is done, even if its claim cannot be cleared afterwards. A refresh that
+would widen the grant's scopes, as its provider compares them ([Granted
+scopes](#granted-scopes)), is refused, the grant never refreshed again, and the wider tokens
+revoked; when the person connected again while it ran, the call uses the new grant.
+
+- `invalid_grant` deletes the grant, and revokes its tokens at the vendor (the refresh token is
+  dead; the access token may not be), and the call answers `connect_required`; but only while
+  the grant is still the version the refresh was claimed for. A grant the person connected
+  again while the refresh ran is kept, and the call uses it.
+- Any other failure (the endpoint unreachable, a `5xx`, the client refused, its secret
+  unresolved, another refusal) keeps the grant and marks it `refresh_failed`; the refresh is
+  tried again after 30 seconds, doubling with each failure in a row up to 15 minutes, never
+  longer. Meanwhile the current token is used while it is valid, and an expired one answers
+  `connector_unavailable`.
+- A refusal by the authorization server other than `invalid_grant` (`invalid_client`, a `401`,
+  or another `4xx`, as some vendors answer a revoked refresh token) is counted. Once the
+  refusals since the grant's last refresh reach gateway.json's
+  `external_consent_refresh_refusals` (3 by default,
+  [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)), a call that cannot use the grant,
+  its token expired or refused by the vendor, answers `connect_required`, so the person is asked
+  to connect again. The grant is kept, and its refresh still retried after the wait, until a
+  connect replaces it or [the daily sweep](#the-daily-sweep) removes it, 30 days after its token
+  expired. A failure that says nothing of the grant (unreachable, `5xx`, `429`, an unusable
+  answer, a secret unresolved) is not counted.
+- Tokens a refresh obtained but did not write, because the grant was connected again or removed
+  meanwhile, or the vault could not be locked or read, are revoked, never dropped; a refresh
+  token the grant still holds, as an authorization server that does not rotate answers it again,
+  is kept, and so is one when the grant stored now cannot be read to tell. Tokens whose write
+  failed part way may be the grant's now, and are never revoked.
+- A claim of the grant's current version that another call finds past its 45-second window
+  means a refresh may have died between the authorization server's answer and the write, so the
+  refresh token may be spent: the grant is never refreshed again, and once its access token
+  expires the call answers `connect_required`.
+- A provider with `token_refresh_enabled: false`, or a grant without a refresh token, is never
+  refreshed: once its access token expires, `connect_required`.
+
+Each refresh is audited, `token_refreshed` or `refresh_failed` with the cause in `detail`.
+
+### The connect API
+
+Another system, such as the one that hosts the person's connect page and the authorization
+server's redirect, runs the browser leg of an OAuth authorization code grant; the gateway holds
+the PKCE verifier, redeems the code, and keeps the grant
+([`src/delegation_vault/connect_api.rs`](../src/delegation_vault/connect_api.rs)). The API is
+server to server only, under a management session or access token, and never returns a token.
+
+`POST /api/v1/delegation-vault/connects` starts a connect:
+
+```json
+{"surface_id": "crm", "hop": "<Transit Point id>", "credential_provider_id": "<provider record id>",
+ "subject": "caller", "principal": "<caller identity hash>", "scopes": ["read"],
+ "redirect_uri": "https://connect.example/api/v1/connect/callback/linear"}
+```
+
+- The surface must serve, at `hop`, a `consent_mode: external` binding of that provider and
+  subject. `principal` is the caller's identity hash for `subject: caller`, and absent or
+  `owner` for `subject: owner`.
+- `scopes` must lie within the binding's `scopes`, or the provider's `default_scopes` when the
+  binding names none; left out, they are those.
+- `redirect_uri` must be the provider's `callback_url`.
+- The provider must still be [permitted](#permitted-issuers), its resource permitted for its
+  issuer, and the Transit Point's target its resource's origin.
+- A binding may have at most 32 connects open, and each principal of it at most 4, so one caller
+  who opens the connect link again and again never blocks the binding's other callers; claimed
+  and expired ones do not count. They are counted from the connects' file names, which name
+  their binding, a tag of their principal and their expiry: counting reads, and decrypts, no
+  connect.
+
+The gateway keeps a pending connect in the vault, encrypted at rest and under the vault's lock,
+holding a fresh verifier (32 random bytes) for ten minutes, and answers `201` with only its
+challenge: `{connect_id, code_challenge, code_challenge_method: "S256", expires_at}`. The other
+system builds the authorization request with that challenge and its own `state`.
+
+`POST /api/v1/delegation-vault/connects/{connect_id}/complete` with `{code, iss}` completes it.
+The code's shape, the provider (still an external consent provider of the connect's tenant, and
+[permitted](#permitted-issuers)) and `iss` (step 1 below) are checked first; a completion they
+refuse leaves the connect open, so it can be completed again with the right values. The connect
+is then claimed once, which moves it, its verifier wiped, to the claimed connects
+(`pending_connects/claimed`), kept until it expires so a second claim answers `already_used`:
+the connect is read and decrypted, and its claimed copy written, outside the vault's lock, which
+only decides, by the file names, which claim came first. Then:
+
+1. `iss`, the authorization response's RFC 9207 parameter, must equal the provider's `issuer`
+   when it is sent, and must be sent unless the issuer's metadata said its responses do not
+   carry it (a provider created before that was recorded needs it too).
+2. The code is redeemed at the provider's pinned token endpoint with the verifier, the
+   connect's `redirect_uri` and the provider's `resource`, as a refresh is sent.
+3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
+   for, as the provider compares them ([Granted scopes](#granted-scopes)).
+4. The grant is kept only while the surface still serves its binding, and the scopes asked for
+   still lie within the binding's (or the provider's default scopes when it names none), checked
+   under the surface's lock; a grant it replaces for the same key is revoked.
+
+Tokens obtained but not kept, because the scopes were wider, or the binding was removed or
+narrowed while the person consented, are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
+"expires_at"}`, or `{"status": "failed", "reason"}` with a fixed reason; the authorization
+server's words are never echoed or logged.
+
+| Status | `reason` | When |
+| --- | --- | --- |
+| `409` | `already_used` | The connect was completed, or tried, before |
+| `410` | `expired` | Ten minutes passed |
+| `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is not claimed, and stays open |
+| `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, or more scopes were granted than asked for |
+| `409` | `binding_removed`, `binding_changed`, `provider_unavailable` | The binding or the provider went away, or the binding was narrowed below the scopes asked for, while the person consented |
+| `403` | `issuer_not_permitted`, `resource_not_permitted` | The operator's rules no longer permit the provider |
+
+`GET /api/v1/delegation-vault/grants?surface_id=[&hop=][&principal=]` reports each
+`consent_mode: external` binding the surface serves: its `hop`, `credential_provider_id` and
+`subject`; for an owner binding, `connected` and its grant; for a caller binding, `callers`, the
+number of callers connected, counted from file names, and, with `principal`, that caller's own
+grant. A grant is reported as metadata only: `grant_id`, `principal`, `scopes`, `created_at`,
+`refreshed_at`, `last_used_at`, `expires_at` and `state` (`live`, `refresh_failed`, or
+`unreadable`). Removing grants is described in [Removing grants](#removing-grants).
+
+Every refusal of a request names a fixed `code`: `surface_not_found` (`404`, also for a surface
+the caller may not manage), `binding_not_found` (`404`), `subject_mismatch`,
+`invalid_principal`, `redirect_uri_mismatch`, `scope_not_permitted`, `invalid_code` (`400`),
+`binding_not_servable` (`409`), `connect_not_found` (`404`), `too_many_pending_connects` (`429`)
+and `grants_unavailable` (`503`, while the vault cannot keep grants).
+
+Who may call it:
+
+- Starting and completing a connect, and the report, need `delegation_vault.connect`, and
+  removal `delegation_vault.delete`; only administrators hold them by default. A token
+  provisioned for the connect API never needs `delegation_vault.view`, which also reads every
+  tenant's agent-keyed tokens.
+- A tenant's access token reaches only its own tenant's surfaces and their connects and grants,
+  and within its resource pattern, which names them as `delegation-vault:<surface id>` (for
+  example `TENANT:${x-tenant}:(?:delegation-vault:.*|...)`); another tenant's surface answers
+  `404`. See [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md).
+- The node that serves the admin API completes connects: the surface's lock serialises that
+  node only.
+
+### Revoking grants at the vendor
+
+A grant by binding is removed when [its provider is deleted](#deleting-a-provider), [a surface
+change removes its binding](#when-a-binding-is-removed), it is [removed through the
+API](#removing-grants), a connect replaces it, the vendor refuses its token and it cannot be
+refreshed ([External consent on a Transit Point](#external-consent-on-a-transit-point)), or [the
+daily sweep](#the-daily-sweep) finds it can never be released; tokens a connect or a refresh
+obtained but no grant keeps are revoked too. Each is revoked at its authorization server (RFC 7009,
+[`src/delegation_vault/revocation.rs`](../src/delegation_vault/revocation.rs)) at the provider's
+`revocation_endpoint`: its refresh token with `token_type_hint=refresh_token`, then its access
+token with `token_type_hint=access_token`, so a server that does not cascade the first
+revocation still ends the access token. A grant without a refresh token has only its access
+token revoked. A server that does not revoke access tokens answers that request with an error,
+which changes nothing else. The client authenticates as its `token_endpoint_auth_method`
+says: `client_id` in the form for `none`, the id and secret in the form for
+`client_secret_post`, HTTP Basic for `client_secret_basic`, and for `private_key_jwt` the id with
+a client assertion (RFC 7523 section 2.2) signed for each request by the same code an
+`oauth2_client_credentials_jwt_auth` provider uses: issuer and subject the client id, audience
+the provider's `issuer` (the authorization server's issuer identifier, as RFC 7523bis requires,
+never an endpoint), a `jti` of its own and a five-minute lifetime. The secret or key is resolved
+from the provider's own tenant only. The call goes
+through the pinned Strict egress client, `https` only, without redirects, ignoring any proxy,
+with a 10-second timeout per request, and its response body is never read or logged. One
+grant's revocation ends within 30 seconds wherever it waits, resolving its client's secret and
+the endpoint's address included; one that takes longer is `unreachable`. When many grants are
+removed at once, at most eight are revoked at a time.
+
+A surface change deletes the grants it removes from the vault while it is saved, which ends
+their release at once, and revokes at the vendor what the vault deleted only once the change is
+saved. When the save fails, or the change is refused because a deletion failed, the deleted
+grants are put back, unrevoked, before the surface's lock is released, so a change that fails
+never costs a person their grant. A grant that cannot be put back, because the vault refuses
+to store it, is revoked instead, and the log says so at `ERROR`: no copy of it is left, so it
+must not stay valid at the vendor. The deletions, the wait for the save and the revocations run
+on one task of their own. The request waits only for the deletions, never on a vendor, however
+slow or unreachable. A request dropped part way, as when its client disconnects or a proxy
+times it out, stops none of it: when a change is dropped before it reported its save, the task
+reads the stored surface again, still under the surface's lock, and revokes the grants when the
+surface stored serves the bindings of the change, with its scopes, since a save can finish after
+its client is gone, and puts them back otherwise. A read that fails counts as saved, so the grants are
+revoked. Each grant is read and deleted in one step, under the vault's lock, and the copy
+deleted is the one revoked, so a grant whose tokens a refresh rotated after the change read it
+has its current tokens revoked; a grant the person connected again after the removal read it is
+a connection the removal never saw, and is kept. A provider delete works the same way: it
+deletes its grants and the provider, then revokes the grants once the provider is deleted, and
+never waits on a vendor ([Deleting a provider](#deleting-a-provider)).
+
+Before any of a batch of removed grants is revoked, each is kept, encrypted, in the vault's
+`delegated_grant_revocations` directory as a pending revocation, and forgotten once its
+revocation reached the vendor, whatever the vendor answered, or the grant was otherwise decided
+(below). A grant a change removes is kept as soon as it is deleted, while the change is saved,
+and forgotten when the change is not saved and the grant is put back. A gateway that stops while revocations are in flight, as in a deploy, tries them again
+when it starts and each time it becomes active, and the daily sweep tries any left. A revocation
+the sweep decides is kept the same way, as a pending one. A revocation that could not reach its vendor
+(`unreachable`, the 30-second limit included) is kept and tried again the same way, at most five
+times in all: its `token_revoked` event ends `,retry:pending` while it will be tried again and
+`,retry:exhausted` on the last, after which its tokens stay valid until they expire or the person
+removes the app at the vendor. A pending revocation whose grant the vault holds again, with any
+of its tokens, is forgotten unrevoked, so a retry never ends a connection in use. The vault
+keeps a pending revocation only while at-rest encryption is active, as it keeps grants, so no
+token is written in plaintext; one it cannot keep is revoked all the same, and a stop before it
+ends loses it, which the log says at `WARN`. A grant is deleted before its pending revocation is
+written, so a stop in between, a matter of milliseconds, still loses that grant's revocation: it
+has a deletion in the logs but no `token_revoked` event.
+
+Revocation is best effort: whatever its outcome the grant is deleted. A `token_revoked`
+delegation audit event records the grant's id, the caller that made the change (`caller`: the
+console user and, on an access token, its id), and `detail` `vendor_revocation:<outcome>` for
+the refresh token, or the access token of a grant without one, followed by
+`,access_token:<outcome>` when the access token was revoked as well, or `,reason:<reason>` when
+it was skipped. An outcome is one of `revoked`, `refused` (the server answered another status),
+`unreachable` (no connection, or the egress policy refused the endpoint), `not_supported` (the
+provider names no revocation endpoint), `client_unavailable` (the client's secret could not be
+resolved) or `skipped`, with the reason `no_secrets_store` (no secrets store is configured, so a
+client that authenticates with a secret cannot), `provider_missing` (the grant's provider no
+longer exists), `purged` (an operator purged the grant without reading it),
+`authorization_in_use` or `deferred` (below), followed by `,retry:pending` or
+`,retry:exhausted` for a revocation that could not reach its vendor (above). Tokens a connect or a refresh obtained but no
+grant keeps are recorded under the id of the grant they were for, which may still be connected,
+so their `detail` ends `,unkept_tokens`, for example
+`vendor_revocation:revoked,access_token:revoked,unkept_tokens`: such a record is no disconnect. A grant purged
+with its binding also has the binding: `surface_id` and `provider_id` in their own fields, and
+`,tenant:<tenant>` (for a tenanted surface) and `,transit_point:<id>` after the reason, each
+value a JSON string, for example
+`vendor_revocation:skipped,reason:purged,tenant:"tenant-a",transit_point:"crm"`. A public client
+is still revoked without a secrets store. The log says the outcome: `INFO` for `revoked`,
+`not_supported` and a `deferred` revocation, `WARN` otherwise. A token a vendor does not revoke
+stays alive: an access token until it expires, a refresh token until the vendor ends it, which
+at some vendors, Google's among them, is only after months unused or when the person removes the
+app at the vendor.
+
+At some vendors, Google's among them, revoking any one token ends the whole authorization the
+vendor account gave the client: every token issued to the client for that account, on any
+surface and for any caller, stops working. A provider for such a vendor sets
+`revocation_ends_authorization: true`. "The same authorization" is the same provider and the
+same vendor account: a connect records the account as the `sub` of the OpenID Connect ID token in
+its token answer, read only when the token's `iss` is the provider's issuer and its `aud` names
+the provider's client (asking for `openid` gets one from Google and Entra). The token comes
+straight from the pinned token endpoint, which OpenID Connect Core accepts in place of checking
+its signature, and is used for nothing else. The gateway then leaves a removed grant unrevoked
+while another grant of the same tenant and vendor account is stored, whoever holds it: a
+reconnect with the same account leaves the grant it replaced unrevoked, and so do tokens a
+connect or a refresh did not keep while the account's grant is stored, and a removal of one
+grant of an account that holds another, on any surface or for any caller. Such a grant is
+recorded `skipped`, with the reason `authorization_in_use`; its tokens stay valid at the vendor
+as part of the authorization the other grant uses, and end with it. A grant whose account is
+not known (no ID token, or one of another issuer or client) is revoked, as is the account's last
+grant, a grant replaced by a reconnect with another account, and every grant when the provider
+is deleted. Whether another grant of the account is stored is read once for each batch of
+removals. When the vault cannot tell, as during a key service outage or while another grant of
+the provider cannot be read, the removed grant is kept, encrypted, in the vault's
+`delegated_grant_revocations` directory and recorded `skipped`, with the reason `deferred`;
+[the daily sweep](#the-daily-sweep) decides it once the vault can tell, and revokes it after 30
+days all the same. A revocation is delayed, never lost; when the vault cannot keep the grant
+either, it is revoked at once. Unset, as by default, every grant removed is revoked: at a vendor
+that ends whole authorizations this fails closed, ending the account's other grants of the
+client, which must be connected again, and never leaves a token live that the gateway no longer
+holds. A refresh token such a vendor issued stays valid while the client is authorized, which is
+why the gateway never forgets one it could not tell about.
+
+### When a binding is removed
+
+A grant lives only as long as its binding
+([`src/identity/handlers/surface_grants.rs`](../src/identity/handlers/surface_grants.rs)). A
+surface change that removes a `consent_mode: external` binding deletes that binding's grants
+while the change is saved, then revokes them once it is, or puts them back when it is not
+([Revoking grants at the vendor](#revoking-grants-at-the-vendor)): the surface deleted, the
+Transit Point removed, its binding removed or given another consent mode, its `subject` or
+provider changed, or the variant that holds it disabled, or its transit turned off
+(`overrides.transit.disabled`). A binding is kept while the surface, or an enabled variant that
+serves transit, still has it, with the same Transit Point id, provider and subject: a disabled
+variant's Transit Points are not served, so they keep no grant, and enabling the variant again
+needs a new consent. Disabling stays quick and always allowed.
+
+A grant follows its Transit Point's `id`, not its alias. A `PUT` or merge `PATCH`, of the
+surface or a variant, that leaves out the `id` of a Transit Point with `consent_mode:
+external`, or sends it empty, keeps the id stored for the Transit Point with the same alias in
+the same place (the surface's points, or the same variant's), so a client that does not send
+ids back never revokes a person's grants by saving. A Transit Point whose id is sent keeps that
+id, and any other Transit Point sent without its id is a new one, as before. Since it keeps its
+id, such a Transit Point also keeps the stored settings a `PUT` keeps for a Transit Point sent
+with its id when it leaves them out: `source_auth`, `allow_unauthenticated_callers` and
+`delegated_credentials_for_fabric_callers`, each under its usual rule ([Transit Point
+callers](SOURCE_AUTH.md#transit-point-callers)). Send them to change them, or
+`"source_auth": null` to remove it.
+
+A change that adds a binding deletes any grant already stored under it, left by an earlier
+binding of the same surface, Transit Point id and provider, so re-adding a binding, or creating
+a surface again under the same id, needs a new consent; an old grant is never re-armed. A change
+of a binding's `scopes` keeps only the grants whose connects asked for scopes within the new
+ones (or within the provider's default scopes, for a binding that names none): narrowing a
+binding removes, and revokes, the others; widening it removes none. Where a surface stored
+outside the API serves one Transit Point id in its base and a variant, a grant must lie within
+the binding's scopes in every place, so narrowing either place removes the grants beyond it. A
+connect completed after the binding was narrowed is refused (`binding_changed`), and a grant
+left beyond its binding's scopes by any other path is never released ([External consent on a
+Transit Point](#external-consent-on-a-transit-point)) and is removed by the daily sweep.
+
+Each surface write takes the surface's lock, reads the stored surface under it, and removes the
+grants of every binding that differs between that stored surface and the one being saved, so a
+write built from an earlier read still removes the grants of a binding a concurrent write added
+and this one drops. Surface writes also hold a provider lock shared, which a provider delete or
+tenant move holds exclusively for its whole check and change, and a write that binds a provider
+deleted, or moved to a tenant the surface may not reference, since its references were checked
+is refused with `400`. The locks serialise the writes
+of the node that serves the admin API.
+
+Only the grants of the bindings a change removes or adds are read. When one of them cannot be
+read, the change is refused and nothing is saved, and only changes that need that grant are
+refused: the surface's other edits, and every other surface and tenant, are unaffected. The
+answer is `503` and names the grant's id and its Transit Point. A grant cannot be read when at-rest encryption is now off, when it
+cannot be decrypted with the current key (a backup restored under another key, a key source
+changed without re-encrypting) or when it cannot be parsed. Make it readable again (for
+encryption, enable `[encryption]` with the key it was written under), or [purge
+it](#removing-grants). A change is also refused when the vault is
+unavailable, or the grants stored were written under another identity hash pepper. Without a
+secrets store a change still removes its grants; a client that needs a secret is then not
+revoked (`skipped`, `no_secrets_store`).
+
+### Deleting a provider
+
+`DELETE /api/v1/credential-providers/{id}` is refused with `409` and `code`
+`provider_in_use` while a surface binds the provider, in its base or a variant, through
+`outbound_credentials` or a Transit Point's `transit_credentials`, or uses it for the
+`credential_provider` target authentication of its Target or a Transit Point. Only the surfaces that may
+reference the provider are read: those of its own tenant, or every surface for an untenanted
+provider. Bindings are read from the surface's stored lists, its own and each variant's, so a
+surface whose variants cannot be resolved still counts by the providers it names. The answer
+names the binding `surface_id` when the caller may see that surface. Remove the bindings first.
+While the surface store is unavailable the bindings cannot be checked, so every provider
+delete, of any type, answers `503` and keeps the provider.
+
+A permitted delete of a provider with an `issuer` deletes every grant made with it, then the
+provider, and answers; the grants are revoked afterwards, on a task of their own, reading only
+that provider's grants. The provider lock is held while the bindings are checked and the grants
+and the provider deleted, never while a vendor is called, so a vendor that is slow or hangs
+keeps no surface write waiting. Surface creates, updates and deletes of every tenant do wait
+while the provider's grants are read, deleted and kept for revocation; with KMS envelope
+encryption each grant read and each kept is a round trip to the key service, so deleting a
+provider with many grants holds up surface writes for that long. A delete dropped part way puts the grants
+back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
+vault cannot list or delete the grants, when the grants stored were written under another
+identity hash pepper, and when one of its grants cannot be read, for example because at-rest
+encryption is now off: it could not be revoked. The answer names that grant. Make it readable
+again, or [purge it](#removing-grants), then delete the provider. Another
+provider's unreadable grant never blocks the delete.
+
+A provider that any surface binds or uses for target authentication, of any tenant, cannot move
+to another tenant either: the tenant reassignment answers `409`. Its bindings would name another
+tenant's provider, and moving it back would serve their grants again. Remove the bindings first.
+Nor can a provider move into a tenant that already has a provider with its `provider_id`
+(`409`), since slugs are unique per tenant. A provider delete or move holds the provider lock
+for its whole check and change, so no surface write binds the provider in between; a delete
+releases it before its grants are revoked.
+
+### Removing grants
+
+Grants by binding are removed one by one or by binding, and each removed grant is deleted, then
+revoked at its authorization server ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)).
+Both routes need `delegation_vault.delete`. A tenant's access token removes only its own
+tenant's grants, of the surfaces its resource pattern names; an operator's removes any. An
+operator is a session, or an access token with neither a tenant nor a resource pattern: a
+resource-scoped token that names no tenant is refused on both routes, as on the vault's other
+writes.
+
+| Route | Removes |
+| --- | --- |
+| `DELETE /api/v1/delegation-vault/grants/{grant_id}` | One grant, by its id (as the report or a refusal names it): `204`, `404` when there is none or it is another tenant's, `400` for an id that is not a grant's. It removes the connection it read, refreshed since or not; a grant the person connected again in between is kept |
+| `DELETE /api/v1/delegation-vault/grants?surface_id=&hop=[&credential_provider_id=][&principal=][&tenant_id=]` | Every grant of one binding, the owner's and each caller's, or only `principal`'s (`owner`, or a caller's identity hash). `transit_point_id` is accepted for `hop`. `credential_provider_id` may be left out while the surface still binds a provider at `hop`; name it for a binding the surface no longer has. An operator names the `tenant_id` of a surface that no longer exists; a tenant's token always means its own. Answers `{"removed": n, "grant_ids": [...], "purged": [...]}`, or `503` `surfaces_unavailable` while the surface cannot be read |
+
+The binding need not be saved any more, so the grants a removed binding left behind can be
+removed. Both routes read and delete the grants under the surface's lock, as a surface write and
+the sweep do, so a surface write that deleted a grant and puts it back when its save fails has
+settled first: the grant it puts back is removed too, never released again after the person was
+told it is gone. A grant gone by then was removed, and is revoked, by whoever removed it, and
+the answer is still `204`. A grant that cannot be read now because the vault's disk or key service fails, as
+during an AWS KMS outage or throttling, is neither removed nor purged, even by an operator: the
+removal answers `503` (`grants_unavailable`), removes nothing, and says to try again. Only a
+grant that cannot be read whenever it is asked again, one that does not decrypt under the
+current key (AES-GCM refuses it, or KMS answers that the wrapped key is not one it can decrypt)
+or does not parse, is taken for unreadable. Such a grant cannot be revoked:
+
+- An operator's removal purges it, deleting it without reading it, so it no longer blocks the
+  removal of its binding or provider. It stays valid at the vendor: its access token until it
+  expires, its refresh token until the vendor ends it or the person removes the app there. It
+  is audited as `token_revoked` with `detail`
+  `vendor_revocation:skipped,reason:purged` and the operator as `caller`; a removal by binding
+  also records the binding. Purged grants are listed under `purged`.
+- A tenant's removal is refused with `409` (`grant_unreadable`), and a removal by binding then
+  removes none of the binding's grants.
+
+A key configuration that no longer matches the grants also makes them unreadable: after an
+operator changes the KMS `key_id`, or moves from a local key to KMS, without re-encrypting the
+vault, every grant reads as unreadable, and an operator's removal purges grants that the old key
+could still read, unrevoked. Put the old key configuration back before removing grants.
+
+A grant's id is its file name in the vault's `delegated_grants` directory, without `.json.enc`
+(`grant-` and three hex values; `pepper-fingerprint` is not a grant). After the identity hash
+pepper changed, a removal by binding cannot derive the binding's ids, so it answers `409` with
+`code` `identity_hash_pepper_mismatch` rather than removing nothing: restore the pepper, or have
+an operator remove each grant by its id, read from the file names. The report lists only the
+grants of the bindings a surface serves. When the key or the pepper the grants were written
+under is lost for good, an operator can instead delete the vault's `delegated_grants` directory
+while the gateway is stopped; those grants are then not revoked at the vendor either.
+
+### The daily sweep
+
+Once a day, the first time ten minutes after startup, and only while the node is active, the
+vault removes ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.rs)):
+
+- pending connects that expired, claimed or not;
+- grants whose binding the surface no longer serves, as after a surface file was edited by hand
+  or a surface deleted outside the admin API, or whose binding no longer permits the scopes they
+  were asked for;
+- grants written under an earlier identity hash pepper, which can never be released again;
+- grants whose access token expired and that cannot be refreshed;
+- grants whose access token expired more than 30 days ago and whose refresh has failed ever
+  since, which answer `connector_unavailable` or `connect_required` and which nobody connected
+  again.
+
+While `AG_IDENTITY_HASH_PEPPER` is not set, or the grants stored were written under another
+pepper ([Grants by binding](#grants-by-binding)), every grant's id differs from the one the
+gateway derives, so the sweep removes no grant at all and logs a warning: a lost or mistyped
+pepper on one node never deletes or revokes the grants, whether or not the fingerprint file is
+still there. Restore the pepper they were written
+under, or [purge them](#removing-grants). Pending connects and kept revocations are still swept.
+
+Each grant removed is revoked, as every removal is. The sweep also decides the revocations a
+removal left to it (`deferred`, [Revoking grants at the vendor](#revoking-grants-at-the-vendor)),
+with their providers, revoking each whose vendor account no other stored grant holds, and each
+that waited 30 days, as pending revocations, so one that cannot reach its vendor is kept and
+tried again; and it tries again the pending revocations kept, which the gateway also tries when
+it starts and each time it becomes active; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
+file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
+and only then reads the binding's grants and decides, so a grant the person connected again
+while the sweep waited is the one it decides on. Every grant is decrypted once or twice a day. A
+grant that cannot be read is left, and counted, for an operator to remove. A binding whose
+surface or provider cannot be read is left as it is, and counted as skipped, until the next
+sweep: a provider store that fails is never taken for a provider that is gone. The log line
+`Swept the delegation vault's grants by binding` counts each kind.
+
 ### Storage
 
 The vault uses **uncached** storage: tokens are read from disk on each lookup and are not
@@ -530,9 +1377,19 @@ held in the in-memory cache, so they do not linger in process memory.
 The vault is encrypted at rest **only when at-rest encryption is enabled** in the
 bootstrap configuration (`[encryption] enabled = true`), because it uses the global
 storage configuration like every other store. The default is off. With the default,
-access and refresh tokens are written to `_storage/` as plaintext JSON. Enable encryption
-at rest on any appliance that holds real user tokens. See
+access and refresh tokens are written to `_storage/` as plaintext JSON, and the vault logs a
+warning at startup saying so. Enable encryption at rest on any appliance that holds real user
+tokens; grants by binding need it. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
+
+Beside the agent-keyed tokens, the vault directory holds `delegated_grants` (grants by binding
+and the pepper fingerprint), `pending_connects` (connects waiting for their code, with their
+PKCE verifiers, and in `pending_connects/claimed` the connects claimed, their verifiers wiped),
+`delegated_grant_refreshes` (claims of running refreshes: a grant's id and a digest of its
+refresh token) and `delegated_grant_revocations` (removed grants whose revocation is under way,
+waits to be tried again, or waits for the daily sweep, with their tokens, kept only while
+at-rest encryption is active). Storage exports
+leave out all four.
 
 ## Management API
 
@@ -541,6 +1398,9 @@ at rest on any appliance that holds real user tokens. See
 | `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens |
 | `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
+| `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
+| `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |
+| `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |
 | `GET /api/v1/delegation-audit` | The delegation audit log |
 
 ### Removing grants keyed by the old identity hash
@@ -566,7 +1426,8 @@ instance runs the new release, as an instance still on the old one writes the ol
 
 Credential providers have their own management routes in
 [`src/credential_providers/router.rs`](../src/credential_providers/router.rs), gated on
-the `credential_providers.*` permissions.
+the `credential_providers.*` permissions. A provider a surface binds cannot be deleted
+([Deleting a provider](#deleting-a-provider)).
 
 In the dashboard these live on the Credentials page, under the **Credential Providers**,
 **Credential Tokens**, and **Credential Delegation Audit** tabs.
