@@ -4248,6 +4248,26 @@ fn managed_agent_received_agent_card_at_path(
     );
 }
 
+#[then(expr = "managed agent {string} received a {word} request at path {string}")]
+fn managed_agent_received_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    expected_path: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    assert_eq!(
+        request.method, method,
+        "request to managed agent '{}' must be a {}, got '{}'",
+        agent_name, method, request.method
+    );
+    assert_eq!(
+        request.path_and_query, expected_path,
+        "request to managed agent '{}' must hit path '{}', got '{}'",
+        agent_name, expected_path, request.path_and_query
+    );
+}
+
 #[then(expr = "the agent card field {string} points to the gateway listen address")]
 fn agent_card_field_points_to_gateway(
     world: &mut SurfaceWorld,

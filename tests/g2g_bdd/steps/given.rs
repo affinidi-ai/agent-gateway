@@ -1034,6 +1034,52 @@ pub async fn surface_requires_caller_identity_issued_by_gateway(
         .unwrap_or_else(|error| panic!("attach identity issuer policy to surface '{surface_id}': {error:#}"));
 }
 
+#[given(expr = "surface {string} has a request policy that allows all requests")]
+async fn surface_has_allow_all_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
+}
+
+#[given(expr = "surface {string} has a request policy that denies all requests")]
+async fn surface_has_deny_all_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    attach_request_policy(world, &surface_name, "deny-all", "default allow := false").await;
+}
+
+async fn attach_request_policy(
+    world: &mut G2gWorld,
+    surface_name: &str,
+    label: &str,
+    rule: &str,
+) {
+    world.start().await;
+    let (gw_index, surface_id) = world.surface(surface_name);
+    let policy_definition_id = format!("{surface_id}-{label}-policy");
+    let admin = &world
+        .harness()
+        .gw(gw_index)
+        .admin;
+    admin
+        .create_surface_policy_definition(
+            &policy_definition_id,
+            &format!("g2g BDD {label} policy for {surface_id}"),
+            &format!("package surface.policy\n\n{rule}\n"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    admin
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({ "target": { "policy": { "policy_definition_id": policy_definition_id } } }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("attach {label} policy to surface '{surface_id}': {error:#}"));
+}
+
 #[given(expr = "the VP Audit Log of gateway {int} keeps every audit event")]
 async fn vp_audit_log_of_gateway_keeps_every_audit_event(
     world: &mut G2gWorld,

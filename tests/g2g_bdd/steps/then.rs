@@ -182,6 +182,90 @@ pub async fn actor_was_not_called(
     assert_no_requests(&requests, &format!("target collaborator '{target_name}'"));
 }
 
+async fn only_request_matching(
+    world: &G2gWorld,
+    target_name: &str,
+    method: &str,
+    path: &str,
+) -> crate::bdd_support::mock_server::ReceivedRequest {
+    let (_, _, mock) = mock_for(world, target_name);
+    let requests = mock.requests().await;
+    let mut matching: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == method && request.path_and_query == path)
+        .cloned()
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "target collaborator '{target_name}' should receive exactly one {method} {path}, got {} of {} request(s): {:?}",
+        matching.len(),
+        requests.len(),
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path_and_query))
+            .collect::<Vec<_>>()
+    );
+    matching.remove(0)
+}
+
+#[then(expr = "managed agent {string} received a {word} request at path {string}")]
+pub async fn managed_agent_received_request_at_path(
+    world: &mut G2gWorld,
+    target_name: String,
+    method: String,
+    path: String,
+) {
+    only_request_matching(world, &target_name, &method, &path).await;
+}
+
+#[then(
+    expr = "the {word} request at path {string} to managed agent {string} carried header {string} with value {string}"
+)]
+pub async fn request_at_path_carried_header(
+    world: &mut G2gWorld,
+    method: String,
+    path: String,
+    target_name: String,
+    header: String,
+    expected_value: String,
+) {
+    let request = only_request_matching(world, &target_name, &method, &path).await;
+    assert_header_value(
+        &request.headers,
+        &header,
+        &expected_value,
+        &format!("{method} {path} to target collaborator '{target_name}'"),
+    );
+}
+
+#[then(expr = "the {word} request at path {string} to managed agent {string} did not carry header {string}")]
+pub async fn request_at_path_did_not_carry_header(
+    world: &mut G2gWorld,
+    method: String,
+    path: String,
+    target_name: String,
+    header: String,
+) {
+    let request = only_request_matching(world, &target_name, &method, &path).await;
+    assert_header_absent(&request.headers, &header, &format!("{method} {path} to target collaborator '{target_name}'"));
+}
+
+#[then(expr = "the {word} request at path {string} to managed agent {string} had an empty body")]
+pub async fn request_at_path_had_empty_body(
+    world: &mut G2gWorld,
+    method: String,
+    path: String,
+    target_name: String,
+) {
+    let request = only_request_matching(world, &target_name, &method, &path).await;
+    assert!(
+        request.raw_body.is_empty(),
+        "{method} {path} to target collaborator '{target_name}' must have an empty body, got '{}'",
+        request.raw_body
+    );
+}
+
 #[then(regex = r#"^gateway (\d+) did not receive a fabric forward request$"#)]
 pub async fn gateway_did_not_receive_fabric_forward_request(
     world: &mut G2gWorld,

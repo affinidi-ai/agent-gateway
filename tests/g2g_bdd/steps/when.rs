@@ -297,6 +297,83 @@ async fn fetch_agent_card(
     world.response_content_type = content_type;
 }
 
+#[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string}")]
+async fn method_request_sent_to_surface_path(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+) {
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new()).await;
+}
+
+#[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string} with headers")]
+async fn method_request_sent_to_surface_path_with_headers(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+    step: &cucumber::gherkin::Step,
+) {
+    let headers: Vec<(String, String)> = step
+        .table
+        .as_ref()
+        .expect("step must have a table of headers")
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [name, value] => (name.clone(), value.clone()),
+            other => panic!("header row must have a name and a value, got {other:?}"),
+        })
+        .collect();
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, headers).await;
+}
+
+async fn send_method_request_to_surface_path(
+    world: &mut G2gWorld,
+    method: &str,
+    gw_index: usize,
+    surface_name: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    let mut request = Client::new().request(method.clone(), format!("http://127.0.0.1:{port}/{surface_id}{path}"));
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if method == reqwest::Method::POST {
+        request = request.json(&build_a2a_request_body());
+    }
+    let response = request
+        .send()
+        .await
+        .expect("caller request must succeed at the transport layer");
+
+    let status = response.status().as_u16();
+    let content_type = collect_headers(response.headers())
+        .get("content-type")
+        .cloned();
+    let raw = response
+        .text()
+        .await
+        .unwrap_or_default();
+    world.response_body = Some(match parse_json_or_sse_body(&raw, content_type.as_deref()) {
+        Value::Null if !raw.is_empty() => Value::String(raw),
+        parsed => parsed,
+    });
+    world.response_status = Some(status);
+    world.response_content_type = content_type;
+}
+
 /// Send a Fabric A2A request carrying a specific JSON-RPC method name.
 ///
 /// Proves a v1.0 method survives the DIDComm hop between gateways unchanged: the
