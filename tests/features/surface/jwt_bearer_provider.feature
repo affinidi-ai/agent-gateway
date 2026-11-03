@@ -29,7 +29,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: Every assertion carries the subject and a jti of its own
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a JWT Bearer provider
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
     And the provider's JWT subject is "svc@example.com"
     And the caller has sent a request to the surface and received status 200
     And the operator has changed the credential provider's scope to "bdd-new-scope"
@@ -41,7 +41,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: The startup report names a stored JWT Bearer provider without a subject
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a JWT Bearer provider
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
     And the gateway keeps its log of warnings
     When the caller sends a request to the surface
     Then the response status is 200
@@ -49,7 +49,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: The startup report stays quiet about a JWT Bearer provider with a subject
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a JWT Bearer provider
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
     And the provider's JWT subject is "svc@example.com"
     And the gateway keeps its log of warnings
     When the caller sends a request to the surface
@@ -58,7 +58,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: An accepted token request is counted as a success
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     When the caller sends a request to the surface
     Then the response status is 200
     And the token request metric counts 1 "success" request for provider type "oauth2_client_credentials"
@@ -67,7 +67,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: A JWT Bearer token request is counted under its provider type
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a JWT Bearer provider
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
     When the caller sends a request to the surface
     Then the response status is 200
     And the token request metric counts 1 "success" request for provider type "oauth2_jwt_bearer"
@@ -75,7 +75,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: A refused token request is counted as refused
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider is refusing token requests
     When the caller sends a request to the surface
     Then the response status is 502
@@ -85,7 +85,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: A token request that outlasts the timeout is counted as a timeout
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the gateway gives a token request 1 second before it gives up
     And the target's credential provider answers token requests only after 3000 ms
     When the caller sends a request to the surface
@@ -95,7 +95,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: An answer without an access token is counted as an invalid response
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider answers token requests with no access token
     When the caller sends a request to the surface
     Then the response status is 502
@@ -104,7 +104,7 @@ Feature: JWT Bearer credential providers
 
   Scenario: A request refused before it reaches the token endpoint is not counted
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider has a plain http token endpoint
     And the gateway enforces the credential rule "token_endpoint_https"
     When the caller sends a request to the surface

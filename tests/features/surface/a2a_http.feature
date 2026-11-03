@@ -105,7 +105,7 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" did not receive header "x-target-api-key"
 
   Scenario: A2A agent card fetch presents a provider-issued target credential
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
@@ -113,7 +113,7 @@ Feature: A2A HTTP surface forwarding and identity
     And the target's credential provider received a client credentials grant from client "bdd-target-client" for scope "https://www.googleapis.com/auth/cloud-platform"
 
   Scenario: A second agent card fetch reuses the cached provider token
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     And the caller has fetched the agent card
     When the caller fetches the agent card
     Then the response status is 200
@@ -122,7 +122,7 @@ Feature: A2A HTTP surface forwarding and identity
 
   # A token is renewed 60 seconds before it expires, so a 60 second token is already stale.
   Scenario: A provider token about to expire is renewed before the agent card fetch
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider issues tokens that expire in 60 seconds
     And the caller has fetched the agent card
     When the caller fetches the agent card
@@ -131,7 +131,7 @@ Feature: A2A HTTP surface forwarding and identity
     And the target's credential provider received 2 token requests
 
   Scenario: A refused provider token request fails the agent card when fallback is reject
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider is refusing token requests
     And the target authentication fallback is "reject"
     When the caller fetches the agent card
@@ -140,7 +140,7 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" was not called
 
   Scenario: A refused provider token request fetches the agent card without it when fallback is passthrough
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider is refusing token requests
     And the target authentication fallback is "passthrough"
     When the caller fetches the agent card
@@ -148,21 +148,21 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" did not receive header "authorization"
 
   Scenario: A2A agent card fetch presents a token from a JWT Bearer grant
-    Given the surface authenticates its target with a JWT Bearer provider
+    Given the gateway authenticates to the managed agent with a JWT Bearer provider
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received a JWT Bearer grant signed with the provider key
 
   Scenario: A forwarded request presents a provider-issued target credential
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     When the caller sends a request to the surface
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the target's credential provider received 1 token request
 
   Scenario: A caller cannot override the provider-issued credential on the agent card fetch
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     When the caller fetches the agent card with extra headers
       | authorization | Bearer caller-forged |
     Then the response status is 200

@@ -19,7 +19,7 @@ Feature: Agent card preview
     And managed agent "bravo" received a request for its agent card without the operator's credentials
 
   Scenario: A target token the provider refuses is reported while the preview still answers
-    Given the surface authenticates its target with a client credentials provider
+    Given the gateway authenticates to the managed agent with a client credentials provider
     And the target's credential provider is refusing token requests
     And the target authentication fallback is "reject"
     When the operator reads the agent card preview of the surface
@@ -99,7 +99,7 @@ Feature: Agent card preview
 
   Scenario: A preview fetch is audited without the target address, a secret or the card
     Given the gateway logs its audit events
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And managed agent "bravo" serves an Agent Card that names its own address
     When the operator reads the agent card preview of the surface
     Then the agent card preview answers 200

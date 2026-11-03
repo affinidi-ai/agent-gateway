@@ -2534,7 +2534,7 @@ fn target_auth_provider(world: &mut SurfaceWorld) -> &mut SurfaceTargetAuthProvi
         .expect("the surface must authenticate its target with a credential provider first")
 }
 
-#[given(expr = "the surface authenticates its target with a client credentials provider")]
+#[given(expr = "the gateway authenticates to the managed agent with a client credentials provider")]
 fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld) {
     world
         .surface_config
@@ -2583,7 +2583,7 @@ fn transit_point_injects_client_credentials_delegated_credentials(
     surface_requires_client_credentials_delegated_credentials(world);
 }
 
-#[given(expr = "the surface authenticates its target with a JWT Bearer provider")]
+#[given(expr = "the gateway authenticates to the managed agent with a JWT Bearer provider")]
 fn surface_authenticates_target_with_jwt_bearer(world: &mut SurfaceWorld) {
     world
         .surface_config

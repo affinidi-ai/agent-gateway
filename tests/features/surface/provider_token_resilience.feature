@@ -6,7 +6,7 @@ Feature: Credential provider token resilience
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the gateway keeps its log of warnings
 
   Scenario: A refused token request holds back the next request
@@ -60,7 +60,7 @@ Feature: Credential provider token resilience
     And the target's credential provider's latest token request carries client secret "bdd-rotated-client-secret-value"
 
   Scenario: A service account JSON key file signs the JWT Bearer grant
-    Given the surface authenticates its target with a JWT Bearer provider
+    Given the gateway authenticates to the managed agent with a JWT Bearer provider
     And the provider's signing key is a service account JSON key file
     When the caller sends a request to the surface
     Then the response status is 200

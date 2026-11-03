@@ -6,7 +6,7 @@ Feature: Credential policy on the request path
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
-    And the surface authenticates its target with a client credentials provider
+    And the gateway authenticates to the managed agent with a client credentials provider
     And the gateway keeps its log of warnings
 
   Scenario: A provider with an http token endpoint authenticates the Target in warn mode
