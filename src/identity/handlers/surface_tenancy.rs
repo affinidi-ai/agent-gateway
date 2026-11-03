@@ -435,56 +435,8 @@ fn check_access_point_target_binding(
     view: &AgentSurface,
     binding: &crate::config::types::OutboundCredentialBinding,
 ) -> Result<(), &'static str> {
-    if view
-        .outbound_credentials
-        .len()
-        != 1
-    {
-        return Err("consent_mode external binds the Access Point's Target alone: outbound_credentials can hold no \
-                    other binding");
-    }
-    if !view
-        .transit_points()
-        .is_empty()
-    {
-        return Err("consent_mode external in outbound_credentials binds the Access Point's Target, on a surface \
-                    without Transit Points: outbound_credentials apply on every Transit Point");
-    }
-    if matches!(binding.inject_as, crate::config::types::CredentialInjection::Meta { .. }) {
-        return Err("consent_mode external injects the grant as a header: bearer_header or custom_header");
-    }
-    if crate::proxy::target_grant::sends_the_grant_across_the_origin(view) {
-        return Err("consent_mode external on an A2A or AP2 Access Point sends the grant at or under the Target's \
-                    endpoint path, so target.endpoint cannot be the root of its origin, where that is every path \
-                    of the vendor's: give it the agent's own path");
-    }
-    if view.target_auth().is_some() {
-        return Err("consent_mode external sends the grant in place of the Target's own credential: remove \
-                    target.auth");
-    }
-    if view
-        .source_auth()
-        .is_some_and(
-            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
-        )
-    {
-        return Err("consent_mode external sends the grant in place of the caller's credential: turn the Access \
-                    Point's forward_header off");
-    }
-    if view.charges_callers() {
-        return Err("consent_mode external charges callers nothing: a payment is settled before the grant is \
-                    released, and the release can still be refused; remove target.payment_policy");
-    }
-    if view.presents_the_agent_to_the_target() {
-        return Err("consent_mode external sends the vendor no presentation of the agent: turn off \
-                    target.identity_injection.inject_vp and target.workload_binding, remove \
-                    identity_slots.inbound, and inject the surface's DID in a header, not protocol_native");
-    }
-    if view.injects_custom_metadata() {
-        return Err("consent_mode external sends the vendor nothing of the gateway's beside the grant: turn \
-                    target.custom_metadata off");
-    }
-    Ok(())
+    crate::proxy::target_grant::target_binding_violation(view, binding)
+        .map_or(Ok(()), |violation| Err(violation.refusal()))
 }
 
 /// The Access Point Target's `consent_mode: external` binding is held in one

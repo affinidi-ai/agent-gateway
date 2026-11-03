@@ -195,7 +195,7 @@ sequenceDiagram
 | --- | --- | --- |
 | `allowed_dids` | empty | Empty means any DID is accepted, so a surface with it takes no binding with external consent ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point)) |
 | `challenge_ttl_seconds` | 300 | Capped at 3600. A longer challenge widens the replay window. |
-| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. A save that sets a value above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds, and a save that keeps it is accepted. |
+| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. Only the first caller-authentication method mints sessions, so the cap applies to the surface's first method and to each variant's own. A save that sets a value above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds, and a save that keeps it is accepted. |
 | `allowed_algorithms` | `["EdDSA"]` | The verifier recognises `EdDSA` and `ES256`; a value outside that set is rejected at validation time |
 
 `IAT_SKEW_SECONDS` is 120 ([`verify.rs`](../src/didauth/verify.rs)). A JWS is rejected
@@ -375,8 +375,11 @@ JSON otherwise; the reason is logged.
 
 `transit.source_auth`, on the surface's `transit` block rather than a Transit Point, is not
 enforced. The admin API refuses a surface that sets it, on the surface or in a variant's
-overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
-its Transit Points refuse every request with `503` in the same way.
+overrides, with `400`. A surface stored with it, on the surface or in a variant's overrides,
+still loads, with a warning in the log, but its Transit Points refuse every request with `503`
+in the same way; one set only in a variant refuses that variant's requests. A variant never
+lifts the surface's refusal, a complete variant whose shared transit settings leave
+`source_auth` out included.
 
 The Surface Builder's Transit Point panel has a **Who can call this Transit Point** section
 with the transit token switch, a **Caller authentication** choice (an API key from the secret
@@ -495,7 +498,8 @@ name only its own tenant's or appliance-wide ones (see
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)).
 
 Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
-refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
+refused, with `401` saying only `Caller credential missing or invalid`, as a JSON-RPC error
+(`-32001`, id `null`) on an MCP Transit Point and a problem JSON on any other;
 which check failed is logged, and the refusal is recorded as an `auth_failed` audit event (see
 [`OBSERVABILITY.md`](OBSERVABILITY.md)). Failed attempts are not throttled: protect a Transit
 Point reachable from untrusted networks with a strong key or certificate, and watch those
@@ -581,8 +585,10 @@ When a surface has Transit Points, its Access Point adds an `X-Transit-Token` he
 request it forwards to the managed agent, and the agent sends it back on its Transit Point
 calls ([`transit_token.rs`](../src/proxy/transit_token.rs)). The token is an HS256 JWT:
 signed, not encrypted, so the agent can read every claim. It names the surface, the
-caller, a hash of the caller's authenticated identity, the Transit Points it opens and the
-trace, and expires its surface's [transit token lifetime](#transit-token-lifetime) after
+caller, how the caller's identity was established (`identity_source`), the caller's DNA UAI
+when resolved (`caller_dna_uai`), a hash of the caller's authenticated identity, the
+operator-configured caller context fields captured on the Access Point
+(`caller_context_fields`), the Transit Points it opens and the trace, and expires its surface's [transit token lifetime](#transit-token-lifetime) after
 it is issued, 300 seconds unless the surface sets another. The agent may send the same
 token on any number of calls to that surface's Transit Points until then. The header is
 never forwarded to a Transit Point's target.
@@ -668,9 +674,17 @@ A Transit Point refuses the call with `401` unless the token:
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
 The refusal says only that the transit token is missing or invalid; which check it failed is
-logged. A `GET` of a public discovery path, such as an agent card, is forwarded without a
-transit token check, and so without any credential (see
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+logged.
+
+A discovery read is forwarded without a transit token check, and so without any credential
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+It is a `GET` or `HEAD` whose path below the Transit Point, which is the path the target
+receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
+`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
+`agent.json` or `discovery`, with at most one trailing slash. A document below another
+segment, such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\`
+or `.` and `..` segments are not discovery reads, whatever the target resolves them to, so
+they need a transit token.
 
 Transit Point policies see the caller the token carries in `input.transit.caller`, and a
 client the Transit Point verified itself apart from it, in `input.transit.client`; see
@@ -686,9 +700,16 @@ a filesystem that supports hard links; one that does not stops the first start w
 saying so. A key file that cannot be read stops the gateway from starting. Every token names
 the key in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
-accepts the tokens the Active instance issued. A portable backup carries the key, so a
+accepts the tokens the Active instance issued; instances that do not share it refuse each
+other's tokens, so every instance that serves a managed agent's Transit Point calls must share
+`vc_keys` with the one that served its inbound request. Instances sharing the directory must
+also agree on encryption at rest: when one creates the plaintext key and another the
+encrypted one at the same time, the one that finds the other's file beside its own removes its
+own and fails to start with an error saying so. The directory is synced after the key file is
+created. A portable backup carries the key only when `vc_keys` is under `_storage`, so a
 gateway restored from it accepts the tokens the original issued. To replace the key, stop
-every instance, delete the file, and start them again; every token issued before is refused.
+every instance, delete both `transit_token_key.json` and `transit_token_key.json.enc`, and
+start them again; every token issued before is refused.
 
 #### Transit token lifetime
 
@@ -770,15 +791,16 @@ except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 header, the caller-info and `did:webvh` identity headers
 (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
 `x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
-like the Transit Point's `target_auth` header, and any header a Header Metadata Mapping is set to
-strip. Other headers, such as an API key header the agent sends for the target itself, pass.
-The gateway sets none of the forwarding headers either, so a target that trusts it as its proxy
-never takes a caller's claim about its address, host or scheme. The credentials the gateway adds
-are described in
+like the Transit Point's `target_auth` header or like the `custom_header` of a credential
+binding that can apply on it, and any header a Header Metadata Mapping is set to strip. Other
+headers, such as an API key header the agent sends for the target itself under another name,
+pass. The gateway sets none of the forwarding headers either, so a target that trusts it as its
+proxy never takes a caller's claim about its address, host or scheme. The credentials the gateway
+adds are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
-The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`
-and `WWW-Authenticate`, so a target cannot set cookies in the agent or send it to
+The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`,
+`Set-Cookie2`, `WWW-Authenticate` and `Authentication-Info`, so a target cannot set cookies in the agent or send it to
 authenticate with the target directly. The response status is unchanged.
 
 ## Managed identity
