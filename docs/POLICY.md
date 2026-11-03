@@ -30,6 +30,11 @@ sending gateway of a `fabric://` Target, so a `POST` to a path that merely ends 
 `/agent-card.json` or `/agent.json` is evaluated like any other call, and the sending gateway
 skips its policy for a `GET` of `/discovery` or `/.well-known/ucp` as the direct path does.
 
+On the direct path and the sending gateway, a request of any method whose path ends in
+`/.well-known/agent-card.json` or `/.well-known/agent.json` is answered by the gateway's own agent
+card fetch, a `GET` to the Target, before policy runs (`handle_agent_card`), so that request never
+reaches the Target as sent.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct

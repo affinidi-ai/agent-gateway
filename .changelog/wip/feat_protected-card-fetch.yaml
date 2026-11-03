@@ -19,15 +19,20 @@ changes:
         such reads on the sending gateway no longer applies to them.
   fixed:
     - timestamp: '2026-11-02T11:45:42Z'
-      title: Fetch agent cards over Fabric with the same rules as direct requests
+      title: Fetch agent cards over Fabric with the direct path's header and failure rules
       description: >-
         On a Fabric route, the receiving gateway sends the Target credential only on a GET or
         HEAD whose normalised path is exactly an agent card path or the configured card
-        location. That fetch is a new GET with no body that keeps only Accept, Accept-Language
-        and User-Agent from the peer, and carries no delegated credential, transit token or
-        trace id. Its answer reaches the peer with only the headers that describe the card, and
-        a refusal with only its status. The card read for policy input now presents the Target
-        credential and is cached per surface and Target authentication for up to 60 seconds.
+        location, with the direct path's header, body and failure rules. That fetch is a new GET
+        with no body that keeps only Accept, Accept-Language and User-Agent from the peer, and
+        carries no delegated credential, transit token or trace id. Its answer reaches the peer
+        with only the headers that describe the card, and a refusal with only its status. Unlike
+        the direct path, it fetches the exact normalised path the peer sent rather than
+        agent-card.json for a legacy agent.json request, and a GET at the configured card
+        location is the card fetch for any caller, including one who failed source
+        authentication on a surface that forwards failed callers to policy. The card read for
+        policy input now presents the Target credential and is cached per surface and Target
+        authentication for up to 60 seconds.
   removed: []
   security:
     - timestamp: '2026-11-02T13:54:10Z'
@@ -36,5 +41,8 @@ changes:
         The sending gateway of a Fabric route skipped its surface policy for any request whose
         path ended in agent.json or agent-card.json, whatever the method, so a POST to such a
         path passed unevaluated. It now skips the policy only for a GET or HEAD of a public
-        discovery path.
+        discovery path. Unchanged, on the direct path and the sending gateway a request of any
+        method to a path ending in .well-known/agent-card.json or .well-known/agent.json is
+        answered by the gateway's own agent card fetch, a GET to the Target, before policy, so
+        it never reaches the Target as sent.
   breaking: []

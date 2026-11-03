@@ -460,8 +460,9 @@ calls, but it moves the default paths of the surface's Transit Points, which fol
 
 ### Agent card fetch over Fabric
 
-The receiving gateway fetches the local Target's agent card the way the
-[direct path](PROTOCOLS.md#agent-card-fetch) does. Only a `GET` or `HEAD` whose path is exactly
+The receiving gateway fetches the local Target's agent card with the
+[direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` or
+`HEAD` whose path is exactly
 `/.well-known/agent-card.json`, `/.well-known/agent.json` or the surface's configured card location
 is a card fetch, matched after percent-encoded unreserved characters are decoded and dot segments
 removed, ignoring the query and keeping case
@@ -484,6 +485,15 @@ Every other public path, such as `/discovery`, `/.well-known/ucp` or `/x/%2e%2e/
 caller authentication and is forwarded without the credential. A credential that cannot be resolved
 under `target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as
 the direct path and the MCP proxy path.
+
+Two things differ from the direct path:
+
+- The direct path fetches `/.well-known/agent-card.json`, or the configured card location, even
+  for a request to the legacy `/.well-known/agent.json`. Over Fabric the fetch goes to the exact
+  normalised path the peer sent.
+- Over Fabric a `GET` at the configured card location is the card fetch for any caller: the
+  gateway sends it as its own request with `target.auth` and returns the card. That includes a
+  caller who failed source authentication on a surface that forwards failed callers to policy.
 
 The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
 from the gateway's secrets store rather than opening one per request. Under
