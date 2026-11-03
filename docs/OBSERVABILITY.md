@@ -97,13 +97,13 @@ counter incremented once for each service token request the gateway sends to a c
 provider's token endpoint: a client credentials, JWT Bearer or Client Credentials JWT grant for
 [target authentication](CREDENTIAL_DELEGATION.md). A cached token served without a request, a
 request held back by the retry backoff, and a request refused before it is sent (a missing
-secret, an endpoint the egress policy or the https rule refuses) are not counted. Refreshes and
+secret, an endpoint the egress policy or the https rule refuses, or whose host does not resolve in time) are not counted. Refreshes and
 code exchanges of delegated user tokens are not counted either.
 
 | Label | Value |
 | --- | --- |
 | `provider_type` | `oauth2_client_credentials`, `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` |
-| `outcome` | `success`; `refused` (the endpoint answered with a non-2xx status, or the connection failed before any answer; a connection that times out is `timeout`); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (a 2xx answer that is not valid JSON, carries an OAuth `error`, is over 64 KiB, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
+| `outcome` | `success`; `refused` (the endpoint answered with a non-2xx status, or the connection failed before any answer; a connection that times out is `timeout`); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (an answer over 64 KiB, or a 2xx answer that is not valid JSON, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
 
 No label carries a URL, provider id, secret or tenant.
 

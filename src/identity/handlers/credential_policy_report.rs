@@ -180,16 +180,24 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
     log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, &egress), policy);
 }
 
+/// The mode a rule runs in; `jwt_subject` has no setting and only warns.
+fn rule_mode(
+    rule: &str,
+    policy: &CredentialPolicyConfig,
+) -> RuleMode {
+    match rule {
+        RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
+        RULE_JWT_SUBJECT => RuleMode::Warn,
+        _ => policy.tenant_credential_isolation,
+    }
+}
+
 fn log_findings(
     findings: &Findings,
     policy: &CredentialPolicyConfig,
 ) {
     for breach in &findings.breaches {
-        let mode = match breach.rule {
-            RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
-            RULE_JWT_SUBJECT => RuleMode::Warn,
-            _ => policy.tenant_credential_isolation,
-        };
+        let mode = rule_mode(breach.rule, policy);
         warn!(
             subject = breach.subject,
             id = %breach.id,
@@ -227,6 +235,18 @@ mod tests {
     use crate::config::credential_policy::CredentialPolicyConfig;
     use crate::config::types::{TargetAuthConfig, TargetAuthMethod};
     use chrono::Utc;
+
+    #[test]
+    fn the_jwt_subject_rule_only_warns_whatever_the_other_rules_enforce() {
+        let policy = CredentialPolicyConfig {
+            token_endpoint_https: RuleMode::Enforce,
+            tenant_credential_isolation: RuleMode::Enforce,
+            ..CredentialPolicyConfig::default()
+        };
+        assert!(!rule_mode(RULE_JWT_SUBJECT, &policy).is_enforced());
+        assert!(rule_mode(RULE_TOKEN_ENDPOINT_HTTPS, &policy).is_enforced());
+        assert!(rule_mode(RULE_TENANT_CREDENTIAL_ISOLATION, &policy).is_enforced());
+    }
 
     fn provider(
         id: &str,

@@ -916,7 +916,7 @@ pub(crate) async fn post_token_request_within(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenRequestOutcome {
     Success,
-    /// The endpoint answered with an error status or OAuth error, or refused the connection.
+    /// The endpoint answered with a non-2xx status, or the connection failed before any answer.
     Refused,
     Timeout,
     /// The answer could not be parsed, was over the size limit, lacked a usable `expires_in`

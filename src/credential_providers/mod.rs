@@ -127,7 +127,7 @@ pub struct JwtAssertionSettings {
     /// `iss` claim of a JWT Bearer grant (a Google service account's `client_email`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_issuer: Option<String>,
-    /// `sub` claim of a JWT Bearer grant (domain-wide delegation)
+    /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
 }

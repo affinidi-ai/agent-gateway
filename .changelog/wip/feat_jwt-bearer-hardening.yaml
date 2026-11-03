@@ -19,12 +19,10 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-02T11:09:37Z'
-      title: ⭐ Require a subject and a unique jti in JWT bearer grant assertions
+      title: ⭐ Add a unique jti to every JWT bearer grant assertion
       description: >-
         Every JWT bearer grant assertion now carries a random jti, so an authorization server
-        can refuse a replayed assertion. Creating, updating or validating an oauth2_jwt_bearer
-        credential provider without jwt_subject is refused with 400. A stored provider without
-        it keeps working. Upgrade note: the next update of such a provider must set jwt_subject.
+        can refuse a replayed assertion.
   breaking:
     - timestamp: '2026-11-03T09:00:00Z'
       title: Refuse JWT bearer credential providers saved without a subject
