@@ -273,7 +273,7 @@ impl SourceAuthConfig {
     /// holds a token in the method's scheme, as its verifier reads it, so
     /// another scheme on the same header, such as an MPP `Authorization:
     /// Payment` credential, is not taken for the JWT.
-    fn is_presented(
+    pub(crate) fn is_presented(
         &self,
         headers: &axum::http::HeaderMap,
         has_client_certificate: bool,

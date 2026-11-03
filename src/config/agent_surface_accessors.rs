@@ -119,6 +119,23 @@ impl AgentSurface {
             .collect()
     }
 
+    /// Whether a caller-authentication method would take `value`, sent in
+    /// header `name`, as its credential: the test method selection applies,
+    /// so another scheme on a method's header, such as an MPP
+    /// `Authorization: Payment` credential beside a JWT bearer method, is not
+    /// one.
+    pub fn takes_source_credential(
+        &self,
+        name: &axum::http::HeaderName,
+        value: &axum::http::HeaderValue,
+    ) -> bool {
+        let mut single = axum::http::HeaderMap::new();
+        single.insert(name.clone(), value.clone());
+        self.source_auth_methods()
+            .iter()
+            .any(|method| method.is_presented(&single, false))
+    }
+
     /// Whether `name` is a header a caller-authentication method reads.
     pub fn is_source_credential_header(
         &self,
