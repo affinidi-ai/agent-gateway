@@ -2009,7 +2009,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .as_deref(),
             };
             let verified = if selection.ambiguous {
-                Err(crate::source_auth::errors::SourceAuthError::ambiguous_credentials())
+                Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
             } else {
                 sa_middleware
                     .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
@@ -2024,12 +2024,17 @@ async fn proxy_handler_with_mcp_runtime(
                 // refuses it. Otherwise record the outcome for the policy layer and
                 // continue with no asserted caller identity — do not block here.
                 Err(e) if e.is_caller_attributable() => {
+                    // On an Access Point that publishes protected resource
+                    // metadata a failed JWT gets the discovery challenge, and a
+                    // failure of any other method a plain refusal, so a bad
+                    // credential never gets further than none.
                     let challenged = protected_resource.is_some()
                         && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
                     let refused = !challenged
-                        && state
-                            .surface
-                            .rejects_failed_caller_authentication();
+                        && (protected_resource.is_some()
+                            || state
+                                .surface
+                                .rejects_failed_caller_authentication());
                     channel_warn!(
                         config_id,
                         "Source authentication failed (reason={}) — {}",

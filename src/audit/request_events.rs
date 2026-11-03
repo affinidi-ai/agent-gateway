@@ -333,6 +333,7 @@ pub fn source_auth_reason(error: &SourceAuthError) -> &'static str {
     match error {
         SourceAuthError::MissingCredential { .. } => "missing_credential",
         SourceAuthError::InvalidCredential { .. } => "invalid_credential",
+        SourceAuthError::AmbiguousCredentials => "ambiguous_credentials",
         SourceAuthError::ConfigNotFound { .. } => "config_not_found",
         SourceAuthError::Internal { .. } => "internal",
     }
@@ -691,6 +692,7 @@ mod tests {
             }),
             "invalid_credential"
         );
+        assert_eq!(reason(SourceAuthError::AmbiguousCredentials), "ambiguous_credentials");
         assert_eq!(reason(SourceAuthError::ConfigNotFound { id: "s".into() }), "config_not_found");
         assert_eq!(reason(SourceAuthError::Internal { reason: "x".into() }), "internal");
     }

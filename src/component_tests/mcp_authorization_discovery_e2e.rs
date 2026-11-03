@@ -667,9 +667,10 @@ async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
 
 /// Only the JWT Bearer method answers with the discovery challenge: a caller
 /// presenting a further method's credential is checked by that method, and a
-/// failure reaches policy, which here forwards it.
+/// failure is refused before policy without the challenge, so a bad credential
+/// gets no further than none.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_further_methods_failure_reaches_policy_without_the_challenge() {
+async fn a_further_methods_failure_is_refused_without_the_challenge() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway_with(
         &fixture,
@@ -718,7 +719,7 @@ async fn a_further_methods_failure_reaches_policy_without_the_challenge() {
     let wrong = call(Some("wrong"))
         .await
         .unwrap();
-    assert_eq!(wrong.status(), 200, "a failed API key reaches policy");
+    assert_eq!(wrong.status(), 401, "a failed API key is refused before policy");
     assert!(
         !wrong
             .headers()
@@ -734,7 +735,7 @@ async fn a_further_methods_failure_reaches_policy_without_the_challenge() {
             .mock
             .request_count
             .load(Ordering::SeqCst),
-        2
+        1
     );
 }
 

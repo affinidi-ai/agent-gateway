@@ -268,10 +268,11 @@ impl SourceAuthConfig {
         }
     }
 
-    /// Whether the request carries this method's credential. A JWT bearer
-    /// header counts only when it holds a token in the method's scheme, as its
-    /// verifier reads it, so another scheme on the same header, such as an MPP
-    /// `Authorization: Payment` credential, is not taken for the JWT.
+    /// Whether the request carries this method's credential: a non-empty
+    /// header, or a client certificate. A JWT bearer header counts only when it
+    /// holds a token in the method's scheme, as its verifier reads it, so
+    /// another scheme on the same header, such as an MPP `Authorization:
+    /// Payment` credential, is not taken for the JWT.
     fn is_presented(
         &self,
         headers: &axum::http::HeaderMap,
@@ -285,7 +286,14 @@ impl SourceAuthConfig {
                 .is_ok();
         }
         match self.credential_source() {
-            CredentialSource::Header(name) => headers.contains_key(name),
+            CredentialSource::Header(name) => headers
+                .get(name)
+                .is_some_and(|value| {
+                    !value
+                        .as_bytes()
+                        .trim_ascii()
+                        .is_empty()
+                }),
             CredentialSource::ClientCertificate => has_client_certificate,
             CredentialSource::McpMeta | CredentialSource::A2aExtension => false,
         }
@@ -1350,6 +1358,13 @@ mod tests {
         }
         let request = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
         assert_eq!(selected_tag(&methods, &request, false), ("api_key", true));
+
+        let empty_key = headers(&[("x-api-key", " "), ("authorization", "Bearer t")]);
+        assert_eq!(
+            selected_tag(&methods, &empty_key, false),
+            ("jwt_bearer", false),
+            "an empty header is no credential"
+        );
 
         let any_scheme = method(serde_json::json!({
             "type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": [], "token_scheme": ""

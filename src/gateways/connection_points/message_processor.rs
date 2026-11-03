@@ -4806,7 +4806,7 @@ async fn process_forward_request_in_request_scope(
                     variant_id: active_variant_id.as_deref(),
                 };
                 let verified = if selection.ambiguous {
-                    Err(crate::source_auth::errors::SourceAuthError::ambiguous_credentials())
+                    Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
                 } else {
                     sa_middleware
                         .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
@@ -4820,9 +4820,12 @@ async fn process_forward_request_in_request_scope(
                     // record the outcome for the policy layer and continue with
                     // no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
+                        // Beside protected resource metadata every failure is
+                        // refused: a failed JWT with the discovery refusal, any
+                        // other method plainly.
                         let challenged = protected_resource.is_some()
                             && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
-                        let refused = challenged || surface.rejects_failed_caller_authentication();
+                        let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(
                             config_id,
                             "GW2: Source authentication failed (reason={}) — {}",
