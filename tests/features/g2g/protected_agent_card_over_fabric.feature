@@ -80,11 +80,16 @@ Feature: Protected agent card fetch over fabric
     Then the response status is 403
     And managed agent "bravo" was not called
 
-  Scenario: gateway 1 does not apply its surface policy to a read of the agent card
+  Scenario Outline: gateway 1 does not apply its surface policy to a public discovery read
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" has a request policy that denies all requests
-    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "<path>"
     Then the response status is 200
-    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received a GET request at path "<path>"
+
+    Examples:
+      | path          |
+      | /x/agent.json |
+      | /discovery    |

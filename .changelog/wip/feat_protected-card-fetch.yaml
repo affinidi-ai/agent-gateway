@@ -1,25 +1,32 @@
 branch: feat/protected-card-fetch
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Answer 502 Target authentication failed on Fabric and MCP proxy paths
+      description: >-
+        When the Target credential cannot be resolved and the fallback is reject, the Fabric
+        receiving gateway and the MCP proxy path now answer 502 with the text Target
+        authentication failed, the same text as the direct path, instead of Target
+        authentication configuration error. Clients that match the old text must match the new
+        one.
   fixed:
     - timestamp: '2026-11-02T11:45:42Z'
       title: Fetch agent cards over Fabric with the same rules as direct requests
       description: >-
         On a Fabric route, the receiving gateway sends the Target credential only on a GET or
-        HEAD whose normalised path is exactly an agent card path, as a new GET with no body that
-        keeps only Accept, Accept-Language and User-Agent. The card read for policy input now
-        uses the Target authentication. A credential failure answers 502 Target authentication
-        failed on every path. Upgrade note: clients matching the old text Target authentication
-        configuration error must match the new one. That card fetch carries no delegated
-        credential or transit token.
+        HEAD whose normalised path is exactly an agent card path or the configured card
+        location. That fetch is a new GET with no body that keeps only Accept, Accept-Language
+        and User-Agent from the peer, and carries no delegated credential, transit token or
+        trace id. The card read for policy input now presents the Target credential.
   removed: []
   security:
     - timestamp: '2026-11-02T13:54:10Z'
       title: Run the surface policy on non-GET requests to agent card paths over Fabric
       description: >-
         The sending gateway of a Fabric route skipped its surface policy for any request whose
-        path ended in agent.json or agent-card.json, whatever the method. It now skips the
-        policy only for a GET or HEAD of such a path, so a POST to a card-like path is
-        evaluated.
+        path ended in agent.json or agent-card.json, whatever the method, so a POST to such a
+        path passed unevaluated. It now skips the policy only for a GET or HEAD of a public
+        discovery path, as the direct path does, which also covers paths ending in discovery,
+        .well-known/ucp and .well-known/agent-card.
   breaking: []
