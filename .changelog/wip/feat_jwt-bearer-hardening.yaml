@@ -1,0 +1,28 @@
+branch: feat/jwt-bearer-hardening
+changes:
+  added:
+    - timestamp: '2026-11-02T11:09:43Z'
+      title: Count credential provider token requests in a metric
+      description: >-
+        The new counter agent_gateway_credential_provider_token_requests_total, labelled by
+        provider_type and outcome (success, refused, timeout or invalid_response), counts each
+        service token request sent to a token endpoint. Cache hits and backoff waits are not
+        counted.
+    - timestamp: '2026-11-02T12:27:18Z'
+      title: Report stored JWT bearer providers without a subject at startup
+      description: >-
+        The startup and reload credential policy report lists each oauth2_jwt_bearer provider
+        without jwt_subject under the rule jwt_subject, so operators can add one before the
+        provider's next update, which now requires it.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-02T11:09:37Z'
+      title: ⭐ Require a subject and a unique jti in JWT bearer grant assertions
+      description: >-
+        Every JWT bearer grant assertion now carries a random jti, so an authorization server
+        can refuse a replayed assertion. Creating, updating or validating an oauth2_jwt_bearer
+        credential provider without jwt_subject is refused with 400. A stored provider without
+        it keeps working. Upgrade note: the next update of such a provider must set jwt_subject.
+  breaking: []
