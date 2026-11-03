@@ -1439,8 +1439,9 @@ struct TargetRequest {
     body: bytes::Bytes,
 }
 
-/// A Target that records every request and serves an agent card only to a
-/// request carrying its key; any other request gets `401`.
+/// A Target that records every request and serves an agent card, with a
+/// session cookie and an internal header, only to a request carrying its key;
+/// any other request gets `401`.
 struct ProtectedTarget {
     url: String,
     received: Arc<std::sync::Mutex<Vec<TargetRequest>>>,
@@ -1475,7 +1476,12 @@ impl ProtectedTarget {
                 if keyed {
                     (
                         axum::http::StatusCode::OK,
-                        [("content-type", "application/json")],
+                        [
+                            ("content-type", "application/json"),
+                            ("cache-control", "max-age=60"),
+                            ("set-cookie", "target-session=gateway"),
+                            ("x-internal", "target-only"),
+                        ],
                         r#"{"name":"protected-agent"}"#,
                     )
                         .into_response()
@@ -1752,9 +1758,13 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
 /// gateway, with a credential from the gateway's secrets store, so a protected
 /// Target's card reaches policy; a credential that cannot be resolved leaves the
 /// policy input without a card, or under `fallback: passthrough` reads it
-/// without the credential.
+/// without the credential. Each surface's outcome is cached, so a second read
+/// neither calls the Target nor resolves the credential.
 #[tokio::test]
 async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_without_it() {
+    if ran_in_child("ATG_FABRIC_POLICY_CARD_CHILD").await {
+        return;
+    }
     let target = ProtectedTarget::start().await;
     let root = tempfile::tempdir().unwrap();
     let secrets = root.path().join("secrets");
@@ -1768,24 +1778,33 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
         super::TEST_SECRETS_STORE
             .scope(store.clone(), async move { super::policy_agent_card(&surface, SURFACE_ID).await })
     };
+    let named = |surface: AgentSurface, surface_id: &str, fallback: Option<&str>| {
+        let mut value = serde_json::to_value(surface).unwrap();
+        value["surface_id"] = json!(surface_id);
+        if let Some(fallback) = fallback {
+            value["target"]["auth"]["fallback"] = json!(fallback);
+        }
+        serde_json::from_value::<AgentSurface>(value).unwrap()
+    };
 
-    let protected = protected_surface(&target.url, "target-key", None);
-    assert_eq!(card(protected).await, Some(json!({ "name": "protected-agent" })));
+    let protected = named(protected_surface(&target.url, "target-key", None), "protected", None);
+    assert_eq!(card(protected.clone()).await, Some(json!({ "name": "protected-agent" })));
     let request = target
         .received()
         .pop()
         .unwrap();
     assert_eq!(request.path, "/.well-known/agent.json");
     assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
-
     let called = target.received().len();
-    let unresolvable = protected_surface(&target.url, "absent-key", None);
+    assert_eq!(card(protected).await, Some(json!({ "name": "protected-agent" })), "cached");
+    assert_eq!(target.received().len(), called, "a cached card calls the Target again");
+
+    let unresolvable = named(protected_surface(&target.url, "absent-key", None), "unresolvable", None);
     assert_eq!(card(unresolvable).await, None, "absent secret");
     assert_eq!(target.received().len(), called, "the Target was asked without the credential");
 
-    let mut passthrough = serde_json::to_value(protected_surface(&target.url, "absent-key", None)).unwrap();
-    passthrough["target"]["auth"]["fallback"] = json!("passthrough");
-    assert_eq!(card(serde_json::from_value(passthrough).unwrap()).await, None, "a 401 is no card");
+    let passthrough = named(protected_surface(&target.url, "absent-key", None), "passthrough", Some("passthrough"));
+    assert_eq!(card(passthrough).await, None, "a 401 is no card");
     let request = target
         .received()
         .pop()
@@ -1799,7 +1818,7 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
         "passthrough reads the card without the credential"
     );
 
-    let unprotected = surface("a2a", &target.url, &[]);
+    let unprotected = named(surface("a2a", &target.url, &[]), "unprotected", None);
     assert_eq!(card(unprotected).await, None, "a 401 is no card");
 }
 
@@ -1842,4 +1861,47 @@ async fn a_card_fetch_over_fabric_carries_no_onward_trace_id() {
         .pop()
         .unwrap();
     assert_eq!(header_values(&request.headers, "x-gateway-trace-id").len(), 1, "a caller's request carries a trace id");
+}
+
+fn response_header_names(response: &Value) -> Vec<String> {
+    response["headers"]
+        .as_object()
+        .map(|headers| {
+            headers
+                .keys()
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Target answered the gateway's own card fetch, which carried its
+/// credential, so only the headers that describe the card reach the peer; a
+/// caller's request still gets every response header.
+#[tokio::test]
+async fn a_card_fetch_over_fabric_relays_only_the_headers_that_describe_the_card() {
+    if ran_in_child("ATG_FABRIC_CARD_RESPONSE_HEADERS_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", None)).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let relayed = response_header_names(&response);
+    for kept in ["content-type", "cache-control"] {
+        assert!(relayed.contains(&kept.to_string()), "{kept} missing from {relayed:?}");
+    }
+    for withheld in ["set-cookie", "x-internal"] {
+        assert!(!relayed.contains(&withheld.to_string()), "{withheld} relayed in {relayed:?}");
+    }
+
+    let mut authenticated = peer_request(root.path(), "POST", "/rpc");
+    authenticated.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
+    let response = forward_response(&authenticated).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let relayed = response_header_names(&response);
+    assert!(relayed.contains(&"set-cookie".to_string()), "a caller's request relays {relayed:?}");
 }

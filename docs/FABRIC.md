@@ -472,7 +472,10 @@ configured location on the Target's origin), carrying `target.auth` and only the
 dropped, and the fetch carries no caller's material: no delegated credential from
 `outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
 configured card location, and no `X-Gateway-Trace-Id`. The client does not follow redirects, so a
-3xx from the Target is answered to the peer as is.
+3xx from the Target is answered to the peer as is. The Target's answer reaches the peer with only
+`Content-Type`, `Content-Language`, `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a
+session cookie or authentication header the Target sets for the credential stays on the receiving
+gateway, and the card is processed as an agent card response.
 
 Every other public path, such as `/discovery`, `/.well-known/ucp` or `/x/%2e%2e/discovery`, skips
 caller authentication and is forwarded without the credential. A credential that cannot be resolved
@@ -481,8 +484,9 @@ the direct path and the MCP proxy path.
 
 The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
 from the gateway's secrets store rather than opening one per request. Under
-`target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it;
-see
+`target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
+The outcome, card or none, is cached per surface for 60 seconds (10 seconds for none) and cleared
+on configuration reload or a surface save; see
 [`POLICY.md`](POLICY.md#other-pinned-egress-sinks).
 
 ### Modern MCP activation

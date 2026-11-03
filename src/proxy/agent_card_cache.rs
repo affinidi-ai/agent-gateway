@@ -17,6 +17,10 @@
 //! accessor. Configuration reload (`POST /v1/config/reload` and the
 //! in-process surface CRUD reload path) invalidates the whole cache via
 //! [`invalidate_all`] so a redeploy never serves a stale card.
+//!
+//! The card a Fabric receiving surface reads for its policy input may be read
+//! with the surface's Target credential, so it is kept in its own map keyed on
+//! the surface and the card URL ([`lookup_surface_card`]), with the same TTLs.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -55,6 +59,13 @@ impl CacheEntry {
 
 fn cache() -> &'static DashMap<CacheKey, CacheEntry> {
     static CACHE: OnceLock<DashMap<CacheKey, CacheEntry>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+type SurfaceCardKey = (String, String);
+
+fn surface_card_cache() -> &'static DashMap<SurfaceCardKey, CacheEntry> {
+    static CACHE: OnceLock<DashMap<SurfaceCardKey, CacheEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
 
@@ -143,11 +154,39 @@ pub fn insert(
     );
 }
 
-/// Drop every cached entry (agent-card payloads **and** memoized
-/// VP-verification outcomes). Wired into the two reload seams so a
+/// [`lookup`] for the card `surface_id` read from `card_url` for its policy
+/// input. No other surface, and no outbound lookup, sees it.
+pub fn lookup_surface_card(
+    surface_id: &str,
+    card_url: &str,
+) -> Option<Option<Value>> {
+    let entry = surface_card_cache().get(&(surface_id.to_string(), card_url.to_string()))?;
+    entry
+        .is_fresh(Instant::now())
+        .then(|| entry.payload.clone())
+}
+
+/// [`insert`] for the card `surface_id` read from `card_url`.
+pub fn insert_surface_card(
+    surface_id: &str,
+    card_url: &str,
+    payload: Option<Value>,
+) {
+    surface_card_cache().insert(
+        (surface_id.to_string(), card_url.to_string()),
+        CacheEntry {
+            fetched_at: Instant::now(),
+            payload,
+        },
+    );
+}
+
+/// Drop every cached entry (agent-card payloads, surface policy cards **and**
+/// memoized VP-verification outcomes). Wired into the reload seams so a
 /// config redeploy never serves a stale card or a stale identity verdict.
 pub fn invalidate_all() {
     cache().clear();
+    surface_card_cache().clear();
     verified_vp_cache().clear();
 }
 
@@ -208,6 +247,21 @@ mod tests {
         invalidate_all();
         assert_eq!(entry_count(), 0);
         assert!(lookup("https://a.example.com", None).is_none());
+    }
+
+    #[test]
+    fn a_surface_card_is_seen_only_by_its_surface_and_cleared_on_invalidate_all() {
+        let _guard = setup();
+        let url = "https://a.example.com/.well-known/agent.json";
+        assert!(lookup_surface_card("orders", url).is_none(), "miss before insert");
+        insert_surface_card("orders", url, Some(json!({"kind": "protected"})));
+        insert_surface_card("billing", url, None);
+        assert_eq!(lookup_surface_card("orders", url), Some(Some(json!({"kind": "protected"}))));
+        assert_eq!(lookup_surface_card("billing", url), Some(None));
+        assert!(lookup_surface_card("orders", "https://b.example.com/.well-known/agent.json").is_none());
+        assert!(lookup("https://a.example.com", None).is_none(), "an outbound lookup never sees it");
+        invalidate_all();
+        assert!(lookup_surface_card("orders", url).is_none(), "cleared on invalidate_all");
     }
 
     #[test]

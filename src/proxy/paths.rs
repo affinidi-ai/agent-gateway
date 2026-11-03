@@ -385,7 +385,11 @@ pub fn is_public_request(
     method: &str,
     path: &str,
 ) -> bool {
-    (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) && is_public_path(path)
+    is_read_method(method) && is_public_path(path)
+}
+
+fn is_read_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
 }
 
 /// The card path when a request is the gateway's own agent card fetch, which may
@@ -400,7 +404,7 @@ pub fn credentialed_agent_card_path(
     path: &str,
     configured_location: Option<&str>,
 ) -> Option<String> {
-    if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
+    if !is_read_method(method) {
         return None;
     }
     let path = normalized_request_path(path);

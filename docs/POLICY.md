@@ -727,7 +727,10 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirect, a non-success answer or a `target.auth` credential that cannot be
   resolved yields no card in the policy input; the failure is logged as a
   warning without the credential. Under `target.auth.fallback: passthrough` a
-  credential that cannot be resolved reads the card without it.
+  credential that cannot be resolved reads the card without it. The outcome is
+  cached per surface for 60 seconds (10 seconds for no card) and cleared on
+  configuration reload or a surface save, so the policy input may see a card up
+  to a minute old.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's

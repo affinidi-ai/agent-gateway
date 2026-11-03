@@ -3527,12 +3527,22 @@ fn fabric_body_limits(
     )
 }
 
+/// Whether a Target response header reaches the peer on the gateway's own agent
+/// card fetch. The fetch carried the Target credential, so only headers that
+/// describe the card pass; a session cookie or authentication answer stays here.
+fn is_relayed_from_credentialed_card_fetch(name: &str) -> bool {
+    ["content-type", "content-language", "cache-control", "etag", "last-modified", "vary"]
+        .iter()
+        .any(|relayed| name.eq_ignore_ascii_case(relayed))
+}
+
 /// The local Target's agent card for the GW2 policy context: the configured card
 /// location on the Target's origin, or `/.well-known/agent.json` under the Target
 /// endpoint, fetched as the gateway itself with the surface's Target
 /// authentication, resolved from the gateway's secrets store. A credential that
 /// cannot be resolved yields no card, or under `fallback: passthrough` a card
-/// read without it.
+/// read without it. The outcome is cached per surface for the card cache's TTLs,
+/// so a request neither fetches the card nor resolves the credential again.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
@@ -3546,6 +3556,19 @@ async fn policy_agent_card(
                 .trim_end_matches('/')
         ),
     };
+    if let Some(card) = crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url) {
+        return card;
+    }
+    let card = read_policy_agent_card(surface, &card_url, config_id).await;
+    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, card.clone());
+    card
+}
+
+async fn read_policy_agent_card(
+    surface: &crate::config::agent_surface::AgentSurface,
+    card_url: &str,
+    config_id: &str,
+) -> Option<serde_json::Value> {
     let credential = match surface.target_auth() {
         Some(target_auth) => {
             let secrets = get_secrets_store();
@@ -3582,12 +3605,12 @@ async fn policy_agent_card(
         }
         None => None,
     };
-    channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(&card_url));
+    channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(card_url));
     let timeout = GLOBAL_FORWARD_TIMEOUT
         .get()
         .copied()
         .unwrap_or(std::time::Duration::from_secs(30));
-    fetch_agent_card(&card_url, credential, timeout, fabric_body_limits(surface), config_id).await
+    fetch_agent_card(card_url, credential, timeout, fabric_body_limits(surface), config_id).await
 }
 
 /// Fetch the local Target's agent card for the GW2 policy context, through the
@@ -5787,7 +5810,6 @@ async fn process_charged_forward_request(
     }
     let forward_path = card_fetch_path
         .as_deref()
-        .filter(|_| credentialed_card_fetch)
         .unwrap_or(path);
 
     // An agent card request at a configured card location goes to that path on the
@@ -5954,7 +5976,7 @@ async fn process_charged_forward_request(
             }
         };
 
-        let caller = if card_fetch_path.is_some() {
+        let caller = if credentialed_card_fetch {
             crate::proxy::handler::CallerAssertion::GatewayOriginated
         } else {
             crate::proxy::handler::CallerAssertion::for_fabric_received_request(
@@ -6664,7 +6686,8 @@ async fn process_charged_forward_request(
                         | "trailers"
                         | "upgrade"
                         | "content-length" // Skip content-length - will be set by HTTP layer
-                ) {
+                ) || (credentialed_card_fetch && !is_relayed_from_credentialed_card_fetch(&key_lower))
+                {
                     continue;
                 }
                 if let Ok(v_str) = v.to_str() {
@@ -6777,7 +6800,7 @@ async fn process_charged_forward_request(
             }
 
             // GW2: Inject trust registry extension into agent card responses for fabric requests
-            if is_agent_card_request && status == 200 && !response_body.is_empty() {
+            if (is_agent_card_request || credentialed_card_fetch) && status == 200 && !response_body.is_empty() {
                 info!(
                     config_id,
                     "GW2: Agent card response detected, checking for trust registry injection"
@@ -7476,6 +7499,7 @@ async fn process_charged_forward_request(
                     crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
                 );
                 let is_card_response = is_agent_card_request
+                    || credentialed_card_fetch
                     || (is_a2a_surface
                         && (crate::a2a::url_rewriter::extended_agent_card_request_id(&body_bytes).is_some()
                             || crate::proxy::paths::is_rest_extended_agent_card_request(
