@@ -1,10 +1,11 @@
 //! Grants by binding: the delegated credentials of external consent.
 //!
 //! A grant is keyed by the binding it serves and whose account it is: the
-//! tenant, the surface, the hop (a Transit Point's id), the credential provider
-//! and the principal, which is [`OWNER_PRINCIPAL`] for a grant every caller of
-//! the binding uses, or a caller's identity hash. No agent DID is involved, so
-//! a grant never crosses surfaces, hops or tenants.
+//! tenant, the surface, the hop (a Transit Point's id, or
+//! [`ACCESS_POINT_TARGET_HOP`] for the surface's Access Point Target), the
+//! credential provider and the principal, which is [`OWNER_PRINCIPAL`] for a
+//! grant every caller of the binding uses, or a caller's identity hash. No
+//! agent DID is involved, so a grant never crosses surfaces, hops or tenants.
 //!
 //! A record's id is derived from its key alone ([`GrantKey::record_id`]), so a
 //! lookup is one read and one decrypt, never a scan. The id starts with a tag
@@ -22,6 +23,11 @@ use crate::storage::filesystem::StorableEntity;
 
 /// The principal of a grant every caller of its binding uses.
 pub const OWNER_PRINCIPAL: &str = "owner";
+
+/// The hop of the grants of a surface's Access Point Target, whose binding is
+/// the surface's `outbound_credentials` with `consent_mode: external`. No
+/// Transit Point with external consent may take it as its id.
+pub const ACCESS_POINT_TARGET_HOP: &str = "target";
 
 /// The directory of the vault that holds grants, excluded from storage exports.
 pub const GRANTS_DIRECTORY: &str = "delegated_grants";
@@ -302,7 +308,7 @@ pub struct GrantKey {
     pub tenant_id: Option<String>,
     /// The surface whose hop the grant serves.
     pub surface_id: String,
-    /// The hop: a Transit Point's id.
+    /// The hop: a Transit Point's id, or [`ACCESS_POINT_TARGET_HOP`].
     pub hop: String,
     /// The credential provider's record id.
     pub credential_provider_id: String,

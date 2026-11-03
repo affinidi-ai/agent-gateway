@@ -510,6 +510,9 @@ pub async fn run_axum_proxy(
     for adjustment in config.transit_token_lifetime_adjustments(transit_token_max_lifetime_secs) {
         warn!("{adjustment}");
     }
+    for adjustment in config.did_auth_session_ttl_adjustments() {
+        warn!("{adjustment}");
+    }
     // Provider create, surface save and the connect API keep the external
     // consent settings they start with, so every later load of gateway.json
     // keeps them too.

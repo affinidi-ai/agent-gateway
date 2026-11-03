@@ -112,11 +112,13 @@ export const credentialDelegationDefinition: NodeDefinition = {
     },
     {
       description: 'Credential delegation requires an agent identity',
+      // A binding with external consent keeps its grant by binding, not by agent, and the
+      // gateway refuses a presentation of the agent beside it.
       condition: c => {
         const rows = Array.isArray(c?.outbound_credentials_form)
           ? (c.outbound_credentials_form as OutboundCredentialFormRow[])
           : [];
-        return rows.length > 0;
+        return rows.some(row => row.consent_mode !== 'external');
       },
       check: (_c, ctx) => surfaceHasAgentIdentity(ctx.allNodes),
       severity: 'error',

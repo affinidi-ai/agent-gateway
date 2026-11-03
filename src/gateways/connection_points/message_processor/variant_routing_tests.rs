@@ -29,6 +29,27 @@ impl Receiver {
     /// A receiving gateway with one paired sender and the given surfaces, each
     /// targeting the same upstream.
     pub async fn new(surfaces: &[(&str, Value, Option<&str>)]) -> Self {
+        Self::serving(|target| {
+            surfaces
+                .iter()
+                .map(|(surface_id, variants, default_variant_id)| {
+                    json!({
+                        "surface_id": surface_id, "name": surface_id,
+                        "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"),
+                            "protocol": "mcp"},
+                        "target": {"endpoint": target},
+                        "variants": variants,
+                        "default_variant_id": default_variant_id
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// A receiving gateway with one paired sender and the surfaces `surfaces`
+    /// makes for the upstream's URL.
+    pub async fn serving(surfaces: impl FnOnce(&str) -> Vec<Value>) -> Self {
         let target = MockServer::start_with_response(
             json!({"jsonrpc": "2.0", "id": "variant", "result": {"tools": []}}).to_string(),
         )
@@ -44,15 +65,8 @@ impl Receiver {
         let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
             .await
             .unwrap();
-        for (surface_id, variants, default_variant_id) in surfaces {
-            let surface: AgentSurface = serde_json::from_value(json!({
-                "surface_id": surface_id, "name": surface_id,
-                "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"), "protocol": "mcp"},
-                "target": {"endpoint": format!("http://{}", target.addr)},
-                "variants": variants,
-                "default_variant_id": default_variant_id
-            }))
-            .unwrap();
+        for surface in surfaces(&format!("http://{}", target.addr)) {
+            let surface: AgentSurface = serde_json::from_value(surface).unwrap();
             store
                 .save(&surface)
                 .await

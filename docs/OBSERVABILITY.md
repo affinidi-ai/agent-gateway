@@ -358,9 +358,14 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
     `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), and on Fabric
-    receive `delegation_not_enabled_for_partners` (a per-user delegated credential binding
-    applies, which a partner's request never gets); the peer is answered `403` with that reason (see
+    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    external consent refused before anything is sent `target_path_refused` (`400`, a path the
+    grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
+    rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
+    ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
+    and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
+    binding applies, which a partner's request never gets); the peer is answered `403` with that
+    reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,

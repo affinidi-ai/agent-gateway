@@ -62,6 +62,16 @@ pub enum RejectionReason {
     /// A closed Access Point without source authentication refused the
     /// request with `503`.
     AccessPointNotReady,
+    /// A request to a Target bound by external consent whose path the vendor
+    /// might read otherwise than the gateway, or that is not one the grant is
+    /// sent to.
+    TargetPathRefused,
+    /// A request to a Target bound by external consent with a method the
+    /// grant is not sent with.
+    TargetMethodRefused,
+    /// A request to a Target bound by external consent refused before its
+    /// grant is read, for a reason a new connect would not fix.
+    ConnectorUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

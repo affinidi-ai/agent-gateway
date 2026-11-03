@@ -27,6 +27,9 @@ pub struct DidAuthHandlerState {
     pub session_store: Arc<DidAuthSessionStore>,
     pub config: Arc<DidAuthAuthConfig>,
     pub surface_id: String,
+    /// The variant serving the request, `None` for the base surface: a
+    /// session minted here authenticates only at this view.
+    pub variant_id: Option<String>,
 }
 
 /// Request body for challenge endpoint
@@ -236,15 +239,20 @@ pub async fn authenticate_handler(
                 .config
                 .effective_session_ttl_seconds();
             // The `channel` field on the request body is intentionally
-            // ignored — the session is bound to `state.surface_id` so it
-            // cannot be replayed against another surface. `channel_name`
+            // ignored - the session is bound to `state.surface_id` and the
+            // variant serving the request so it cannot be replayed against
+            // another surface or another view of this one. `channel_name`
             // remains a display-only field for logging + audit; the
             // authoritative surface identifier is stored on the session
             // record and rechecked on every subsequent lookup.
             let channel_name = state.surface_id.clone();
+            let view = crate::didauth::sessions::SessionView {
+                surface_id: &state.surface_id,
+                variant_id: state.variant_id.as_deref(),
+            };
             let session = state
                 .session_store
-                .create_session(verified.did.clone(), channel_name, state.surface_id.clone(), session_ttl)
+                .create_session(verified.did.clone(), channel_name, view, session_ttl)
                 .await;
             info!(
                 surface = %state.surface_id,
@@ -388,6 +396,7 @@ mod tests {
                 allowed_algorithms: vec![],
             }),
             surface_id: "surface-1".to_string(),
+            variant_id: None,
         };
         let challenge = state
             .session_store

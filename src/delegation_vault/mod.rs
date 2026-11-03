@@ -508,6 +508,7 @@ mod tests {
             inject_as: CredentialInjection::BearerHeader,
             elicit_timeout_secs: 300,
             elicit_fallback: crate::config::types::ElicitFallback::OnDemand,
+            subject: None,
         };
         let json = serde_json::to_string(&binding).unwrap();
         let deserialized: OutboundCredentialBinding = serde_json::from_str(&json).unwrap();

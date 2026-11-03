@@ -1710,6 +1710,9 @@ async fn proxy_handler_with_mcp_runtime(
                     .surface
                     .surface_id
                     .clone(),
+                variant_id: state
+                    .active_variant_id
+                    .clone(),
             };
 
             // Route to appropriate handler based on path
@@ -1948,8 +1951,14 @@ async fn proxy_handler_with_mcp_runtime(
         let peer_cert = req
             .extensions()
             .get::<crate::source_auth::models::PeerCertInfo>();
+        let view = crate::didauth::sessions::SessionView {
+            surface_id: &state.surface.surface_id,
+            variant_id: state
+                .active_variant_id
+                .as_deref(),
+        };
         match sa_middleware
-            .authenticate(&resolved_auth_config, &headers, &channel_name, &state.surface.surface_id, peer_cert)
+            .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
             .await
         {
             Ok(identity) => Some(identity),
@@ -3135,6 +3144,34 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(crate::a2a::errors::create_invalid_params_response(&field_errors));
     }
 
+    // ── The route of a request to a Target bound by external consent ───────
+    // Before any payment, so a surface that would charge for such a request
+    // is refused before anyone pays. Its grant is sent only at the Target's
+    // endpoint path, at the origin of the provider's resource, through Strict
+    // egress.
+    let target_grant = match crate::proxy::target_grant::route(
+        &state,
+        crate::proxy::target_grant::TargetRequest {
+            method: method.as_str(),
+            path: uri.path(),
+            query: uri.query(),
+            headers: &headers,
+            modern: modern_request.is_some(),
+            body: &body_bytes,
+            facts: &audit_facts,
+        },
+    )
+    .await
+    {
+        Ok(route) => route,
+        Err(refused) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refused);
+        }
+    };
+
     // ── Track payment context for OPA input ────────────────────────────────
     let mut payment_context: Option<crate::surface_context::PaymentContext> = None;
 
@@ -3794,12 +3831,30 @@ async fn proxy_handler_with_mcp_runtime(
     // Build target URL (or get direct response for special protocols like DID).
     // A2A Proxy targets are internal adapter references, not network URLs; keep
     // them in the normal policy/trust pipeline, then dispatch after OPA.
+    // A discovery read is the only request a Target bound by external consent
+    // is sent without the grant, and it is sent without the caller's query.
+    let uri_without_query;
+    let forwarded_uri = match uri.path_and_query() {
+        Some(path_and_query)
+            if path_and_query
+                .query()
+                .is_some()
+                && crate::proxy::target_grant::binds_the_target(&state.surface) =>
+        {
+            uri_without_query = path_and_query
+                .path()
+                .parse()
+                .unwrap_or_else(|_| uri.clone());
+            &uri_without_query
+        }
+        _ => &uri,
+    };
     let target_url = if is_a2a_proxy_target {
         String::new()
     } else {
         match build_target_url(
             &state.surface.target.endpoint,
-            &uri,
+            forwarded_uri,
             &method,
             &headers,
             state
@@ -3881,8 +3936,16 @@ async fn proxy_handler_with_mcp_runtime(
     // is created/updated, so it is also skipped at this sink rather than
     // DNS-resolving the placeholder host and failing closed on every request.
     let is_mcp_proxy_target = target_url.starts_with("proxy://");
-    let mut forward_client: Option<reqwest::Client> = None;
-    if !is_a2a_proxy_target && !is_mcp_proxy_target {
+    // A request carrying the grant of a Target bound by external consent goes
+    // to the URL its route decided.
+    let target_url = match target_grant.as_ref() {
+        Some(route) => route.target_url().to_string(),
+        None => target_url,
+    };
+    let mut forward_client: Option<reqwest::Client> = target_grant
+        .as_ref()
+        .map(|route| route.client().clone());
+    if forward_client.is_none() && !is_a2a_proxy_target && !is_mcp_proxy_target {
         match pinned_target_client(&state, &channel_name, &target_url, &audit_facts).await {
             Ok(client) => forward_client = Some(client),
             Err(blocked) => return Ok(blocked),
@@ -5942,10 +6005,9 @@ async fn proxy_handler_with_mcp_runtime(
 
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
-        && !state
+        && state
             .surface
-            .outbound_credentials
-            .is_empty()
+            .has_agent_keyed_outbound_credentials()
     {
         use crate::proxy::credential_delegation::modern::{
             ModernDelegationError, ModernDelegationResult, prepare_direct,
@@ -6112,6 +6174,22 @@ async fn proxy_handler_with_mcp_runtime(
             |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
         )
         && resource_authorization.is_none();
+    // A Target bound by external consent is a third party: it is sent only
+    // what a Transit Point sends its vendor, no caller-info or DID header, and
+    // is asked for an answer the gateway can read as it is sent.
+    let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+    let forwards_header = |name: &str| {
+        if bound_target {
+            crate::proxy::target_grant::forwards_caller_header(name, source_cred_header, header_metadata_mapping)
+        } else {
+            should_forward_ap_request_header_with_mapping(
+                name,
+                source_cred_header,
+                header_metadata_mapping,
+                forward_source_auth_header,
+            )
+        }
+    };
 
     // Build upstream request. The forward send uses the per-request pinned,
     // redirect-disabled client built at the SSRF vetting sink above; only the
@@ -6127,14 +6205,12 @@ async fn proxy_handler_with_mcp_runtime(
     // Copy headers (excluding hop-by-hop headers, content-length, host,
     // and the source-auth credential header which must not leak upstream)
     for (key, value) in headers.iter() {
-        if should_forward_ap_request_header_with_mapping(
-            key.as_str(),
-            source_cred_header,
-            header_metadata_mapping,
-            forward_source_auth_header,
-        ) {
+        if forwards_header(key.as_str()) {
             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
         }
+    }
+    if bound_target {
+        upstream_req = upstream_req.header(reqwest::header::ACCEPT_ENCODING, "identity");
     }
 
     // For MCP channels, advertise SSE support upstream ONLY if the client
@@ -6157,7 +6233,9 @@ async fn proxy_handler_with_mcp_runtime(
 
     // Inject DID:webvh identity into HTTP headers (Header and SignedHeader modes)
     #[cfg(feature = "didwebvh")]
-    if let Some(ref context) = did_context {
+    if let Some(ref context) = did_context
+        && !bound_target
+    {
         use crate::config::DidInjectionMode;
         if *context.injection_mode() != DidInjectionMode::ProtocolNative {
             let mut did_headers = Vec::new();
@@ -6221,8 +6299,10 @@ async fn proxy_handler_with_mcp_runtime(
         #[cfg(not(feature = "didwebvh"))]
         let gateway_did: Option<String> = None;
 
-        for (key, value) in CallerHeaders::build(&caller, gateway_did.as_deref()) {
-            upstream_req = upstream_req.header(&key, &value);
+        if !bound_target {
+            for (key, value) in CallerHeaders::build(&caller, gateway_did.as_deref()) {
+                upstream_req = upstream_req.header(&key, &value);
+            }
         }
     }
 
@@ -6348,12 +6428,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .request(method.clone(), &target_url)
                         .body(body_bytes.clone());
                     for (key, value) in headers.iter() {
-                        if should_forward_ap_request_header_with_mapping(
-                            key.as_str(),
-                            source_cred_header,
-                            header_metadata_mapping,
-                            forward_source_auth_header,
-                        ) {
+                        if forwards_header(key.as_str()) {
                             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
                         }
                     }
@@ -6401,6 +6476,36 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
     }
+
+    // ── The Target's grant by binding, in place of the caller's credentials ──
+    let released_target_grant = match target_grant.as_ref() {
+        Some(route) => match route
+            .release(
+                &state,
+                crate::proxy::target_grant::Caller {
+                    identity: authenticated_identity.as_ref(),
+                    source_auth_failed,
+                    facts: &audit_facts,
+                },
+                &body_bytes,
+            )
+            .await
+        {
+            Ok(released) => {
+                upstream_req = released
+                    .apply(upstream_req)
+                    .map_err(|refused| *refused)?;
+                Some(released)
+            }
+            Err(refused) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(refused);
+            }
+        },
+        None => None,
+    };
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
@@ -7263,6 +7368,25 @@ async fn proxy_handler_with_mcp_runtime(
         None
     };
 
+    // A Target bound by external consent is sent a request only with its
+    // grant, or as a public discovery read.
+    if bound_target
+        && released_target_grant.is_none()
+        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    {
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(crate::proxy::target_grant::refuse_without_the_grant(&state.surface, &body_bytes));
+    }
+
+    // The request as sent, for the one retry a vendor's refusal of the
+    // Target's grant gets; a body too large to send twice has none.
+    let target_grant_retry = released_target_grant
+        .as_ref()
+        .filter(|_| body_bytes.len() <= crate::delegation_vault::release::RETRY_BODY_LIMIT)
+        .and_then(|_| upstream_req.try_clone());
+
     // Implement retry logic if configured
     let send_with_retry = || async {
         if let Some(retry_config) = state
@@ -7424,6 +7548,37 @@ async fn proxy_handler_with_mcp_runtime(
     } else {
         send_response.await?
     };
+    // The vendor's answer to the Target's grant: a refusal of the token gets
+    // one refresh and one retry, and its cookies and authentication challenges
+    // never reach the caller.
+    let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
+        (Some(route), Some(released)) => match route
+            .answer(&state, released, upstream_response, target_grant_retry, &body_bytes)
+            .await
+        {
+            Ok(response) => response,
+            Err(refused) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(refused);
+            }
+        },
+        _ => upstream_response,
+    };
+    if bound_target {
+        crate::proxy::target_grant::withhold_vendor_headers(&mut upstream_response);
+        if let Some(refused) = crate::proxy::target_grant::refuse_a_compressed_answer(
+            &state.surface,
+            upstream_response.headers(),
+            &body_bytes,
+        ) {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refused);
+        }
+    }
 
     // Process response
     let _process_span = tracing::info_span!(
@@ -7461,6 +7616,7 @@ async fn proxy_handler_with_mcp_runtime(
             .target
             .endpoint
             .starts_with("proxy://")
+        && !bound_target
         && matches!(
             upstream_response
                 .status()
@@ -10119,9 +10275,7 @@ fn delegates_credentials_over_fabric(surface: &crate::config::agent_surface::Age
     surface
         .target
         .fabric_delegated_credentials
-        && !surface
-            .outbound_credentials
-            .is_empty()
+        && surface.has_agent_keyed_outbound_credentials()
 }
 
 /// The Access Point's answer to a modern MCP request the Fabric transport
@@ -16016,6 +16170,9 @@ pub(crate) fn compute_transit_token_caller_context(
 pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
+mod target_grant_tests;
+
+#[cfg(test)]
 mod forward_response_log_tests {
     #[test]
     fn forward_response_log_summary_keeps_header_values_and_body_out() {
@@ -16969,6 +17126,7 @@ allow if {
             delegation_vault_store: state
                 .delegation_vault_store
                 .clone(),
+            egress_allowlist: state.egress_allowlist.clone(),
             gateway_base_url: state.gateway_base_url.clone(),
             transit_token_issuer: state
                 .transit_token_issuer
@@ -19309,12 +19467,14 @@ allow if {
             didwebvh_log_manager: None,
             credential_provider_store: Some(providers),
             delegation_vault_store: Some(vault.clone()),
+            egress_allowlist: None,
             gateway_base_url: Some("https://gateway.example".into()),
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            served_surface: Arc::new(surface.clone()),
             surface: Arc::new(surface),
         };
         access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
@@ -21072,12 +21232,14 @@ allow if {
             didwebvh_log_manager: None,
             credential_provider_store: None,
             delegation_vault_store: None,
+            egress_allowlist: None,
             gateway_base_url: None,
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            served_surface: std::sync::Arc::new(surface.clone()),
             surface: std::sync::Arc::new(surface),
         }
     }
@@ -21462,12 +21624,14 @@ mod fabric_extended_card_tests {
             didwebvh_log_manager: None,
             credential_provider_store: None,
             delegation_vault_store: None,
+            egress_allowlist: None,
             gateway_base_url: Some("https://gateway.example".into()),
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
+            served_surface: Arc::new(crate::config::agent_surface::AgentSurface::clone(&surface)),
             surface: Arc::new(surface),
         };
         FabricPeer {

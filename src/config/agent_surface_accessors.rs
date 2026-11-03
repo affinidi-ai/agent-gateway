@@ -85,6 +85,51 @@ impl AgentSurface {
             .and_then(|ca| ca.methods.first())
     }
 
+    /// Whether any of the Access Point's caller-authentication methods
+    /// accepts a caller who names itself: DID Auth without `allowed_dids`
+    /// accepts any DID that signs its challenge, so whoever mints one is
+    /// authenticated, and named by nobody the gateway can check. No grant by
+    /// binding is released to such callers.
+    pub fn admits_self_named_callers(&self) -> bool {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .is_some_and(|authentication| {
+                authentication
+                    .methods
+                    .iter()
+                    .any(|method| {
+                        matches!(method, crate::source_auth::SourceAuthConfig::DidAuth(config)
+                            if config.allowed_dids.is_empty())
+                    })
+            })
+    }
+
+    /// Whether any of the Access Point's caller-authentication methods
+    /// accepts a token minted for any service: a JWT bearer method without
+    /// `audiences` skips the audience check, unless the Access Point publishes
+    /// a protected resource, whose `resource` is then the only audience
+    /// accepted. Whoever holds a token of the issuer, for any of its relying
+    /// parties, is then a caller. No grant by binding is released to such
+    /// callers.
+    pub fn admits_tokens_for_any_audience(&self) -> bool {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .is_some_and(|authentication| {
+                authentication
+                    .protected_resource
+                    .is_none()
+                    && authentication
+                        .methods
+                        .iter()
+                        .any(|method| {
+                            matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(config)
+                                if config.audiences.is_empty())
+                        })
+            })
+    }
+
     /// RFC 9728 settings of the Access Point's caller authentication.
     #[inline]
     pub fn protected_resource(&self) -> Option<&crate::protocols::protected_resource::ProtectedResourceConfig> {
@@ -281,14 +326,45 @@ impl AgentSurface {
 
     /// Outbound credential bindings for an Access Point request to the
     /// surface's Target. Only the surface-level `outbound_credentials`;
-    /// never a Transit Point's `transit_credentials`.
+    /// never a Transit Point's `transit_credentials`, nor the Target's
+    /// `consent_mode = external` binding, which
+    /// [`Self::target_external_credentials`] returns instead.
     pub fn target_outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
+        self.agent_keyed_outbound_credentials()
+            .cloned()
+            .collect()
+    }
+
+    /// The surface-level `outbound_credentials` an agent-keyed path serves:
+    /// every one but the Access Point Target's `consent_mode = external`
+    /// binding.
+    pub fn agent_keyed_outbound_credentials(
+        &self
+    ) -> impl Iterator<Item = &crate::config::types::OutboundCredentialBinding> {
         self.outbound_credentials
-            .clone()
+            .iter()
+            .filter(|binding| !binding.is_external())
+    }
+
+    /// Whether the surface has a surface-level binding an agent-keyed path
+    /// serves.
+    pub fn has_agent_keyed_outbound_credentials(&self) -> bool {
+        self.agent_keyed_outbound_credentials()
+            .next()
+            .is_some()
+    }
+
+    /// The Access Point Target's `consent_mode = external` binding, whose
+    /// grant is kept by binding under the hop `target`.
+    pub fn target_external_credentials(&self) -> Option<&crate::config::types::OutboundCredentialBinding> {
+        self.outbound_credentials
+            .iter()
+            .find(|binding| binding.is_external())
     }
 
     /// Outbound credential bindings for a request through one Transit Point.
-    /// Prefers the surface-level `outbound_credentials` field; otherwise
+    /// Prefers the surface-level `outbound_credentials` field, without the
+    /// Access Point Target's `consent_mode = external` binding; otherwise
     /// only that point's own `transit_credentials`, never another point's,
     /// unless it is a `consent_mode = external` binding, which
     /// [`Self::transit_point_external_credentials`] returns instead.
@@ -300,9 +376,7 @@ impl AgentSurface {
             .outbound_credentials
             .is_empty()
         {
-            return self
-                .outbound_credentials
-                .clone();
+            return self.target_outbound_credentials();
         }
         point
             .transit_credentials
@@ -480,6 +554,20 @@ impl AgentSurface {
         }
     }
 
+    /// Whether the Target's payment policy charges the Access Point's callers,
+    /// here or through a payment gateway.
+    pub fn charges_callers(&self) -> bool {
+        match self
+            .target
+            .payment_policy
+            .as_ref()
+        {
+            Some(crate::config::agent_surface::PaymentPolicy::X402(config)) => config.enabled,
+            Some(crate::config::agent_surface::PaymentPolicy::Mpp(config)) => config.enabled,
+            None => false,
+        }
+    }
+
     /// Mirrors legacy `channel.mpp_auto_pay_max_amount`.
     #[inline]
     pub fn mpp_auto_pay_max_amount(&self) -> Option<&str> {
@@ -582,6 +670,28 @@ impl AgentSurface {
             .workload_binding
             .as_ref()
             .filter(|wb| wb.enabled)
+    }
+
+    /// Whether a request to the Target carries a presentation of the agent in
+    /// its body: an identity VP ([`Self::inject_identity_vp`]), a workload
+    /// binding, or the surface's DID injected `protocol_native`.
+    pub fn presents_the_agent_to_the_target(&self) -> bool {
+        self.inject_identity_vp()
+            || self
+                .target_workload_binding()
+                .is_some()
+            || self
+                .access_point
+                .didwebvh_identity
+                .as_ref()
+                .is_some_and(|did| did.injection_mode == super::agent_surface::DidInjectionMode::ProtocolNative)
+    }
+
+    /// Whether the Target is sent operator-configured custom metadata, in the
+    /// request body or in `X-Gateway-*` headers.
+    pub fn injects_custom_metadata(&self) -> bool {
+        self.custom_metadata()
+            .is_some_and(|metadata| metadata.enabled)
     }
 
     // ── Transit shorthands ──────────────────────────────────────────────────
@@ -810,6 +920,7 @@ fn transit_credential_binding(
             surface::ElicitFallback::OnDemand => ElicitFallback::OnDemand,
             surface::ElicitFallback::Fail => ElicitFallback::Fail,
         },
+        subject: None,
     })
 }
 
@@ -1063,5 +1174,49 @@ mod tests {
             vec![serde_json::from_value(serde_json::json!({"credential_provider_id": "surface-provider"})).unwrap()];
         assert_eq!(providers(s.transit_point_outbound_credentials(&peer_with_own)), vec!["surface-provider"]);
         assert_eq!(providers(s.target_outbound_credentials()), vec!["surface-provider"]);
+        assert!(
+            s.target_external_credentials()
+                .is_none()
+        );
+    }
+
+    /// The Access Point Target's external consent binding is served by its
+    /// grant by binding only: no agent-keyed path, on the Target or a Transit
+    /// Point, is given it.
+    #[test]
+    fn the_access_point_targets_external_binding_reaches_no_agent_keyed_path() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        s.outbound_credentials = serde_json::from_value(serde_json::json!([
+            {"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner"},
+            {"credential_provider_id": "agent-keyed"}
+        ]))
+        .unwrap();
+        let point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "partner", "target_endpoint": "https://partner.example/mcp"}))
+        .unwrap();
+        let providers = |bindings: Vec<crate::config::types::OutboundCredentialBinding>| {
+            bindings
+                .into_iter()
+                .map(|binding| binding.credential_provider_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(providers(s.target_outbound_credentials()), vec!["agent-keyed"]);
+        assert_eq!(providers(s.transit_point_outbound_credentials(&point)), vec!["agent-keyed"]);
+        let external = s
+            .target_external_credentials()
+            .expect("the Target's external binding");
+        assert_eq!(external.credential_provider_id, "vendor");
+        assert_eq!(external.subject, Some(crate::config::agent_surface::GrantSubject::Owner));
+        assert!(s.has_agent_keyed_outbound_credentials());
+
+        s.outbound_credentials
+            .truncate(1);
+        assert!(
+            s.target_outbound_credentials()
+                .is_empty()
+        );
+        assert!(!s.has_agent_keyed_outbound_credentials());
+        assert_eq!(providers(s.outbound_credentials()), vec!["vendor"], "the display keeps every binding");
     }
 }

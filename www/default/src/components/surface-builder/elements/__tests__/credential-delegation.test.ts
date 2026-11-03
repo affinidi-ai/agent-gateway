@@ -1,5 +1,9 @@
 import { registry } from '../index';
 import { credentialDelegationDefinition } from '../credential-delegation/definition';
+import {
+  outboundCredentialApiToForm,
+  outboundCredentialFormToApi,
+} from '../_shared/OutboundCredentialsListSection';
 import type { PayloadContext, SurfaceContext } from '../types';
 
 /**
@@ -244,6 +248,19 @@ describe('credential-delegation definition', () => {
       expect(identityRule.check(credNode.config, ctx)).toBe(false);
     });
 
+    it('needs no agent identity for an Access Point Target binding with external consent', () => {
+      const deps = credentialDelegationDefinition.featureDependencies!;
+      const identityRule = deps.find(d => /agent identity/i.test(d.description))!;
+      const external = {
+        outbound_credentials_form: [
+          { ...sampleBindingRow, consent_mode: 'external' as const, subject: 'owner' as const },
+        ],
+      };
+      expect(identityRule.condition(external, ctxWith([callerAuth]))).toBe(false);
+      const sourceAuthRule = deps.find(d => /source authentication/i.test(d.description))!;
+      expect(sourceAuthRule.condition(external, ctxWith([]))).toBe(true);
+    });
+
     it('passes both bindings rules when caller-auth and identity are present', () => {
       const deps = credentialDelegationDefinition.featureDependencies!;
       const ctx = ctxWith([callerAuth, identity]);
@@ -295,5 +312,24 @@ describe('credential-delegation definition', () => {
       expect(recovered.some(n => n.type === 'credential-delegation')).toBe(false);
       expect(recovered.some(n => n.type === 'workload-binding')).toBe(false);
     });
+  });
+});
+
+describe('an Access Point Target binding with external consent', () => {
+  it('keeps its consent mode and subject through the form', () => {
+    for (const subject of ['owner', 'caller']) {
+      const api = {
+        credential_provider_id: 'vendor',
+        scopes: ['read'],
+        required_for: 'all',
+        consent_mode: 'external',
+        subject,
+        inject_as: { type: 'bearer_header' },
+      };
+      const row = outboundCredentialApiToForm(api)!;
+      expect(row.consent_mode).toBe('external');
+      expect(row.subject).toBe(subject);
+      expect(outboundCredentialFormToApi(row)).toEqual(api);
+    }
   });
 });

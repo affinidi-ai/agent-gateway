@@ -223,8 +223,7 @@ pub async fn prepare_direct(
 /// check.
 pub fn transit_point_bindings_apply(surface: &crate::config::agent_surface::AgentSurface) -> bool {
     surface
-        .outbound_credentials
-        .iter()
+        .agent_keyed_outbound_credentials()
         .any(|config| matches!(config.required_for, CredentialRequirement::All))
 }
 
@@ -350,9 +349,9 @@ impl ModernDelegationContext<'_> {
         request: &ValidatedModernMessage,
     ) -> Result<Vec<SelectedProvider<'context>>, ContinuationError> {
         let mut selected = Vec::new();
-        for config in &self
+        for config in self
             .surface
-            .outbound_credentials
+            .agent_keyed_outbound_credentials()
         {
             // Tool-scoped bindings never apply on a Transit Point: a partner
             // upstream names its own tools, and bindings carry no destination.
@@ -527,8 +526,7 @@ impl ModernDelegationContext<'_> {
             injections: Vec::new(),
             handled_provider_ids: self
                 .surface
-                .outbound_credentials
-                .iter()
+                .agent_keyed_outbound_credentials()
                 .map(|binding| {
                     binding
                         .credential_provider_id

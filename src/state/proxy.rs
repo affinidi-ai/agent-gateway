@@ -77,6 +77,11 @@ pub struct ProxyState {
     /// Delegation vault store for cached OAuth tokens
     pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
 
+    /// The test allow-list of fixtures Strict egress admits for a request
+    /// carrying the Access Point Target's grant by binding
+    /// ([`crate::egress::bdd_egress_allowlist`]); `None` in production.
+    pub egress_allowlist: Option<String>,
+
     /// Gateway base URL for building OAuth callback URLs
     pub gateway_base_url: Option<String>,
 
@@ -105,6 +110,12 @@ pub struct ProxyState {
     /// active_variant_alias)` so every variant override is already
     /// applied.
     pub surface: Arc<crate::config::agent_surface::AgentSurface>,
+
+    /// The surface as it is served, its base and every variant, before
+    /// [`Self::surface`] resolved this request's variant: the Target's grant
+    /// by binding is released only within every place that serves its
+    /// binding.
+    pub served_surface: Arc<crate::config::agent_surface::AgentSurface>,
 }
 
 /// Surface info with routing support (includes rules engines and identity selector)

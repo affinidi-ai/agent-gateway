@@ -104,6 +104,7 @@ pub(crate) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxySt
         didwebvh_log_manager: None,
         credential_provider_store: None,
         delegation_vault_store: None,
+        egress_allowlist: None,
         gateway_base_url: Some("https://gateway.example".into()),
         transit_token_issuer: None,
         mcp_proxy_store: None,

@@ -1158,6 +1158,20 @@ pub struct OutboundCredentialBinding {
     /// did not advertise the `elicitation` capability during `initialize`.
     #[serde(default)]
     pub elicit_fallback: ElicitFallback,
+
+    /// Whose account the grant of a `consent_mode = external` binding is.
+    /// Required with `external`, refused with every other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<crate::config::agent_surface::GrantSubject>,
+}
+
+impl OutboundCredentialBinding {
+    /// Whether the binding is the Access Point Target's external consent
+    /// binding, whose grants are kept by binding and which no agent-keyed
+    /// path serves.
+    pub fn is_external(&self) -> bool {
+        self.consent_mode == ConsentMode::External
+    }
 }
 
 fn default_elicit_timeout_secs() -> u64 {
@@ -1199,6 +1213,11 @@ pub enum ConsentMode {
     /// `decline`/`cancel`. Requires the MCP client to have advertised the
     /// `elicitation` capability during `initialize`; see `elicit_fallback`.
     Elicit,
+    /// Another system obtains the grant through the browser; the gateway keeps
+    /// it by binding, never builds an authorization URL, and refuses the call
+    /// while it has no grant. In `outbound_credentials` it binds the Access
+    /// Point's Target, as the only binding of a surface without Transit Points.
+    External,
 }
 
 /// What to do when `consent_mode = elicit` but the MCP client did not declare

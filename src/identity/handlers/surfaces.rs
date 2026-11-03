@@ -741,8 +741,11 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 /// Without this hook a dashboard save could persist values that would then
 /// be rejected on the next process restart (`challenge_ttl_seconds: 0`,
 /// unsupported `allowed_algorithms`, etc.).
-fn validate_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
-    crate::config::validate_source_auth_config(surface).map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
+fn validate_source_auth(
+    surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    crate::config::validate_source_auth_config(surface, stored).map_err(|e| SurfaceApiError::BadRequest(e.to_string()))
 }
 
 /// Validate every transit point: alias must match the URL-safe pattern,
@@ -932,7 +935,12 @@ fn validate_transit_point_caller_authentication(
                 .map_err(|error| SurfaceApiError::BadRequest(format!("{path}: {error}")))?;
         }
         if let Some(source_auth) = &tp.source_auth {
-            crate::config::validate_source_auth_method(source_auth, &surface.name)
+            let stored_source_auth = stored_points
+                .into_iter()
+                .flatten()
+                .find(|previous| !tp.id.is_empty() && previous.id == tp.id)
+                .and_then(|previous| previous.source_auth.as_ref());
+            crate::config::validate_source_auth_method(source_auth, stored_source_auth, &surface.name)
                 .map_err(|error| SurfaceApiError::BadRequest(format!("{path}: {error}")))?;
         }
     }
@@ -954,7 +962,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 /// does so where the surface cannot tell a partner's users apart
 /// ([`fabric_caller_delegation_warnings`]), and each with external consent
 /// that a variant keeps under its own settings
-/// ([`inherited_external_point_warnings`]).
+/// ([`inherited_external_point_warnings`]), as the Access Point Target's
+/// binding with external consent ([`inherited_target_binding_warnings`]).
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -976,15 +985,21 @@ async fn save_warnings(
         .chain(fabric_delegation_identity_warnings(surface))
         .chain(fabric_caller_delegation_warnings(surface, &issuers))
         .chain(inherited_external_point_warnings(surface))
+        .chain(inherited_target_binding_warnings(surface))
     {
-        let quoted = warning
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")) {
+        if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
         }
     }
     headers
+}
+
+/// A `Warning` header (code 299) carrying `warning`.
+fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
+    let quoted = warning
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")).ok()
 }
 
 /// Each MCP Transit Point, on the surface or in a variant, that authenticates
@@ -1357,6 +1372,49 @@ fn inherited_external_point_warnings(surface: &AgentSurface) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// Each enabled variant that keeps the surface's `outbound_credentials`, and
+/// with them the Access Point Target's binding with `consent_mode: external`,
+/// while it overrides the Access Point or the Target. Its grants are kept
+/// under the hop `target`, so calls through the variant use the surface's
+/// grants under the variant's own caller authentication, policies and tool
+/// gating.
+fn inherited_target_binding_warnings(surface: &AgentSurface) -> Vec<String> {
+    if surface
+        .target_external_credentials()
+        .is_none()
+    {
+        return Vec::new();
+    }
+    surface
+        .variants
+        .iter()
+        .filter(|variant| {
+            variant.enabled
+                && variant
+                    .overrides
+                    .outbound_credentials
+                    .is_none()
+                && (variant
+                    .overrides
+                    .access_point
+                    .is_some()
+                    || variant
+                        .overrides
+                        .target
+                        .is_some())
+        })
+        .map(|variant| {
+            format!(
+                "Variant '{}' keeps the Access Point Target's binding with consent_mode external, and overrides its \
+                 Access Point or its Target: calls through the variant use the Target's grants under the variant's \
+                 own caller authentication, policies and tool gating; to keep them apart, give the variant \
+                 outbound_credentials of its own",
+                variant.alias
+            )
+        })
+        .collect()
 }
 
 /// Each Transit Point, on the surface or in an enabled variant, whose
@@ -3195,7 +3253,7 @@ async fn validate_and_save_surface(
     validate_trust_checks(&surface)?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
-    validate_source_auth(&surface)?;
+    validate_source_auth(&surface, existing)?;
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
@@ -3971,6 +4029,51 @@ async fn load_surface_or_404(
     Ok((store, surface))
 }
 
+/// Another variant's `overrides`, as a new variant starts from them, and
+/// whether the Access Point Target's binding with external consent was left
+/// out. A binding with external consent is kept in one place: a Transit Point
+/// that has one gets an id of its own, and its own grants once consented, and
+/// the Access Point Target's binding is not copied, so the new variant keeps
+/// the rest of the copied `outbound_credentials` without it.
+fn copied_overrides(mut overrides: SurfaceOverrides) -> (SurfaceOverrides, bool) {
+    for point in overrides
+        .transit
+        .iter_mut()
+        .filter_map(|transit| transit.points.as_mut())
+        .flatten()
+        .filter(|point| {
+            point
+                .transit_credentials
+                .as_ref()
+                .is_some_and(|binding| binding.is_external())
+        })
+    {
+        point.id = uuid::Uuid::new_v4().to_string();
+    }
+    let mut left_out_target_binding = false;
+    if let Some(bindings) = overrides
+        .outbound_credentials
+        .as_mut()
+    {
+        let copied = bindings.len();
+        bindings.retain(|binding| !binding.is_external());
+        left_out_target_binding = bindings.len() != copied;
+    }
+    (overrides, left_out_target_binding)
+}
+
+/// What a variant created from one holding the Access Point Target's binding
+/// with external consent is told: it is created disabled, since it keeps the
+/// copied Target, which it would send requests without the grant, its
+/// callers' own headers among them.
+fn copied_target_binding_warning(alias: &str) -> String {
+    format!(
+        "Variant '{alias}' is created disabled: the variant it was copied from holds the Access Point Target's \
+         consent_mode external binding, which is kept in one place and not copied, so this variant would send its \
+         Target requests without the grant; give it a Target or a binding of its own before enabling it"
+    )
+}
+
 /// `POST /v1/surfaces/{id}/variants`
 ///
 /// Create a new variant on the surface. When `source_alias` is provided
@@ -4037,30 +4140,14 @@ pub async fn create_variant(
     } else {
         SurfaceOverrides::default()
     };
-    // A Transit Point with external consent is kept in one place, so the copy
-    // gets ids of its own for those, and its own grants once consented.
-    let mut seed_overrides = seed_overrides;
-    for point in seed_overrides
-        .transit
-        .iter_mut()
-        .filter_map(|transit| transit.points.as_mut())
-        .flatten()
-        .filter(|point| {
-            point
-                .transit_credentials
-                .as_ref()
-                .is_some_and(|binding| binding.is_external())
-        })
-    {
-        point.id = uuid::Uuid::new_v4().to_string();
-    }
+    let (seed_overrides, left_out_target_binding) = copied_overrides(seed_overrides);
 
     let new_variant = SurfaceVariant {
         id: uuid::Uuid::new_v4().to_string(),
         alias: body.alias,
         name: body.name,
         description: body.description,
-        enabled: true,
+        enabled: !left_out_target_binding,
         overrides: seed_overrides,
     };
 
@@ -4088,7 +4175,11 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    Ok((StatusCode::CREATED, save_warnings(&state, &saved).await, Json(SurfaceResponse::variant(new_variant, &saved))))
+    let mut warnings = save_warnings(&state, &saved).await;
+    if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
+        warnings.append(axum::http::header::WARNING, value);
+    }
+    Ok((StatusCode::CREATED, warnings, Json(SurfaceResponse::variant(new_variant, &saved))))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -5392,6 +5483,121 @@ mod validation_tests {
         ] {
             assert!(inherited_external_point_warnings(&surface).is_empty(), "{case}");
         }
+    }
+
+    /// A variant that keeps the surface's `outbound_credentials` uses the
+    /// Access Point Target's grants by binding under its own Access Point and
+    /// Target settings: a save says so when the variant overrides either.
+    #[test]
+    fn a_save_warns_of_a_variant_that_uses_the_targets_grants_under_its_own_settings() {
+        let surface_with = |enabled: bool, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "vendor",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/mcp", "protocol": "mcp" },
+                "target": { "endpoint": "https://mcp.vendor.example/mcp" },
+                "outbound_credentials": [{ "credential_provider_id": "vendor", "consent_mode": "external",
+                    "subject": "owner" }],
+                "variants": [{ "id": "dev", "alias": "dev", "name": "Dev", "enabled": enabled,
+                    "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let warning = vec![
+            "Variant 'dev' keeps the Access Point Target's binding with consent_mode external, and overrides its \
+             Access Point or its Target: calls through the variant use the Target's grants under the variant's own \
+             caller authentication, policies and tool gating; to keep them apart, give the variant \
+             outbound_credentials of its own"
+                .to_string(),
+        ];
+        for (case, overrides) in [
+            (
+                "its own Access Point",
+                serde_json::json!({ "access_point": { "caller_authentication": { "methods": [caller_key()] } } }),
+            ),
+            ("its own Target settings", serde_json::json!({ "target": { "mcp_tool_policies_enabled": false } })),
+        ] {
+            assert_eq!(inherited_target_binding_warnings(&surface_with(true, overrides)), warning, "{case}");
+        }
+        for (case, surface) in [
+            ("no overrides", surface_with(true, serde_json::json!({}))),
+            (
+                "its own outbound_credentials",
+                surface_with(
+                    true,
+                    serde_json::json!({ "outbound_credentials": [], "access_point": { "caller_authentication": {
+                        "methods": [caller_key()] } } }),
+                ),
+            ),
+            (
+                "a disabled variant",
+                surface_with(
+                    false,
+                    serde_json::json!({ "access_point": { "caller_authentication": { "methods": [caller_key()] } } }),
+                ),
+            ),
+        ] {
+            assert!(inherited_target_binding_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
+    /// A variant created from another keeps no binding with external consent
+    /// in a second place: its Transit Points with one get ids of their own,
+    /// and the Access Point Target's binding is left out of its copy.
+    #[test]
+    fn a_new_variant_copies_no_binding_with_external_consent_into_a_second_place() {
+        let overrides: SurfaceOverrides = serde_json::from_value(serde_json::json!({
+            "transit": { "points": [
+                { "id": "crm-id", "alias": "crm", "target_endpoint": "https://crm.example/mcp",
+                    "transit_credentials": { "credential_provider_id": "vendor", "consent_mode": "external",
+                        "subject": "owner" } },
+                { "id": "docs-id", "alias": "docs", "target_endpoint": "https://docs.example/mcp" }
+            ] },
+            "outbound_credentials": [
+                { "credential_provider_id": "vendor", "consent_mode": "external", "subject": "caller" },
+                { "credential_provider_id": "agent-keyed" }
+            ]
+        }))
+        .unwrap();
+        let (copied, left_out_target_binding) = copied_overrides(overrides);
+        assert!(left_out_target_binding, "the Access Point Target's binding is left out");
+        let points = copied
+            .transit
+            .as_ref()
+            .and_then(|transit| transit.points.as_ref())
+            .unwrap();
+        assert_ne!(points[0].id, "crm-id");
+        assert_eq!(points[1].id, "docs-id");
+        let providers: Vec<&str> = copied
+            .outbound_credentials
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|binding| {
+                binding
+                    .credential_provider_id
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(providers, ["agent-keyed"]);
+        let (none, left_out_target_binding) = copied_overrides(SurfaceOverrides::default());
+        assert!(
+            none.outbound_credentials
+                .is_none(),
+            "a variant that kept the surface's still does"
+        );
+        assert!(!left_out_target_binding, "nothing was left out");
+        let agent_keyed: SurfaceOverrides = serde_json::from_value(serde_json::json!({
+            "outbound_credentials": [{ "credential_provider_id": "agent-keyed" }]
+        }))
+        .unwrap();
+        assert!(!copied_overrides(agent_keyed).1, "a binding without external consent is copied as it is");
+        assert_eq!(
+            warning_header(&copied_target_binding_warning("copy")).map(|value| value
+                .to_str()
+                .unwrap()
+                .to_string()),
+            Some(format!("299 - \"{}\"", copied_target_binding_warning("copy")))
+        );
     }
 
     #[test]
@@ -7184,7 +7390,7 @@ mod validation_tests {
     #[test]
     fn source_auth_validation_accepts_defaults() {
         let s = didauth_surface(valid_didauth_config());
-        validate_source_auth(&s).expect("defaults must pass");
+        validate_source_auth(&s, None).expect("defaults must pass");
     }
 
     #[test]
@@ -7192,7 +7398,7 @@ mod validation_tests {
         let mut cfg = valid_didauth_config();
         cfg.challenge_ttl_seconds = Some(0);
         let s = didauth_surface(cfg);
-        let err = validate_source_auth(&s).expect_err("challenge_ttl_seconds=0 must fail on save");
+        let err = validate_source_auth(&s, None).expect_err("challenge_ttl_seconds=0 must fail on save");
         match err {
             SurfaceApiError::BadRequest(msg) => assert!(
                 msg.contains("challenge_ttl_seconds"),
@@ -7207,8 +7413,25 @@ mod validation_tests {
         let mut cfg = valid_didauth_config();
         cfg.session_ttl_seconds = Some(0);
         let s = didauth_surface(cfg);
-        let err = validate_source_auth(&s).expect_err("session_ttl_seconds=0 must fail on save");
+        let err = validate_source_auth(&s, None).expect_err("session_ttl_seconds=0 must fail on save");
         assert!(matches!(err, SurfaceApiError::BadRequest(_)));
+    }
+
+    /// A DID Auth session lasts at most 24 hours: a longer
+    /// `session_ttl_seconds` is refused on save, and the longest is accepted.
+    #[test]
+    fn source_auth_validation_rejects_a_session_ttl_over_the_longest() {
+        use crate::source_auth::models::DidAuthAuthConfig;
+        let mut cfg = valid_didauth_config();
+        cfg.session_ttl_seconds = Some(DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS + 1);
+        let err =
+            validate_source_auth(&didauth_surface(cfg.clone()), None).expect_err("over the longest must fail on save");
+        match err {
+            SurfaceApiError::BadRequest(msg) => assert!(msg.contains("session_ttl_seconds"), "{msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        cfg.session_ttl_seconds = Some(DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS);
+        validate_source_auth(&didauth_surface(cfg), None).expect("the longest passes");
     }
 
     #[test]
@@ -7216,7 +7439,7 @@ mod validation_tests {
         let mut cfg = valid_didauth_config();
         cfg.allowed_algorithms = vec!["HS256".into()];
         let s = didauth_surface(cfg);
-        let err = validate_source_auth(&s).expect_err("HS256 must fail on save");
+        let err = validate_source_auth(&s, None).expect_err("HS256 must fail on save");
         match err {
             SurfaceApiError::BadRequest(msg) => assert!(msg.contains("allowed_algorithms")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -7228,7 +7451,7 @@ mod validation_tests {
         let mut cfg = valid_didauth_config();
         cfg.allowed_dids = vec!["   ".into()];
         let s = didauth_surface(cfg);
-        let err = validate_source_auth(&s).expect_err("blank DID must fail on save");
+        let err = validate_source_auth(&s, None).expect_err("blank DID must fail on save");
         assert!(matches!(err, SurfaceApiError::BadRequest(_)));
     }
 
@@ -7237,7 +7460,7 @@ mod validation_tests {
         let mut cfg = valid_didauth_config();
         cfg.allowed_dids = vec!["not-a-did".into()];
         let s = didauth_surface(cfg);
-        let err = validate_source_auth(&s).expect_err("non-DID string must fail on save");
+        let err = validate_source_auth(&s, None).expect_err("non-DID string must fail on save");
         assert!(matches!(err, SurfaceApiError::BadRequest(_)));
     }
 
@@ -7245,7 +7468,7 @@ mod validation_tests {
     fn source_auth_validation_ignores_surfaces_without_caller_auth() {
         // No caller auth → nothing to check; must succeed regardless.
         let s = base_surface();
-        validate_source_auth(&s).expect("no caller_auth must pass");
+        validate_source_auth(&s, None).expect("no caller_auth must pass");
     }
 
     // Delegated (Model B) A2A + jwt_bearer(Authorization) is unreachable: MPP's
