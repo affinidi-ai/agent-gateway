@@ -7,20 +7,9 @@ changes:
       title: Persist audiences entered in Caller Context
       description: >-
         Save an audience typed into the Caller Context editor even when the operator does not
-        press Add, Enter, or comma first. The audience now appears in the list and clears the
-        warning that audience claim validation is disabled.
-    - timestamp: '2026-10-29T16:00:00Z'
-      title: Save pending Caller Context audiences with keyboard shortcuts
-      description: >-
-        Commit an audience that is still focused in the Caller Context editor before a keyboard
-        save builds the surface payload, and cover empty, duplicate, and discovery-locked values.
-    - timestamp: '2026-10-30T09:00:00Z'
-      title: Run the license and format checks on pull requests from forks
-      description: >-
-        The license and Rustfmt checks checked out the pull request branch by name from the base
-        repository, so they failed for branches that live on a fork. They now use the default
-        pull request checkout, and the Rust security scan, which needs repository secrets that
-        fork pull requests do not receive, is skipped for them.
+        press Add, Enter, or comma first, including when the operator saves with Cmd/Ctrl+S while
+        the field is focused. The audience now appears in the list and clears the warning that
+        audience claim validation is disabled.
   removed: []
   security: []
   breaking: []
