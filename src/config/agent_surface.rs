@@ -1897,6 +1897,11 @@ fn default_true() -> bool {
 
 // ─── Conversion from Legacy ChannelMapping ──────────────────────────────────
 
+/// Why [`AgentSurface::validate_protected_resource`] refuses a JWT Bearer
+/// method other than the first beside protected resource metadata.
+pub const LATER_JWT_BEARER_BESIDE_DISCOVERY: &str = "allows JWT Bearer only as the first caller authentication \
+                                                     method: the discovery audience and challenge belong to that method";
+
 impl AgentSurface {
     /// Compute the base URL for this surface given the gateway's external host.
     #[allow(dead_code)]
@@ -3269,6 +3274,19 @@ impl AgentSurface {
     /// enforced caller authentication method reads JWT Bearer tokens from the
     /// `Authorization` header, where RFC 9728 clients send them, and keeps
     /// them from the Target: MCP forbids passing a client's token through.
+    /// Whether the Access Point publishes protected resource metadata and has a
+    /// JWT Bearer method other than the first, which
+    /// [`Self::validate_protected_resource`] refuses.
+    pub fn has_later_jwt_bearer_beside_discovery(&self) -> bool {
+        self.protected_resource()
+            .is_some()
+            && self
+                .source_auth_methods()
+                .iter()
+                .skip(1)
+                .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
+    }
+
     pub fn validate_protected_resource(&self) -> Result<(), String> {
         let Some(protected) = self.protected_resource() else {
             return Ok(());
@@ -3277,15 +3295,8 @@ impl AgentSurface {
             return Err("requires an MCP Access Point".into());
         }
         protected.validate()?;
-        if self
-            .source_auth_methods()
-            .iter()
-            .skip(1)
-            .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
-        {
-            return Err("allows JWT Bearer only as the first caller authentication method: the discovery audience \
-                        and challenge belong to that method"
-                .into());
+        if self.has_later_jwt_bearer_beside_discovery() {
+            return Err(LATER_JWT_BEARER_BESIDE_DISCOVERY.into());
         }
         match self
             .source_auth_methods()

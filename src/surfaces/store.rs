@@ -82,22 +82,25 @@ pub async fn strip_unsupported_header_metadata_mappings<S: AgentSurfaceStore + ?
 /// Refusing to boot over them would take every surface down; keeping the
 /// first method serves the surface as it was served before.
 ///
-/// Called from gateway startup (`main.rs::load_surfaces`), before the
-/// resolved-surface cache is seeded and the listeners are built.
+/// Called from gateway startup (`main.rs::load_surfaces`) and the local
+/// config reload (`identity/handlers/config.rs::load_base_gateway_config`),
+/// before the surfaces are served. Only an active node persists the
+/// correction (`persist`); a standby node serves it from memory, as
+/// [`crate::surfaces::carry_over_a2a_settings`] does.
 pub async fn fall_back_to_first_source_auth_methods<S: AgentSurfaceStore + ?Sized>(
     store: &S,
     channels: &mut [AgentSurface],
+    persist: bool,
 ) -> anyhow::Result<()> {
     for surface in channels.iter_mut() {
-        let Some(reason) = crate::config::fall_back_to_first_source_auth_method(surface) else {
+        let fallbacks = crate::config::fall_back_to_first_source_auth_method(surface);
+        if fallbacks.is_empty() {
             continue;
-        };
-        error!(
-            surface = %surface.name,
-            surface_id = %surface.surface_id,
-            "source authentication methods found in storage that the gateway refuses ({reason}) — keeping only the \
-             first method so the gateway can boot; resolve via the UI or API"
-        );
+        }
+        crate::config::log_source_auth_fallbacks(surface, &fallbacks);
+        if !persist {
+            continue;
+        }
         store
             .save(surface)
             .await
@@ -816,7 +819,7 @@ mod tests {
             surface_with_methods("s-valid", serde_json::json!([jwt.clone(), partner_key])),
         ];
 
-        fall_back_to_first_source_auth_methods(&store, &mut channels)
+        fall_back_to_first_source_auth_methods(&store, &mut channels, true)
             .await
             .expect("fallback should succeed");
 
@@ -855,6 +858,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_standby_node_serves_the_fallback_without_persisting_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let jwt = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let shared_header = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "authorization"}, "secret_id": "keys"
+        });
+        let mut channels = vec![surface_with_methods("s-standby", serde_json::json!([jwt, shared_header]))];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels, false)
+            .await
+            .expect("fallback should succeed");
+
+        assert_eq!(
+            channels[0]
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get("s-standby")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a standby node does not rewrite storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_surface_with_a_later_jwt_bearer_beside_discovery_keeps_its_first_method() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut surface = surface_with_methods(
+            "s-discovery",
+            serde_json::json!([
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "internal", "audiences": [],
+                    "token_header": "X-Internal-Token"}
+            ]),
+        );
+        surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .expect("caller authentication")
+            .protected_resource = Some(
+            serde_json::from_value(serde_json::json!({
+                "resource": "https://gateway.example/agents/s-discovery",
+                "authorization_servers": ["https://idp.example"]
+            }))
+            .expect("protected resource"),
+        );
+        let mut channels = vec![surface];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels, true)
+            .await
+            .expect("fallback should succeed");
+
+        let reloaded = store
+            .get("s-discovery")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(
+            reloaded
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert_eq!(reloaded.validate_protected_resource(), Ok(()));
+    }
+
     #[test]
     fn a_surface_whose_first_method_is_invalid_does_not_fall_back() {
         let mut surface = surface_with_methods(
@@ -864,7 +942,7 @@ mod tests {
                 {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Other"}}
             ]),
         );
-        assert!(crate::config::fall_back_to_first_source_auth_method(&mut surface).is_none());
+        assert!(crate::config::fall_back_to_first_source_auth_method(&mut surface).is_empty());
         assert_eq!(
             surface
                 .source_auth_methods()

@@ -25,7 +25,8 @@ pub use metrics_config::*;
 pub use network::*;
 pub use pepper_cache_config::PepperCacheConfig;
 pub(crate) use proxy::{
-    additional_source_auth_method_notices, fall_back_to_first_source_auth_method, validate_source_auth_config,
+    fall_back_to_first_source_auth_method, fall_back_to_first_source_auth_methods_in_memory,
+    log_additional_source_auth_method_notices, log_source_auth_fallbacks, validate_source_auth_config,
     validate_source_auth_method,
 };
 pub use rbac_config::*;

@@ -3,7 +3,7 @@
 use super::network::NetworkConfig;
 use super::types::*;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[allow(dead_code)]
 impl BootstrapConfig {
@@ -426,24 +426,179 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
     Ok(())
 }
 
+/// The methods the source authentication fallback dropped from one place of a
+/// surface: the base Access Point, or a variant overriding its caller
+/// authentication.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceAuthFallback {
+    /// `None` for the base surface, else the variant's alias.
+    pub variant: Option<String>,
+    /// The rule the stored methods broke.
+    pub reason: String,
+    /// Each dropped method as [`describe_source_auth_method`] names it, so an
+    /// operator can rebuild it.
+    pub dropped: Vec<String>,
+}
+
 /// Serve a stored surface whose source authentication methods break the
 /// rules for several methods with its first method alone, the only one the
 /// gateway enforced before those rules, when that method is valid on its own.
-/// Returns the rule broken; the caller logs it and persists the surface.
+/// The base Access Point and each enabled variant overriding its caller
+/// authentication are checked as resolved, and trimmed independently.
+/// Returns what was dropped; the caller logs it
+/// ([`log_source_auth_fallbacks`]) and may persist the surface.
 pub fn fall_back_to_first_source_auth_method(
     surface: &mut crate::config::agent_surface::AgentSurface
-) -> Option<String> {
-    let error = validate_stored_source_auth_methods(surface).err()?;
-    let mut first_only = surface.clone();
-    first_only
-        .access_point
-        .caller_authentication
-        .as_mut()?
-        .methods
-        .truncate(1);
-    validate_stored_source_auth_methods(&first_only).ok()?;
-    *surface = first_only;
-    Some(error.to_string())
+) -> Vec<SourceAuthFallback> {
+    let mut fallbacks = Vec::new();
+    if let Err(error) = validate_stored_source_auth_methods(surface) {
+        let mut first_only = surface.clone();
+        if let Some(authentication) = first_only
+            .access_point
+            .caller_authentication
+            .as_mut()
+        {
+            let dropped = authentication
+                .methods
+                .split_off(1.min(authentication.methods.len()));
+            if validate_stored_source_auth_methods(&first_only).is_ok() {
+                *surface = first_only;
+                fallbacks.push(SourceAuthFallback {
+                    variant: None,
+                    reason: error.to_string(),
+                    dropped: dropped
+                        .iter()
+                        .map(describe_source_auth_method)
+                        .collect(),
+                });
+            }
+        }
+    }
+    for index in 0..surface.variants.len() {
+        let variant = &surface.variants[index];
+        let overrides_methods = variant
+            .overrides
+            .access_point
+            .as_ref()
+            .and_then(|access_point| {
+                access_point
+                    .caller_authentication
+                    .as_ref()
+            })
+            .is_some_and(|authentication| authentication.methods.len() > 1);
+        if !variant.enabled || !overrides_methods {
+            continue;
+        }
+        let alias = variant.alias.clone();
+        let Ok(resolved) = surface.resolve_variant(Some(&alias)) else {
+            continue;
+        };
+        let Err(error) = validate_stored_source_auth_methods(&resolved) else {
+            continue;
+        };
+        let mut first_only = surface.clone();
+        let Some(authentication) = first_only.variants[index]
+            .overrides
+            .access_point
+            .as_mut()
+            .and_then(|access_point| {
+                access_point
+                    .caller_authentication
+                    .as_mut()
+            })
+        else {
+            continue;
+        };
+        let dropped = authentication
+            .methods
+            .split_off(1);
+        let valid_alone = first_only
+            .resolve_variant(Some(&alias))
+            .is_ok_and(|resolved| validate_stored_source_auth_methods(&resolved).is_ok());
+        if valid_alone {
+            *surface = first_only;
+            fallbacks.push(SourceAuthFallback {
+                variant: Some(alias),
+                reason: error.to_string(),
+                dropped: dropped
+                    .iter()
+                    .map(describe_source_auth_method)
+                    .collect(),
+            });
+        }
+    }
+    fallbacks
+}
+
+/// Log each place of `surface` the source authentication fallback trimmed,
+/// naming the dropped methods so an operator can restore them.
+pub fn log_source_auth_fallbacks(
+    surface: &crate::config::agent_surface::AgentSurface,
+    fallbacks: &[SourceAuthFallback],
+) {
+    for fallback in fallbacks {
+        error!(
+            surface = %surface.name,
+            surface_id = %surface.surface_id,
+            variant = fallback.variant.as_deref().unwrap_or(""),
+            dropped = %fallback.dropped.join("; "),
+            "source authentication methods the gateway refuses ({}) — serving only the first method; resolve via the \
+             UI or API",
+            fallback.reason
+        );
+    }
+}
+
+/// Log [`additional_source_auth_method_notices`] for `surfaces` at `WARN`, as
+/// the gateway does once when it starts.
+pub fn log_additional_source_auth_method_notices(surfaces: &[crate::config::agent_surface::AgentSurface]) {
+    for notice in surfaces
+        .iter()
+        .flat_map(additional_source_auth_method_notices)
+    {
+        warn!("{notice}");
+    }
+}
+
+/// Apply [`fall_back_to_first_source_auth_method`] to surfaces held in memory,
+/// as a DynamoDB load does, logging each trim.
+pub fn fall_back_to_first_source_auth_methods_in_memory(surfaces: &mut [crate::config::agent_surface::AgentSurface]) {
+    for surface in surfaces {
+        let fallbacks = fall_back_to_first_source_auth_method(surface);
+        log_source_auth_fallbacks(surface, &fallbacks);
+    }
+}
+
+/// A source authentication method as its tag, credential location and
+/// non-secret references (strategy, secret, provider agent, certificates), so
+/// a log line can name a method well enough to rebuild it.
+pub fn describe_source_auth_method(method: &crate::source_auth::SourceAuthConfig) -> String {
+    use crate::source_auth::SourceAuthConfig;
+    use crate::source_auth::models::MtlsTrust;
+
+    let location = describe_credential_source(method.credential_source());
+    let reference = match method {
+        SourceAuthConfig::JwtBearer(config) => format!(", strategy '{}'", config.jwt_verification_strategy_id),
+        SourceAuthConfig::ApiKey(config) => format!(", secret '{}'", config.secret_id),
+        SourceAuthConfig::ApiKeyProvider(config) => format!(", provider agent '{}'", config.agent_id),
+        SourceAuthConfig::DidAuth(_) => String::new(),
+        SourceAuthConfig::Mtls(config) => match &config.trust {
+            MtlsTrust::Pinned { certificate_ids } => format!(", pinned certificates {certificate_ids:?}"),
+            MtlsTrust::Ca { ca_certificate_ids, .. } => format!(", CA certificates {ca_certificate_ids:?}"),
+        },
+    };
+    format!("{} (reads {location}{reference})", method.method_tag())
+}
+
+fn describe_credential_source(source: crate::source_auth::models::CredentialSource<'_>) -> String {
+    use crate::source_auth::models::CredentialSource;
+
+    match source {
+        CredentialSource::Header(name) => format!("the '{name}' header"),
+        CredentialSource::McpMeta => "MCP _meta".to_string(),
+        CredentialSource::A2aExtension => "the A2A message extension".to_string(),
+        CredentialSource::ClientCertificate => "the client certificate".to_string(),
+    }
 }
 
 /// One line per surface, and per variant overriding its caller
@@ -489,13 +644,24 @@ pub fn additional_source_auth_method_notices(surface: &crate::config::agent_surf
 }
 
 /// The rules a stored surface's source authentication methods must meet to
-/// load: each method's own, and those that let a request select one method.
+/// load: each method's own, those that let a request select one method, and,
+/// beside protected resource metadata, JWT Bearer only as the first method,
+/// since every request to such a surface would otherwise fail its metadata
+/// check.
 fn validate_stored_source_auth_methods(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     let methods = surface.source_auth_methods();
     for method in methods {
         validate_stored_source_auth_method(method, &surface.name)?;
     }
-    validate_method_selection(methods, &surface.name)
+    validate_method_selection(methods, &surface.name)?;
+    if surface.has_later_jwt_bearer_beside_discovery() {
+        anyhow::bail!(
+            "Channel '{}': caller_authentication.protected_resource {}",
+            surface.name,
+            crate::config::agent_surface::LATER_JWT_BEARER_BESIDE_DISCOVERY
+        );
+    }
+    Ok(())
 }
 
 /// Validate a surface's `source_auth` configuration on the HTTP save path
@@ -634,12 +800,7 @@ fn validate_method_selection(
 ) -> anyhow::Result<()> {
     use crate::source_auth::models::{CredentialSource, SourceAuthConfig};
 
-    let describe = |source: CredentialSource<'_>| match source {
-        CredentialSource::Header(name) => format!("the '{name}' header"),
-        CredentialSource::McpMeta => "MCP _meta".to_string(),
-        CredentialSource::A2aExtension => "the A2A message extension".to_string(),
-        CredentialSource::ClientCertificate => "the client certificate".to_string(),
-    };
+    let describe = describe_credential_source;
     for (position, method) in methods.iter().enumerate() {
         let source = method.credential_source();
         if methods.len() > 1 && matches!(source, CredentialSource::McpMeta | CredentialSource::A2aExtension) {
@@ -1024,8 +1185,17 @@ mod tests {
             serde_json::json!([jwt_method(), api_key_method("authorization")]),
             serde_json::json!({}),
         );
-        let reason = fall_back_to_first_source_auth_method(&mut surface).unwrap();
-        assert!(reason.contains("both read the 'authorization' header"), "{reason}");
+        let fallbacks = fall_back_to_first_source_auth_method(&mut surface);
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert_eq!(fallbacks[0].variant, None);
+        assert!(
+            fallbacks[0]
+                .reason
+                .contains("both read the 'authorization' header"),
+            "{:?}",
+            fallbacks[0]
+        );
+        assert_eq!(fallbacks[0].dropped, ["api_key (reads the 'authorization' header, secret 'keys')"]);
         assert_eq!(
             surface
                 .source_auth_methods()
@@ -1038,12 +1208,103 @@ mod tests {
             serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
             serde_json::json!({}),
         );
-        assert!(fall_back_to_first_source_auth_method(&mut valid).is_none());
+        assert!(fall_back_to_first_source_auth_method(&mut valid).is_empty());
         assert_eq!(
             valid
                 .source_auth_methods()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_later_jwt_bearer_beside_discovery_falls_back_to_the_first_method() {
+        let second_jwt = serde_json::json!({
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "internal", "audiences": ["internal"],
+            "token_header": "X-Internal-Token"
+        });
+        let mut surface =
+            surface_with_caller_auth(serde_json::json!([jwt_method(), second_jwt]), serde_json::json!({}));
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .unwrap()
+            .protected_resource = Some(
+            serde_json::from_value(serde_json::json!({
+                "resource": "https://gateway.example/mcp/alpha",
+                "authorization_servers": ["https://idp.example"]
+            }))
+            .unwrap(),
+        );
+        assert!(validate_source_auth_surface(&surface).is_err(), "boot refuses it without the fallback");
+
+        let fallbacks = fall_back_to_first_source_auth_method(&mut surface);
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0]
+                .reason
+                .contains("allows JWT Bearer only as the first"),
+            "{:?}",
+            fallbacks[0]
+        );
+        assert_eq!(fallbacks[0].dropped, ["jwt_bearer (reads the 'X-Internal-Token' header, strategy 'internal')"]);
+        assert_eq!(
+            surface
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        validate_source_auth_surface(&surface).unwrap();
+    }
+
+    #[test]
+    fn an_enabled_variant_breaking_the_method_rules_falls_back_on_its_own() {
+        let override_methods = |methods: serde_json::Value| serde_json::json!({"access_point": {"caller_authentication": {"methods": methods}}});
+        let breaking = serde_json::json!([jwt_method(), api_key_method("authorization")]);
+        let mut surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
+            serde_json::json!({"variants": [
+                {"id": "v1", "alias": "broken", "name": "Broken", "overrides": override_methods(breaking.clone())},
+                {"id": "v2", "alias": "off", "name": "Off", "enabled": false, "overrides": override_methods(breaking)}
+            ]}),
+        );
+
+        let fallbacks = fall_back_to_first_source_auth_method(&mut surface);
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert_eq!(
+            fallbacks[0]
+                .variant
+                .as_deref(),
+            Some("broken")
+        );
+        assert_eq!(fallbacks[0].dropped, ["api_key (reads the 'authorization' header, secret 'keys')"]);
+        let methods_of = |surface: &crate::config::agent_surface::AgentSurface, alias: &str| {
+            surface
+                .variants
+                .iter()
+                .find(|variant| variant.alias == alias)
+                .and_then(|variant| {
+                    variant
+                        .overrides
+                        .access_point
+                        .as_ref()
+                })
+                .and_then(|access_point| {
+                    access_point
+                        .caller_authentication
+                        .as_ref()
+                })
+                .map_or(0, |authentication| authentication.methods.len())
+        };
+        assert_eq!(methods_of(&surface, "broken"), 1);
+        assert_eq!(methods_of(&surface, "off"), 2, "a disabled variant is left as stored");
+        assert_eq!(
+            surface
+                .source_auth_methods()
+                .len(),
+            2,
+            "the base keeps its valid methods"
         );
     }
 

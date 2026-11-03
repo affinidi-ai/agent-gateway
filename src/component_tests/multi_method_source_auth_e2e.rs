@@ -174,3 +174,105 @@ async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_th
     );
     assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1]);
 }
+
+/// A config reload runs the boot fallback: a stored surface whose methods break
+/// the rules for several methods, here two on one header, is served and stored
+/// with its first method alone, so a valid key is not refused as ambiguous.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_serves_a_rule_breaking_surface_with_its_first_method() {
+    let mut paths = None;
+    let h = GatewayHarness::start_with_mock(helpers::MockServer::start().await, |_, _, bootstrap| {
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            API_KEY_SECRET_ID,
+            API_KEY,
+        );
+        let admin = helpers::configure_admin_api(bootstrap);
+        paths = Some((
+            admin,
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            ),
+        ));
+    })
+    .await;
+    let (admin, surfaces_dir) = paths.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while admin
+        .get(format!("{}/api/v1/health", h.gateway_base))
+        .send()
+        .await
+        .map_or(true, |response| response.status() != 200)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "the gateway never became ready to serve");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let created = admin
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&json!({
+            "name": "reloaded-methods", "status": "active",
+            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/reloaded-methods",
+                             "protocol": "a2a", "caller_authentication": {"methods": [api_key_method()]}},
+            "target": {"endpoint": h.mock.url()}
+        }))
+        .send()
+        .await
+        .expect("create surface");
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let surface_id = created["surface_id"]
+        .as_str()
+        .unwrap();
+    let send_key = || async {
+        reqwest::Client::new()
+            .post(format!("{}/smoke/reloaded-methods", h.gateway_base))
+            .header("content-type", "application/json")
+            .header("x-api-key", API_KEY)
+            .body(r#"{"jsonrpc":"2.0","method":"message/send","id":1,"params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"hi"}]}}}"#)
+            .send()
+            .await
+            .expect("inbound request failed")
+            .status()
+            .as_u16()
+    };
+    assert_eq!(send_key().await, 200, "the stored surface accepts its key");
+
+    let stored_path = std::fs::read_dir(&surfaces_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(surface_id)))
+        .expect("stored surface file");
+    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    let mut same_header = api_key_method();
+    same_header["extraction"]["field"] = json!("X-API-KEY");
+    stored["access_point"]["caller_authentication"]["methods"]
+        .as_array_mut()
+        .unwrap()
+        .push(same_header);
+    std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+
+    let reload = admin
+        .post(format!("{}/api/v1/config/reload", h.gateway_base))
+        .send()
+        .await
+        .expect("reload");
+    assert!(reload.status().is_success(), "reload: {}", reload.status());
+
+    assert_eq!(send_key().await, 200, "the reloaded surface serves its first method alone");
+    let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    assert_eq!(
+        stored["access_point"]["caller_authentication"]["methods"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the reload stores the correction"
+    );
+}
