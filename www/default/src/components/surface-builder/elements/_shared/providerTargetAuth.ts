@@ -142,16 +142,30 @@ export interface TargetAuthFieldProblems {
   endpoint?: string;
 }
 
-const RESERVED_HEADERS = [
+export const RESERVED_HEADERS = [
   'Host',
   'Content-Length',
   'Transfer-Encoding',
   'Connection',
   'Keep-Alive',
   'Proxy-Connection',
+  'Proxy-Authorization',
+  'Proxy-Authenticate',
   'TE',
   'Upgrade',
   'Trailer',
+  'Trailers',
+  'X-Transit-Token',
+  'X-Gateway-Fabric-Hops',
+  'X-Caller-Did',
+  'X-Caller-Identity-Source',
+  'X-Caller-Dna-Uai',
+  'X-Gateway-Did',
+  'X-Did-Identity',
+  'X-Did-Signed-Identity',
+  'X-Gateway-Trace-Id',
+  'X-Mirrored-Request',
+  'Mcp-Session-Id',
 ];
 
 export const TARGET_AUTH_HTTPS_PROBLEM =

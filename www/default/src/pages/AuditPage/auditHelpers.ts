@@ -271,12 +271,12 @@ export function traceTerminated(entry: AuditEntry): TraceTerminatedData | null {
   return null;
 }
 
-/** Extracts the RequestRejected payload if present, else null */
 /** A `target_auth_failed` record whose request was forwarded without the Target credential. */
 export function isTargetAuthPassthrough(rejected: RequestRejectedData): boolean {
   return rejected.target_auth?.outcome === 'passthrough';
 }
 
+/** Extracts the RequestRejected payload if present, else null */
 export function requestRejected(entry: AuditEntry): RequestRejectedData | null {
   if (
     typeof entry.event === 'object' &&

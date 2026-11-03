@@ -14,7 +14,7 @@ import FabricDelegatedCredentialsSection, {
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
 import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
-import { transitPointTargetAuthProblems } from './targetAuth';
+import { staticSecretAuthType, transitPointTargetAuthProblems } from './targetAuth';
 import {
   PROVIDER_TARGET_AUTH_DEFAULTS,
   providerTargetAuthFromApi,
@@ -111,11 +111,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
     if (!ss) return;
     const headerName: string = ss.header_name || 'Authorization';
     const headerFormat: string = ss.header_format || '{value}';
-    let authType: string = 'custom_header';
-    if (headerFormat.startsWith('Bearer ')) authType = 'bearer';
-    else if (headerName === 'X-API-Key' || headerName.toLowerCase().includes('api-key')) {
-      authType = 'api_key';
-    }
+    const authType = staticSecretAuthType(headerName, headerFormat);
     authHydratedRef.current = true;
     updateFields({
       auth_type: authType,

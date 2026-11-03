@@ -5,13 +5,14 @@ import { managedAgentDefinition } from '../managed-agent/definition';
 import {
   headerFormatProblem,
   headerNameProblem,
+  RESERVED_HEADERS,
   isHttpsTarget,
   mergeTargetAuth,
   TARGET_AUTH_HTTPS_PROBLEM,
   TP_CALLER_CHECK_PROBLEM,
 } from '../_shared/providerTargetAuth';
 import { managedAgentTargetAuthProblems } from '../managed-agent/targetAuth';
-import { transitPointTargetAuthProblems } from '../transit-point/targetAuth';
+import { staticSecretAuthType, transitPointTargetAuthProblems } from '../transit-point/targetAuth';
 import { targetAuthBreaches } from '../targetAuthRules';
 import { validateSurfacePayload } from '../validateSurface';
 
@@ -88,6 +89,41 @@ describe('header and endpoint rules', () => {
     for (const endpoint of ['http://a.example', 'fabric://g/s', 'a2a-proxy://p', 'proxy://m', '']) {
       expect(isHttpsTarget(endpoint)).toBe(false);
     }
+  });
+});
+
+describe('reserved header names', () => {
+  it('lists the 23 names the gateway reserves', () => {
+    expect(RESERVED_HEADERS).toHaveLength(23);
+    expect(RESERVED_HEADERS).toEqual(
+      expect.arrayContaining([
+        'Proxy-Authorization',
+        'X-Transit-Token',
+        'Mcp-Session-Id',
+        'Trailers',
+      ])
+    );
+  });
+
+  it.each(RESERVED_HEADERS)('refuses %s in any case and passes a prefixed twin', name => {
+    expect(headerNameProblem(name)).toBe(`Header name must not be the reserved header ${name}`);
+    expect(headerNameProblem(name.toLowerCase())).toBe(
+      `Header name must not be the reserved header ${name}`
+    );
+    expect(headerNameProblem(`X-Partner-${name}`)).toBeNull();
+  });
+});
+
+describe('Transit Point auth type of a stored static secret', () => {
+  it('reads a Bearer format as bearer only under the Authorization header', () => {
+    expect(staticSecretAuthType('Authorization', 'Bearer {value}')).toBe('bearer');
+    expect(staticSecretAuthType('authorization', 'Bearer {value}')).toBe('bearer');
+    expect(staticSecretAuthType('X-Partner', 'Bearer {value}')).toBe('custom_header');
+  });
+
+  it('keeps the api key and custom header readings', () => {
+    expect(staticSecretAuthType('X-API-Key', '{value}')).toBe('api_key');
+    expect(staticSecretAuthType('X-Auth', 'Token {value}')).toBe('custom_header');
   });
 });
 
