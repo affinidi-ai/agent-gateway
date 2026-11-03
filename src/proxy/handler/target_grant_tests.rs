@@ -1322,6 +1322,44 @@ async fn a_refusal_before_anything_is_sent_is_audited() {
             (RejectionStage::Admission, RejectionReason::TargetPathRefused, Some(400), None),
         ),
         (
+            "an MCP request with a query string",
+            vendor_surface("mcp", &target, "owner"),
+            call_to("POST", "/vendor?x=1", Some(tools.clone())),
+            400,
+            (RejectionStage::Admission, RejectionReason::TargetPathRefused, Some(400), Some(-32600)),
+        ),
+        (
+            "an A2A read with a page token",
+            vendor_surface("a2a", &target, "owner"),
+            call_to("GET", "/vendor/v1/tasks?pageToken=abc", None),
+            400,
+            (RejectionStage::Admission, RejectionReason::TargetPathRefused, Some(400), None),
+        ),
+        (
+            "a 2026-07-28 MCP request",
+            vendor_surface("mcp", &target, "owner"),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/vendor")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", "read")
+                .header("x-api-key", KEY)
+                .body(axum::body::Body::from(
+                    json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+                        "name": "read", "arguments": {}, "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                    }}})
+                    .to_string(),
+                ))
+                .unwrap(),
+            400,
+            (RejectionStage::Admission, RejectionReason::VersionUnsupported, Some(400), Some(-32022)),
+        ),
+        (
             "an MCP read",
             vendor_surface("mcp", &target, "owner"),
             call_to("GET", "/vendor", None),

@@ -500,7 +500,8 @@ a `403` with a fixed reason (`delegation_not_enabled_for_partners` or
 A receiving surface whose Target is bound by external consent (`consent_mode: external`) refuses
 every request with `403`, public discovery reads included, before any payment is asked for or
 verified: the caller the peer asserts never keys a grant by binding, and a discovery read would
-carry the peer's headers to the vendor
+carry the peer's headers to the vendor. Each refusal is recorded as a `request_rejected`
+(`consent_identity_required`)
 ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)).
 
 The gateway that receives a request applies these rules; the sending gateway's release does not
@@ -604,8 +605,8 @@ included, starts again at 1, and so does a call without a transit token through 
 that does not require one (it reads the count from a token the agent sends), a call through a
 Transit Point that does not list `allow_fabric_callers` (the agent got no token for it), a call
 through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
-public discovery `GET` (an agent card or `.well-known` document) through any Transit Point,
-which reads no token either. So does a chain through a gateway that predates the hop count,
+discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
+the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
 The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
 the agent sending the token it was given each time; two agents that call each other's Access
