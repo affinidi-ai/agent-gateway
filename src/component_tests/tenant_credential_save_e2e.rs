@@ -973,7 +973,7 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_kept_only_wh
             api.client
                 .post(api.url("credential-providers/validate"))
                 .json(&json!({
-                    "tenant_id": "tenant-a", "provider_type": "oauth2_jwt_bearer",
+                    "tenant_id": "tenant-a", "provider_type": "oauth2_jwt_bearer", "jwt_subject": "admin@tenant-a.example",
                     "token_endpoint": STORED_TOKEN_ENDPOINT, "jwt_signing_key_secret_ref": "appliance-signing-key"
                 })),
         )

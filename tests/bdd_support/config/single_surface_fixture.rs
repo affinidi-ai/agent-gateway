@@ -359,6 +359,8 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// A JWT Bearer provider's signing-key secret holds a whole service account JSON key
     /// file whose `private_key_id` names the key, and the provider sets no key id itself.
     pub signing_key_is_service_account_file: bool,
+    /// The `jwt_subject` a JWT Bearer provider stores; the grant's `sub` claim.
+    pub jwt_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +380,7 @@ impl SurfaceTargetAuthProviderConfig {
             insecure_token_endpoint: false,
             authenticates_surface_target: true,
             signing_key_is_service_account_file: false,
+            jwt_subject: Some("bdd-subject@example.com".to_string()),
         }
     }
 }

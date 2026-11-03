@@ -127,7 +127,7 @@ pub struct JwtAssertionSettings {
     /// `iss` claim of a JWT Bearer grant (a Google service account's `client_email`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_issuer: Option<String>,
-    /// `sub` claim of a JWT Bearer grant (domain-wide delegation)
+    /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
 }
@@ -161,6 +161,19 @@ impl JwtAssertionSettings {
                 .jwt_subject
                 .or(existing.jwt_subject),
         }
+    }
+
+    /// Does a provider of `provider_type` need a `jwt_subject` these settings leave blank?
+    /// Only a JWT Bearer grant does: its assertion names the subject the token is for.
+    pub fn lacks_subject_for(
+        &self,
+        provider_type: &CredentialProviderType,
+    ) -> bool {
+        *provider_type == CredentialProviderType::OAuth2JwtBearer
+            && self
+                .jwt_subject
+                .as_deref()
+                .is_none_or(|subject| subject.trim().is_empty())
     }
 
     /// The same settings with blank values removed and the rest trimmed, so a field
@@ -491,6 +504,13 @@ impl CredentialProvider {
         } else {
             crate::tenancy::can_reference(surface_tenancy.tenant_id, self.tenant_id.as_deref())
         }
+    }
+
+    /// Is this a JWT Bearer provider without a `jwt_subject`? A save refuses one; a stored
+    /// one still signs its grant without `sub`.
+    pub fn lacks_jwt_subject(&self) -> bool {
+        self.jwt
+            .lacks_subject_for(&self.provider_type)
     }
 
     /// The algorithm this provider signs its JWT with: the configured one, or its

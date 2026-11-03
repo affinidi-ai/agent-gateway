@@ -178,11 +178,12 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
           <div className="col-md-6">
             <div className="field-label-with-help">
               <label htmlFor="jwt_subject" className="mb-0">
-                Subject
+                Subject <span className="text-danger">*</span>
               </label>
               <FieldHelp ariaLabel="About Subject" testId="field-help-jwt-subject">
-                Optional <code>sub</code> claim, the user a Google service account acts for with
-                domain-wide delegation.
+                The <code>sub</code> claim: the user the assertion is for, such as the user a Google
+                service account acts for with domain-wide delegation. Without it, use the service
+                account's own <code>client_email</code>.
               </FieldHelp>
             </div>
             <input
@@ -193,6 +194,7 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
               className="form-control"
               value={form.jwt_subject}
               onChange={onChange}
+              required
             />
           </div>
         )}

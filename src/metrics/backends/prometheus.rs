@@ -232,6 +232,20 @@ lazy_static! {
         h
     };
 
+    /// Credential provider token requests sent to a token endpoint (labeled by provider_type,
+    /// outcome). `provider_type` = `oauth2_client_credentials` | `oauth2_jwt_bearer` |
+    /// `oauth2_client_credentials_jwt_auth`; `outcome` = `success` | `refused` | `timeout` |
+    /// `invalid_response`.
+    pub static ref CREDENTIAL_PROVIDER_TOKEN_REQUESTS: IntCounterVec = {
+        let opts = Opts::new(
+            names::CREDENTIAL_PROVIDER_TOKEN_REQUESTS_TOTAL,
+            "Credential provider token requests sent to a token endpoint (provider_type = oauth2_client_credentials|oauth2_jwt_bearer|oauth2_client_credentials_jwt_auth; outcome = success|refused|timeout|invalid_response)",
+        );
+        let counter = IntCounterVec::new(opts, &["provider_type", "outcome"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// AWS KMS per-value envelope operation outcomes (labeled by op, result).
     /// `op` = `generate_data_key` | `decrypt`; `result` = `ok` | `error`.
     pub static ref KMS_OPERATION: IntCounterVec = {
@@ -682,6 +696,19 @@ pub fn track_sts_token_exchange(
     STS_TOKEN_EXCHANGE_DURATION
         .with_label_values(&[grant])
         .observe(duration_secs);
+}
+
+/// Track one credential provider token request that was sent to a token endpoint.
+///
+/// `provider_type` = `oauth2_client_credentials` | `oauth2_jwt_bearer` | `oauth2_client_credentials_jwt_auth`
+/// `outcome`       = `success` | `refused` | `timeout` | `invalid_response`
+pub fn track_credential_provider_token_request(
+    provider_type: &str,
+    outcome: &str,
+) {
+    CREDENTIAL_PROVIDER_TOKEN_REQUESTS
+        .with_label_values(&[provider_type, outcome])
+        .inc();
 }
 
 /// Track an AWS KMS per-value envelope operation.

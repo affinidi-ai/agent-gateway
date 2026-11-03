@@ -11,37 +11,37 @@ Feature: Credential policy on a Transit Point
     And MCP server "bravo" publishes a tool catalog
 
   Scenario: A Transit Point uses a provider with an http token endpoint in warn mode
-    Given Transit Point "alpha" authenticates its target with a client credentials provider
-    And the target's credential provider has a plain http token endpoint
+    Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
+    And the credential provider has a plain http token endpoint
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
     Then the response status is 200
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
-    And the target's credential provider received 1 token request
+    And the credential provider received 1 token request
 
   Scenario: A Transit Point cannot use a provider with an http token endpoint when https is enforced
-    Given Transit Point "alpha" authenticates its target with a client credentials provider
-    And the target's credential provider has a plain http token endpoint
+    Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
+    And the credential provider has a plain http token endpoint
     And the gateway enforces the credential rule "token_endpoint_https"
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
     Then the response status is 502
-    And the target's credential provider received 0 token requests
+    And the credential provider received 0 token requests
     And MCP server "bravo" was not called
 
   Scenario: A tenant surface's Transit Point uses a global credential provider in warn mode
     Given the surface belongs to tenant "tenant-a"
-    And Transit Point "alpha" authenticates its target with a client credentials provider
+    And the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
     Then the response status is 200
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
-    And the target's credential provider received 1 token request
+    And the credential provider received 1 token request
 
   Scenario: A tenant surface's Transit Point cannot use a global credential provider when tenant isolation is enforced
     Given the surface belongs to tenant "tenant-a"
-    And Transit Point "alpha" authenticates its target with a client credentials provider
+    And the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And the gateway enforces the credential rule "tenant_credential_isolation"
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
     Then the response status is 502
-    And the target's credential provider received 0 token requests
+    And the credential provider received 0 token requests
     And MCP server "bravo" was not called
 
   Scenario: A tenant surface's Transit Point injects a delegated credential from a global provider in warn mode
@@ -52,7 +52,7 @@ Feature: Credential policy on a Transit Point
     When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
     Then the response status is 200
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
-    And the target's credential provider received 1 token request
+    And the credential provider received 1 token request
 
   Scenario: A tenant surface's Transit Point cannot inject a delegated credential from a global provider when tenant isolation is enforced
     Given the surface belongs to tenant "tenant-a"
@@ -62,5 +62,5 @@ Feature: Credential policy on a Transit Point
     And managed agent "example-agent" holds a transit token naming caller "alice"
     When managed agent "example-agent" asks for available tools through Transit Point "alpha" with its transit token
     Then the response status is 503
-    And the target's credential provider received 0 token requests
+    And the credential provider received 0 token requests
     And MCP server "bravo" was not called

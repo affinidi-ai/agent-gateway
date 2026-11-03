@@ -1097,6 +1097,14 @@ async fn scrape_trust_check_counter(
     query_type: &str,
     result: &str,
 ) -> u64 {
+    sum_labeled_counter(
+        &scrape_prometheus(world).await,
+        "agent_gateway_trust_check_total",
+        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
+    )
+}
+
+pub(crate) async fn scrape_prometheus(world: &SurfaceWorld) -> String {
     let infra = world
         .infra
         .as_ref()
@@ -1113,14 +1121,10 @@ async fn scrape_trust_check_counter(
         .await
         .unwrap_or_else(|error| panic!("read prometheus body from {url}: {error}"));
     assert!(status.is_success(), "prometheus scrape at {url} returned {status}; body: {body}");
-    sum_labeled_counter(
-        &body,
-        "agent_gateway_trust_check_total",
-        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
-    )
+    body
 }
 
-fn sum_labeled_counter(
+pub(crate) fn sum_labeled_counter(
     exposition: &str,
     metric_name: &str,
     required_labels: &[(&str, &str)],
@@ -4023,7 +4027,7 @@ async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, Stri
                 .target_token_endpoint
                 .as_ref()
         })
-        .expect("the target's credential provider must serve a token endpoint")
+        .expect("the credential provider must serve a token endpoint")
         .requests()
         .await
         .iter()
@@ -4114,6 +4118,24 @@ fn startup_report_names_breach(
     );
 }
 
+#[then(expr = "the startup report does not name the {word} {string} as breaking the rule {string}")]
+fn startup_report_does_not_name_breach(
+    world: &mut SurfaceWorld,
+    subject: String,
+    id: String,
+    rule: String,
+) {
+    let expected = format!("subject=\"{subject}\" id={id} ");
+    let rule_field = format!("rule=\"{rule}\"");
+    let reports = warning_lines_containing(world, "Stored configuration breaks a credential policy rule");
+    assert!(
+        !reports
+            .iter()
+            .any(|line| line.contains(&expected) && line.contains(&rule_field)),
+        "the startup report names the {subject} {id} for rule {rule}: {reports:?}"
+    );
+}
+
 #[then("the gateway log shows no credential provider secret or token")]
 fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
     let log = gateway_log(world);
@@ -4125,7 +4147,7 @@ fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
     }
 }
 
-#[then(expr = "the target's credential provider received {int} token request(s)")]
+#[then(expr = "the credential provider received {int} token request(s)")]
 async fn target_credential_provider_received_token_requests(
     world: &mut SurfaceWorld,
     expected: usize,
@@ -4133,15 +4155,10 @@ async fn target_credential_provider_received_token_requests(
     let observed = target_token_requests(world)
         .await
         .len();
-    assert_eq!(
-        observed, expected,
-        "the target's credential provider received {observed} token requests, expected {expected}"
-    );
+    assert_eq!(observed, expected, "the credential provider received {observed} token requests, expected {expected}");
 }
 
-#[then(
-    expr = "the target's credential provider received a client credentials grant from client {string} for scope {string}"
-)]
+#[then(expr = "the credential provider received a client credentials grant from client {string} for scope {string}")]
 async fn target_credential_provider_received_client_credentials_grant(
     world: &mut SurfaceWorld,
     client_id: String,
@@ -4159,28 +4176,28 @@ async fn target_credential_provider_received_client_credentials_grant(
     assert_eq!(
         field("grant_type"),
         Some("client_credentials"),
-        "the target's credential provider received grant_type {:?}, expected client_credentials",
+        "the credential provider received grant_type {:?}, expected client_credentials",
         field("grant_type")
     );
     assert_eq!(
         field("client_id"),
         Some(client_id.as_str()),
-        "the target's credential provider received client_id {:?}, expected {client_id}",
+        "the credential provider received client_id {:?}, expected {client_id}",
         field("client_id")
     );
     assert_eq!(
         field("scope"),
         Some(scope.as_str()),
-        "the target's credential provider received scope {:?}, expected {scope}",
+        "the credential provider received scope {:?}, expected {scope}",
         field("scope")
     );
     assert!(
         !grant.contains_key("assertion"),
-        "a client credentials grant carries no assertion, but the target's credential provider received one"
+        "a client credentials grant carries no assertion, but the credential provider received one"
     );
 }
 
-#[then("the target's credential provider received a JWT Bearer grant signed with the provider key")]
+#[then("the credential provider received a JWT Bearer grant signed with the provider key")]
 async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut SurfaceWorld) {
     use crate::bdd_support::config::target_auth::{
         TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_SCOPE, target_auth_signing_key,

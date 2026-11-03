@@ -39,6 +39,9 @@ pub mod prom {
     pub const STS_TOKEN_EXCHANGE_TOTAL: &str = "agent_gateway_sts_token_exchange_total";
     pub const STS_TOKEN_EXCHANGE_DURATION_SECONDS: &str = "agent_gateway_sts_token_exchange_duration_seconds";
 
+    // Credential provider token requests sent to a token endpoint
+    pub const CREDENTIAL_PROVIDER_TOKEN_REQUESTS_TOTAL: &str = "agent_gateway_credential_provider_token_requests_total";
+
     // AWS KMS per-value envelope operations (GenerateDataKey / Decrypt)
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";
     pub const KMS_OPERATION_DURATION_SECONDS: &str = "agent_gateway_kms_operation_duration_seconds";

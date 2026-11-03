@@ -2531,10 +2531,10 @@ fn target_auth_provider(world: &mut SurfaceWorld) -> &mut SurfaceTargetAuthProvi
         .surface_config
         .target_auth_provider
         .as_mut()
-        .expect("the surface must authenticate its target with a credential provider first")
+        .expect("the gateway must authenticate to the managed agent with a credential provider first")
 }
 
-#[given(expr = "the surface authenticates its target with a client credentials provider")]
+#[given(expr = "the gateway authenticates to the managed agent with a client credentials provider")]
 fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld) {
     world
         .surface_config
@@ -2551,7 +2551,9 @@ fn serve_client_credentials_provider_off_the_surface_target(world: &mut SurfaceW
         .target_auth_provider = Some(provider);
 }
 
-#[given(expr = "Transit Point {string} authenticates its target with a client credentials provider")]
+#[given(
+    expr = "the gateway authenticates to the destination of Transit Point {string} with a client credentials provider"
+)]
 fn transit_point_authenticates_target_with_client_credentials(
     world: &mut SurfaceWorld,
     transit_point: String,
@@ -2583,14 +2585,23 @@ fn transit_point_injects_client_credentials_delegated_credentials(
     surface_requires_client_credentials_delegated_credentials(world);
 }
 
-#[given(expr = "the surface authenticates its target with a JWT Bearer provider")]
+#[given(expr = "the gateway authenticates to the managed agent with a JWT Bearer provider")]
 fn surface_authenticates_target_with_jwt_bearer(world: &mut SurfaceWorld) {
     world
         .surface_config
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::JwtBearer));
 }
 
-#[given("the target's credential provider is refusing token requests")]
+#[given(expr = "the gateway authenticates to the managed agent with a JWT Bearer provider stored without a subject")]
+fn surface_authenticates_target_with_jwt_bearer_without_subject(world: &mut SurfaceWorld) {
+    let mut provider = SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::JwtBearer);
+    provider.jwt_subject = None;
+    world
+        .surface_config
+        .target_auth_provider = Some(provider);
+}
+
+#[given("the credential provider is refusing token requests")]
 fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
     target_auth_provider(world).token_status = 401;
 }
@@ -2603,7 +2614,7 @@ fn target_auth_provider_fallback(
     target_auth_provider(world).fallback = fallback;
 }
 
-#[given(expr = "the target's credential provider issues tokens that expire in {int} seconds")]
+#[given(expr = "the credential provider issues tokens that expire in {int} seconds")]
 fn target_credential_provider_token_lifetime(
     world: &mut SurfaceWorld,
     expires_in: u64,
@@ -2611,7 +2622,7 @@ fn target_credential_provider_token_lifetime(
     target_auth_provider(world).expires_in = expires_in;
 }
 
-#[given("the target's credential provider has a plain http token endpoint")]
+#[given("the credential provider has a plain http token endpoint")]
 fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
     target_auth_provider(world).insecure_token_endpoint = true;
 }

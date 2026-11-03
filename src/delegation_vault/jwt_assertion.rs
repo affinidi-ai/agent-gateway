@@ -166,7 +166,7 @@ pub fn certificate_thumbprint(certificate_pem: &str) -> Result<String, Assertion
 }
 
 /// Claims of a JWT Bearer grant: `iss` is the configured issuer, the scopes travel in
-/// the `scope` claim.
+/// the `scope` claim, and a fresh `jti` lets the issuer refuse a replayed assertion.
 pub fn grant_assertion_claims(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -184,7 +184,7 @@ pub fn grant_assertion_claims(
             .clone(),
         aud: audience(provider)?,
         scope: (!scopes.is_empty()).then(|| scopes.join(" ")),
-        jti: None,
+        jti: Some(uuid::Uuid::new_v4().to_string()),
         nbf: None,
         iat: now,
         exp: now + ASSERTION_LIFETIME_SECS,
@@ -369,6 +369,7 @@ mod tests {
                 "sub": "user@example.com",
                 "aud": "https://oauth2.example/token",
                 "scope": "https://www.googleapis.com/auth/cloud-platform openid",
+                "jti": claims.jti.as_deref().unwrap(),
                 "iat": 1_000,
                 "exp": 1_300,
             })
@@ -391,10 +392,26 @@ mod tests {
             serde_json::json!({
                 "iss": "agent@project.iam.gserviceaccount.com",
                 "aud": "https://audience.example/",
+                "jti": claims.jti.as_deref().unwrap(),
                 "iat": 50,
                 "exp": 350,
             })
         );
+    }
+
+    #[test]
+    fn every_grant_assertion_carries_its_own_jti() {
+        let provider = provider(CredentialProviderType::OAuth2JwtBearer);
+        let first = grant_assertion_claims(&provider, &[], 50).unwrap();
+        let second = grant_assertion_claims(&provider, &[], 50).unwrap();
+        let first_jti = first
+            .jti
+            .expect("a grant assertion carries a jti");
+        let second_jti = second
+            .jti
+            .expect("a grant assertion carries a jti");
+        assert_ne!(first_jti, second_jti);
+        assert!(uuid::Uuid::parse_str(&first_jti).is_ok(), "{first_jti}");
     }
 
     #[test]

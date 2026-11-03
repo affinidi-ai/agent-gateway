@@ -757,6 +757,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
                 "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
+                "jwt_subject": provider.jwt_subject,
             })
         }),
         created_at: now,

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::bdd_support::caller::post_json;
 use crate::bdd_support::config::target_auth::{
-    TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_TOKEN,
-    target_auth_signing_key,
+    TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
+    TARGET_AUTH_PROVIDER_TOKEN, target_auth_signing_key,
 };
 use crate::bdd_support::json_rpc::build_a2a_message_send_body;
 use crate::bdd_support::mock_server::{MockResponse, MockServer};
@@ -26,7 +26,7 @@ fn token_endpoint(world: &SurfaceWorld) -> &MockServer {
                 .target_token_endpoint
                 .as_ref()
         })
-        .expect("the target's credential provider must serve a token endpoint")
+        .expect("the credential provider must serve a token endpoint")
 }
 
 async fn token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, String>> {
@@ -53,7 +53,7 @@ fn issued_token(expires_in: u64) -> MockResponse {
     }))
 }
 
-#[given("the target's credential provider accepts token requests")]
+#[given("the credential provider accepts token requests")]
 async fn target_credential_provider_accepts_tokens(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
     token_endpoint(world)
@@ -74,7 +74,7 @@ async fn caller_has_sent_a_request(
     assert_eq!(status, Some(expected), "the first request must answer {expected}");
 }
 
-#[given(expr = "the target's credential provider answers token requests only after {int} ms")]
+#[given(expr = "the credential provider answers token requests only after {int} ms")]
 async fn target_credential_provider_answers_slowly(
     world: &mut SurfaceWorld,
     delay_ms: u64,
@@ -85,7 +85,7 @@ async fn target_credential_provider_answers_slowly(
         .await;
 }
 
-#[given(expr = "the target's credential provider refuses token requests with error {string} and description {string}")]
+#[given(expr = "the credential provider refuses token requests with error {string} and description {string}")]
 async fn target_credential_provider_refuses_with_error(
     world: &mut SurfaceWorld,
     error: String,
@@ -119,7 +119,7 @@ fn provider_signing_key_is_service_account_file(world: &mut SurfaceWorld) {
         .surface_config
         .target_auth_provider
         .as_mut()
-        .expect("the surface must authenticate its target with a credential provider first")
+        .expect("the gateway must authenticate to the managed agent with a credential provider first")
         .signing_key_is_service_account_file = true;
 }
 
@@ -192,6 +192,124 @@ async fn operator_has_changed_provider_scope(
     assert_eq!(response.status, 200, "updating the credential provider answered {}", response.body);
 }
 
+async fn change_stored_provider(
+    world: &mut SurfaceWorld,
+    mut changes: Value,
+    subject: Option<String>,
+) {
+    ensure_admin_session(world).await;
+    if let Some(subject) = subject {
+        changes["jwt_subject"] = json!(subject);
+    }
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            Method::PUT,
+            &format!("/api/v1/credential-providers/{TARGET_AUTH_PROVIDER_ID}"),
+            Some(&changes),
+        )
+        .await
+        .expect("update the credential provider through the admin API");
+    world.admin_response = Some(response);
+}
+
+#[when(expr = "the operator changes the credential provider's scope to {string}")]
+async fn operator_changes_provider_scope(
+    world: &mut SurfaceWorld,
+    scope: String,
+) {
+    change_stored_provider(world, json!({ "default_scopes": [scope] }), None).await;
+}
+
+#[when(expr = "the operator changes the credential provider's scope to {string} and names the subject {string}")]
+async fn operator_changes_provider_scope_with_subject(
+    world: &mut SurfaceWorld,
+    scope: String,
+    subject: String,
+) {
+    change_stored_provider(world, json!({ "default_scopes": [scope] }), Some(subject)).await;
+}
+
+#[when(expr = "the operator changes the credential provider's signing key to the secret {string}")]
+async fn operator_changes_provider_signing_key(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    change_stored_provider(world, json!({ "jwt_signing_key_secret_ref": secret_id }), None).await;
+}
+
+#[when(
+    expr = "the operator changes the credential provider's signing key to the secret {string} and names the subject {string}"
+)]
+async fn operator_changes_provider_signing_key_with_subject(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+    subject: String,
+) {
+    change_stored_provider(world, json!({ "jwt_signing_key_secret_ref": secret_id }), Some(subject)).await;
+}
+
+#[when("the operator clears the credential provider's subject")]
+async fn operator_clears_provider_subject(world: &mut SurfaceWorld) {
+    change_stored_provider(world, json!({ "jwt_subject": "" }), None).await;
+}
+
+#[then(expr = "the credential provider stores the subject {string}")]
+async fn stored_provider_has_subject(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<Value>(
+            Method::GET,
+            &format!("/api/v1/credential-providers/{TARGET_AUTH_PROVIDER_ID}"),
+            None,
+        )
+        .await
+        .expect("read the credential provider through the admin API");
+    assert_eq!(response.body["jwt_subject"], json!(subject), "the stored provider: {}", response.body);
+}
+
+#[then("the credential provider stores no subject")]
+async fn stored_provider_has_no_subject(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<Value>(
+            Method::GET,
+            &format!("/api/v1/credential-providers/{TARGET_AUTH_PROVIDER_ID}"),
+            None,
+        )
+        .await
+        .expect("read the credential provider through the admin API");
+    let subject = &response.body["jwt_subject"];
+    assert!(subject.is_null() || subject == "", "the stored provider has a subject: {}", response.body);
+}
+
+#[then("no JWT Bearer assertion the credential provider received carries a subject")]
+async fn no_assertion_has_subject(world: &mut SurfaceWorld) {
+    let requests = token_requests(world).await;
+    assert!(!requests.is_empty(), "the token endpoint received no grant");
+    for request in requests {
+        let claims = assertion_claims(&request["assertion"]);
+        assert!(claims.get("sub").is_none(), "the assertion carries a subject: {claims}");
+        assert!(
+            claims["jti"]
+                .as_str()
+                .is_some_and(|jti| !jti.is_empty()),
+            "the assertion carries no jti: {claims}"
+        );
+    }
+}
+
 #[given(expr = "the operator has replaced the provider's client secret with {string}")]
 async fn operator_has_replaced_client_secret(
     world: &mut SurfaceWorld,
@@ -212,7 +330,7 @@ async fn operator_has_replaced_client_secret(
     assert_eq!(response.status, 200, "updating the secret answered {}", response.body);
 }
 
-#[then(expr = "the target's credential provider's latest token request asks for scope {string}")]
+#[then(expr = "the credential provider's latest token request asks for scope {string}")]
 async fn latest_token_request_asks_for_scope(
     world: &mut SurfaceWorld,
     scope: String,
@@ -221,7 +339,7 @@ async fn latest_token_request_asks_for_scope(
     assert_eq!(grant.get("scope"), Some(&scope), "the latest token request asked for {:?}", grant.get("scope"));
 }
 
-#[then(expr = "the target's credential provider's latest token request carries client secret {string}")]
+#[then(expr = "the credential provider's latest token request carries client secret {string}")]
 async fn latest_token_request_carries_client_secret(
     world: &mut SurfaceWorld,
     secret: String,
@@ -236,7 +354,7 @@ async fn latest_token_request_carries_client_secret(
     );
 }
 
-#[then(expr = "the target's credential provider received a JWT Bearer grant signed with key id {string}")]
+#[then(expr = "the credential provider received a JWT Bearer grant signed with key id {string}")]
 async fn token_request_is_jwt_bearer_signed_with_key_id(
     world: &mut SurfaceWorld,
     key_id: String,
@@ -319,4 +437,134 @@ async fn delegation_audit_trail_has_no_record_containing(
     assert_eq!(response.status, 200, "reading the delegation audit trail answered {}", response.body);
     let trail = response.body.to_string();
     assert!(!trail.contains(&text), "the delegation audit trail contains {text:?}: {trail}");
+}
+
+#[given(expr = "the credential provider stores the JWT subject {string}")]
+fn provider_jwt_subject_is(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    world
+        .surface_config
+        .target_auth_provider
+        .as_mut()
+        .expect("the gateway must authenticate to the managed agent with a credential provider first")
+        .jwt_subject = Some(subject);
+}
+
+#[given("the credential provider's token endpoint is not listening")]
+async fn token_endpoint_is_not_listening(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let endpoint = world
+        .infra
+        .as_mut()
+        .and_then(|infra| {
+            infra
+                .target_token_endpoint
+                .take()
+        });
+    drop(endpoint.expect("the credential provider must serve a token endpoint"));
+}
+
+#[given("the credential provider answers token requests with no access token")]
+async fn target_credential_provider_answers_without_access_token(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    token_endpoint(world)
+        .set_response(MockResponse::json(json!({ "token_type": "Bearer" })))
+        .await;
+}
+
+fn assertion_claims(assertion: &str) -> Value {
+    use base64::Engine as _;
+    let payload = assertion
+        .split('.')
+        .nth(1)
+        .expect("an assertion has a payload");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("the assertion payload is base64url");
+    serde_json::from_slice(&bytes).expect("the assertion payload is JSON")
+}
+
+#[then(expr = "every JWT Bearer assertion the credential provider received has subject {string}")]
+async fn every_assertion_has_subject(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    let requests = token_requests(world).await;
+    assert!(!requests.is_empty(), "the token endpoint received no grant");
+    for request in requests {
+        let claims = assertion_claims(&request["assertion"]);
+        assert_eq!(claims["sub"], json!(subject), "the assertion's claims: {claims}");
+    }
+}
+
+#[then("no two JWT Bearer assertions the credential provider received share a jti")]
+async fn assertions_have_distinct_jti(world: &mut SurfaceWorld) {
+    let requests = token_requests(world).await;
+    assert!(requests.len() >= 2, "the token endpoint received {} grants", requests.len());
+    let mut seen = std::collections::HashSet::new();
+    for request in requests {
+        let claims = assertion_claims(&request["assertion"]);
+        let jti = claims["jti"]
+            .as_str()
+            .filter(|jti| !jti.is_empty())
+            .unwrap_or_else(|| panic!("the assertion carries no jti: {claims}"))
+            .to_string();
+        assert!(seen.insert(jti.clone()), "the jti {jti} was used twice");
+    }
+}
+
+const TOKEN_REQUEST_METRIC: &str = "agent_gateway_credential_provider_token_requests_total";
+
+#[then(expr = "the token request metric counts {int} {string} request(s) for provider type {string}")]
+async fn token_request_metric_counts(
+    world: &mut SurfaceWorld,
+    expected: u64,
+    outcome: String,
+    provider_type: String,
+) {
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    let counted = crate::steps::then::sum_labeled_counter(
+        &exposition,
+        TOKEN_REQUEST_METRIC,
+        &[("provider_type", provider_type.as_str()), ("outcome", outcome.as_str())],
+    );
+    assert_eq!(counted, expected, "{TOKEN_REQUEST_METRIC} for {provider_type} {outcome}");
+}
+
+#[then("the token request metric counts no requests")]
+async fn token_request_metric_counts_nothing(world: &mut SurfaceWorld) {
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    assert_eq!(crate::steps::then::sum_labeled_counter(&exposition, TOKEN_REQUEST_METRIC, &[]), 0);
+}
+
+#[then("the token request metric is labelled only by provider type and outcome")]
+async fn token_request_metric_labels_are_bounded(world: &mut SurfaceWorld) {
+    let endpoint = token_endpoint(world).url();
+    let exposition = crate::steps::then::scrape_prometheus(world).await;
+    let samples: Vec<&str> = exposition
+        .lines()
+        .filter(|line| line.starts_with(TOKEN_REQUEST_METRIC))
+        .collect();
+    assert!(!samples.is_empty(), "the metric has no sample");
+    for sample in samples {
+        let labels = sample
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map_or("", |(labels, _)| labels);
+        for pair in labels.split(',') {
+            let key = pair
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            assert!(matches!(key, "provider_type" | "outcome"), "unexpected label in {sample}");
+        }
+        for leaked in
+            [TARGET_AUTH_PROVIDER_ID, endpoint.as_str(), TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN]
+        {
+            assert!(!labels.contains(leaked), "the labels of {sample} hold {leaked}");
+        }
+    }
 }
