@@ -11,5 +11,12 @@ changes:
         the largest value, so exp can never land before iat. The inputs are the gateway clock and
         a configured lifetime, so callers could not reach this.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-03T10:32:45Z'
+      title: Refuse an Ed25519 JWK whose public key is not 32 bytes
+      description: >-
+        A JWT verification strategy's OKP key went to the EdDSA verifier without a length check,
+        and a token whose header named EdDSA against a key with a short or empty x made the
+        verifier panic, failing the request. The key must now decode to exactly 32 bytes, and any
+        other key is refused as an invalid token.
   breaking: []

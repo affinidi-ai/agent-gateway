@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, decode_header};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -21,6 +22,8 @@ use crate::jwt_bearer::{
 
 /// All decoded JWT claims, returned on successful validation.
 pub type Claims = Value;
+
+const ED25519_PUBLIC_KEY_LEN: usize = 32;
 
 /// Extract the bearer token from a raw header value.
 ///
@@ -193,6 +196,15 @@ fn decoding_key_from_jwk(jwk: &crate::jwt_bearer::jwks::Jwk) -> JwtBearerResult<
                 .x
                 .as_deref()
                 .ok_or_else(|| JwtBearerError::InvalidToken("OKP JWK missing 'x'".to_string()))?;
+            let key_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(x)
+                .map(|bytes| bytes.len())
+                .map_err(|_| JwtBearerError::InvalidToken("OKP JWK 'x' is not base64url".to_string()))?;
+            if key_len != ED25519_PUBLIC_KEY_LEN {
+                return Err(JwtBearerError::InvalidToken(format!(
+                    "OKP JWK 'x' must be {ED25519_PUBLIC_KEY_LEN} bytes, got {key_len}"
+                )));
+            }
             DecodingKey::from_ed_components(x)
                 .map_err(|e| JwtBearerError::InvalidToken(format!("Failed to build EdDSA decoding key: {}", e)))
         }
@@ -665,6 +677,51 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
             matches!(result, Err(JwtBearerError::KeyNotFound(_))),
             "token referencing an unknown kid should return KeyNotFound, got: {:?}",
             result
+        );
+    }
+
+    // ── OKP key length ────────────────────────────────────────────────────────
+
+    async fn validate_with_okp_x(x: &str) -> JwtBearerResult<Claims> {
+        use crate::jwt_bearer::test_utils::{sign_ed25519_jwt, static_okp_strategy};
+        let strategy = static_okp_strategy("okp", None, "https://issuer.example.com", "okp-key", x);
+        let token = sign_ed25519_jwt(
+            &json!({ "iss": "https://issuer.example.com", "sub": "okp-user", "exp": now_secs() + 3600 }),
+            "okp-key",
+        );
+        JwtBearerVerifier::new(Arc::new(JwksClient::new()))
+            .validate(&token, &strategy, &[])
+            .await
+    }
+
+    #[tokio::test]
+    async fn okp_jwk_with_a_32_byte_x_verifies_an_eddsa_token() {
+        let claims = validate_with_okp_x(crate::jwt_bearer::test_utils::ED25519_JWK_X)
+            .await
+            .expect("a well-formed Ed25519 JWK must verify its own signature");
+        assert_eq!(claims["sub"], "okp-user");
+    }
+
+    #[tokio::test]
+    async fn okp_jwk_with_an_empty_or_short_x_is_refused_without_panicking() {
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 31]);
+        let long = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 33]);
+        for x in ["", short.as_str(), long.as_str()] {
+            let result = validate_with_okp_x(x).await;
+            assert!(
+                matches!(&result, Err(JwtBearerError::InvalidToken(message)) if message.contains("must be 32 bytes")),
+                "x of {} chars must be refused as InvalidToken, got {result:?}",
+                x.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn okp_jwk_with_a_non_base64url_x_is_refused() {
+        let result = validate_with_okp_x("not base64url!").await;
+        assert!(
+            matches!(&result, Err(JwtBearerError::InvalidToken(message)) if message.contains("not base64url")),
+            "got {result:?}"
         );
     }
 
