@@ -531,6 +531,17 @@ const ISOLATED_TEST_CHILD_ENV: &str = "AG_ISOLATED_TEST_CHILD";
 /// the parent once the child has passed.
 #[cfg(test)]
 pub(crate) fn run_isolated_from_other_tests() -> bool {
+    run_isolated_from_other_tests_with_env(&[], &[])
+}
+
+/// Like [`run_isolated_from_other_tests`], with `set` added to and `removed`
+/// taken out of the child's environment, so the test runs under process-wide
+/// variables without this process ever changing its own environment.
+#[cfg(test)]
+pub(crate) fn run_isolated_from_other_tests_with_env(
+    set: &[(&str, &str)],
+    removed: &[&str],
+) -> bool {
     if std::env::var_os(ISOLATED_TEST_CHILD_ENV).is_some() {
         return true;
     }
@@ -538,9 +549,15 @@ pub(crate) fn run_isolated_from_other_tests() -> bool {
         .name()
         .expect("test thread name")
         .to_string();
-    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary path"));
+    command
         .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
         .env(ISOLATED_TEST_CHILD_ENV, "1")
+        .envs(set.iter().copied());
+    for name in removed {
+        command.env_remove(name);
+    }
+    let output = command
         .output()
         .expect("run test in an isolated process");
     let stdout = String::from_utf8_lossy(&output.stdout);

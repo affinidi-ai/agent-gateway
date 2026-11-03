@@ -2579,7 +2579,17 @@ fn marked_failed(trust_registry_id: &str) -> TrustRegistryError {
 /// local development can point at loopback / private-IP mediators. Never set
 /// in production.
 fn skip_outbound_url_validation() -> bool {
-    let enabled = std::env::var("AG_ALLOW_LOCAL_OOB")
+    skip_outbound_url_validation_for(
+        std::env::var("AG_ALLOW_LOCAL_OOB")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`skip_outbound_url_validation`] for an `AG_ALLOW_LOCAL_OOB` value, so tests
+/// can supply it without changing the process environment.
+fn skip_outbound_url_validation_for(value: Option<&str>) -> bool {
+    let enabled = value
         .map(|v| {
             matches!(
                 v.to_ascii_lowercase()
@@ -4786,59 +4796,22 @@ mod tests {
 
     // --- AG_ALLOW_LOCAL_OOB env-gated bypass (dev/test only) ---
 
-    /// Serialises env-var toggles so parallel tests don't observe each other's
-    /// AG_ALLOW_LOCAL_OOB state.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_env<T>(
-        key: &str,
-        value: Option<&str>,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var(key).ok();
-        // SAFETY: serialised via ENV_LOCK; no other thread reads AG_ALLOW_LOCAL_OOB while the guard is held.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-        let result = f();
-        // SAFETY: still under ENV_LOCK.
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-        result
-    }
-
     #[test]
     fn skip_outbound_url_validation_defaults_off() {
-        with_env("AG_ALLOW_LOCAL_OOB", None, || {
-            assert!(!skip_outbound_url_validation());
-        });
+        assert!(!skip_outbound_url_validation_for(None));
     }
 
     #[test]
     fn skip_outbound_url_validation_accepts_truthy_values() {
         for v in ["1", "true", "TRUE", "yes", "YES", "Yes"] {
-            with_env("AG_ALLOW_LOCAL_OOB", Some(v), || {
-                assert!(skip_outbound_url_validation(), "expected true for {v:?}");
-            });
+            assert!(skip_outbound_url_validation_for(Some(v)), "expected true for {v:?}");
         }
     }
 
     #[test]
     fn skip_outbound_url_validation_rejects_other_values() {
         for v in ["0", "false", "no", "", "on", "enabled"] {
-            with_env("AG_ALLOW_LOCAL_OOB", Some(v), || {
-                assert!(!skip_outbound_url_validation(), "expected false for {v:?}");
-            });
+            assert!(!skip_outbound_url_validation_for(Some(v)), "expected false for {v:?}");
         }
     }
 

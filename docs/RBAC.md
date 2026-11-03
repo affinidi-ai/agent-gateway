@@ -98,6 +98,24 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
+## Dashboard log lines
+
+Log lines from the gateway log file need `logs.view`, checked against the caller's role and, for a
+personal access token, its feature scopes ([`dashboard.rs`](../src/observability/dashboard.rs)):
+
+- `GET /v1/dashboard/delta` leaves out `changes.logs`, and `GET /v1/dashboard/stats` returns an
+  empty `proxy_info.log_entries`, without reading the log file.
+- A dashboard WebSocket connection drops the `logs` section of each `DashboardDelta` and every
+  `LogEntry` update. It checks its session, without extending it, and its user's role and status
+  when it connects and again on each keep-alive ping (every 30 seconds), so an open connection
+  keeps receiving log lines for up to 30 seconds after its session ends (logout, expiry or
+  revocation) or its user loses `logs.view` or is no longer Approved.
+
+A caller that cannot be checked gets no log lines: a request or connection without an RBAC guard
+(no auth backend), an unknown user, a user who is not Approved, a failed user lookup, or an
+unauthenticated WebSocket (`websocket_require_auth` off). The built-in defaults grant `logs.view`
+to `user`.
+
 ## Integrations
 
 Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the
