@@ -1339,8 +1339,8 @@ fn default_replay_backend() -> String {
     "in_process".to_string()
 }
 
-/// Throttle for the token endpoint: bounds repeated attempts per client id and
-/// per source address so credential guessing is rate-limited.
+/// Throttle for the token endpoint: bounds repeated attempts per client id from
+/// each source, and per source, so credential guessing is rate-limited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEndpointThrottleConfig {
     /// Master switch for the throttle.
@@ -1349,10 +1349,11 @@ pub struct TokenEndpointThrottleConfig {
     /// Count only failed client authentications (recommended) rather than every request.
     #[serde(default = "sts_throttle_default_true")]
     pub failed_attempts_only: bool,
-    /// Per-`client_id` limit.
+    /// Per-`client_id` limit, counted separately for each source (an IPv4 address or an IPv6 /64).
     #[serde(default = "default_throttle_per_client")]
     pub per_client: RateLimitConfig,
-    /// Per-source-address limit (source read from `X-Forwarded-For` / `Forwarded`).
+    /// Per-source limit (an IPv4 address or an IPv6 /64; forwarded headers count only from
+    /// `client_ip.trusted_proxies`).
     #[serde(default = "default_throttle_per_ip")]
     pub per_ip: RateLimitConfig,
     /// Seconds a key stays blocked once over its limit (0 = until the window rolls off).
