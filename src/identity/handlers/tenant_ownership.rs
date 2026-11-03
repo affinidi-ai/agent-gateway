@@ -987,8 +987,9 @@ async fn persist_tenant_id(
                 resource.tenant_id = tenant_id;
                 super::surface_tenancy::validate_surface_references(state, &resource, Some(&resource), None, None)
                     .await
-                    .map_err(|error| {
-                        OwnershipApiError::Internal(format!("Surface reference validation failed: {:?}", error))
+                    .map_err(|error| match error {
+                        super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
+                        other => OwnershipApiError::Internal(format!("Surface reference validation failed: {other:?}")),
                     })?;
             }
             super::surface_tenancy::validate_external_consent_bindings(state, &resource)

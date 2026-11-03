@@ -1660,6 +1660,25 @@ async fn a_stored_appliance_key_on_a_tenant_surface_is_refused_when_enforced() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn giving_a_tenant_to_a_surface_naming_an_appliance_key_is_refused_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let surface = api
+        .created_id(&api.surface(
+            "/smoke/appliance-key-wide",
+            None,
+            json!({"identity_slots": {"protected": from_api_key(STORED_APPLIANCE_KEY)}}),
+        ))
+        .await;
+
+    let (status, body) = api
+        .reassign("surfaces", &surface, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body, json!({"error": NOT_ACCESSIBLE_KEY_OWNER}));
+    assert_eq!(api.stored(&surface).await["tenant_id"], Value::Null, "a refused reassignment changes nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_surface_keeps_a_provider_key_it_already_named_after_the_key_is_deleted_but_cannot_add_one() {
     let (_harness, api) = harness(RuleMode::Enforce).await;
     let owner = api
