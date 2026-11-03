@@ -382,6 +382,15 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
+- **Identity → From API Key** on the inbound Identity has no key field: in place of the picker
+  the panel shows the one line "Each caller is identified by the API key it presents."
+  (`identity-panel-inbound-api-key-note`);
+  `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
+  the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
+  Save unless the first Caller Context method is API Key or API Key Provider, with the gateway's
+  own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
+  and rules on inactive variants show as the save-error banner.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener
@@ -818,7 +827,9 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 - Keeps the shared `required_headers` and `resource_pattern` fields, and enforces Agent
   Gateway's canonical values: blank is appliance-wide, and every nonblank pattern is
   `TENANT:${one-header}:<bounded-resource-selector>` with every alternative starting in a
-  known resource kind.
+  known resource kind. The known kinds (`ACCESS_TOKEN_RESOURCE_KINDS` in
+  `accessTokenHelpers.ts`) list every backend `ResourceKind`; a Rust test in `src/tenancy`
+  fails while one is missing.
 - The tester uses the compact sample-header and **Sample entity ID** rows, plus Agent
   Gateway's resource-kind selector and canonical target.
 - Static patterns, repeated or multiple placeholders, and tenant-wide catch-alls block

@@ -10,6 +10,7 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping';
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
+import { isInboundIdentity } from './placement';
 
 interface ApiKeyOption {
   key_id: string;
@@ -152,13 +153,14 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   // No default extraction type — user must explicitly pick one.
   const extractionType: ExtractionType = (config.type as ExtractionType) || '';
   const slotContext = describeIdentitySlot(node.slotId);
+  const isInbound = isInboundIdentity(node);
   const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([]);
   const [certificates, setCertificates] = useState<CertificateOption[]>([]);
   const [loadingKeys, setLoadingKeys] = useState(false);
   const [loadingCerts, setLoadingCerts] = useState(false);
 
   useEffect(() => {
-    if (extractionType !== 'from_api_key' || apiKeys.length > 0) return;
+    if (extractionType !== 'from_api_key' || isInbound || apiKeys.length > 0) return;
     setLoadingKeys(true);
     apiClient
       .fetch('/api/v1/api-keys')
@@ -166,7 +168,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
       .then((data: ApiKeyOption[]) => setApiKeys(data.filter(k => k.status === 'active')))
       .catch(() => setApiKeys([]))
       .finally(() => setLoadingKeys(false));
-  }, [extractionType, apiKeys.length]);
+  }, [extractionType, isInbound, apiKeys.length]);
 
   useEffect(() => {
     if (extractionType !== 'from_mtls' || certificates.length > 0) return;
@@ -343,12 +345,24 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
         </>
       )}
 
-      {extractionType === 'from_api_key' && (
+      {extractionType === 'from_api_key' && isInbound && (
+        <div className="config-section">
+          <Form.Text
+            className="text-muted d-block"
+            data-testid="identity-panel-inbound-api-key-note"
+          >
+            Each caller is identified by the API key it presents.
+          </Form.Text>
+        </div>
+      )}
+
+      {extractionType === 'from_api_key' && !isInbound && (
         <div className="config-section">
           <label>API Key</label>
           <Form.Select
             size="sm"
             className="dropdown-styling"
+            data-testid="identity-panel-api-key-select"
             value={config.api_key_id || ''}
             onChange={e => updateField('api_key_id', e.target.value)}
             disabled={loadingKeys}

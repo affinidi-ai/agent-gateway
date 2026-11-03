@@ -230,7 +230,14 @@ presented VP is rejected, a raw `agent-identity/v1` extension beside it yields n
 either. On that path no audit record is written, and a presentation it cannot verify
 because no verifier is configured counts as rejected. A surface-configured
 `inbound_identity`, meaning `static`, `from_mtls`, `from_api_key`, or `from_jwt_claim`,
-still applies, except on public discovery paths where none is resolved.
+still applies, except on public discovery paths where none is resolved. An inbound
+`from_api_key` replaces even a verified presentation with the presented key's DID. On a Fabric
+send it does so for `access_point.inbound_policy` only; `target.policy` keeps the target agent's
+card and the request body (see
+[`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)).
+
+The fabric receive path does not read an inbound `from_api_key`: there the presentation or
+the identity extension in the request body sets the caller.
 
 Policies read how the caller DID was established from
 `input.extension_identity.verification` and `input.agent.did_verification`.
@@ -239,8 +246,8 @@ Policies read how the caller DID was established from
 | --- | --- |
 | `vp` | Verified presentation from a connection issuer. Fabric path only. |
 | `vp_unanchored` | Verified presentation on the direct A2A path, where no authenticated sender vouches for the issuer. |
-| `source_auth` | DID bound to this request's authenticated source credential, meaning `from_jwt_claim`. |
-| `unverified` | Payload-derived pseudonyms, and surface-configured identities such as `static`, `from_mtls`, and `from_api_key`. |
+| `source_auth` | DID bound to this request's authenticated source credential: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
+| `unverified` | Payload-derived pseudonyms, and surface-configured identities such as `static`, `from_mtls`, a stored-key `from_api_key`, and a plain API Key on an inbound `from_api_key` slot. |
 
 `input.extension_identity.verified` and `input.agent.did_verified` are the boolean
 projections: everything but `unverified` is verified.

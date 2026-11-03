@@ -863,13 +863,17 @@ const SurfaceDetailPage: React.FC = () => {
     );
     if (policyDefinitionsReason) return { message: policyDefinitionsReason };
     const firstIncomplete = builder.state.nodes.find(
-      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
     );
     if (firstIncomplete) {
       const def = registry.get(firstIncomplete.type);
       const reason =
-        getIncompleteReason(firstIncomplete.type, firstIncomplete.config, surfacePolicyIds) ||
-        'configuration is incomplete';
+        getIncompleteReason(
+          firstIncomplete.type,
+          firstIncomplete.config,
+          surfacePolicyIds,
+          firstIncomplete
+        ) || 'configuration is incomplete';
       return {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
@@ -938,13 +942,17 @@ const SurfaceDetailPage: React.FC = () => {
             };
           }
           const incomplete = snapNodes.find(
-            n => getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+            n => getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
           );
           if (incomplete) {
             const def = registry.get(incomplete.type);
             const reason =
-              getIncompleteReason(incomplete.type, incomplete.config, surfacePolicyIds) ||
-              'configuration is incomplete';
+              getIncompleteReason(
+                incomplete.type,
+                incomplete.config,
+                surfacePolicyIds,
+                incomplete
+              ) || 'configuration is incomplete';
             return {
               message: `Variant "${label}" — ${def?.label ?? incomplete.type}: ${reason}`,
               nodeId: incomplete.id,

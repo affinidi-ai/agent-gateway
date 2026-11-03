@@ -138,10 +138,12 @@ the canonical string with SHA-256. This hash is deterministic and unkeyed. Crede
 identity pepper. `AG_IDENTITY_HASH_PEPPER` supplies the stable pepper when valid; otherwise startup
 generates an ephemeral pepper and derived DIDs change after restart. The `static` mode returns its
 configured DID directly without hashing or issuance; see
-[`src/identity/credential_identity.rs`](../src/identity/credential_identity.rs). Only
-`from_jwt_claim` is reported to policy as verified (`source_auth`); payload-derived, `from_mtls`,
-`from_api_key`, and `static` identities are `unverified`, while an identity presentation reports
-`vp` / `vp_unanchored` regardless of mode (see
+[`src/identity/credential_identity.rs`](../src/identity/credential_identity.rs). `from_jwt_claim`
+and an API Key Provider key on an inbound `from_api_key` slot are reported to policy as verified
+(`source_auth`); payload-derived, `from_mtls`, `static`, stored-key `from_api_key` and plain API
+Key inbound `from_api_key` identities are `unverified`. An identity presentation reports
+`vp` / `vp_unanchored`, except on an inbound `from_api_key` slot, where the presented key's DID
+replaces it (see
 [`docs/POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)).
 
 Target `custom_metadata` is merged into outbound extension metadata. A secret reference must occupy

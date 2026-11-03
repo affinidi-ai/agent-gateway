@@ -38,7 +38,7 @@ function resolveRow(node: CanvasNode, surfacePolicyIds: Set<string> | null): Row
   // Use the same fault reason the Save guard checks (incomplete fields
   // OR validation errors) so the Status badge in this list never
   // disagrees with the toast that blocks Save.
-  const faultReason = getIncompleteReason(node.type, node.config ?? {}, surfacePolicyIds);
+  const faultReason = getIncompleteReason(node.type, node.config ?? {}, surfacePolicyIds, node);
   return {
     id: node.id,
     icon: def.paletteIcon,

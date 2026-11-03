@@ -69,12 +69,9 @@ impl Fixture {
     ) -> Self {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         let directory = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("TARGET_GRANT_TEST_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
-            key_env_var: "TARGET_GRANT_TEST_MASTER_KEY".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         })
         .unwrap();

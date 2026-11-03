@@ -1683,11 +1683,7 @@ async fn step_resolve_agent_identity(
     // credential (mTLS cert, API key) or fixed. Resolve them here so the
     // pipeline does not insist on parsing a JSON body when none is expected.
     let cred_id_start = Instant::now();
-    let cred_id_channel = ctx
-        .surface
-        .config_id()
-        .unwrap_or("unknown")
-        .to_string();
+    let cred_id_channel = ctx.surface.name.clone();
     let mode_label = match managed_identity {
         crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_) => "payload_extraction",
         crate::source_auth::ManagedIdentityConfig::FromMtls { .. } => "from_mtls",
@@ -11563,6 +11559,54 @@ mod tests {
             }
             ProtectedAgentIdentity::Anonymous => panic!("expected Managed identity, got Anonymous"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_step_resolve_agent_identity_shares_the_did_of_an_api_key_that_identifies_a_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_ob_caller", true, None)
+            .await
+            .unwrap();
+        let caller = vc_issuer
+            .issue_or_get_caller_credential(fields, Some(hash.clone()), None, None)
+            .await
+            .unwrap();
+        let vc_issuer = Arc::new(vc_issuer);
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(vc_issuer.clone());
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_ob_caller".to_string()),
+        });
+        let mut surface = (*ctx.surface).clone();
+        surface.surface_id = "ob-shared-key".to_string();
+        surface.name = "ob-shared-key-name".to_string();
+        ctx.surface = Arc::new(surface);
+        let count = |channel: &str, result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&[channel, "from_api_key", result])
+                .get()
+        };
+
+        step_resolve_agent_identity(&state, &mut ctx)
+            .await
+            .expect("an API key that identifies a caller also resolves as the Managed Agent");
+
+        match &ctx.resolved_identity {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, &caller.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected Managed identity, got Anonymous"),
+        }
+        let record = vc_issuer
+            .get_identity_store()
+            .find_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(crate::identity::IdentityOrigin::ExternalCaller));
+        assert_eq!(count("ob-shared-key-name", "ok_cached"), 1);
+        assert_eq!(count("ob-shared-key", "ok_cached"), 0);
     }
 
     #[tokio::test]

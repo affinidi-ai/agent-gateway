@@ -326,7 +326,9 @@ impl PolicyInput {
     /// `agent.did_verified` / `did_verification`; a payload-asserted
     /// `agent.did` equal to the resolved extension DID is marked verified when
     /// the extension identity is. No-op when `agent.did` is already set to a
-    /// different DID or `extension_identity.did` is missing.
+    /// different DID or `extension_identity.did` is missing. On inbound
+    /// `from_api_key` surfaces the direct path binds `agent.did` to the
+    /// presented key's DID with [`AgentContext::bind_caller_did`] first.
     pub fn normalize_caller_did(&mut self) {
         let Some((ext_did, verification)) = self
             .extension_identity
@@ -531,6 +533,45 @@ pub struct AgentContext {
     pub tr_identity_mismatch: bool,
 }
 
+impl AgentContext {
+    /// Make `did` the gateway-resolved caller DID, replacing any DID the
+    /// request body asserted, or clear it when no caller identity was
+    /// resolved. When the DID changes or no caller identity was resolved,
+    /// everything the body asserted or the gateway verified about the previous
+    /// DID (trust registry, provider, authority, issuer, Agent DNA and trust
+    /// verification) is dropped, so the caller cannot choose them.
+    pub fn bind_caller_did(
+        &mut self,
+        extension_identity: Option<&ExtensionIdentityContext>,
+    ) {
+        let resolved = extension_identity.and_then(|e| {
+            e.did
+                .clone()
+                .map(|did| (did, e.verification))
+        });
+        let resolved_did = resolved
+            .as_ref()
+            .map(|(did, _)| did.as_str());
+        if resolved_did.is_none() || self.did.as_deref() != resolved_did {
+            self.trust_verification = None;
+            self.source_trust_verification = None;
+            self.target_trust_verification = None;
+            self.agent_dna = None;
+            self.trust_registry_did = None;
+            self.provider_did = None;
+            self.authority_did = None;
+            self.identity_issuer_did = None;
+        }
+        self.did_verified = resolved
+            .as_ref()
+            .is_some_and(|(_, v)| v.is_verified());
+        self.did_verification = resolved
+            .as_ref()
+            .map(|(_, v)| *v);
+        self.did = resolved.map(|(did, _)| did);
+    }
+}
+
 // ── Context types (moved from gateway_manager.rs) ──────────
 
 /// Gateway-level policy context added to `input.gateway` in Rego
@@ -640,11 +681,13 @@ pub enum IdentityVerification {
     /// `input.agent.identity_issuer_did`.
     VpUnanchored,
     /// The DID is bound to the source credential this gateway authenticated on
-    /// this request (`from_jwt_claim`).
+    /// this request: `from_jwt_claim`, or an API Key Provider key on an inbound
+    /// `from_api_key` slot.
     SourceAuth,
     /// Nothing in this request proves the DID: `x-identity` payload
-    /// pseudonyms and identities configured on the surface (`static`,
-    /// `from_mtls`, `from_api_key`).
+    /// pseudonyms, identities configured on the surface (`static`,
+    /// `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an
+    /// inbound `from_api_key` slot, shared by every holder of the secret.
     Unverified,
 }
 
@@ -1815,6 +1858,168 @@ allow if {
         let agent = input.agent.as_ref().unwrap();
         assert_eq!(agent.did.as_deref(), Some("did:webvh:from-payload"));
         assert!(!agent.did_verified, "a differing payload DID must never inherit the extension's verification");
+    }
+
+    fn caller_trust_check_entity(
+        input: &PolicyInput
+    ) -> Result<String, crate::trust_registry_verification::template::TemplateError> {
+        crate::trust_registry_verification::template::resolve(
+            crate::trust_registry_verification::predefined_queries::AGENT_POLICY_AGENT_TEMPLATE,
+            &serde_json::json!({ "input": serde_json::to_value(input).unwrap() }),
+        )
+    }
+
+    #[test]
+    fn bind_caller_did_replaces_a_payload_asserted_did() {
+        let mut input = make_input();
+        let mut agent = agent_with_body_assertions("did:web:asserted.example");
+        input.extension_identity = Some(ExtensionIdentityContext {
+            did: Some("did:webvh:key".into()),
+            identity_hash: Some("hash-key".into()),
+            verification: IdentityVerification::SourceAuth,
+        });
+
+        agent.bind_caller_did(
+            input
+                .extension_identity
+                .as_ref(),
+        );
+        input.agent = Some(agent);
+        input.normalize_caller_did();
+
+        let agent = input.agent.as_ref().unwrap();
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
+        assert!(agent.did_verified);
+        assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
+        assert_eq!(caller_trust_check_entity(&input).unwrap(), "did:webvh:key");
+        assert_body_assertions_dropped(agent);
+    }
+
+    fn agent_with_body_assertions(did: &str) -> AgentContext {
+        let mut agent = agent_with_did(did);
+        agent.trust_verification = Some(true);
+        agent.source_trust_verification = Some(true);
+        agent.target_trust_verification = Some(true);
+        agent.trust_registry_did = Some("did:web:registry.example".into());
+        agent.provider_did = Some("did:web:provider.example".into());
+        agent.authority_did = Some("did:web:authority.example".into());
+        agent.identity_issuer_did = Some("did:web:issuer.example".into());
+        agent.agent_dna = Some(crate::identity::uai::types::AgentDna {
+            uai: "uai:asserted".into(),
+            ..Default::default()
+        });
+        agent
+    }
+
+    fn assert_body_assertions_dropped(agent: &AgentContext) {
+        assert_eq!(agent.trust_verification, None);
+        assert_eq!(agent.source_trust_verification, None);
+        assert_eq!(agent.target_trust_verification, None);
+        assert_eq!(agent.trust_registry_did, None);
+        assert_eq!(agent.provider_did, None);
+        assert_eq!(agent.authority_did, None);
+        assert_eq!(agent.identity_issuer_did, None);
+        assert!(agent.agent_dna.is_none());
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_about_another_did() {
+        let mut agent = agent_with_body_assertions("did:web:asserted.example");
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_without_naming_a_did() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_when_no_did_is_named_or_resolved() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(None);
+
+        assert_eq!(agent.did, None);
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, None);
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_keeps_what_the_body_asserted_about_the_same_did() {
+        let mut agent = agent_with_body_assertions("did:webvh:caller");
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, Some(IdentityVerification::Unverified));
+        assert_eq!(agent.trust_verification, Some(true));
+        assert_eq!(agent.source_trust_verification, Some(true));
+        assert_eq!(agent.target_trust_verification, Some(true));
+        assert_eq!(
+            agent
+                .trust_registry_did
+                .as_deref(),
+            Some("did:web:registry.example")
+        );
+        assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
+        assert_eq!(agent.authority_did.as_deref(), Some("did:web:authority.example"));
+        assert_eq!(
+            agent
+                .identity_issuer_did
+                .as_deref(),
+            Some("did:web:issuer.example")
+        );
+        assert_eq!(
+            agent
+                .agent_dna
+                .as_ref()
+                .map(|dna| dna.uai.as_str()),
+            Some("uai:asserted")
+        );
+    }
+
+    #[test]
+    fn bind_caller_did_clears_the_did_when_no_caller_was_resolved() {
+        let mut input = make_input();
+        let mut agent = agent_with_did("did:web:asserted.example");
+        agent.did_verified = true;
+        agent.did_verification = Some(IdentityVerification::Vp);
+        agent.trust_verification = Some(true);
+
+        agent.bind_caller_did(None);
+        input.agent = Some(agent);
+        input.normalize_caller_did();
+
+        let agent = input.agent.as_ref().unwrap();
+        assert_eq!(agent.did, None);
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, None);
+        assert_eq!(agent.trust_verification, None);
+        assert!(caller_trust_check_entity(&input).is_err());
+    }
+
+    #[test]
+    fn caller_trust_check_entity_is_the_payload_did_without_binding() {
+        let mut input = make_input();
+        input.extension_identity = Some(extension_identity(true));
+        input.agent = Some(agent_with_did("did:web:asserted.example"));
+
+        input.normalize_caller_did();
+
+        assert_eq!(caller_trust_check_entity(&input).unwrap(), "did:web:asserted.example");
     }
 
     fn identity_policy_input_json(verified: bool) -> serde_json::Value {

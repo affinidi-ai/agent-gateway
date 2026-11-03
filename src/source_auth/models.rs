@@ -537,11 +537,12 @@ pub enum ManagedIdentityConfig {
     #[serde(alias = "from_payload")]
     PayloadExtraction(PayloadExtractionConfig),
 
-    /// Use an API key (presented by the caller or bound to the surface)
-    /// to look up the upstream agent identity.
+    /// Derive the agent identity from a stored API key.
     FromApiKey {
-        /// API key identifier (matches a stored key in the secret store).
-        api_key_id: String,
+        /// Stored key identifier: a secret id or an `atgk_` provider key id.
+        /// The stored-credential resolver refuses `FromApiKey` without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_id: Option<String>,
     },
 
     /// Take the upstream agent identity from the TLS client certificate.
@@ -687,7 +688,7 @@ mod tests {
                 certificate_id: "cert-1".to_string(),
             },
             ManagedIdentityConfig::FromApiKey {
-                api_key_id: "key-1".to_string(),
+                api_key_id: Some("key-1".to_string()),
             },
         ] {
             assert_eq!(configured.caller_verification(), IdentityVerification::Unverified, "{configured:?}");
@@ -1093,12 +1094,33 @@ mod tests {
     #[test]
     fn managed_identity_from_api_key_roundtrip() {
         let config = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "key-1".to_string(),
+            api_key_id: Some("key-1".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"type\":\"from_api_key\""));
         let back: ManagedIdentityConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn managed_identity_from_api_key_with_id_keeps_id_on_the_wire() {
+        let wire = serde_json::json!({ "type": "from_api_key", "api_key_id": "x" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            config,
+            ManagedIdentityConfig::FromApiKey {
+                api_key_id: Some("x".to_string())
+            }
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
+    }
+
+    #[test]
+    fn managed_identity_from_api_key_without_id_omits_it_on_the_wire() {
+        let wire = serde_json::json!({ "type": "from_api_key" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(config, ManagedIdentityConfig::FromApiKey { api_key_id: None });
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
     }
 
     #[test]

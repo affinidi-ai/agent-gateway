@@ -456,11 +456,12 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
         .agent_surface_store
         .as_ref()
     {
-        for surface in store
+        for mut surface in store
             .list_all()
             .await
             .map_err(internal)?
         {
+            super::surfaces::drop_inbound_api_key_ids(&mut surface);
             let source = endpoint(ResourceKind::Surfaces, &surface.surface_id, surface.tenant_id.clone(), true);
             for reference in collect_surface_reference_keys(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
@@ -942,6 +943,7 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            super::surfaces::drop_inbound_api_key_ids(&mut resource);
             if resource.tenant_id != tenant_id {
                 resource.tenant_id = tenant_id;
                 super::surface_tenancy::validate_surface_references(state, &resource, Some(&resource), None, None)

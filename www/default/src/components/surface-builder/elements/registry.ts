@@ -15,6 +15,7 @@ import {
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
 } from './edges/archetypes';
+import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
@@ -166,8 +167,8 @@ class ElementRegistry {
    * node with an invalid URL is reported the same as a missing one so the
    * canvas mirrors the sidebar's fault state.
    */
-  isConfigured(type: SurfaceNodeType | string, config: any): boolean {
-    if (this.getIncompleteReason(type, config) !== null) return false;
+  isConfigured(type: SurfaceNodeType | string, config: any, node?: DependencyNode): boolean {
+    if (this.getIncompleteReason(type, config, node) !== null) return false;
     return this.getValidationErrors(type, config).length === 0;
   }
 
@@ -176,10 +177,14 @@ class ElementRegistry {
    * is fully configured. Delegates to the element's `incompleteReason` (a
    * mandatory contract member); returns null for unknown types.
    */
-  getIncompleteReason(type: SurfaceNodeType | string, config: any): string | null {
+  getIncompleteReason(
+    type: SurfaceNodeType | string,
+    config: any,
+    node?: DependencyNode
+  ): string | null {
     const def = this.get(type);
     if (!def) return null;
-    return def.incompleteReason(config ?? {});
+    return def.incompleteReason(config ?? {}, node);
   }
 
   /**
@@ -207,8 +212,12 @@ class ElementRegistry {
    * fields) and falls back to the first validation error so a malformed
    * URL surfaces on the canvas the same way the sidebar shows it.
    */
-  getFaultReason(type: SurfaceNodeType | string, config: any): string | null {
-    const incomplete = this.getIncompleteReason(type, config);
+  getFaultReason(
+    type: SurfaceNodeType | string,
+    config: any,
+    node?: DependencyNode
+  ): string | null {
+    const incomplete = this.getIncompleteReason(type, config, node);
     if (incomplete) return incomplete;
     const errs = this.getValidationErrors(type, config);
     return errs.length > 0 ? errs[0].message : null;
@@ -434,7 +443,7 @@ class ElementRegistry {
         id,
         type: def.type as SurfaceNodeType,
         label: '',
-        configured: this.isConfigured(def.type, panelConfig),
+        configured: this.isConfigured(def.type, panelConfig, { id, parentId }),
         config: panelConfig,
         parentId,
         ...(direction === 'response' ? { direction: 'response' as const } : {}),
@@ -565,7 +574,7 @@ class ElementRegistry {
           id,
           type: elementType,
           label: '',
-          configured: this.isConfigured(elementType, panelConfig),
+          configured: this.isConfigured(elementType, panelConfig, { id, slotId: slot.id }),
           config: panelConfig,
           parentId,
           slotId: slot.id,
@@ -1103,7 +1112,10 @@ class ElementRegistry {
             id: bn.id,
             type: bn.type as SurfaceNodeType,
             label: bn.label || bn.id,
-            configured: this.isConfigured(bn.type as SurfaceNodeType, blobCfg),
+            configured: this.isConfigured(bn.type as SurfaceNodeType, blobCfg, {
+              id: bn.id,
+              slotId: bn.slotId,
+            }),
             config: blobCfg,
             parentId: bn.parentId ?? undefined,
             ...(bn.slotId ? { slotId: bn.slotId } : {}),
@@ -1142,7 +1154,7 @@ class ElementRegistry {
           // pulled from the blob can flip validity (e.g. an element
           // whose `incompleteReason` looks at a field that isn't part
           // of the persisted payload slice).
-          target.configured = this.isConfigured(target.type, target.config);
+          target.configured = this.isConfigured(target.type, target.config, target);
         }
         const overlay = readLayoutOverlay(bn);
         if (overlay.position) target.position = overlay.position;
@@ -1312,6 +1324,19 @@ export function buildCanvasBlob(
         Object.prototype.hasOwnProperty.call(configToPersist, 'trust_check_list')
       ) {
         const { trust_check_list: _stripped, ...rest } = configToPersist as Record<string, unknown>;
+        void _stripped;
+        configToPersist = rest;
+      }
+      // The inbound Identity names no stored key: each caller is identified
+      // by the key it presents, so an `api_key_id` loaded from an older save
+      // is not carried forward.
+      if (
+        configToPersist &&
+        n.type === 'identity' &&
+        isInboundIdentity(n) &&
+        Object.prototype.hasOwnProperty.call(configToPersist, 'api_key_id')
+      ) {
+        const { api_key_id: _stripped, ...rest } = configToPersist as Record<string, unknown>;
         void _stripped;
         configToPersist = rest;
       }

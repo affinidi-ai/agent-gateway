@@ -6,6 +6,7 @@ mod access_point_closed_e2e;
 mod access_tokens_pat;
 mod agent_card_preview;
 mod agent_pay_gate_e2e;
+mod api_key_identity_e2e;
 mod channel_e2e;
 mod connection_point_integration_events_e2e;
 mod custom_metadata_tenancy_e2e;
