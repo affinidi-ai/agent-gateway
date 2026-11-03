@@ -80,8 +80,9 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
           Accept more than one kind of credential, for example a JWT for internal users and an API
           key for partner agents. The gateway verifies each request with the method whose credential
           it carries. The primary method checks a request that carries none, and a request carrying
-          credentials for several methods is refused. Each method must read its own header. Policy
-          sees which method verified the caller as <code>input.source_auth.method</code>.
+          credentials for several methods fails source authentication. Each method must read its own
+          header. Policy sees which method verified the caller as{' '}
+          <code>input.source_auth.method</code>.
         </p>
         <CallerAuthMethodList
           config={config}

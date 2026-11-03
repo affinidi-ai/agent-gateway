@@ -1,4 +1,9 @@
 import type { CallerAuthMethodType } from './methodOptions';
+import { readProtectedResource } from './protectedResource';
+
+/** The gateway's refusal of a JWT Bearer method after the first beside discovery. */
+export const LATER_JWT_BEARER_BESIDE_DISCOVERY =
+  'Authorization server discovery allows JWT Bearer only as the first caller authentication method: the discovery audience and challenge belong to that method';
 
 /**
  * One caller authentication method in the caller-auth element's flat panel
@@ -19,9 +24,11 @@ export interface CallerAuthMethodConfig {
 }
 
 /**
- * The caller-auth element's config: its methods, in the order the gateway
- * breaks ties between presented credentials, and the authorization server
- * discovery setting, which belongs to the first method. An older canvas
+ * The caller-auth element's config: its methods, the first being the primary
+ * method, which checks a request carrying no credential, and the
+ * authorization server discovery setting, which belongs to the primary. A
+ * request carrying credentials for several methods fails source
+ * authentication. An older canvas
  * stored the first method's fields on the element itself and the rest as
  * `additional_methods`; {@link readMethods} still reads that shape.
  */
@@ -40,6 +47,14 @@ export function readMethods(config: CallerAuthConfig | undefined): CallerAuthMet
     ...first
   } = config;
   return [first, ...(Array.isArray(additional_methods) ? additional_methods : [])];
+}
+
+/** Whether authorization server discovery is on, which needs a JWT Bearer first method. */
+export function discoveryIsOn(config: CallerAuthConfig | undefined): boolean {
+  return (
+    readMethods(config)[0]?.method_type === 'jwt_bearer' &&
+    readProtectedResource(config?.protected_resource) !== null
+  );
 }
 
 /** The first method with the discovery setting, as the discovery rules read it. */
@@ -124,8 +139,15 @@ const readsRequestBody = (method: CallerAuthMethodConfig) =>
  * the gateway selects a method by the credential a request carries, so each
  * method reads its own location and only a sole method reads the body.
  */
-export function methodConflict(methods: CallerAuthMethodConfig[], position: number): string | null {
+export function methodConflict(
+  methods: CallerAuthMethodConfig[],
+  position: number,
+  discoveryOn = false
+): string | null {
   const method = methods[position];
+  if (discoveryOn && position > 0 && method.method_type === 'jwt_bearer') {
+    return LATER_JWT_BEARER_BESIDE_DISCOVERY;
+  }
   const location = credentialLocation(method);
   if (methods.length > 1 && readsRequestBody(method)) {
     return `Method ${position + 1} reads ${location}; with more than one method, each must read a header or the client certificate`;
@@ -146,14 +168,21 @@ export function methodConflict(methods: CallerAuthMethodConfig[], position: numb
 }
 
 /** The first problem of the method at `position`: incomplete, or in conflict. */
-export function methodProblem(methods: CallerAuthMethodConfig[], position: number): string | null {
-  return methodIncompleteReason(methods[position]) ?? methodConflict(methods, position);
+export function methodProblem(
+  methods: CallerAuthMethodConfig[],
+  position: number,
+  discoveryOn = false
+): string | null {
+  return (
+    methodIncompleteReason(methods[position]) ?? methodConflict(methods, position, discoveryOn)
+  );
 }
 
 export function methodSelectionProblems(config: CallerAuthConfig | undefined) {
   const methods = readMethods(config);
+  const discoveryOn = discoveryIsOn(config);
   return methods
-    .map((_, position) => methodConflict(methods, position))
+    .map((_, position) => methodConflict(methods, position, discoveryOn))
     .filter((message): message is string => message !== null)
     .map(message => ({ field: 'methods', message }));
 }

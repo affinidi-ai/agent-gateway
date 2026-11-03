@@ -6,10 +6,10 @@ import {
   type CallerAuthMethodConfig,
   credentialLocation,
   defaultMethodConfig,
+  discoveryIsOn,
   methodProblem,
   readMethods,
 } from './methods';
-import { readProtectedResource } from './protectedResource';
 
 interface CallerAuthMethodListProps {
   config: CallerAuthConfig;
@@ -27,9 +27,10 @@ interface CallerAuthMethodListProps {
 /**
  * The caller-auth element's methods, one row each: whether the method is
  * ready, what it reads, and a Configure button. The first is the primary
- * method, which checks a request carrying no credential, or credentials for
- * several methods, and is the only one that can publish authorization server
- * discovery; while discovery is on, the primary stays primary.
+ * method, which checks a request carrying no credential, and is the only one
+ * that can publish authorization server discovery; while discovery is on, the
+ * primary stays primary. A request carrying credentials for several methods
+ * fails source authentication without any method being verified.
  */
 const CallerAuthMethodList: React.FC<CallerAuthMethodListProps> = ({
   config,
@@ -41,9 +42,7 @@ const CallerAuthMethodList: React.FC<CallerAuthMethodListProps> = ({
 }) => {
   const [adding, setAdding] = useState(false);
   const methods = readMethods(config);
-  const discoveryOn =
-    methods[0]?.method_type === 'jwt_bearer' &&
-    readProtectedResource(config.protected_resource) !== null;
+  const discoveryOn = discoveryIsOn(config);
   const setMethods = (next: CallerAuthMethodConfig[], extra: Record<string, unknown> = {}) =>
     updateFields({ methods: next, ...extra });
   const makePrimary = (position: number) => {
@@ -68,7 +67,7 @@ const CallerAuthMethodList: React.FC<CallerAuthMethodListProps> = ({
     <div data-testid={`${area}-methods`}>
       <ul className="list-group mb-2">
         {methods.map((method, position) => {
-          const problem = methodProblem(methods, position);
+          const problem = methodProblem(methods, position, discoveryOn);
           const type: CallerAuthMethodType = method.method_type || 'jwt_bearer';
           const rowId = `${area}-method-${position}`;
           return (
@@ -94,7 +93,7 @@ const CallerAuthMethodList: React.FC<CallerAuthMethodListProps> = ({
                   {position === 0 && methods.length > 1 && (
                     <span
                       className="badge bg-primary ms-2"
-                      title="Checks requests that carry no credential, or credentials for several methods"
+                      title="Checks requests that carry no credential. A request carrying credentials for several methods fails source authentication."
                     >
                       Primary
                     </span>

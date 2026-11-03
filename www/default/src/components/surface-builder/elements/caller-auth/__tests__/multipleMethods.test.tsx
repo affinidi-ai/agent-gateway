@@ -7,7 +7,11 @@ import { registry } from '../../index';
 import type { CanvasNode, ConfigPanelProps, PayloadContext } from '../../types';
 import CallerAuthFullscreen from '../CallerAuthFullscreen';
 import CallerAuthPanel from '../CallerAuthPanel';
-import { methodSelectionProblems, readMethods } from '../methods';
+import {
+  LATER_JWT_BEARER_BESIDE_DISCOVERY,
+  methodSelectionProblems,
+  readMethods,
+} from '../methods';
 import { selectMethod } from '../selectedMethod';
 import { identityDefinition } from '../../identity/definition';
 
@@ -325,6 +329,37 @@ describe('Caller Context editor: the method list', () => {
 
     expect(screen.getByTestId('caller-auth-editor-method-0')).toHaveTextContent('discovery');
     expect(screen.getByTestId('caller-auth-editor-method-1-make-primary-button')).toBeDisabled();
+  });
+
+  describe('a later JWT Bearer method beside discovery', () => {
+    const SECOND_JWT = { ...JWT_METHOD, jwt_token_header: 'X-Internal-Token' };
+    const DISCOVERY = {
+      resource: 'https://gateway.example/mcp/alpha',
+      authorization_servers: ['https://idp.example/realms/agents'],
+    };
+
+    it('is flagged with the gateway refusal while discovery is on', () => {
+      const config = { methods: [JWT_METHOD, SECOND_JWT], protected_resource: DISCOVERY };
+      render(<Harness initial={config} latest={{}} />);
+
+      expect(screen.getByTestId('caller-auth-editor-method-1')).toHaveTextContent(
+        LATER_JWT_BEARER_BESIDE_DISCOVERY
+      );
+      expect(methodSelectionProblems(config)).toEqual([
+        { field: 'methods', message: LATER_JWT_BEARER_BESIDE_DISCOVERY },
+      ]);
+    });
+
+    it('is ready while discovery is off', () => {
+      const config = { methods: [JWT_METHOD, SECOND_JWT], protected_resource: null };
+      render(<Harness initial={config} latest={{}} />);
+
+      expect(screen.getByTestId('caller-auth-editor-method-1-status')).toHaveAttribute(
+        'aria-label',
+        'Ready'
+      );
+      expect(methodSelectionProblems(config)).toEqual([]);
+    });
   });
 
   it('flags a method that reads the same header as an earlier one', () => {

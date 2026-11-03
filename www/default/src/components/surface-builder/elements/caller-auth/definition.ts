@@ -32,8 +32,9 @@ const isOnFailure = (v: unknown): v is 'reject' | 'continue' => v === 'reject' |
  *
  * Writes `access_point.caller_authentication.methods` from the element's
  * `methods`, in order, and `protected_resource` with the first method. The
- * gateway verifies each request with the first method whose credential it
- * carries, so each method reads its own credential location.
+ * gateway verifies each request with the method whose credential it carries,
+ * so each method reads its own credential location, and a request carrying
+ * credentials for several methods fails source authentication.
  */
 export const callerAuthDefinition: NodeDefinition = {
   type: 'caller-auth',
@@ -71,7 +72,7 @@ export const callerAuthDefinition: NodeDefinition = {
       <p>With several methods, each caller uses the one its credential
       belongs to. The first, primary, method checks a request that carries
       no credential, and a request carrying credentials for more than one
-      method is refused; a rejected credential is never retried with another
+      method fails source authentication; a rejected credential is never retried with another
       method. Each method must read its own header (or the client
       certificate). Policy sees which method verified the caller as
       <code>input.source_auth.method</code>.</p>

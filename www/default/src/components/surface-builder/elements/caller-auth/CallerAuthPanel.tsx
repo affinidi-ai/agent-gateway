@@ -70,8 +70,8 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
         />
         <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '10px' }}>
           Each caller is verified by the method its credential belongs to; a caller presenting
-          credentials for more than one is refused. Default: JWT Bearer, the standard choice unless
-          you specifically need an API key or client certificate.
+          credentials for more than one fails source authentication. Default: JWT Bearer, the
+          standard choice unless you specifically need an API key or client certificate.
         </Form.Text>
         {showsDiscovery && (
           <Form.Text
