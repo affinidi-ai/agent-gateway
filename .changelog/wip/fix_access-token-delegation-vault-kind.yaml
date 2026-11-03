@@ -11,7 +11,8 @@ changes:
         backend accepts it. The dashboard kept its own list of resource kinds, which did not
         include the delegation vault, so a token that confines the connect API and grants to a
         tenant's surfaces (`delegation-vault:<surface id>`) could not be made from the form. The
-        list now matches the backend's, and a test keeps every kind the backend names accepted.
+        list now matches the backend's, and a backend test fails while a resource kind is missing
+        from it.
   removed: []
   security: []
   breaking: []

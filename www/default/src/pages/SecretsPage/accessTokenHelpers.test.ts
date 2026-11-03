@@ -1,4 +1,5 @@
 import {
+  ACCESS_TOKEN_RESOURCE_KINDS,
   accessTokenExpiryBounds,
   canonicalResourceTarget,
   evaluateScopePreview,
@@ -63,29 +64,9 @@ describe('access-token tenant scope helpers', () => {
   });
 
   it('accepts every resource kind the backend names, the delegation vault included', () => {
-    const kinds = [
-      'secrets',
-      'certificates',
-      'api-keys',
-      'surfaces',
-      'gateways',
-      'connection-points',
-      'mediators',
-      'mcp-proxies',
-      'a2a-proxies',
-      'trust-registries',
-      'issuers',
-      'authorities',
-      'integrations',
-      'policy-definitions',
-      'surface-templates',
-      'credential-providers',
-      'jwt-verification-strategies',
-      'sts-clients',
-      'delegation-vault',
-    ];
+    expect(ACCESS_TOKEN_RESOURCE_KINDS).toContain('delegation-vault');
     const tenant = 'TENANT:${x-external-account}:';
-    for (const kind of kinds) {
+    for (const kind of ACCESS_TOKEN_RESOURCE_KINDS) {
       expect(validateScopeConfig(`${tenant}(?:secrets:demo-.*|${kind}:.*)`, [header])).toEqual([]);
     }
     expect(

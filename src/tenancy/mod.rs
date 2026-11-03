@@ -72,6 +72,8 @@ pub fn header_derived_tenant_permitted(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename_all = "kebab-case"))]
 pub enum ResourceKind {
     Secrets,
     Certificates,
@@ -378,5 +380,53 @@ mod tests {
 
         // Broad selector: permitted only behind a covering, asserted trusted edge.
         assert!(header_derived_tenant_permitted(&broad, Some(&covering_edge)));
+    }
+
+    /// Every `ResourceKind` name, taken from the enum itself so a new variant is included.
+    fn resource_kind_names() -> Vec<String> {
+        <ResourceKind as ts_rs::TS>::inline()
+            .split(" | ")
+            .map(|name| {
+                name.trim_matches('"')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The names of `ResourceKind` that the dashboard list `listed` leaves out.
+    fn kinds_missing_from(listed: &str) -> Vec<String> {
+        resource_kind_names()
+            .into_iter()
+            .filter(|name| !listed.contains(&format!("'{name}'")))
+            .collect()
+    }
+
+    #[test]
+    fn every_resource_kind_name_is_its_canonical_path_family() {
+        let names = resource_kind_names();
+        assert!(names.contains(&"delegation-vault".to_string()), "{names:?}");
+        for name in &names {
+            assert_eq!(ResourceKind::from_path_family(name).map(ResourceKind::as_str), Some(name.as_str()));
+        }
+    }
+
+    #[test]
+    fn the_access_token_form_lists_every_resource_kind() {
+        let helpers = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/www/default/src/pages/SecretsPage/accessTokenHelpers.ts"
+        ))
+        .expect("the dashboard's access token helpers are readable");
+        let listed = helpers
+            .split_once("ACCESS_TOKEN_RESOURCE_KINDS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("accessTokenHelpers.ts declares ACCESS_TOKEN_RESOURCE_KINDS");
+
+        assert_eq!(kinds_missing_from(listed), Vec::<String>::new());
+        assert_eq!(
+            kinds_missing_from(&listed.replace("'delegation-vault',", "")),
+            vec!["delegation-vault".to_string()]
+        );
     }
 }
