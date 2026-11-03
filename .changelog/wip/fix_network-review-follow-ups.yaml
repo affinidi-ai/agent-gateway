@@ -13,4 +13,12 @@ changes:
         as True-Client-IP, CF-Connecting-IP, X-Client-IP and X-Original-Host, so a target that
         trusts the gateway as its proxy could still take the caller's claim. It now drops those
         too, in any case and with underscores for dashes, and the docs list every header dropped.
+    - timestamp: '2026-11-03T20:35:00Z'
+      title: Bound and escape the caller's path on the log lines of a matched route
+      description: >-
+        A request to a served route, before any caller authentication, logged its whole path at
+        INFO when the route matched, and again on the route matching and rewriting lines and when
+        the surface's handler took it, so a long or crafted path could flood the log or show a
+        capability id in full. Those lines now carry the path, its tail and its alias escaped,
+        cut to 256 characters and with capability ids shortened, like the unknown path line.
   breaking: []
