@@ -1235,18 +1235,22 @@ impl ReferenceAuthorizer<'_> {
     ) -> Result<(), SurfaceApiError> {
         let tenant_id = self
             .api_key_parent_tenant(id)
-            .await?;
+            .await?
+            .ok_or_else(|| inaccessible("API-key parent Surface"))?;
         self.ensure(tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
     }
 
+    /// The tenant of the surface `id` owning API keys, or `None` when that surface no longer
+    /// exists.
     async fn api_key_parent_tenant(
         &self,
         id: &str,
-    ) -> Result<Option<String>, SurfaceApiError> {
+    ) -> Result<Option<Option<String>>, SurfaceApiError> {
         if id == self.current_surface_id {
-            return Ok(self
-                .owner_tenant_id
-                .map(str::to_string));
+            return Ok(Some(
+                self.owner_tenant_id
+                    .map(str::to_string),
+            ));
         }
         let store = self
             .state
@@ -1257,13 +1261,13 @@ impl ReferenceAuthorizer<'_> {
             .get(id)
             .await
             .map_err(|error| internal("API-key parent Surface", error))?
-            .ok_or_else(|| inaccessible("API-key parent Surface"))?
-            .tenant_id)
+            .map(|surface| surface.tenant_id))
     }
 
-    /// A provider key a surface derives a DID from must exist, unless the stored surface already
-    /// named it, and its owning surface must be one this surface may reference. A tenant surface
-    /// names a key of a surface with no tenant only as it sends an appliance-wide secret upstream.
+    /// A provider key a surface derives a DID from must exist and have an owning surface, unless
+    /// the stored surface already named it, and that owning surface must be one this surface may
+    /// reference. A tenant surface names a key of a surface with no tenant only as it sends an
+    /// appliance-wide secret upstream. The token's API key pattern must match every key id.
     async fn provider_keys(
         &self,
         keys: &[String],
@@ -1273,17 +1277,26 @@ impl ReferenceAuthorizer<'_> {
         }
         let owners = provider_key_owners(self.state).await?;
         for key_id in keys {
+            let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, key_id);
+            if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
+                return Err(inaccessible("API-key parent Surface"));
+            }
             let Some(surface_ids) = owners.get(key_id) else {
-                if is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, key_id) {
+                if kept {
                     continue;
                 }
                 return Err(inaccessible("API key"));
             };
             for surface_id in surface_ids {
-                let tenant_id = self
+                let Some(tenant_id) = self
                     .api_key_parent_tenant(surface_id)
-                    .await?;
-                self.ensure(tenant_id.as_deref(), ResourceKind::ApiKeys, key_id, "API-key parent Surface")?;
+                    .await?
+                else {
+                    if kept {
+                        continue;
+                    }
+                    return Err(inaccessible("API-key parent Surface"));
+                };
                 if !can_reference_with_rule(
                     self.owner_tenant_id,
                     tenant_id.as_deref(),
@@ -2001,9 +2014,15 @@ mod tests {
             shared: Default::default(),
         });
 
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "variant-id", "alias": "variant", "name": "Variant",
+            "overrides": {"identity_slots": {"protected": {"type": "from_api_key", "api_key_id": "atgk_variant"}}}
+        }]))
+        .unwrap();
+
         let keys = collect_provider_key_references(&surface).unwrap();
 
-        assert_eq!(keys, ["atgk_injected", "atgk_point", "atgk_shared"]);
+        assert_eq!(keys, ["atgk_injected", "atgk_point", "atgk_shared", "atgk_variant"]);
         assert!(
             collect_provider_key_references(&AgentSurface::default())
                 .unwrap()

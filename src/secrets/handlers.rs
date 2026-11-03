@@ -523,7 +523,9 @@ mod tests {
             &self,
             _request: CreateSecretRequest,
         ) -> Result<Secret> {
-            unreachable!()
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.secret.clone())
         }
         async fn get(
             &self,
@@ -855,21 +857,35 @@ mod tests {
 
     #[tokio::test]
     async fn a_secret_id_with_the_api_key_id_prefix_is_refused_on_create() {
-        let (status, body) = create_with_id(recording_store(None), "atgk_0123456789abcdef").await;
+        let recording = recording_store(None);
+        let (status, body) = create_with_id(recording.clone(), "atgk_0123456789abcdef").await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["message"],
             "secret_id cannot start with atgk_, which is reserved for API key ids"
         );
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
     async fn a_secret_id_without_the_api_key_id_prefix_is_created() {
-        let (status, body) = create_with_id(store(), "billing_api_key").await;
+        let recording = recording_store(None);
+        let (status, body) = create_with_id(recording.clone(), "billing_api_key").await;
 
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["secret_id"], "billing_api_key");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]

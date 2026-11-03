@@ -513,15 +513,8 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 .unwrap_or_default();
             for owner in owners {
                 references.extend(
-                    ownership_reference(
-                        state,
-                        source.clone(),
-                        ResourceKind::ApiKeys,
-                        &owner,
-                        "surface identity",
-                        false,
-                    )
-                    .await?,
+                    ownership_reference(state, source.clone(), ResourceKind::ApiKeys, &owner, "surface identity", true)
+                        .await?,
                 );
             }
         }

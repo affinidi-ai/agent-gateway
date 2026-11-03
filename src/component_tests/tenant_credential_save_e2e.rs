@@ -20,6 +20,7 @@ const STORED_METADATA_SURFACE: &str = "stored-metadata-surface";
 const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface";
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
 const STORED_DISABLED_METADATA_SURFACE: &str = "stored-disabled-metadata-surface";
+const STORED_CREDENTIAL_LOOKUP_SURFACE: &str = "stored-credential-lookup-surface";
 const STORED_KEY_OWNER_SURFACE: &str = "stored-key-owner-surface";
 const STORED_APPLIANCE_KEY_SURFACE: &str = "stored-appliance-key-surface";
 const STORED_APPLIANCE_KEY: &str = "atgk_00000000000000000000000000000a11";
@@ -394,6 +395,16 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
                 .agent_surfaces,
             STORED_TENANT_PROVIDER_SURFACE,
             surface(STORED_TENANT_PROVIDER_SURFACE, json!({"outbound_credentials": binding(STORED_TENANT_PROVIDER)})),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_CREDENTIAL_LOOKUP_SURFACE,
+            surface(
+                STORED_CREDENTIAL_LOOKUP_SURFACE,
+                json!({"tenant_id": null, "target": {"endpoint": "http://127.0.0.1:9/", "auth": {"method": "credential_lookup"}}}),
+            ),
         ),
         (
             &bootstrap
@@ -1510,6 +1521,60 @@ impl Api {
             .unwrap()
             .to_string()
     }
+
+    async fn assert_create_refused(
+        &self,
+        surface: &Value,
+        details: &str,
+    ) {
+        assert_refused(self.create(surface).await, details);
+        let (status, body) = self
+            .send(
+                self.client
+                    .get(self.url("surfaces")),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let route = &surface["access_point"]["route"];
+        assert!(
+            !body
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stored| &stored["access_point"]["route"] == route),
+            "a refused create stores nothing: {route}"
+        );
+    }
+
+    async fn assert_put_refused(
+        &self,
+        surface_id: &str,
+        surface: &Value,
+        details: &str,
+    ) {
+        let before = self.stored(surface_id).await;
+        assert_refused(
+            self.put(surface_id, surface)
+                .await,
+            details,
+        );
+        assert_eq!(self.stored(surface_id).await, before, "a refused save stores nothing");
+    }
+
+    async fn assert_patch_refused(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+        details: &str,
+    ) {
+        let before = self.stored(surface_id).await;
+        assert_refused(
+            self.patch(surface_id, patch)
+                .await,
+            details,
+        );
+        assert_eq!(self.stored(surface_id).await, before, "a refused patch stores nothing");
+    }
 }
 
 fn from_api_key(key_id: &str) -> Value {
@@ -1553,39 +1618,39 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
     };
 
     for slot in ["protected", "external"] {
-        assert_refused(
-            api.create(&with_slot(&format!("/smoke/{slot}-cross"), Some("tenant-a"), slot, &keys.tenant_b))
-                .await,
+        api.assert_create_refused(
+            &with_slot(&format!("/smoke/{slot}-cross"), Some("tenant-a"), slot, &keys.tenant_b),
             NOT_ACCESSIBLE_KEY_OWNER,
-        );
-        assert_refused(
-            api.create(&with_slot(&format!("/smoke/{slot}-wide"), None, slot, &keys.tenant_a))
-                .await,
+        )
+        .await;
+        api.assert_create_refused(
+            &with_slot(&format!("/smoke/{slot}-wide"), None, slot, &keys.tenant_a),
             NOT_ACCESSIBLE_KEY_OWNER,
-        );
+        )
+        .await;
         assert_saved(
             api.create(&with_slot(&format!("/smoke/{slot}-own"), Some("tenant-a"), slot, &keys.tenant_a))
                 .await,
         );
-        assert_refused(
-            api.create(&with_slot(&format!("/smoke/{slot}-appliance"), Some("tenant-a"), slot, &keys.appliance))
-                .await,
+        api.assert_create_refused(
+            &with_slot(&format!("/smoke/{slot}-appliance"), Some("tenant-a"), slot, &keys.appliance),
             NOT_ACCESSIBLE_KEY_OWNER,
-        );
+        )
+        .await;
         assert_saved(
             api.create(&with_slot(&format!("/smoke/{slot}-appliance-wide"), None, slot, &keys.appliance))
                 .await,
         );
     }
-    assert_refused(
-        api.create(&api.surface(
+    api.assert_create_refused(
+        &api.surface(
             "/smoke/point-cross",
             Some("tenant-a"),
             json!({"transit": transit_point_identity(&keys.tenant_b)}),
-        ))
-        .await,
+        ),
         NOT_ACCESSIBLE_KEY_OWNER,
-    );
+    )
+    .await;
     assert_saved(
         api.create(&api.surface(
             "/smoke/point-own",
@@ -1594,31 +1659,27 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
         ))
         .await,
     );
-    assert_refused(
-        api.create(&with_slot(
-            "/smoke/missing-key",
-            Some("tenant-a"),
-            "protected",
-            "atgk_00000000000000000000000000000000",
-        ))
-        .await,
+    api.assert_create_refused(
+        &with_slot("/smoke/missing-key", Some("tenant-a"), "protected", "atgk_00000000000000000000000000000000"),
         "API key reference is not accessible",
-    );
+    )
+    .await;
 }
 
 async fn assert_a_new_appliance_key_on_a_tenant_surface_is_refused(api: &Api) {
     let protected = json!({"identity_slots": {"protected": from_api_key(STORED_APPLIANCE_KEY)}});
-    assert_refused(
-        api.create(&api.surface("/smoke/new-appliance-key", Some("tenant-a"), protected.clone()))
-            .await,
+    api.assert_create_refused(
+        &api.surface("/smoke/new-appliance-key", Some("tenant-a"), protected.clone()),
         NOT_ACCESSIBLE_KEY_OWNER,
-    );
+    )
+    .await;
     let plain = api
         .created_id(&api.surface("/smoke/plain-tenant-surface", Some("tenant-a"), json!({})))
         .await;
     let mut added = api.stored(&plain).await;
     added["identity_slots"] = protected["identity_slots"].clone();
-    assert_refused(api.put(&plain, &added).await, NOT_ACCESSIBLE_KEY_OWNER);
+    api.assert_put_refused(&plain, &added, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
     assert_saved(
         api.create(&api.surface("/smoke/new-appliance-key-wide", None, protected))
             .await,
@@ -1651,17 +1712,33 @@ async fn a_stored_appliance_key_on_a_tenant_surface_is_refused_when_enforced() {
         .stored(STORED_APPLIANCE_KEY_SURFACE)
         .await;
 
-    assert_refused(
-        api.put(STORED_APPLIANCE_KEY_SURFACE, &stored)
-            .await,
-        NOT_ACCESSIBLE_KEY_OWNER,
-    );
+    api.assert_put_refused(STORED_APPLIANCE_KEY_SURFACE, &stored, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
     assert_a_new_appliance_key_on_a_tenant_surface_is_refused(&api).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn giving_a_tenant_to_a_surface_naming_an_appliance_key_is_refused_when_enforced() {
-    let (_harness, api) = harness(RuleMode::Enforce).await;
+async fn giving_a_tenant_to_a_surface_whose_configuration_cannot_be_saved_is_refused() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+
+    let (status, body) = api
+        .reassign("surfaces", STORED_CREDENTIAL_LOOKUP_SURFACE, Some("tenant-a"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "Target authentication method credential_lookup is not supported; use static_secret or credential_provider"})
+    );
+    assert_eq!(
+        api.stored(STORED_CREDENTIAL_LOOKUP_SURFACE)
+            .await["tenant_id"],
+        Value::Null,
+        "a refused reassignment changes nothing"
+    );
+}
+
+async fn assert_giving_a_tenant_to_a_surface_naming_an_appliance_key_is_a_conflict(mode: RuleMode) {
+    let (_harness, api) = harness(mode).await;
     let surface = api
         .created_id(&api.surface(
             "/smoke/appliance-key-wide",
@@ -1674,8 +1751,53 @@ async fn giving_a_tenant_to_a_surface_naming_an_appliance_key_is_refused_when_en
         .reassign("surfaces", &surface, Some("tenant-a"))
         .await;
     assert_eq!(status, 409, "{body}");
-    assert_eq!(body, json!({"error": NOT_ACCESSIBLE_KEY_OWNER}));
-    assert_eq!(api.stored(&surface).await["tenant_id"], Value::Null, "a refused reassignment changes nothing");
+    assert_eq!(body["error"], "tenant_reassignment_blocked", "{body}");
+    assert_eq!(
+        body["conflicts"][0]["reason"], "The proposed tenant would give a tenant resource an appliance-wide credential",
+        "{body}"
+    );
+    assert_eq!(api.stored(&surface).await["tenant_id"], Value::Null, "a blocked reassignment changes nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_a_tenant_to_a_surface_naming_an_appliance_key_is_a_conflict_in_warn_mode() {
+    assert_giving_a_tenant_to_a_surface_naming_an_appliance_key_is_a_conflict(RuleMode::Warn).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_a_tenant_to_a_surface_naming_an_appliance_key_is_a_conflict_when_enforced() {
+    assert_giving_a_tenant_to_a_surface_naming_an_appliance_key_is_a_conflict(RuleMode::Enforce).await;
+}
+
+async fn assert_moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict(mode: RuleMode) {
+    let (_harness, api) = harness(mode).await;
+    let owner = api
+        .created_id(&api.surface("/smoke/named-key-owner", Some("tenant-a"), json!({})))
+        .await;
+    let key_id = api.api_key(&owner).await;
+    api.created_id(&api.surface(
+        "/smoke/named-key-user",
+        Some("tenant-a"),
+        json!({"identity_slots": {"protected": from_api_key(&key_id)}}),
+    ))
+    .await;
+
+    let (status, body) = api
+        .reassign("surfaces", &owner, None)
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "tenant_reassignment_blocked", "{body}");
+    assert_eq!(api.stored(&owner).await["tenant_id"], "tenant-a", "a blocked reassignment changes nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict_in_warn_mode() {
+    assert_moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict(RuleMode::Warn).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict_when_enforced() {
+    assert_moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict(RuleMode::Enforce).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1716,11 +1838,110 @@ async fn a_surface_keeps_a_provider_key_it_already_named_after_the_key_is_delete
 
     let mut added = api.stored(&other).await;
     added["identity_slots"] = protected["identity_slots"].clone();
-    assert_refused(api.put(&other, &added).await, "API key reference is not accessible");
-    assert_refused(
-        api.create(&api.surface("/smoke/deleted-key-new", Some("tenant-a"), protected))
-            .await,
+    api.assert_put_refused(&other, &added, "API key reference is not accessible")
+        .await;
+    api.assert_create_refused(
+        &api.surface("/smoke/deleted-key-new", Some("tenant-a"), protected),
         "API key reference is not accessible",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_keeps_a_provider_key_whose_owning_surface_is_deleted_but_cannot_add_one() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let owner = api
+        .created_id(&api.surface("/smoke/deleted-owner", Some("tenant-a"), json!({})))
+        .await;
+    let key_id = api.api_key(&owner).await;
+    let protected = json!({"identity_slots": {"protected": from_api_key(&key_id)}});
+    let naming = api
+        .created_id(&api.surface("/smoke/deleted-owner-user", Some("tenant-a"), protected.clone()))
+        .await;
+    let other = api
+        .created_id(&api.surface("/smoke/deleted-owner-other", Some("tenant-a"), json!({})))
+        .await;
+    let (status, body) = api
+        .send(
+            api.client
+                .delete(api.url(&format!("surfaces/{owner}"))),
+        )
+        .await;
+    assert!(matches!(status, 200 | 204), "{status} {body}");
+    let (status, body) = api
+        .send(
+            api.client
+                .get(api.url("api-keys")),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.to_string()
+            .contains(&key_id),
+        "the key outlives its surface: {body}"
+    );
+
+    let stored = api.stored(&naming).await;
+    assert_saved(
+        api.put(&naming, &stored)
+            .await,
+    );
+    assert_eq!(api.stored(&naming).await["identity_slots"]["protected"]["api_key_id"], json!(key_id));
+
+    let mut added = api.stored(&other).await;
+    added["identity_slots"] = protected["identity_slots"].clone();
+    api.assert_put_refused(&other, &added, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+    api.assert_create_refused(
+        &api.surface("/smoke/deleted-owner-new", Some("tenant-a"), protected),
+        NOT_ACCESSIBLE_KEY_OWNER,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_a_patch_or_a_target_identity_injection_cannot_name_another_tenants_key() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let keys = owned_keys(&api).await;
+
+    api.assert_create_refused(
+        &api.surface(
+            "/smoke/variant-cross",
+            Some("tenant-a"),
+            json!({"variants": [{
+                "id": "variant-id", "alias": "variant", "name": "Variant", "enabled": true,
+                "overrides": {"identity_slots": {"protected": from_api_key(&keys.tenant_b)}}
+            }]}),
+        ),
+        NOT_ACCESSIBLE_KEY_OWNER,
+    )
+    .await;
+    let injected = |route: &str, key_id: &str| {
+        api.surface(
+            route,
+            Some("tenant-a"),
+            json!({"target": {"endpoint": api.target, "identity_injection": from_api_key(key_id)}}),
+        )
+    };
+    api.assert_create_refused(&injected("/smoke/injection-cross", &keys.tenant_b), NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+    assert_saved(
+        api.create(&injected("/smoke/injection-own", &keys.tenant_a))
+            .await,
+    );
+
+    let plain = api
+        .created_id(&api.surface("/smoke/patch-cross", Some("tenant-a"), json!({})))
+        .await;
+    api.assert_patch_refused(
+        &plain,
+        &json!({"identity_slots": {"protected": from_api_key(&keys.tenant_b)}}),
+        NOT_ACCESSIBLE_KEY_OWNER,
+    )
+    .await;
+    assert_saved(
+        api.patch(&plain, &json!({"identity_slots": {"protected": from_api_key(&keys.tenant_a)}}))
+            .await,
     );
 }
 
