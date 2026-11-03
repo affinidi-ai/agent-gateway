@@ -10165,7 +10165,8 @@ async fn fetch_agent_card(
 /// Returns `Ok(None)` for other modes and on public/discovery paths, where
 /// source auth, Trust Check and surface OPA are bypassed (mirroring the
 /// `from_jwt_claim` resolution). A credential that cannot be derived is a
-/// `502` error response.
+/// `502` error response, except a `from_api_key` slot with no `api_key_id`,
+/// which is a fixed `500` counted as `api_key_id_missing`.
 async fn resolve_configured_caller_identity(
     state: &ProxyState,
     method: &str,
@@ -10298,6 +10299,16 @@ async fn resolve_configured_caller_identity(
             }
         }
         Ok(None) => return Ok(None),
+        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing) => {
+            warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
+            crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                channel_name,
+                "from_api_key",
+                e.reason_label(),
+                0.0,
+            );
+            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
+        }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
             return Err(create_error_response(
@@ -21731,6 +21742,25 @@ allow if {
             .unwrap();
 
             assert!(result.is_none());
+        }
+
+        #[tokio::test]
+        async fn protected_api_key_without_key_id_is_a_fixed_500() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(
+                surface_with("pak-protected-no-id", None, Some(ManagedIdentityConfig::FromApiKey { api_key_id: None })),
+                Some(issuer),
+            );
+
+            let response = resolve(&state, Some(&provider_key("atgk_pak_caller")), false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_text(response).await;
+            assert!(body.contains(super::super::CALLER_IDENTITY_UNRESOLVED), "{body}");
+            assert!(!body.contains("api_key_id"), "{body}");
+            assert_eq!(resolve_count("pak-protected-no-id", "api_key_id_missing"), 1);
         }
 
         #[tokio::test]

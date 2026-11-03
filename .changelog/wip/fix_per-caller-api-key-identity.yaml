@@ -65,7 +65,8 @@ changes:
         `mode="from_api_key"` and `result` `api_key_unavailable`. Saving one, on the surface
         or an enabled variant, is refused with 400, as is combining it with
         `mcp_http.authorization`, or a From API Key Identity on the protected, external or a
-        Transit Point slot without a key id. A missing VC issuer or a failed DID issuance
+        Transit Point slot without a key id; a stored one answers a fixed 500 (`result`
+        `api_key_id_missing`). A missing VC issuer or a failed DID issuance
         still resolves no caller identity and leaves the decision to policy.
     - timestamp: '2026-10-31T00:00:00Z'
       title: Give each API key its own DID, so rules tied to the shared DID stop matching

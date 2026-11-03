@@ -1,4 +1,4 @@
-import { registry } from '../index';
+import { buildCanvasBlob, registry } from '../index';
 import { buildSurfaceContext } from '../surfaceContext';
 import { INBOUND_API_KEY_NEEDS_API_KEY_CALLER } from '../identity/definition';
 import type { CanvasNode, PayloadContext } from '../types';
@@ -77,6 +77,26 @@ describe('identity From API Key — payload', () => {
       type: 'from_api_key',
       api_key_id: 'atgk_agent',
     });
+  });
+});
+
+describe('identity From API Key — canvas blob', () => {
+  const blobConfig = (node: CanvasNode) =>
+    buildCanvasBlob([{ ...node, position: { x: 0, y: 0 } }]).nodes.find(n => n.id === node.id)!
+      .config;
+
+  it('drops a stored api_key_id from the inbound node config', () => {
+    const config = blobConfig(
+      identity(inboundNode, { type: 'from_api_key', api_key_id: 'atgk_stale' })
+    );
+    expect(config).toEqual({ type: 'from_api_key' });
+  });
+
+  it('keeps api_key_id on the protected node config', () => {
+    const config = blobConfig(
+      identity(protectedNode, { type: 'from_api_key', api_key_id: 'atgk_agent' })
+    );
+    expect(config).toEqual({ type: 'from_api_key', api_key_id: 'atgk_agent' });
   });
 });
 

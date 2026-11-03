@@ -15,6 +15,7 @@ import {
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
 } from './edges/archetypes';
+import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
@@ -1325,6 +1326,19 @@ export function buildCanvasBlob(
         Object.prototype.hasOwnProperty.call(configToPersist, 'trust_check_list')
       ) {
         const { trust_check_list: _stripped, ...rest } = configToPersist as Record<string, unknown>;
+        void _stripped;
+        configToPersist = rest;
+      }
+      // The inbound Identity names no stored key: each caller is identified
+      // by the key it presents, so an `api_key_id` loaded from an older save
+      // is not carried forward.
+      if (
+        configToPersist &&
+        n.type === 'identity' &&
+        isInboundIdentity(n) &&
+        Object.prototype.hasOwnProperty.call(configToPersist, 'api_key_id')
+      ) {
+        const { api_key_id: _stripped, ...rest } = configToPersist as Record<string, unknown>;
         void _stripped;
         configToPersist = rest;
       }

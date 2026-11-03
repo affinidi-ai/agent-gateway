@@ -842,7 +842,7 @@ plus a UUID) therefore gets that key's identity record and DID. Neither the secr
 a surface save refuses such an id, so do not name a secret after an API Key Provider key.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
-`api_key_id`. A surface with no inbound identity whose protected slot is `from_api_key`,
+`api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,
 `from_mtls` or `static` identifies its callers with the Managed Agent's DID, but only when the
 request body carries no identity, and never on public discovery paths.
 
@@ -853,8 +853,9 @@ was created in. A key used as both a Managed Agent (protected slot or Transit Po
 `managed_identity`) and a caller (presented key or external slot), on one surface or across
 surfaces, resolves to that same DID in both roles, and a save that uses one key in both roles
 is accepted. A record with no role takes the role of the next request that uses it. When only
-the role cannot be recorded, the request still resolves the record's DID; a store that cannot
-write the record fails the request.
+the role cannot be recorded, the request still resolves the record's DID. A store that cannot
+write the record fails a Managed Agent's request; a caller then resolves no identity and policy
+decides (see the request-time refusals below).
 
 #### One key in both roles
 
@@ -907,6 +908,7 @@ Point's outbound request:
 | Caller authentication is not API Key or API Key Provider | `500` | `api_key_unavailable` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
+| A stored `from_api_key` Managed Agent or Transit Point identity has no `api_key_id` | `500` | `api_key_id_missing` |
 
 When no VC issuer is configured (`vc_issuer_missing`) or DID issuance fails
 (`vc_issuer_error`), the request is not refused: it resolves no caller identity and policy
