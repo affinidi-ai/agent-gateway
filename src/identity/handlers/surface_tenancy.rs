@@ -38,10 +38,10 @@ pub async fn validate_surface_references(
             let mut grandfathered =
                 grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?);
             grandfathered.extend(
-                collect_provider_key_references(stored)
+                provider_key_ids(stored)
                     .unwrap_or_default()
-                    .into_iter()
-                    .map(|key_id| (ResourceKind::ApiKeys, key_id)),
+                    .all()
+                    .map(|key_id| (ResourceKind::ApiKeys, key_id.clone())),
             );
             grandfathered
         }
@@ -66,7 +66,7 @@ pub async fn validate_surface_references(
             .await?;
     }
     authorizer
-        .provider_keys(&collect_provider_key_references(surface)?)
+        .provider_keys(&provider_key_ids(surface)?)
         .await?;
     validate_target_auth_methods(state, surface).await
 }
@@ -1270,13 +1270,17 @@ impl ReferenceAuthorizer<'_> {
     /// appliance-wide secret upstream. The token's API key pattern must match every key id.
     async fn provider_keys(
         &self,
-        keys: &[String],
+        ids: &ProviderKeyIds,
     ) -> Result<(), SurfaceApiError> {
-        if keys.is_empty() {
+        if ids.is_empty() {
             return Ok(());
         }
         let owners = provider_key_owners(self.state).await?;
-        for key_id in keys {
+        for secret_id in &ids.legacy_secrets {
+            self.legacy_secret(secret_id, &owners)
+                .await?;
+        }
+        for key_id in &ids.keys {
             let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, key_id);
             if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
                 return Err(inaccessible("API-key parent Surface"));
@@ -1304,6 +1308,37 @@ impl ReferenceAuthorizer<'_> {
                 ) {
                     return Err(inaccessible("API-key parent Surface"));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// A Caller Context API Key `secret_id` shaped like a key id, on a view whose inbound
+    /// Identity is From API Key, shares the DID of a key of that id. A new one is refused when
+    /// that key belongs to a surface this one may not reference, or to a surface with no tenant;
+    /// one the stored surface already named is kept under `warn`. An id no key has stays a
+    /// plain secret.
+    async fn legacy_secret(
+        &self,
+        secret_id: &str,
+        owners: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<(), SurfaceApiError> {
+        let rule = self.rule_for(ResourceKind::ApiKeys, secret_id);
+        for surface_id in owners
+            .get(secret_id)
+            .into_iter()
+            .flatten()
+        {
+            let Some(tenant_id) = self
+                .api_key_parent_tenant(surface_id)
+                .await?
+            else {
+                continue;
+            };
+            let breaks = !can_reference(self.owner_tenant_id, tenant_id.as_deref())
+                || crate::tenancy::breaks_tenant_isolation(self.owner_tenant_id, tenant_id.as_deref());
+            if breaks && rule.is_enforced() {
+                return Err(inaccessible("API-key parent Surface"));
             }
         }
         Ok(())

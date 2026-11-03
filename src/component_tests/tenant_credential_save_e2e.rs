@@ -21,6 +21,9 @@ const STORED_RESPONSE_METADATA_SURFACE: &str = "stored-response-metadata-surface
 const STORED_DANGLING_METADATA_SURFACE: &str = "stored-dangling-metadata-surface";
 const STORED_DISABLED_METADATA_SURFACE: &str = "stored-disabled-metadata-surface";
 const STORED_CREDENTIAL_LOOKUP_SURFACE: &str = "stored-credential-lookup-surface";
+const STORED_TENANT_B_KEY_OWNER: &str = "stored-tenant-b-key-owner";
+const STORED_LEGACY_SECRET_SURFACE: &str = "stored-legacy-secret-surface";
+const STORED_TENANT_B_KEY: &str = "atgk_00000000000000000000000000000b11";
 const STORED_KEY_OWNER_SURFACE: &str = "stored-key-owner-surface";
 const STORED_APPLIANCE_KEY_SURFACE: &str = "stored-appliance-key-surface";
 const STORED_APPLIANCE_KEY: &str = "atgk_00000000000000000000000000000a11";
@@ -417,6 +420,30 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
             &bootstrap
                 .storage_paths
                 .agent_surfaces,
+            STORED_TENANT_B_KEY_OWNER,
+            surface(STORED_TENANT_B_KEY_OWNER, json!({"tenant_id": "tenant-b"})),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+            STORED_LEGACY_SECRET_SURFACE,
+            surface(
+                STORED_LEGACY_SECRET_SURFACE,
+                json!({
+                    "identity_slots": {"inbound": {"type": "from_api_key"}},
+                    "access_point": {
+                        "listen_address": format!("http://localhost:{port}"),
+                        "route": format!("/smoke/{STORED_LEGACY_SECRET_SURFACE}"), "protocol": "a2a",
+                        "caller_authentication": legacy_caller(STORED_TENANT_B_KEY)
+                    }
+                }),
+            ),
+        ),
+        (
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
             STORED_APPLIANCE_KEY_SURFACE,
             surface(
                 STORED_APPLIANCE_KEY_SURFACE,
@@ -453,6 +480,14 @@ fn seed_stored_credentials(bootstrap: &crate::config::BootstrapConfig) {
         .unwrap();
     }
     seed_api_key(bootstrap, STORED_KEY_OWNER_SURFACE, STORED_APPLIANCE_KEY);
+    seed_api_key(bootstrap, STORED_TENANT_B_KEY_OWNER, STORED_TENANT_B_KEY);
+    super::helpers::write_api_key_secret(
+        &bootstrap
+            .storage_paths
+            .secrets,
+        STORED_TENANT_B_KEY,
+        "legacy-secret-value",
+    );
 }
 
 fn api_keys_dir(bootstrap: &crate::config::BootstrapConfig) -> std::path::PathBuf {
@@ -1617,6 +1652,12 @@ impl Api {
     }
 }
 
+fn legacy_caller(secret_id: &str) -> Value {
+    json!({"methods": [{
+        "type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": secret_id
+    }]})
+}
+
 fn from_api_key(key_id: &str) -> Value {
     json!({"type": "from_api_key", "api_key_id": key_id})
 }
@@ -2070,6 +2111,11 @@ async fn a_surface_naming_a_provider_key_is_not_saved_without_an_api_key_store()
     let mut client = None;
     let harness = GatewayHarness::start(|_, _, bootstrap| {
         client = Some(configure_admin_api(bootstrap));
+        write_stored_surface(
+            bootstrap,
+            SCOPED_STORED_SURFACE,
+            json!({"identity_slots": {"protected": from_api_key(SCOPED_GONE_KEY)}}),
+        );
         let blocked = api_keys_dir(bootstrap);
         std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
         std::fs::write(&blocked, b"not a directory").unwrap();
@@ -2094,8 +2140,61 @@ async fn a_surface_naming_a_provider_key_is_not_saved_without_an_api_key_store()
         .await;
     assert_eq!(status, 500, "{body}");
     assert_eq!(body["details"], "API key store is not configured", "{body}");
+    let plain = api
+        .created_id(&api.surface("/smoke/no-key-store-plain", Some("tenant-a"), json!({})))
+        .await;
+
+    let (status, body) = api
+        .reassign("surfaces", &plain, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body, json!({"error": "API key store is not configured"}));
+    assert_eq!(api.stored(&plain).await["tenant_id"], "tenant-a", "a refused reassignment changes nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_legacy_secret_named_like_another_tenants_key_is_kept_in_warn_mode_and_a_new_one_refused() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let stored = api
+        .stored(STORED_LEGACY_SECRET_SURFACE)
+        .await;
     assert_saved(
-        api.create(&api.surface("/smoke/no-key-store-plain", Some("tenant-a"), json!({})))
+        api.put(STORED_LEGACY_SECRET_SURFACE, &stored)
             .await,
     );
+
+    let route = "/smoke/new-legacy-secret";
+    api.assert_create_refused(
+        &api.surface(
+            route,
+            Some("tenant-a"),
+            json!({
+                "identity_slots": {"inbound": {"type": "from_api_key"}},
+                "access_point": {"listen_address": api.listener, "route": route, "protocol": "a2a",
+                    "caller_authentication": legacy_caller(STORED_TENANT_B_KEY)}
+            }),
+        ),
+        NOT_ACCESSIBLE_KEY_OWNER,
+    )
+    .await;
+    let route = "/smoke/new-legacy-secret-no-identity";
+    assert_saved(
+        api.create(&api.surface(
+            route,
+            Some("tenant-a"),
+            json!({"access_point": {"listen_address": api.listener, "route": route, "protocol": "a2a",
+                "caller_authentication": legacy_caller(STORED_TENANT_B_KEY)}}),
+        ))
+        .await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_legacy_secret_named_like_another_tenants_key_is_refused_when_enforced() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let stored = api
+        .stored(STORED_LEGACY_SECRET_SURFACE)
+        .await;
+    api.assert_put_refused(STORED_LEGACY_SECRET_SURFACE, &stored, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
 }

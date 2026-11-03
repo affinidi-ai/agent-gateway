@@ -187,8 +187,10 @@ target, on direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets and Fa
 MCP callers get a JSON-RPC error carrying the request id; other callers get
 `application/problem+json`. The body says only that the Access Point is not available; the
 reason is logged, and each refusal is recorded in the Audit Log as `request_rejected` with the
-reason `access_point_not_ready`. Legacy and public Access Points are always ready, and so are
-onboarding surfaces, which capture a request and never forward it.
+reason `access_point_not_ready`. Legacy and public Access Points are always ready for this
+reason, and so are onboarding surfaces, which capture a request and never forward it. A surface
+that derives a DID from an API key it may not use is not ready too, whatever its Access Point;
+see [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
 
 Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
@@ -999,14 +1001,19 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   surface was deleted: "API-key parent Surface reference is not accessible". Either is kept when
   the stored surface already named it, so a GET→PUT of that surface saves;
 - a key id outside a resource-scoped token's pattern (`api-keys:<key id>`), also when the stored
-  surface already named it.
+  surface already named it;
+- a new Caller Context API Key `secret_id` that starts with `atgk_`, on a view whose inbound
+  Identity is From API Key, when a key of that id belongs to a surface this one may not
+  reference or to a surface with no tenant. One the stored surface already named is kept under
+  `warn` and refused under `enforce`. An id no key has is a plain secret.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured". A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
 when it would leave a surface naming a key whose owning surface it may not reference, or would
 make a tenant surface name the key of a surface with no tenant. Under `warn`, a tenant surface
 that already names such a key may still move. A reassignment whose surface then fails any
-reference check is a `409` too, never a `500`.
+reference check is a `409` too, never a `500`, and so is one made while a surface names an
+`atgk_` id and no API key store is configured ("API key store is not configured").
 
 #### Provider keys when a surface goes live
 
@@ -1022,9 +1029,10 @@ no secret.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
   tenant, or the key of a surface with no tenant is not ready.
 - A key or owning surface that no longer exists is only reported: key ids are never reused.
-- While the API key store cannot be read, every surface naming an `atgk_` id is not ready. The
-  outage is logged once. Each request checks again, so the surface serves as soon as the store
-  can be read.
+- While the API key store cannot be read, every surface naming an `atgk_` id that has not been
+  checked yet is not ready; a surface checked before the outage keeps its verdict. The outage is
+  logged once. Each request to an unchecked surface checks again, so it serves as soon as the
+  store can be read.
 
 The check also covers a Caller Context API Key `secret_id` that starts with `atgk_` on a view
 whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is

@@ -492,6 +492,9 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             if keys.is_empty() {
                 continue;
             }
+            if state.api_key_store.is_none() {
+                return Err(OwnershipApiError::Refused("API key store is not configured".into()));
+            }
             if key_owners.is_none() {
                 key_owners = Some(
                     provider_key_owners(state)

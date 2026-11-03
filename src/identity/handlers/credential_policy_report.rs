@@ -13,6 +13,7 @@ use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
+use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::ResourceKind;
@@ -20,7 +21,6 @@ use crate::tenancy::ResourceKind;
 const RULE_TOKEN_ENDPOINT_HTTPS: &str = "token_endpoint_https";
 const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
 const RULE_JWT_SUBJECT: &str = "jwt_subject";
-const RULE_PROVIDER_KEY_TENANT: &str = "provider_key_tenant";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -256,7 +256,7 @@ fn log_findings(
             subject = "surface",
             id = %finding.surface_id,
             tenant = finding.tenant_id.as_deref().unwrap_or("appliance"),
-            rule = RULE_PROVIDER_KEY_TENANT,
+            rule = PROVIDER_KEY_TENANT_RULE,
             api_key_id = %finding.issue.key_id,
             issue = finding.issue.kind.as_str(),
             not_ready = finding.issue.kind.is_breach(),
@@ -802,7 +802,7 @@ mod tests {
         );
         log_findings(&findings, &CredentialPolicyConfig::default());
         let text = logs.text();
-        assert!(text.contains(RULE_PROVIDER_KEY_TENANT), "{text}");
+        assert!(text.contains(PROVIDER_KEY_TENANT_RULE), "{text}");
         assert!(text.contains("atgk_t2") && text.contains("other_tenant") && text.contains("cross"), "{text}");
         assert!(!text.contains("no credential provider or surface breaks a rule"), "{text}");
         assert!(!text.contains("S_OWN") && !text.contains("atgs_"), "{text}");

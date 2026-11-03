@@ -3374,16 +3374,20 @@ impl AgentSurface {
         }
     }
 
-    /// The [`Self::access_point_status`] of the surface a request without a
-    /// variant alias is served from: the default variant, when
-    /// [`Self::select_variant`] selects one, else the base.
-    pub fn served_access_point_status(&self) -> AccessPointStatus {
+    /// The surface a request without a variant alias is served from: the
+    /// default variant, when [`Self::select_variant`] selects one, else the
+    /// base without its variants.
+    pub fn served_view(&self) -> AgentSurface {
         match self.select_variant(None) {
-            Ok(Some(variant)) => self
-                .serve_selected(Some(variant))
-                .surface
-                .access_point_status(),
-            _ => self.access_point_status(),
+            Ok(Some(variant)) => {
+                self.serve_selected(Some(variant))
+                    .surface
+            }
+            _ => AgentSurface {
+                variants: Vec::new(),
+                default_variant_id: None,
+                ..self.clone()
+            },
         }
     }
 
@@ -4139,15 +4143,27 @@ mod tests {
             "overrides": {"complete": true, "access_point": {}}}]);
         let mut surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
         surface.apply_public_access();
-        assert_eq!(surface.served_access_point_status(), super::AccessPointStatus::Ready);
+        assert_eq!(
+            surface
+                .served_view()
+                .access_point_status(),
+            super::AccessPointStatus::Ready
+        );
 
         surface.default_variant_id = Some("beta".to_string());
         assert_eq!(surface.access_point_status(), super::AccessPointStatus::Ready, "the base stays ready");
-        assert_eq!(surface.served_access_point_status(), super::AccessPointStatus::NotReady);
+        assert_eq!(
+            surface
+                .served_view()
+                .access_point_status(),
+            super::AccessPointStatus::NotReady
+        );
 
         surface.variants[0].enabled = false;
         assert_eq!(
-            surface.served_access_point_status(),
+            surface
+                .served_view()
+                .access_point_status(),
             super::AccessPointStatus::Ready,
             "a disabled default variant serves nothing, so the base status stands"
         );

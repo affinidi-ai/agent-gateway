@@ -3859,11 +3859,12 @@ pub struct SurfaceResponse<T> {
 
 impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
     /// The status is that of the surface its URL serves: the default variant,
-    /// when there is one ([`AgentSurface::served_access_point_status`]).
+    /// when there is one ([`AgentSurface::served_view`]).
     fn from(surface: AgentSurface) -> Self {
+        let served = surface.served_view();
         Self {
-            access_point_status: surface.served_access_point_status(),
-            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&surface),
+            access_point_status: served.access_point_status(),
+            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&served),
             resource: surface,
         }
     }
@@ -3876,12 +3877,12 @@ impl SurfaceResponse<SurfaceVariant> {
         variant: SurfaceVariant,
         surface: &AgentSurface,
     ) -> Self {
+        let served = surface
+            .serve_selected(Some(&variant))
+            .surface;
         Self {
-            access_point_status: surface
-                .serve_selected(Some(&variant))
-                .surface
-                .access_point_status(),
-            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(surface),
+            access_point_status: served.access_point_status(),
+            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&served),
             resource: variant,
         }
     }
@@ -9125,6 +9126,38 @@ mod tests {
             "warnings are Warning headers: {response}"
         );
         assert_eq!(serde_json::to_value(SurfaceResponse::from(surface)).unwrap()["access_point_status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn test_not_ready_reason_is_reported_for_the_view_that_names_the_refused_key() {
+        let enforced = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("owner-a", "atgk_view_a"), ("owner-b", "atgk_view_b")],
+        )
+        .await;
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "views", "name": "views", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/views", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9"},
+            "identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_view_a"}},
+            "variants": [{"id": "cross-id", "alias": "cross", "name": "Cross", "enabled": true,
+                "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_view_b"}}}}]
+        }))
+        .unwrap();
+        enforced
+            .gate
+            .admit(&surface)
+            .await;
+
+        let base = serde_json::to_value(SurfaceResponse::from(surface.clone())).unwrap();
+        assert!(
+            base.get("not_ready_reason")
+                .is_none(),
+            "{base}"
+        );
+        let variant = surface.variants[0].clone();
+        let response = serde_json::to_value(SurfaceResponse::variant(variant, &surface)).unwrap();
+        assert_eq!(response["not_ready_reason"], "provider_key_tenant", "{response}");
     }
 
     #[test]

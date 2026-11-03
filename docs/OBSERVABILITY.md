@@ -405,8 +405,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
-    `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    `access_point_not_ready` (a closed Access Point without source authentication, logged with
+    `reason=no source authentication`, or a surface that derives a DID from an API key it may
+    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
+    over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
     external consent refused before anything is sent `target_path_refused` (`400`, a path the
     grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request

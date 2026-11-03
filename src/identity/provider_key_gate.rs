@@ -240,13 +240,14 @@ impl ProviderKeyGate {
         verdict.reason()
     }
 
-    /// The reason a kept verdict refuses `surface` under, for the admin API; `None` when no
-    /// verdict refuses it or none covers its key ids yet.
+    /// The reason a kept verdict refuses `surface` as served (a resolved view, or a surface with
+    /// variants in every view) under, for the admin API; `None` when no verdict refuses it or
+    /// none covers its key ids yet.
     pub fn recorded_refusal(
         &self,
         surface: &AgentSurface,
     ) -> Option<&'static str> {
-        let ids = ids_of(surface);
+        let ids = served_provider_key_ids(surface).unwrap_or_else(|_| ids_of(surface));
         if ids.is_empty() {
             return None;
         }
