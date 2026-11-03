@@ -85,8 +85,9 @@ a surface with credential bindings; see _Surface Builder_ in
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
 Transit Point element's **Who can call this Transit Point** section sets the transit token, a
-Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the API is kept) and
-`allow_unauthenticated_callers`, and shows the exposure `Warning` headers a save answers with.
+Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the API is kept),
+`allow_unauthenticated_callers` and `allow_fabric_callers` (**Let agents serving partner
+requests call it**), and shows the exposure `Warning` headers a save answers with.
 See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 

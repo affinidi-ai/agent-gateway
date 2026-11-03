@@ -27,9 +27,11 @@ let latest: Record<string, any> = {};
 function Harness({
   initial,
   meta = {},
+  agentTargetIsHttp = true,
 }: {
   initial: Record<string, any>;
   meta?: Record<string, unknown>;
+  agentTargetIsHttp?: boolean;
 }) {
   const [config, setConfig] = useState<Record<string, any>>(initial);
   latest = config;
@@ -38,6 +40,7 @@ function Harness({
       <TransitCallerSection
         config={config}
         alias="crm"
+        agentTargetIsHttp={agentTargetIsHttp}
         updateField={(f, v) => setConfig(c => ({ ...c, [f]: v }))}
         updateFields={fields => setConfig(c => ({ ...c, ...fields }))}
       />
@@ -199,6 +202,81 @@ describe('Who can call this Transit Point', () => {
     expect(latest.allow_unauthenticated_callers).toBe(false);
     fireEvent.click(screen.getByTestId('transit-point-require-transit-token-switch'));
     expect(latest.require_transit_token).toBe(true);
+  });
+
+  it('lets agents serving partner requests call it only once switched on, and off again', () => {
+    render(<Harness initial={{ id: 'tp' }} />);
+    const fabricSwitch = screen.getByTestId('transit-point-allow-fabric-callers-switch');
+    expect(fabricSwitch).not.toBeChecked();
+    fireEvent.click(fabricSwitch);
+    expect(latest.allow_fabric_callers).toBe(true);
+    expect(fabricSwitch).toBeChecked();
+    fireEvent.click(fabricSwitch);
+    expect(latest.allow_fabric_callers).toBe(false);
+    expect(callerAuthToWire(latest)).toEqual({ allow_fabric_callers: false });
+  });
+
+  it('hides the Fabric switch where the agent would get no token for it', () => {
+    render(<Harness initial={{ id: 'tp' }} agentTargetIsHttp={false} />);
+    expect(screen.queryByTestId('transit-point-allow-fabric-callers-switch')).toBeNull();
+  });
+
+  it('hides it while the transit token is not required, and shows it again with the token', () => {
+    render(
+      <Harness
+        initial={{
+          id: 'tp',
+          require_transit_token: false,
+          ...{
+            source_auth: {
+              type: 'api_key',
+              extraction: { source: 'http_header', field: 'X-API-Key' },
+              secret_id: 's',
+            },
+          },
+        }}
+      />
+    );
+    expect(screen.queryByTestId('transit-point-allow-fabric-callers-switch')).toBeNull();
+    fireEvent.click(screen.getByTestId('transit-point-require-transit-token-switch'));
+    expect(screen.getByTestId('transit-point-allow-fabric-callers-switch')).toBeInTheDocument();
+  });
+
+  it('keeps a stored switch visible where it has no effect, says so, and lets it be turned off', () => {
+    render(
+      <Harness initial={{ id: 'tp', allow_fabric_callers: true }} agentTargetIsHttp={false} />
+    );
+    const fabricSwitch = screen.getByTestId('transit-point-allow-fabric-callers-switch');
+    expect(fabricSwitch).toBeChecked();
+    expect(screen.getByTestId('transit-point-fabric-callers-inert')).toHaveTextContent(
+      'HTTP or HTTPS agent'
+    );
+    fireEvent.click(fabricSwitch);
+    expect(latest.allow_fabric_callers).toBe(false);
+  });
+
+  it('notes API-set credential delegation while Fabric callers are on, and never writes it', () => {
+    render(
+      <Harness
+        initial={{
+          id: 'tp',
+          allow_fabric_callers: true,
+          delegated_credentials_for_fabric_callers: true,
+        }}
+      />
+    );
+    expect(screen.getByTestId('transit-point-fabric-callers-delegation')).toBeInTheDocument();
+    expect(callerAuthToWire(latest)).toEqual({ allow_fabric_callers: true });
+    fireEvent.click(screen.getByTestId('transit-point-allow-fabric-callers-switch'));
+    expect(screen.queryByTestId('transit-point-fabric-callers-delegation')).toBeNull();
+    expect(callerAuthToWire(latest)).toEqual({ allow_fabric_callers: false });
+    expect(latest.delegated_credentials_for_fabric_callers).toBe(true);
+  });
+
+  it('shows a stored allow_fabric_callers as on', () => {
+    render(<Harness initial={{ id: 'tp', allow_fabric_callers: true }} />);
+    expect(screen.getByTestId('transit-point-allow-fabric-callers-switch')).toBeChecked();
+    expect(screen.queryByTestId('transit-point-fabric-callers-inert')).toBeNull();
   });
 
   it('hides the open switch while a resource access token authenticates callers', () => {

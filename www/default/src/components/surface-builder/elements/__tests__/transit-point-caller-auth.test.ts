@@ -8,6 +8,7 @@ import {
   NO_CALLER_AUTH_PROBLEM,
   OPEN_WITH_AUTH_PROBLEM,
   reachableFromOtherHosts,
+  targetIsHttpAgent,
   transitPointSaveError,
   warningsForTransitPoint,
 } from '../transit-point/callerAuth';
@@ -228,6 +229,59 @@ describe('the dashboard save round-trip', () => {
     for (const tp of tps) expect(callerAuthProblems(tp.config)).toEqual([]);
   });
 
+  it('sends allow_fabric_callers as set, false included, and leaves it out when never set', () => {
+    expect(pointOf({ allow_fabric_callers: true }).allow_fabric_callers).toBe(true);
+    expect(pointOf({ allow_fabric_callers: false }).allow_fabric_callers).toBe(false);
+    expect(pointOf({})).not.toHaveProperty('allow_fabric_callers');
+    expect(callerAuthToWire({ allow_fabric_callers: 'yes' })).toEqual({});
+    expect(
+      pointOf({ allow_fabric_callers: false, delegated_credentials_for_fabric_callers: true })
+    ).not.toHaveProperty('delegated_credentials_for_fabric_callers');
+  });
+
+  it('writes back a stored allow_fabric_callers unchanged', () => {
+    const stored = {
+      access_point: { route: '/api' },
+      target: { endpoint: 'https://upstream.example.com' },
+      transit: {
+        points: [
+          {
+            id: 'partner',
+            alias: 'partner',
+            target_endpoint: 'https://partner.example.com',
+            protocol: 'a2a',
+            require_transit_token: true,
+            allow_fabric_callers: true,
+          },
+          {
+            id: 'local',
+            alias: 'local',
+            target_endpoint: 'https://local.example.com',
+            protocol: 'a2a',
+            require_transit_token: true,
+          },
+        ],
+      },
+    };
+    const tps = registry.nodesFromPayload(stored).filter(n => n.type === 'transit-point-a2a');
+    const written = (registry.buildPayload(makeCtx([...baseNodes, ...tps])) as any).transit.points;
+    expect(written.map((p: any) => p.allow_fabric_callers)).toEqual([true, undefined]);
+  });
+
+  it('tells an HTTP(S) agent Target apart by parsing it as a URL, as the gateway does', () => {
+    const target = (endpoint: unknown) => [{ type: 'target', config: { endpoint } }];
+    expect(targetIsHttpAgent(target('https://agent.example.com'))).toBe(true);
+    expect(targetIsHttpAgent(target('http://localhost:9000/a2a'))).toBe(true);
+    expect(targetIsHttpAgent(target('  https://agent.example.com'))).toBe(true);
+    expect(targetIsHttpAgent(target('a2a-proxy://proxy-1'))).toBe(false);
+    expect(targetIsHttpAgent(target('fabric://gw/surface'))).toBe(false);
+    expect(targetIsHttpAgent(target('http://'))).toBe(false);
+    expect(targetIsHttpAgent(target('https://bad host'))).toBe(false);
+    expect(targetIsHttpAgent(target(undefined))).toBe(false);
+    expect(targetIsHttpAgent([])).toBe(false);
+    expect(targetIsHttpAgent(undefined)).toBe(false);
+  });
+
   it('writes the fields only through callerAuthToWire', () => {
     expect(callerAuthToWire({})).toEqual({});
     expect(callerAuthToWire({ source_auth: apiKey })).toEqual({ source_auth: apiKey });
@@ -414,6 +468,9 @@ describe('what a save answers with', () => {
   });
 
   it('changes the signature when the caller authentication or address changes', () => {
+    expect(callerAuthSignature({ allow_fabric_callers: true })).not.toBe(
+      callerAuthSignature({ allow_fabric_callers: false })
+    );
     const before = callerAuthSignature({ listen_address: 'a', require_transit_token: true });
     expect(callerAuthSignature({ listen_address: 'a', require_transit_token: true })).toBe(before);
     expect(callerAuthSignature({ listen_address: 'b', require_transit_token: true })).not.toBe(

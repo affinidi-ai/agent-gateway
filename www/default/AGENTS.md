@@ -181,7 +181,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   ignores.
 - The Transit Point panel's **Who can call this Transit Point** section
   (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
-  (`transit-point-require-transit-token-switch`), the **Caller authentication** select
+  (`transit-point-require-transit-token-switch`), the **Let agents serving partner requests
+  call it** switch (`transit-point-allow-fabric-callers-switch`, setting `allow_fabric_callers`;
+  shown while the transit token is required and the Target is an HTTP(S) agent, or while it is
+  stored on, with `transit-point-fabric-callers-inert` saying it has no effect), the **Caller authentication** select
   (`transit-point-caller-auth-method`: None, API key from the secret store, API key from the
   provider, JWT bearer; mTLS only shows, and keeps, one set through the API) with its fields
   (`transit-point-caller-auth-header`, `-secret`, `-strategy`, `-audience-input`,
@@ -202,7 +205,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   shows `transit-point-caller-auth-provider-scope`: its keys are the surface's own, the same an
   Access Point using the provider accepts. Its `agent_id` is written from the surface being
   saved (`callerAuthToWire(config, surfaceId)`), as the Access Point's is, so a Transit Point
-  copied from a template or another surface does not keep that surface's. The strategy and API key secret lists load through
+  copied from a template or another surface does not keep that surface's.
+  `callerAuthToWire` sends `allow_fabric_callers` as the switch shows it, an explicit `false`
+  included, and leaves it out for a Transit Point that never had it. Whether the Target is an
+  HTTP(S) agent comes from `targetIsHttpAgent` (a URL parse, as the gateway's).
+  `delegated_credentials_for_fabric_callers` stays API-only: the switch never changes it and
+  `callerAuthToWire` never sends it, so the gateway keeps the stored value. While both are on,
+  the section shows an info note (`transit-point-fabric-callers-delegation`). The strategy and API key secret lists load through
   `useJwtStrategies` and `useApiKeySecrets` (`elements/caller-auth/useCallerAuthOptions.ts`),
   shared with the Access Point's caller authentication editor.
 - The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`

@@ -615,8 +615,10 @@ token it issues at `INFO`, with its token ID (`jti`), the peer's Remote gateway 
 hop count, so a token presented later can be traced to the request it was issued for.
 
 A managed agent serving a partner's request gets a transit token only for the Transit Points
-that set `allow_fabric_callers: true`, off by default and set through the admin API only (a
-Surface Builder save keeps it, as it keeps a Transit Point's `source_auth`). Without one, the
+that set `allow_fabric_callers: true`, off by default. Set it through the admin API, or with
+the **Let agents serving partner requests call it** switch in the Surface Builder's Transit
+Point panel ([the switch](SOURCE_AUTH.md#transit-point-callers));
+a save that leaves it out keeps the stored value. Without one, the
 agent gets no token, and a Transit Point that requires one refuses its calls with `401`. A
 surface variant's Transit Points set it for that variant. When a token should be issued and
 cannot be, the receiving gateway refuses the request with `503`, recorded as a

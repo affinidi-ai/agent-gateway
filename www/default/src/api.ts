@@ -1412,6 +1412,10 @@ export interface TransitPoint {
   source_auth?: Record<string, unknown>;
   /** The explicit marking that the Transit Point serves callers it does not authenticate. */
   allow_unauthenticated_callers?: boolean;
+  /** Issues the agent a transit token for this Transit Point while it serves a partner's Fabric request. */
+  allow_fabric_callers?: boolean;
+  /** Releases per-user delegated credentials to those calls; set through the API. */
+  delegated_credentials_for_fabric_callers?: boolean;
   /** Per-Transit-Point MCP Tool Gating firewall (`{ gates: [...] }`, MCP only). */
   mcp_tool_gating?: { gates?: any[] };
 }

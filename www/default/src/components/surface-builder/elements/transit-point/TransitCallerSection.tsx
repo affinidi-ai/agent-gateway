@@ -27,6 +27,8 @@ interface Props {
   config: Record<string, any>;
   /** The Transit Point's routing alias, which the gateway's messages name it by. */
   alias: string;
+  /** Whether the surface's Target is an HTTP(S) agent, the only kind Fabric receive issues a token for. */
+  agentTargetIsHttp: boolean;
   updateField: (field: string, value: any) => void;
   updateFields: (fields: Record<string, any>) => void;
 }
@@ -40,13 +42,20 @@ const CHOICES: Array<{ value: CallerAuthChoice; label: string; disabled?: boolea
 ];
 
 /**
- * "Who can call this Transit Point": the transit token, the Transit Point's own
- * caller authentication (`source_auth`), and the explicit marking that it is
- * open to any caller. Applies the gateway's save rules before the save, and
- * shows the gateway's refusals and exposure warnings next to the fields they
- * are about.
+ * "Who can call this Transit Point": the transit token, whether agents serving
+ * a partner's Fabric request may call it (`allow_fabric_callers`), the Transit
+ * Point's own caller authentication (`source_auth`), and the explicit marking
+ * that it is open to any caller. Applies the gateway's save rules before the
+ * save, and shows the gateway's refusals and exposure warnings next to the
+ * fields they are about.
  */
-const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, updateFields }) => {
+const TransitCallerSection: React.FC<Props> = ({
+  config,
+  alias,
+  agentTargetIsHttp,
+  updateField,
+  updateFields,
+}) => {
   const meta = useOptionalSurfaceMeta();
   const variant = meta?.activeVariantAlias;
   const sourceAuth = readSourceAuth(config);
@@ -115,6 +124,10 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
 
   const canMarkOpen = !tokenOn && !sourceAuth && !resourceToken;
 
+  const fabricCallers = config.allow_fabric_callers === true;
+  const fabricCallersApply = tokenOn && agentTargetIsHttp;
+  const fabricDelegation = config.delegated_credentials_for_fabric_callers === true;
+
   return (
     <div className="config-section" data-testid="transit-point-caller-section">
       <div role="group" aria-labelledby="tp-caller-title" aria-describedby="tp-caller-help">
@@ -149,6 +162,44 @@ const TransitCallerSection: React.FC<Props> = ({ config, alias, updateField, upd
             mark the Transit Point open to any caller.
           </Form.Text>
         </Form.Group>
+
+        {(fabricCallersApply || fabricCallers) && (
+          <Form.Group className="mb-2" data-testid="transit-point-fabric-callers-group">
+            <Form.Check
+              type="switch"
+              id={`tp-allow-fabric-callers-${config.id || 'new'}`}
+              data-testid="transit-point-allow-fabric-callers-switch"
+              label="Let agents serving partner requests call it"
+              checked={fabricCallers}
+              onChange={e => updateField('allow_fabric_callers', e.target.checked)}
+            />
+            <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
+              While the managed agent serves a request a paired gateway sent over Fabric, it gets a
+              transit token that opens this Transit Point, so it can call onward.
+            </Form.Text>
+            {fabricCallers && !fabricCallersApply && (
+              <Alert
+                variant="warning"
+                className="py-1 px-2 small mt-1 mb-0"
+                data-testid="transit-point-fabric-callers-inert"
+              >
+                {tokenOn
+                  ? 'This has no effect: the agent gets a token only when the surface Target is an HTTP or HTTPS agent.'
+                  : 'This has no effect while the transit token is not required: this Transit Point does not check the token.'}
+              </Alert>
+            )}
+            {fabricCallers && fabricDelegation && (
+              <Alert
+                variant="info"
+                className="py-1 px-2 small mt-1 mb-0"
+                data-testid="transit-point-fabric-callers-delegation"
+              >
+                Delegated per-user credentials are also released to these calls (set through the
+                API).
+              </Alert>
+            )}
+          </Form.Group>
+        )}
 
         <Form.Group className="mb-2">
           <Form.Label className="small text-muted mb-1" htmlFor="tp-caller-auth-method">

@@ -2726,10 +2726,10 @@ fn retain_mcp_settings(
     settle_retained_protected_resources(surface, base_retained, &retained_aliases, network)
 }
 
-/// PUT carries the whole record, or a variant PUT its whole overrides, but the
-/// Surface Builder shows none of a Transit Point's `source_auth`,
-/// `allow_unauthenticated_callers`, `allow_fabric_callers` and
-/// `delegated_credentials_for_fabric_callers`, so a save from it omits them.
+/// PUT carries the whole record, or a variant PUT its whole overrides, but a
+/// Surface Builder save may leave out a Transit Point's `source_auth`,
+/// `allow_unauthenticated_callers` and `allow_fabric_callers`, and never sends
+/// `delegated_credentials_for_fabric_callers`.
 /// An omitted `allow_fabric_callers` is kept. An omitted
 /// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
 /// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
@@ -2779,7 +2779,7 @@ fn retain_transit_caller_authentication(
 /// The Transit Points a stored variant's own overrides define, else the stored
 /// surface's: a variant without its own list, or one added in this save,
 /// inherits them, and the Surface Builder sends it a copy of the surface's list
-/// that leaves out each Transit Point's caller authentication.
+/// that may leave out each Transit Point's caller authentication.
 fn variant_stored_points<'a>(
     existing: &'a AgentSurface,
     variant_id: &str,
@@ -5241,9 +5241,9 @@ mod validation_tests {
         );
     }
 
-    /// A PUT that leaves out a Transit Point's `allow_fabric_callers`, as a
-    /// Surface Builder save does, keeps the stored one, on the surface and in a
-    /// variant; one that sends it, `false` included, sets it.
+    /// A PUT that leaves out a Transit Point's `allow_fabric_callers` keeps the
+    /// stored one, on the surface and in a variant; one that sends it, `false`
+    /// included, sets it.
     #[test]
     fn a_save_that_omits_allow_fabric_callers_keeps_it() {
         let point = |allow: Option<bool>| {

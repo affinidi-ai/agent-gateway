@@ -379,9 +379,10 @@ overrides, with `400`. A surface stored with it still loads, with a warning in t
 its Transit Points refuse every request with `503` in the same way.
 
 The Surface Builder's Transit Point panel has a **Who can call this Transit Point** section
-with the transit token switch, a **Caller authentication** choice (an API key from the secret
+with the transit token switch, a **Let agents serving partner requests call it** switch
+(`allow_fabric_callers`, below), a **Caller authentication** choice (an API key from the secret
 store or from the provider, or a JWT bearer with its strategy, audiences, token header and
-scheme), and an **Open to any caller** switch that asks for confirmation. The switch shows
+scheme), and an **Open to any caller** switch that asks for confirmation. The open switch shows
 while the Transit Point has no transit token, `source_auth` or `mcp_http.authorization`, and
 while it is already marked open; choosing the token or a method turns the marking off. An
 empty token scheme is allowed: the gateway then reads the token as the raw header value. The
@@ -395,10 +396,26 @@ Point does not support. The panel applies the rules above before the save: a Tra
 authenticates no caller and is not open, one that is open beside the token or a method, and a
 method that is missing its secret, header, strategy or audience cannot be saved, and the panel
 says why. A refusal from the admin API shows in the same section in plain words. Turning
-caller authentication off sends `"source_auth": null`. The panel shows neither
-`allow_fabric_callers` nor `delegated_credentials_for_fabric_callers`; a dashboard save keeps
-both, the second while the Transit Point still requires the transit token and the surface's
-caller authentication still tells a partner's users apart.
+caller authentication off sends `"source_auth": null`.
+
+The **Let agents serving partner requests call it** switch sets `allow_fabric_callers`
+([Fabric](FABRIC.md#chains-across-gateways)):
+
+- It shows while the Transit Point requires the transit token and the surface's Target is an
+  HTTP or HTTPS agent. The agent gets a token only for such a Target, and a Transit Point that
+  does not require the token does not check it.
+- It also shows while it is stored on, with a note saying it has no effect when either condition
+  is not met, so it can be turned off.
+- A save sends it as the switch shows it, `false` included, and leaves it out for a Transit
+  Point that never had it, so the stored value is kept.
+
+`delegated_credentials_for_fabric_callers` is set through the admin API only. The switch never
+changes it, and a dashboard save never sends it: the gateway keeps the stored value while the
+Transit Point still requires the transit token and the surface's caller authentication still
+tells a partner's users apart. It releases nothing while `allow_fabric_callers` is off, so
+turning the switch off stops the release and turning it back on restores what the operator
+configured. While both are on, the panel notes that delegated per-user credentials are also
+released to these calls.
 
 These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its

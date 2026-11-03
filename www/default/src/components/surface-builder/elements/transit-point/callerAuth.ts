@@ -65,6 +65,24 @@ export function requiresTransitToken(config: Config): boolean {
   return config?.require_transit_token !== false;
 }
 
+/**
+ * Whether the surface's Target is an HTTP or HTTPS agent, the only Target Fabric
+ * receive issues the agent a transit token for. Parses the endpoint as a URL,
+ * as the gateway does, so a malformed one counts as not HTTP.
+ */
+export function targetIsHttpAgent(
+  nodes: ReadonlyArray<{ type: string; config?: Config }> | undefined
+): boolean {
+  const endpoint = nodes?.find(n => n.type === 'target')?.config?.endpoint;
+  if (typeof endpoint !== 'string') return false;
+  try {
+    const { protocol } = new URL(endpoint);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the Transit Point is marked open to any caller. */
 export function isOpenToAnyCaller(config: Config): boolean {
   return config?.allow_unauthenticated_callers === true;
@@ -316,6 +334,7 @@ export function callerAuthSignature(config: Config): string {
     config?.require_transit_token,
     config?.allow_unauthenticated_callers,
     config?.source_auth ?? null,
+    config?.allow_fabric_callers === true,
     config?.listen_address,
     config?.alias,
     config?.name,
@@ -331,6 +350,10 @@ export function callerAuthSignature(config: Config): string {
  * it off, so the stored marking does not return. An `api_key_provider` validates
  * the keys of the surface being saved, `surfaceId`, as the Access Point's does,
  * so a Transit Point copied from another surface does not keep that one's.
+ * `allow_fabric_callers` is sent as the switch shows it, an explicit `false`
+ * included, and left out for a Transit Point that never had it.
+ * `delegated_credentials_for_fabric_callers` is never sent, so the gateway
+ * keeps the stored one.
  */
 export function callerAuthToWire(config: Config, surfaceId?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -343,6 +366,9 @@ export function callerAuthToWire(config: Config, surfaceId?: string): Record<str
     out.allow_unauthenticated_callers = true;
   } else if (config?.allow_unauthenticated_callers === false) {
     out.allow_unauthenticated_callers = false;
+  }
+  if (typeof config?.allow_fabric_callers === 'boolean') {
+    out.allow_fabric_callers = config.allow_fabric_callers;
   }
   return out;
 }

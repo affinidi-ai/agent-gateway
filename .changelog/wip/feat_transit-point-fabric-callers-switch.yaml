@@ -1,0 +1,20 @@
+branch: feat/transit-point-fabric-callers-switch
+changes:
+  added:
+    - timestamp: '2026-11-03T11:56:07Z'
+      title: Let agents serving partner requests call a Transit Point from the dashboard
+      description: >-
+        The Transit Point panel's Who can call this Transit Point section has a new switch, Let
+        agents serving partner requests call it, which sets allow_fabric_callers. While the
+        managed agent serves a request a paired gateway sent over Fabric, it then gets a transit
+        token that opens this Transit Point, so it can call onward. Until now the setting could
+        only be changed through the admin API. The switch is off by default and shows where it
+        has an effect: the transit token is required and the surface Target is an HTTP or HTTPS
+        agent. A stored setting that has no effect still shows, with a note, so it can be turned
+        off. Per-user credential release to these calls stays an admin API setting that the
+        switch does not change; the panel notes it while both are on.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

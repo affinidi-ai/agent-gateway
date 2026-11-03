@@ -18,6 +18,7 @@ import {
   providerTargetAuthFromApi,
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
+import { targetIsHttpAgent } from './callerAuth';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import { filterSelectableGateways } from '../../../../utils/gateways';
 
@@ -521,6 +522,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
       <TransitCallerSection
         config={config}
         alias={alias}
+        agentTargetIsHttp={targetIsHttpAgent(allNodes)}
         updateField={updateField}
         updateFields={updateFields}
       />

@@ -132,6 +132,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].require_transit_token',
   'transit.points[*].source_auth',
   'transit.points[*].allow_unauthenticated_callers',
+  'transit.points[*].allow_fabric_callers',
   'transit.points[*].fabric_delegated_credentials',
   'transit.points[*].trust_check_list',
   'transit.points[*].trust_check_migrated',
