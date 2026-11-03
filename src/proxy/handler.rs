@@ -22230,8 +22230,8 @@ allow if {
             .filter(|line| line.contains("No surface route matches path"))
             .collect();
         assert_eq!(misses.len(), 1, "{text}");
-        assert!(misses[0].contains(&format!("\"/unknown/{}\"...", &tail[..247])), "{}", misses[0]);
-        assert!(!misses[0].contains(&tail[..248]), "{}", misses[0]);
+        assert!(misses[0].contains(&loggable::untrusted(&format!("/unknown/{tail}"))), "{}", misses[0]);
+        assert!(!misses[0].contains(&tail), "{}", misses[0]);
         assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
     }
 

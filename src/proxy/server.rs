@@ -195,8 +195,6 @@ pub(crate) fn join_host_and_route(
     }
 }
 
-/// Run a listener for a specific port that handles multiple channels with different routes
-/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
 /// The host of a URL string, without its port, in lower case and in the form the
 /// URL parser normalises it to: an IPv6 address in brackets and compressed, so
 /// `[2001:DB8:0::1]` and `[2001:db8::1]` are the same host. `None` for a URL
@@ -419,6 +417,8 @@ pub(crate) fn open_transit_points(
         .collect()
 }
 
+/// Run a listener for a specific port that handles multiple channels with different routes
+/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
 pub async fn run_port_server(
     port: u16,
     surfaces: Vec<crate::config::agent_surface::AgentSurface>,
@@ -2709,10 +2709,6 @@ mod tests {
         assert_eq!(extract_hostname("http://example.com:8080/foo"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("https://Example.COM"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("no-scheme"), None);
-    }
-
-    #[test]
-    fn extract_hostname_keeps_ipv4_and_whole_ipv6_hosts() {
         assert_eq!(extract_hostname("http://10.0.0.1:8080/x"), Some("10.0.0.1".to_string()));
         assert_eq!(extract_hostname("https://[2001:db8::1]:8443/x"), Some("[2001:db8::1]".to_string()));
         assert_eq!(extract_hostname("https://[::1]"), Some("[::1]".to_string()));

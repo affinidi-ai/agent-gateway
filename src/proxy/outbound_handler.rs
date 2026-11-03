@@ -2493,8 +2493,7 @@ pub(crate) fn should_forward_outbound_request_header(
 
 /// Whether `name` is a header a proxy sets to tell the next hop who connected to
 /// it, for which host and over what: `Forwarded`, `X-Real-IP` and every
-/// `X-Forwarded-*` header. A Transit Point caller's own are its claims, not what
-/// the gateway saw, so none reaches the target.
+/// `X-Forwarded-*` header.
 fn is_proxy_forwarding_header(name: &str) -> bool {
     const X_FORWARDED: &str = "x-forwarded-";
     name.eq_ignore_ascii_case("forwarded")

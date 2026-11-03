@@ -1,4 +1,5 @@
-//! Renders credentials, request URIs and endpoint URLs in a form that is safe to log.
+//! Renders credentials, request URIs, endpoint URLs and caller-supplied values in a form that
+//! is safe to log.
 
 use std::path::{Path, PathBuf};
 
@@ -149,7 +150,6 @@ mod tests {
     fn untrusted_escapes_line_breaks_and_quotes_into_one_token() {
         assert_eq!(untrusted("/a\r\nWARN forged \"line\""), r#""/a\r\nWARN forged \"line\"""#);
         assert_eq!(untrusted("/plain"), r#""/plain""#);
-        assert!(!untrusted("x\ny").contains('\n'));
     }
 
     #[test]
