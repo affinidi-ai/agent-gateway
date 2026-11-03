@@ -505,7 +505,7 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 .as_ref()
                 .map(|owners| {
                     keys.iter()
-                        .filter_map(|key| owners.get(&key.key_id))
+                        .filter_map(|key_id| owners.get(key_id))
                         .flatten()
                         .cloned()
                         .collect::<Vec<_>>()

@@ -1478,12 +1478,6 @@ fn transit_point_identity(key_id: &str) -> Value {
     }]})
 }
 
-fn plain_api_key_caller(secret_id: &str) -> Value {
-    json!({"methods": [{
-        "type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": secret_id
-    }]})
-}
-
 struct OwnedKeys {
     tenant_a: String,
     tenant_b: String,
@@ -1558,41 +1552,6 @@ async fn a_surface_names_a_provider_key_only_when_it_may_reference_the_keys_surf
         ))
         .await,
         "API key reference is not accessible",
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_plain_api_key_secret_cannot_share_the_did_of_another_tenants_provider_key() {
-    let (_harness, api) = harness(RuleMode::Warn).await;
-    let keys = owned_keys(&api).await;
-    let unmatched = "atgk_ffffffffffffffffffffffffffffffff";
-    for secret_id in [&keys.tenant_b, &keys.tenant_a, unmatched] {
-        api.secret(secret_id, Some("tenant-a"), "v")
-            .await;
-    }
-    let caller = |route: &str, secret_id: &str| {
-        api.surface(
-            route,
-            Some("tenant-a"),
-            json!({"access_point": {
-                "listen_address": api.listener, "route": route, "protocol": "a2a",
-                "caller_authentication": plain_api_key_caller(secret_id)
-            }}),
-        )
-    };
-
-    assert_refused(
-        api.create(&caller("/smoke/secret-cross", &keys.tenant_b))
-            .await,
-        NOT_ACCESSIBLE_KEY_OWNER,
-    );
-    assert_saved(
-        api.create(&caller("/smoke/secret-own", &keys.tenant_a))
-            .await,
-    );
-    assert_saved(
-        api.create(&caller("/smoke/secret-unmatched", unmatched))
-            .await,
     );
 }
 

@@ -1240,26 +1240,23 @@ impl ReferenceAuthorizer<'_> {
         self.ensure(resource.tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
     }
 
-    /// A provider key a surface derives a DID from must exist, unless it is only a plain
-    /// secret's id, and its owning surface must be one this surface may reference.
+    /// A provider key a surface derives a DID from must exist, and its owning surface must be
+    /// one this surface may reference.
     async fn provider_keys(
         &self,
-        keys: &[ProviderKeyReference],
+        keys: &[String],
     ) -> Result<(), SurfaceApiError> {
         if keys.is_empty() {
             return Ok(());
         }
         let owners = provider_key_owners(self.state).await?;
-        for key in keys {
-            match owners.get(&key.key_id) {
-                Some(surface_ids) => {
-                    for surface_id in surface_ids {
-                        self.api_key_parent(surface_id, &key.key_id)
-                            .await?;
-                    }
-                }
-                None if key.required => return Err(inaccessible("API key")),
-                None => {}
+        for key_id in keys {
+            let surface_ids = owners
+                .get(key_id)
+                .ok_or_else(|| inaccessible("API key"))?;
+            for surface_id in surface_ids {
+                self.api_key_parent(surface_id, key_id)
+                    .await?;
             }
         }
         Ok(())
@@ -1575,52 +1572,33 @@ fn collect_identity_injection_references(
     }
 }
 
-/// An API Key Provider key id a surface derives a DID from. `required` is false for a plain
-/// API Key `secret_id` shaped like a key id: it needs no provider key, but when one exists the
-/// secret shares that key's DID.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProviderKeyReference {
-    pub key_id: String,
-    pub required: bool,
-}
-
-pub(crate) fn collect_provider_key_references(
-    surface: &AgentSurface
-) -> Result<Vec<ProviderKeyReference>, SurfaceApiError> {
-    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+/// The API Key Provider key ids a surface derives a DID from, sorted and without duplicates.
+pub(crate) fn collect_provider_key_references(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
+    use crate::source_auth::ManagedIdentityConfig;
     let mut keys = Vec::new();
-    let mut push = |id: Option<&str>, required: bool| {
-        if let Some(id) = id.filter(|id| id.starts_with(crate::api_keys::KEY_ID_PREFIX)) {
-            keys.push(ProviderKeyReference {
-                key_id: id.to_string(),
-                required,
-            });
+    let mut push = |identity: Option<&ManagedIdentityConfig>| {
+        if let Some(ManagedIdentityConfig::FromApiKey { api_key_id: Some(id) }) = identity
+            && id.starts_with(crate::api_keys::KEY_ID_PREFIX)
+        {
+            keys.push(id.clone());
         }
     };
-    let api_key_id = |identity: Option<&ManagedIdentityConfig>| match identity {
-        Some(ManagedIdentityConfig::FromApiKey { api_key_id }) => api_key_id.clone(),
-        _ => None,
-    };
     for view in resolved_views(surface)? {
-        for identity in [
+        push(
             view.identity_slots
                 .protected
                 .as_ref(),
+        );
+        push(
             view.identity_slots
                 .external
                 .as_ref(),
-        ] {
-            push(api_key_id(identity).as_deref(), true);
-        }
+        );
         push(
-            api_key_id(
-                crate::config::agent_surface_compat::identity_injection_to_managed_identity(
-                    &view.target.identity_injection,
-                )
-                .as_ref(),
+            crate::config::agent_surface_compat::identity_injection_to_managed_identity(
+                &view.target.identity_injection,
             )
-            .as_deref(),
-            true,
+            .as_ref(),
         );
         for point in view
             .transit
@@ -1628,32 +1606,14 @@ pub(crate) fn collect_provider_key_references(
             .flat_map(|transit| &transit.points)
         {
             push(
-                api_key_id(
-                    point
-                        .managed_identity
-                        .as_ref(),
-                )
-                .as_deref(),
-                true,
+                point
+                    .managed_identity
+                    .as_ref(),
             );
         }
-        for method in view
-            .access_point
-            .caller_authentication
-            .iter()
-            .flat_map(|authentication| &authentication.methods)
-        {
-            if let SourceAuthConfig::ApiKey(config) = method {
-                push(Some(&config.secret_id), false);
-            }
-        }
     }
-    keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
-    keys.dedup_by(|later, kept| {
-        let duplicate = later.key_id == kept.key_id;
-        kept.required |= duplicate && later.required;
-        duplicate
-    });
+    keys.sort();
+    keys.dedup();
     Ok(keys)
 }
 
@@ -2009,19 +1969,7 @@ mod tests {
 
         let keys = collect_provider_key_references(&surface).unwrap();
 
-        let key = |key_id: &str, required: bool| ProviderKeyReference {
-            key_id: key_id.into(),
-            required,
-        };
-        assert_eq!(
-            keys,
-            vec![
-                key("atgk_injected", true),
-                key("atgk_point", true),
-                key("atgk_secret", false),
-                key("atgk_shared", true),
-            ]
-        );
+        assert_eq!(keys, ["atgk_injected", "atgk_point", "atgk_shared"]);
         assert!(
             collect_provider_key_references(&AgentSurface::default())
                 .unwrap()
