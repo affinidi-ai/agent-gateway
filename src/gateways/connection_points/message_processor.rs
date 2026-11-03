@@ -4078,8 +4078,8 @@ pub(super) fn fabric_response_workload_binding(
 
 /// The transit token the managed agent behind `surface` gets with a request a
 /// Fabric peer sent: when `target_url`, the Target, is the agent itself, by
-/// HTTP or HTTPS, and a Transit Point of the surface sets
-/// `allow_fabric_callers`. The token opens only those Transit Points. A Target
+/// HTTP or HTTPS, and the surface has a Transit Point. The token names every
+/// Transit Point of the surface, as the Access Point's token does. A Target
 /// the gateway runs has no agent to hold one, and an agent card fetch is no
 /// request of the agent's own. `max_lifetime_secs` is the appliance's
 /// `transit_token_max_lifetime_secs`. Its only principal,
@@ -4102,7 +4102,6 @@ pub(super) fn fabric_receive_transit_token(
     let allowed_transit_points: Vec<String> = surface
         .transit_points()
         .iter()
-        .filter(|point| point.allow_fabric_callers)
         .map(|point| point.alias.clone())
         .collect();
     if allowed_transit_points.is_empty() || !agent_target || agent_card_request {

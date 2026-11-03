@@ -94,9 +94,7 @@ fn surface(
 ) -> AgentSurface {
     let points: Vec<Value> = aliases
         .iter()
-        .map(|alias| {
-            json!({ "alias": alias, "target_endpoint": format!("https://{alias}.example"), "allow_fabric_callers": true })
-        })
+        .map(|alias| json!({ "alias": alias, "target_endpoint": format!("https://{alias}.example") }))
         .collect();
     let mut surface = json!({
         "surface_id": SURFACE_ID, "name": SURFACE_ID,
@@ -1322,10 +1320,11 @@ fn a_fabric_token_is_issued_only_for_an_agent_behind_an_http_target() {
     ));
 }
 
-/// The token opens only the Transit Points that set `allow_fabric_callers`,
-/// and none is issued when no Transit Point sets it.
+/// The token names every Transit Point of the surface, as the Access Point's
+/// token does, whether or not it requires the token, and none is issued for a
+/// surface without Transit Points.
 #[test]
-fn a_fabric_token_opens_only_the_transit_points_that_allow_fabric_callers() {
+fn a_fabric_token_names_every_transit_point_of_the_surface() {
     let issuer = test_issuer();
     let issue = |surface: &AgentSurface| {
         fabric_receive_transit_token(
@@ -1344,22 +1343,17 @@ fn a_fabric_token_opens_only_the_transit_points_that_allow_fabric_callers() {
         .as_mut()
         .unwrap()
         .points[1]
-        .allow_fabric_callers = false;
+        .require_transit_token = false;
     let (token, _) = issue(&mixed)
         .unwrap()
-        .expect("a token for the Transit Point that allows Fabric callers");
+        .expect("a token for a surface with Transit Points");
     let claims = issuer
         .validate(&token, 300)
         .unwrap();
-    assert_eq!(claims.allowed_transit_points, vec!["crm".to_string()]);
+    assert_eq!(claims.allowed_transit_points, vec!["crm".to_string(), "billing".to_string()]);
 
-    let mut none = mixed.clone();
-    none.transit
-        .as_mut()
-        .unwrap()
-        .points[0]
-        .allow_fabric_callers = false;
-    assert_eq!(issue(&none), Ok(None), "no Transit Point allows Fabric callers");
+    let without_points = surface("a2a", "https://agent.example", &[]);
+    assert_eq!(issue(&without_points), Ok(None), "a surface without Transit Points gets no token");
 }
 
 /// A Fabric request whose managed agent should get a transit token that cannot

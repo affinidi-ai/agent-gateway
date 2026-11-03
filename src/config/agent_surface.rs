@@ -1504,17 +1504,12 @@ pub struct TransitPoint {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fabric_delegated_credentials: bool,
 
-    /// Lets the managed agent call this Transit Point while it serves a
-    /// request a paired gateway sent over Fabric: the transit token issued for
-    /// that request opens only the Transit Points that set it. Off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_fabric_callers: bool,
     /// Releases delegated per-user credentials for a call whose transit token
     /// this gateway issued for a request a paired gateway sent over Fabric,
     /// keyed by the caller the receiving surface's own `source_auth` or
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
-    /// may set it, and it has an effect only beside `allow_fabric_callers`.
+    /// may set it.
     /// The admin API refuses it on a surface whose caller authentication
     /// cannot tell a partner's users apart
     /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
@@ -5814,7 +5809,6 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
-                        allow_fabric_callers: false,
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
@@ -5847,7 +5841,6 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
-                        allow_fabric_callers: false,
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,

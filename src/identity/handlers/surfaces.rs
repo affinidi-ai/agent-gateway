@@ -2896,11 +2896,10 @@ fn retain_mcp_settings(
     settle_retained_protected_resources(surface, base_retained, &retained_aliases, network)
 }
 
-/// PUT carries the whole record, or a variant PUT its whole overrides, but the
-/// Surface Builder shows none of a Transit Point's `source_auth`,
-/// `allow_unauthenticated_callers`, `allow_fabric_callers` and
-/// `delegated_credentials_for_fabric_callers`, so a save from it omits them.
-/// An omitted `allow_fabric_callers` is kept. An omitted
+/// PUT carries the whole record, or a variant PUT its whole overrides, but a
+/// Surface Builder save may leave out a Transit Point's `source_auth` and
+/// `allow_unauthenticated_callers`, and never sends
+/// `delegated_credentials_for_fabric_callers`. An omitted
 /// `source_auth` means unchanged, as an omitted `mcp_http.authorization` does;
 /// removal is explicit: a `null` `source_auth` in the PUT, or a merge PATCH
 /// whose Transit Points leave it out. The save rules then refuse a Transit
@@ -3091,7 +3090,7 @@ fn carry_point_ids(
 }
 
 /// Keeps each Transit Point's stored `source_auth`,
-/// `allow_unauthenticated_callers`, `allow_fabric_callers` and
+/// `allow_unauthenticated_callers` and
 /// `delegated_credentials_for_fabric_callers` that `sent_points`, the JSON the
 /// request sent for `points`, leaves out; see
 /// `retain_transit_caller_authentication`.
@@ -3121,14 +3120,6 @@ fn retain_transit_points_caller_authentication(
         });
         if !sends_open_flag && previous.allow_unauthenticated_callers && !point.authenticates_callers() {
             point.allow_unauthenticated_callers = true;
-        }
-        let sends_fabric_flag = sent_point.is_some_and(|point| {
-            point
-                .get("allow_fabric_callers")
-                .is_some()
-        });
-        if !sends_fabric_flag && previous.allow_fabric_callers {
-            point.allow_fabric_callers = true;
         }
         let sends_fabric_caller_delegation = sent_point.is_some_and(|point| {
             point
@@ -5417,53 +5408,26 @@ mod validation_tests {
         );
     }
 
-    /// A PUT that leaves out a Transit Point's `allow_fabric_callers`, as a
-    /// Surface Builder save does, keeps the stored one, on the surface and in a
-    /// variant; one that sends it, `false` included, sets it.
+    /// A Transit Point stored with the removed `allow_fabric_callers` still
+    /// loads, on the surface and in a variant, and a save writes it without
+    /// the setting.
     #[test]
-    fn a_save_that_omits_allow_fabric_callers_keeps_it() {
-        let point = |allow: Option<bool>| {
-            let mut point = serde_json::json!({ "id": "tp-crm", "alias": "crm", "target_endpoint": "fabric://gw/crm",
-                "require_transit_token": true });
-            if let Some(allow) = allow {
-                point["allow_fabric_callers"] = serde_json::json!(allow);
-            }
-            point
-        };
-        let existing =
-            surface_with_transit_points(serde_json::json!([point(Some(true))]), serde_json::json!([point(Some(true))]));
-        let allows = |surface: &AgentSurface| {
-            (
-                surface
-                    .transit
-                    .as_ref()
-                    .unwrap()
-                    .points[0]
-                    .allow_fabric_callers,
-                surface.variants[0]
-                    .overrides
-                    .transit
-                    .as_ref()
-                    .and_then(|transit| transit.points.as_ref())
-                    .unwrap()[0]
-                    .allow_fabric_callers,
-            )
-        };
-        let save = |sent_point: serde_json::Value| {
-            let mut surface = surface_with_transit_points(
-                serde_json::json!([sent_point.clone()]),
-                serde_json::json!([sent_point.clone()]),
-            );
-            let sent = serde_json::json!({
-                "transit": { "points": [sent_point.clone()] },
-                "variants": [{ "id": "candidate", "overrides": { "transit": { "points": [sent_point] } } }]
-            });
-            retain_transit_caller_authentication(&mut surface, &existing, &sent);
-            allows(&surface)
-        };
-
-        assert_eq!(save(point(None)), (true, true), "an omitted setting is kept");
-        assert_eq!(save(point(Some(false))), (false, false), "a sent false turns it off");
+    fn a_stored_allow_fabric_callers_loads_and_is_not_written_back() {
+        let point = serde_json::json!({ "id": "tp-crm", "alias": "crm", "target_endpoint": "fabric://gw/crm",
+            "require_transit_token": true, "allow_fabric_callers": true });
+        let surface = surface_with_transit_points(serde_json::json!([point.clone()]), serde_json::json!([point]));
+        let written = serde_json::to_value(&surface).expect("surface serializes");
+        assert_eq!(written["transit"]["points"][0]["alias"], "crm");
+        assert!(
+            written["transit"]["points"][0]
+                .get("allow_fabric_callers")
+                .is_none()
+        );
+        assert!(
+            written["variants"][0]["overrides"]["transit"]["points"][0]
+                .get("allow_fabric_callers")
+                .is_none()
+        );
     }
 
     /// A shared-issuer warning names the variant whose overrides define the

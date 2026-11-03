@@ -1,0 +1,31 @@
+branch: feat/fabric-transit-token-all-transit-points
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-03T15:20:42Z'
+      title: ⭐ Let agents serving partner requests call every Transit Point of their surface
+      description: >-
+        A managed agent serving a request a paired gateway sent over Fabric now gets a transit
+        token for every Transit Point of the surface, as it does for a direct caller, so it can
+        call onward with no extra setting. Before, it got one only for Transit Points that set
+        allow_fabric_callers, which was off by default and could be set only through the admin
+        API. After upgrading, a partner that reaches a surface can make its agent call all of
+        that surface's Transit Points, with the credentials each sends, its static target_auth
+        included, and delegated_credentials_for_fabric_callers takes effect on a Transit Point
+        that sets it without allow_fabric_callers. Partner reach is now decided per surface:
+        expose to each remote gateway (Publishing tab) only the surfaces whose Transit Points it
+        may drive, and keep a sensitive Transit Point on a separate surface no partner reaches.
+        After upgrading, review each remote gateway's exposure (a peer migrated from a release
+        before exposure modes can reach every surface) and any Transit Point policy that admits
+        every verified or non-anonymous caller, which also admits a partner's call; see
+        FABRIC.md, Which Transit Points a partner can drive.
+  fixed: []
+  removed:
+    - timestamp: '2026-11-03T15:20:42Z'
+      title: Stop reading a Transit Point's allow_fabric_callers setting
+      description: >-
+        allow_fabric_callers no longer has an effect, since a token issued for a partner's
+        request now opens every Transit Point of the surface. A stored surface that has it still
+        loads, and the next save drops it.
+  security: []
+  breaking: []

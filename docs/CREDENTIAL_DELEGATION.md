@@ -514,8 +514,7 @@ either, so such a call needs the Transit Point's managed identity: its own `mana
 or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
 one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
 Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
-header saying so. The switch has an effect only on a Transit Point that also sets
-`allow_fabric_callers`, since a token issued for a partner's request opens no other.
+header saying so.
 
 The switch releases anything only when the receiving surface verifies a per-user credential on
 each Fabric request. Only two kinds of caller authentication can tell a partner's users apart: a
