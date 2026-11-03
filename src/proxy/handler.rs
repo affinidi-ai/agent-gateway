@@ -10120,7 +10120,12 @@ async fn handle_onboarding_request(
     mut connection_guard: ConnectionGuard,
     _req: Request,
 ) -> Result<Response, Response> {
-    info!(channel = channel_name, method = %method, path = %uri.path(), "Onboarding channel detected");
+    info!(
+        channel = channel_name,
+        method = %method,
+        path = %loggable::untrusted(&loggable::path(uri.path())),
+        "Onboarding channel detected"
+    );
 
     // Onboarding handler implementation would go here - this is a simplified version
     // The full implementation is quite long (lines 1438-1695 in original file)
