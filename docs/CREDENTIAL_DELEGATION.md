@@ -176,10 +176,12 @@ tenant](#provider-secrets-belong-to-the-providers-tenant)).
   rebuild its id index when it is asked for an id it does not know. A secret the type sends that
   no longer exists reports `SecretUnavailable` and a secrets store error `StoreUnavailable`;
   neither serves the cached token nor sends a request.
-- After a new token is stored, the expired tokens of the same agent, provider and purpose
-  (those left by earlier settings, scopes or secret versions) are removed from the vault.
-  Unexpired tokens, user grants, pending consents and refresh claims are kept. A failure to
-  remove them is logged as a warning only. A token response without `expires_in`, with an empty token, or
+- The expired tokens of the same agent, provider and purpose (those left by earlier
+  settings, scopes or secret versions) are removed from the vault in the same step that
+  stores the new token, under the same vault lock and the same read of the vault, so a fresh
+  token costs one scan of the vault, not two. Unexpired tokens, user grants and pending
+  consents are kept, and so are the refresh claims of the tokens that are kept. A failure to remove them is logged as a warning only and does
+  not fail the store. A token response without `expires_in`, with an empty token, or
   with a `token_type` other than `Bearer` is refused, as is a response over 64 KiB or slower
   than `credential_policy.token_request_timeout_secs` (30 by default); only the response's OAuth `error` code is logged (see _Logging token endpoint errors_ below).
 - When scopes were requested, the issued `scope` must name the same set, or the token is

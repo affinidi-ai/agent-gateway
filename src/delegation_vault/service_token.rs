@@ -256,33 +256,29 @@ pub async fn acquire(
         })?;
     let token = context
         .vault
-        .store(DelegationToken {
-            id: uuid::Uuid::new_v4().to_string(),
-            agent_did: key.agent_did.into(),
-            user_identity_hash: identity,
-            credential_provider_id: provider.id.clone(),
-            provider_id: provider.provider_id.clone(),
-            access_token: response.access_token,
-            refresh_token: None,
-            token_type: response.token_type,
-            scopes: granted,
-            expires_at: Some(expires_at),
-            delegation_vc: None,
-            consent_identity: None,
-            consent_granted_at: created,
-            last_used_at: Some(created),
-            created_at: created,
-            updated_at: created,
-        })
+        .store_replacing_expired(
+            DelegationToken {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_did: key.agent_did.into(),
+                user_identity_hash: identity,
+                credential_provider_id: provider.id.clone(),
+                provider_id: provider.provider_id.clone(),
+                access_token: response.access_token,
+                refresh_token: None,
+                token_type: response.token_type,
+                scopes: granted,
+                expires_at: Some(expires_at),
+                delegation_vc: None,
+                consent_identity: None,
+                consent_granted_at: created,
+                last_used_at: Some(created),
+                created_at: created,
+                updated_at: created,
+            },
+            key.purpose,
+        )
         .await
         .map_err(|_| ServiceTokenError::StoreUnavailable)?;
-    if let Err(error) = context
-        .vault
-        .prune_expired(key.agent_did, &provider.id, key.purpose, &token.id)
-        .await
-    {
-        warn!(target: "credential_delegation", provider_id = %provider.provider_id, %error, "Could not remove expired service tokens");
-    }
     Ok(ServiceToken::issued(token, Freshness::Fresh, insecure_endpoint))
 }
 

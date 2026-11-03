@@ -75,7 +75,8 @@ changes:
         reference left from another type, such as an API key kept after a provider became
         client credentials, is neither read nor part of the key, so deleting or rotating its
         secret no longer fails requests or renews the token. Expired service tokens of the same provider are removed from
-        the vault when a new one is stored. Upgrade note: each binding and target
+        the vault in the same step that stores a new one, which reads the vault once.
+        Upgrade note: each binding and target
         authentication requests one new token after the upgrade.
     - timestamp: '2026-10-30T23:00:04Z'
       title: Send one token request per credential at a time
