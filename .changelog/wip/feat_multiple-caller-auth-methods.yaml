@@ -51,7 +51,7 @@ changes:
         method, naming the methods after the first.
   breaking:
     - timestamp: '2026-11-03T14:40:00.000Z'
-      title: Fail requests carrying two credentials and trim stored methods breaking the new rules
+      title: Fail requests carrying two credentials and trim rule-breaking stored methods
       description: >-
         A request carrying credentials for two of a surface's methods, which the first
         method used to verify, now fails source authentication: it is refused on a
