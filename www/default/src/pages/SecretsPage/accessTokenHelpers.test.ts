@@ -1,4 +1,5 @@
 import {
+  ACCESS_TOKEN_RESOURCE_KINDS,
   accessTokenExpiryBounds,
   canonicalResourceTarget,
   evaluateScopePreview,
@@ -60,6 +61,25 @@ describe('access-token tenant scope helpers', () => {
     ]) {
       expect(validateScopeConfig(pattern, [header]).length).toBeGreaterThan(0);
     }
+  });
+
+  it('accepts every resource kind the backend names, the delegation vault included', () => {
+    expect(ACCESS_TOKEN_RESOURCE_KINDS).toContain('delegation-vault');
+    const tenant = 'TENANT:${x-external-account}:';
+    for (const kind of ACCESS_TOKEN_RESOURCE_KINDS) {
+      expect(validateScopeConfig(`${tenant}(?:secrets:demo-.*|${kind}:.*)`, [header])).toEqual([]);
+    }
+    expect(
+      validateScopeConfig(
+        'TENANT:${x-external-account}:(?:credential-providers:.*|delegation-vault:boris-.*)',
+        [header]
+      )
+    ).toEqual([]);
+    expect(
+      validateScopeConfig('TENANT:${x-external-account}:(?:secrets:.*|delegation-vaults:.*)', [
+        header,
+      ]).length
+    ).toBeGreaterThan(0);
   });
 
   it('builds and matches the canonical UUID resource target', () => {

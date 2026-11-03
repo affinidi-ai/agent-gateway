@@ -25,6 +25,7 @@ export const ACCESS_TOKEN_RESOURCE_KINDS = [
   'credential-providers',
   'jwt-verification-strategies',
   'sts-clients',
+  'delegation-vault',
 ] as const;
 
 export type AccessTokenResourceKind = (typeof ACCESS_TOKEN_RESOURCE_KINDS)[number];

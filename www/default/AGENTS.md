@@ -615,7 +615,9 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 - Keeps the shared `required_headers` and `resource_pattern` fields, and enforces Agent
   Gateway's canonical values: blank is appliance-wide, and every nonblank pattern is
   `TENANT:${one-header}:<bounded-resource-selector>` with every alternative starting in a
-  known resource kind.
+  known resource kind. The known kinds (`ACCESS_TOKEN_RESOURCE_KINDS` in
+  `accessTokenHelpers.ts`) list every backend `ResourceKind`; a Rust test in `src/tenancy`
+  fails while one is missing.
 - The tester uses the compact sample-header and **Sample entity ID** rows, plus Agent
   Gateway's resource-kind selector and canonical target.
 - Static patterns, repeated or multiple placeholders, and tenant-wide catch-alls block
