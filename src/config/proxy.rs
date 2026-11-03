@@ -446,6 +446,48 @@ pub fn fall_back_to_first_source_auth_method(
     Some(error.to_string())
 }
 
+/// One line per surface, and per variant overriding its caller
+/// authentication, with more than one source authentication method, naming
+/// the methods after the first. Releases before several methods were
+/// supported enforced only the first, so on upgrade the later ones start
+/// authenticating callers; the gateway logs each line at startup so an
+/// operator can check them.
+pub fn additional_source_auth_method_notices(surface: &crate::config::agent_surface::AgentSurface) -> Vec<String> {
+    let describe = |label: String, methods: &[crate::source_auth::SourceAuthConfig]| {
+        (methods.len() > 1).then(|| {
+            let later = methods
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(index, method)| format!("{} ({})", index + 1, method.method_tag()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{label}: source authentication methods after the first authenticate callers: {later}; releases \
+                 before several methods were supported enforced only the first"
+            )
+        })
+    };
+    let base = format!("Surface '{}' ({})", surface.name, surface.surface_id);
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            let methods = &variant
+                .overrides
+                .access_point
+                .as_ref()?
+                .caller_authentication
+                .as_ref()?
+                .methods;
+            describe(format!("{base} variant '{}'", variant.alias), methods)
+        });
+    describe(base.clone(), surface.source_auth_methods())
+        .into_iter()
+        .chain(variants)
+        .collect()
+}
+
 /// The rules a stored surface's source authentication methods must meet to
 /// load: each method's own, and those that let a request select one method.
 fn validate_stored_source_auth_methods(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
@@ -818,6 +860,36 @@ mod tests {
 
     fn did_auth_method(header: &str) -> serde_json::Value {
         serde_json::json!({"type": "did_auth", "extraction": {"source": "http_header", "field": header}})
+    }
+
+    #[test]
+    fn notices_name_the_methods_after_the_first_on_the_surface_and_its_variants() {
+        let single = surface_with_caller_auth(serde_json::json!([jwt_method()]), serde_json::json!({}));
+        assert!(additional_source_auth_method_notices(&single).is_empty());
+
+        let surface = surface_with_caller_auth(
+            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
+            serde_json::json!({"variants": [
+                {"id": "v1", "alias": "partners", "name": "Partners", "overrides": {"access_point": {
+                    "caller_authentication": {"methods": [api_key_method("X-API-Key"), did_auth_method("X-DID")]}
+                }}},
+                {"id": "v2", "alias": "plain", "name": "Plain"}
+            ]}),
+        );
+        let notices = additional_source_auth_method_notices(&surface);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices[0].starts_with("Surface 'multi' (s1): ")
+                && notices[0].contains("authenticate callers: 2 (api_key);"),
+            "{}",
+            notices[0]
+        );
+        assert!(
+            notices[1].starts_with("Surface 'multi' (s1) variant 'partners': ")
+                && notices[1].contains("authenticate callers: 2 (did_auth);"),
+            "{}",
+            notices[1]
+        );
     }
 
     #[test]

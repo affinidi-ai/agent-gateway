@@ -84,6 +84,12 @@ gateway configuration):
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
 
+Upgrading turns on every method of a stored surface: earlier releases enforced only the first
+and ignored the rest, so a caller presenting a later method's credential, which failed before,
+is now authenticated. At startup the gateway logs, at `info`, one line per surface and per
+variant with more than one method, naming the methods after the first
+([`additional_source_auth_method_notices`](../src/config/proxy.rs)).
+
 Surfaces stored before these rules may break them, because the gateway then enforced only
 the first method and ignored the rest. At startup, a stored surface whose methods break them
 keeps only its first method, when that method is valid alone, the gateway logs an error naming

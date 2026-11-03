@@ -705,6 +705,9 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                                  method; resolve via the UI or API"
                             );
                         }
+                        for notice in config::additional_source_auth_method_notices(surface) {
+                            info!("{notice}");
+                        }
                     }
 
                     // Load x402 headers from x402.json
@@ -977,6 +980,12 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
     disable_duplicate_route_surfaces(&store, &mut channels, &network_config).await?;
     surfaces::strip_unsupported_header_metadata_mappings(&store, &mut channels).await?;
     surfaces::fall_back_to_first_source_auth_methods(&store, &mut channels).await?;
+    for notice in channels
+        .iter()
+        .flat_map(config::additional_source_auth_method_notices)
+    {
+        info!("{notice}");
+    }
     surfaces::clear_dangling_default_variants(&store, &mut channels).await?;
     surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
         surfaces::RetiredA2aSwitches::read(bootstrap)

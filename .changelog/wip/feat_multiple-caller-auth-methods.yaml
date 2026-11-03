@@ -26,21 +26,28 @@ changes:
         from a menu, and made primary or removed in the editor.
   changed:
     - timestamp: '2026-10-30T16:00:00.000Z'
-      title: Serve stored surfaces with extra source authentication methods safely on upgrade
+      title: Keep serving stored surfaces whose source authentication methods break the new rules
       description: >-
-        Methods after the first in a stored surface's `caller_authentication.methods` used to be
-        ignored and now take effect, so a request carrying one of their credentials is verified
-        by that method, and a request carrying credentials for two of the methods, which the
-        first method used to verify, is refused. A stored surface whose methods break the new
-        rules (two methods on one credential location, a second DID Auth method, a
-        body-extracted method beside another, or an invalid later method) no longer stops the
-        gateway from starting: it keeps only its first method, the gateway logs an error naming
-        the surface and the rule, and local storage persists the correction. A stored
-        `from_jwt_claim` identity beside a method other than JWT bearer, or an inbound
-        `from_api_key` identity beside a method other than an API key, is logged as a warning at
-        startup and refused on the next save; until then a caller verified by that other method
-        is refused.
+        A stored surface whose methods break the new rules (two methods on one credential
+        location, a second DID Auth method, a body-extracted method beside another, or an invalid
+        later method) no longer stops the gateway from starting: it keeps only its first method,
+        the gateway logs an error naming the surface and the rule, and local storage persists the
+        correction. A stored `from_jwt_claim` identity beside a method other than JWT bearer, or
+        an inbound `from_api_key` identity beside a method other than an API key, is logged as a
+        warning at startup and refused on the next save; until then a caller verified by that
+        other method is refused.
   fixed: []
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-03T14:40:00.000Z'
+      title: Methods after the first in `caller_authentication.methods` now authenticate callers
+      description: >-
+        Earlier releases enforced only the first method in a stored surface's
+        `caller_authentication.methods` and ignored the rest. They now take effect, which widens
+        who reaches the managed agent: a caller presenting only a later method's credential, which
+        failed (refused, or passed to policy as `source_auth.method == "failed"`), is now
+        authenticated by that method. A request carrying credentials for two of the methods, which
+        the first method used to verify, is now refused. At startup the gateway logs, at `info`,
+        one line per surface and per variant with more than one method, naming the methods after
+        the first, so operators can check them before traffic arrives.
