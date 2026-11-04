@@ -2,7 +2,14 @@ branch: fix/gate-management-routes
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-04T12:30:00Z'
+      title: Show the Dashboard metrics Delete button only to users with settings.edit
+      description: >-
+        The Dashboard's Gateway Configuration card showed the metrics Delete button to every
+        user, although truncating stored metrics needs `settings.edit`. The button now appears
+        only for users who hold `settings.edit`, so others no longer see an action the gateway
+        refuses.
   removed: []
   security:
     - timestamp: '2026-11-04T12:00:00Z'

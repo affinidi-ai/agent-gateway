@@ -150,6 +150,9 @@ surface, a not-ready one, or a surface without `public` and without a Caller Con
 after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
+_Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture

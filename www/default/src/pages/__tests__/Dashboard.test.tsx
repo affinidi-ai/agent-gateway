@@ -4,10 +4,15 @@ import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from '../Dashboard';
 import { useApp } from '../../context/AppContext';
+import { usePermissions } from '../../context/PermissionsContext';
 import { apiClient } from '../../api';
 
 jest.mock('../../context/AppContext', () => ({
   useApp: jest.fn(),
+}));
+
+jest.mock('../../context/PermissionsContext', () => ({
+  usePermissions: jest.fn(),
 }));
 
 jest.mock('../../api', () => ({
@@ -39,7 +44,18 @@ jest.mock('chart.js', () => ({
 }));
 
 const mockedUseApp = useApp as jest.Mock;
+const mockedUsePermissions = usePermissions as jest.Mock;
 const mockedApiClient = apiClient as jest.Mocked<typeof apiClient>;
+
+const grantPermissions = (granted: string[]) => {
+  mockedUsePermissions.mockReturnValue({
+    permissions: Object.fromEntries(granted.map(permission => [permission, true])),
+    loading: false,
+    error: null,
+    refetchPermissions: jest.fn(),
+    hasPermission: (permission: string) => granted.includes(permission),
+  });
+};
 
 type DashboardTestContext = {
   state: {
@@ -113,6 +129,37 @@ describe('Dashboard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockedApiClient.listSurfaces.mockResolvedValue([] as any);
+    grantPermissions(['settings.edit']);
+  });
+
+  it('hides the metrics Delete button without settings.edit', async () => {
+    grantPermissions(['settings.view', 'metrics.view']);
+    mockedUseApp.mockReturnValue(makeContextValue(0));
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => expect(mockedApiClient.listSurfaces).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByTestId('dashboard-logs-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('dashboard-metrics-delete-button')).not.toBeInTheDocument();
+  });
+
+  it('shows the metrics Delete button with settings.edit', async () => {
+    mockedUseApp.mockReturnValue(makeContextValue(0));
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => expect(mockedApiClient.listSurfaces).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByTestId('dashboard-metrics-delete-button')).toHaveTextContent('Delete');
   });
 
   it('forces a dashboard stats refresh on mount', () => {
