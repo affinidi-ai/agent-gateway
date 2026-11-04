@@ -58,7 +58,7 @@ Point, identifies callers by the same claim.
   path into `a`. Claims that name the token, its issuer, audience, client, tenant, session or
   lifetime are refused, since none names a person: `iss`, `aud`, `exp`, `iat`, `nbf`, `jti`,
   `azp`, `client_id`, `tid`, `idp`, `scope`, `scp`, `nonce`, `sid`, `act`, `cnf`, `typ`, `ver`,
-  `auth_time` and `amr`. Naming `sub` is the default, and is not stored.
+  `auth_time`, `amr` and `acr`. Naming `sub` is the default, and is not stored.
 - A strategy whose stored `principal_claim` is one the API refuses, such as one written to
   `_storage/` by hand, names no caller: JWT source authentication through it answers `500`.
 - `principal_claim` is fixed when the strategy is created. Changing it would change every

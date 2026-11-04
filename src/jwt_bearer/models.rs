@@ -54,7 +54,7 @@ const MAX_PRINCIPAL_CLAIM_LEN: usize = 128;
 /// tenant, session or lifetime rather than a person. Naming one would put
 /// every caller that shares its value, such as a whole tenant or application,
 /// under one identity hash.
-const NON_IDENTIFYING_CLAIMS: [&str; 20] = [
+const NON_IDENTIFYING_CLAIMS: [&str; 21] = [
     "iss",
     "aud",
     "exp",
@@ -75,6 +75,7 @@ const NON_IDENTIFYING_CLAIMS: [&str; 20] = [
     "ver",
     "auth_time",
     "amr",
+    "acr",
 ];
 
 impl JwtVerificationStrategy {
@@ -297,6 +298,7 @@ mod tests {
             "ver",
             "auth_time",
             "amr",
+            "acr",
         ] {
             assert!(normalize_principal_claim(Some(refused)).is_err(), "{refused:?}");
         }
