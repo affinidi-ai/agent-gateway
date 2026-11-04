@@ -625,7 +625,10 @@ on: the operator's switch is the consent to partner use, so tell users before tu
 it on only beside a JWT with an audience or resource tokens, and only for peers the surface is
 exposed to on purpose: a partner that holds several people's valid tokens can use each one's grant
 while the tokens last, swap one person's token for another's, and learn from the refusals which of
-them have connected.
+them have connected. A save of a surface whose Target sets the switch, on the surface or in an
+enabled variant, where that view's caller authentication cannot tell a partner's users apart, or
+whose JWT verification strategy names no issuer, is accepted with a `Warning` header naming the
+view and the reason; Fabric callers then get none of that view's per-user grants.
 
 A legacy Fabric request a binding applies to is refused with `403`, before the Target is called,
 when:

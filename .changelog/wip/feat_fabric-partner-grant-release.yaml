@@ -21,6 +21,17 @@ changes:
         consent_not_available_for_partners. The switch is read on every request, and a node that
         predates it refuses to load a surface that sets it, so turn it off everywhere before
         moving back to such a release.
+    - timestamp: '2026-11-04T17:45:00Z'
+      title: Warn when a Target releases grants where callers cannot be told apart
+      description: >-
+        A save of a surface whose Target sets delegated_credentials_for_fabric_callers, on the
+        surface or in an enabled variant, answers with a Warning header for each such view whose
+        caller authentication cannot tell a partner's users apart, such as an API key, an API Key
+        Provider key, DID Auth or a JWT without an audience, whose JWT verification strategy names
+        no issuer, or whose Target is not an http:// or https:// URL, to which Fabric
+        receive sends no delegated credential. Fabric receive releases none of that view's
+        per-user grants. The save is
+        not refused, as for a Transit Point that sets the same switch.
   changed:
     - timestamp: '2026-11-04T17:15:00Z'
       title: Key a Fabric request's delegated credentials by the receiving surface
