@@ -61,6 +61,9 @@ pub async fn validate_surface_references(
     super::surface_target_auth::validate_target_auth_rules(surface, stored)
 }
 
+pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
+    "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent";
+
 /// The target authentication methods of every Target and Transit Point, in every
 /// variant, must be usable: `credential_lookup` was never implemented, and a provider
 /// that needs a user's consent cannot authenticate the gateway to its target.
@@ -99,9 +102,7 @@ async fn validate_target_auth_methods(
                         .map_err(|error| internal("Credential provider", error))?
                         .ok_or_else(|| inaccessible("Credential provider"))?;
                     if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
-                        return Err(SurfaceApiError::BadRequest(
-                            "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent".into(),
-                        ));
+                        return Err(SurfaceApiError::BadRequest(TARGET_AUTH_NEEDS_CONSENT.into()));
                     }
                 }
             }

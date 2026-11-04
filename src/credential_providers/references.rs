@@ -244,7 +244,7 @@ fn surface_reference_ids(
     }
 }
 
-fn target_auth_provider_ids(surface: &AgentSurface) -> Vec<String> {
+pub(crate) fn target_auth_provider_ids(surface: &AgentSurface) -> Vec<String> {
     let Ok(views) = crate::identity::handlers::surface_tenancy::resolved_views(surface) else {
         return string_values(surface);
     };

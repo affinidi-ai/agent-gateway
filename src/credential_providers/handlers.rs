@@ -942,30 +942,17 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
-    if previous
+    let retypes_to_need_consent = previous
         .provider_type
         .sends_gateway_credential()
         && !updated
             .provider_type
-            .sends_gateway_credential()
+            .sends_gateway_credential();
+    if retypes_to_need_consent
+        && let Err(response) =
+            refuse_retype_while_target_auth_uses(&state, &previous, &context, &scope, &caller, &pat).await
     {
-        match state
-            .references
-            .target_auth_referrers_of_provider(&previous.id)
-            .await
-        {
-            Ok(referrers) if referrers.is_empty() => {}
-            Ok(referrers) => {
-                return super::references::conflict_response(
-                    PROVIDER_IN_USE_BY_TARGET_AUTH,
-                    &referrers,
-                    &viewable_kinds(&state, &caller, &pat).await,
-                    tenant_context(&context),
-                    resource_scope(&scope),
-                );
-            }
-            Err(error) => return reference_scan_failed(error),
-        }
+        return response;
     }
 
     if let Err(error) = validate_provider_settings(
@@ -981,6 +968,18 @@ pub async fn update_provider(
         return error.into_response();
     }
 
+    let _bindings = if retypes_to_need_consent {
+        let bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        if let Err(response) =
+            refuse_retype_while_target_auth_uses(&state, &previous, &context, &scope, &caller, &pat).await
+        {
+            return response;
+        }
+        Some(bindings)
+    } else {
+        None
+    };
+
     match state
         .store
         .update(updated.clone())
@@ -991,6 +990,34 @@ pub async fn update_provider(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to update: {}", e)})))
                 .into_response()
         }
+    }
+}
+
+/// Refuse to retype `previous` to a provider that needs a user's consent while a surface's
+/// Target authentication uses it. The update holds the provider lock exclusively across this
+/// check and its store, so no surface write binds the provider in between.
+async fn refuse_retype_while_target_auth_uses(
+    state: &CredentialProviderState,
+    previous: &CredentialProvider,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    caller: &Option<Extension<AuthGuardOk>>,
+    pat: &Option<Extension<PatContext>>,
+) -> Result<(), Response> {
+    match state
+        .references
+        .target_auth_referrers_of_provider(&previous.id)
+        .await
+    {
+        Ok(referrers) if referrers.is_empty() => Ok(()),
+        Ok(referrers) => Err(super::references::conflict_response(
+            PROVIDER_IN_USE_BY_TARGET_AUTH,
+            &referrers,
+            &viewable_kinds(state, caller, pat).await,
+            tenant_context(context),
+            resource_scope(scope),
+        )),
+        Err(error) => Err(reference_scan_failed(error)),
     }
 }
 
@@ -1830,6 +1857,60 @@ mod jwt_provider_tests {
         assert_eq!((response["references"].clone(), response["hidden_references"].clone()), (json!([]), json!(1)));
         let (status, response) = update(&state, &ids[1], json!({"provider_type": "oauth2_authorization_code"})).await;
         assert_eq!(status, StatusCode::OK, "a binding may use a provider that needs consent: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_provider_to_need_consent_waits_for_the_surface_writes_binding_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                directory
+                    .path()
+                    .join("surfaces"),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut state = state;
+        state.references.surfaces = Some(surfaces);
+        let (status, created) = create(
+            &state,
+            json!({
+                "name": "machine", "provider_id": "machine", "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://192.0.2.1/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+        let retype = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                update(
+                    &state,
+                    &id,
+                    json!({
+                        "provider_type": "oauth2_authorization_code",
+                        "authorization_endpoint": "https://192.0.2.1/authorize",
+                        "token_endpoint": "https://192.0.2.1/token"
+                    }),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!retype.is_finished(), "the retype waits for the surface write that holds the lock");
+        drop(writing);
+        let (status, response) = retype.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["provider_type"], "oauth2_authorization_code");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

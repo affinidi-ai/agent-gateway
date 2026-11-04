@@ -719,6 +719,10 @@ method, which still loads from storage. The provider is a reference of the surfa
 cannot be deleted, or moved to another tenant, while a surface uses it ([Deleting a
 provider](#deleting-a-provider)), nor changed to a type that needs consent while a surface uses
 it for Target authentication ([Records that are still in use](#records-that-are-still-in-use)).
+That type change holds the provider bindings lock from its last check of the surfaces until the
+provider is stored, and a surface save checks under the same lock that no provider of its
+Target authentication (the Target and every Transit Point, in the base surface and each variant)
+needs consent, so of a type change and a save that overlap, one is refused.
 
 The token is a service token (see above), cached in the vault under the agent half
 `surface:<surface_id>` and the user half `__target_auth__:<hash>` of the provider, its scopes

@@ -550,7 +550,9 @@ pub(crate) async fn hold_provider_bindings_exclusively() -> tokio::sync::RwLockW
 /// `current`, does not bind already: its references were checked before the
 /// write took the provider lock, so a provider deleted or moved to another
 /// tenant in between is caught here. Both answer alike, so the refusal never
-/// says another tenant has the provider.
+/// says another tenant has the provider. A provider of the Target authentication of `after`,
+/// stored already or not, that has been retyped to need a user's consent since the write
+/// checked it is refused as well.
 async fn refuse_gone_providers(
     removal: &GrantRemoval<'_>,
     current: Option<&AgentSurface>,
@@ -559,6 +561,18 @@ async fn refuse_gone_providers(
     let Some(store) = removal.providers else {
         return Ok(());
     };
+    for id in crate::credential_providers::references::target_auth_provider_ids(after) {
+        let needs_consent = store
+            .get(&id)
+            .await
+            .map_err(|_| unavailable())?
+            .is_some_and(|provider| {
+                provider.provider_type == crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode
+            });
+        if needs_consent {
+            return Err(SurfaceApiError::BadRequest(super::surface_tenancy::TARGET_AUTH_NEEDS_CONSENT.into()));
+        }
+    }
     let kept = current
         .map(super::surface_tenancy::bound_credential_provider_ids)
         .unwrap_or_default();
@@ -1547,6 +1561,115 @@ mod tests {
         })
         .await
         .expect("a provider of the surface's tenant is bound");
+    }
+
+    async fn add_provider(
+        fixture: &Fixture,
+        id: &str,
+        provider_type: crate::credential_providers::CredentialProviderType,
+    ) {
+        let mut provider = fixture
+            .providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.id = id.to_string();
+        provider.provider_id = id.to_string();
+        provider.provider_type = provider_type;
+        fixture
+            .providers
+            .create(provider)
+            .await
+            .unwrap();
+    }
+
+    fn authenticating_with(
+        provider: &str,
+        on_transit_point: bool,
+    ) -> AgentSurface {
+        let mut surface = surface(json!([point("owner-hop", None)]));
+        let authentication = json!({"method": {"credential_provider": {"provider_id": provider}}});
+        if on_transit_point {
+            surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .points[0]
+                .target_auth = serde_json::from_value(authentication).unwrap();
+        } else {
+            surface.target.auth = serde_json::from_value(authentication).unwrap();
+        }
+        surface
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_whose_target_auth_provider_sends_a_gateway_credential_is_saved() {
+        use crate::credential_providers::CredentialProviderType;
+        let fixture = Fixture::new().await;
+        add_provider(&fixture, "machine", CredentialProviderType::OAuth2ClientCredentials).await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        for on_transit_point in [false, true] {
+            let saved = write_surface(
+                &removal,
+                surfaces.clone(),
+                "surface",
+                Stored::Any,
+                Some(&authenticating_with("machine", on_transit_point)),
+                || async { Ok::<_, SurfaceApiError>("saved") },
+            )
+            .await;
+            assert_eq!(saved.unwrap(), "saved");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_whose_target_auth_provider_was_retyped_to_need_consent_is_refused() {
+        use crate::credential_providers::CredentialProviderType;
+        let fixture = Fixture::new().await;
+        add_provider(&fixture, "machine", CredentialProviderType::OAuth2ClientCredentials).await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        let after = authenticating_with("machine", false);
+        write_surface(&removal, surfaces.clone(), "surface", Stored::Any, Some(&after), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .unwrap();
+        let mut retyped = fixture
+            .providers
+            .get("machine")
+            .await
+            .unwrap()
+            .unwrap();
+        retyped.provider_type = CredentialProviderType::OAuth2AuthorizationCode;
+        fixture
+            .providers
+            .update(retyped)
+            .await
+            .unwrap();
+        let saved = std::sync::atomic::AtomicBool::new(false);
+        for on_transit_point in [false, true] {
+            let refused = write_surface(
+                &removal,
+                surfaces.clone(),
+                "surface",
+                Stored::Any,
+                Some(&authenticating_with("machine", on_transit_point)),
+                || async {
+                    saved.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<(), SurfaceApiError>(())
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(SurfaceApiError::BadRequest(ref message))
+                    if message == super::super::surface_tenancy::TARGET_AUTH_NEEDS_CONSENT),
+                "{refused:?}"
+            );
+        }
+        assert!(!saved.load(std::sync::atomic::Ordering::SeqCst), "nothing is saved");
     }
 
     /// A write binds a provider only while it exists: one deleted since the
