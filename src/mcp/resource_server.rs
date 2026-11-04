@@ -610,7 +610,11 @@ impl McpResourceServerConfig {
             .and_then(Value::as_str)
             .ok_or(ResourceTokenError::Invalid)?
             .to_string();
-        Ok(crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims })
+        Ok(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject,
+            principal_claim: crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string(),
+            claims,
+        })
     }
 
     pub fn validate(&self) -> Result<(), String> {

@@ -218,6 +218,7 @@ mod tests {
 
     fn sample_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {
+            principal_claim: None,
             id: String::new(), // populated by create()
             tenant_id: None,
             name: "Test IdP".to_string(),

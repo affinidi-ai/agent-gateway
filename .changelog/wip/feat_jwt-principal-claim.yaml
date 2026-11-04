@@ -1,0 +1,19 @@
+branch: feat/jwt-principal-claim
+changes:
+  added:
+    - timestamp: '2026-11-04T13:00:00Z'
+      title: Name the claim that identifies a caller on a JWT verification strategy
+      description: >-
+        A JWT verification strategy has an optional principal_claim, default sub, whose value is the
+        caller's subject in their identity hash. The hash, the transit token's user_identity_hash, the
+        keys of delegated credentials and the connect hint follow it, on the Access Point, Transit
+        Points and anywhere else a strategy identifies a caller. Use oid for Microsoft Entra, whose sub
+        differs for each application. A token without the claim, or with a value that is not a
+        non-empty string, names no caller. The claim is fixed when the strategy is created, an update
+        that names another claim is refused and one that leaves it out keeps it, and a strategy
+        without it behaves as before. The Edit JWT Verification Strategy page has the field.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -844,6 +844,7 @@ mod tests {
             .bound_subject(&json!({"iss": strategy.expected_issuer, "sub": "alice"}))
             .unwrap();
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: subject.clone(),
             claims: json!({"iss": profile.issuer, "sub": subject, "scope": "read", "exp": now + 300}),
         };

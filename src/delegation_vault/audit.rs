@@ -1080,7 +1080,7 @@ pub fn vp_fingerprint(vp_jwt: &str) -> String {
 /// Build an `AuditCallerContext` from a source-auth identity
 pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity) -> AuditCallerContext {
     match identity {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims } => {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
             let iss = claims
                 .get("iss")
                 .and_then(|v| v.as_str())
@@ -1758,6 +1758,7 @@ mod tests {
     #[test]
     fn caller_context_preserves_raw_jwt_identity_evidence() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({
                 "iss": "https://issuer.example",
@@ -2455,6 +2456,7 @@ mod tests {
     #[tokio::test]
     async fn audit_policy_decision_records_the_authenticated_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
         };
@@ -2707,6 +2709,7 @@ mod tests {
     #[test]
     fn a_vp_injection_record_has_the_full_field_set() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
         };
@@ -2737,6 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
         };

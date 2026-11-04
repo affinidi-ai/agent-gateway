@@ -936,6 +936,7 @@ mod tests {
     #[test]
     fn caller_fields_map_each_identity_variant() {
         let jwt = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "sub-123".to_string(),
             claims: serde_json::json!({}),
         };
@@ -965,6 +966,7 @@ mod tests {
     #[test]
     fn decision_caller_prefers_the_authenticated_identity_over_a_carried_caller() {
         let identity = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
         };

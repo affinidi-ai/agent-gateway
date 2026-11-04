@@ -394,8 +394,10 @@ pub enum CredentialExtraction {
 pub enum AuthenticatedIdentity {
     /// JWT Bearer authentication succeeded.
     JwtBearer {
-        /// The `sub` claim from the token.
+        /// The value of the principal claim in the token.
         subject: String,
+        /// The claim `subject` was read from: the strategy's principal claim.
+        principal_claim: String,
         /// All decoded claims.
         claims: Value,
     },
@@ -478,13 +480,17 @@ impl AuthenticatedIdentity {
         tenant_id: Option<&str>,
     ) -> Option<String> {
         let (method, issuer, subject) = match self {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+            AuthenticatedIdentity::JwtBearer {
+                subject,
+                principal_claim,
+                claims,
+            } => {
                 let issuer = claims
                     .get("iss")
                     .and_then(Value::as_str)
                     .filter(|issuer| !issuer.is_empty())?;
                 let named = claims
-                    .get("sub")
+                    .get(principal_claim.as_str())
                     .and_then(Value::as_str)?;
                 if named != subject {
                     return None;
@@ -889,6 +895,7 @@ mod tests {
     #[test]
     fn authenticated_identity_jwt_claims_accessor() {
         let id = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "agent-1".to_string(),
             claims: serde_json::json!({"oid": "abc", "tid": "tenant-1"}),
         };
@@ -909,6 +916,103 @@ mod tests {
         assert!(other.jwt_claims().is_none());
     }
 
+    fn jwt_named_by(
+        principal_claim: &str,
+        claims: serde_json::Value,
+    ) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::JwtBearer {
+            subject: claims[principal_claim]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            principal_claim: principal_claim.to_string(),
+            claims,
+        }
+    }
+
+    #[test]
+    fn the_identity_hash_follows_the_principal_claim() {
+        let claims = || {
+            serde_json::json!({
+                "iss": "https://login.example.com",
+                "sub": "pairwise-sub",
+                "oid": "00000000-0000-0000-0000-0000000000aa",
+                "email": "alice@example.com",
+                "tid": 7
+            })
+        };
+        let by_oid = jwt_named_by("oid", claims());
+        assert_eq!(
+            by_oid
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            caller_identity_hash(
+                "jwt_bearer",
+                "https://login.example.com",
+                Some("tenant-1"),
+                "00000000-0000-0000-0000-0000000000aa"
+            )
+            .as_deref()
+        );
+        assert_eq!(
+            by_oid
+                .principal_hash(None)
+                .as_deref(),
+            Some("b35c6f7bd8d2ba63e7fcf70cc1275e4cd5760452021617db32372775e318dcad")
+        );
+        assert_ne!(
+            by_oid.principal_hash(None),
+            jwt_named_by("sub", claims()).principal_hash(None),
+            "the claim chosen decides the caller"
+        );
+        assert_ne!(by_oid.principal_hash(None), jwt_named_by("email", claims()).principal_hash(None));
+        let other_app = serde_json::json!({
+            "iss": "https://login.example.com",
+            "sub": "another-pairwise-sub",
+            "oid": "00000000-0000-0000-0000-0000000000aa"
+        });
+        assert_eq!(
+            by_oid.principal_hash(None),
+            jwt_named_by("oid", other_app).principal_hash(None),
+            "the same oid from another application is the same caller"
+        );
+    }
+
+    #[test]
+    fn a_token_without_a_usable_principal_claim_names_no_caller() {
+        for claims in [
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": "" }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": 42 }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": ["a"] }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": null }),
+        ] {
+            assert_eq!(jwt_named_by("oid", claims).principal_hash(None), None);
+        }
+    }
+
+    #[test]
+    fn an_identity_whose_subject_is_not_its_principal_claims_value_has_no_hash() {
+        let claims = serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": "o-1" });
+        let forged = AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: "oid".to_string(),
+            claims,
+        };
+        assert_eq!(forged.principal_hash(None), None);
+    }
+
+    #[test]
+    fn the_default_principal_claim_keeps_the_hashes_it_always_had() {
+        let identity = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        assert_eq!(
+            identity
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f")
+        );
+    }
+
     /// The identity hash is the SHA-256 of `[method, issuer, tenant, subject]`,
     /// so a caller is told apart by each, and a JWT that names no subject has no
     /// hash at all.
@@ -916,6 +1020,7 @@ mod tests {
     fn the_identity_hash_tells_callers_apart_by_method_issuer_and_tenant() {
         use sha2::{Digest, Sha256};
         let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()
                 .unwrap_or("<none>")
@@ -966,6 +1071,7 @@ mod tests {
             (
                 "a subject the claims do not carry",
                 AuthenticatedIdentity::JwtBearer {
+                    principal_claim: "sub".to_string(),
                     subject: "alice".into(),
                     claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
                 },

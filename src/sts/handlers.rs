@@ -1603,6 +1603,7 @@ pub(crate) fn gateway_self_trust_strategy(
         name: "gateway self-trust (auto)".to_string(),
         expected_issuer: issuer.to_string(),
         jwks_source: crate::jwt_bearer::models::JwksSource::Static { jwks: parsed },
+        principal_claim: None,
         created_at: now,
         updated_at: now,
     })

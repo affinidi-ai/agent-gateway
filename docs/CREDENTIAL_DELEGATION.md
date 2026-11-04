@@ -1157,7 +1157,8 @@ certificate identity therefore shares one set of delegated tokens.
 
 | Source authentication | `method` | `issuer` | `subject` |
 | --- | --- | --- | --- |
-| `jwt_bearer`, and a resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
+| `jwt_bearer` | `jwt_bearer` | The token's `iss` | The value of the verification strategy's `principal_claim` in the token (`sub` unless the strategy names another claim: [Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)) |
+| A resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
 | `api_key` | `api_key` | `""` | The `secret_id` |
 | `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
 | `did_auth` | `did_auth` | `""` | The DID |
@@ -1168,7 +1169,7 @@ by another method, issuer, API Key Provider agent or tenant is therefore another
 grants of its own. An mTLS caller is keyed by the subject and key of the CA the gateway trusted, not by the
 issuer name its certificate states, so renewing a CA with the same subject and key keeps its callers' identity
 hashes, and a CA with another key gives them new ones. With pinned trust, replacing a pinned
-certificate gives its caller a new hash. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+certificate gives its caller a new hash. A JWT without a non-empty string in its strategy's principal claim (`sub` by default), or without an `iss`, names no caller: it has
 no identity hash, so it is given no delegated credential: an Access Point answers `403`
 `identity-required`, and a Transit Point `403`.
 

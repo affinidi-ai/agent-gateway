@@ -28,6 +28,36 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 | DID Auth | `did_auth` | A DID Auth session token |
 | mTLS | `mtls` | A TLS client certificate |
 
+### Which claim names a JWT caller
+
+A JWT verification strategy names the claim that identifies a caller with `principal_claim`
+(default `sub`; the API field may be left out). The claim's value is the caller's subject in the
+[identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash), so it decides which
+delegated credentials a caller uses, `input.source_auth.subject`, and the caller key of
+per-caller limits. Every method that points at the strategy, on an Access Point or a Transit
+Point, identifies callers by the same claim.
+
+- Choose a claim that is unique to one person and that the identity provider never lets them
+  change. Microsoft Entra's `sub` is different for each application, so a caller's `sub` in one
+  application differs from their `sub` in another; use `oid`, which is the same across a
+  tenant's applications. A claim a person can edit, such as an email address they control, lets
+  them take another person's name.
+- The value must be a non-empty string. A token without the claim, or with a value that is
+  empty or not a string, is valid but names no caller: an Access Point answers `403`
+  `identity-required` to a request that needs one, and no delegated credential is given.
+- The claim name is printable ASCII with no spaces, up to 128 characters. `iss`, `aud`, `exp`,
+  `iat`, `nbf` and `jti` are refused, since none names a person. Naming `sub` is the default,
+  and is not stored.
+- `principal_claim` is fixed when the strategy is created. Changing it would change every
+  caller's identity hash and orphan the credentials stored under the old ones, so an update that
+  names a different claim is refused with `400`, and an update that leaves it out keeps it. To
+  use another claim, create a new strategy, point the surface at it, and have callers connect
+  again.
+- Two strategies for the same issuer that name different claims identify the same person as
+  different callers, each with credentials of their own.
+- Token exchange ([STS](STS.md)) keeps reading `sub`, as RFC 8693 does: it passes the subject
+  token's `sub` on and does not key credentials by the identity hash.
+
 ### Several methods on one Access Point
 
 `methods` is a list, so one surface can accept callers with different credentials, for

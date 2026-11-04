@@ -15,7 +15,7 @@ use crate::auth_manager::middleware::pat_scope_allows;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::jwt_bearer::{
     JwtVerificationStrategyStorage,
-    models::{JwksSource, JwtVerificationStrategy},
+    models::{JwksSource, JwtVerificationStrategy, normalize_principal_claim},
 };
 use crate::rbac::{Feature, RbacConfig};
 use crate::tenancy::{
@@ -49,6 +49,8 @@ pub struct JwtVerificationStrategyRequest {
     pub name: String,
     pub expected_issuer: String,
     pub jwks_source: JwksSource,
+    #[serde(default)]
+    pub principal_claim: Option<String>,
 }
 
 /// Error response body.
@@ -137,6 +139,14 @@ pub async fn create_strategy(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
     }
 
+    let principal_claim = match normalize_principal_claim(
+        body.principal_claim
+            .as_deref(),
+    ) {
+        Ok(claim) => claim,
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
+
     body.tenant_id = match tenant_for_create(body.tenant_id.take(), pat.is_some(), tenant_context(&context)) {
         Ok(tenant_id) => tenant_id,
         Err(message) => return (StatusCode::FORBIDDEN, ErrorBody::json(message)).into_response(),
@@ -158,6 +168,7 @@ pub async fn create_strategy(
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
+        principal_claim,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -319,12 +330,32 @@ pub async fn update_strategy(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
     }
 
+    if let Some(requested) = body
+        .principal_claim
+        .as_deref()
+    {
+        let requested = match normalize_principal_claim(Some(requested)) {
+            Ok(claim) => claim,
+            Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+        };
+        if requested != existing.principal_claim {
+            return (
+                StatusCode::BAD_REQUEST,
+                ErrorBody::json(
+                    "principal_claim cannot be changed after creation: create a new strategy and point the surface at it",
+                ),
+            )
+                .into_response();
+        }
+    }
+
     let updated = JwtVerificationStrategy {
         id: existing.id.clone(),
         tenant_id: existing.tenant_id,
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
+        principal_claim: existing.principal_claim,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -864,6 +895,150 @@ mod tests {
         );
     }
 
+    async fn send_strategy(
+        router: &Router,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response_body(response).await)
+    }
+
+    fn strategy_body(principal_claim: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "name": "Entra callers",
+            "expected_issuer": "https://login.example.com/tenant/v2.0",
+            "jwks_source": { "type": "remote", "jwks_uri": "https://login.example.com/tenant/keys" }
+        });
+        if let Some(claim) = principal_claim {
+            body["principal_claim"] = serde_json::json!(claim);
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn a_strategy_stores_the_principal_claim_it_is_created_with() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+
+        let (status, created) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("oid"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["principal_claim"], "oid");
+
+        let (_, read) = send_strategy(
+            &router,
+            "GET",
+            &format!(
+                "/v1/jwt-verification-strategies/{}",
+                created["id"]
+                    .as_str()
+                    .unwrap()
+            ),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(read["principal_claim"], "oid");
+
+        let (status, default) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(None)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            default
+                .get("principal_claim")
+                .is_none(),
+            "the default claim is not stored: {default}"
+        );
+
+        let (status, named_default) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("sub"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            named_default
+                .get("principal_claim")
+                .is_none(),
+            "naming sub is the default: {named_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_principal_claim_that_does_not_name_a_caller_is_refused() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        for claim in ["", "two words", "iss", "aud", "exp", "jti", &"x".repeat(129)] {
+            let (status, body) =
+                send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some(claim))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{claim:?}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_principal_claim_cannot_be_changed_after_creation() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let (_, created) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("oid"))).await;
+        let path = format!(
+            "/v1/jwt-verification-strategies/{}",
+            created["id"]
+                .as_str()
+                .unwrap()
+        );
+
+        for other in [Some("email"), Some("sub")] {
+            let (status, body) = send_strategy(&router, "PUT", &path, strategy_body(other)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{other:?}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot be changed"),
+                "{body}"
+            );
+        }
+
+        let (status, same) = send_strategy(&router, "PUT", &path, strategy_body(Some("oid"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(same["principal_claim"], "oid");
+
+        let (status, omitted) = send_strategy(&router, "PUT", &path, strategy_body(None)).await;
+        assert_eq!(status, StatusCode::OK, "an update that does not mention the claim keeps it");
+        assert_eq!(omitted["principal_claim"], "oid");
+    }
+
     #[tokio::test]
     async fn test_update_returns_404_for_missing_strategy() {
         let store = Arc::new(MemStore::default());
@@ -1105,6 +1280,7 @@ mod tests {
 
     fn seeded_strategy(tenant_id: Option<&str>) -> JwtVerificationStrategy {
         JwtVerificationStrategy {
+            principal_claim: None,
             id: "strategy-a".to_string(),
             tenant_id: tenant_id.map(str::to_string),
             name: "Operator strategy".to_string(),
