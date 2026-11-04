@@ -1,0 +1,48 @@
+branch: fix/ftl-30901-review-findings
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Keep an owner's connected account when the vendor refuses its token
+      description: >-
+        A vendor's 401 to an owner binding's grant that cannot be refreshed no longer removes and
+        revokes the grant; the call answers connect_required and the grant is kept, since any
+        caller of the binding can send a request the vendor refuses. A caller's own grant is still
+        removed and revoked, and a refresh token the authorization server refuses still removes
+        either. The daily sweep removes an owner's grant once it has actually expired.
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Document what a system that runs the connect API must do
+      description: >-
+        The connect API section of CREDENTIAL_DELEGATION.md now states the calling system's duties:
+        name the signed-in person as the principal, bind the authorization request's state to that
+        person's browser session, and start an owner connect only for the binding's owner.
+  fixed:
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Keep grants whose surface or provider cannot be read during the daily sweep
+      description: >-
+        The sweep took a surface or credential provider whose file is stored but could not be read,
+        for example one that fails to decrypt, for one that was deleted, and removed and revoked its
+        grants. It now skips that binding until the next sweep, as the documentation says.
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Revoke a deleted provider's kept revocations before the provider is gone
+      description: >-
+        Deleting a credential provider revoked its stored grants but left the revocations kept for
+        its earlier removals, pending or deferred to the daily sweep, which the sweep then forgot
+        unrevoked once the provider was gone. The delete now decides them while it still holds the
+        provider, and answers 503 and keeps the provider when the vault cannot list them.
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Record an Access Point grant's use at most hourly, off the request path
+      description: >-
+        A grant released for the Access Point Target was written back to the vault on every request
+        to record its use. Like a Transit Point's, it is now recorded on a task of its own and only
+        when the last recorded use is an hour old, and the vault checks that again before writing.
+    - timestamp: '2026-11-04T16:45:03Z'
+      title: Revoke one binding's swept grants at a time
+      description: >-
+        The daily sweep started each binding's revocations without waiting for them, so the number
+        of vendor calls in flight was not bounded overall. It now finishes one binding's
+        revocations before it goes on to the next, and stops between bindings once the node is
+        no longer active.
+  removed: []
+  security: []
+  breaking: []

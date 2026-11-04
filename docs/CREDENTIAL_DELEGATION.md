@@ -1052,15 +1052,19 @@ When the vendor answers `401` with a `Bearer` challenge that rejects the token
 (`error="invalid_token"`), the gateway refreshes the grant, single-flight, and sends the call
 once more with the new token; an MCP server checks the token before it acts, so a `401` means
 nothing ran. When another call has refreshed the grant, or the person has connected again,
-meanwhile, that grant is used without a refresh. A grant that cannot be refreshed, or a refresh
-token the authorization server refuses (`invalid_grant`), removes the grant, revoking it at the
-vendor, and the call answers `connect_required`; but only while the grant still holds the token
+meanwhile, that grant is used without a refresh. A refresh token the authorization server
+refuses (`invalid_grant`) removes the grant, revoking it at the vendor, and so does a caller's
+grant that cannot be refreshed; an owner's grant that cannot be refreshed is kept. Either way the
+call answers `connect_required`; a removal happens only while the grant still holds the token
 the vendor refused, so a grant refreshed or connected again meanwhile is kept, and the call
 answers `connector_unavailable` instead. A second `401`, to the call sent again with a token the
 authorization server has just issued or another call or a reconnect has just stored, refuses
 that request, not the connection: the grant is kept, nothing is revoked, and the call answers
 `connector_unavailable`. Any caller of an owner binding can send a request a resource refuses,
-so no such answer ends the owner's grant; a dead authorization shows at the next refresh. A
+so no such answer ends the owner's grant; a dead authorization shows at the next refresh. An
+owner's grant the vendor keeps refusing is still sent with each call, and each call answers
+`connect_required`, until the owner connects again or its access token expires; one whose token
+never expires lasts until a reconnect, or until the grant is [removed](#removing-grants). A
 `401` without such a challenge, as a front proxy, a firewall or a path that is not the vendor's
 answers, or with one that names no `error`, which RFC 6750 keeps for a request that carried no
 token, is not taken for a refused token: the grant is kept and the call answers
@@ -1173,7 +1177,8 @@ At run time a request to the Target:
   counted against `external_consent_refresh_refusals`; a `403` whose challenge says
   `insufficient_scope` answers `scope_insufficient`; anything a new connect would not fix
   answers `connector_unavailable` and keeps the grant;
-- marks the grant used and audits it `token_injected`, with the binding's subject in the detail
+- marks the grant used, at most hourly as every release does, and audits it `token_injected`,
+  with the binding's subject in the detail
   (`grant_by_binding:owner:target` or `grant_by_binding:caller:target`), under the identity hash
   of the caller it was released for, on the first send and on the one retry alike;
 - is answered, when refused, before anything is sent, with the fixed reasons of the table above:
@@ -1831,12 +1836,24 @@ Who may call it:
 - The node that serves the admin API completes connects: the surface's lock serialises that
   node only.
 
+The gateway does not authenticate the person who connects: the calling system does, and the
+gateway keeps the grant for the `principal` it names. The calling system must:
+
+- name as `principal` the person signed in to it, computed from the token they signed in with
+  ([Computing the identity hash outside the gateway](#computing-the-identity-hash-outside-the-gateway)),
+  never a value the browser sends;
+- bind the authorization request's `state` to that person's browser session, and complete a
+  connect only from a redirect that returns it in the session that started it, so a code another
+  person obtained is never kept under this principal;
+- start a connect for an `owner` binding only for the binding's owner, since every caller of the
+  binding acts with the account connected.
+
 ### Revoking grants at the vendor
 
 A grant by binding is removed when [its provider is deleted](#deleting-a-provider), [a surface
 change removes its binding](#when-a-binding-is-removed), it is [removed through the
-API](#removing-grants), a connect replaces it, the vendor refuses its token and it cannot be
-refreshed ([External consent on a Transit Point](#external-consent-on-a-transit-point)), or [the
+API](#removing-grants), a connect replaces it, the vendor refuses a caller's token and it cannot
+be refreshed ([External consent on a Transit Point](#external-consent-on-a-transit-point)), or [the
 daily sweep](#the-daily-sweep) finds it can never be released; tokens a connect or a refresh
 obtained but no grant keeps are revoked too. Each is revoked at its authorization server (RFC 7009,
 [`src/delegation_vault/revocation.rs`](../src/delegation_vault/revocation.rs)) at the provider's
@@ -2028,14 +2045,18 @@ delete, of any type, answers `503` and keeps the provider.
 
 A permitted delete of a provider with an `issuer` deletes every grant made with it, then the
 provider, and answers; the grants are revoked afterwards, on a task of their own, reading only
-that provider's grants. The provider lock is held while the bindings are checked and the grants
+that provider's grants. The same task then decides the revocations the vault kept for that
+provider's earlier removals, pending or deferred to the daily sweep, while it still holds the
+provider: none of its grants is stored any more, so each is revoked. One that cannot reach its
+vendor then is not tried again, since its provider is gone. The provider lock is held while the bindings are checked and the grants
 and the provider deleted, never while a vendor is called, so a vendor that is slow or hangs
 keeps no surface write waiting. Surface creates, updates and deletes of every tenant do wait
-while the provider's grants are read, deleted and kept for revocation; with KMS envelope
+while the provider's grants are read, deleted and kept for revocation, and while the
+revocations the vault kept are read; with KMS envelope
 encryption each grant read and each kept is a round trip to the key service, so deleting a
 provider with many grants holds up surface writes for that long. A delete dropped part way puts the grants
 back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
-vault cannot list or delete the grants, when the grants stored were written under another
+vault cannot list or delete the grants, or list the revocations it kept, when the grants stored were written under another
 identity hash pepper, and when one of its grants cannot be read, for example because at-rest
 encryption is now off: it could not be revoked. The answer names that grant. Make it readable
 again, or [purge it](#removing-grants), then delete the provider. Another
@@ -2129,7 +2150,8 @@ tried again; and it tries again the pending revocations kept, which the gateway 
 it starts and each time it becomes active; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
 file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
 and only then reads the binding's grants and decides, so a grant the person connected again
-while the sweep waited is the one it decides on. Every grant is decrypted once or twice a day. A
+while the sweep waited is the one it decides on. It finishes revoking one binding's removals
+before it goes on to the next, and stops between bindings once the node is no longer active. Every grant is decrypted once or twice a day. A
 grant that cannot be read is left, and counted, for an operator to remove. A binding whose
 surface or provider cannot be read is left as it is, and counted as skipped, until the next
 sweep: a provider store that fails is never taken for a provider that is gone. The log line

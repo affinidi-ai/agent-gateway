@@ -6630,11 +6630,12 @@ fn refuse_a_compressed_mcp_answer(
 
 /// [12a] A vendor's refusal of a grant by binding. A `401` whose `Bearer`
 /// challenge rejects the token (`invalid_token`) gets one refresh,
-/// single-flight, and one retry with the new token. A grant that cannot be
-/// refreshed, or a refresh token the authorization server refuses
-/// (`invalid_grant`), removes the grant, revoking it at the vendor, and
-/// answers `connect_required`, but only while the grant still holds the token
-/// refused: a grant refreshed or reconnected meanwhile is kept. A second `401`
+/// single-flight, and one retry with the new token. A refresh token the
+/// authorization server refuses (`invalid_grant`), or a caller's grant that
+/// cannot be refreshed, removes the grant, revoking it at the vendor, but only
+/// while the grant still holds the token refused: a grant refreshed or
+/// reconnected meanwhile is kept. An owner's grant that cannot be refreshed is
+/// kept. Each answers `connect_required`. A second `401`
 /// refuses that request, not the fresh grant, which is kept, and answers
 /// `connector_unavailable`. A `401` without such a challenge, as a front
 /// proxy or a firewall answers, or with one that names no error, and a
@@ -17990,6 +17991,82 @@ mod tests {
         assert!(vendor.requests().is_empty());
     }
 
+    /// A vendor's `401` to a grant that cannot be refreshed asks for a new
+    /// connect. A caller's grant is removed and revoked. An owner's is kept and
+    /// nothing is revoked: any caller of the binding can send a request the
+    /// vendor refuses, so none ends the owner's grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendors_401_to_a_grant_that_cannot_be_refreshed_removes_only_a_callers_grant() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        for (subject, key) in [
+            ("owner", GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor")),
+            ("caller", GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap()),
+        ] {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![
+                Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#),
+            ])
+            .await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&key, "first");
+            unrefreshable.refresh_token = None;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            vault
+                .store_grant(unrefreshable)
+                .await
+                .unwrap();
+            let surface = fixture_surface(&vendor, subject, "http");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let refused = send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(grant_refusal(&refused), Some(GrantRefusal::ConnectRequired { .. })),
+                "{subject}: {refused:?}"
+            );
+            let kept = vault
+                .grant(&key)
+                .await
+                .unwrap();
+            if subject == "owner" {
+                assert_eq!(kept.map(|grant| grant.access_token), Some("first".to_string()), "{subject}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                assert!(
+                    authorization_server
+                        .requests()
+                        .is_empty(),
+                    "{subject}: nothing is revoked"
+                );
+            } else {
+                assert!(kept.is_none(), "{subject}");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while authorization_server
+                        .requests()
+                        .is_empty()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    !authorization_server
+                        .requests()
+                        .is_empty(),
+                    "{subject}: revoked at the vendor"
+                );
+            }
+        }
+    }
+
     /// A vendor's `401` gets one refresh and one retry with the new token. A
     /// second `401`, after a refresh the authorization server granted, refuses
     /// this request, not the connection, which any caller of an owner binding
@@ -19326,6 +19403,7 @@ mod tests {
             };
             let caller = "a".repeat(64);
             let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+            let caller_key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
             let revoked_line = "Revoked a delegated grant at its authorization server";
 
             {
@@ -19336,7 +19414,7 @@ mod tests {
                 .await;
                 let directory = tempfile::tempdir().unwrap();
                 let state = fixture_grant_state(directory.path(), &authorization_server, &rejecting).await;
-                let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&key, "first");
+                let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&caller_key, "first");
                 unrefreshable.refresh_token = None;
                 state
                     .delegation_vault_store
@@ -19345,7 +19423,7 @@ mod tests {
                     .store_grant(unrefreshable)
                     .await
                     .unwrap();
-                let surface = fixture_surface(&rejecting, "owner", "http");
+                let surface = fixture_surface(&rejecting, "caller", "http");
                 lines.clear();
                 let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
                 assert!(

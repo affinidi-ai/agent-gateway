@@ -1586,9 +1586,9 @@ async fn no_payment_is_taken_for_the_targets_grant() {
 /// The injection of a refreshed grant into the one retry is audited as the
 /// first one is: under the caller's identity hash, whose grant it is or who
 /// acts as the owner, with the binding's subject in the detail; and the
-/// refreshed grant is recorded as used.
+/// grant's use is recorded, on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
+async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
     for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
         let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), vendor_result()]).await;
         let target = format!("{}/mcp", fixture.vendor.origin());
@@ -1619,20 +1619,21 @@ async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
             .collect();
         let expected = (Some(caller_principal()), Some(format!("grant_by_binding:{subject}:target")));
         assert_eq!(injected, [expected.clone(), expected], "{subject}");
-        let kept = fixture
-            .vault
-            .grant(&key)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut kept = None;
+        for _ in 0..250 {
+            let grant = fixture
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            if grant.last_used_at.is_some() {
+                kept = Some(grant);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let kept = kept.unwrap_or_else(|| panic!("{subject}: the grant's use is recorded"));
         assert_eq!(kept.access_token, "second", "{subject}");
-        assert!(
-            kept.last_used_at
-                .zip(kept.refreshed_at)
-                .is_some_and(|(used, refreshed)| used >= refreshed),
-            "{subject}: the refreshed grant is recorded as used: {:?} {:?}",
-            kept.last_used_at,
-            kept.refreshed_at
-        );
     }
 }

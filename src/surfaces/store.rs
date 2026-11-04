@@ -21,6 +21,15 @@ pub trait AgentSurfaceStore: Send + Sync {
         surface_id: &str,
     ) -> anyhow::Result<Option<AgentSurface>>;
 
+    /// As [`Self::get`], except that a surface stored but unreadable is an
+    /// error, never `None`.
+    async fn get_checked(
+        &self,
+        surface_id: &str,
+    ) -> anyhow::Result<Option<AgentSurface>> {
+        self.get(surface_id).await
+    }
+
     /// List all Agent Surfaces
     async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>>;
 

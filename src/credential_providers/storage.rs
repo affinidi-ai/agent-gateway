@@ -19,6 +19,14 @@ pub trait CredentialProviderStorage: Send + Sync {
         &self,
         id: &str,
     ) -> Result<Option<CredentialProvider>>;
+    /// As [`Self::get`], except that a provider stored but unreadable is an
+    /// error, never `None`.
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<CredentialProvider>> {
+        self.get(id).await
+    }
     async fn list(&self) -> Result<Vec<CredentialProvider>>;
     async fn update(
         &self,
@@ -83,6 +91,15 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
         id: &str,
     ) -> Result<Option<CredentialProvider>> {
         self.storage.get(id).await
+    }
+
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<CredentialProvider>> {
+        self.storage
+            .get_checked(id)
+            .await
     }
 
     async fn list(&self) -> Result<Vec<CredentialProvider>> {

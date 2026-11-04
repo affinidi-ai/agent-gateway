@@ -106,6 +106,15 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
             .await
     }
 
+    async fn get_checked(
+        &self,
+        surface_id: &str,
+    ) -> Result<Option<AgentSurface>> {
+        self.storage
+            .get_checked(surface_id)
+            .await
+    }
+
     async fn list_all(&self) -> Result<Vec<AgentSurface>> {
         self.storage.list_all().await
     }
