@@ -1320,8 +1320,9 @@ struct StrategyCallerNaming {
 /// Each Transit Point, on the surface or in an enabled variant, whose
 /// `jwt_bearer` strategy names the same issuer, in `issuers`, as another
 /// strategy the same view accepts, on its Access Point or another Transit
-/// Point, and each pair of Access Point methods whose strategies name one
-/// issuer but different claims. The identity hash keys a JWT caller by its
+/// Point, and each pair of Access Point strategies that name one issuer but
+/// different claims ([`access_point_claim_warnings`]). The identity hash keys a
+/// JWT caller by its
 /// issuer, subject and principal claim, so callers verified through two
 /// strategies naming one claim are one caller, with the same delegated
 /// credentials, and through two naming different claims are two. A strategy
@@ -1385,50 +1386,95 @@ fn shared_issuer_warnings(
                 }
             }
         }
-        let access_point_strategies: Vec<&str> = access_point
+    }
+    for warning in access_point_claim_warnings(surface, issuers) {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
+
+/// Each pair of JWT verification strategies the surface's Access Point
+/// accepts, on the surface or in an enabled variant, that name one issuer but
+/// different claims: the same person reaching the surface through either is
+/// two callers. A strategy is named with a variant only when that variant's
+/// overrides set the Access Point's caller authentication; one a variant
+/// inherits is the surface's own, so each pair is warned of once.
+fn access_point_claim_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    let mut accepted: Vec<(String, Option<String>)> = Vec::new();
+    for (variant, view) in surface_views(surface) {
+        let defined_by = variant
+            .as_deref()
+            .filter(|alias| variant_sets_caller_authentication(surface, alias))
+            .map(str::to_string);
+        let (access_point, _) = jwt_bearer_methods(&view, variant.as_deref());
+        for config in access_point {
+            let entry = (config.jwt_verification_strategy_id, defined_by.clone());
+            if !accepted.contains(&entry) {
+                accepted.push(entry);
+            }
+        }
+    }
+    let located = |strategy: &str, variant: &Option<String>| match variant {
+        Some(alias) => format!("'{strategy}' in variant '{alias}'"),
+        None => format!("'{strategy}'"),
+    };
+    let mut warnings = Vec::new();
+    for (index, (strategy, variant)) in accepted.iter().enumerate() {
+        let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
+            continue;
+        };
+        for (other, other_variant) in accepted
             .iter()
-            .map(|config| {
-                config
-                    .jwt_verification_strategy_id
-                    .as_str()
-            })
-            .collect();
-        for (index, strategy) in access_point_strategies
-            .iter()
-            .enumerate()
+            .skip(index + 1)
         {
-            let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
+            let Some((other_issuer, other_claim)) = usable_naming(issuers, other) else {
                 continue;
             };
-            for other in access_point_strategies
-                .iter()
-                .skip(index + 1)
-            {
-                let Some((other_issuer, other_claim)) = usable_naming(issuers, other) else {
-                    continue;
-                };
-                if other_issuer != issuer || other_claim == claim {
-                    continue;
-                }
-                let location = variant
-                    .as_deref()
-                    .map_or_else(
-                        || "The Access Point".to_string(),
-                        |alias| format!("The Access Point in variant '{alias}'"),
-                    );
-                let warning = format!(
-                    "{location} accepts tokens from issuer '{issuer}' through JWT verification strategies \
-                     '{strategy}' and '{other}', which name callers by different claims ('{claim}' and \
-                     '{other_claim}'): the same person through either is two callers, each with delegated \
-                     credentials of their own; use one strategy per issuer"
-                );
-                if !warnings.contains(&warning) {
-                    warnings.push(warning);
-                }
+            if other_issuer != issuer || other_claim == claim {
+                continue;
+            }
+            let warning = format!(
+                "The Access Point accepts tokens from issuer '{issuer}' through JWT verification strategies {} and \
+                 {}, which name callers by different claims ('{claim}' and '{other_claim}'): the same person \
+                 through either is two callers, each with delegated credentials of their own; use one strategy \
+                 per issuer",
+                located(strategy, variant),
+                located(other, other_variant)
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
     warnings
+}
+
+/// Whether the enabled variant `alias` overrides the Access Point's caller
+/// authentication rather than inheriting the surface's.
+fn variant_sets_caller_authentication(
+    surface: &AgentSurface,
+    alias: &str,
+) -> bool {
+    surface
+        .variants
+        .iter()
+        .any(|candidate| {
+            candidate.alias == alias
+                && candidate
+                    .overrides
+                    .access_point
+                    .as_ref()
+                    .is_some_and(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .is_some()
+                    })
+        })
 }
 
 /// The issuer and principal claim of `strategy` in `issuers`, unless its
@@ -5737,6 +5783,52 @@ mod validation_tests {
                     .to_string()
             ]
         );
+    }
+
+    /// The Access Point different-claims warning compares the strategies of
+    /// every view: a variant that inherits the Access Point's methods adds no
+    /// copy of it, and one that overrides them with a strategy naming another
+    /// claim for the same issuer is warned of, under its name.
+    #[test]
+    fn the_access_point_claims_warning_compares_every_view_once() {
+        let jwt = |strategy: &str, header: &str| {
+            serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy,
+                "audiences": ["api://agent"], "token_header": header })
+        };
+        let surface_with = |methods: serde_json::Value, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "agent",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": { "methods": methods } },
+                "target": { "endpoint": "https://agent.internal" },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let issuers = std::collections::HashMap::from([
+            ("by-sub".to_string(), naming("https://login.example", "sub")),
+            ("by-oid".to_string(), naming("https://login.example", "oid")),
+        ]);
+        let expected = |second: &str| {
+            format!(
+                "The Access Point accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategies 'by-sub' and {second}, which name callers by different claims ('sub' and 'oid'): the \
+                 same person through either is two callers, each with delegated credentials of their own; use one \
+                 strategy per issuer"
+            )
+        };
+
+        let inheriting = surface_with(
+            serde_json::json!([jwt("by-sub", "Authorization"), jwt("by-oid", "X-Entra-Token")]),
+            serde_json::json!({}),
+        );
+        assert_eq!(shared_issuer_warnings(&inheriting, &issuers), vec![expected("'by-oid'")]);
+
+        let overriding = surface_with(
+            serde_json::json!([jwt("by-sub", "Authorization")]),
+            serde_json::json!({ "access_point": { "caller_authentication": { "methods": [jwt("by-oid", "Authorization")] } } }),
+        );
+        assert_eq!(shared_issuer_warnings(&overriding, &issuers), vec![expected("'by-oid' in variant 'beta'")]);
     }
 
     fn naming(
