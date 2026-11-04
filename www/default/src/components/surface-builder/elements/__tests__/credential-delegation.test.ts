@@ -367,6 +367,28 @@ describe('credential-delegation definition', () => {
       });
       expect(recovered.some(n => n.type === 'credential-delegation')).toBe(true);
     });
+
+    it('keeps an element whose rows name no provider yet through a reload', () => {
+      // Such a row is never saved, as from a template, so the blob is its only copy.
+      const unsaved = { credential_provider_id: '', consent_mode: 'on_demand', scopes: 'read' };
+      const blob = {
+        version: 1,
+        nodes: [
+          {
+            id: 'cd',
+            type: 'credential-delegation',
+            config: { outbound_credentials_form: [unsaved] },
+          },
+        ],
+      };
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      const node = recovered.find(n => n.type === 'credential-delegation');
+      expect(node?.config.outbound_credentials_form).toEqual([expect.objectContaining(unsaved)]);
+    });
   });
 });
 

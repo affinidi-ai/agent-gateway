@@ -1503,13 +1503,13 @@ fn inherited_external_point_warnings(surface: &AgentSurface) -> Vec<String> {
     warnings
 }
 
-/// Each enabled view of `surface`, its own route or a variant, that sends its
-/// requests to the origin the Access Point Target's binding with
-/// `consent_mode: external` sends its grant to, without that binding or a
-/// credential of its own for the vendor (`target.auth`, another binding or a
-/// forwarded caller credential): such as a variant copied from the one holding
-/// the binding and then enabled. Its callers' own headers reach the vendor
-/// with no grant.
+/// Each served view of `surface`, its own route (unless a default variant takes
+/// its requests) or an enabled variant, that sends its requests to the origin
+/// the Access Point Target's binding with `consent_mode: external` sends its
+/// grant to, without that binding or a credential of its own for the vendor
+/// (`target.auth`, another binding, or a caller credential every method
+/// forwards): such as a variant copied from the one holding the binding and
+/// then enabled. Its callers' requests reach the vendor with no grant.
 fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
     let origin = |endpoint: &str| {
         url::Url::parse(endpoint)
@@ -1525,24 +1525,29 @@ fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
     if bound.is_empty() {
         return Vec::new();
     }
-    surface_views(surface)
+    surface
+        .default_variant_id
+        .is_none()
+        .then(|| (None, surface.clone()))
         .into_iter()
-        .filter(|(variant, _)| {
-            variant
-                .as_deref()
-                .is_none_or(|alias| {
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter(|variant| variant.enabled)
+                .filter_map(|variant| {
                     surface
-                        .variants
-                        .iter()
-                        .any(|candidate| candidate.alias == alias && candidate.enabled)
-                })
-        })
+                        .resolve_variant(Some(&variant.alias))
+                        .ok()
+                        .map(|view| (Some(variant.alias.clone()), view))
+                }),
+        )
         .filter(|(_, view)| {
             view.target_auth().is_none()
                 && view
                     .outbound_credentials
                     .is_empty()
-                && !view.forwards_caller_credential()
+                && !view.forwards_every_caller_credential()
                 && origin(&view.target.endpoint).is_some_and(|view_origin| bound.contains(&view_origin))
         })
         .map(|(variant, view)| {
@@ -1550,7 +1555,7 @@ fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
                 variant.map_or_else(|| "The surface's own route".to_string(), |alias| format!("Variant '{alias}'"));
             format!(
                 "{named} sends requests to the vendor of the external consent binding without the binding or a \
-                 credential of its own: callers' headers reach the vendor with no grant. Give it another Target or \
+                 credential of its own: callers' requests reach the vendor with no grant. Give it another Target or \
                  its own credential (target.auth, a binding or forward_header). Target: {}",
                 view.target.endpoint
             )
@@ -5793,7 +5798,7 @@ mod validation_tests {
         let warning = |named: &str| {
             format!(
                 "{named} sends requests to the vendor of the external consent binding without the binding or a \
-                 credential of its own: callers' headers reach the vendor with no grant. Give it another Target or \
+                 credential of its own: callers' requests reach the vendor with no grant. Give it another Target or \
                  its own credential (target.auth, a binding or forward_header). Target: \
                  https://mcp.vendor.example/mcp"
             )
@@ -5859,33 +5864,38 @@ mod validation_tests {
                 ),
             ),
             (
-                "a variant forwarding the caller's JWT on its first method",
+                "a variant whose every method forwards the caller's JWT",
                 surface_with(
                     external.clone(),
                     true,
-                    with_methods(serde_json::json!([jwt_bearer(true), api_key.clone()])),
+                    with_methods(serde_json::json!([jwt_bearer(true), jwt_bearer(true)])),
                 ),
             ),
-            (
-                "a variant forwarding the caller's JWT on a later method",
-                surface_with(
-                    external.clone(),
+            ("the surface's own route while a default variant takes its requests", {
+                let mut surface = surface_with(
+                    serde_json::json!([]),
                     true,
-                    with_methods(serde_json::json!([api_key.clone(), jwt_bearer(true)])),
-                ),
-            ),
+                    serde_json::json!({ "outbound_credentials": external.clone() }),
+                );
+                surface.default_variant_id = Some("copy".to_string());
+                surface
+            }),
         ] {
             assert!(unbound_vendor_view_warnings(&surface).is_empty(), "{case}");
         }
-        assert_eq!(
-            unbound_vendor_view_warnings(&surface_with(
-                external.clone(),
-                true,
-                with_methods(serde_json::json!([api_key.clone(), jwt_bearer(false)]))
-            )),
-            vec![warning("Variant 'copy'")],
-            "a JWT method that does not forward the caller's token is no credential of the variant's own"
-        );
+        // A request is forwarded with the credential of the method it matched, so
+        // a method that forwards none leaves its callers without one.
+        for (case, methods) in [
+            ("a forwarding JWT method after an API key", serde_json::json!([api_key.clone(), jwt_bearer(true)])),
+            ("a forwarding JWT method before an API key", serde_json::json!([jwt_bearer(true), api_key.clone()])),
+            ("a JWT method that forwards nothing", serde_json::json!([api_key.clone(), jwt_bearer(false)])),
+        ] {
+            assert_eq!(
+                unbound_vendor_view_warnings(&surface_with(external.clone(), true, with_methods(methods))),
+                vec![warning("Variant 'copy'")],
+                "{case}"
+            );
+        }
     }
 
     /// A variant created from another keeps no binding with external consent

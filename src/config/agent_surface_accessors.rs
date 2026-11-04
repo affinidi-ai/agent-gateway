@@ -93,6 +93,18 @@ impl AgentSurface {
             )
     }
 
+    /// Whether every caller-authentication method forwards the caller's own
+    /// credential to the Target: a request is forwarded with the credential of
+    /// the method it matched, so a method that forwards none leaves its callers
+    /// without one.
+    pub fn forwards_every_caller_credential(&self) -> bool {
+        let methods = self.source_auth_methods();
+        !methods.is_empty()
+            && methods.iter().all(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
     #[inline]
     pub fn has_source_auth(&self) -> bool {
         !self
