@@ -1968,6 +1968,11 @@ async fn a_surface_keeps_a_provider_key_whose_owning_surface_is_deleted_but_cann
             .await,
     );
     assert_eq!(api.stored(&naming).await["identity_slots"]["protected"]["api_key_id"], json!(key_id));
+    let (status, body) = api
+        .reassign("surfaces", &naming, Some("tenant-b"))
+        .await;
+    assert_eq!(status, 200, "a deleted owner does not block reassigning a surface naming its key: {body}");
+    assert_eq!(api.stored(&naming).await["tenant_id"], "tenant-b");
 
     let mut added = api.stored(&other).await;
     added["identity_slots"] = protected["identity_slots"].clone();

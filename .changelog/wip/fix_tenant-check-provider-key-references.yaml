@@ -73,13 +73,6 @@ changes:
         whose owning surface was deleted, is refused on save with `400`, where it used to be saved
         with a DID derived from the id alone. A surface that already stored the reference keeps it,
         so a GET then PUT still saves. Issue a new API key to add one.
-    - timestamp: '2026-11-04T13:00:00Z'
-      title: Refuse reassigning a surface that names a key whose owning surface was deleted
-      description: >-
-        A tenant reassignment now checks the owning surface of each API key a surface names. When
-        that surface was deleted, its keys remain, and every reassignment of a surface naming one
-        answers `409` "Referenced resource does not exist", where it used to succeed. Point the
-        surface at a key of an existing surface, or remove the reference, before reassigning it.
     - timestamp: '2026-11-03T17:00:00Z'
       title: Reserve the atgk_ prefix for API key ids and refuse it as a new secret id
       description: >-

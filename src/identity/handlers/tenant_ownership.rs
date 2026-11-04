@@ -515,10 +515,13 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 })
                 .unwrap_or_default();
             for owner in owners {
-                references.extend(
+                if let Some(edge) =
                     ownership_reference(state, source.clone(), ResourceKind::ApiKeys, &owner, "surface identity", true)
-                        .await?,
-                );
+                        .await?
+                    && edge.target.exists
+                {
+                    references.push(edge);
+                }
             }
         }
     }
