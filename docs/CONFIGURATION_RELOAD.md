@@ -214,6 +214,12 @@ pipeline: the node admits traffic after one start attempt and, if that start is 
 integrations cannot be listed, or the other node still holds the journal), keeps trying in the
 background.
 
+Also on becoming Active, before it reloads its configuration, a node reconciles with disk its
+policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
+created, rotated or revoked while this node was Standby therefore authenticate, or stop
+authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
+held.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).

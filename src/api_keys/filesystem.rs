@@ -167,9 +167,19 @@ impl FileSystemApiKeyStore {
             .into();
         self.stores
             .insert(agent_id.to_string(), store.clone());
+        self.index_agent(agent_id, store.as_ref())
+            .await?;
 
-        // Build the secret-hash lookup for this agent from disk. Legacy records
-        // without a `secret_hash` are skipped and therefore never validate.
+        Ok(store)
+    }
+
+    /// Build, or rebuild, the secret-hash lookup of one agent from its store's records.
+    /// Legacy records without a `secret_hash` are skipped and therefore never validate.
+    async fn index_agent(
+        &self,
+        agent_id: &str,
+        store: &dyn StorageBackend<ApiKeyRecord>,
+    ) -> ApiKeyResult<()> {
         let index = DashMap::new();
         for record in store.list_all().await? {
             if let Some(ref hash) = record.secret_hash {
@@ -178,8 +188,43 @@ impl FileSystemApiKeyStore {
         }
         self.hash_index
             .insert(agent_id.to_string(), index);
+        Ok(())
+    }
 
-        Ok(store)
+    /// Reconcile every agent's keys with disk, as another node sharing the storage wrote
+    /// them: load agent folders created since, re-read each loaded agent's records, so a key
+    /// created, rotated or revoked elsewhere takes effect, rebuild its secret-hash lookup, and
+    /// drop an agent whose folder is gone. An agent that cannot be refreshed keeps what it
+    /// held and is logged.
+    pub async fn refresh_from_disk(&self) -> ApiKeyResult<()> {
+        self.load_new_agents().await?;
+        let agents: Vec<(String, Arc<dyn StorageBackend<ApiKeyRecord>>)> = self
+            .stores
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (agent_id, store) in agents {
+            if !fs::try_exists(self.agent_dir(&agent_id)).await? {
+                self.stores.remove(&agent_id);
+                self.hash_index
+                    .remove(&agent_id);
+                continue;
+            }
+            let refreshed = match store
+                .refresh_from_disk()
+                .await
+            {
+                Ok(()) => {
+                    self.index_agent(&agent_id, store.as_ref())
+                        .await
+                }
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = refreshed {
+                warn!("Failed to refresh keys for agent {}: {}", agent_id, error);
+            }
+        }
+        Ok(())
     }
 
     /// Insert or replace this record's `secret_hash -> key_id` entry.
@@ -522,6 +567,10 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         Ok(())
     }
 
+    async fn refresh_from_disk(&self) -> ApiKeyResult<()> {
+        FileSystemApiKeyStore::refresh_from_disk(self).await
+    }
+
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
         self.load_new_agents().await?;
         let stores: Vec<_> = self
@@ -654,6 +703,87 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].key_id, created.key_id);
         assert_eq!(seen[0].agent_id, "agent-later");
+    }
+
+    #[tokio::test]
+    async fn refresh_from_disk_takes_in_keys_another_store_created_rotated_or_revoked() {
+        let (first, temp_dir) = create_test_store().await;
+        let rotated = first
+            .create("agent-x", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let revoked = first
+            .create("agent-x", "client-2", None, "test-actor")
+            .await
+            .unwrap();
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let created = first
+            .create("agent-x", "client-3", None, "test-actor")
+            .await
+            .unwrap();
+        let rotation = first
+            .rotate("agent-x", &rotated.key_id, "test-actor")
+            .await
+            .unwrap();
+        first
+            .revoke("agent-x", &revoked.key_id, "test-actor")
+            .await
+            .unwrap();
+        let validates = |secret: String| {
+            let second = &second;
+            async move {
+                second
+                    .validate("agent-x", &secret)
+                    .await
+                    .unwrap()
+                    .map(|meta| meta.key_id)
+            }
+        };
+        assert_eq!(validates(created.secret.clone()).await, None, "not seen before the refresh");
+
+        ApiKeyStore::refresh_from_disk(&second)
+            .await
+            .unwrap();
+
+        let listed: Vec<String> = second
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.key_id)
+            .collect();
+        assert!(listed.contains(&created.key_id), "{listed:?}");
+        assert_eq!(validates(created.secret.clone()).await, Some(created.key_id.clone()));
+        assert_eq!(validates(rotation.secret.clone()).await, Some(rotated.key_id.clone()));
+        assert_eq!(validates(rotated.secret.clone()).await, None, "the rotated-out secret no longer validates");
+        assert_eq!(validates(revoked.secret.clone()).await, None, "a revoked key no longer validates");
+
+        std::fs::remove_dir_all(
+            temp_dir
+                .path()
+                .join("agent-x"),
+        )
+        .unwrap();
+        ApiKeyStore::refresh_from_disk(&second)
+            .await
+            .unwrap();
+        assert!(
+            second
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a deleted agent folder is dropped"
+        );
+        assert_eq!(validates(created.secret.clone()).await, None);
     }
 
     #[tokio::test]

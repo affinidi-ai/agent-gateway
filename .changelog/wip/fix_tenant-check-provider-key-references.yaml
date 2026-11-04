@@ -10,7 +10,14 @@ changes:
         a surface answers `503` without reading the logs. A write body that sends it back has it
         dropped, like `access_point_status`.
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Reload API keys when a Standby node becomes Active
+      description: >-
+        A Standby node promoted to Active kept the API keys it loaded at startup, so a key the
+        other node created, rotated or revoked meanwhile was refused, kept its old secret, or still
+        authenticated until a restart, and the provider key check missed it. On becoming Active the
+        node now reconciles its API keys with disk before it reloads its configuration.
   removed: []
   security:
     - timestamp: '2026-11-03T17:00:00Z'

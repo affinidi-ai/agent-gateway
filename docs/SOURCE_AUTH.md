@@ -1041,7 +1041,8 @@ no secret.
   naming a key that does not exist does not read the API key store on every request. Each read
   of the API key store picks up the keys of a surface whose first key another node created; a
   key another node adds for a surface whose keys this node already holds shows up only with
-  `cache_refresh_interval_secs` greater than `0`.
+  `cache_refresh_interval_secs` greater than `0`, or when this node becomes Active (see
+  [Server mode](CONFIGURATION_RELOAD.md#server-mode)).
 - While the API key store cannot be read, a surface naming an `atgk_` id is not ready in either
   mode unless it was checked before the outage and has not gone live again since; a surface that
   goes live during the outage loses its earlier verdict. The outage is logged once. Each request

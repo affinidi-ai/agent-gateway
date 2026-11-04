@@ -4454,6 +4454,15 @@ async fn rederive_planes_on_activation(
     {
         warn!("Gateway store refresh on activation failed: {e}");
     }
+    if let Some(store) = identity_state
+        .api_key_store
+        .as_ref()
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("API key store refresh on activation failed: {e}");
+    }
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state

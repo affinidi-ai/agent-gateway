@@ -116,6 +116,12 @@ pub trait ApiKeyStore: Send + Sync {
         agent_id: &str,
         key_id: &str,
     ) -> ApiKeyResult<()>;
+
+    /// Reconcile the keys held in memory with storage another node may have written.
+    /// The default holds nothing in memory and so does nothing.
+    async fn refresh_from_disk(&self) -> ApiKeyResult<()> {
+        Ok(())
+    }
 }
 
 /// Validation trait for API key authentication
