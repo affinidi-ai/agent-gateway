@@ -50,7 +50,32 @@ pub const DEFAULT_PRINCIPAL_CLAIM: &str = "sub";
 
 const MAX_PRINCIPAL_CLAIM_LEN: usize = 128;
 
-const NON_IDENTIFYING_CLAIMS: [&str; 6] = ["iss", "aud", "exp", "iat", "nbf", "jti"];
+/// Registered claims that name the token, its issuer, audience, client,
+/// tenant, session or lifetime rather than a person. Naming one would put
+/// every caller that shares its value, such as a whole tenant or application,
+/// under one identity hash.
+const NON_IDENTIFYING_CLAIMS: [&str; 20] = [
+    "iss",
+    "aud",
+    "exp",
+    "iat",
+    "nbf",
+    "jti",
+    "azp",
+    "client_id",
+    "tid",
+    "idp",
+    "scope",
+    "scp",
+    "nonce",
+    "sid",
+    "act",
+    "cnf",
+    "typ",
+    "ver",
+    "auth_time",
+    "amr",
+];
 
 impl JwtVerificationStrategy {
     /// The claim that names this strategy's callers. A stored claim the API
@@ -246,7 +271,33 @@ mod tests {
             normalize_principal_claim(Some("https://example.com/claims/user_id")),
             Ok(Some("https://example.com/claims/user_id".to_string()))
         );
-        for refused in ["", " oid", "o id", "oid\n", "caf\u{e9}", "iss", "aud", "exp", "iat", "nbf", "jti"] {
+        for refused in [
+            "",
+            " oid",
+            "o id",
+            "oid\n",
+            "caf\u{e9}",
+            "iss",
+            "aud",
+            "exp",
+            "iat",
+            "nbf",
+            "jti",
+            "azp",
+            "client_id",
+            "tid",
+            "idp",
+            "scope",
+            "scp",
+            "nonce",
+            "sid",
+            "act",
+            "cnf",
+            "typ",
+            "ver",
+            "auth_time",
+            "amr",
+        ] {
             assert!(normalize_principal_claim(Some(refused)).is_err(), "{refused:?}");
         }
         assert!(normalize_principal_claim(Some(&"x".repeat(129))).is_err());

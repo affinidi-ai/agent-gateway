@@ -1001,7 +1001,7 @@ mod tests {
             uid,
             Arc::new(crate::jwt_bearer::JwksClient::new()),
         );
-        for claim in ["", "two words", "iss", "aud", "exp", "jti", &"x".repeat(129)] {
+        for claim in ["", "two words", "iss", "aud", "exp", "jti", "tid", "azp", "client_id", &"x".repeat(129)] {
             let (status, body) =
                 send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some(claim))).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{claim:?}: {body}");

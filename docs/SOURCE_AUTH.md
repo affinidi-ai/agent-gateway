@@ -45,9 +45,14 @@ Point, identifies callers by the same claim.
 - The value must be a non-empty string. A token without the claim, or with a value that is
   empty or not a string, is valid but names no caller: an Access Point answers `403`
   `identity-required` to a request that needs one, and no delegated credential is given.
-- The claim name is printable ASCII with no spaces, up to 128 characters. `iss`, `aud`, `exp`,
-  `iat`, `nbf` and `jti` are refused, since none names a person. Naming `sub` is the default,
-  and is not stored.
+- The claim name is printable ASCII with no spaces, up to 128 characters. It names a top-level
+  claim, matched case-sensitively: `Sub` is not `sub`, and `a.b` is a claim named `a.b`, not a
+  path into `a`. Claims that name the token, its issuer, audience, client, tenant, session or
+  lifetime are refused, since none names a person: `iss`, `aud`, `exp`, `iat`, `nbf`, `jti`,
+  `azp`, `client_id`, `tid`, `idp`, `scope`, `scp`, `nonce`, `sid`, `act`, `cnf`, `typ`, `ver`,
+  `auth_time` and `amr`. Naming `sub` is the default, and is not stored.
+- A strategy whose stored `principal_claim` is one the API refuses, such as one written to
+  `_storage/` by hand, names no caller: JWT source authentication through it answers `500`.
 - `principal_claim` is fixed when the strategy is created. Changing it would change every
   caller's identity hash and orphan the credentials stored under the old ones, so an update that
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
