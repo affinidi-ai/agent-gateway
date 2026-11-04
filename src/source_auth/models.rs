@@ -542,10 +542,14 @@ impl AuthenticatedIdentity {
     }
 
     /// A stable key for the authenticated caller, distinct across auth modes,
-    /// for per-caller limits.
+    /// for per-caller limits. A JWT caller is keyed by its identity hash, so its
+    /// issuer and principal claim tell it apart as they do for its grants; one
+    /// that names no caller is `jwt:<none>`.
     pub fn principal_key(&self) -> String {
         match self {
-            AuthenticatedIdentity::JwtBearer { subject, .. } => format!("jwt:{subject}"),
+            AuthenticatedIdentity::JwtBearer { .. } => self
+                .principal_hash(None)
+                .map_or_else(|| "jwt:<none>".to_string(), |hash| format!("jwt:{hash}")),
             AuthenticatedIdentity::ApiKey { key_name, .. } => format!("api-key:{key_name}"),
             AuthenticatedIdentity::DidAuth { did } => format!("did-auth:{did}"),
             AuthenticatedIdentity::Mtls { principal, .. } => format!("mtls:{principal}"),
@@ -1027,6 +1031,32 @@ mod tests {
             Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"),
             "sub keeps the hash it always had"
         );
+    }
+
+    /// Per-caller limits key a JWT caller as its grants do: one value in two
+    /// claims, or from two issuers, is two callers.
+    #[test]
+    fn a_jwt_callers_limit_key_follows_its_issuer_and_principal_claim() {
+        let alice = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        let by_username = jwt_named_by(
+            "preferred_username",
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "m-1", "preferred_username": "alice" }),
+        );
+        let other_issuer =
+            jwt_named_by("sub", serde_json::json!({ "iss": "https://other.example.com", "sub": "alice" }));
+        assert_ne!(alice.principal_key(), by_username.principal_key());
+        assert_ne!(alice.principal_key(), other_issuer.principal_key());
+        assert_eq!(
+            alice.principal_key(),
+            format!(
+                "jwt:{}",
+                alice
+                    .principal_hash(None)
+                    .unwrap()
+            )
+        );
+        let nobody = jwt_named_by("oid", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        assert_eq!(nobody.principal_key(), "jwt:<none>");
     }
 
     #[test]

@@ -257,6 +257,7 @@ impl SourceAuthMiddleware {
         let subject = claims
             .get(principal_claim.as_str())
             .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
             .unwrap_or("<none>")
             .to_string();
 
@@ -1762,6 +1763,14 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await
             .expect("the token is valid; it just names no caller");
         assert_eq!(identity.principal_hash(None), None, "a token without the claim names no caller");
+
+        let empty = token_with(json!({ "oid": "" }));
+        let identity = mw
+            .authenticate(&config, &bearer(&empty), "test-channel", SessionView::base("surface"), None)
+            .await
+            .unwrap();
+        assert_eq!(identity.principal(), "<none>", "an empty claim reaches policy as the placeholder");
+        assert_eq!(identity.principal_key(), "jwt:<none>");
 
         let numeric = token_with(json!({ "oid": 7 }));
         let identity = mw
