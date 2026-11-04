@@ -79,7 +79,7 @@ fn extract_session_token(request: &Request) -> Option<String> {
 }
 
 /// Public helper: extract session token from request headers only.
-/// Priority: Authorization Bearer header > `session_token` cookie.
+/// Priority: Authorization Bearer header > `__Host-session_token` cookie.
 ///
 /// Tokens are deliberately never read from the URL query string: a token in the
 /// URL leaks into access logs, `Referer` headers, browser history, and proxy
@@ -1069,7 +1069,7 @@ mod tests {
     // Tokens in the URL leak into access logs, Referer headers, browser
     // history, and proxy caches, so the query-string path is not honoured even
     // when the token is otherwise valid. Tokens must arrive via the
-    // Authorization header or the HttpOnly session_token cookie.
+    // Authorization header or the HttpOnly __Host-session_token cookie.
 
     #[tokio::test]
     async fn protected_endpoints_reject_valid_token_in_query_param() {

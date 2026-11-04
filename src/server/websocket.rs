@@ -345,7 +345,7 @@ async fn verify_websocket_terms(
 }
 
 /// Extract session token from Authorization header, rejected query parameters, or cookies.
-/// Priority: Authorization Bearer header > rejected `token` query param > `session_token` cookie.
+/// Priority: Authorization Bearer header > rejected `token` query param > `__Host-session_token` cookie.
 fn extract_session_token(
     headers: &HeaderMap,
     params: &HashMap<String, String>,

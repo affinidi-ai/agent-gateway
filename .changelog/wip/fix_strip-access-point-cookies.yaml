@@ -18,6 +18,7 @@ changes:
       description: >-
         The dashboard session cookie is now named __Host-session_token and is Secure, so a
         browser sends it only over HTTPS or to localhost and no other host can set it. The old
-        session_token cookie is no longer read; a browser that holds only that cookie signs in
-        again. Single sign-on over plain HTTP on a host other than localhost needs HTTPS.
+        session_token cookie is no longer read; an open dashboard receives the new cookie on its
+        next request. Over plain HTTP on a host other than localhost the browser drops the
+        cookie, so the dashboard's live updates stop, while signing in still works.
   breaking: []

@@ -117,7 +117,8 @@ flowchart LR
 The dashboard's session cookie, `__Host-session_token`, is `Secure`, so a browser keeps it
 only over HTTPS or on `http://localhost`. Behind a load balancer that terminates TLS, port
 `8080` serves the dashboard as before. Opened over plain HTTP on any other host, the
-dashboard's single sign-on (SAML) login fails, because the browser drops the cookie it sets.
+dashboard still signs in, but its live updates stop: the browser drops the cookie, and the
+dashboard's WebSocket authenticates only with it.
 
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:

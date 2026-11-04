@@ -85,14 +85,14 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
     cors_layer(cors_origins, false)
 }
 
-/// Removes every `Set-Cookie` from an Access Point's answer. The target shares
-/// the caller-facing host with the gateway's dashboard, so a cookie it sets
-/// would land on the dashboard's origin; and the caller's cookies are never
-/// forwarded to it, so a cookie it sets could never come back.
+/// Removes every `Set-Cookie` and `Set-Cookie2` from an Access Point's answer.
+/// The target shares the caller-facing host with the gateway's dashboard, so a
+/// cookie it sets would land on the dashboard's origin; and the caller's
+/// cookies are never forwarded to it, so a cookie it sets could never come back.
 async fn withhold_target_cookies(mut response: axum::response::Response) -> axum::response::Response {
-    response
-        .headers_mut()
-        .remove(axum::http::header::SET_COOKIE);
+    let headers = response.headers_mut();
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove("set-cookie2");
     response
 }
 
@@ -816,6 +816,7 @@ pub async fn run_port_server(
                         "/.well-known/oauth-protected-resource/{*path}",
                         axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
                     )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
                     .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
                         proxy_cors_layer(&network_config.cors)
                     } else {
@@ -2157,6 +2158,7 @@ mod tests {
                         [
                             (header::SET_COOKIE, "__Host-session_token=planted; Path=/; Secure"),
                             (header::SET_COOKIE, "lb=sticky"),
+                            (header::HeaderName::from_static("set-cookie2"), "legacy=1"),
                             (header::CACHE_CONTROL, "no-store"),
                         ],
                         StatusCode::OK,
@@ -2180,6 +2182,11 @@ mod tests {
             !response
                 .headers()
                 .contains_key(header::SET_COOKIE)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie2")
         );
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }

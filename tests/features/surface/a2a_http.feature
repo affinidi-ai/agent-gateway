@@ -168,7 +168,7 @@ Feature: A2A HTTP surface forwarding and identity
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
 
-  Scenario: Without a target credential the agent card fetch forwards caller headers as before
+  Scenario: Without a target credential the agent card fetch forwards caller headers except cookies
     When the caller fetches the agent card with extra headers
       | x-request-id | req-caller     |
       | cookie       | session=caller |
