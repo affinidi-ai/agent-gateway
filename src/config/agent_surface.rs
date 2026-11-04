@@ -718,6 +718,17 @@ pub struct Target {
     /// to a `fabric://` peer on modern MCP requests. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fabric_delegated_credentials: bool,
+
+    /// Releases the per-user grants of this Target's `outbound_credentials`
+    /// to a legacy Fabric request, for the caller the surface's own
+    /// `source_auth` or resource token verified, while that caller
+    /// authentication tells a partner's users apart
+    /// ([`AgentSurface::fabric_caller_authentication_gap`]). A view that sets
+    /// it keeps each person's grant under the surface, for legacy direct and
+    /// Fabric callers alike. Off by default, when a per-user binding refuses
+    /// every Fabric request it applies to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated_credentials_for_fabric_callers: bool,
 }
 
 /// Payment policy configuration.
@@ -5724,6 +5735,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -5802,6 +5814,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: Some(TransitConfig {
                 points: vec![
@@ -5899,6 +5912,37 @@ mod tests {
             surface
                 .find_transit_point("nonexistent")
                 .is_none()
+        );
+    }
+
+    /// A Target releases no per-user grant to Fabric callers unless it says
+    /// so, and the switch is stored only when set, so a surface saved without
+    /// it reads the same on a release that does not know it.
+    #[test]
+    fn target_fabric_caller_release_defaults_off_and_is_omitted_when_off() {
+        let off: Target = serde_json::from_value(serde_json::json!({ "endpoint": "https://agent.example" })).unwrap();
+        assert!(!off.delegated_credentials_for_fabric_callers);
+        assert!(
+            serde_json::to_value(&off)
+                .unwrap()
+                .get("delegated_credentials_for_fabric_callers")
+                .is_none()
+        );
+
+        let on: Target = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://agent.example", "delegated_credentials_for_fabric_callers": true
+        }))
+        .unwrap();
+        assert!(on.delegated_credentials_for_fabric_callers);
+        assert!(!on.fabric_delegated_credentials, "independent of the switch that sends grants to a peer");
+        assert_eq!(serde_json::to_value(&on).unwrap()["delegated_credentials_for_fabric_callers"], true);
+
+        assert!(
+            serde_json::from_value::<Target>(serde_json::json!({
+                "endpoint": "https://agent.example", "delegated_credentials_for_fabric_caller": true
+            }))
+            .is_err(),
+            "a misspelt switch is refused, not read as off"
         );
     }
 
