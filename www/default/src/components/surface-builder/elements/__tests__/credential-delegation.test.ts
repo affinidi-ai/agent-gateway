@@ -312,6 +312,83 @@ describe('credential-delegation definition', () => {
       expect(recovered.some(n => n.type === 'credential-delegation')).toBe(false);
       expect(recovered.some(n => n.type === 'workload-binding')).toBe(false);
     });
+
+    const external = {
+      credential_provider_id: 'vendor',
+      consent_mode: 'external',
+      subject: 'owner',
+    };
+    const bound = {
+      access_point: { route: '/api', protocol: 'mcp' },
+      target: { endpoint: 'https://mcp.vendor.example/mcp' },
+      outbound_credentials: [external],
+    };
+    const blobOf = (nodes: any[]) => ({
+      version: 1,
+      nodes: nodes.map(n => ({ id: n.id, type: n.type, config: n.config, parentId: n.parentId })),
+    });
+
+    it('never restores a binding the stored surface no longer holds from its canvas blob', () => {
+      // The binding moved to a variant, or was removed, outside the
+      // dashboard: the canvas blob still holds the old element.
+      const blob = blobOf(registry.nodesFromPayload(bound));
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      expect(recovered.some(n => n.type === 'credential-delegation')).toBe(false);
+      expect(registry.buildPayload(makeCtx(recovered)).outbound_credentials).toBeUndefined();
+    });
+
+    it('takes a stored binding from the surface, not from its canvas blob', () => {
+      const blob = blobOf(registry.nodesFromPayload(bound));
+      const recovered = registry.nodesFromPayload({ ...bound, canvas: blob });
+      expect(registry.buildPayload(makeCtx(recovered)).outbound_credentials).toEqual([
+        expect.objectContaining({
+          credential_provider_id: 'vendor',
+          consent_mode: 'external',
+          subject: 'owner',
+        }),
+      ]);
+    });
+
+    it('keeps a dropped element that has no binding yet through a reload', () => {
+      const blob = {
+        version: 1,
+        nodes: [
+          { id: 'cd', type: 'credential-delegation', config: { outbound_credentials_form: [] } },
+        ],
+      };
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      expect(recovered.some(n => n.type === 'credential-delegation')).toBe(true);
+    });
+
+    it('keeps an element whose rows name no provider yet through a reload', () => {
+      // Such a row is never saved, as from a template, so the blob is its only copy.
+      const unsaved = { credential_provider_id: '', consent_mode: 'on_demand', scopes: 'read' };
+      const blob = {
+        version: 1,
+        nodes: [
+          {
+            id: 'cd',
+            type: 'credential-delegation',
+            config: { outbound_credentials_form: [unsaved] },
+          },
+        ],
+      };
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      const node = recovered.find(n => n.type === 'credential-delegation');
+      expect(node?.config.outbound_credentials_form).toEqual([expect.objectContaining(unsaved)]);
+    });
   });
 });
 
