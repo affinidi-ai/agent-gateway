@@ -1,8 +1,8 @@
 //! A surface stored naming an API Key Provider key it may not use goes live without the save
 //! check, at boot or on a configuration reload. Under `tenant_credential_isolation: warn` it keeps
 //! serving and the gateway logs the key id and rule; under `enforce`, or while the API key store
-//! is unavailable, its Access Point is not ready: every request is refused with `503` and the
-//! admin API names the reason. A surface naming its own tenant's key serves in both modes.
+//! is unavailable, its Access Point is not ready: every request is refused with `503`. A surface
+//! naming its own tenant's key serves in both modes.
 
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -414,4 +414,36 @@ async fn refresh_scan_flow() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(!verdicts.has_verdict(NAMES_OWN), "a deleted surface's verdict is dropped");
+}
+
+#[test]
+fn a_key_owner_moved_to_another_tenant_by_another_node_takes_the_surfaces_naming_its_key_out_of_service() {
+    run_in_own_process(owner_tenant_change_flow);
+}
+
+async fn owner_tenant_change_flow() {
+    crate::storage::filesystem::set_cache_refresh_interval_secs(1);
+    let gate = Gate::start_with(RuleMode::Enforce, true, 1).await;
+    let (status, body) = gate.call(NAMES_OWN).await;
+    assert_eq!(status, 200, "{body}");
+
+    gate.rewrite("owner-a", |stored| {
+        stored["tenant_id"] = json!("tenant-b");
+    });
+    assert_not_ready(
+        gate.call_until(NAMES_OWN, 503)
+            .await,
+        "its key's owner moved to another tenant by another node",
+    );
+    let reached = gate.reached();
+    assert_not_ready(gate.call(NAMES_OWN).await, "its key's owner moved to another tenant");
+    assert_eq!(gate.reached(), reached, "a not-ready Access Point never reaches the Target");
+
+    gate.rewrite("owner-a", |stored| {
+        stored["tenant_id"] = json!("tenant-a");
+    });
+    let (status, body) = gate
+        .call_until(NAMES_OWN, 200)
+        .await;
+    assert_eq!(status, 200, "its key's owner moved back: {body}");
 }

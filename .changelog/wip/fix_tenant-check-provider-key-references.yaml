@@ -32,8 +32,10 @@ changes:
         such a surface is not ready and answers `503` on direct inbound, Fabric receive and its
         Transit Points. While the API key store cannot be read, a surface naming a key id that
         has not been checked answers `503` in either mode; a store that failed to start needs a
-        restart. A legacy Caller Context API Key secret named like such a key on an inbound From
-        API Key view is checked the same way, and a new reference to one is refused on save.
+        restart. When a key-owning surface changes or is deleted, the surfaces naming its keys are
+        checked again on their next request. A legacy Caller Context API Key secret named like
+        such a key on an inbound From API Key view is checked the same way, and a new reference
+        to one is refused on save.
     - timestamp: '2026-11-03T17:00:00Z'
       title: Fetch no agent card preview for a surface that names an API key it may not use
       description: >-

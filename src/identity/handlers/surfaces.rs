@@ -3948,13 +3948,12 @@ async fn apply_surface_change_while_locked(
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
 
-    // Phase C — keep the resolved-surface snapshot cache in lockstep
-    // with the on-disk store. Done up-front (before reload) so the
-    // cache reflects the change even if the channel reload below
-    // fails: the next request will then hit either the new snapshots
-    // (which match what was just persisted) or a clean miss for a
-    // deleted surface.
     let provider_key_gate = crate::identity::provider_key_gate::gate();
+    let changed_id = match change {
+        SurfaceChange::Upsert(surface) => surface.surface_id.as_str(),
+        SurfaceChange::Delete(id) => id,
+    };
+    provider_key_gate.owner_changed(changed_id);
     match change {
         SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
             provider_key_gate
@@ -3964,6 +3963,13 @@ async fn apply_surface_change_while_locked(
         SurfaceChange::Upsert(surface) => provider_key_gate.forget(&surface.surface_id),
         SurfaceChange::Delete(id) => provider_key_gate.forget(id),
     }
+
+    // Phase C — keep the resolved-surface snapshot cache in lockstep
+    // with the on-disk store. Done up-front (before reload) so the
+    // cache reflects the change even if the channel reload below
+    // fails: the next request will then hit either the new snapshots
+    // (which match what was just persisted) or a clean miss for a
+    // deleted surface.
     match change {
         SurfaceChange::Upsert(surface) => {
             if surface.status == crate::config::agent_surface::SurfaceStatus::Active {

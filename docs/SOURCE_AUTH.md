@@ -1025,7 +1025,9 @@ Each time, the gateway checks its key ids against their owning surfaces and logs
 per surface that names a key it may not use, or whose key or owning surface is gone. The line
 names the `surface`, its `tenant`, `rule="provider_key_tenant"`, each key id with its issue
 (`other_tenant`, `appliance_key`, `missing_key` or `missing_owner`) and `not_ready`. It carries
-no secret.
+no secret. When a surface that owns keys changes the same ways, or by a save, or is deleted, every
+surface naming one of its keys is checked again on its next request, so an owner moved to
+another tenant on disk or by another node takes those surfaces out of service under `enforce`.
 
 - Under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
