@@ -16,6 +16,7 @@ pub mod policy_definitions;
 pub mod policy_validation;
 pub mod settings;
 pub(crate) mod surface_grants;
+mod surface_target_auth;
 pub(crate) mod surface_tenancy;
 pub mod surfaces;
 pub mod tenant_ownership;

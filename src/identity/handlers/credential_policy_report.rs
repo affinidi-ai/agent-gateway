@@ -9,6 +9,8 @@ use super::surface_tenancy::collect_surface_reference_keys;
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+use crate::config::target_auth_rules::{TargetCredentialRule, broken_target_credential_rules, is_https_target};
+use crate::config::types::{TargetAuthConfig, TargetAuthMethod};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::state::IdentityApiState;
@@ -18,6 +20,8 @@ use crate::tenancy::ResourceKind;
 const RULE_TOKEN_ENDPOINT_HTTPS: &str = "token_endpoint_https";
 const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
 const RULE_JWT_SUBJECT: &str = "jwt_subject";
+const RULE_TARGET_HTTPS: &str = TargetCredentialRule::Https.key();
+const RULE_TARGET_SOURCE_AUTH: &str = TargetCredentialRule::SourceAuth.key();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -83,6 +87,66 @@ pub(crate) struct Findings {
     pub skipped: Vec<SkippedSurface>,
 }
 
+/// The surface itself and each variant as it resolves, so a variant's overrides are held to
+/// the same rules. A variant that cannot be resolved is skipped.
+fn effective_views(surface: &AgentSurface) -> Vec<AgentSurface> {
+    let mut views = vec![surface.clone()];
+    for variant in &surface.variants {
+        let mut resolvable = surface.clone();
+        if let Some(candidate) = resolvable
+            .variants
+            .iter_mut()
+            .find(|candidate| candidate.id == variant.id)
+        {
+            candidate.enabled = true;
+        }
+        if let Ok(resolved) = resolvable.resolve_variant(Some(&variant.alias)) {
+            views.push(resolved);
+        }
+    }
+    views
+}
+
+fn sends_credential(auth: Option<&TargetAuthConfig>) -> bool {
+    auth.is_some_and(|auth| {
+        matches!(auth.method, TargetAuthMethod::StaticSecret { .. } | TargetAuthMethod::CredentialProvider { .. })
+    })
+}
+
+/// The rules each leg of `surface` that sends a static secret or credential provider token
+/// breaks on a caller's request: the Target, checked by the Access Point, and each Transit
+/// Point, checked by itself. The backend credential of an A2A proxy Target is held to
+/// `target_source_auth` only, since it does not go over the `a2a-proxy://` endpoint. Every
+/// variant as it resolves is included.
+fn broken_target_rules(surface: &AgentSurface) -> Vec<TargetCredentialRule> {
+    let mut rules = Vec::new();
+    for view in effective_views(surface) {
+        if view.dispatches_to_a2a_proxy() {
+            rules.extend(broken_target_credential_rules(true, view.authenticates_callers(), false));
+        }
+        if sends_credential(view.target.auth.as_ref()) {
+            rules.extend(broken_target_credential_rules(
+                is_https_target(&view.target.endpoint),
+                view.authenticates_callers(),
+                false,
+            ));
+        }
+        for point in view
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .filter(|point| sends_credential(point.target_auth.as_ref()))
+        {
+            rules.extend(broken_target_credential_rules(
+                is_https_target(&point.target_endpoint),
+                point.authenticates_callers(),
+                false,
+            ));
+        }
+    }
+    rules
+}
+
 pub(crate) fn find_breaches(
     providers: &[CredentialProvider],
     surfaces: &[AgentSurface],
@@ -116,15 +180,9 @@ pub(crate) fn find_breaches(
         }
     }
     for surface in surfaces {
+        let mut rules = Vec::new();
         match surface_breaks_isolation(surface, secret_tenants, &by_id) {
-            Ok(true) => findings
-                .breaches
-                .push(PolicyBreach {
-                    subject: "surface",
-                    id: surface.surface_id.clone(),
-                    tenant_id: surface.tenant_id.clone(),
-                    rule: RULE_TENANT_CREDENTIAL_ISOLATION,
-                }),
+            Ok(true) => rules.push(RULE_TENANT_CREDENTIAL_ISOLATION),
             Ok(false) => {}
             Err(error) => findings
                 .skipped
@@ -134,6 +192,22 @@ pub(crate) fn find_breaches(
                     error: format!("{error:?}"),
                 }),
         }
+        let target_rules = broken_target_rules(surface);
+        for rule in [TargetCredentialRule::Https, TargetCredentialRule::SourceAuth] {
+            if target_rules.contains(&rule) {
+                rules.push(rule.key());
+            }
+        }
+        findings.breaches.extend(
+            rules
+                .into_iter()
+                .map(|rule| PolicyBreach {
+                    subject: "surface",
+                    id: surface.surface_id.clone(),
+                    tenant_id: surface.tenant_id.clone(),
+                    rule,
+                }),
+        );
     }
     findings
 }
@@ -188,6 +262,8 @@ fn rule_mode(
     match rule {
         RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
         RULE_JWT_SUBJECT => RuleMode::Warn,
+        RULE_TARGET_HTTPS => policy.target_https,
+        RULE_TARGET_SOURCE_AUTH => policy.target_source_auth,
         _ => policy.tenant_credential_isolation,
     }
 }
@@ -420,7 +496,7 @@ mod tests {
                 )
                 .breaches
                 .iter()
-                .filter(|breach| breach.subject == "surface")
+                .filter(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
                 .collect::<Vec<_>>()
                 .is_empty()
             })
@@ -430,7 +506,7 @@ mod tests {
             find_breaches(&providers, &surfaces[..1], &secret_tenants, &egress(CredentialPolicyConfig::default()))
                 .breaches
                 .into_iter()
-                .find(|breach| breach.subject == "surface")
+                .find(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
                 .unwrap();
         assert_eq!(breach.id, "s");
         assert_eq!(breach.tenant_id.as_deref(), Some("t1"));
@@ -551,5 +627,198 @@ mod tests {
         assert!(!reported(Some("t1"), "S_OWN"));
         assert!(!reported(Some("t1"), "S_GONE"));
         assert!(!reported(None, "S_WIDE"));
+    }
+
+    fn target_surface(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+        source_auth: bool,
+    ) -> AgentSurface {
+        let mut surface = AgentSurface {
+            surface_id: "s".to_string(),
+            ..Default::default()
+        };
+        surface.target.endpoint = endpoint.to_string();
+        surface.target.auth = method.map(|method| TargetAuthConfig {
+            method,
+            auth_type: None,
+            target_identifier: None,
+            fallback: Default::default(),
+        });
+        if source_auth {
+            surface
+                .access_point
+                .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+                methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(
+                    crate::source_auth::models::ApiKeyAuthConfig {
+                        extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
+                            field: "X-Caller".to_string(),
+                        },
+                        secret_id: "caller-keys".to_string(),
+                    },
+                )],
+                protected_resource: None,
+                on_failure: Default::default(),
+            });
+        }
+        surface
+    }
+
+    fn static_secret() -> TargetAuthMethod {
+        TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "Authorization".to_string(),
+            header_format: "{value}".to_string(),
+        }
+    }
+
+    fn provider_method() -> TargetAuthMethod {
+        TargetAuthMethod::CredentialProvider {
+            provider_id: "p".to_string(),
+            header_name: "Authorization".to_string(),
+            header_format: "{value}".to_string(),
+            scopes: Vec::new(),
+        }
+    }
+
+    fn surface_rules(surface: &AgentSurface) -> Vec<&'static str> {
+        find_breaches(&[], std::slice::from_ref(surface), &HashMap::new(), &egress(CredentialPolicyConfig::default()))
+            .breaches
+            .into_iter()
+            .map(|breach| breach.rule)
+            .collect()
+    }
+
+    fn transit_point(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+        require_transit_token: bool,
+    ) -> crate::config::agent_surface::TransitPoint {
+        serde_json::from_value(serde_json::json!({
+            "alias": "tp",
+            "target_endpoint": endpoint,
+            "require_transit_token": require_transit_token,
+            "target_auth": method.map(|method| serde_json::to_value(TargetAuthConfig {
+                method,
+                auth_type: None,
+                target_identifier: None,
+                fallback: Default::default(),
+            }).unwrap()),
+        }))
+        .unwrap()
+    }
+
+    fn transit_config(
+        points: Vec<crate::config::agent_surface::TransitPoint>
+    ) -> crate::config::agent_surface::TransitConfig {
+        serde_json::from_value(serde_json::json!({ "points": points })).unwrap()
+    }
+
+    #[test]
+    fn a_target_credential_on_a_non_https_target_is_reported() {
+        for method in [static_secret, provider_method] {
+            for (endpoint, reported) in [
+                ("http://upstream.internal/mcp", true),
+                ("fabric://gw/surface", true),
+                ("a2a-proxy://agent", true),
+                ("https://upstream.example/mcp", false),
+                ("HTTPS://upstream.example/mcp", false),
+            ] {
+                let rules = surface_rules(&target_surface(endpoint, Some(method()), true));
+                assert_eq!(rules.contains(&RULE_TARGET_HTTPS), reported, "{endpoint}");
+            }
+        }
+        assert!(surface_rules(&target_surface("http://upstream.internal", None, true)).is_empty());
+    }
+
+    #[test]
+    fn a_transit_point_credential_on_a_non_https_endpoint_is_reported() {
+        let mut surface = target_surface("https://upstream.example", None, true);
+        surface.transit = Some(transit_config(vec![transit_point("http://tp.internal", Some(static_secret()), true)]));
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_HTTPS]);
+        surface.transit = Some(transit_config(vec![transit_point("https://tp.example", Some(static_secret()), true)]));
+        assert!(surface_rules(&surface).is_empty());
+    }
+
+    #[test]
+    fn a_target_credential_without_access_point_source_auth_is_reported() {
+        let without = surface_rules(&target_surface("https://upstream.example", Some(static_secret()), false));
+        assert_eq!(without, vec![RULE_TARGET_SOURCE_AUTH]);
+        let with = surface_rules(&target_surface("https://upstream.example", Some(provider_method()), true));
+        assert!(with.is_empty());
+        let no_credential = surface_rules(&target_surface("https://upstream.example", None, false));
+        assert!(no_credential.is_empty());
+    }
+
+    #[test]
+    fn a_transit_point_credential_needs_a_transit_point_that_checks_its_callers() {
+        let with_points = |access_point_checks: bool, token: bool| {
+            let mut surface = target_surface("https://upstream.example", None, access_point_checks);
+            surface.transit =
+                Some(transit_config(vec![transit_point("https://tp.example", Some(static_secret()), token)]));
+            surface
+        };
+        assert_eq!(surface_rules(&with_points(false, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert_eq!(surface_rules(&with_points(true, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert!(surface_rules(&with_points(false, true)).is_empty());
+    }
+
+    #[test]
+    fn an_a2a_proxy_target_is_held_to_target_source_auth_only() {
+        assert_eq!(surface_rules(&target_surface("a2a-proxy://agent", None, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert!(surface_rules(&target_surface("a2a-proxy://agent", None, true)).is_empty());
+        let mut mcp = target_surface("a2a-proxy://agent", None, false);
+        mcp.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+        assert!(surface_rules(&mcp).is_empty(), "only an A2A or AP2 surface dispatches to an A2A proxy");
+        assert!(surface_rules(&target_surface("https://upstream.example", None, false)).is_empty());
+    }
+
+    /// `target_surface` whose Access Point has an API key and a JWT Bearer method.
+    fn two_method_surface(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+    ) -> AgentSurface {
+        let mut surface = target_surface(endpoint, method, false);
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "secret_id": "caller-keys",
+                 "extraction": {"source": "http_header", "field": "X-Caller"}},
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []}
+            ]}))
+            .unwrap(),
+        );
+        surface
+    }
+
+    #[test]
+    fn an_access_point_with_several_methods_checks_the_targets_callers_but_not_a_transit_points() {
+        assert!(surface_rules(&two_method_surface("https://upstream.example", Some(static_secret()))).is_empty());
+        assert!(surface_rules(&two_method_surface("a2a-proxy://agent", None)).is_empty());
+
+        let mut variant = two_method_surface("https://upstream.example", Some(provider_method()));
+        variant.variants = serde_json::from_value(serde_json::json!([{
+            "id": "open-id", "alias": "open", "name": "Open",
+            "overrides": {"access_point": {"caller_authentication": {"methods": []}}}
+        }]))
+        .unwrap();
+        assert_eq!(surface_rules(&variant), vec![RULE_TARGET_SOURCE_AUTH], "a variant without a method");
+
+        let mut open_point = two_method_surface("https://upstream.example", None);
+        let mut point = transit_point("https://tp.example", Some(static_secret()), false);
+        point.allow_unauthenticated_callers = true;
+        open_point.transit = Some(transit_config(vec![point]));
+        assert_eq!(surface_rules(&open_point), vec![RULE_TARGET_SOURCE_AUTH]);
+    }
+
+    #[test]
+    fn a_resource_access_token_counts_as_checking_the_targets_callers() {
+        let mut surface = target_surface("https://upstream.example", Some(static_secret()), false);
+        surface.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({"authorization": {"resource": "https://gateway.example/s"}}))
+                .unwrap(),
+        );
+        assert!(surface_rules(&surface).is_empty());
     }
 }

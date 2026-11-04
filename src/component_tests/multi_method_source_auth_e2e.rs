@@ -226,6 +226,69 @@ async fn an_ambiguous_request_forwards_no_jwt_even_when_the_forwarding_method_is
     assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1].keys());
 }
 
+/// Under `target_source_auth` `enforce`, on an Access Point with an API key method and a
+/// forwarding JWT method, a caller either method verified gets the Target credential: the JWT
+/// caller's token goes with it, the API key caller's key does not. A caller carrying both
+/// credentials is verified by neither and gets nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_target_credential_goes_beside_the_forwarded_jwt_of_the_method_that_verified_the_caller() {
+    const TARGET_CREDENTIAL: &str = "target-credential-value";
+    let fixture = JwksFixture::start().await;
+    let target = RecordingTarget::start(StatusCode::OK, &[]).await;
+    let target_url = target.url.clone();
+    let fixture_ref = &fixture;
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        let strategy_id = write_jwt_strategy(fixture_ref, temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            API_KEY_SECRET_ID,
+            API_KEY,
+        );
+        super::target_auth_provider_e2e::write_secret(bootstrap, "target-key", TARGET_CREDENTIAL);
+        bootstrap.credential_policy = crate::config::credential_policy::CredentialPolicyConfig {
+            target_source_auth: crate::config::credential_policy::RuleMode::Enforce,
+            ..Default::default()
+        };
+        let mut surface = helpers::build_minimal_channel();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [api_key_method(), jwt_method(strategy_id, true)] }))
+                .expect("caller authentication"),
+        );
+        surface.target.endpoint = target_url.clone();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {
+                    "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+                }},
+                "fallback": "passthrough"
+            }))
+            .unwrap(),
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
+
+    assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200);
+    assert_eq!(send(&h, &[("x-api-key", API_KEY.to_string())]).await, 200);
+    assert_eq!(send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await, 200);
+
+    let received = target.received();
+    assert_eq!(received.len(), 3);
+    assert_eq!(received[0]["authorization"], jwt.as_str(), "the JWT method forwards its token");
+    assert_eq!(received[0]["x-target-key"], TARGET_CREDENTIAL, "the JWT caller gets the Target credential");
+    assert_eq!(received[1]["x-target-key"], TARGET_CREDENTIAL, "the API key caller gets the Target credential");
+    assert!(!received[1].contains_key("authorization"), "{:?}", received[1].keys());
+    assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1].keys());
+    for name in ["x-target-key", "authorization", "x-api-key"] {
+        assert!(!received[2].contains_key(name), "an ambiguous caller gets no {name}: {:?}", received[2].keys());
+    }
+}
+
 /// Policy sees the method that verified each caller: on one two-method
 /// surface a policy admitting only API key callers lets the API key caller
 /// through and refuses the JWT caller, though both authenticated.

@@ -112,7 +112,10 @@ impl Api {
     ) -> Value {
         let mut surface = json!({
             "name": route.trim_start_matches('/').replace('/', "-"), "status": "disabled",
-            "access_point": {"listen_address": self.listener, "route": route, "protocol": "a2a"},
+            "access_point": {
+                "listen_address": self.listener, "route": route, "protocol": "a2a",
+                "caller_authentication": caller_authentication()
+            },
             "target": {"endpoint": self.target},
             "tenant_id": tenant
         });
@@ -234,7 +237,41 @@ impl Api {
 }
 
 fn static_secret(secret_id: &str) -> Value {
-    json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "Authorization"}}})
+    json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "X-Target-Key"}}})
+}
+
+fn api_key_caller_check() -> Value {
+    json!({"type": "api_key", "secret_id": "caller-key", "extraction": {"source": "http_header", "field": "X-Caller-Key"}})
+}
+
+fn caller_authentication() -> Value {
+    json!({"methods": [api_key_caller_check()]})
+}
+
+/// Makes the Target of a stored surface, its variant's, and the Transit Points at
+/// `transit_points` meet the Target authentication rules a changed setting is held to: an
+/// https Target and a leg that checks its callers.
+fn meeting_target_auth_rules(
+    surface: &mut Value,
+    transit_points: &[usize],
+) {
+    surface["access_point"]["caller_authentication"] = caller_authentication();
+    surface["target"]["endpoint"] = json!("https://127.0.0.1:9/");
+    surface["variants"][0]["overrides"]["target"]["endpoint"] = json!("https://127.0.0.1:9/staging");
+    for &index in transit_points {
+        let point = &mut surface["transit"]["points"][index];
+        point["target_endpoint"] = json!(format!(
+            "https://127.0.0.1:9/{}",
+            point["alias"]
+                .as_str()
+                .unwrap()
+        ));
+        point
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_unauthenticated_callers");
+        point["source_auth"] = api_key_caller_check();
+    }
 }
 
 fn secret_metadata(secret_id: &str) -> Value {
@@ -441,11 +478,12 @@ async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
         listener: harness
             .gateway_base
             .replace("127.0.0.1", "localhost"),
-        target: harness.mock.url(),
+        target: "https://127.0.0.1:9/".to_string(),
     };
     let signing_key = crate::delegation_vault::jwt_assertion::test_keys::rsa_pkcs8().private_pem;
     for (secret_id, tenant, value) in [
         ("appliance-key", None, "v"),
+        ("caller-key", None, "v"),
         ("appliance-client-id", None, "v"),
         ("appliance-client-secret", None, "v"),
         ("appliance-signing-key", None, signing_key.as_str()),
@@ -693,6 +731,7 @@ async fn a_new_appliance_wide_credential_on_a_tenant_surface_is_refused_and_a_st
         NOT_ACCESSIBLE_SECRET,
     );
     moved["target"]["auth"] = static_secret("tenant-key");
+    meeting_target_auth_rules(&mut moved, &[]);
     assert_saved(
         api.put(STORED_SECRET_SURFACE, &moved)
             .await,
@@ -732,6 +771,7 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_surface_is_refused_when_
     );
     let mut fixed = target_fixed;
     fixed["transit"]["points"][0]["target_auth"] = static_secret("tenant-key");
+    meeting_target_auth_rules(&mut fixed, &[0]);
     assert_saved(
         api.put(STORED_SECRET_SURFACE, &fixed)
             .await,
@@ -1006,7 +1046,7 @@ async fn a_stored_appliance_wide_credential_on_a_tenant_provider_is_refused_when
 }
 
 fn provider_auth(provider_id: &str) -> Value {
-    json!({"method": {"credential_provider": {"provider_id": provider_id}}})
+    json!({"method": {"credential_provider": {"provider_id": provider_id, "header_name": "X-Target-Token"}}})
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1424,7 +1464,7 @@ async fn a_tenant_surface_cannot_keep_a_metadata_secret_its_tenant_deleted() {
     let (status, body) = api
         .send(
             api.client
-                .delete(api.url(&format!("secrets/{uuid}"))),
+                .delete(api.url(&format!("secrets/{uuid}?force=true"))),
         )
         .await;
     assert_eq!(status, 204, "{body}");

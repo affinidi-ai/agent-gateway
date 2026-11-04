@@ -113,6 +113,12 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
                     .contains_key(&val.key)
             });
 
+        assert!(
+            world
+                .plain_http_collaborators
+                .is_empty(),
+            "only the single-surface harness checks that a collaborator is reached over plain http"
+        );
         let need_some_starting = !all_gateway_processes_running || !all_agent_processes_running;
 
         if need_some_starting {
@@ -241,6 +247,10 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     let mut replacement_mock = None;
     let mut transit_point_mocks = std::collections::HashMap::new();
     let mut transit_target_urls = std::collections::HashMap::new();
+    let mut collaborator_urls = std::collections::HashMap::from([(
+        PRIMARY_COLLABORATOR_KEY.to_string(),
+        config::single_surface_writer::effective_target_url(&mock.url(), &world.surface_config),
+    )]);
     for transit_point in &world
         .surface_config
         .transit_points
@@ -258,8 +268,16 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         let target_url = if world.target_is_unreachable(&collaborator_key) {
             "http://127.0.0.1:1".to_string()
         } else {
-            mock.url()
+            format!(
+                "{}{}",
+                mock.url(),
+                transit_point
+                    .target_base_path
+                    .as_deref()
+                    .unwrap_or_default()
+            )
         };
+        collaborator_urls.insert(collaborator_key.clone(), target_url.clone());
         transit_target_urls.insert(transit_point.alias.clone(), target_url);
         if collaborator_key == SECONDARY_COLLABORATOR_KEY {
             replacement_mock = Some(mock);
@@ -267,7 +285,20 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             transit_point_mocks.insert(collaborator_key, mock);
         }
     }
-    let (outbound_port, mut outbound_port_reservation) = if !transit_target_urls.is_empty() {
+    for collaborator_key in &world.plain_http_collaborators {
+        let url = collaborator_urls
+            .get(collaborator_key)
+            .unwrap_or_else(|| panic!("collaborator '{collaborator_key}' has no endpoint on the surface"));
+        assert!(
+            url.starts_with("http://"),
+            "collaborator '{collaborator_key}' must be reached over plain http, not {url}"
+        );
+    }
+    let has_outbound_listener = !transit_target_urls.is_empty()
+        || world
+            .surface_config
+            .outbound_public_origin;
+    let (outbound_port, mut outbound_port_reservation) = if has_outbound_listener {
         let (port, reservation) = config::reserve_free_port("gateway outbound port");
         (port, Some(reservation))
     } else {
@@ -299,7 +330,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         (None, None)
     };
 
-    if !transit_target_urls.is_empty() {
+    if has_outbound_listener {
         config::single_surface_writer::write_single_surface_config_with_outbound_listener(
             temp_dir.path(),
             gateway_port,
@@ -392,7 +423,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     gateway
         .wait_until_ready()
         .await;
-    if !transit_target_urls.is_empty() {
+    if has_outbound_listener {
         gateway
             .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
             .await
@@ -665,7 +696,7 @@ async fn fetch_created_surface(
     fetch_surface_by_id(world, &surface_id).await;
 }
 
-fn build_request_body(protocol: &str) -> serde_json::Value {
+pub(crate) fn build_request_body(protocol: &str) -> serde_json::Value {
     match protocol {
         "a2a" => build_a2a_message_send_body("hello"),
         "mcp" => build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha")),
@@ -2472,7 +2503,7 @@ async fn caller_sends_modern_mcp_list_with_mirrored_method(
     send_json_request_and_record(world, body, modern_mcp_request_headers(&McpVersion::Modern, &mirrored_method)).await;
 }
 
-async fn send_mcp_request_through_transit_point(
+pub(crate) async fn send_mcp_request_through_transit_point(
     world: &mut SurfaceWorld,
     agent_name: &str,
     transit_point: &str,

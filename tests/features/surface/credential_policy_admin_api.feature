@@ -3,7 +3,10 @@ Feature: Credential rules when saving through the admin API
   plain http, and refuses to give a tenant's credential provider or surface a secret that is
   appliance-wide or belongs to another tenant. A surface that already stores an appliance-wide
   secret keeps it while tenant credential isolation only warns, and is refused once the gateway
-  enforces it.
+  enforces it. A surface whose stored Target credential, on the Target or a Transit Point,
+  breaks the https or caller rule saves again unchanged and the save answers with a Warning
+  header for each breach; once that credential is edited it is checked as new, and refused
+  while the rule is enforced.
 
   Scenario: A credential provider with an http token endpoint is refused and not stored
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -83,7 +86,7 @@ Feature: Credential rules when saving through the admin API
   Scenario: A tenant surface that already stores an appliance-wide secret can be saved again in warn mode
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    And the surface injects target authentication from secret "appliance-key" with value "appliance-secret-value" as header "Authorization"
+    And the gateway authenticates to the managed agent with secret "appliance-key" holding "appliance-secret-value" in header "Authorization"
     When the operator saves the surface with the description "Renamed in the dashboard"
     Then the admin API response status is 200
     And the stored surface has the description "Renamed in the dashboard"
@@ -92,10 +95,81 @@ Feature: Credential rules when saving through the admin API
   Scenario: A tenant surface that already stores an appliance-wide secret cannot be saved again when tenant isolation is enforced
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    And the surface injects target authentication from secret "appliance-key" with value "appliance-secret-value" as header "Authorization"
+    And the gateway authenticates to the managed agent with secret "appliance-key" holding "appliance-secret-value" in header "Authorization"
     And the gateway enforces the credential rule "tenant_credential_isolation"
     When the operator saves the surface with the description "Renamed in the dashboard"
     Then the admin API response status is 400
     And the admin API error response mentions "Secret reference is not accessible"
     And the stored surface has the description "BDD test surface"
     And the stored surface authenticates its target with secret "appliance-key"
+
+  Scenario: A surface whose stored Target credential breaks both Target rules saves again unchanged in warn mode
+    Given an A2A surface targeting managed agent "bravo"
+    And managed agent "bravo" is reached over plain http
+    And the surface's Access Point does not check its callers
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And the gateway only warns on the credential rule "target_https"
+    And the gateway only warns on the credential rule "target_source_auth"
+    When the operator saves the surface with the description "Renamed in the dashboard"
+    Then the admin API response status is 200
+    And the stored surface has the description "Renamed in the dashboard"
+    And the stored surface authenticates its target with secret "bdd-target-api-key"
+    And the admin API response carries a Warning header containing "target.auth sends a credential, so its Target must be an https URL; it will be refused once credential_policy.target_https is enforce"
+
+  Scenario: A surface whose stored Target credential breaks both Target rules saves again unchanged when both are enforced
+    Given an A2A surface targeting managed agent "bravo"
+    And managed agent "bravo" is reached over plain http
+    And the surface's Access Point does not check its callers
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And the gateway enforces the credential rule "target_https"
+    And the gateway enforces the credential rule "target_source_auth"
+    When the operator saves the surface with the description "Renamed in the dashboard"
+    Then the admin API response status is 200
+    And the stored surface has the description "Renamed in the dashboard"
+    And the stored surface authenticates its target with secret "bdd-target-api-key"
+    And the admin API response carries a Warning header containing "target.auth sends a credential, so its Target must be an https URL; the credential is withheld while credential_policy.target_https is enforce"
+    And the admin API response carries a Warning header containing "target.auth sends a credential, so it needs source authentication on the Access Point; the credential is withheld while credential_policy.target_source_auth is enforce"
+
+  Scenario: A surface whose stored Transit Point credential breaks both Target rules saves again unchanged when both are enforced
+    Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
+    And Transit Point "alpha" routes to MCP server "bravo"
+    And Transit Point "alpha" is an Open Transit Point
+    And MCP server "bravo" is reached over plain http
+    And the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
+    And the gateway enforces the credential rule "target_https"
+    And the gateway enforces the credential rule "target_source_auth"
+    When the operator saves the surface with the description "Renamed in the dashboard"
+    Then the admin API response status is 200
+    And the stored surface has the description "Renamed in the dashboard"
+    And the admin API response carries a Warning header containing "transit.points['alpha'].target_auth sends a credential, so its target endpoint must be an https URL; the credential is withheld while credential_policy.target_https is enforce"
+    And the admin API response carries a Warning header containing "transit.points['alpha'].target_auth sends a credential, so it needs a Transit Point that authenticates its callers; the credential is withheld while credential_policy.target_source_auth is enforce"
+
+  Scenario: Editing a stored Target credential that breaks the https rule is saved with a warning in warn mode
+    Given an A2A surface targeting managed agent "bravo"
+    And managed agent "bravo" is reached over plain http
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And the gateway keeps its log of warnings
+    When the operator saves the surface with its Target authentication formatting the value as "Token {value}"
+    Then the admin API response status is 200
+    And the gateway log has a warning containing "it will be refused once credential_policy.target_https is enforce"
+    And the admin API response carries a Warning header containing "target.auth sends a credential, so its Target must be an https URL; it will be refused once credential_policy.target_https is enforce"
+
+  Scenario: Editing a stored Target credential that breaks the https rule is refused when https Targets are enforced
+    Given an A2A surface targeting managed agent "bravo"
+    And managed agent "bravo" is reached over plain http
+    And the gateway enforces the credential rule "target_https"
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the operator saves the surface with its Target authentication formatting the value as "Token {value}"
+    Then the admin API response status is 400
+    And the admin API error response mentions "target.auth sends a credential, so its Target must be an https URL"
+    And the stored surface has the description "BDD test surface"
+
+  Scenario: Editing a stored Transit Point credential that breaks the https rule is refused when https Targets are enforced
+    Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
+    And Transit Point "alpha" routes to MCP server "bravo"
+    And MCP server "bravo" is reached over plain http
+    And the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
+    And the gateway enforces the credential rule "target_https"
+    When the operator saves the surface with the Target authentication of Transit Point "alpha" falling back to "passthrough"
+    Then the admin API response status is 400
+    And the admin API error response mentions "transit.points['alpha'].target_auth sends a credential, so its target endpoint must be an https URL"

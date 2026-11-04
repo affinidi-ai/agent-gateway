@@ -131,6 +131,47 @@ async fn caller_has_waited(
     tokio::time::sleep(Duration::from_secs(seconds)).await;
 }
 
+/// Moves the issue time of every token the gateway holds back by `seconds`. The vault is read
+/// from disk on every request, so the gateway sees the older time without a restart.
+#[given(expr = "the gateway's token from the credential provider has aged {int} seconds")]
+fn provider_token_has_aged(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    let vault_dir = world
+        .infra
+        .as_ref()
+        .expect("the gateway must hold a token before it can age")
+        ._temp_dir
+        .path()
+        .join("_storage/delegation_vault");
+    let mut aged = 0;
+    for entry in std::fs::read_dir(&vault_dir).expect("read the delegation vault directory") {
+        let path = entry
+            .expect("delegation vault entry")
+            .path();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let mut token: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read a stored token"))
+            .expect("a stored token is JSON");
+        let issued_at = chrono::DateTime::parse_from_rfc3339(
+            token["consent_granted_at"]
+                .as_str()
+                .expect("a stored token has an issue time"),
+        )
+        .expect("the issue time is RFC 3339");
+        token["consent_granted_at"] = json!((issued_at - chrono::Duration::seconds(seconds)).to_rfc3339());
+        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the aged token");
+        aged += 1;
+    }
+    assert_eq!(aged, 1, "the gateway must hold exactly one token from the credential provider");
+}
+
 /// Records the first answer that is not a 200, or the first answer when every caller got a
 /// 200, so a following status check holds only when every caller was served.
 #[when(expr = "{int} callers send a request to the surface at the same time")]

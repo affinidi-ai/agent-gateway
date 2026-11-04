@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-pub use crate::audit::events::{RejectionReason, RejectionStage};
+pub use crate::audit::events::{RejectionReason, RejectionStage, TargetAuthOutcome};
 
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
@@ -113,7 +113,40 @@ fn record_rejection(
             http_status: (!facts.via_fabric).then_some(http_status),
             rpc_error_code,
             requested_variant: requested_variant.map(str::to_string),
+            target_auth: None,
         })
+    })
+}
+
+/// The Target credential was not sent: it could not be obtained, or a `[credential_policy]`
+/// rule in `enforce` withheld it. Recorded as a `forward` refusal with reason
+/// `target_auth_failed` whether `outcome` refused the request (`http_status` 502 on HTTP) or
+/// forwarded it without the credential (no `http_status`). `transit_point` names the Transit
+/// Point whose credential it was, absent for the Target; `provider_id` names the credential
+/// provider; `oauth_error` is the token endpoint's registered OAuth `error` code, or `other`,
+/// never its body.
+pub fn target_auth_failed(
+    facts: &RequestFacts<'_>,
+    transit_point: Option<&str>,
+    provider_id: Option<&str>,
+    outcome: TargetAuthOutcome,
+    oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
+) {
+    emit("request_rejected", || {
+        let mut record = facts.record(DelegationAuditAction::RequestRejected {
+            stage: RejectionStage::Forward,
+            reason: RejectionReason::TargetAuthFailed,
+            http_status: (outcome == TargetAuthOutcome::Rejected && !facts.via_fabric).then_some(502),
+            rpc_error_code: None,
+            requested_variant: None,
+            target_auth: Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(|code| code.to_string()),
+            }),
+        });
+        record.provider_id = provider_id.map(str::to_string);
+        record
     })
 }
 
@@ -476,6 +509,97 @@ mod tests {
             stored["event"]["request_rejected"]
                 .get("http_status")
                 .is_none(),
+            "{stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_the_provider_outcome_and_oauth_error_code() {
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("invalid_client")),
+            );
+            target_auth_failed(&facts(), Some("partner"), None, TargetAuthOutcome::Passthrough, None);
+            target_auth_failed(&fabric, None, Some("machine"), TargetAuthOutcome::Rejected, None);
+        })
+        .await;
+
+        let recorded: Vec<_> = events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    target_auth,
+                    ..
+                } => (*stage, *reason, *http_status, event.provider_id.clone(), target_auth.clone()),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect();
+        let detail = |outcome, transit_point: Option<&str>, oauth_error: Option<&str>| {
+            Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(str::to_string),
+            })
+        };
+        let forward = (RejectionStage::Forward, RejectionReason::TargetAuthFailed);
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    forward.0,
+                    forward.1,
+                    Some(502),
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, Some("invalid_client"))
+                ),
+                (forward.0, forward.1, None, None, detail(TargetAuthOutcome::Passthrough, Some("partner"), None)),
+                (
+                    forward.0,
+                    forward.1,
+                    None,
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, None)
+                ),
+            ]
+        );
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            stored["event"]["request_rejected"],
+            serde_json::json!({
+                "stage": "forward", "reason": "target_auth_failed", "http_status": 502,
+                "target_auth": {"outcome": "rejected", "oauth_error": "invalid_client"}
+            })
+        );
+        assert_eq!(stored["provider_id"], "machine");
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_an_unregistered_oauth_error_as_other() {
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("echoed client-id-12345")),
+            );
+        })
+        .await;
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(stored["event"]["request_rejected"]["target_auth"]["oauth_error"], "other");
+        assert!(
+            !stored
+                .to_string()
+                .contains("client-id-12345"),
             "{stored}"
         );
     }

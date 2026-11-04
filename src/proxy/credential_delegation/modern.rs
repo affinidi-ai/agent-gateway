@@ -766,6 +766,7 @@ impl ModernDelegationContext<'_> {
                 | ServiceTokenError::SecretUnavailable
                 | ServiceTokenError::TokenRequestFailed
                 | ServiceTokenError::ProviderMisconfigured
+                | ServiceTokenError::TokenRequestRejected(_)
                 | ServiceTokenError::TokenEndpointRefused
                 | ServiceTokenError::TokenEndpointNotHttps
                 | ServiceTokenError::StoreUnavailable => ContinuationError::Unavailable,

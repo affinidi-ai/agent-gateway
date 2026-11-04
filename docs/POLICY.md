@@ -725,11 +725,13 @@ documented here so operators can assess exposure.
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);
   discovery through it reads tool names from the loaded OpenAPI spec and does not
   dial, but a `tools/call` dials `base_url` through rmcp-openapi's own internally
-  built HTTP client (re-resolves at connect; `base_url` is management-gated and
-  checked on create/update with `validate_resolved_url`, which blocks cloud
-  metadata, loopback and unspecified addresses but not RFC 1918). The gateway
-  cannot pin that client, so this path retains a DNS-rebinding window between
-  validation and connect. Modern `tools/call` uses the gateway's own pinned
+  built HTTP client, or, when it carries the Target credential, through the
+  gateway's REST client (`modern_rest::call_stored_backend`, which follows no
+  redirects and applies the `mcp_http` limits). Either client re-resolves at
+  connect (`base_url` is management-gated and checked on create/update with
+  `validate_resolved_url`, which blocks cloud metadata, loopback and unspecified
+  addresses but not RFC 1918). Neither client is pinned, so this path retains a
+  DNS-rebinding window between validation and connect. Modern `tools/call` uses the gateway's own pinned
   client instead (`egress::pinned_configured_client`, see _Other pinned egress
   sinks_), which applies the save-time policy at call time: a host that rebinds
   to loopback, an unspecified address or cloud metadata after validation is

@@ -249,15 +249,22 @@ needs a restart.
 | --- | --- | --- |
 | `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
 | `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether credential providers may use only secrets of their own tenant, and tenant surfaces (including their custom metadata and the credential providers they bind) and tenant A2A Proxies only their own tenant's secrets and providers; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant) and [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs). |
+| `target_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential (a static secret or a credential provider) may only be sent to an `https` Target or Transit Point endpoint. A `fabric://`, `a2a-proxy://` or `proxy://` endpoint is not https. In `enforce` the credential is withheld at request time and `target.auth.fallback` decides the request; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
+| `target_source_auth` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential may only be sent from a leg that checks its callers: the Access Point (at least one `caller_authentication` method, or `mcp_http.authorization`) for the Target, the Transit Point itself (a transit token, `source_auth` or `mcp_http.authorization`) for a Transit Point. It also holds the Direct Line credential an A2A proxy sends for an `a2a-proxy://` Target of an A2A or AP2 surface, which `target_https` does not. In `enforce` the credential is withheld at request time, except on the gateway's own agent card fetch; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
 | `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants and their refreshes, the legacy delegated refresh, the legacy code exchange and the `2026-07-28` consent exchange. It does not apply to the connect API's grant code exchange and refresh, which keep a fixed 30 seconds. The no-redirect rule is unchanged. |
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
-configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. For
-`tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
-credential provider; a reference to another tenant's is refused in both modes (see
+configurations that break `token_endpoint_https` or `tenant_credential_isolation` are refused on
+save, while ones that break `target_https` or `target_source_auth` are saved with a warning.
+`"enforce"` refuses all of them on save and also at runtime. For `tenant_credential_isolation`
+that means a tenant surface sending an appliance-wide secret or credential provider; for
+`target_https` and `target_source_auth`, a request whose Target credential breaks the rule goes
+out without it or is refused, as `target.auth.fallback` says (see
+[Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A
+reference to another tenant's is refused in both modes (see
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
-unknown value fails startup, and an absent section means both rules are `"warn"`. The report also names a stored JWT Bearer provider without a subject under a third rule, `jwt_subject`, which only warns and has no setting. A provider with
+unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
 `token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and

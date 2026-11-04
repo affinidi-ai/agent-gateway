@@ -58,6 +58,9 @@ pub struct CredentialProviderState {
     /// external consent provider may name, with the origins their endpoints may
     /// use beyond the issuer's own host.
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    pub references: super::references::ReferenceStores,
+    /// Decides which referrers a 409 may name; `None` names none.
+    pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
 }
 
 /// A provider as the API returns it, with `resource_origin`, the only origin
@@ -70,6 +73,29 @@ fn provider_body(provider: &CredentialProvider) -> serde_json::Value {
         fields.insert("resource_origin".to_string(), serde_json::Value::String(origin));
     }
     body
+}
+
+const PROVIDER_IN_USE_BY_TARGET_AUTH: &str = "The credential provider is used for Target authentication, which cannot use a provider that needs a user's consent";
+
+async fn viewable_kinds(
+    state: &CredentialProviderState,
+    caller: &Option<Extension<AuthGuardOk>>,
+    pat: &Option<Extension<PatContext>>,
+) -> super::references::ViewableKinds {
+    super::references::ViewableKinds::of_caller(
+        state.rbac.as_ref(),
+        caller
+            .as_ref()
+            .map(|Extension(caller)| caller),
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+}
+
+fn reference_scan_failed(error: anyhow::Error) -> Response {
+    warn!(target: "credential_delegation", %error, "Failed to find what references a credential provider");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"}))).into_response()
 }
 
 /// Why a provider's settings, secret references or consent strategy were rejected.
@@ -784,11 +810,14 @@ pub async fn get_provider(
 }
 
 /// PUT /api/v1/credential-providers/{id}
+#[allow(clippy::too_many_arguments)]
 pub async fn update_provider(
     State(state): State<CredentialProviderState>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    pat: Option<Extension<PatContext>>,
     Json(req): Json<UpdateCredentialProviderRequest>,
 ) -> impl IntoResponse {
     let existing = match state.store.get(&id).await {
@@ -912,6 +941,32 @@ pub async fn update_provider(
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
+
+    if previous
+        .provider_type
+        .sends_gateway_credential()
+        && !updated
+            .provider_type
+            .sends_gateway_credential()
+    {
+        match state
+            .references
+            .target_auth_referrers_of_provider(&previous.id)
+            .await
+        {
+            Ok(referrers) if referrers.is_empty() => {}
+            Ok(referrers) => {
+                return super::references::conflict_response(
+                    PROVIDER_IN_USE_BY_TARGET_AUTH,
+                    &referrers,
+                    &viewable_kinds(&state, &caller, &pat).await,
+                    tenant_context(&context),
+                    resource_scope(&scope),
+                );
+            }
+            Err(error) => return reference_scan_failed(error),
+        }
+    }
 
     if let Err(error) = validate_provider_settings(
         &state,
@@ -1362,6 +1417,8 @@ mod jwt_provider_tests {
             egress_allowlist: None,
             resource_origins: Arc::default(),
             issuers: Arc::default(),
+            references: Default::default(),
+            rbac: None,
         }
     }
 
@@ -1404,6 +1461,8 @@ mod jwt_provider_tests {
         let response = update_provider(
             State(state.clone()),
             Path(id.into()),
+            None,
+            None,
             None,
             None,
             Json(serde_json::from_value(body).unwrap()),
@@ -1675,6 +1734,102 @@ mod jwt_provider_tests {
                 .as_deref(),
             Some("admin@example.com")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_a_surface_authenticates_with_is_not_retyped_to_need_consent() {
+        use crate::surfaces::AgentSurfaceStore;
+        let directory = tempfile::tempdir().unwrap();
+        let admin = crate::credential_providers::references::test_support::administrator().await;
+        let mut state = with_key_material(&directory).await;
+        state.rbac = Some(admin.rbac.clone());
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                directory
+                    .path()
+                    .join("surfaces"),
+            )
+            .await
+            .unwrap(),
+        );
+        state.references.surfaces = Some(surfaces.clone());
+        let mut ids = Vec::new();
+        for provider_id in ["machine", "bound"] {
+            let (status, created) = create(
+                &state,
+                json!({
+                    "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_client_credentials",
+                    "token_endpoint": "https://192.0.2.1/token",
+                    "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            ids.push(
+                created["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let surface = |surface_id: &str, extra: Value| -> crate::config::agent_surface::AgentSurface {
+            let mut body = json!({
+                "surface_id": surface_id, "name": format!("{surface_id} name"),
+                "access_point": {"listen_address": "0.0.0.0:8443", "route": format!("/{surface_id}"), "protocol": "a2a"},
+                "target": {"endpoint": "https://api.example.com"}
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            serde_json::from_value(body).unwrap()
+        };
+        surfaces
+            .save(&surface(
+                "uses-target-auth",
+                json!({"target": {"endpoint": "https://api.example.com",
+                    "auth": {"method": {"credential_provider": {"provider_id": ids[0]}}}}}),
+            ))
+            .await
+            .unwrap();
+        surfaces
+            .save(&surface("uses-binding", json!({"outbound_credentials": [{"credential_provider_id": ids[1]}]})))
+            .await
+            .unwrap();
+
+        let retype = |pat: Option<PatContext>| {
+            let state = state.clone();
+            let caller = admin.caller.clone();
+            let id = ids[0].clone();
+            async move {
+                body_of(
+                    update_provider(
+                        State(state),
+                        Path(id),
+                        None,
+                        None,
+                        Some(Extension(caller)),
+                        pat.map(Extension),
+                        Json(serde_json::from_value(json!({"provider_type": "oauth2_authorization_code"})).unwrap()),
+                    )
+                    .await
+                    .into_response(),
+                )
+                .await
+            }
+        };
+        let (status, response) = retype(None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["message"], PROVIDER_IN_USE_BY_TARGET_AUTH);
+        assert_eq!(
+            response["references"],
+            json!([{"kind": "surface", "id": "uses-target-auth", "name": "uses-target-auth name"}])
+        );
+        assert_eq!(response["hidden_references"], 0);
+        let (status, response) = retype(Some(PatContext(Some(vec!["credential_providers.edit".into()])))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!((response["references"].clone(), response["hidden_references"].clone()), (json!([]), json!(1)));
+        let (status, response) = update(&state, &ids[1], json!({"provider_type": "oauth2_authorization_code"})).await;
+        assert_eq!(status, StatusCode::OK, "a binding may use a provider that needs consent: {response}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2304,6 +2459,8 @@ mod jwt_provider_tests {
             Path("stored".into()),
             tenant_a_context(),
             None,
+            None,
+            None,
             Json(serde_json::from_value(json!({"name": "Renamed"})).unwrap()),
         )
         .await
@@ -2317,6 +2474,8 @@ mod jwt_provider_tests {
                 State(state.clone()),
                 Path("stored".into()),
                 tenant_a_context(),
+                None,
+                None,
                 None,
                 Json(serde_json::from_value(json!({"api_key_secret_ref": secret_ref})).unwrap()),
             )
@@ -2512,6 +2671,8 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -2658,6 +2819,8 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
@@ -2693,9 +2856,10 @@ mod consent_strategy_tests {
             .into_response();
         assert_eq!(read.status(), StatusCode::OK);
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::FORBIDDEN);
 
         let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
@@ -2718,9 +2882,10 @@ mod consent_strategy_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = state_with_provider(&directory, Some("tenant-b")).await;
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::NOT_FOUND);
 
         let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
@@ -2742,9 +2907,10 @@ mod consent_strategy_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = state_with_provider(&directory, Some("tenant-a")).await;
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::OK);
         assert_eq!(
             state
@@ -2824,6 +2990,8 @@ mod external_provider_tests {
                 crate::credential_providers::external::tests::ISSUER.to_string(),
                 Vec::new(),
             )]))),
+            references: Default::default(),
+            rbac: None,
         }
     }
 
@@ -3216,6 +3384,8 @@ mod external_provider_tests {
                     State(state),
                     Path(id),
                     tenant("tenant-a"),
+                    None,
+                    None,
                     None,
                     Json(serde_json::from_value(body).unwrap()),
                 )

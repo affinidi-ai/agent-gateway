@@ -559,6 +559,7 @@ mod tests {
                 http_status: Some(404),
                 rpc_error_code: None,
                 requested_variant: None,
+                target_auth: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,

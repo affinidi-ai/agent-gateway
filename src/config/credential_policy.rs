@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleMode {
-    /// Stored configurations that break the rule keep working with a warning;
-    /// new or changed ones are refused on save.
+    /// Stored configurations that break the rule keep working with a warning. New or
+    /// changed ones are refused on save for `token_endpoint_https` and
+    /// `tenant_credential_isolation`, and saved with a warning for `target_https` and
+    /// `target_source_auth`.
     #[default]
     Warn,
-    /// A configuration that breaks the rule is refused at runtime as well.
+    /// A configuration that breaks the rule is refused on save and at runtime.
     Enforce,
 }
 
@@ -35,6 +37,12 @@ pub struct CredentialPolicyConfig {
     pub token_endpoint_https: RuleMode,
     /// Whether a credential provider may only use secrets of its own tenant.
     pub tenant_credential_isolation: RuleMode,
+    /// Whether a Target credential may only be sent to an https Target. A `fabric://` or
+    /// `a2a-proxy://` Target is not https.
+    pub target_https: RuleMode,
+    /// Whether a Target credential may only be sent for a surface whose Access Point
+    /// authenticates its callers.
+    pub target_source_auth: RuleMode,
     /// Exact token endpoint URLs that may use http deliberately.
     pub insecure_token_endpoints: Vec<String>,
     /// Seconds a credential provider token request may take, 1 to 120.
@@ -46,6 +54,8 @@ impl Default for CredentialPolicyConfig {
         Self {
             token_endpoint_https: RuleMode::default(),
             tenant_credential_isolation: RuleMode::default(),
+            target_https: RuleMode::default(),
+            target_source_auth: RuleMode::default(),
             insecure_token_endpoints: Vec::new(),
             token_request_timeout_secs: DEFAULT_TOKEN_REQUEST_TIMEOUT_SECS,
         }
@@ -143,6 +153,8 @@ mod tests {
         let config = CredentialPolicyConfig::default();
         assert_eq!(config.token_endpoint_https, RuleMode::Warn);
         assert_eq!(config.tenant_credential_isolation, RuleMode::Warn);
+        assert_eq!(config.target_https, RuleMode::Warn);
+        assert_eq!(config.target_source_auth, RuleMode::Warn);
         assert!(
             config
                 .insecure_token_endpoints
@@ -268,6 +280,25 @@ mod tests {
             error,
             "Invalid [credential_policy] config: insecure_token_endpoints entry \"htp://idp.internal/token\" must be an http URL"
         );
+    }
+
+    #[test]
+    fn target_rules_parse_warn_and_enforce_and_default_to_warn() {
+        let config: CredentialPolicyConfig =
+            toml::from_str("target_https = \"enforce\"\ntarget_source_auth = \"warn\"\n").unwrap();
+        assert_eq!(config.target_https, RuleMode::Enforce);
+        assert_eq!(config.target_source_auth, RuleMode::Warn);
+
+        let config: CredentialPolicyConfig = toml::from_str("target_source_auth = \"enforce\"").unwrap();
+        assert_eq!(config.target_https, RuleMode::Warn);
+        assert_eq!(config.target_source_auth, RuleMode::Enforce);
+    }
+
+    #[test]
+    fn unknown_target_rule_mode_is_refused() {
+        assert!(toml::from_str::<CredentialPolicyConfig>("target_https = \"off\"").is_err());
+        assert!(toml::from_str::<CredentialPolicyConfig>("target_source_auth = \"Enforce\"").is_err());
+        assert!(toml::from_str::<CredentialPolicyConfig>("target_https = true").is_err());
     }
 
     #[test]

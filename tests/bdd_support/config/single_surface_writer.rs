@@ -90,6 +90,37 @@ pub fn write_single_surface_config_with_outbound_listener(
     );
 }
 
+/// The Target endpoint the surface is written with, when its managed agent is served by the
+/// mock at `mock_url`.
+pub fn effective_target_url(
+    mock_url: &str,
+    surface_config: &SurfaceConfigBuilder,
+) -> String {
+    if let Some(proxy) = &surface_config.mcp_proxy_target {
+        format!("proxy://{}", proxy.proxy_id)
+    } else if let Some(proxy) = &surface_config.a2a_proxy_target {
+        format!("a2a-proxy://{}", proxy.proxy_id)
+    } else {
+        surface_config
+            .override_target_url
+            .clone()
+            .unwrap_or_else(|| target_url_under_base_path(mock_url, surface_config))
+    }
+}
+
+fn target_url_under_base_path(
+    mock_url: &str,
+    surface_config: &SurfaceConfigBuilder,
+) -> String {
+    format!(
+        "{mock_url}{}",
+        surface_config
+            .target_base_path
+            .as_deref()
+            .unwrap_or_default()
+    )
+}
+
 fn transit_point_json(
     transit_point: &SurfaceTransitPointConfig,
     target_endpoint: &str,
@@ -114,7 +145,15 @@ fn transit_point_json(
         transit_point_json["transit_credentials"] = binding.clone();
     }
     if transit_point.target_auth_provider {
-        transit_point_json["target_auth"] = credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, "reject");
+        transit_point_json["target_auth"] =
+            credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &transit_point.target_auth_fallback);
+    } else if let Some(target_auth) = &transit_point.target_auth_secret {
+        transit_point_json["target_auth"] = static_secret_target_auth_json(
+            &target_auth.secret_id,
+            &target_auth.header_name,
+            &target_auth.header_format,
+            &target_auth.fallback,
+        );
     }
     if !transit_point
         .header_metadata_mapping
@@ -212,16 +251,7 @@ fn write_single_surface_config_inner(
         .surface_name
         .as_deref()
         .unwrap_or("bdd-surface");
-    let effective_target_url = if let Some(proxy) = &surface_config.mcp_proxy_target {
-        format!("proxy://{}", proxy.proxy_id)
-    } else if let Some(proxy) = &surface_config.a2a_proxy_target {
-        format!("a2a-proxy://{}", proxy.proxy_id)
-    } else {
-        surface_config
-            .override_target_url
-            .clone()
-            .unwrap_or_else(|| mock_url.to_string())
-    };
+    let effective_target_url = effective_target_url(mock_url, surface_config);
     let mut surface_fixture = AgentSurfaceFixture::new(
         "bdd-surface",
         surface_name,
@@ -498,7 +528,7 @@ fn write_single_surface_config_inner(
     );
 
     if let Some(proxy) = &surface_config.mcp_proxy_target {
-        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, mock_url);
+        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, target_url_under_base_path(mock_url, surface_config));
         if let Some(spec) = &proxy.openapi_spec {
             fixture = fixture.with_openapi_spec(spec.clone());
         }
@@ -532,7 +562,10 @@ fn write_single_surface_config_inner(
         .protected_resource
         .is_some()
     {
-        add_inbound_public_origin(base_dir, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+        add_public_origin(base_dir, 0, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+    if surface_config.outbound_public_origin {
+        add_public_origin(base_dir, 1, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
     }
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
@@ -597,17 +630,18 @@ fn set_transit_token_max_lifetime(
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
-/// Adds a public origin to the inbound listener, the origin a protected
-/// resource must be published under.
-fn add_inbound_public_origin(
+/// Adds a public origin to the listener at `listener` (the inbound listener is first, the
+/// outbound one second), the origin an MCP resource must be published under.
+fn add_public_origin(
     base_dir: &Path,
+    listener: usize,
     origin: &str,
 ) {
     let path = base_dir.join("gateway.json");
     let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    gateway["listeners"][0]["external_urls"]
+    gateway["listeners"][listener]["external_urls"]
         .as_array_mut()
-        .expect("inbound listener external_urls")
+        .expect("listener external_urls")
         .push(serde_json::json!(origin));
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }

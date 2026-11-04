@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::config::McpHttpConfig;
+use crate::proxy::handler::SentServiceToken;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RestError {
@@ -353,6 +354,7 @@ fn request_url(
     {
         return Err(RestError::Target);
     }
+    let base = url.clone();
     {
         let mut segments = url
             .path_segments_mut()
@@ -368,6 +370,14 @@ fn request_url(
             }
             segments.push(&segment);
         }
+    }
+    if !base
+        .path()
+        .trim_matches('/')
+        .is_empty()
+        && !crate::proxy::paths::is_within_target_base(base.as_str(), url.as_str())
+    {
+        return Err(RestError::Arguments);
     }
     if !parameters.query.is_empty() {
         let mut query = url.query_pairs_mut();
@@ -434,6 +444,12 @@ fn request_headers(
             || headers
                 .get(&name)
                 .is_some_and(|current| current != value)
+            || headers
+                .keys()
+                .any(|existing| {
+                    existing != name
+                        && crate::proxy::handler::is_target_auth_header(name.as_str(), Some(existing.as_str()))
+                })
         {
             return Err(RestError::Arguments);
         }
@@ -584,6 +600,16 @@ async fn add_body(
     Ok(request)
 }
 
+/// How a REST tool call reaches its backend.
+enum RestEgress<'a> {
+    /// Vet the URL with the configured-backend egress policy and pin the client to
+    /// the address it resolves to; the BDD allow-list can admit a loopback fixture.
+    Pinned(Option<&'a str>),
+    /// Reach the stored base URL the way the legacy MCP proxy client does: the URL
+    /// was vetted when the proxy was saved and is not vetted again per call.
+    Stored,
+}
+
 pub(super) async fn call(
     base_url: &str,
     metadata: &ToolMetadata,
@@ -592,6 +618,60 @@ pub(super) async fn call(
     limits: &McpHttpConfig,
     content_type: &str,
     egress_allowlist: Option<&str>,
+    sent_token: Option<&SentServiceToken<'_>>,
+) -> Result<CallToolResult, RestError> {
+    call_with(
+        base_url,
+        metadata,
+        arguments,
+        target_headers,
+        limits,
+        content_type,
+        RestEgress::Pinned(egress_allowlist),
+        sent_token,
+    )
+    .await
+}
+
+/// The pooled client for stored MCP proxy backends: redirects off, each request
+/// carrying its own timeout.
+fn stored_backend_client() -> Result<reqwest::Client, RestError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| RestError::Unavailable)?;
+    Ok(CLIENT
+        .get_or_init(|| client)
+        .clone())
+}
+
+/// [`call`] for a legacy MCP proxy tool call: the backends it reaches are those the
+/// legacy `rmcp_openapi` client reaches, and redirects stay off.
+pub(super) async fn call_stored_backend(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    sent_token: Option<&SentServiceToken<'_>>,
+) -> Result<CallToolResult, RestError> {
+    call_with(base_url, metadata, arguments, target_headers, limits, content_type, RestEgress::Stored, sent_token).await
+}
+
+async fn call_with(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    egress: RestEgress<'_>,
+    sent_token: Option<&SentServiceToken<'_>>,
 ) -> Result<CallToolResult, RestError> {
     if serde_json::to_vec(arguments)
         .map_err(|_| RestError::Arguments)?
@@ -637,17 +717,27 @@ pub(super) async fn call(
             )
             .max(1),
         );
-    // Resolve the target once, vet it with the save-time policy and pin the
-    // client to that address, so DNS cannot rebind it to loopback between the
-    // save-time check and this call. Redirects stay off.
-    let raw_url = url.to_string();
-    let egress_allowlist = egress_allowlist.map(str::to_string);
-    let (client, _) = tokio::task::spawn_blocking(move || {
-        crate::egress::pinned_configured_client(&raw_url, Duration::from_secs(timeout), egress_allowlist.as_deref())
-    })
-    .await
-    .map_err(|_| RestError::Unavailable)?
-    .map_err(|_| RestError::Target)?;
+    // A pinned call resolves the target once, vets it with the save-time policy
+    // and pins the client to that address, so DNS cannot rebind it to loopback
+    // between the save-time check and this call. Redirects stay off either way.
+    let client = match egress {
+        RestEgress::Pinned(egress_allowlist) => {
+            let raw_url = url.to_string();
+            let egress_allowlist = egress_allowlist.map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                crate::egress::pinned_configured_client(
+                    &raw_url,
+                    Duration::from_secs(timeout),
+                    egress_allowlist.as_deref(),
+                )
+            })
+            .await
+            .map_err(|_| RestError::Unavailable)?
+            .map_err(|_| RestError::Target)?
+            .0
+        }
+        RestEgress::Stored => stored_backend_client()?,
+    };
     let headers = request_headers(&parameters, target_headers)?;
     if headers
         .iter()
@@ -660,6 +750,7 @@ pub(super) async fn call(
     let request = add_body(
         client
             .request(method, url.clone())
+            .timeout(Duration::from_secs(timeout))
             .headers(headers),
         &parameters,
         content_type,
@@ -679,6 +770,11 @@ pub(super) async fn call(
         .execute(request)
         .await
         .map_err(|_| RestError::Execution)?;
+    if let Some(sent_token) = sent_token {
+        sent_token
+            .forget_if_refused(response.status().as_u16(), response.headers())
+            .await;
+    }
     if response
         .status()
         .is_redirection()
@@ -917,6 +1013,7 @@ mod tests {
             &limits,
             "application/x-www-form-urlencoded",
             Some(base.as_str()),
+            None,
         )
         .await
         .unwrap();
@@ -926,10 +1023,18 @@ mod tests {
             "content": format!("data:text/plain;base64,{}", base64::engine::general_purpose::STANDARD.encode(b"file contents")),
             "filename": "document.txt"
         }}});
-        let result =
-            call(&base, &tool, &arguments, &HeaderMap::new(), &limits, "multipart/form-data", Some(base.as_str()))
-                .await
-                .unwrap();
+        let result = call(
+            &base,
+            &tool,
+            &arguments,
+            &HeaderMap::new(),
+            &limits,
+            "multipart/form-data",
+            Some(base.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.is_error, Some(false));
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let bounded = McpHttpConfig {
@@ -937,8 +1042,17 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            call(&base, &tool, &arguments, &HeaderMap::new(), &bounded, "multipart/form-data", Some(base.as_str()))
-                .await,
+            call(
+                &base,
+                &tool,
+                &arguments,
+                &HeaderMap::new(),
+                &bounded,
+                "multipart/form-data",
+                Some(base.as_str()),
+                None
+            )
+            .await,
             Err(RestError::Arguments)
         ));
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -969,6 +1083,21 @@ mod tests {
             .path
             .insert("id".into(), json!(".."));
         assert!(matches!(request_url("https://target.example/api", &tool, &parameters), Err(RestError::Arguments)));
+        for climbing in ["../../admin", "..\\..\\admin", "..;", "%2e%2e/admin", "..%2Fadmin"] {
+            parameters
+                .path
+                .insert("id".into(), json!(climbing));
+            assert!(
+                matches!(request_url("https://target.example/api", &tool, &parameters), Err(RestError::Arguments)),
+                "{climbing}"
+            );
+        }
+        for kept in ["a/b", "x..y", "...", ".hidden"] {
+            parameters
+                .path
+                .insert("id".into(), json!(kept));
+            assert!(request_url("https://target.example/api", &tool, &parameters).is_ok(), "{kept}");
+        }
         for path in ["//other.example/", "/../escape", "/bad?query", "/bad#fragment", "/bad\\path"] {
             assert!(request_url("https://target.example/api", &metadata(path), &parameters).is_err());
         }
@@ -993,6 +1122,18 @@ mod tests {
             .insert("Authorization".into(), json!("Bearer argument-token"));
         assert!(matches!(request_headers(&parameters, &target), Err(RestError::Arguments)));
         parameters.headers.clear();
+        target.insert("x-api-key", "target-key".parse().unwrap());
+        parameters
+            .headers
+            .insert("X_Api_Key".into(), json!("argument-key"));
+        assert!(matches!(request_headers(&parameters, &target), Err(RestError::Arguments)));
+        parameters.headers.clear();
+        parameters
+            .headers
+            .insert("X-Api-Key-Hint".into(), json!("kept"));
+        assert_eq!(request_headers(&parameters, &target).unwrap()["x-api-key-hint"], "kept");
+        parameters.headers.clear();
+        target.remove("x-api-key");
         for name in ["host", "content-length", "mcp-param-header", "connection"] {
             parameters
                 .headers
@@ -1075,10 +1216,18 @@ mod tests {
         for path in ["/ok", "/error"] {
             let mut tool = metadata(path);
             tool.output_schema = Some(json!({"type": "object"}));
-            let result =
-                call(&base, &tool, &json!({}), &HeaderMap::new(), &limits, "application/json", Some(base.as_str()))
-                    .await
-                    .unwrap();
+            let result = call(
+                &base,
+                &tool,
+                &json!({}),
+                &HeaderMap::new(),
+                &limits,
+                "application/json",
+                Some(base.as_str()),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(result.is_error, Some(path == "/error"));
             assert_eq!(
                 result
@@ -1109,6 +1258,7 @@ mod tests {
             &limits,
             "application/json",
             Some(base.as_str()),
+            None,
         )
         .await
         .unwrap();
@@ -1117,7 +1267,8 @@ mod tests {
         assert_eq!(image["content"][0]["mimeType"], "image/png");
         assert!(
             matches!(
-                call(&base, &metadata("/ok"), &json!({}), &HeaderMap::new(), &limits, "application/json", None).await,
+                call(&base, &metadata("/ok"), &json!({}), &HeaderMap::new(), &limits, "application/json", None, None)
+                    .await,
                 Err(RestError::Target)
             ),
             "a backend that resolves to loopback is refused at call time"
@@ -1131,7 +1282,8 @@ mod tests {
                     &HeaderMap::new(),
                     &limits,
                     "application/json",
-                    Some(base.as_str())
+                    Some(base.as_str()),
+                    None,
                 )
                 .await,
                 Err(RestError::Limit)

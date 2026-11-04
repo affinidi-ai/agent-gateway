@@ -10,7 +10,7 @@
 use crate::audit::events::{
     Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
     PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetKind,
+    RejectionStage, RequestFailureOutcome, TargetAuthRejection, TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -512,6 +512,10 @@ pub enum DelegationAuditAction {
         /// longest alias a variant can have. Caller-chosen text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_variant: Option<String>,
+        /// On `target_auth_failed` only: whether the request was refused or forwarded
+        /// without the credential, and the token endpoint's OAuth `error` code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_auth: Option<TargetAuthRejection>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -2149,6 +2153,7 @@ mod tests {
                     http_status: Some(413),
                     rpc_error_code: Some(-32600),
                     requested_variant: None,
+                    target_auth: None,
                 },
                 "request_rejected",
             ),
@@ -2224,6 +2229,7 @@ mod tests {
             http_status: Some(403),
             rpc_error_code: None,
             requested_variant: None,
+            target_auth: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");

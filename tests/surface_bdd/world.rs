@@ -126,6 +126,9 @@ pub struct SurfaceWorld {
     pub captured_mcp_identity_schema: Option<serde_json::Value>,
     pub sse_endpoint_path: Option<String>,
     pub sse_responses: Vec<serde_json::Value>,
+    /// Collaborators a step said are reached over plain http; the gateway start checks the
+    /// URL it writes for each.
+    pub plain_http_collaborators: Vec<String>,
     /// A modern MCP response read incrementally by later steps.
     pub mcp_stream: Option<reqwest::Response>,
     pub mcp_stream_buffer: String,
@@ -142,6 +145,8 @@ pub struct SurfaceWorld {
     pub oauth_callback_query: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
+    /// A surface the operator is about to save through the admin API.
+    pub surface_draft: Option<serde_json::Value>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -197,6 +202,7 @@ impl SurfaceWorld {
             captured_mcp_identity_schema: None,
             sse_endpoint_path: None,
             sse_responses: Vec::new(),
+            plain_http_collaborators: Vec::new(),
             mcp_stream: None,
             mcp_stream_buffer: String::new(),
             mcp_stream_progress: None,
@@ -206,6 +212,7 @@ impl SurfaceWorld {
             a2a_stream_ended: false,
             oauth_callback_query: None,
             transit_token: None,
+            surface_draft: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

@@ -1863,6 +1863,7 @@ async fn a_tenant_pat_reads_but_cannot_change_an_appliance_wide_secret() {
         None,
         None,
         None,
+        Default::default(),
         Some(RbacGuard::new(users, rbac)),
     )
     .layer(middleware::from_fn_with_state(auth, require_session_auth));

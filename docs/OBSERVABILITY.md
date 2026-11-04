@@ -290,7 +290,7 @@ endpoint URL.
 | `subject` | `credential_provider` or `surface` |
 | `id` | The provider's `id` or the surface's `surface_id` |
 | `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
-| `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
@@ -304,6 +304,14 @@ or provider that no longer exists is not reported.
 An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
 signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
 for this rule.
+A surface breaks `target_https` when its Target, or one of its Transit Points, sends a static secret
+or credential provider token to an endpoint that is not `https` (`http://`, `fabric://`, `a2a-proxy://`
+and `proxy://` count as not https). It breaks `target_source_auth` when its Target sends a
+credential, or is an `a2a-proxy://` Target of an A2A or AP2 surface (its A2A proxy sends its
+Direct Line credential), and its Access Point has neither a source authentication method nor
+`mcp_http.authorization`, or a Transit Point sends one and requires no transit token and sets
+neither `mcp_http.authorization` nor its own `source_auth`. Both checks cover every surface
+variant as it resolves, and use the same predicates as the request path.
 
 ## Governance audit forwarding
 
@@ -409,6 +417,23 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
+    `target_auth`) was not sent, because it could not be obtained (a secret or provider that
+    cannot be read, a token request that failed) or a `[credential_policy]` rule in `enforce`
+    withheld it. One record per request, on the direct path, a `proxy://` MCP Target, the
+    Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
+    fetch and its preview. The record carries `provider_id` for a credential provider and a
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
+    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `transit_point` names the Transit Point by alias when the credential was a Transit Point's
+    `target_auth` (absent for the Target), and
+    `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the
+    code itself when RFC 6749 section 5.2 or RFC 6750 section 3.1 registers it
+    (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`,
+    `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`), otherwise
+    `other`, so a token endpoint cannot write its own text into the record. A token, an
+    assertion, a secret, the token endpoint's body and its `error_description` are never
+    recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.

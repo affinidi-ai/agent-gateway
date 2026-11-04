@@ -106,9 +106,10 @@ pub enum CardAuthResult {
     Failed,
 }
 
-/// Why the gateway did not obtain its Target credential. `Forbidden`,
-/// `InvalidHeader`, `OutsideTargetBase` and `HeaderConflict` are never reported;
-/// they keep the spellings the dashboard accepts.
+/// Why the gateway did not obtain its Target credential. `Forbidden` is a credential
+/// a `[credential_policy]` rule in `enforce` withholds. `InvalidHeader`,
+/// `OutsideTargetBase` and `HeaderConflict` are never reported; they keep the
+/// spellings the dashboard accepts.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(not(test), expect(dead_code))]
@@ -133,6 +134,7 @@ impl CardAuthFailure {
             | TargetAuthError::SecretNotFound
             | TargetAuthError::ServiceToken(ServiceTokenError::SecretUnavailable) => Self::SecretUnavailable,
             TargetAuthError::ProviderNotFound => Self::ProviderNotFound,
+            TargetAuthError::Withheld(_) => Self::Forbidden,
             TargetAuthError::ProviderNeedsConsent | TargetAuthError::ServiceToken(ServiceTokenError::Unsupported) => {
                 Self::Unsupported
             }
@@ -967,6 +969,10 @@ mod tests {
             (TargetAuthError::SecretNotFound, CardAuthFailure::SecretUnavailable),
             (TargetAuthError::ProviderNotFound, CardAuthFailure::ProviderNotFound),
             (TargetAuthError::ProviderNeedsConsent, CardAuthFailure::Unsupported),
+            (
+                TargetAuthError::Withheld(crate::config::target_auth_rules::TargetCredentialRule::Https),
+                CardAuthFailure::Forbidden,
+            ),
             (TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed), CardAuthFailure::TokenUnavailable),
             (TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused), CardAuthFailure::TokenUnavailable),
             (
@@ -1369,8 +1375,33 @@ mod tests {
             "method": {"static_secret": {"secret_id": "missing", "header_name": "x-key"}}}}))
         .await;
 
-        let (preview, _) = fetch_preview(&state, Duration::from_secs(5)).await;
+        let ((preview, _), events) =
+            crate::audit::producer::capture(fetch_preview(&state, Duration::from_secs(5))).await;
 
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason, target_auth, ..
+                } => Some((
+                    *reason,
+                    target_auth
+                        .as_ref()
+                        .map(|detail| detail.outcome),
+                    event.surface_id.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            records,
+            vec![(
+                crate::audit::request_events::RejectionReason::TargetAuthFailed,
+                Some(crate::audit::request_events::TargetAuthOutcome::Rejected),
+                Some("orders".to_string())
+            )],
+            "the preview records the credential it could not obtain once"
+        );
         assert_eq!(fetch_of(&preview), (CardFetchStatus::Failed, Some(CardFetchCause::AuthFailed), None));
         assert_eq!(
             auth_of(&preview),

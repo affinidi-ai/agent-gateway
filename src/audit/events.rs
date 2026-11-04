@@ -72,6 +72,32 @@ pub enum RejectionReason {
     /// A request to a Target bound by external consent refused before its
     /// grant is read, for a reason a new connect would not fix.
     ConnectorUnavailable,
+    /// The Target credential was not sent: it could not be obtained, or a
+    /// `[credential_policy]` rule in `enforce` withheld it.
+    TargetAuthFailed,
+}
+
+/// What `target.auth.fallback` did with a request whose Target credential was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthOutcome {
+    /// Refused with 502.
+    Rejected,
+    /// Forwarded without the credential.
+    Passthrough,
+}
+
+/// The detail of a `target_auth_failed` refusal. Never a token, an assertion, a token
+/// endpoint body or its `error_description`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetAuthRejection {
+    pub outcome: TargetAuthOutcome,
+    /// The alias of the Transit Point whose credential was not sent; absent for the Target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    /// The token endpoint's OAuth `error` code, when it answered with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

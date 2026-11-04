@@ -1246,6 +1246,17 @@ pub enum CredentialInjection {
     Meta { field: String },
 }
 
+impl CredentialInjection {
+    /// The header this injection sets; `None` for one into `_meta`.
+    pub fn header_name(&self) -> Option<&str> {
+        match self {
+            Self::BearerHeader => Some("Authorization"),
+            Self::CustomHeader { name, .. } => Some(name.as_str()),
+            Self::Meta { .. } => None,
+        }
+    }
+}
+
 /// Rate limit configuration for a channel
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {

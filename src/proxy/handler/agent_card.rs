@@ -540,20 +540,7 @@ impl TargetCardFetch<'_> {
     ) -> Result<JsonValue, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
-        let source_cred_headers = state
-            .surface
-            .source_credential_headers();
-        let mut forwarded_headers = headers
-            .iter()
-            .filter(|(key, _)| super::should_forward_header(key.as_str(), &source_cred_headers))
-            .filter_map(|(key, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (key.as_str().to_string(), value.to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
+        let forwarded_headers = fabric_card_fetch_headers(&state.surface, headers);
         let trace_id = uuid::Uuid::new_v4().to_string();
         let path = super::agent_card_fabric_forward_path(&state.surface);
         let response = crate::proxy::fabric_forward::forward_via_fabric(
@@ -603,13 +590,13 @@ impl TargetCardFetch<'_> {
     /// when the surface has none. Honours `target.auth.fallback` exactly as the
     /// forwarded path does: `reject` fails the card with 502 rather than asking the
     /// target without the credential it requires.
-    async fn target_credential(&self) -> Result<Option<(String, String)>, CardFailure> {
+    async fn target_credential(&self) -> Result<Option<super::TargetCredential>, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
         let Some(target_auth) = state.surface.target_auth() else {
             return Ok(None);
         };
-        match super::inject_target_auth_header(
+        match super::resolve_target_credential(
             target_auth,
             &TargetAuthContext::of_proxy(state),
             channel_name,
@@ -620,6 +607,17 @@ impl TargetCardFetch<'_> {
             Ok(credential) => Ok(credential),
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target authentication for agent card fetch");
+                super::record_target_auth_failure(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &state.surface.surface_id,
+                        channel_name,
+                        trace_id: None,
+                        via_fabric: false,
+                    },
+                    None,
+                    target_auth,
+                    &e,
+                );
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => Err(self.fail(
                         FetchFault::CredentialRejected(e),
@@ -706,19 +704,27 @@ impl TargetCardFetch<'_> {
             .surface
             .source_credential_headers();
         let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+        let target_auth_header = super::target_auth_header_name(state.surface.target_auth());
         for (key, value) in headers.iter() {
             let forward = match credential {
                 Some(_) => super::is_forwarded_on_credentialed_card_fetch(key.as_str()),
                 None if bound_target => {
                     crate::proxy::target_grant::forwards_caller_header(key.as_str(), &source_cred_headers, None)
                 }
-                None => super::should_forward_header(key.as_str(), &source_cred_headers),
+                None => {
+                    !super::is_target_auth_header(key.as_str(), target_auth_header)
+                        && super::should_forward_header(key.as_str(), &source_cred_headers)
+                }
             };
             if forward {
                 req = req.header(key.as_str(), value.as_bytes());
             }
         }
-        if let Some((header_name, header_value)) = &credential {
+        if let Some(super::TargetCredential {
+            header: (header_name, header_value),
+            ..
+        }) = &credential
+        {
             req = req.header(header_name.as_str(), header_value.as_str());
             self.credential_sent
                 .store(true, Ordering::Relaxed);
@@ -737,6 +743,18 @@ impl TargetCardFetch<'_> {
                 );
                 self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream"))
             })?;
+        super::forget_refused_target_token(
+            state
+                .delegation_vault_store
+                .as_deref(),
+            credential
+                .as_ref()
+                .and_then(|credential| credential.issued.as_ref()),
+            &state.surface.surface_id,
+            response.status().as_u16(),
+            response.headers(),
+        )
+        .await;
 
         let fault = FetchFault::Status {
             status: response.status().as_u16(),
@@ -856,8 +874,63 @@ fn record_agent_card_gateway_fault(
     }
 }
 
+/// The caller's headers a card fetch over Fabric carries: those the Access Point forwards,
+/// except one named like the Target credential header, with the first Fabric crossing.
+fn fabric_card_fetch_headers(
+    surface: &crate::config::agent_surface::AgentSurface,
+    headers: &HeaderMap,
+) -> HashMap<String, String> {
+    let source_cred_headers = surface.source_credential_headers();
+    let target_auth_header = super::target_auth_header_name(surface.target_auth());
+    let mut forwarded_headers = headers
+        .iter()
+        .filter(|(key, _)| {
+            !super::is_target_auth_header(key.as_str(), target_auth_header)
+                && super::should_forward_header(key.as_str(), &source_cred_headers)
+        })
+        .filter_map(|(key, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (key.as_str().to_string(), value.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
+    forwarded_headers
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_card_fetch_over_fabric_drops_a_caller_header_named_like_the_target_credential_header() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "fabric-card", "name": "Fabric card",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "fabric://peer/remote", "auth": {"method": {"static_secret": {
+                "secret_id": "key", "header_name": "X-Target-Key"}}}}
+        }))
+        .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in [("x-target-key", "caller"), ("x_target_key", "caller"), ("accept", "application/json")] {
+            headers.insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
+        }
+
+        let forwarded = super::fabric_card_fetch_headers(&surface, &headers);
+
+        assert!(
+            !forwarded
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("x-target-key") || name.eq_ignore_ascii_case("x_target_key")),
+            "{forwarded:?}"
+        );
+        assert_eq!(
+            forwarded
+                .get("accept")
+                .map(String::as_str),
+            Some("application/json")
+        );
+    }
+
     use super::*;
     use crate::component_tests::helpers::{MockServer, RecordingTarget};
     use serde_json::json;
@@ -1043,6 +1116,35 @@ mod tests {
             assert_eq!(failure.fault, FetchFault::CredentialRejected(TargetAuthError::StoreUnavailable), "{mode:?}");
             assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_fetch_drops_a_token_its_target_refuses_as_invalid() {
+        use super::super::target_auth_tests::{
+            BackendAnswer, Fixture, assert_a_refused_token_is_dropped, backend_answering, provider_auth,
+        };
+        let fixture = Fixture::new(200).await;
+        let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+        let card = json!({"name": "Orders agent", "url": "http://agent.internal/a2a", "skills": []});
+        let (target_url, _target) = backend_answering(answer.clone(), card).await;
+        let mut target = surface(json!({"endpoint": target_url}));
+        target.target.auth = Some(provider_auth("machine"));
+        let mut router = super::super::variant_routing_tests::router(target);
+        router.secrets_store = Some(fixture.secrets.clone());
+        router.credential_provider_store = Some(fixture.providers.clone());
+        router.delegation_vault_store = Some(fixture.vault.clone());
+        let state = router
+            .base_proxy_state("orders")
+            .await
+            .unwrap();
+        let call = || {
+            let fetched = fixture
+                .egress
+                .clone()
+                .scope(Box::pin(build(&state, CardMode::Serve)));
+            async move { json!({"isError": fetched.await.is_err()}) }
+        };
+        assert_a_refused_token_is_dropped(&fixture, &answer, "agent card fetch", call).await;
     }
 
     #[test]

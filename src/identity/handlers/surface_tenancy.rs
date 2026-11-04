@@ -18,7 +18,8 @@ use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
-/// Validates the resources a surface references. A tenant surface may not send an
+/// Validates the resources a surface references and the rules its Target authentication
+/// must meet. A tenant surface may not send an
 /// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
 /// credential of a provider holding a secret outside the provider's tenant: a reference that
 /// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
@@ -56,7 +57,8 @@ pub async fn validate_surface_references(
             .validate_reference(&reference)
             .await?;
     }
-    validate_target_auth_methods(state, surface).await
+    validate_target_auth_methods(state, surface).await?;
+    super::surface_target_auth::validate_target_auth_rules(surface, stored)
 }
 
 /// The target authentication methods of every Target and Transit Point, in every
@@ -862,7 +864,7 @@ fn grandfathered_references(
     grandfathered
 }
 
-fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
+pub(crate) fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
     let mut views = vec![surface.clone()];
     for variant in &surface.variants {
         let mut resolvable = surface.clone();

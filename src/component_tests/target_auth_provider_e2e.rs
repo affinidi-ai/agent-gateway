@@ -18,7 +18,9 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
     .await;
     let admin = admin.unwrap();
     let api = format!("{}/api/v1", h.gateway_base);
-    for (secret_id, value) in [("target-client-id", "client"), ("target-client-secret", "secret")] {
+    for (secret_id, value) in
+        [("target-client-id", "client"), ("target-client-secret", "secret"), ("caller-key", "caller")]
+    {
         let created = admin
             .post(format!("{api}/secrets/new"))
             .json(&json!({"name": secret_id, "secret_id": secret_id, "value": value}))
@@ -68,8 +70,14 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
     let surface = |method: serde_json::Value| {
         json!({
             "name": "target-auth-provider",
-            "access_point": { "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a" },
-            "target": { "endpoint": h.mock.url(), "auth": { "method": method } }
+            "access_point": {
+                "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a",
+                "caller_authentication": {"methods": [{
+                    "type": "api_key", "secret_id": "caller-key",
+                    "extraction": {"source": "http_header", "field": "X-Caller-Key"}
+                }]}
+            },
+            "target": { "endpoint": "https://127.0.0.1:9/", "auth": { "method": method } }
         })
     };
 
@@ -208,4 +216,109 @@ async fn a_token_endpoint_the_egress_policy_blocks_fails_the_request_before_the_
         0
     );
     assert_eq!(token_requests.load(Ordering::SeqCst), 0);
+}
+
+pub(super) fn write_secret(
+    bootstrap: &crate::config::BootstrapConfig,
+    secret_id: &str,
+    value: &str,
+) {
+    use crate::secrets::SecretsStore;
+
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            crate::secrets::FilesystemSecretsStore::new(
+                &bootstrap
+                    .storage_paths
+                    .secrets,
+            )
+            .unwrap()
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: value.into(),
+                secret_type: "General".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        })
+    });
+}
+
+async fn forwarded_headers_for_credential_header(
+    credential_secret: Option<&str>,
+    fallback: &str,
+) -> std::collections::HashMap<String, String> {
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        if let Some(value) = credential_secret {
+            write_secret(bootstrap, "target-key", value);
+        }
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {
+                    "secret_id": "target-key", "header_name": "X-Api-Key", "header_format": "{value}"
+                }},
+                "fallback": fallback
+            }))
+            .unwrap(),
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("X-API-KEY", "caller-value")
+        .header("X-Other", "kept")
+        .body(r#"{"jsonrpc":"2.0","method":"message/send","id":1,"params":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    h.mock
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("the target received the request")
+        .headers
+        .into_iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_header_named_like_the_credential_header_is_replaced_by_the_credential() {
+    let headers = forwarded_headers_for_credential_header(Some("gateway-value"), "reject").await;
+    assert_eq!(
+        headers
+            .get("x-api-key")
+            .map(String::as_str),
+        Some("gateway-value")
+    );
+    assert_eq!(
+        headers
+            .get("x-other")
+            .map(String::as_str),
+        Some("kept")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_header_named_like_the_credential_header_is_dropped_when_no_credential_is_added() {
+    let headers = forwarded_headers_for_credential_header(None, "passthrough").await;
+    assert_eq!(headers.get("x-api-key"), None);
+    assert_eq!(
+        headers
+            .get("x-other")
+            .map(String::as_str),
+        Some("kept")
+    );
 }

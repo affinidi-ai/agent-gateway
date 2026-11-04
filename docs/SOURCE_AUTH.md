@@ -222,13 +222,19 @@ That includes an mTLS certificate that lacks the configured binding field. The r
 continues with no caller identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
-([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
+([`errors.rs`](../src/source_auth/errors.rs)). Such a request, including one that carries
+credentials for more than one method (`ambiguous_credentials`), is forwarded without the
 surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
 Fabric send and Fabric receive. A Transit Point refuses such a caller itself (see
-[Transit Point callers](#transit-point-callers)). To reject unauthenticated callers at such an
-Access Point, close it (`public: false` with caller authentication), or attach a policy that
-denies them:
+[Transit Point callers](#transit-point-callers)). A surface with no caller authentication at
+all sends that credential for every caller, and is held to
+[`target_source_auth`](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path):
+in `warn` a warning is logged once, in `enforce` the credential is withheld and a new or
+changed Target authentication, or a new `a2a-proxy://` Target, on such a surface is refused on
+save. To reject
+unauthenticated callers at such an Access Point, close it (`public: false` with caller
+authentication), or attach a policy that denies them:
 
 ```rego
 package surface.policy

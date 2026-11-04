@@ -62,13 +62,13 @@ Feature: A2A HTTP surface forwarding and identity
     Then both responses contain the same DID
 
   Scenario: A2A agent card fetch presents the surface's target credential
-    Given the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
   Scenario: A caller cannot override or ride along on the credentialed agent card fetch
-    Given the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller fetches the agent card with extra headers
       | x-target-api-key | caller-forged  |
       | cookie           | session=caller |
@@ -83,7 +83,7 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" received header "accept-language" with value "en-GB"
 
   Scenario: The credentialed agent card fetch does not follow a redirect
-    Given the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And managed agent "bravo" redirects its agent card to managed agent "charlie"
     When the caller fetches the agent card
     Then the response status is 502
@@ -92,14 +92,14 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "charlie" was not called
 
   Scenario: A missing target credential fails the agent card when fallback is reject
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "reject"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller fetches the agent card
     Then the response status is 502
     And the response body is error "agent_card_target_auth_failed"
     And managed agent "bravo" was not called
 
   Scenario: A missing target credential fetches the agent card without it when fallback is passthrough
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "passthrough"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "passthrough"
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" did not receive header "x-target-api-key"
@@ -133,7 +133,7 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A refused provider token request fails the agent card when fallback is reject
     Given the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider is refusing token requests
-    And the target authentication fallback is "reject"
+    And the gateway's authentication to the managed agent falls back to "reject"
     When the caller fetches the agent card
     Then the response status is 502
     And the response body is error "agent_card_target_auth_failed"
@@ -142,7 +142,7 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A refused provider token request fetches the agent card without it when fallback is passthrough
     Given the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider is refusing token requests
-    And the target authentication fallback is "passthrough"
+    And the gateway's authentication to the managed agent falls back to "passthrough"
     When the caller fetches the agent card
     Then the response status is 200
     And managed agent "bravo" did not receive header "authorization"

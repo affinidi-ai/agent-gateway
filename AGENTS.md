@@ -144,10 +144,11 @@ a setting the operator switched off in the same PUT; see _Authorization server d
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Access Point panel's **Public access** switch writes `access_point.public`. A closed
-surface with no Caller Context saves but is not ready, shown as "Not ready for external
-access" under the Access Point URL with a **Configure Authentication** action. Saving a public
-surface, a not-ready one, or a surface without `public` and without a Caller Context, warns
-after the save; see
+surface with no Caller Context saves but is not ready (unless it sends a Target credential,
+or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is `enforce`,
+which refuses the save), shown as "Not ready for external access" under the Access Point URL
+with a **Configure Authentication** action. Saving a public surface, a not-ready one, or a
+surface without `public` and without a Caller Context, warns after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.

@@ -1323,7 +1323,7 @@ allow if {{
     ));
 }
 
-fn transit_point_config_mut<'a>(
+pub(crate) fn transit_point_config_mut<'a>(
     world: &'a mut SurfaceWorld,
     transit_point: &str,
 ) -> &'a mut SurfaceTransitPointConfig {
@@ -2495,7 +2495,9 @@ fn configure_target_auth_secret(
     });
 }
 
-#[given(expr = "the surface injects target authentication from secret {string} with value {string} as header {string}")]
+#[given(
+    expr = "the gateway authenticates to the managed agent with secret {string} holding {string} in header {string}"
+)]
 fn surface_injects_target_auth_secret(
     world: &mut SurfaceWorld,
     secret_id: String,
@@ -2523,7 +2525,7 @@ fn configure_missing_target_auth(
 }
 
 #[given(
-    expr = "the surface injects target authentication from missing secret {string} as header {string} with fallback {string}"
+    expr = "the gateway authenticates to the managed agent with missing secret {string} in header {string}, falling back to {string}"
 )]
 fn surface_injects_missing_target_auth(
     world: &mut SurfaceWorld,
@@ -2614,11 +2616,19 @@ fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
     target_auth_provider(world).token_status = 401;
 }
 
-#[given(expr = "the target authentication fallback is {string}")]
-fn target_auth_provider_fallback(
+#[given(expr = "the gateway's authentication to the managed agent falls back to {string}")]
+fn target_auth_fallback(
     world: &mut SurfaceWorld,
     fallback: String,
 ) {
+    if let Some(secret) = world
+        .surface_config
+        .target_auth
+        .as_mut()
+    {
+        secret.fallback = fallback;
+        return;
+    }
     target_auth_provider(world).fallback = fallback;
 }
 
@@ -2650,13 +2660,32 @@ fn surface_belongs_to_tenant(
     world.surface_config.tenant_id = Some(tenant_id);
 }
 
+/// Warn is the default mode of every credential rule, so this states it rather than setting it.
+#[given(expr = "the gateway only warns on the credential rule {string}")]
+fn gateway_warns_on_credential_rule(
+    world: &mut SurfaceWorld,
+    rule: String,
+) {
+    assert!(
+        !world
+            .surface_config
+            .enforced_credential_rules
+            .contains(&rule),
+        "the credential rule {rule:?} is already enforced"
+    );
+    assert!(world.infra.is_none(), "the credential rule must be set before the gateway starts");
+}
+
 #[given(expr = "the gateway enforces the credential rule {string}")]
 fn gateway_enforces_credential_rule(
     world: &mut SurfaceWorld,
     rule: String,
 ) {
     assert!(
-        matches!(rule.as_str(), "token_endpoint_https" | "tenant_credential_isolation"),
+        matches!(
+            rule.as_str(),
+            "token_endpoint_https" | "tenant_credential_isolation" | "target_https" | "target_source_auth"
+        ),
         "unknown credential rule {rule:?}"
     );
     assert!(

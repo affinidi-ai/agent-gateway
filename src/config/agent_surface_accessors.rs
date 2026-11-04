@@ -136,17 +136,6 @@ impl AgentSurface {
             .any(|method| method.is_presented(&single, false))
     }
 
-    /// Whether `name` is a header a caller-authentication method reads.
-    pub fn is_source_credential_header(
-        &self,
-        name: &str,
-    ) -> bool {
-        self.source_auth_methods()
-            .iter()
-            .filter_map(|method| method.credential_header_name())
-            .any(|header| name.eq_ignore_ascii_case(header))
-    }
-
     /// The DID Auth configurations that mint sessions: the Access Point's DID
     /// Auth caller-authentication method, of which there is at most one, on the
     /// surface and in each variant whose overrides set the Access Point's caller
@@ -1106,9 +1095,6 @@ mod tests {
             {"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}
         ]));
         assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
-        assert!(surface.is_source_credential_header("authorization"));
-        assert!(surface.is_source_credential_header("x-api-key"));
-        assert!(!surface.is_source_credential_header("x-trace"));
         assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
         assert!(surface.has_source_auth());
     }
