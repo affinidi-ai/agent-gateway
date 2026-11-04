@@ -1,14 +1,6 @@
 branch: fix/tenant-check-provider-key-references
 changes:
-  added:
-    - timestamp: '2026-11-03T17:00:00Z'
-      title: Say why a surface is not ready in the surface response's not_ready_reason
-      description: >-
-        Surface responses of the admin API carry a read-only `not_ready_reason` while the surface
-        is refused for its API Key Provider keys: `provider_key_tenant`, or
-        `api_key_store_unavailable` while the API key store cannot be read. Operators can see why
-        a surface answers `503` without reading the logs. A write body that sends it back has it
-        dropped, like `access_point_status`.
+  added: []
   changed: []
   fixed:
     - timestamp: '2026-11-04T12:00:00Z'
@@ -100,7 +92,9 @@ changes:
         Key Provider key, a tenant's key on a surface with no tenant, or the key of a surface with
         no tenant now answers every request with `503`. If you run `enforce`, upgrade with
         `warn` first, read the startup credential policy report for `provider_key_tenant` lines,
-        fix those surfaces, then restart with `enforce`.
+        fix those surfaces, then restart with `enforce`. Such a surface still reports
+        `access_point_status: ready`; the gateway log line with `rule="provider_key_tenant"` says
+        why it answers `503`.
     - timestamp: '2026-11-04T09:00:00Z'
       title: Answer 503 from surfaces naming an API key id while the key store is unavailable
       description: >-

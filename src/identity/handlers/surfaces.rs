@@ -523,18 +523,14 @@ where
     }
 }
 
-/// Removes the read-only `access_point_status` and `not_ready_reason` of a
-/// [`SurfaceResponse`] from a write body, so a client can send back what a read
-/// or a save returned. Whether either was there.
+/// Removes the read-only `access_point_status` of a [`SurfaceResponse`] from
+/// a write body, so a client can send back what a read or a save returned.
+/// Whether it was there.
 fn drop_access_point_status(body: &mut serde_json::Value) -> bool {
     body.as_object_mut()
         .is_some_and(|body| {
-            let status = body
-                .remove("access_point_status")
-                .is_some();
-            body.remove("not_ready_reason")
+            body.remove("access_point_status")
                 .is_some()
-                || status
         })
 }
 
@@ -3852,19 +3848,14 @@ pub struct SurfaceResponse<T> {
     #[serde(flatten)]
     pub resource: T,
     pub access_point_status: AccessPointStatus,
-    /// The rule a surface whose Access Point is otherwise ready is refused under, while it is.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_ready_reason: Option<&'static str>,
 }
 
 impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
     /// The status is that of the surface its URL serves: the default variant,
-    /// when there is one ([`AgentSurface::served_view`]).
+    /// when there is one ([`AgentSurface::served_access_point_status`]).
     fn from(surface: AgentSurface) -> Self {
-        let served = surface.served_view();
         Self {
-            access_point_status: served.access_point_status(),
-            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&served),
+            access_point_status: surface.served_access_point_status(),
             resource: surface,
         }
     }
@@ -3877,12 +3868,11 @@ impl SurfaceResponse<SurfaceVariant> {
         variant: SurfaceVariant,
         surface: &AgentSurface,
     ) -> Self {
-        let served = surface
-            .serve_selected(Some(&variant))
-            .surface;
         Self {
-            access_point_status: served.access_point_status(),
-            not_ready_reason: crate::identity::provider_key_gate::gate().recorded_refusal(&served),
+            access_point_status: surface
+                .serve_selected(Some(&variant))
+                .surface
+                .access_point_status(),
             resource: variant,
         }
     }
@@ -9128,48 +9118,12 @@ mod tests {
         assert_eq!(serde_json::to_value(SurfaceResponse::from(surface)).unwrap()["access_point_status"], "ready");
     }
 
-    #[tokio::test]
-    async fn test_not_ready_reason_is_reported_for_the_view_that_names_the_refused_key() {
-        let enforced = crate::identity::provider_key_gate::test_support::enforced_gate(
-            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
-            &[("owner-a", "atgk_view_a"), ("owner-b", "atgk_view_b")],
-        )
-        .await;
-        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
-            "surface_id": "views", "name": "views", "tenant_id": "tenant-a",
-            "access_point": {"listen_address": "https://gateway.example", "route": "/views", "protocol": "a2a"},
-            "target": {"endpoint": "http://127.0.0.1:9"},
-            "identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_view_a"}},
-            "variants": [{"id": "cross-id", "alias": "cross", "name": "Cross", "enabled": true,
-                "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_view_b"}}}}]
-        }))
-        .unwrap();
-        enforced
-            .gate
-            .admit(&surface)
-            .await;
-
-        let base = serde_json::to_value(SurfaceResponse::from(surface.clone())).unwrap();
-        assert!(
-            base.get("not_ready_reason")
-                .is_none(),
-            "{base}"
-        );
-        let variant = surface.variants[0].clone();
-        let response = serde_json::to_value(SurfaceResponse::variant(variant, &surface)).unwrap();
-        assert_eq!(response["not_ready_reason"], "provider_key_tenant", "{response}");
-    }
-
     #[test]
     fn test_write_body_sent_back_from_a_response_loses_only_its_access_point_status() {
-        let mut sent = serde_json::json!({"name": "saved", "access_point_status": "ready",
-            "not_ready_reason": "provider_key_tenant"});
+        let mut sent = serde_json::json!({"name": "saved", "access_point_status": "ready"});
         assert!(drop_access_point_status(&mut sent));
         assert_eq!(sent, serde_json::json!({"name": "saved"}));
         assert!(!drop_access_point_status(&mut sent));
-        let mut reason_only = serde_json::json!({"name": "saved", "not_ready_reason": "api_key_store_unavailable"});
-        assert!(drop_access_point_status(&mut reason_only));
-        assert_eq!(reason_only, serde_json::json!({"name": "saved"}));
         let mut not_an_object = serde_json::json!(["access_point_status"]);
         assert!(!drop_access_point_status(&mut not_an_object));
     }

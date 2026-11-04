@@ -210,20 +210,6 @@ impl Gate {
         )
     }
 
-    async fn status(
-        &self,
-        surface_id: &str,
-    ) -> Value {
-        let response = self
-            .admin
-            .get(format!("{}/api/v1/surfaces/{surface_id}", self.h.gateway_base))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        response.json().await.unwrap()
-    }
-
     /// Rewrites the stored file of `surface_id` as another node or an operator would, and reloads
     /// the gateway's configuration.
     async fn rewrite_and_reload(
@@ -319,12 +305,6 @@ async fn under_warn_a_surface_naming_another_tenants_key_serves_and_is_logged() 
             .any(|line| line.contains("provider_key_tenant") && line.contains(NAMES_OWN)),
         "{warnings}"
     );
-    assert!(
-        gate.status(NAMES_CROSS)
-            .await
-            .get("not_ready_reason")
-            .is_none()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -337,16 +317,6 @@ async fn under_enforce_a_surface_naming_another_tenants_key_is_not_ready() {
     let (status, body) = gate.call(NAMES_OWN).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(gate.reached(), 1);
-
-    let refused = gate.status(NAMES_CROSS).await;
-    assert_eq!(refused["not_ready_reason"], "provider_key_tenant", "{refused}");
-    assert_eq!(refused["access_point_status"], "ready", "{refused}");
-    assert!(
-        gate.status(NAMES_OWN)
-            .await
-            .get("not_ready_reason")
-            .is_none()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -367,7 +337,6 @@ async fn a_reload_that_makes_a_serving_surface_name_another_tenants_key_takes_it
     let reached = gate.reached();
     assert_not_ready(gate.call(NAMES_OWN).await, "rewritten to another tenant's key");
     assert_eq!(gate.reached(), reached, "a not-ready Access Point never reaches the Target");
-    assert_eq!(gate.status(NAMES_OWN).await["not_ready_reason"], "provider_key_tenant");
 
     gate.rewrite_and_reload(NAMES_OWN, |stored| {
         stored["identity_slots"]["external"]["api_key_id"] = json!(KEY_A);
@@ -438,7 +407,6 @@ async fn refresh_scan_flow() {
     );
     let verdicts = gate.h.provider_key_gate();
     assert!(verdicts.has_verdict(NAMES_OWN));
-    assert_eq!(gate.status(NAMES_OWN).await["not_ready_reason"], "provider_key_tenant");
 
     std::fs::remove_file(gate.stored_path(NAMES_OWN)).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

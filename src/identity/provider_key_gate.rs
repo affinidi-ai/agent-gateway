@@ -283,9 +283,10 @@ impl ProviderKeyGate {
     }
 
     /// The reason a kept verdict refuses `surface` as served (a resolved view, or a surface with
-    /// variants in every view) under, for the admin API; `None` when no verdict refuses it or
-    /// none covers its key ids yet.
-    pub fn recorded_refusal(
+    /// variants in every view) under; `None` when no verdict refuses it or none covers its key
+    /// ids yet.
+    #[cfg(test)]
+    pub(crate) fn recorded_refusal(
         &self,
         surface: &AgentSurface,
     ) -> Option<&'static str> {

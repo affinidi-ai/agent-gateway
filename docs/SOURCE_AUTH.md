@@ -194,14 +194,10 @@ see [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-
 
 Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
-has one, otherwise the base. Variant responses carry it for that variant.
-
-They also carry a read-only `not_ready_reason` while the surface is refused for its API Key
-Provider keys: `provider_key_tenant`, or `api_key_store_unavailable` while the API key store
-cannot be read; see [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
-`access_point_status` stays `ready` for such a surface, and the dashboard shows only
-`access_point_status`. `not_ready_reason` is the verdict of the gateway node that answered the
-request. The field is absent otherwise.
+has one, otherwise the base. Variant responses carry it for that variant. `ready` does not mean
+the surface serves: a surface refused for its API Key Provider keys stays `ready` and answers
+`503`. Look for `rule="provider_key_tenant"` in the gateway log; see
+[Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -218,7 +214,7 @@ in `Warning` headers (code 299), before the Transit Point warnings described bel
 Access Point is public, when it or an enabled variant is not ready (a variant's warning is
 prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
 admits every caller. A write request that sends a response back unchanged has its top-level
-`access_point_status` and `not_ready_reason` dropped before parsing.
+`access_point_status` dropped before parsing.
 
 A gateway rolled back to a release without these fields cannot load the surfaces that store
 them, which is every surface created after the upgrade; see
@@ -1061,7 +1057,10 @@ Point](#not-ready-access-points) does. The refusal is logged with `reason=provid
 or `reason=api_key_store_unavailable` during a store outage, and recorded in the Audit Log as
 `request_rejected` with the reason `access_point_not_ready` (a Transit Point refusal is logged
 only). The agent card preview of such a surface reports `unsupported_reason: not_running` and
-fetches nothing. The surface response's `not_ready_reason` says why.
+fetches nothing. The surface response's `access_point_status` stays `ready`, and the Audit Log
+reason is the one a closed surface without source authentication gets, so neither says why. The
+`WARN` line with `rule="provider_key_tenant"` always does; the credential policy report lists the
+surface too, but only at boot and on reload.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,
