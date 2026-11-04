@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::jwt_bearer::errors::JwtBearerError;
 use crate::jwt_bearer::jwks::Jwk;
 
 /// Where to fetch/find the JSON Web Key Set for a `JwtVerificationStrategy`.
@@ -52,10 +53,28 @@ const MAX_PRINCIPAL_CLAIM_LEN: usize = 128;
 const NON_IDENTIFYING_CLAIMS: [&str; 6] = ["iss", "aud", "exp", "iat", "nbf", "jti"];
 
 impl JwtVerificationStrategy {
-    pub fn principal_claim_name(&self) -> &str {
-        self.principal_claim
+    /// The claim that names this strategy's callers. A stored claim the API
+    /// would refuse, such as one written to storage by hand, is an error rather
+    /// than a caller name, so a strategy naming `iss` identifies nobody.
+    pub fn principal_claim_name(&self) -> Result<&str, JwtBearerError> {
+        match self
+            .principal_claim
             .as_deref()
-            .unwrap_or(DEFAULT_PRINCIPAL_CLAIM)
+        {
+            None => Ok(DEFAULT_PRINCIPAL_CLAIM),
+            Some(claim) => normalize_principal_claim(Some(claim))
+                .map(|_| claim)
+                .map_err(JwtBearerError::InvalidPrincipalClaim),
+        }
+    }
+
+    /// The stored claim in the form the API stores it: `None` for `sub`.
+    pub fn normalized_principal_claim(&self) -> Result<Option<String>, JwtBearerError> {
+        normalize_principal_claim(
+            self.principal_claim
+                .as_deref(),
+        )
+        .map_err(JwtBearerError::InvalidPrincipalClaim)
     }
 }
 
@@ -151,14 +170,24 @@ mod tests {
     #[test]
     fn the_principal_claim_defaults_to_sub_and_is_stored_only_when_it_is_not() {
         let mut strategy = make_strategy();
-        assert_eq!(strategy.principal_claim_name(), "sub");
+        assert_eq!(
+            strategy
+                .principal_claim_name()
+                .unwrap(),
+            "sub"
+        );
         assert!(
             !serde_json::to_string(&strategy)
                 .unwrap()
                 .contains("principal_claim")
         );
         strategy.principal_claim = Some("oid".to_string());
-        assert_eq!(strategy.principal_claim_name(), "oid");
+        assert_eq!(
+            strategy
+                .principal_claim_name()
+                .unwrap(),
+            "oid"
+        );
         let back: JwtVerificationStrategy = serde_json::from_str(&serde_json::to_string(&strategy).unwrap()).unwrap();
         assert_eq!(
             back.principal_claim
@@ -170,7 +199,42 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
         }))
         .unwrap();
-        assert_eq!(legacy.principal_claim_name(), "sub");
+        assert_eq!(
+            legacy
+                .principal_claim_name()
+                .unwrap(),
+            "sub"
+        );
+    }
+
+    #[test]
+    fn a_stored_principal_claim_the_api_would_refuse_names_no_caller() {
+        let mut strategy = make_strategy();
+        strategy.principal_claim = Some("sub".to_string());
+        assert_eq!(
+            strategy
+                .principal_claim_name()
+                .unwrap(),
+            "sub"
+        );
+        assert_eq!(
+            strategy
+                .normalized_principal_claim()
+                .unwrap(),
+            None
+        );
+        for refused in ["iss", "", "o id"] {
+            strategy.principal_claim = Some(refused.to_string());
+            assert!(
+                matches!(strategy.principal_claim_name(), Err(JwtBearerError::InvalidPrincipalClaim(_))),
+                "{refused:?}"
+            );
+            assert!(
+                strategy
+                    .normalized_principal_claim()
+                    .is_err()
+            );
+        }
     }
 
     #[test]

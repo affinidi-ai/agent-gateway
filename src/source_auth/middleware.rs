@@ -243,16 +243,17 @@ impl SourceAuthMiddleware {
                 ))
             })?;
 
+        let principal_claim = jwt_strategy
+            .principal_claim_name()
+            .map_err(SourceAuthError::from)?
+            .to_string();
+
         // 3. Verify
         let claims = self
             .jwt_verifier
             .validate(token, &jwt_strategy, &config.audiences)
             .await
             .map_err(SourceAuthError::from)?;
-
-        let principal_claim = jwt_strategy
-            .principal_claim_name()
-            .to_string();
         let subject = claims
             .get(principal_claim.as_str())
             .and_then(|v| v.as_str())
@@ -1768,6 +1769,33 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await
             .unwrap();
         assert_eq!(identity.principal_hash(None), None, "a claim that is not a string names no caller");
+    }
+
+    #[tokio::test]
+    async fn a_strategy_stored_with_a_claim_the_api_refuses_authenticates_nobody() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("iss")).await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let error = mw
+            .authenticate(&config, &bearer(&token), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect_err("a strategy naming iss identifies nobody");
+        assert!(matches!(error, SourceAuthError::Internal { .. }), "{error}");
+        assert!(!error.is_caller_attributable(), "the strategy, not the caller, is at fault");
     }
 
     #[tokio::test]

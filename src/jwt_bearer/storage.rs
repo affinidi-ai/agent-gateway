@@ -258,6 +258,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_principal_claim_stored_without_the_api_is_checked_when_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let mut written = sample_strategy();
+        written.principal_claim = Some("iss".to_string());
+        let id = FileSystemJwtVerificationStrategyStore::new(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .create(written)
+            .await
+            .unwrap()
+            .id;
+
+        let reloaded = FileSystemJwtVerificationStrategyStore::new(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("the strategy loads");
+        assert!(matches!(
+            reloaded.principal_claim_name(),
+            Err(crate::jwt_bearer::errors::JwtBearerError::InvalidPrincipalClaim(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_returns_none_for_missing() {
         let (store, _tmp) = make_store().await;
         let result = store

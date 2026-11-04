@@ -330,6 +330,16 @@ pub async fn update_strategy(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
     }
 
+    // A stored claim the API would refuse is kept as it is: it names no caller
+    // when used, and no request can name it, so it can only be replaced by a new
+    // strategy.
+    let stored_claim = existing
+        .normalized_principal_claim()
+        .unwrap_or_else(|_| {
+            existing
+                .principal_claim
+                .clone()
+        });
     if let Some(requested) = body
         .principal_claim
         .as_deref()
@@ -338,7 +348,7 @@ pub async fn update_strategy(
             Ok(claim) => claim,
             Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
         };
-        if requested != existing.principal_claim {
+        if requested != stored_claim {
             return (
                 StatusCode::BAD_REQUEST,
                 ErrorBody::json(
@@ -355,7 +365,7 @@ pub async fn update_strategy(
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
-        principal_claim: existing.principal_claim,
+        principal_claim: stored_claim,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -1037,6 +1047,64 @@ mod tests {
         let (status, omitted) = send_strategy(&router, "PUT", &path, strategy_body(None)).await;
         assert_eq!(status, StatusCode::OK, "an update that does not mention the claim keeps it");
         assert_eq!(omitted["principal_claim"], "oid");
+
+        let (_, default) = send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(None)).await;
+        let default_path = format!(
+            "/v1/jwt-verification-strategies/{}",
+            default["id"]
+                .as_str()
+                .unwrap()
+        );
+        let (status, named_default) = send_strategy(&router, "PUT", &default_path, strategy_body(Some("sub"))).await;
+        assert_eq!(status, StatusCode::OK, "naming sub on a default strategy is no change: {named_default}");
+        assert!(
+            named_default
+                .get("principal_claim")
+                .is_none()
+        );
+    }
+
+    /// A strategy written to storage by hand skips the API's checks: naming
+    /// `sub` there is still the default, and a claim the API would refuse can
+    /// be kept but not changed.
+    #[tokio::test]
+    async fn an_update_compares_with_the_stored_claim_in_its_api_form() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        for (id, stored) in [("named-sub", "sub"), ("named-iss", "iss")] {
+            let mut strategy = seeded_strategy(None);
+            strategy.id = id.to_string();
+            strategy.principal_claim = Some(stored.to_string());
+            store
+                .inner
+                .insert(id.to_string(), strategy);
+        }
+
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-sub", strategy_body(Some("sub")))
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("principal_claim")
+                .is_none(),
+            "the stored sub is saved in its API form: {body}"
+        );
+
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-iss", strategy_body(Some("oid")))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-iss", strategy_body(None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["principal_claim"], "iss", "it is kept, and names no caller when used");
     }
 
     #[tokio::test]
