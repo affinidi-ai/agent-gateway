@@ -1181,6 +1181,41 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
 
+#### Computing the identity hash outside the gateway
+
+A system that runs the connect for a caller, such as the page that hosts the person's connect
+and the authorization server's redirect, passes the caller's identity hash as the `principal`
+of a connect and of a grant removal, and reads it from a grant report. It computes the hash
+itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
+computed outside the gateway: take the token's `iss` and `sub`, and the surface's `tenant_id`
+(or `null`).
+
+The form is a compatibility surface. It is not changed without a documented migration, since
+a changed form orphans every stored grant. No pepper and no configuration setting is part of
+it: the same inputs always give the same hash, on every gateway. (The pepper derives the ids
+grants are stored under, never the hash itself.) These values are held by
+tests, and a change to the form fails them:
+
+| `method` | `issuer` | `tenant` | `subject` | Identity hash |
+| --- | --- | --- | --- | --- |
+| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
+| `api_key` | `""` | `null` | `partner-key` | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
+
+The third row shows RFC 8785 escaping: the subject is written with `\"` for the quote, `\\` for the
+backslash, the character `é` as itself in UTF-8, and `\n` for the line feed.
+
+The `hint` of a `connect_required` refusal for a caller is computed from the identity hash the
+same way on both sides: the first 16 bytes of the SHA-256 of the UTF-8 text
+`agent-gateway-connect-hint`, a line feed, and the identity hash as its lowercase hex text,
+written as base64url without padding (22 characters). It has the same compatibility promise:
+
+| Identity hash | Hint |
+| --- | --- |
+| `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` | `WXYw1wqFnUD93SdLiPtFyA` |
+| `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` | `YvFEO7T_9N80_y4j8sxMVA` |
+
 Delegated credentials stored by a release that keyed them by an earlier form of the identity
 hash are never looked up again, but their access and refresh tokens stay in the vault until
 they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
