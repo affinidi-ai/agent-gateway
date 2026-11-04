@@ -5,10 +5,31 @@ import {
 } from '../resolve';
 
 describe('computeOverridesFromPayload', () => {
-  it('emits an empty transit.points override when access_point/target/transit are absent', () => {
-    // Empty `points` is intentional — it ensures a variant whose
-    // user removed every TP overrides base instead of inheriting it.
-    expect(computeOverridesFromPayload({})).toEqual({ complete: true, transit: { points: [] } });
+  it('emits empty transit.points and outbound_credentials overrides when they are absent', () => {
+    // Empty lists are intentional — a variant whose user removed every
+    // TP or credential binding overrides base instead of inheriting it.
+    expect(computeOverridesFromPayload({})).toEqual({
+      complete: true,
+      transit: { points: [] },
+      outbound_credentials: [],
+    });
+  });
+
+  it('sends a variant without credential bindings an empty outbound_credentials, never none', () => {
+    // The gateway keeps the base surface's bindings for a variant that
+    // leaves the list out, while the dashboard shows it with none.
+    const binding = {
+      credential_provider_id: 'vendor',
+      consent_mode: 'external',
+      subject: 'owner',
+    };
+    expect(
+      computeOverridesFromPayload({ outbound_credentials: [binding] }).outbound_credentials
+    ).toEqual([binding]);
+    expect(computeOverridesFromPayload({ outbound_credentials: [] }).outbound_credentials).toEqual(
+      []
+    );
+    expect(computeOverridesFromPayload({}).outbound_credentials).toEqual([]);
   });
 
   it('extracts whitelisted access_point fields and skips unknown ones', () => {
