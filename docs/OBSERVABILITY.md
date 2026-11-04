@@ -634,6 +634,30 @@ for which writes.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
+**Connector calls.** A call through a Transit Point whose `transit_credentials` take a connector
+grant (`consent_mode: external`) is recorded as `connector_call` (group Delegation), once per
+call. It answers who used whose account: `user_identity_hash` is the caller's identity hash
+whichever account the grant is, and `subject` says whether the grant was the `owner`'s, one
+account for every caller, or the caller's own.
+
+- `transit_point`: the Transit Point's id; `provider_id` the credential provider; `surface_id`,
+  `channel_name` and `tenant_id` the surface and its tenant (absent for an appliance-wide
+  surface). `mcp_tool_name` names the tool an MCP `tools/call` asks for, never its arguments.
+- `outcome` `forwarded`: the call was sent with the grant and the vendor answered; `status_class`
+  is the class of that answer, `2xx` to `5xx`. A call the vendor rejected for its token and the
+  gateway retried with a refreshed one is one record, carrying the retry's answer. The call's
+  earlier `token_injected` records, one per send, remain. A call that could not reach the
+  vendor, or whose answer could not be read, records no `connector_call`.
+- `outcome` `refused`: the call was refused, before it was forwarded or because the vendor
+  rejected the grant; `reason` is the fixed reason the caller was told (`connect_required`,
+  `scope_insufficient`, `connector_unavailable`) or `caller_not_identified`, and `cause` the
+  fixed cause inside it, as the gateway's log names it (for example `provider_of_another_tenant`,
+  `grant_beyond_the_bindings_scopes`).
+- The record names the caller by the hash alone: no `caller` context, argument, token or text
+  from the vendor. A call a Transit Point refuses for its rate limit is `rate_limited`, and one
+  its tool gate denies is `policy_decision`; neither is repeated as a `connector_call`. The Access
+  Point's Target grant keeps its own records (`token_injected`, `request_rejected`).
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,

@@ -92,6 +92,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Delegation,
     ),
     event(
+        "connector_call",
+        "Connector Call",
+        "A call through a connector's Transit Point was forwarded with a grant, or refused before it was",
+        Delegation,
+    ),
+    event(
         "token_refreshed",
         "Token Refreshed",
         "An expired delegated credential was refreshed and injected",
@@ -291,6 +297,7 @@ mod tests {
         }
         for delegation in [
             "token_injected",
+            "connector_call",
             "token_refreshed",
             "token_not_found",
             "token_revoked",
