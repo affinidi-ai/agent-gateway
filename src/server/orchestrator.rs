@@ -4354,8 +4354,14 @@ pub async fn run_axum_proxy(
         let saml_sessions_for_cleanup = saml_state
             .as_ref()
             .map(|s| s.session_manager.clone());
+        let passkey_challenges_for_cleanup = auth_state_for_notif.clone();
         let session_cleanup_task = tokio::spawn(async move {
-            periodic_session_cleanup(didauth_sessions_for_cleanup, saml_sessions_for_cleanup).await;
+            periodic_session_cleanup(
+                didauth_sessions_for_cleanup,
+                saml_sessions_for_cleanup,
+                passkey_challenges_for_cleanup,
+            )
+            .await;
         });
 
         tasks.push(session_cleanup_task);

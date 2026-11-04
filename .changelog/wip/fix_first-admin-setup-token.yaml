@@ -30,6 +30,13 @@ changes:
         `client_ip.trusted_proxies`, or every caller shares its budget; when the limit locks
         out a caller that did not come through a listed proxy, the gateway logs a warning
         saying so.
+    - timestamp: '2026-11-04T16:30:00Z'
+      title: Expire unfinished passkey challenges after five minutes
+      description: >-
+        A passkey registration or sign-in challenge could be finished at any later time, because
+        WebAuthn passes its timeout to the browser only as a hint, and challenges nobody finished
+        stayed in memory until the gateway restarted. A challenge now has to be finished within
+        five minutes, and the periodic session cleanup drops older ones.
   breaking:
     - timestamp: '2026-11-04T13:30:00Z'
       title: ⭐ Require a setup token to register the first passkey administrator

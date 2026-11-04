@@ -386,8 +386,10 @@ be deleted or demoted. With passkeys, that first registration needs the single-u
 the gateway keeps in `_storage/passkeys/setup-token` while no user exists, or the one set in
 `AG_SETUP_TOKEN`; see [`RBAC.md`](RBAC.md#primary-administrator). Each passkey
 registration endpoint takes 5 requests per client IP per 15 minutes by default
-(`registration_throttle` in `gateway.json`), answering 429 with `Retry-After` past that.
-A SAML sign-in must return from the identity provider within five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
+(`registration_throttle` in `gateway.json`), answering 429 with `Retry-After` past that. A
+passkey registration or sign-in must be finished within five minutes of starting it, and its
+challenge is accepted once. A SAML sign-in must return from the identity provider within five
+minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
 `saml.json` for 20 sign-ins per client IP per minute (the default `per_ip`), with 429 and

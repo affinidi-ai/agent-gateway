@@ -4,11 +4,12 @@ use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{debug, info};
 
-/// Periodically clean up expired sessions from both session stores
-/// Runs every 5 minutes to keep disk storage clean and prevent accumulation
+/// Periodically clean up expired sessions from both session stores, and expired passkey
+/// challenges. Runs every 5 minutes to keep disk storage clean and prevent accumulation
 pub async fn periodic_session_cleanup(
     didauth_store: Arc<crate::didauth::DidAuthSessionStore>,
     saml_session_manager: Option<Arc<crate::auth::SessionManager>>,
+    passkey_auth_state: Option<Arc<crate::auth::AuthState>>,
 ) {
     // Clean up every 5 minutes
     let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
@@ -30,6 +31,12 @@ pub async fn periodic_session_cleanup(
         if let Some(ref session_mgr) = saml_session_manager {
             session_mgr
                 .cleanup_expired()
+                .await;
+        }
+
+        if let Some(ref auth_state) = passkey_auth_state {
+            auth_state
+                .cleanup_expired_challenges()
                 .await;
         }
 

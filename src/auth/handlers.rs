@@ -275,25 +275,22 @@ pub async fn register_finish(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<RegisterFinishRequest>,
 ) -> Result<StatusCode, RegisterFinishError> {
-    info!("Completing passkey registration for challenge: {}", req.challenge_id);
+    info!(
+        "Completing passkey registration for challenge: {}",
+        crate::observability::loggable::untrusted(&req.challenge_id)
+    );
 
-    // Retrieve challenge state
-    let mut challenges = auth_state
-        .challenges
-        .write()
-        .await;
-    let challenge_state = challenges
-        .remove(&req.challenge_id)
+    let challenge_state = auth_state
+        .take_challenge(&req.challenge_id)
+        .await
         .ok_or_else(|| {
-            error!("Challenge not found: {}", req.challenge_id);
+            error!("Challenge not found or expired: {}", crate::observability::loggable::untrusted(&req.challenge_id));
             StatusCode::BAD_REQUEST
         })?;
 
     let reg_state = challenge_state
         .registration_state
         .ok_or(StatusCode::BAD_REQUEST)?;
-
-    drop(challenges); // Release lock
 
     // Get username from challenge state
     let username = challenge_state
@@ -573,25 +570,22 @@ pub async fn login_finish(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<LoginFinishRequest>,
 ) -> Result<impl IntoResponse, SessionFinalizationError> {
-    info!("Completing passkey authentication for challenge: {}", req.challenge_id);
+    info!(
+        "Completing passkey authentication for challenge: {}",
+        crate::observability::loggable::untrusted(&req.challenge_id)
+    );
 
-    // Retrieve challenge state
-    let mut challenges = auth_state
-        .challenges
-        .write()
-        .await;
-    let challenge_state = challenges
-        .remove(&req.challenge_id)
+    let challenge_state = auth_state
+        .take_challenge(&req.challenge_id)
+        .await
         .ok_or_else(|| {
-            error!("Challenge not found: {}", req.challenge_id);
+            error!("Challenge not found or expired: {}", crate::observability::loggable::untrusted(&req.challenge_id));
             StatusCode::BAD_REQUEST
         })?;
 
     let auth_state_data = challenge_state
         .authentication_state
         .ok_or(StatusCode::BAD_REQUEST)?;
-
-    drop(challenges); // Release lock
 
     // Get username from challenge state
     let username = challenge_state
@@ -1572,5 +1566,176 @@ mod tests {
 
         assert!(rendered.contains(r#"session_token: "0f2c9d7e...""#), "{rendered}");
         assert!(!rendered.contains(token), "{rendered}");
+    }
+
+    const PAST_CHALLENGE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::seconds(301);
+
+    async fn age_challenge(
+        state: &AuthState,
+        challenge_id: &str,
+        by: chrono::TimeDelta,
+    ) {
+        state
+            .challenges
+            .write()
+            .await
+            .get_mut(challenge_id)
+            .expect("the challenge exists")
+            .created_at -= by;
+    }
+
+    async fn finish_registration(
+        state: &Arc<AuthState>,
+        challenge_id: &str,
+    ) -> StatusCode {
+        let request: RegisterFinishRequest = serde_json::from_value(serde_json::json!({
+            "challenge_id": challenge_id,
+            "credential": {
+                "id": "AAAA",
+                "rawId": "AAAA",
+                "response": {"attestationObject": "AAAA", "clientDataJSON": "AAAA"},
+                "type": "public-key",
+                "extensions": {}
+            },
+            "setup_token": SETUP_TOKEN
+        }))
+        .unwrap();
+        super::register_finish(axum::Extension(None), State(state.clone()), Json(request))
+            .await
+            .unwrap_or_else(|error| error.into_response().status())
+    }
+
+    async fn finish_login(
+        state: &Arc<AuthState>,
+        challenge_id: &str,
+    ) -> StatusCode {
+        let request: super::LoginFinishRequest = serde_json::from_value(serde_json::json!({
+            "challenge_id": challenge_id,
+            "credential": {
+                "id": "AAAA",
+                "rawId": "AAAA",
+                "response": {
+                    "authenticatorData": "AAAA",
+                    "clientDataJSON": "AAAA",
+                    "signature": "AAAA",
+                    "userHandle": null
+                },
+                "type": "public-key",
+                "extensions": {}
+            }
+        }))
+        .unwrap();
+        match super::login_finish(axum::Extension(None), State(state.clone()), Json(request)).await {
+            Ok(response) => response
+                .into_response()
+                .status(),
+            Err(error) => error.into_response().status(),
+        }
+    }
+
+    async fn login_challenge(state: &Arc<AuthState>) -> String {
+        let Json(response) = login_start(
+            State(state.clone()),
+            Json(LoginStartRequest {
+                username: "first-admin".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        response.challenge_id
+    }
+
+    async fn registration_challenge(state: &Arc<AuthState>) -> String {
+        start(state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap()
+            .challenge_id
+    }
+
+    #[tokio::test]
+    async fn register_finish_refuses_a_challenge_older_than_five_minutes() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let expired = registration_challenge(&state).await;
+        let fresh = registration_challenge(&state).await;
+        age_challenge(&state, &expired, PAST_CHALLENGE_LIFETIME).await;
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let expired_status = finish_registration(&state, &expired).await;
+        let expired_log = logs.text();
+        let fresh_status = finish_registration(&state, &fresh).await;
+        let fresh_log = logs.text()[expired_log.len()..].to_string();
+
+        assert_eq!(expired_status, StatusCode::BAD_REQUEST);
+        assert!(expired_log.contains("Challenge not found or expired"), "{expired_log}");
+        assert!(!expired_log.contains("Failed to finish passkey registration"), "{expired_log}");
+        assert_eq!(fresh_status, StatusCode::BAD_REQUEST);
+        assert!(fresh_log.contains("Failed to finish passkey registration"), "a fresh challenge reaches verification");
+        assert!(!fresh_log.contains("Challenge not found or expired"), "{fresh_log}");
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty(),
+            "a presented challenge is removed, expired or not"
+        );
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_finish_refuses_a_challenge_older_than_five_minutes() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let expired = login_challenge(&state).await;
+        let fresh = login_challenge(&state).await;
+        age_challenge(&state, &expired, PAST_CHALLENGE_LIFETIME).await;
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let expired_status = finish_login(&state, &expired).await;
+        let expired_log = logs.text();
+        let fresh_status = finish_login(&state, &fresh).await;
+        let fresh_log = logs.text()[expired_log.len()..].to_string();
+
+        assert_eq!(expired_status, StatusCode::BAD_REQUEST);
+        assert!(expired_log.contains("Challenge not found or expired"), "{expired_log}");
+        assert!(!expired_log.contains("Failed to finish passkey authentication"), "{expired_log}");
+        assert_eq!(fresh_status, StatusCode::UNAUTHORIZED);
+        assert!(
+            fresh_log.contains("Failed to finish passkey authentication"),
+            "a fresh challenge reaches verification"
+        );
+        assert!(!fresh_log.contains("Challenge not found or expired"), "{fresh_log}");
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty(),
+            "a presented challenge is removed, expired or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_handlers_log_a_presented_challenge_id_escaped() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let forged = "forged\nERROR a fake log line";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let registration = finish_registration(&state, forged).await;
+        let login = finish_login(&state, forged).await;
+
+        let text = logs.text();
+        assert_eq!(registration, StatusCode::BAD_REQUEST);
+        assert_eq!(login, StatusCode::BAD_REQUEST);
+        assert!(!text.contains(forged), "{text}");
+        assert_eq!(
+            text.matches(r#""forged\nERROR a fake log line""#)
+                .count(),
+            4,
+            "{text}"
+        );
     }
 }

@@ -8,6 +8,10 @@ use crate::auth::setup_token::SetupToken;
 use crate::auth::storage::PasskeyStorage;
 use crate::config::types::SecretValue;
 
+/// How long a registration or authentication challenge can be finished. WebAuthn only passes its
+/// timeout to the browser as a hint, so the gateway enforces it.
+const CHALLENGE_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 /// State for the authentication system
 #[derive(Clone)]
 pub struct AuthState {
@@ -46,7 +50,6 @@ pub struct ChallengeState {
     pub username: String,
 
     /// Timestamp when this challenge was created
-    #[allow(dead_code)]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -101,17 +104,140 @@ impl AuthState {
             .is_empty())
     }
 
-    /// Clean up expired challenges (should be called periodically)
-    #[allow(dead_code)]
-    pub async fn cleanup_expired_challenges(&self) {
-        let mut challenges = self.challenges.write().await;
-        let now = chrono::Utc::now();
+    /// Removes the challenge `challenge_id` and returns it, unless it is older than five minutes.
+    /// A challenge is taken once, whether or not it has expired.
+    pub async fn take_challenge(
+        &self,
+        challenge_id: &str,
+    ) -> Option<ChallengeState> {
+        let challenge = self
+            .challenges
+            .write()
+            .await
+            .remove(challenge_id)?;
+        is_fresh(&challenge, chrono::Utc::now()).then_some(challenge)
+    }
 
-        challenges.retain(|_, state| {
-            // Keep challenges younger than 5 minutes
-            now.signed_duration_since(state.created_at)
-                .num_minutes()
-                < 5
-        });
+    /// Drops every challenge older than five minutes. The session cleanup task calls it on each
+    /// run, so challenges nobody finishes do not accumulate.
+    pub async fn cleanup_expired_challenges(&self) {
+        let now = chrono::Utc::now();
+        self.challenges
+            .write()
+            .await
+            .retain(|_, challenge| is_fresh(challenge, now));
+    }
+}
+
+fn is_fresh(
+    challenge: &ChallengeState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(challenge.created_at) < CHALLENGE_TTL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn auth_state(dir: &tempfile::TempDir) -> AuthState {
+        let path = |name: &str| {
+            dir.path()
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        AuthState::new(
+            "example.com".to_string(),
+            url::Url::parse("https://example.com").unwrap(),
+            path("users"),
+            path("avatars"),
+            30,
+            path("sessions"),
+            Arc::new(crate::terms::TermsManager::disabled()),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn insert_challenge(
+        state: &AuthState,
+        challenge_id: &str,
+        age: chrono::TimeDelta,
+    ) {
+        state
+            .challenges
+            .write()
+            .await
+            .insert(
+                challenge_id.to_string(),
+                ChallengeState {
+                    registration_state: None,
+                    authentication_state: None,
+                    username: "alice".to_string(),
+                    created_at: chrono::Utc::now() - age,
+                },
+            );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_challenge_is_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = auth_state(&dir).await;
+        insert_challenge(&state, "fresh", chrono::TimeDelta::minutes(4)).await;
+
+        let first = state
+            .take_challenge("fresh")
+            .await;
+        let second = state
+            .take_challenge("fresh")
+            .await;
+
+        assert_eq!(first.map(|challenge| challenge.username), Some("alice".to_string()));
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_challenge_older_than_five_minutes_is_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = auth_state(&dir).await;
+        insert_challenge(&state, "expired", chrono::TimeDelta::minutes(5) + chrono::TimeDelta::seconds(1)).await;
+
+        let taken = state
+            .take_challenge("expired")
+            .await;
+
+        assert!(taken.is_none());
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty(),
+            "an expired challenge is removed when it is presented"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_only_expired_challenges() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = auth_state(&dir).await;
+        insert_challenge(&state, "fresh", chrono::TimeDelta::minutes(4)).await;
+        insert_challenge(&state, "expired", chrono::TimeDelta::minutes(6)).await;
+
+        state
+            .cleanup_expired_challenges()
+            .await;
+
+        let mut remaining: Vec<String> = state
+            .challenges
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["fresh".to_string()]);
     }
 }
