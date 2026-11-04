@@ -1558,7 +1558,7 @@ person has opened the start page, a second opener of a start link already used, 
 using up a link, a callback whose path names another provider, a missing or wrong `iss` from a
 provider whose operator recorded its issuer, and content spoofing through reflected error text.
 A sibling subdomain cannot plant a binding cookie (`__Host-`), a managed agent, target or peer
-cannot set one through the gateway, and none is forwarded to them.
+cannot set one with `Set-Cookie`, and none is forwarded to them.
 
 They do not stop a person who opens and confirms a start link someone else sent them, nor
 someone who opens a forwarded start link before its intended person: the browser that confirms
@@ -1566,7 +1566,8 @@ the start page first is the one the grant is bound to, and the grant is stored u
 and user the link was made for. The start page names the agent, surface and provider so a
 person can notice a link that is not theirs. Single use of start and callback states is
 remembered per gateway process, for 15 minutes, so a restart or another replica behind the same
-callback URL does not know a state was used.
+callback URL does not know a state was used. Script served on the gateway's own origin, such as
+the dashboard, could still set a binding cookie, since `__Host-` only keeps other hosts out.
 
 ### State
 

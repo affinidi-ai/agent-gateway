@@ -23,7 +23,7 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
-  callbackUrlFor,
+  callbackUrlToSave,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderForm extends JwtFormFields {
@@ -42,6 +42,8 @@ interface CredentialProviderForm extends JwtFormFields {
   callback_host: string;
   /** The callback path the gateway stored for an existing provider; empty for a new one. */
   callback_path: string;
+  /** The callback URL stored for an existing provider; empty for a new one. */
+  callback_url: string;
   /** The stored resource, shown only through the Entra warning; never sent on save. */
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
@@ -68,6 +70,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   description: '',
   callback_host: '',
   callback_path: '',
+  callback_url: '',
   resource: '',
   issuer: '',
   ...EMPTY_JWT_FIELDS,
@@ -166,6 +169,7 @@ const EditCredentialProviderPage: React.FC = () => {
         description: data.description ?? '',
         callback_host: callbackHost,
         callback_path: data.callback_path ?? '',
+        callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         ...jwtFieldsOf(data),
@@ -260,7 +264,8 @@ const EditCredentialProviderPage: React.FC = () => {
         form.callback_host &&
         routingConfig
       ) {
-        body.callback_url = callbackUrlFor(
+        body.callback_url = callbackUrlToSave(
+          form.callback_url,
           form.callback_host,
           routingConfig.oauth_callback_route,
           form.provider_id,
@@ -630,7 +635,8 @@ const EditCredentialProviderPage: React.FC = () => {
                       <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
                         <i className="fas fa-info-circle me-2"></i>
                         <strong>Callback URL:</strong>{' '}
-                        {callbackUrlFor(
+                        {callbackUrlToSave(
+                          form.callback_url,
                           form.callback_host,
                           routingConfig.oauth_callback_route,
                           form.provider_id,
@@ -641,7 +647,8 @@ const EditCredentialProviderPage: React.FC = () => {
                           className="btn btn-xs ms-2"
                           style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
                           onClick={e => {
-                            const url = callbackUrlFor(
+                            const url = callbackUrlToSave(
+                              form.callback_url,
                               form.callback_host,
                               routingConfig.oauth_callback_route,
                               form.provider_id,
