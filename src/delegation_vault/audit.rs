@@ -1094,12 +1094,16 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             let (sub, principal) = if named_by_sub {
                 (Some(subject.clone()), None)
             } else {
+                let carried = claims
+                    .get(principal_claim.as_str())
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty() && *value == subject.as_str());
                 (
                     claims
                         .get("sub")
                         .and_then(|v| v.as_str())
                         .map(String::from),
-                    Some(subject.clone()),
+                    carried.map(String::from),
                 )
             };
             let iss = claims
@@ -1831,6 +1835,14 @@ mod tests {
             claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
         };
         assert_eq!(build_caller_context(&without_sub).sub, None);
+        let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "<none>".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
+        };
+        let caller = build_caller_context(&without_oid);
+        assert_eq!(caller.principal, None, "a token without the claim has no principal, not the placeholder");
+        assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
     }
 
     #[test]
