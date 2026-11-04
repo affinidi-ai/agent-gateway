@@ -1212,15 +1212,6 @@ pub fn create_identity_api_router(
                         ),
                     )
                     .route(
-                        "/v1/gateways/{id}/surfaces/{surface_id}/payment-manifest",
-                        peer_gate(
-                            get(crate::gateways::handlers::get_payment_manifest::<
-                                crate::gateways::FileSystemGatewayStore,
-                            >),
-                            Feature::GatewaysView,
-                        ),
-                    )
-                    .route(
                         "/v1/gateways/payment-logos/{sha256}",
                         gate(get(crate::gateways::handlers::get_payment_logo), Feature::GatewaysView),
                     )

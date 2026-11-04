@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::types::{Gateway, GatewayRole, GatewayType};
+use super::types::{ExposureMode, Gateway, GatewayRole, GatewayType};
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
 /// Filesystem-based implementation of GatewayStore with in-memory cache
@@ -75,28 +75,60 @@ impl FileSystemGatewayStore {
         Ok(migrated)
     }
 
-    /// Makes every remote peer in `payment_gateway_ids` (the gateways that
-    /// `agent_pay` policies name) a payment gateway reaching no local surface,
-    /// so the surfaces keep charging through it. Returns how many changed.
+    /// Makes a payment gateway of every remote peer that an `agent_pay` policy
+    /// of a surface it may serve names, so those surfaces keep charging through
+    /// it. Like turning a peer into a payment gateway through the API, a peer
+    /// that a surface routes to over `fabric://`, or that reaches local
+    /// surfaces, is left a peer with a warning. Returns how many changed.
     pub async fn migrate_payment_roles(
         &self,
-        payment_gateway_ids: &std::collections::HashSet<String>,
+        surfaces: &[crate::config::agent_surface::AgentSurface],
     ) -> Result<usize> {
         let mut migrated = 0usize;
         for mut gateway in self.list_all().await? {
-            if gateway.gateway_type == GatewayType::Remote
-                && gateway.role == GatewayRole::Peer
-                && payment_gateway_ids.contains(&gateway.id)
-            {
-                tracing::info!(gateway_id = %gateway.id, "Migrating a gateway that takes payments to a payment gateway");
-                gateway.role = GatewayRole::Payment;
-                gateway.exposure_mode = Some(super::types::ExposureMode::None);
-                gateway
-                    .exposed_channels
-                    .clear();
-                self.update(&gateway).await?;
-                migrated += 1;
+            if gateway.gateway_type != GatewayType::Remote || gateway.role != GatewayRole::Peer {
+                continue;
             }
+            let named = surfaces
+                .iter()
+                .filter(|surface| {
+                    crate::tenancy::can_reference(surface.tenant_id.as_deref(), gateway.tenant_id.as_deref())
+                })
+                .any(|surface| {
+                    surface
+                        .payment_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                });
+            if !named {
+                continue;
+            }
+            let fabric_routes = surfaces
+                .iter()
+                .filter(|surface| {
+                    surface
+                        .fabric_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                })
+                .count();
+            if fabric_routes > 0 || gateway.exposure_mode != Some(ExposureMode::None) {
+                tracing::warn!(
+                    gateway_id = %gateway.id,
+                    gateway_name = %gateway.name,
+                    fabric_routes,
+                    exposure_mode = ?gateway.exposure_mode,
+                    "Not migrating a gateway that takes payments to a payment gateway: it is a fabric:// route or \
+                     reaches local surfaces. Point those routes elsewhere and use it as a payment gateway, or the \
+                     surfaces charging through it cannot be saved"
+                );
+                continue;
+            }
+            tracing::info!(gateway_id = %gateway.id, "Migrating a gateway that takes payments to a payment gateway");
+            gateway.role = GatewayRole::Payment;
+            gateway
+                .exposed_channels
+                .clear();
+            self.update(&gateway).await?;
+            migrated += 1;
         }
         Ok(migrated)
     }
@@ -269,22 +301,51 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 mod tests {
     use super::*;
 
+    fn surface(
+        tenant_id: Option<&str>,
+        endpoint: &str,
+        payment_gateway_id: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": format!("{payment_gateway_id}-{endpoint}"),
+            "name": payment_gateway_id,
+            "tenant_id": tenant_id,
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/x", "protocol": "mcp"},
+            "target": {
+                "endpoint": endpoint,
+                "payment_policy": {
+                    "type": "agent_pay",
+                    "payment_gateway_id": payment_gateway_id,
+                    "payment_surface_id": "pay-1",
+                },
+            },
+        }))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn migrate_payment_roles_turns_only_named_remote_peers_into_payment_gateways() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
             .await
             .expect("store");
-        let remote = |id: &str| {
+        let remote = |id: &str, tenant_id: Option<&str>, exposure_mode: ExposureMode| {
             let mut gateway =
                 Gateway::new(id.into(), String::new(), format!("did:web:{id}.example"), GatewayType::Remote);
             gateway.id = id.into();
+            gateway.tenant_id = tenant_id.map(str::to_string);
+            gateway.exposure_mode = Some(exposure_mode);
             gateway
         };
-        let mut agent_pay = remote("agent-pay");
-        agent_pay.exposure_mode = Some(super::super::types::ExposureMode::List);
+        let mut agent_pay = remote("agent-pay", None, ExposureMode::None);
         agent_pay.exposed_channels = vec!["s1".to_string()];
-        for gateway in [agent_pay, remote("routing-peer")] {
+        for gateway in [
+            agent_pay,
+            remote("exposed", None, ExposureMode::List),
+            remote("routed", None, ExposureMode::None),
+            remote("tenant-b", Some("b"), ExposureMode::None),
+            remote("routing-peer", None, ExposureMode::None),
+        ] {
             store
                 .create(&gateway)
                 .await
@@ -298,12 +359,18 @@ mod tests {
             .find(|g| g.gateway_type == GatewayType::SelfGateway)
             .unwrap()
             .id;
-        let named: std::collections::HashSet<String> =
-            ["agent-pay".to_string(), self_id.clone(), "gone".to_string()].into();
+        let surfaces = [
+            surface(Some("a"), "https://up.example", "agent-pay"),
+            surface(None, "https://up.example", "exposed"),
+            surface(None, "https://up.example", "routed"),
+            surface(None, "fabric://routed/s", "gone"),
+            surface(Some("a"), "https://up.example", "tenant-b"),
+            surface(None, "https://up.example", &self_id),
+        ];
 
         assert_eq!(
             store
-                .migrate_payment_roles(&named)
+                .migrate_payment_roles(&surfaces)
                 .await
                 .unwrap(),
             1
@@ -325,17 +392,33 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(migrated.exposure_mode, Some(super::super::types::ExposureMode::None));
+        assert_eq!(migrated.exposure_mode, Some(ExposureMode::None));
         assert!(
             migrated
                 .exposed_channels
                 .is_empty()
         );
-        assert_eq!(role_of("routing-peer".into()).await, GatewayRole::Peer);
+        for (id, why) in [
+            ("exposed", "a peer reaching local surfaces stays a peer"),
+            ("routed", "a fabric:// route stays a peer"),
+            ("tenant-b", "another tenant's surface cannot name it"),
+            ("routing-peer", "no surface names it"),
+        ] {
+            assert_eq!(role_of(id.into()).await, GatewayRole::Peer, "{why}");
+        }
+        assert_eq!(
+            store
+                .get("exposed")
+                .await
+                .unwrap()
+                .unwrap()
+                .exposure_mode,
+            Some(ExposureMode::List)
+        );
         assert_eq!(role_of(self_id).await, GatewayRole::Peer);
         assert_eq!(
             store
-                .migrate_payment_roles(&named)
+                .migrate_payment_roles(&surfaces)
                 .await
                 .unwrap(),
             0,

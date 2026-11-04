@@ -458,18 +458,7 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Load and cache X402 Proxy configuration (wallet/network config for fabric auto-pay)
-    match crate::x402::proxy_config::load_x402_proxy_config(&bootstrap_config) {
-        Ok(x402_proxy_config) => {
-            crate::x402::proxy_config_cache::set_x402_proxy_config(x402_proxy_config).await;
-        }
-        Err(e) => {
-            warn!("Failed to load X402 Proxy configuration: {}", e);
-            warn!("Fabric auto-pay may not function - config not loaded");
-        }
-    }
-
-    // Initialize gateway facilitator service for DIDComm-based payment verification
+    // Initialize gateway facilitator service for DIDComm-based settlement of stored x402 payments
     x402::init_gateway_facilitator_service().await;
     info!("Gateway facilitator service initialized - ready for ATM infrastructure");
 
@@ -578,7 +567,12 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     };
-    payments_ledger::flush_global().await;
+    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, payments_ledger::flush_global())
+        .await
+        .is_err()
+    {
+        warn!("Timed out writing the payments ledger during shutdown");
+    }
 
     if let Some(store) = observability::global_system_metrics_store()
         && tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, store.flush())

@@ -94,8 +94,6 @@ pub(crate) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxySt
         policy_manager: None,
         gateway_policy_manager: None,
         didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
-        transaction_store: None,
-        mpp_transaction_store: None,
         trust_registry_listener_manager: None,
         source_auth_middleware: None,
         #[cfg(feature = "didwebvh")]

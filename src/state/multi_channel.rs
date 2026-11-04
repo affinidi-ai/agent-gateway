@@ -26,8 +26,6 @@ pub struct MultiSurfaceProxyState {
     pub policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
     pub gateway_policy_manager: Option<Arc<crate::policies::GatewayPolicyManager>>,
     pub didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
-    pub transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-    pub mpp_transaction_store: Option<Arc<crate::mpp::MppTransactionStore>>,
 
     /// Optional trust registry listener manager for agent trust OPA context building
     pub trust_registry_listener_manager: Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>,
@@ -139,10 +137,6 @@ impl MultiSurfaceProxyState {
                 .clone(),
             didauth_session_store: self
                 .didauth_session_store
-                .clone(),
-            transaction_store: self.transaction_store.clone(),
-            mpp_transaction_store: self
-                .mpp_transaction_store
                 .clone(),
             trust_registry_listener_manager: self
                 .trust_registry_listener_manager

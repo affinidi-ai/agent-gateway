@@ -24,7 +24,7 @@ The bootstrap TOML is the entry point. Everything else is named from it.
 | `limits.json` | Resource count ceilings per record kind | Startup |
 | `saml.json` | SAML identity provider, when `auth_mode = "saml"` | Startup |
 | `x402.json` | x402 payment networks, assets, and facilitator settings | Startup |
-| `x402-proxy.json` | Networks and wallets for the x402 proxy; read, but not used | Startup |
+| `x402-proxy.json` | Networks and wallets for the x402 proxy, which is gone | Not read |
 | `test-endpoints.json` | Payment requirements for the x402 test endpoints, which are not served | Not read |
 | `agent_surface_templates/` | Surface templates seeded into the template store | Startup |
 
@@ -49,7 +49,6 @@ rbac = "rbac.json"
 limits = "limits.json"
 saml = "saml.json"
 x402 = "x402.json"
-x402_proxy = "x402-proxy.json"
 agent_surface_templates_dir = "agent_surface_templates"
 ```
 
@@ -61,7 +60,6 @@ flowchart LR
     T --> L[limits.json]
     T --> S[saml.json]
     T --> X[x402.json]
-    T --> XP[x402-proxy.json]
     T --> TP["agent_surface_templates/"]
     T -->|"[storage_paths]"| ST["_storage/"]
 ```
@@ -194,7 +192,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
 | `transit_token_max_lifetime_secs` | The longest lifetime, in seconds, a surface may set for its transit tokens in `transit.transit_token_lifetime_secs`, and the longest the Access Point issues, from 30 to 900; 300 when unset. Read once, when the gateway starts: anything but a whole number from 30 to 900 stops it from starting, and a change takes a restart, as a reload keeps the startup value and logs a warning while the file differs from it. A stored surface lifetime above it gets tokens living this long, with a warning; it never stops the gateway. A Transit Point does not read it, so instances with different values accept each other's tokens. The shortest lifetime, 30, is fixed. Upgrade every instance that shares surface storage before raising it above 300 or setting any surface lifetime: an earlier release refuses tokens living longer than 300 seconds and drops a stored surface lifetime when it saves the surface. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime). |
 | `payment_gate` | `breaker_failures` (default `5`, 1 to 1000) consecutive failed calls to one agent-pay gateway open its circuit breaker for `breaker_open_secs` (default `30`, 1 to 3600); the gate then answers `503` at once. Read at startup. Opening and closing are logged and counted (see [`OBSERVABILITY.md`](OBSERVABILITY.md#settlement-breaker-and-ledger-metrics)). |
-| `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
+| `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits (default empty, so the TCP peer is the client). Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 payments already in the transaction store still settle. |
 | `cors` | Permitted dashboard origins |
@@ -378,12 +376,10 @@ identity provider sends later, so a missing or changed role claim cannot remove 
 guaranteed administrator. A sign-in that would have changed it logs a warning instead
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
 
-## `x402.json` and `x402-proxy.json`
+## `x402.json`
 
 `x402.json` configures payment networks, assets, and facilitator behaviour for the x402
-protocol. `x402-proxy.json` configures the `networks` and `wallets` the x402 proxy used,
-each network carrying a CAIP-2 `id`, `chain_type`, and `rpc_endpoint`; it is still read at
-startup, but nothing uses it.
+protocol.
 
 Two `x402.json` sections control x402 storage. If `x402.json` fails to parse, the gateway
 logs a warning and starts neither.
@@ -403,7 +399,9 @@ through local x402; see
 
 `test-endpoints.json` (`[config_files].test_endpoints`) fed the unauthenticated x402 test
 endpoints. Those endpoints are not served, whatever `facilitator_mode.enable_test_endpoints`
-says, so the file is not read.
+says, so the file is not read. Nor is `x402-proxy.json` (`[config_files].x402_proxy`), which
+held the networks and wallets of the removed MPP auto-pay; a wallet's `private_key` in an old
+copy of the file is never loaded, and the file can be deleted.
 
 A network entry pointing at mainnet moves real value. The demo scripts and a worked walkthrough are in
 [`scripts/x402/README.md`](../scripts/x402/README.md); protocol behaviour is in
@@ -540,7 +538,8 @@ neither lists them nor acts on them.
   [`agent_pay_flag.rs`](../src/gateways/agent_pay_flag.rs)). While it is off,
   `POST /v1/payment-gateways/connect-via-oob` and `POST /v1/gateways/{id}/payment-role` answer
   `403`; payment gateways already connected keep taking payments and every read route still
-  works. The dashboard hides its agent-pay UI while it is off. A user's own settings cannot
+  works. The dashboard hides its agent-pay UI while it is off, except the Payments page, which
+  needs only `payments.view`. A user's own settings cannot
   override this flag or `mediator_federation`
   ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
@@ -561,8 +560,13 @@ neither lists them nor acts on them.
 - Payment gateways count toward their own appliance limit, `connections.paymentgateways` in
   `limits.json`, and peers toward `connections.gateways`; both count toward the `connections`
   total. Connecting and turning a peer into a payment gateway are refused with `403` at the limit.
-- At startup every peer that an `agent_pay` policy names becomes a payment gateway with exposure
-  `none`, so surfaces that already charge keep charging and agent-pay reaches no local surface.
+- At startup every peer that an `agent_pay` policy of a surface it may serve names (a surface of
+  the peer's tenant, or any surface for an appliance-wide peer) becomes a payment gateway, so
+  surfaces that already charge keep charging. It leaves a peer that a surface routes to over
+  `fabric://` (which `payment-role` also refuses), or whose exposure is not already `none` (so it
+  never cuts a peer off from local surfaces), a peer and logs a warning naming it; those surfaces keep charging through it but cannot be saved until the routes are
+  pointed elsewhere, its exposure is `none` and it is turned into a payment gateway. A migrated
+  gateway answers `404` on `/v1/gateways/*`, and there is no way back to a peer.
 
 ### Taking the payment
 
@@ -705,13 +709,14 @@ The ledger keeps its newest 50,000 rows in memory, which is what `GET /api/admin
 per UTC hour, `ledger-YYYY-MM-DDTHH.jsonl` under `_storage/payments_ledger/`, owner-only. Recording
 a row only appends it in memory; a background worker writes the rows recorded since its last pass
 every second, in one write and one sync per segment, and the gateway writes what is left if the
-server returns. On `SIGTERM` or `SIGINT` it writes what is left (waiting at most 5 seconds) and
-ends with status 143 or 130; a process stopped by `SIGKILL`, or that crashes, loses the rows
+server returns. On `SIGTERM` or `SIGINT` the gateway's shutdown writes what is left (waiting at
+most 10 seconds) before it exports the last metrics and exits; a process stopped by `SIGKILL`, or that crashes, loses the rows
 recorded in the last second. `GET /api/admin/payments/{id}` reads a row that
 has left the window from the one segment its time-ordered id names. A segment is deleted when its
 whole hour is older than `payment_ledger.retention_days` (seven days unless set in
 `gateway.json`), and the oldest segments are deleted early while the ledger holds more than
-`payment_ledger.max_size_mb` (2 GiB unless set); the list still serves only the in-memory window,
+`payment_ledger.max_size_mb` (2 GiB unless set), but never one that holds a payment still awaiting
+capture or void, which stays in memory and on disk until it is settled; the list still serves only the in-memory window,
 so a longer retention keeps older rows readable by id and on disk, not in the list; a segment stops taking rows at 256 MiB, and rows past that, or recorded
 while more than 20,000 rows wait for the disk, are served from memory only until restart.
 
@@ -754,8 +759,11 @@ is handled as before. Neither header is relayed to the caller. With held funds:
    intent.
 5. A gate step cancelled after agent-pay was asked and before its answer was recorded leaves an
    `unconfirmed` row under the request's idempotency key, which the reconciler asks agent-pay about
-   and voids when funds are held. A shutdown loses only unsent decisions, which the reconciler
-   finishes from the rows after the restart.
+   and voids when funds are held. At most 1,000 such rows without a held payment await the
+   reconciler at once; past that a cancelled request is not recorded, since its credential was
+   never committed and the caller can retry it, and funds held for it lapse at their capture
+   deadline. A shutdown loses only unsent decisions, which the reconciler finishes from the rows
+   after the restart.
 
 **What counts as delivered.** The response status must be `2xx`. On MCP, A2A and AP2 the body is
 then read for JSON-RPC errors: a message with a non-null `error` is not delivered, even beside a
@@ -768,10 +776,12 @@ is judged by its status alone. Other protocols are judged by status alone.
 MCP or A2A Target, chunked JSON) is returned at once, with the authorization receipt in its
 `PAYMENT-RESPONSE` / `Payment-Receipt` header and in each JSON-RPC result's `_meta` / `metadata`
 (`org.paymentauth/receipt`), since the headers and earlier events are sent before the capture.
-The gateway watches the stream: it captures when the stream completes without a JSON-RPC error
-event, and voids when an event carries an error, the upstream stream fails, or the client
-disconnects before it completes. An event stream then ends with one more event, after the capture
-answered:
+The gateway watches the stream: it captures as soon as it passes on an event carrying a JSON-RPC
+result (for a protocol without JSON-RPC, any body bytes), or when the stream completes without a
+JSON-RPC error event, so a client that reads a result and disconnects still pays. It voids when an
+event carries an error before any result, or when the upstream stream fails or the client
+disconnects before a result was passed on. An event stream then ends with one more event, after
+the capture answered:
 
 ```
 event: payment-receipt
@@ -785,13 +795,16 @@ no place for the capture receipt; the caller reads it from the poll endpoint bel
 The answer (`payment-settle-response`) is `{"authorization_id","status","receipt"?,"reason"?}`,
 `status` one of `captured`, `voided`, `failed`, `unconfirmed`, `expired` or `unknown`.
 
-Every 30 seconds the Active node reconciles open rows, four at a time: an `authorized` row with
+Every 30 seconds the Active node reconciles open rows, four at a time, rows holding funds first by
+capture deadline: an `authorized` row with
 an intent is sent it again; one without an intent is left alone while this node still has its
 request in flight (a long Target call or stream) up to its capture deadline, and is otherwise
 voided once untouched for twice `timeout_ms` (a request lost to a restart);
 an `unconfirmed` row is asked about with `payment-settlement-status`
 (`{"authorization_id"}`, or `{"idempotency_key"}` for a payment the gate could not confirm) and
-settled to `paid`, `voided`, `capture_failed` or `rejected`. An unconfirmed row whose request was
+settled to `paid`, `voided`, `capture_failed` or `rejected`; an idempotency key agent-pay answers
+`unknown` without a reason, once agent-pay's replay window has passed, paid for nothing, and its
+row becomes `rejected` with reason `no_payment_taken`. An unconfirmed row whose request was
 retried and settled by a later row is marked `superseded_by` that row. After the capture deadline
 (24 hours for a row without one) a row that still cannot be settled is marked
 `reconcile_failed`, and the `payment.reconcile_failed` integration event is raised.
@@ -900,7 +913,12 @@ was deleted are dropped at startup, and their cases are `404`.
   over HTTP and over the fabric, with `503 {"error": "payment_unavailable"}`, and the
   dashboard reports `payment_status: "unsupported_legacy"`. Saving it, on the surface or
   on a variant, is refused with `400`, code `local_payment_unsupported`, until the policy
-  is replaced with `agent_pay`. A disabled one charges nothing and is left alone.
+  is replaced with `agent_pay`. A disabled one charges nothing and is left alone. An
+  `agent_pay` policy names a payment gateway, and connecting one needs the
+  `agent_pay_delegation` feature flag (Settings › System › Feature Flags, see
+  [Payment gateways](#payment-gateways)), which the startup warning for such a surface
+  names. The dashboard's Payments page needs only `payments.view`, so the legacy x402/MPP
+  payment history stays readable with the flag off.
 - `target.mpp_auto_pay`, `target.mpp_auto_pay_max_amount` and
   `transit.points[*].payment_policy` are refused on save with the same code. A stored
   `mpp_auto_pay` is ignored: a `402` from a `fabric://` Target is passed back to the caller.

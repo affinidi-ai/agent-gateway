@@ -4449,7 +4449,7 @@ fn payment_logo_response(logo: Option<Vec<u8>>) -> axum::response::Response {
     }
 }
 
-/// `GET /v1/gateways/{id}/surfaces/{surface_id}/payment-manifest`: the Payment
+/// `GET /v1/payment-gateways/{id}/surfaces/{surface_id}/payment-manifest`: the Payment
 /// Manifest a connected agent-pay gateway publishes for one of its payment
 /// surfaces. `surface_id` may carry a `$alias`. A payable manifest is reused
 /// for a minute; `?force_refresh=true` skips that cache, but a manifest is

@@ -23,7 +23,6 @@ Each of these is named from the `[config_files]` table in `config.toml`.
 | [`limits.example.json`](limits.example.json) | `limits.json` | Ceilings on how many records of each kind may exist. |
 | [`saml.example.json`](saml.example.json) | `saml.json` | SAML identity provider. Read only when `auth_mode = "saml"`. |
 | [`x402.example.json`](x402.example.json) | `x402.json` | x402 networks, assets, and settlement storage. Only used to settle payments verified before local x402 payment was withdrawn; a surface charges through agent-pay (see [Surface payment policy](../../docs/CONFIGURATION_REFERENCE.md#surface-payment-policy)). |
-| [`x402-proxy.example.json`](x402-proxy.example.json) | `x402-proxy.json` | Networks and wallets for the x402 proxy. Still read at startup, but nothing uses it since MPP auto-pay was removed. |
 | [`agent_surface_templates/`](agent_surface_templates/) | the directory named by `agent_surface_templates_dir` | Surface templates seeded into the template store at boot. Has its own [README](agent_surface_templates/README.md). |
 
 ## Secrets

@@ -2715,7 +2715,7 @@ pub struct ConfigFilePaths {
     #[serde(default = "default_payment_policy_path")]
     pub x402: String,
 
-    /// X402Proxy configuration file path - defines wallets and networks for MCP proxy payments
+    /// Path of `x402-proxy.json`, the removed MPP auto-pay's wallets; not read.
     #[serde(default = "default_x402_proxy_config_path", alias = "mcpx402")]
     pub x402_proxy: String,
 
@@ -3545,72 +3545,6 @@ fn default_test_endpoints_config_path() -> String {
 
 fn default_agent_surface_templates_dir() -> String {
     "agent_surface_templates".to_string()
-}
-
-/// EVM test endpoint configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvmTestEndpointConfig {
-    /// CAIP-2 network identifier (e.g., "eip155:84532" for Base Sepolia)
-    pub network: String,
-
-    /// RPC endpoint URL
-    pub rpc_endpoint: String,
-
-    /// Token contract address
-    pub token_address: String,
-
-    /// Recipient address for test payments
-    pub recipient: String,
-
-    /// Amount in token's smallest unit (e.g., "1000000" for 1 USDC with 6 decimals)
-    pub amount: String,
-
-    /// Payment method (e.g., "eip3009", "permit2")
-    pub payment_method: String,
-
-    /// Token EIP-712 domain name (e.g., "USDC"), issued as `extra.name`; required for EIP-3009
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_name: Option<String>,
-
-    /// Token EIP-712 domain version (e.g., "2"), issued as `extra.version`; required for EIP-3009
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_version: Option<String>,
-}
-
-/// Solana test endpoint configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SolanaTestEndpointConfig {
-    /// CAIP-2 network identifier (e.g., "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" for devnet)
-    pub network: String,
-
-    /// RPC endpoint URL
-    pub rpc_endpoint: String,
-
-    /// Token mint address
-    pub token_address: String,
-
-    /// Recipient address for test payments
-    pub recipient: String,
-
-    /// Amount in token's smallest unit (e.g., "1000000" for 1 USDC with 6 decimals)
-    pub amount: String,
-}
-
-/// Test endpoints configuration
-/// Provides deployment-specific values for E2E payment testing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestEndpointsConfig {
-    /// EVM test endpoint (Base Sepolia by default)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evm: Option<EvmTestEndpointConfig>,
-
-    /// Solana devnet test endpoint
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solana_devnet: Option<SolanaTestEndpointConfig>,
-
-    /// Solana mainnet test endpoint
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solana_mainnet: Option<SolanaTestEndpointConfig>,
 }
 
 /// How to inject a DID identity into outgoing requests

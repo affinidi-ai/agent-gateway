@@ -113,6 +113,10 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
 
+This gateway verifies no x402 or MPP payment itself, so `x402.verification.failed` and the three
+`mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
+The other x402 events come from settling and pruning x402 payments recorded before.
+
 A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or

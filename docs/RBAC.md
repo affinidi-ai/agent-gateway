@@ -123,13 +123,15 @@ never reaches a payment gateway and `payment_gateways.*` never reaches a peer:
 
 | Routes | Permissions |
 | --- | --- |
-| `/v1/gateways`, `/v1/gateways/{id}/…`, `/v1/gateways/{gateway_id}/connection-points` | `gateways.view` / `gateways.edit` / `gateways.delete` |
+| `/v1/gateways`, `/v1/gateways/{id}/…`, `/v1/gateways/{gateway_id}/connection-points`, `/v1/connection-points/…` | `gateways.view` / `gateways.edit` / `gateways.delete` |
 | `/v1/payment-gateways`, `/v1/payment-gateways/connect-via-oob`, `/v1/payment-gateways/{id}` (get, put, delete), `/v1/payment-gateways/{id}/ping`, `…/surfaces`, `…/surfaces/{surface_id}/payment-manifest`, `…/info` | `payment_gateways.view` / `payment_gateways.edit` / `payment_gateways.delete` |
 | `GET /v1/gateways/payment-providers` (the Surface Builder's payment gateway list) | `payment_gateways.view` |
 | `POST /v1/gateways/{id}/payment-role` (turn a peer into a payment gateway) | `gateways.edit` and `payment_gateways.edit` |
 
 A route answers `404` for a gateway of the other role
-([`role_scope.rs`](../src/gateways/role_scope.rs)), after the permission check, so a caller
+([`role_scope.rs`](../src/gateways/role_scope.rs)), and `/v1/connection-points/…` answers `404`
+for, and never lists, a payment gateway's connection points, so they can't be deleted, disabled or
+reconnected there; both checks run after the permission check, so a caller
 without the permission learns nothing about which ids exist. The built-in defaults grant
 `payment_gateways.view` to `user` and `payment_gateways.edit` / `payment_gateways.delete` to
 `administrator`. A token's resource scope treats both as `gateways` resources.

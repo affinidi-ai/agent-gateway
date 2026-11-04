@@ -363,9 +363,40 @@ pub fn unsettled_payments(
     store: &DelegatedPaymentStore,
     payment_gateway_id: &str,
 ) -> usize {
-    store
-        .rows_where(|row| row.payment_gateway_id == payment_gateway_id && store::awaits_settlement(row))
-        .len()
+    store.count_where(|row| row.payment_gateway_id == payment_gateway_id && store::awaits_settlement(row))
+}
+
+/// The most rows of cancelled requests, whose payment agent-pay may or may not
+/// have taken, awaiting the reconciler at once. Past it, a cancelled request is
+/// not recorded: its credential was never committed, so the caller can retry it
+/// within agent-pay's replay window, and funds agent-pay held for it lapse at
+/// their capture deadline.
+const MAX_OPEN_CANCELLED: usize = 1_000;
+
+/// Whether `store` has room for one more row of a cancelled request.
+fn admits_cancelled(store: &DelegatedPaymentStore) -> bool {
+    store.count_where(|row| {
+        row.outcome == LedgerOutcome::Unconfirmed && row.authorization_id.is_none() && store::awaits_settlement(row)
+    }) < MAX_OPEN_CANCELLED
+}
+
+/// Records the unconfirmed row of a request cancelled while agent-pay was
+/// asked, unless [`MAX_OPEN_CANCELLED`] such rows already await the reconciler.
+pub async fn record_cancelled(
+    row: PaymentLedgerRow,
+    tenant_id: Option<String>,
+) {
+    let Some(store) = global() else {
+        return;
+    };
+    if !admits_cancelled(&store) {
+        warn!(
+            surface_id = %row.surface_id,
+            "[payments-ledger] Not recording a cancelled paid request: {MAX_OPEN_CANCELLED} already await the reconciler"
+        );
+        return;
+    }
+    record(row, tenant_id).await;
 }
 
 /// Records a row in the global store, when it is initialised. A row that
@@ -395,90 +426,6 @@ pub async fn flush_global() {
     if let Some(store) = global() {
         store.flush().await;
     }
-}
-
-/// The most a termination signal waits for the ledger to reach the disk.
-const TERMINATION_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// A signal that ends the process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Termination {
-    Interrupt,
-    Terminate,
-}
-
-impl Termination {
-    /// The status a shell reports for a process the signal ended: 128 plus the
-    /// signal number.
-    fn exit_status(self) -> i32 {
-        match self {
-            Self::Interrupt => 130,
-            Self::Terminate => 143,
-        }
-    }
-}
-
-/// Waits for the first termination signal.
-#[cfg(unix)]
-fn termination_signal() -> Option<impl std::future::Future<Output = Termination>> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt()).ok()?;
-    let mut terminate = signal(SignalKind::terminate()).ok()?;
-    Some(async move {
-        tokio::select! {
-            _ = interrupt.recv() => Termination::Interrupt,
-            _ = terminate.recv() => Termination::Terminate,
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn termination_signal() -> Option<impl std::future::Future<Output = Termination>> {
-    Some(async {
-        let _ = tokio::signal::ctrl_c().await;
-        Termination::Interrupt
-    })
-}
-
-/// Waits for `signal`, gives `store` up to `limit` to write what it still holds,
-/// then hands the signal's conventional exit status to `exit`.
-async fn flush_when_terminated(
-    signal: impl std::future::Future<Output = Termination>,
-    store: Option<Arc<DelegatedPaymentStore>>,
-    limit: std::time::Duration,
-    exit: impl FnOnce(i32),
-) {
-    let termination = signal.await;
-    if let Some(store) = store
-        && tokio::time::timeout(limit, store.flush())
-            .await
-            .is_err()
-    {
-        warn!("[payments-ledger] The ledger did not reach the disk within {limit:?} of {termination:?}");
-    }
-    exit(termination.exit_status());
-}
-
-/// Writes what the global store still holds when the process is interrupted or
-/// terminated, then ends it with the status that signal would have given it.
-/// Taking over those signals from the operating system's default is why the
-/// process must end here itself. Only the real binary listens: a test process
-/// would otherwise stop obeying them.
-#[cfg_attr(test, allow(dead_code, reason = "only the real binary listens for termination signals"))]
-pub fn spawn_termination_flush() {
-    static SPAWNED: std::sync::Once = std::sync::Once::new();
-    SPAWNED.call_once(|| {
-        let Some(signal) = termination_signal() else {
-            warn!(
-                "[payments-ledger] Could not listen for termination signals; the ledger is flushed on a clean exit only"
-            );
-            return;
-        };
-        tokio::spawn(flush_when_terminated(signal, global(), TERMINATION_FLUSH_TIMEOUT, |status| {
-            std::process::exit(status)
-        }));
-    });
 }
 
 /// Rebuilds the global store's window from disk when this node becomes Active.
@@ -606,70 +553,35 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_termination_signal_flushes_the_ledger_and_exits_with_its_conventional_status() {
-        for (termination, status) in [(Termination::Interrupt, 130), (Termination::Terminate, 143)] {
-            let (store, dir) = store().await;
-            let recorded = row("s-1", LedgerOutcome::Paid, Duration::zero());
-            store
-                .record(recorded.clone(), None)
-                .unwrap();
-            let exited = std::sync::Mutex::new(None);
-
-            flush_when_terminated(
-                std::future::ready(termination),
-                Some(Arc::new(store)),
-                std::time::Duration::from_secs(5),
-                |status| *exited.lock().unwrap() = Some(status),
-            )
-            .await;
-
-            assert_eq!(*exited.lock().unwrap(), Some(status), "{termination:?}");
-            let reopened = DelegatedPaymentStore::new(dir.clone())
-                .await
-                .unwrap();
-            assert_eq!(
-                reopened
-                    .get(&recorded.id)
-                    .await,
-                Some((recorded, None)),
-                "{termination:?}: written to disk"
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_termination_signal_without_a_ledger_still_exits_and_waits_for_the_signal() {
-        let (signal, arrived) = tokio::sync::oneshot::channel();
-        let exited = Arc::new(std::sync::Mutex::new(None));
-        let task = tokio::spawn({
-            let exited = exited.clone();
-            flush_when_terminated(
-                async move {
-                    arrived
-                        .await
-                        .unwrap_or(Termination::Terminate)
-                },
-                None,
-                std::time::Duration::from_secs(5),
-                move |status| *exited.lock().unwrap() = Some(status),
-            )
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(*exited.lock().unwrap(), None, "nothing happens before a signal");
-        signal
-            .send(Termination::Interrupt)
+    async fn cancelled_requests_stop_being_recorded_once_too_many_await_the_reconciler() {
+        let (store, dir) = store().await;
+        let mut held = row("s-1", LedgerOutcome::Unconfirmed, Duration::zero());
+        held.authorization_id = Some("auth-1".to_string());
+        store
+            .record(held, None)
             .unwrap();
-        task.await.unwrap();
-        assert_eq!(*exited.lock().unwrap(), Some(130));
-    }
+        store
+            .record(row("s-1", LedgerOutcome::Paid, Duration::zero()), None)
+            .unwrap();
+        for _ in 1..MAX_OPEN_CANCELLED {
+            store
+                .record(row("s-1", LedgerOutcome::Unconfirmed, Duration::zero()), None)
+                .unwrap();
+        }
+        assert!(admits_cancelled(&store), "held and settled rows do not count");
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_signal_listener_registers_for_interrupt_and_terminate() {
-        assert!(termination_signal().is_some());
-        assert_eq!(Termination::Interrupt.exit_status(), 130);
-        assert_eq!(Termination::Terminate.exit_status(), 143);
+        let last = row("s-1", LedgerOutcome::Unconfirmed, Duration::zero());
+        store
+            .record(last.clone(), None)
+            .unwrap();
+        assert!(!admits_cancelled(&store));
+
+        store
+            .update(&last.id, |row| row.outcome = LedgerOutcome::Rejected)
+            .await
+            .unwrap();
+        assert!(admits_cancelled(&store), "a closed row makes room");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

@@ -594,9 +594,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   path="/payments"
                   element={
                     <ProtectedRoute permission="payments.view">
-                      <AgentPayRoute fallback={ROUTES.DASHBOARD}>
-                        <PaymentsPage />
-                      </AgentPayRoute>
+                      <PaymentsPage />
                     </ProtectedRoute>
                   }
                 />

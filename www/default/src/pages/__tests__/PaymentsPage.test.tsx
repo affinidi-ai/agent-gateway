@@ -17,6 +17,12 @@ jest.mock('../../api', () => ({
   },
 }));
 
+let mockFlags: Record<string, boolean> = { agent_pay_delegation: true };
+
+jest.mock('../../context/AppContext', () => ({
+  useApp: () => ({ state: { settings: { feature_flags: mockFlags } } }),
+}));
+
 const mockFetch = apiClient.fetch as jest.Mock;
 const mockList = apiClient.listPayments as jest.Mock;
 const mockGet = apiClient.getPayment as jest.Mock;
@@ -82,6 +88,7 @@ const renderPage = (path = '/payments') =>
 beforeEach(() => {
   jest.resetAllMocks();
   mockGateways.mockResolvedValue([]);
+  mockFlags = { agent_pay_delegation: true };
 });
 
 describe('PaymentsPage', () => {
@@ -718,6 +725,42 @@ describe('PaymentsPage — legacy rows', () => {
 
     expect(await screen.findByTestId('payments-legacy-panel')).toBeInTheDocument();
     expect(screen.getByTestId('payments-row-p-1')).toBeInTheDocument();
+  });
+
+  it('shows the legacy rows and the payments while agent-pay is off', async () => {
+    mockFlags = {};
+    mockApi({ x402: [settlement('tx-1', '10000', 1_700_000_100)] });
+    renderPage();
+
+    const panel = await screen.findByTestId('payments-legacy-panel');
+    expect(within(panel).getByTestId('payments-legacy-row-x402-tx-1')).toHaveTextContent('$0.01');
+    expect(screen.getByTestId('payments-row-p-1')).toBeInTheDocument();
+  });
+});
+
+describe('PaymentsPage — agent-pay flag', () => {
+  const emptyLedger = () => {
+    mockApi();
+    mockList.mockResolvedValue({ payments: [], total: 0 });
+  };
+
+  it('points an empty ledger at the Payment element while agent-pay is on', async () => {
+    emptyLedger();
+    renderPage();
+
+    expect(await screen.findByText('No payments yet')).toBeInTheDocument();
+    expect(screen.getByText(/surface with a Payment element/)).toBeInTheDocument();
+    expect(screen.queryByText(/agent_pay_delegation/)).not.toBeInTheDocument();
+  });
+
+  it('names the flag instead of the Payment element while agent-pay is off', async () => {
+    mockFlags = {};
+    emptyLedger();
+    renderPage();
+
+    expect(await screen.findByText('No payments yet')).toBeInTheDocument();
+    expect(screen.getByText(/needs the agent_pay_delegation feature flag/)).toBeInTheDocument();
+    expect(screen.queryByText(/surface with a Payment element/)).not.toBeInTheDocument();
   });
 });
 

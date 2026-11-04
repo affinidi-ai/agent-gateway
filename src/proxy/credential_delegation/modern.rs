@@ -509,7 +509,7 @@ impl ModernDelegationContext<'_> {
             ContinuationRoute::AccessPoint
             | ContinuationRoute::Fabric { .. }
             | ContinuationRoute::FabricSend { .. } => {
-                crate::proxy::handler::surface_payment::request_without_local_payment(self.surface, request)
+                crate::proxy::handler::surface_payment::request_without_payment_credentials(self.surface, request)
             }
             _ => request.clone(),
         };

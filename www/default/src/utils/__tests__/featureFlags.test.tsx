@@ -39,15 +39,6 @@ function renderRoute(path = '/payment-gateways/gw-1') {
           }
         />
         <Route path="/connections" element={<div data-testid="connections" />} />
-        <Route
-          path="/payments"
-          element={
-            <AgentPayRoute fallback="/">
-              <div data-testid="payments-page" />
-            </AgentPayRoute>
-          }
-        />
-        <Route path="/" element={<div data-testid="dashboard" />} />
       </Routes>
     </MemoryRouter>
   );
@@ -65,19 +56,6 @@ describe('AgentPayRoute', () => {
     mockSettings = { feature_flags: { agent_pay_delegation: true } };
     renderRoute();
     expect(screen.getByTestId('flagged-page')).toBeInTheDocument();
-  });
-
-  it('sends the Payments page to its own fallback while agent-pay is off', () => {
-    mockSettings = { feature_flags: {} };
-    renderRoute('/payments');
-    expect(screen.queryByTestId('payments-page')).not.toBeInTheDocument();
-    expect(screen.getByTestId('dashboard')).toBeInTheDocument();
-  });
-
-  it('shows the Payments page while agent-pay is on', () => {
-    mockSettings = { feature_flags: { agent_pay_delegation: true } };
-    renderRoute('/payments');
-    expect(screen.getByTestId('payments-page')).toBeInTheDocument();
   });
 
   it('redirects to Connections while agent-pay is off', () => {

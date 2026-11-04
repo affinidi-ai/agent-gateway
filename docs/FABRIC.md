@@ -144,16 +144,17 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
 directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-verify and settle messages always send directly. Delegated `agent_pay` payment
+settle messages for stored payments always send directly. Delegated `agent_pay` payment
 requests are ordinary fabric forwards and are routed like any other send.
 
 The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
 answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
 `{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
 (`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
-whatever `facilitator_mode.facilitator_via_fabric` says. Verify and settle responses to this
-gateway's own requests are still handled, and the settlement worker still drains x402
-payments already in its transaction store.
+whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify request, so
+an `x402/verify-response` is dropped without touching the transaction store. Settle responses to
+its own requests are still handled, and the settlement worker still drains x402 payments already
+in its transaction store.
 
 ## Peer issuer DIDs
 
@@ -270,7 +271,9 @@ Connection Point (OOB responder or acceptor) admits only its peer: the account i
 with anonymous receipt off, and its access list holds exactly the peer's DID. That DID is the secure
 DID recorded on the Connection Point at pairing (`acceptor_secure_did` or `inviter_secure_did`),
 else the DID on its remote gateway record, because a pairing's gateway record can still carry the
-peer's temporary DID when the listener starts; with neither, the account admits no one. Every other
+peer's temporary DID when the listener starts; with neither, the account stays open to every
+sender and a warning names the Connection Point, so a pairing made before peer DIDs were recorded
+keeps working. Every other
 Connection Point (an invitation endpoint, a pairing's temporary listener, a legacy one) stays open
 to every sender, since it does not serve a single known peer. The mediator's own replies are not
 subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
@@ -475,8 +478,7 @@ unless the sending route's `fabric://` Target pins one of its variants:
 `fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
 `active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
 `variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
-variant. The `ForwardRequest` an Access Point resends after MPP auto-pay pays a `402` carries the
-same alias. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+variant. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
 one variant of the sending surface to a particular peer variant, override that variant's Target
 with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
 there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its

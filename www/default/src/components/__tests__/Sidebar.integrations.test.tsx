@@ -65,7 +65,7 @@ test('shows Connections to a payment-gateways-only caller only while agent-pay i
   expect(screen.queryByTestId('nav-connections')).not.toBeInTheDocument();
 });
 
-test('shows Payments only while agent-pay is on', () => {
+test('shows Payments on payments.view whether agent-pay is on or off', () => {
   mockPermissions = { 'payments.view': true };
 
   mockFlags = { agent_pay_delegation: true };
@@ -79,5 +79,14 @@ test('shows Payments only while agent-pay is on', () => {
 
   mockFlags = {};
   renderSidebar();
+  expect(screen.getByTestId('nav-payments')).toHaveAttribute('href', '/payments');
+});
+
+test('hides Payments from callers without payments.view, even with agent-pay on', () => {
+  mockPermissions = { 'payment_gateways.view': true };
+  mockFlags = { agent_pay_delegation: true };
+
+  renderSidebar();
+
   expect(screen.queryByTestId('nav-payments')).not.toBeInTheDocument();
 });

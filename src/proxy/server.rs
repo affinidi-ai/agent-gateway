@@ -16,8 +16,8 @@ use crate::observability::loggable;
 use crate::state::{MultiSurfaceProxyState, SurfaceInfo};
 
 // ── Credential delegation global stores ──────────────────────────────────────
-// Follows the same OnceLock pattern used for mpp_transaction_store and
-// trust_registry_listener_manager in gateways/connection_points/message_processor.rs
+// Follows the same OnceLock pattern used for trust_registry_listener_manager
+// in gateways/connection_points/message_processor.rs
 
 static GLOBAL_CREDENTIAL_PROVIDER_STORE: OnceLock<
     Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>,
@@ -717,20 +717,6 @@ pub async fn run_port_server(
 
     let channel_infos_arc = Arc::new(RwLock::new(channel_infos));
 
-    // Use the global transaction store (created unconditionally in orchestrator.rs)
-    // This single store handles ALL x402 operations:
-    // - HTTP payment middleware (GW1 role: create payment, send to facilitator)
-    // - DIDComm message handlers (GW2 role: receive verify/settle requests)
-    // - Admin API (serves UI data)
-    // - Settlement worker (processes transactions where facilitator_gateway_id == this gateway)
-    let transaction_store = crate::gateways::connection_points::message_processor::get_transaction_store();
-    if transaction_store.is_none() {
-        warn!("Transaction store not initialized - x402 payment processing will fail");
-    }
-
-    // Transaction store workers (cleanup, crash recovery, settlement) are spawned in orchestrator.rs
-    // No duplicate workers needed here - all x402 operations use the single global store
-
     let state = Arc::new(MultiSurfaceProxyState {
         config: Arc::clone(&config),
         network_config: Arc::clone(&network_config),
@@ -746,8 +732,6 @@ pub async fn run_port_server(
         policy_manager: policy_manager.clone(),
         gateway_policy_manager: gateway_policy_manager.clone(),
         didauth_session_store: Arc::clone(&didauth_session_store),
-        transaction_store: transaction_store.clone(),
-        mpp_transaction_store: crate::gateways::connection_points::message_processor::get_mpp_transaction_store(),
         trust_registry_listener_manager:
             crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
         source_auth_middleware: source_auth_middleware.clone(),

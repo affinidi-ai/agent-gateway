@@ -93,9 +93,11 @@ Connections has a **Payment Gateways** tab beside Gateways, Mediators and Regist
 connect wizard that waits for agent-pay's approval and verifies the peer with `gateway-info`, a
 detail page per payment gateway, and a **Use as payment gateway** action on the Gateways tab; see
 _Connections page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#connections-page). All of
-it, the Payments page, the Payment element in the palette and payment templates show only while the
+it, the Payment element in the palette and payment templates show only while the
 `agent_pay_delegation` feature flag is on (default off); a surface's existing Payment element
-always stays. See _Feature flags_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#feature-flags).
+always stays. The Payments page needs only `payments.view`, so the payment ledger and legacy
+x402/MPP history stay readable with the flag off. See _Feature flags_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#feature-flags).
 
 The Surface Builder's Payment manifest preview shows each payment method with the logo agent-pay
 sent beside the manifest, served by `GET /v1/gateways/payment-logos/{sha256}`, or a generic icon;
@@ -251,7 +253,7 @@ proxy Targets, Fabric receive); a free request makes no fabric hop. The gate liv
 captures funds agent-pay only held (`payment-authorization`) once the Target delivered and voids
 them otherwise, recording the decision in the payments ledger first
 ([`src/payments_ledger/settlement.rs`](src/payments_ledger/settlement.rs)); a streamed response
-is settled when its stream ends ([`src/proxy/handler/agent_pay_gate/streamed.rs`](src/proxy/handler/agent_pay_gate/streamed.rs)),
+is captured once a result is passed on, or settled when its stream ends ([`src/proxy/handler/agent_pay_gate/streamed.rs`](src/proxy/handler/agent_pay_gate/streamed.rs)),
 and callers poll held cases through
 [`src/payments_ledger/caller_api.rs`](src/payments_ledger/caller_api.rs). The gateway-signed
 payment credentials (receipt, rejection, access grant) are dispute evidence that nothing accepts

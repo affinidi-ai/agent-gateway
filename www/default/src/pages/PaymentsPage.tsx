@@ -6,6 +6,7 @@ import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import InfoBanner from '../components/shared/InfoBanner';
 import { DOCS_URL } from '../config/docs';
+import { useAgentPayFlag } from '../utils/featureFlags';
 import { PAYMENT_OUTCOMES, type PaymentLedgerRow, type PaymentOutcome } from '../types';
 import PaymentLedgerTable from './PaymentsPage/PaymentLedgerTable';
 import PaymentDetailModal from './PaymentsPage/PaymentDetailModal';
@@ -40,6 +41,7 @@ const PaymentsPage: React.FC = () => {
     });
 
   const gatewayName = usePaymentGatewayNames();
+  const { enabled: agentPayOn } = useAgentPayFlag();
 
   const needle = filterText.trim().toLowerCase();
   const visibleRows = useMemo(
@@ -108,7 +110,11 @@ const PaymentsPage: React.FC = () => {
             <EmptyState
               icon="fa-money-bill-wave"
               title="No payments yet"
-              body="Payments appear here once a surface with a Payment element starts charging callers through agent-pay."
+              body={
+                agentPayOn
+                  ? 'Payments appear here once a surface with a Payment element starts charging callers through agent-pay.'
+                  : 'Payments appear here once a surface charges callers through agent-pay. Connecting a payment gateway needs the agent_pay_delegation feature flag.'
+              }
               docsHref={DOCS_URL.payments}
             />
           ) : visibleRows.length === 0 ? (
@@ -133,7 +139,6 @@ const PaymentsPage: React.FC = () => {
       <div className="d-sm-flex align-items-center justify-content-between mb-4 gap-2">
         <div className="d-flex align-items-center gap-2 flex-wrap">
           <SearchInput
-            data-testid="payments-search-input"
             value={filterText}
             onChange={setFilterText}
             placeholder="Filter Payments..."

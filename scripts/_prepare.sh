@@ -456,11 +456,6 @@ then
   cp ./config/examples/limits.example.json "${target_dir}/config/limits.json"
 fi
 
-if [[ ! -f "${target_dir}/config/x402-proxy.json" ]]
-then
-  cp ./config/examples/x402-proxy.example.json "${target_dir}/config/x402-proxy.json"
-fi
-
 if [[ ! -f "${target_dir}/config/rbac.json" ]]
 then
   cp ./config/examples/rbac.example.json "${target_dir}/config/rbac.json"

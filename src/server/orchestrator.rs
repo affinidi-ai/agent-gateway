@@ -1066,8 +1066,6 @@ pub async fn run_axum_proxy(
                 let store = Arc::new(store);
                 crate::payments_ledger::init_global(Arc::clone(&store));
                 crate::payments_ledger::spawn_background_workers(store, ledger_config.retention_days());
-                #[cfg(not(test))]
-                crate::payments_ledger::spawn_termination_flush();
                 info!(path = ?ledger_path, "✓ Delegated payment ledger initialized");
             }
             Err(e) => {
@@ -1633,22 +1631,18 @@ pub async fn run_axum_proxy(
                         Ok(n) => info!("Migrated the exposure mode of {n} remote gateway(s)"),
                         Err(e) => warn!("Failed to migrate remote gateway exposure modes: {}", e),
                     }
-                    let payment_gateway_ids = match agent_surface_store.as_ref() {
+                    let surfaces = match agent_surface_store.as_ref() {
                         Some(surfaces) => match crate::surfaces::AgentSurfaceStore::list_all(surfaces.as_ref()).await {
-                            Ok(surfaces) => surfaces
-                                .iter()
-                                .flat_map(|surface| surface.payment_gateway_ids())
-                                .map(str::to_string)
-                                .collect(),
+                            Ok(surfaces) => surfaces,
                             Err(e) => {
                                 warn!("Failed to list surfaces for the payment gateway migration: {}", e);
-                                Default::default()
+                                Vec::new()
                             }
                         },
-                        None => Default::default(),
+                        None => Vec::new(),
                     };
                     match store
-                        .migrate_payment_roles(&payment_gateway_ids)
+                        .migrate_payment_roles(&surfaces)
                         .await
                     {
                         Ok(0) => {}

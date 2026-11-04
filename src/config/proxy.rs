@@ -145,28 +145,6 @@ impl BootstrapConfig {
         );
         Ok(metadata)
     }
-
-    /// Load test endpoints configuration from test-endpoints.json
-    pub fn load_test_endpoints_config(&self) -> anyhow::Result<TestEndpointsConfig> {
-        let test_endpoints_path = &self
-            .config_files
-            .test_endpoints;
-        info!("Loading test endpoints configuration from: {}", test_endpoints_path);
-
-        // Read and parse test-endpoints.json
-        let contents = std::fs::read_to_string(test_endpoints_path)?;
-        let config: TestEndpointsConfig = serde_json::from_str(&contents)?;
-
-        info!(
-            "Loaded test endpoints config: evm={}, solana_devnet={}, solana_mainnet={}",
-            config.evm.is_some(),
-            config.solana_devnet.is_some(),
-            config
-                .solana_mainnet
-                .is_some()
-        );
-        Ok(config)
-    }
 }
 
 #[allow(dead_code)]
@@ -306,7 +284,8 @@ impl GatewayConfig {
             if surface.payment_policy_unsupported() {
                 warn!(
                     "Surface '{}'{}: local x402/MPP payment is no longer supported; requests answer 503 until the \
-                     payment policy points at an agent-pay surface",
+                     payment policy points at an agent-pay surface (connecting a payment gateway needs the \
+                     agent_pay_delegation feature flag)",
                     surface.name, channel_id
                 );
             }

@@ -85,8 +85,7 @@ card, and how the gateway's fetch went:
   ignored.
 
 The preview builds the card exactly as the card route does for an anonymous caller, with the
-same Target Authentication, identity, endpoint rewrite and identity credential. It skips the
-x402 and MPP payment gate and reports only `payment_required`. It records no gateway fault,
+same Target Authentication, identity, endpoint rewrite and identity credential. It records no gateway fault,
 rejected request, Trust Recorder write or connection metric. It fetches from an `http(s)` Target
 over a client pinned to the vetted address, credential or not, without following redirects; a
 `fabric://` Target is asked through the remote gateway as the card route asks it. The request to the agent carries only
@@ -105,7 +104,6 @@ Every fetch result is a `200` with these fields, each always present:
 | `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
 | `fetch` | `status` (`ok`, `failed`, `not_served`), `cause`, `http_status`, `duration_ms`. |
 | `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
-| `payment_required` | Callers must pay before the card route serves the card. |
 | `before`, `before_bytes` | The agent's own card as fetched, and its size. |
 | `after`, `after_bytes` | The card the gateway serves, and its size. |
 | `display_limit_bytes` | 262144. A card larger than this is reported by size only, with the card `null`. |

@@ -1,6 +1,8 @@
 //! Held funds for a response whose body streams: the first byte is not delayed,
-//! the funds are captured once the stream completes without a JSON-RPC error and
-//! voided when the upstream stream fails or the client goes away first.
+//! the funds are captured once a JSON-RPC result (any body bytes, for a protocol
+//! without JSON-RPC) is passed on to the client, or once the stream completes
+//! without a JSON-RPC error, and voided when the upstream stream fails or the
+//! client goes away before either.
 
 use std::sync::Arc;
 
@@ -15,7 +17,8 @@ use super::{Authorization, ChannelProtocol, MAX_RECEIPT_BODY_BYTES, Receipt};
 /// receipt in. Clients reading only `message` events skip it.
 pub(super) const RECEIPT_EVENT: &str = "payment-receipt";
 
-/// Tells from the bytes of a streamed body whether it carried a JSON-RPC error.
+/// Tells from the bytes of a streamed body whether it carried a JSON-RPC error,
+/// and whether it has passed a result on.
 struct Judge {
     rpc: bool,
     events: bool,
@@ -24,6 +27,7 @@ struct Judge {
     /// body is judged by its status alone.
     overflowed: bool,
     failed: bool,
+    result_relayed: bool,
 }
 
 impl Judge {
@@ -37,6 +41,7 @@ impl Judge {
             pending: Vec::new(),
             overflowed: false,
             failed: false,
+            result_relayed: false,
         }
     }
 
@@ -44,7 +49,11 @@ impl Judge {
         &mut self,
         chunk: &[u8],
     ) {
-        if !self.rpc || self.overflowed || self.failed {
+        if !self.rpc {
+            self.result_relayed |= !chunk.is_empty();
+            return;
+        }
+        if self.overflowed || self.failed {
             return;
         }
         self.pending
@@ -63,6 +72,7 @@ impl Judge {
                     self.failed = true;
                     return;
                 }
+                self.result_relayed |= carries_result(&line);
             }
         }
         if self.pending.len() > MAX_RECEIPT_BODY_BYTES {
@@ -84,7 +94,28 @@ impl Judge {
     }
 }
 
-/// Voids the held funds when the stream is dropped before it completed.
+/// Whether an event stream line carries a JSON-RPC result.
+fn carries_result(line: &[u8]) -> bool {
+    let Some(data) = std::str::from_utf8(line)
+        .ok()
+        .and_then(|line| line.strip_prefix("data:"))
+    else {
+        return false;
+    };
+    let is_result = |message: &serde_json::Value| {
+        message
+            .get("result")
+            .is_some_and(|result| !result.is_null())
+    };
+    match serde_json::from_str::<serde_json::Value>(data.trim()) {
+        Ok(serde_json::Value::Array(batch)) => batch.iter().any(is_result),
+        Ok(message) => is_result(&message),
+        Err(_) => false,
+    }
+}
+
+/// Voids the held funds when the stream is dropped before it completed, unless
+/// a result was already passed on.
 struct Unfinished(Option<Arc<Authorization>>);
 
 impl Unfinished {
@@ -155,7 +186,15 @@ pub(super) fn settle_when_streamed(
         }
         match state.upstream.next().await {
             Some(Ok(chunk)) => {
+                let relayed = state.judge.result_relayed;
                 state.judge.observe(&chunk);
+                if !relayed
+                    && state.judge.result_relayed
+                    && let Some(authorization) = state.guard.0.as_ref()
+                {
+                    let action = authorization.decide(true);
+                    authorization.spawn_settle(&tokio::runtime::Handle::current(), action);
+                }
                 Some((Ok::<Bytes, axum::Error>(chunk), state))
             }
             Some(Err(error)) => {
@@ -228,6 +267,35 @@ mod tests {
         let mut ok = Judge::new(&ChannelProtocol::A2a, "application/json");
         ok.observe(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
         assert!(ok.delivered());
+    }
+
+    #[test]
+    fn judge_marks_a_result_relayed_only_once_a_whole_result_line_passed() {
+        let mut judge = Judge::new(&ChannelProtocol::Mcp, "text/event-stream");
+        judge.observe(b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n");
+        assert!(!judge.result_relayed, "a notification is not a result");
+        judge.observe(b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"res");
+        assert!(!judge.result_relayed, "half a result is not passed on");
+        judge.observe(b"ult\":{}}\n\n");
+        assert!(judge.result_relayed);
+
+        let mut errored = Judge::new(&ChannelProtocol::Mcp, "text/event-stream");
+        errored.observe(b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1}}\n\n");
+        errored.observe(b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n");
+        assert!(!errored.result_relayed, "nothing is captured after an error");
+
+        let mut json = Judge::new(&ChannelProtocol::A2a, "application/json");
+        json.observe(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+        assert!(!json.result_relayed, "a JSON body is judged at its end");
+    }
+
+    #[test]
+    fn judge_marks_any_body_bytes_relayed_without_json_rpc() {
+        let mut judge = Judge::new(&ChannelProtocol::DIDComm, "application/octet-stream");
+        judge.observe(b"");
+        assert!(!judge.result_relayed);
+        judge.observe(b"x");
+        assert!(judge.result_relayed);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::types::GatewayConnectionPoint;
 use super::ws_listener::ConnectionPointListenerManager;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::gateways::filesystem::GatewayStore;
-use crate::gateways::types::{Gateway, GatewayType};
+use crate::gateways::types::{Gateway, GatewayRole, GatewayType};
 use crate::identity::VCIssuer;
 use crate::mediators::filesystem::MediatorStore;
 use crate::mediators::utils::set_acl_to_allow_everything_and_more;
@@ -472,13 +472,16 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
+/// `/v1/connection-points/*` serves `gateways.*`, which never reaches a payment
+/// gateway, so a payment gateway's connection points answer like missing ones.
 fn connection_point_allowed(
     connection_point: &GatewayConnectionPoint,
     gateway: &Gateway,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> bool {
-    can_access(gateway.tenant_id.as_deref(), tenant_context(context))
+    gateway.role != GatewayRole::Payment
+        && can_access(gateway.tenant_id.as_deref(), tenant_context(context))
         && scope_allows_resource(
             resource_scope(scope),
             tenant_context(context),
@@ -2419,6 +2422,76 @@ mod tests {
                 "a hidden connection point answers exactly like a missing one (mutation: {mutation})"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn connection_point_routes_never_reach_a_payment_gateway() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayCreationType, GatewayRole, GatewayType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+            .await
+            .unwrap();
+        let points = crate::gateways::connection_points::FileSystemConnectionPointStore::new(dir.path().join("points"))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for role in [GatewayRole::Peer, GatewayRole::Payment] {
+            let mut gateway = Gateway::new_with_creation_type(
+                format!("{role:?}"),
+                String::new(),
+                format!("did:web:{role:?}.example").to_lowercase(),
+                GatewayType::Remote,
+                GatewayCreationType::User,
+            );
+            gateway.role = role;
+            gateways
+                .create(&gateway)
+                .await
+                .unwrap();
+            let point = connection_point_for(&gateway.id);
+            points
+                .create(&point)
+                .await
+                .unwrap();
+            ids.push(point.id);
+        }
+
+        let peer = super::load_accessible_connection_point(&points, &gateways, &ids[0], &None, &None, true).await;
+        assert_eq!(
+            peer.map(|(point, _)| point.id)
+                .ok(),
+            Some(ids[0].clone())
+        );
+        for mutation in [false, true] {
+            let refused = super::load_accessible_connection_point(&points, &gateways, &ids[1], &None, &None, mutation)
+                .await
+                .err();
+            assert_eq!(
+                refused,
+                Some((StatusCode::NOT_FOUND, "Connection point not found".to_string())),
+                "mutation: {mutation}"
+            );
+        }
+
+        let listed = super::list_connection_points(
+            axum::Extension(Arc::new(points)),
+            axum::Extension(Arc::new(gateways)),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            listed
+                .into_iter()
+                .map(|point| point.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0].clone()]
+        );
     }
 
     async fn create_on_appliance_gateway(tenant: Option<crate::tenancy::PatTenantContext>) -> (StatusCode, usize) {

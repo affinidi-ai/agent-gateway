@@ -5,7 +5,6 @@
 
 use super::PaymentPayload;
 use super::x402rs_adapter;
-use crate::config::types::X402PaymentRequirement;
 use crate::observability::loggable;
 use reqwest::Url;
 use tracing::{error, info};
@@ -45,83 +44,6 @@ impl RemoteFacilitator {
         .map_err(|e| format!("Invalid facilitator URL: {}", e))?;
 
         Ok(Self { base_url: target.url, client })
-    }
-
-    /// Verify a payment against the surface requirement it was resolved to
-    pub async fn verify(
-        &self,
-        payload: &PaymentPayload,
-        requirement: &X402PaymentRequirement,
-        channel_name: &str,
-    ) -> Result<proto::VerifyResponse, String> {
-        // Convert to x402-rs VerifyRequest
-        let verify_request = x402rs_adapter::to_verify_request(payload, requirement)?;
-
-        info!(
-            channel = channel_name,
-            facilitator = %loggable::url(self.base_url.as_str()),
-            network = %payload.network(),
-            amount = %payload.amount(),
-            "🌐 [X402 VERIFY] Calling external facilitator"
-        );
-
-        // Call facilitator /verify endpoint
-        let response = self
-            .client
-            .post(
-                self.base_url
-                    .join("/verify")
-                    .map_err(|e| e.to_string())?,
-            )
-            .header("Content-Type", "application/json")
-            .json(&verify_request)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to call facilitator: {}", e.without_url()))?;
-
-        let status = response.status();
-        info!("📥 [X402 VERIFY] Response status: {}", status);
-
-        // Read response body
-        let body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read response: {}", e.without_url()))?;
-
-        if !status.is_success() {
-            error!(
-                channel = channel_name,
-                status = %status,
-                body_bytes = body.len(),
-                facilitator = %loggable::url(self.base_url.as_str()),
-                "❌ Facilitator verification failed"
-            );
-            return Err(format!("Facilitator rejected payment: {}", status));
-        }
-
-        // Parse response using x402-rs types
-        let verify_response: proto::VerifyResponse =
-            serde_json::from_str(&body).map_err(|e| format!("Invalid facilitator response JSON: {}", e))?;
-
-        // Check if verification was valid
-        if !x402rs_adapter::is_verification_valid(&verify_response) {
-            let reason =
-                x402rs_adapter::extract_verify_error(&verify_response).unwrap_or_else(|| "Unknown error".to_string());
-            error!(
-                channel = channel_name,
-                reason = %reason,
-                "❌ Payment verification failed"
-            );
-            return Err(format!("Payment verification failed: {}", reason));
-        }
-
-        info!(
-            channel = channel_name,
-            payer = ?x402rs_adapter::extract_payer(&verify_response),
-            "✅ Payment verified successfully"
-        );
-
-        Ok(verify_response)
     }
 
     /// Settle a payment via the remote facilitator

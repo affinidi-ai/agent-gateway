@@ -894,35 +894,7 @@ fn inject_did_headers(
     }
 }
 
-/// The payments the card route asks a caller for before it serves the card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CardPaymentGates {
-    pub x402: bool,
-    pub mpp: bool,
-}
-
-impl CardPaymentGates {
-    pub(crate) fn any(self) -> bool {
-        self.x402 || self.mpp
-    }
-}
-
-/// The payment gates of the card route. A delegated (Model B) x402 policy has no
-/// local price/verify config to check there and is never routed through the
-/// delegation relay on that endpoint, so it does not paywall the card.
-pub(crate) fn card_payment_gates(surface: &crate::config::agent_surface::AgentSurface) -> CardPaymentGates {
-    CardPaymentGates {
-        x402: surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay),
-        mpp: surface
-            .mpp_config()
-            .is_some_and(|p| crate::mpp::should_require_payment(p, &surface.channel_protocol(), b"", None)),
-    }
-}
-
 /// Handle agent card requests - intercept and potentially modify
-#[allow(dead_code)]
 pub async fn handle_agent_card(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ProxyState>,
@@ -952,99 +924,6 @@ pub async fn handle_agent_card(
         surface = %channel_name,
         "Intercepting /.well-known/agent-card.json request"
     );
-
-    // Handle payment verification (x402, MPP, or both)
-    // When both protocols are enabled, the client can satisfy either one.
-    // If no credential is provided, a combined 402 is returned with both
-    // x402 JSON body and MPP WWW-Authenticate headers.
-    {
-        let config_id = state
-            .surface
-            .surface_id
-            .as_str();
-        let resource_url = "/.well-known/agent-card.json";
-        let CardPaymentGates {
-            x402: x402_required,
-            mpp: mpp_required,
-        } = card_payment_gates(&state.surface);
-
-        if x402_required || mpp_required {
-            let payment_signature = crate::x402::extract_payment_signature(
-                &headers,
-                &state
-                    .config
-                    .x402_headers
-                    .payment_signature,
-            );
-            let mpp_credential = crate::mpp::extract_mpp_credential(&headers);
-
-            if x402_required && payment_signature.is_some() {
-                // Client sent x402 credential → verify via x402
-                match crate::x402::process_payment(
-                    payment_signature,
-                    state
-                        .surface
-                        .x402_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    resource_url,
-                    state
-                        .listener_manager
-                        .read()
-                        .await
-                        .clone(),
-                    state
-                        .transaction_store
-                        .clone(),
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(error) => return Err(error.render(&state.config.x402_headers)),
-                }
-            } else if mpp_required && mpp_credential.is_some() {
-                // Client sent MPP credential → verify via MPP
-                match crate::mpp::process_payment(
-                    mpp_credential,
-                    state
-                        .surface
-                        .mpp_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    resource_url,
-                    state
-                        .mpp_transaction_store
-                        .clone(),
-                    &state.secrets_store,
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(error) => return Err(error.into_response()),
-                }
-            } else if let Some(error) = surface_payment::payment_required(
-                // No credential → return 402 (combined if both protocols enabled)
-                state
-                    .surface
-                    .x402_config()
-                    .filter(|_| x402_required),
-                state
-                    .surface
-                    .mpp_config()
-                    .filter(|_| mpp_required),
-                &channel_name,
-                config_id,
-                resource_url,
-                &surface_payment::LocalPaymentServices::of(&state).await,
-            )
-            .await
-            {
-                return Err(error.render(&state.config.x402_headers));
-            }
-        }
-    }
 
     let card = agent_card::build_public_card(&state, &headers, &source_addr, agent_card::CardMode::Serve)
         .await
@@ -2742,7 +2621,7 @@ async fn proxy_charged_request(
                 .payment_signature,
         },
     );
-    let mut payment_context = payment
+    let payment_context = payment
         .as_ref()
         .map(agent_pay_gate::Intake::policy_input);
     if let Some(payment) = &payment {
@@ -3312,212 +3191,7 @@ async fn proxy_charged_request(
     };
 
     // ── Payment ─────────────────────────────────────────────────────────────
-    let mut mpp_receipt_header: Option<String> = None;
     let mut gate_receipt: Option<agent_pay_gate::Receipt> = None;
-
-    let defer_surface_payment = modern_request.is_some();
-    if !defer_surface_payment
-        && state
-            .surface
-            .target
-            .endpoint
-            .starts_with("fabric://")
-    {
-        // An x402 policy that delegates to agent-pay has no local price, so
-        // the local paywall does not run for it.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| {
-                p.provider != crate::config::types::X402Provider::AgentPay
-                    && crate::x402::should_require_payment(
-                        p,
-                        &state
-                            .surface
-                            .channel_protocol(),
-                        &body_bytes,
-                        mcp_context.as_ref(),
-                    )
-            });
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    &body_bytes,
-                    mcp_context.as_ref(),
-                )
-            });
-
-        if x402_required || mpp_required {
-            let resource_url = uri.to_string();
-
-            // Extract credentials for both protocols (with MCP body extraction)
-            let (payment_signature, mpp_credential, modified_body) = if state
-                .surface
-                .channel_protocol()
-                == crate::config::ChannelProtocol::Mcp
-            {
-                let (sig, body1) = crate::x402::extract_payment_signature_with_mcp(
-                    &headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                    &body_bytes,
-                );
-                let (cred, body2) = crate::mpp::extract_mpp_credential_with_mcp(&headers, &body1);
-                (sig, cred, body2)
-            } else {
-                let sig = crate::x402::extract_payment_signature(
-                    &headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                let cred = crate::mpp::extract_mpp_credential(&headers);
-                (sig, cred, body_bytes.to_vec())
-            };
-
-            if x402_required && payment_signature.is_some() {
-                // Client sent x402 credential → verify via x402
-                match crate::x402::process_payment(
-                    payment_signature,
-                    state
-                        .surface
-                        .x402_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    &resource_url,
-                    state
-                        .listener_manager
-                        .read()
-                        .await
-                        .clone(),
-                    state
-                        .transaction_store
-                        .clone(),
-                )
-                .await
-                .map_err(|error| error.render(&state.config.x402_headers))
-                {
-                    Ok(response_header) => {
-                        body_bytes = modified_body.into();
-                        if let Some(hdr) = response_header {
-                            payment_context = Some(crate::surface_context::PaymentContext {
-                                required: true,
-                                response_header: Some(hdr),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    Err(err_response) => {
-                        channel_warn!(config_id, "❌ Payment verification failed for fabric request");
-                        record_payment_refusal(&state, &source_addr, start_time, &trace_id, err_response.status());
-
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(err_response);
-                    }
-                }
-            } else if mpp_required && mpp_credential.is_some() {
-                // Client sent MPP credential → verify via MPP
-                match crate::mpp::process_payment(
-                    mpp_credential,
-                    state
-                        .surface
-                        .mpp_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    &resource_url,
-                    state
-                        .mpp_transaction_store
-                        .clone(),
-                    &state.secrets_store,
-                )
-                .await
-                {
-                    Ok(receipt_header) => {
-                        mpp_receipt_header = receipt_header;
-                        body_bytes = modified_body.into();
-                    }
-                    Err(error) => {
-                        channel_warn!(config_id, "❌ MPP payment verification failed for fabric request");
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(error.into_response());
-                    }
-                }
-            } else if let Some(error) = surface_payment::payment_required(
-                // No credential → return 402 (combined if both protocols enabled)
-                state
-                    .surface
-                    .x402_config()
-                    .filter(|_| x402_required),
-                state
-                    .surface
-                    .mpp_config()
-                    .filter(|_| mpp_required),
-                &channel_name,
-                config_id,
-                &resource_url,
-                &surface_payment::LocalPaymentServices::of(&state).await,
-            )
-            .await
-            {
-                channel_warn!(config_id, "❌ Payment required for fabric request");
-
-                if let Some(ref metrics) = state.metrics_store {
-                    let latency_ms = start_time
-                        .elapsed()
-                        .as_millis() as u64;
-                    let channel_config_id = state
-                        .surface
-                        .surface_id
-                        .clone();
-                    let source = source_addr.clone();
-                    let dest = state
-                        .surface
-                        .target
-                        .endpoint
-                        .clone();
-                    let metrics_clone = Arc::clone(metrics);
-                    let trace_id_clone = trace_id.clone();
-                    crate::observability::policy_audit::spawn_in_request(async move {
-                        metrics_clone
-                            .record_connection(
-                                channel_config_id,
-                                source,
-                                dest,
-                                crate::metrics::ConnectionStatus::Success,
-                                Some(latency_ms),
-                                None,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace_id_clone,
-                                None,
-                                None,
-                                latency_ms,
-                            )
-                            .await;
-                    });
-                }
-
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(error.render(&state.config.x402_headers));
-            }
-        }
-    }
 
     // ── MCP fabric:// SSE transport (GET /sse and POST /mcp/messages/) ─────
     // For MCP channels with fabric:// targets, SSE transport must be handled
@@ -4060,38 +3734,6 @@ async fn proxy_charged_request(
             StatusCode::PAYLOAD_TOO_LARGE,
             &format!("Request body too large: {} bytes (max: {})", body_bytes.len(), state.config.a2a.max_body_size),
         ));
-    }
-
-    if !defer_surface_payment {
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            mcp_context.as_ref(),
-            &uri.to_string(),
-            None,
-        )
-        .await
-        {
-            Ok(payment) => {
-                body_bytes = payment.body;
-                if payment.context.is_some() {
-                    payment_context = payment.context;
-                }
-                if payment.mpp_receipt.is_some() {
-                    mpp_receipt_header = payment.mpp_receipt;
-                }
-            }
-            Err(response) => {
-                channel_warn!(config_id, "Payment did not authorize the request");
-                record_payment_refusal(&state, &source_addr, start_time, &trace_id, response.status());
-
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
     }
 
     // ── MCP Streamable HTTP transport: GET (notification stream) + DELETE ────
@@ -4788,14 +4430,6 @@ async fn proxy_charged_request(
             }
         }
     }
-
-    let local_receipt = surface_payment::receipt_header(
-        payment_context.as_ref(),
-        mpp_receipt_header.as_deref(),
-        &state.config.x402_headers,
-    )
-    .map_err(|_| create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid payment receipt header"))?;
-    let mut modern_local_receipt = None;
 
     // Inspect extensions if enabled and this is a POST with JSON body (A2A or MCP protocol)
     // Also capture if client supports credential extension for response VP injection
@@ -6187,7 +5821,9 @@ async fn proxy_charged_request(
             authenticated_identity.as_ref(),
             request_agent_did.as_deref(),
             crate::mcp::continuations::protected::ContinuationRoute::AccessPoint,
-            surface_payment::is_unpaid(&state, &headers, &body_bytes, payment.as_ref()),
+            payment
+                .as_ref()
+                .is_some_and(agent_pay_gate::Intake::is_unpaid),
         )
         .await
         {
@@ -6215,19 +5851,7 @@ async fn proxy_charged_request(
                     Err(response) => return Ok(response),
                     Ok(receipt) => *receipt_out = receipt,
                 }
-                return match surface_payment::process(
-                    &state,
-                    &headers,
-                    body_bytes,
-                    mcp_context.as_ref(),
-                    &uri.to_string(),
-                    None,
-                )
-                .await
-                {
-                    Err(response) => Ok(response),
-                    Ok(_) => Err(ModernDelegationError::Unpaid.response(request)),
-                };
+                return Err(ModernDelegationError::Unpaid.response(request));
             }
             Err(error) => {
                 connection_guard
@@ -6237,65 +5861,16 @@ async fn proxy_charged_request(
             }
         }
     }
-    if defer_surface_payment {
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            mcp_context.as_ref(),
-            &uri.to_string(),
-            modern_delegation
-                .as_ref()
-                .and_then(|prepared| prepared.payment()),
-        )
-        .await
-        {
-            Ok(mut payment) => {
-                if let Some(prepared) = modern_delegation.as_mut()
-                    && let Some(evidence) = payment.continuation_evidence()
-                {
-                    let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                    })?;
-                    prepared
-                        .record_payment(
-                            evidence,
-                            mcp_continuations
-                                .as_ref()
-                                .map_or(300, |runtime| runtime.config.ttl_secs),
-                            now,
-                        )
-                        .map_err(|_| {
-                            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                        })?;
-                }
-                payment
-                    .strip_consumed_mcp_argument()
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid paid MCP request")
-                    })?;
-                payment.strip_consumed_headers(
-                    &mut headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                modern_local_receipt = payment
-                    .receipt_header(&state.config.x402_headers)
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid payment receipt header")
-                    })?;
-                body_bytes = payment.body;
-                payment_context = payment.context;
-            }
-            Err(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
+    if let Some(response) = surface_payment::continuation_payment_refusal(
+        &state.surface,
+        modern_delegation
+            .as_ref()
+            .and_then(|prepared| prepared.payment()),
+    ) {
+        connection_guard
+            .decrement()
+            .await;
+        return Err(response);
     }
 
     // Determine source-auth credential header to strip from upstream requests.
@@ -7584,6 +7159,12 @@ async fn proxy_charged_request(
         .filter(|_| body_bytes.len() <= crate::delegation_vault::release::RETRY_BODY_LIMIT)
         .and_then(|_| upstream_req.try_clone());
 
+    // Whether any attempt may have reached the Target; a paid request's claim
+    // is handed back only when none did.
+    let reached_target = std::sync::atomic::AtomicBool::new(false);
+    let sent_nothing =
+        |error: &reqwest::Error| error.is_connect() && !reached_target.load(std::sync::atomic::Ordering::Relaxed);
+
     // Implement retry logic if configured
     let send_with_retry = || async {
         if let Some(retry_config) = state
@@ -7613,7 +7194,14 @@ async fn proxy_charged_request(
                     break result;
                 };
 
-                match req_to_send.send().await {
+                let sent = req_to_send.send().await;
+                if !sent
+                    .as_ref()
+                    .is_err_and(reqwest::Error::is_connect)
+                {
+                    reached_target.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                match sent {
                     Ok(resp) => {
                         let status = resp.status();
 
@@ -7702,7 +7290,7 @@ async fn proxy_charged_request(
                     return Err(circuit_open_response(retry_after));
                 }
                 Err(crate::policies::CircuitBreakerError::Inner(e)) => {
-                    if e.is_connect() {
+                    if sent_nothing(&e) {
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
@@ -7722,7 +7310,7 @@ async fn proxy_charged_request(
                 .instrument(_send_span.clone())
                 .await
                 .map_err(|e| {
-                    if e.is_connect() {
+                    if sent_nothing(&e) {
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
@@ -8114,13 +7702,10 @@ async fn proxy_charged_request(
     };
 
     let mut modern_receipt_headers = HeaderMap::new();
-    if modern_request.is_some() {
-        if let Some((name, value)) = modern_local_receipt {
-            modern_receipt_headers.append(name, value);
-        }
-        if let Some(receipt) = gate_receipt.as_ref() {
-            receipt.apply(&mut modern_receipt_headers);
-        }
+    if modern_request.is_some()
+        && let Some(receipt) = gate_receipt.as_ref()
+    {
+        receipt.apply(&mut modern_receipt_headers);
     }
     let modern_completion = modern_upstream
         .as_ref()
@@ -9485,10 +9070,6 @@ async fn proxy_charged_request(
             response = response.header("Mcp-Session-Id", sid);
         }
 
-        if !is_modern_response && let Some((name, value)) = local_receipt.clone() {
-            response = response.header(name, value);
-        }
-
         // Apply Custom Metadata HTTP headers (when injection_target is Headers or Both).
         for (name, value) in &response_metadata_headers {
             response = response.header(name.as_str(), value.as_str());
@@ -10770,7 +10351,7 @@ async fn handle_fabric_request_inner(
         channel_name,
         method,
         uri,
-        mut headers,
+        headers,
         source_addr,
         start_time,
         mut connection_guard,
@@ -11868,7 +11449,7 @@ async fn handle_fabric_request_inner(
                 ContinuationRoute::FabricSend {
                     peer_did: remote_gateway_did.clone(),
                 },
-                surface_payment::is_unpaid(&state, &headers, &body_bytes, payment),
+                payment.is_some_and(agent_pay_gate::Intake::is_unpaid),
             )
             .await
             {
@@ -11896,19 +11477,7 @@ async fn handle_fabric_request_inner(
                         Err(response) => return Ok(response),
                         Ok(receipt) => *gate_receipt = receipt,
                     }
-                    return match surface_payment::process(
-                        &state,
-                        &headers,
-                        body_bytes,
-                        modern_mcp_context.as_ref(),
-                        &uri.to_string(),
-                        None,
-                    )
-                    .await
-                    {
-                        Err(response) => Ok(response),
-                        Ok(_) => Err(ModernDelegationError::Unpaid.response(request)),
-                    };
+                    return Err(ModernDelegationError::Unpaid.response(request));
                 }
                 Err(error) => {
                     connection_guard
@@ -11918,65 +11487,16 @@ async fn handle_fabric_request_inner(
                 }
             }
         }
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            modern_mcp_context.as_ref(),
-            &uri.to_string(),
+        if let Some(response) = surface_payment::continuation_payment_refusal(
+            &state.surface,
             modern_delegation
                 .as_ref()
                 .and_then(|prepared| prepared.payment()),
-        )
-        .await
-        {
-            Ok(mut payment) => {
-                if let Some(prepared) = modern_delegation.as_mut()
-                    && let Some(evidence) = payment.continuation_evidence()
-                {
-                    let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                    })?;
-                    prepared
-                        .record_payment(
-                            evidence,
-                            mcp_continuations
-                                .as_ref()
-                                .map_or(300, |runtime| runtime.config.ttl_secs),
-                            now,
-                        )
-                        .map_err(|_| {
-                            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                        })?;
-                }
-                payment
-                    .strip_consumed_mcp_argument()
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid paid MCP request")
-                    })?;
-                payment.strip_consumed_headers(
-                    &mut headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                if let Some((name, value)) = payment
-                    .receipt_header(&state.config.x402_headers)
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid payment receipt header")
-                    })?
-                {
-                    modern_payment_headers.insert(name, value);
-                }
-                body_bytes = payment.body;
-            }
-            Err(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
+        ) {
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
         }
     }
 
@@ -17316,7 +16836,6 @@ allow if {
         let known = caller_did("did:example:caller");
         let payment = crate::surface_context::PaymentContext {
             required: true,
-            response_header: None,
             ..Default::default()
         };
 
@@ -17448,12 +16967,6 @@ allow if {
                 .clone(),
             didauth_session_store: state
                 .didauth_session_store
-                .clone(),
-            transaction_store: state
-                .transaction_store
-                .clone(),
-            mpp_transaction_store: state
-                .mpp_transaction_store
                 .clone(),
             trust_registry_listener_manager: state
                 .trust_registry_listener_manager
@@ -19841,8 +19354,6 @@ allow if {
             policy_manager: None,
             gateway_policy_manager: None,
             didauth_session_store: sessions,
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: Some(middleware),
             #[cfg(feature = "didwebvh")]
@@ -21470,8 +20981,6 @@ allow if {
             policy_manager,
             gateway_policy_manager: None,
             didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: None,
             #[cfg(feature = "didwebvh")]
@@ -22514,8 +22023,6 @@ mod fabric_send_tests {
             policy_manager: None,
             gateway_policy_manager: None,
             didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: None,
             #[cfg(feature = "didwebvh")]

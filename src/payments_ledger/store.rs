@@ -198,19 +198,30 @@ impl Window {
         true
     }
 
+    /// Drops the rows created before `cutoff`, except those still awaiting
+    /// settlement.
     fn drop_older_than(
         &mut self,
         cutoff: DateTime<Utc>,
     ) {
-        while let Some(oldest) = self
-            .rows
-            .front()
-            .filter(|oldest| oldest.row.created_at < cutoff)
-        {
-            self.by_id
-                .remove(&oldest.row.id);
-            self.rows.pop_front();
-        }
+        let by_id = &mut self.by_id;
+        self.rows.retain(|held| {
+            let keep = held.row.created_at >= cutoff || awaits_settlement(&held.row);
+            if !keep {
+                by_id.remove(&held.row.id);
+            }
+            keep
+        });
+    }
+
+    /// The segments holding a row that still awaits settlement, which neither
+    /// retention nor the size bound deletes.
+    fn open_segments(&self) -> std::collections::BTreeSet<Segment> {
+        self.rows
+            .iter()
+            .filter(|held| awaits_settlement(&held.row))
+            .filter_map(|held| Segment::of_row_id(&held.row.id))
+            .collect()
     }
 }
 
@@ -390,6 +401,19 @@ impl DelegatedPaymentStore {
             .filter(|stored| keep(&stored.row))
             .map(|stored| (stored.row.clone(), stored.tenant_id.clone()))
             .collect()
+    }
+
+    /// How many rows in the window `keep` admits.
+    pub fn count_where(
+        &self,
+        keep: impl Fn(&PaymentLedgerRow) -> bool,
+    ) -> usize {
+        self.inner()
+            .window
+            .rows
+            .iter()
+            .filter(|stored| keep(&stored.row))
+            .count()
     }
 
     /// Writes one row version to the segment its id names. A new row is held to
@@ -696,15 +720,28 @@ impl DelegatedPaymentStore {
     }
 
     /// Deletes the oldest segments while the ledger is over its size bound,
-    /// keeping the newest.
+    /// keeping the newest and those holding a row that awaits settlement.
     async fn enforce_size(&self) {
         loop {
             let oldest = {
                 let inner = self.inner();
                 let total: u64 = inner.segments.values().sum();
-                match inner.segments.keys().next() {
-                    Some(oldest) if total > self.limits.ledger_bytes && inner.segments.len() > 1 => *oldest,
-                    _ => return,
+                if total <= self.limits.ledger_bytes {
+                    return;
+                }
+                let open = inner.window.open_segments();
+                let newest = inner
+                    .segments
+                    .keys()
+                    .next_back()
+                    .copied();
+                match inner
+                    .segments
+                    .keys()
+                    .find(|segment| Some(**segment) != newest && !open.contains(segment))
+                {
+                    Some(oldest) => *oldest,
+                    None => return,
                 }
             };
             warn!(
@@ -746,7 +783,8 @@ impl DelegatedPaymentStore {
 
     /// Deletes the segments that end before `now - max_age` and drops older
     /// rows from the window; returns how many segments were deleted. A segment
-    /// that still holds rows inside `max_age` is kept whole.
+    /// that still holds rows inside `max_age`, or a row that awaits settlement,
+    /// is kept whole, and so is that row in the window.
     pub async fn cleanup_older_than(
         &self,
         max_age: Duration,
@@ -754,13 +792,17 @@ impl DelegatedPaymentStore {
         let _writing = self.writing.lock().await;
         let cutoff = Utc::now() - max_age;
         let first_kept = Segment::at(cutoff);
-        let expired: Vec<Segment> = self
-            .inner()
-            .segments
-            .keys()
-            .copied()
-            .take_while(|segment| *segment < first_kept)
-            .collect();
+        let expired: Vec<Segment> = {
+            let inner = self.inner();
+            let open = inner.window.open_segments();
+            inner
+                .segments
+                .keys()
+                .copied()
+                .take_while(|segment| *segment < first_kept)
+                .filter(|segment| !open.contains(segment))
+                .collect()
+        };
         let mut removed = 0;
         for segment in expired {
             if self
@@ -1698,6 +1740,84 @@ mod tests {
         );
         let (listed, _) = store.list(&LedgerFilter::default(), all);
         assert_eq!(listed.len(), 2, "the expired row is no longer served");
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_a_row_awaiting_settlement_and_its_segment_past_the_retention() {
+        let dir = temp();
+        let store = store_in(dir.path()).await;
+        let held = row("s-1", LedgerOutcome::Authorized, Duration::days(3));
+        let settled = row("s-1", LedgerOutcome::Paid, Duration::days(3) + Duration::hours(2));
+        for r in [&held, &settled] {
+            store
+                .record(r.clone(), None)
+                .unwrap();
+        }
+        store.flush().await;
+
+        assert_eq!(
+            store
+                .cleanup_older_than(Duration::days(1))
+                .await,
+            1,
+            "only the settled row's segment goes"
+        );
+        assert_eq!(
+            segment_files(dir.path()),
+            vec![
+                Segment::of_row_id(&held.id)
+                    .unwrap()
+                    .file_name()
+            ]
+        );
+        assert_eq!(
+            store
+                .rows_where(awaits_settlement)
+                .into_iter()
+                .map(|(row, _)| row.id)
+                .collect::<Vec<_>>(),
+            vec![held.id.clone()],
+            "the reconciler still finds it"
+        );
+        assert_eq!(store.get(&settled.id).await, None);
+
+        store
+            .update(&held.id, |row| row.outcome = LedgerOutcome::Paid)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .cleanup_older_than(Duration::days(1))
+                .await,
+            1,
+            "once settled, it expires like any other"
+        );
+        assert!(segment_files(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_size_bound_keeps_a_segment_holding_a_row_awaiting_settlement() {
+        let dir = temp();
+        let store = store_with(dir.path(), small(|l| l.ledger_bytes = 1)).await;
+        let held = row("s-1", LedgerOutcome::Unconfirmed, Duration::hours(5));
+        let old = row("s-1", LedgerOutcome::Paid, Duration::hours(3));
+        let newest = row("s-1", LedgerOutcome::Paid, Duration::zero());
+        for r in [&held, &old, &newest] {
+            store
+                .record(r.clone(), None)
+                .unwrap();
+        }
+        store.flush().await;
+
+        assert_eq!(
+            segment_files(dir.path()),
+            [&held, &newest]
+                .iter()
+                .map(|r| Segment::of_row_id(&r.id)
+                    .unwrap()
+                    .file_name())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

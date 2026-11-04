@@ -493,6 +493,91 @@ async fn a_paid_call_that_fails_upstream_still_carries_its_receipt() {
     assert_eq!(gate.calls(), 1);
 }
 
+/// A Target that answers its first request `503` and then stops listening.
+fn unavailable_then_gone() -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = requests.clone();
+    std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        drop(listener);
+        let _ = connection.read(&mut [0u8; 65536]);
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ =
+            connection.write_all(b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+    });
+    (address, requests)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retried_paid_call_that_reached_the_target_keeps_its_credential_used() {
+    let gate = taking_gate();
+    install_test_transport("e2e-retry", gate.clone());
+    let (target, reached) = unavailable_then_gone();
+    let harness = start_with(
+        "e2e-retry",
+        MockServer::start_with_response(UPSTREAM_RESULT).await,
+        |surface| {
+            surface.target.endpoint = format!("http://{target}");
+            surface.target.networking = Some(
+                serde_json::from_value(json!({
+                    "retry": {"max_attempts": 1, "initial_backoff_ms": 1, "max_backoff_ms": 1, "retryable_status_codes": [503]}
+                }))
+                .unwrap(),
+            );
+        },
+    )
+    .await;
+    let headers = [("PAYMENT-SIGNATURE", "retried-proof")];
+
+    let (status, _, body) = post(&harness, &tool_call("paid_report", json!({})), &headers).await;
+    assert_eq!(status, 502, "the retry could not connect: {body}");
+    assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(gate.calls(), 1);
+
+    let (status, _, body) = post(&harness, &tool_call("paid_report", json!({})), &headers).await;
+    assert_eq!(status, 402, "{body}");
+    assert_eq!(
+        body["error"]["data"]["failure"]["reason"], "payment_already_used",
+        "the first attempt reached the Target, so the credential stays used"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paid_call_that_never_reaches_the_target_hands_its_credential_back() {
+    let gate = taking_gate();
+    install_test_transport("e2e-never-sent", gate.clone());
+    let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let harness = start_with(
+        "e2e-never-sent",
+        MockServer::start_with_response(UPSTREAM_RESULT).await,
+        |surface| {
+            surface.target.endpoint = format!("http://{unreachable}");
+            surface.target.networking = Some(
+                serde_json::from_value(json!({
+                    "retry": {"max_attempts": 1, "initial_backoff_ms": 1, "max_backoff_ms": 1, "retryable_status_codes": [503]}
+                }))
+                .unwrap(),
+            );
+        },
+    )
+    .await;
+    let headers = [("PAYMENT-SIGNATURE", "unsent-proof")];
+
+    for attempt in 1..=2 {
+        let (status, response_headers, body) = post(&harness, &tool_call("paid_report", json!({})), &headers).await;
+        assert_eq!(status, 502, "attempt {attempt}: {body}");
+        assert_eq!(response_headers["payment-response"], "settled-receipt", "attempt {attempt}");
+    }
+    assert_eq!(gate.calls(), 2, "nothing reached the Target, so the credential could pay again");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paid_event_stream_response_carries_the_receipt_header() {
     let gate = taking_gate();

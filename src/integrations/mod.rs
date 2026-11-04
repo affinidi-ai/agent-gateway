@@ -14,7 +14,6 @@ pub mod identity_integration_triggers;
 pub mod mcp_proxy_integration_triggers;
 pub mod mediator_integration_triggers;
 pub mod migration;
-pub mod mpp_integration_triggers;
 pub mod payment_gate_integration_triggers;
 pub mod publishers;
 pub mod runtime_variables;

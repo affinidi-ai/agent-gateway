@@ -97,7 +97,7 @@ flowchart TB
     end
     subgraph P["Before forwarding"]
         direction LR
-        P1[Egress check] --> P2[Body-size limit] --> P3["Local x402 / MPP<br/>(unreachable)"] --> P4[MCP tool policies]
+        P1[Egress check] --> P2[Body-size limit] --> P4[MCP tool policies]
     end
     subgraph C["Caller context"]
         direction LR
@@ -151,7 +151,6 @@ logic.
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Egress check | Vetting the forward target before the request is charged or forwarded | [`src/egress.rs`](src/egress.rs) |
 | Body-size limit | Refusing a body over `[a2a] max_body_size` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
-| Local payment | x402 and MPP verification and paywalls. Unreachable: a surface with an enabled local policy is refused with `503 payment_unavailable` before any stage runs, over HTTP and over the fabric. | [`src/x402/`](src/x402/), [`src/mpp/`](src/mpp/), [`src/proxy/handler/surface_payment.rs`](src/proxy/handler/surface_payment.rs) |
 | MCP tool policies | Per-tool authorization, configured as `target.mcp_tool_policies` | [`src/policies/opa.rs`](src/policies/opa.rs) |
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
@@ -222,7 +221,7 @@ context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A v
 and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
 MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
 payment, then fabric dispatch) →
-forward-target egress check → body-size limit → local x402/MPP → MCP tool
+forward-target egress check → body-size limit → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → consent preparation (modern MCP) → identity and caller-info headers → transit
@@ -407,8 +406,8 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`x402/`](src/x402/) | Mapping agent-pay's answers (`delegate.rs`); settlement and transaction records kept only for payments verified before local x402 payment was withdrawn | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
-| [`mpp/`](src/mpp/) | Machine Payments Protocol verification, no longer reachable from a surface | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#migrating-older-policies) |
+| [`x402/`](src/x402/) | Mapping agent-pay's answers (`delegate.rs`); the chargeable-request matching (`middleware.rs`) and payment-header parsing the agent-pay gate shares; settlement, startup recovery and the admin API for x402 transactions recorded before local x402 payment was withdrawn. It verifies no payment and is not an x402 facilitator | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
+| [`mpp/`](src/mpp/) | The local MPP policy configuration a stored surface still loads, the MPP challenge and credential wire formats the agent-pay gate relays, and the admin API for MPP transactions recorded before local MPP payment was withdrawn. It verifies no payment | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#migrating-older-policies) |
 | [`payments_ledger/`](src/payments_ledger/) | One record per delegated payment call: a bounded in-memory window served at `/api/admin/payments`, and append-only hourly segment files kept 7 days | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#taking-the-payment), [`RBAC.md`](docs/RBAC.md) |
 | [`payment_credentials.rs`](src/payment_credentials.rs) | Dispute-evidence credentials | Source only: [`src/payment_credentials.rs`](src/payment_credentials.rs) |
 

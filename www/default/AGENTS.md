@@ -586,8 +586,8 @@ fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-sta
 
 ## Payments page
 
-`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown only while
-`agent_pay_delegation` is on (see _Feature flags_), is one list of payments, with no tabs, chart or audit trail view, and reads the
+`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown on
+`payments.view` whether or not `agent_pay_delegation` is on (see _Feature flags_), is one list of payments, with no tabs, chart or audit trail view, and reads the
 append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
 `outcome` from the filter) and shows one row per payment check with an outcome badge; a
 held row shows its case id. The Surface cell says `via <payment surface> on <payment
@@ -727,7 +727,7 @@ surface, never the unsaved form.
   a `remote_gateway` sign-in reads "The remote gateway refused this gateway's authorization (HTTP
   {status}). Check the sign-in settings of the remote surface."), a card over the display limit
   (`agent-card-too-large`), a gateway-generated A2A proxy card (`agent-card-generated`, served column
-  only), callers paying first (`agent-card-payment`) and Surface Variants existing
+  only) and Surface Variants existing
   (`agent-card-variant-note`, because the view shows the base route). `hasVariants` comes from the
   saved surface's enabled variants.
 - Card content comes from the agent, so it
@@ -1203,9 +1203,10 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   (`registry.paletteItems(protocol, hidden)`) and the templates panel hides templates that add
   one (`templateTakesPayments`); the Payment element's gateway picker shows no Add link
   (`addGatewayLink={null}`). A surface that already has a Payment element keeps it, rendered and
-  editable, so opening and saving it never drops its `payment_policy`. The Payments page is gated
-  too: its sidebar entry (`featureFlag: 'agent_pay_delegation'`) is hidden and `/payments` (and
-  `/x402payments`, which redirects to it) goes to the dashboard (`AgentPayRoute`'s `fallback`).
+  editable, so opening and saving it never drops its `payment_policy`. The Payments page is not
+  gated: its sidebar entry and `/payments` (and `/x402payments`, which redirects to it) need only
+  `payments.view`, so the ledger and the legacy x402/MPP list stay readable with the flag off;
+  only its empty state changes, naming the flag instead of the Payment element.
   Like `mediator_federation`, it is
   system-only: a user's own flag overrides never change it, so the UI always matches the gateway,
   which refuses to add a payment gateway while it is off. The gateway turns it on at startup when a

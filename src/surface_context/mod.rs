@@ -745,9 +745,6 @@ pub struct PaymentContext {
     pub amount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
-    /// A locally verified payment's receipt; never part of `input.payment`.
-    #[serde(skip)]
-    pub response_header: Option<String>,
 }
 
 /// Identity binding from an upstream gateway's request-path VP.

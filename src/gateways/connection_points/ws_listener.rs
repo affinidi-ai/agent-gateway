@@ -2205,7 +2205,7 @@ fn received_message(
 /// Who a connection point's mediator account admits. A paired connection point
 /// (OOB responder or acceptor) admits only its peer: the secure DID recorded on
 /// it at pairing, else the DID on its remote gateway record; with neither it
-/// admits no one. The recorded DID comes first because a pairing's gateway
+/// stays open, so an older pairing keeps working. The recorded DID comes first because a pairing's gateway
 /// record can still carry the peer's temporary DID when the listener starts. Every other connection point stays open, since invitation
 /// endpoints, pairing temporaries and legacy connection points do not serve a
 /// single known peer.
@@ -2240,10 +2240,10 @@ pub(crate) async fn inbound_acl_for(
         Some(peer) => InboundAcl::Peers(vec![peer]),
         None => {
             warn!(
-                "Connection point '{}' has no known peer DID; its mediator account admits no one",
+                "Connection point '{}' has no known peer DID; its mediator account stays open to any sender",
                 connection_point.name
             );
-            InboundAcl::Peers(Vec::new())
+            InboundAcl::Open
         }
     }
 }
@@ -5436,8 +5436,8 @@ mod tests {
                 Some(&store)
             )
             .await,
-            InboundAcl::Peers(Vec::new()),
-            "a paired connection point with no known peer admits no one"
+            InboundAcl::Open,
+            "a paired connection point with no known peer stays open"
         );
         for cp_type in [ConnectionPointType::User, ConnectionPointType::OobInviter, ConnectionPointType::System] {
             assert_eq!(

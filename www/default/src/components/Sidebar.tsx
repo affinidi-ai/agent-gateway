@@ -76,7 +76,6 @@ const Sidebar: React.FC = () => {
       icon: 'fa-dollar-sign',
       path: '/payments',
       permission: 'payments.view' as const,
-      featureFlag: 'agent_pay_delegation',
     },
     {
       id: 'configuration',

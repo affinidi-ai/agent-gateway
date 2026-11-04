@@ -627,6 +627,21 @@ fn wait_of(row: &PaymentLedgerRow) -> Duration {
         .map_or(DEFAULT_WAIT, Duration::from_millis)
 }
 
+/// Why a row the reconciler found agent-pay never took a payment for is closed.
+const NEVER_TAKEN: &str = "no_payment_taken";
+
+/// Whether agent-pay answered that it holds and took nothing under the row's
+/// idempotency key: it records every payment it takes or holds under that key,
+/// so after the replay window a key it does not know paid for nothing.
+fn never_taken(
+    query: &SettlementQuery,
+    answer: &SettlementAnswer,
+) -> bool {
+    matches!(query, SettlementQuery::IdempotencyKey(_))
+        && answer.status == SettlementStatus::Unknown
+        && answer.reason.is_none()
+}
+
 /// Whether the reconciler has anything to do with a row.
 fn open(row: &PaymentLedgerRow) -> bool {
     super::store::awaits_settlement(row) && (row.authorization_id.is_some() || row.idempotency_key.is_some())
@@ -637,10 +652,11 @@ pub async fn reconcile_once(
     store: &DelegatedPaymentStore,
     now: DateTime<Utc>,
 ) -> usize {
-    let open_rows = store.rows_where(open);
+    let mut open_rows = store.rows_where(open);
     if open_rows.is_empty() {
         return 0;
     }
+    open_rows.sort_by_key(|(row, _)| (row.authorization_id.is_none(), row.capture_deadline));
     let mut settled_keys: HashMap<String, String> = HashMap::new();
     for (row, _) in
         store.rows_where(|row| row.idempotency_key.is_some() && !matches!(row.outcome, LedgerOutcome::Unconfirmed))
@@ -735,6 +751,10 @@ async fn reconcile_row(
         .await;
     crate::metrics::backends::prometheus::track_payment_settlement("status", status_label(&answer));
     if let Ok(answer) = &answer {
+        if never_taken(&query, answer) {
+            apply(store, &row.id, LedgerOutcome::Rejected, None, None, Some(NEVER_TAKEN.to_string())).await;
+            return true;
+        }
         if let Some(outcome) = outcome_of_status(row.settle_intent, answer.status) {
             apply(
                 store,
@@ -1324,6 +1344,94 @@ pub(crate) mod tests {
         assert!(given_up.reconcile_failed);
         assert_eq!(given_up.outcome, LedgerOutcome::Unconfirmed);
         assert_eq!(reconcile_once(&store, Utc::now()).await, 0, "a row given up on is left alone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_row_whose_key_agent_pay_never_saw_is_closed_and_an_unclear_answer_keeps_it_open() {
+        let (store, dir) = store().await;
+        let gateway_id = gateway();
+        let unknown = |reason: Option<&str>| {
+            Ok(SettlementAnswer {
+                status: SettlementStatus::Unknown,
+                authorization_id: None,
+                receipt: None,
+                reason: reason.map(str::to_string),
+            })
+        };
+        let client = Arc::new(Scripted {
+            status: Mutex::new(vec![unknown(None), unknown(Some("invalid_request"))]),
+            ..Scripted::default()
+        });
+        install_test_client(&gateway_id, client.clone());
+        let mut rows = Vec::new();
+        for key in ["junk-key", "unclear-key"] {
+            let mut row =
+                crate::payments_ledger::tests::row("s-1", LedgerOutcome::Unconfirmed, chrono::Duration::minutes(5));
+            row.payment_gateway_id = gateway_id.clone();
+            row.idempotency_key = Some(key.to_string());
+            store
+                .record_durable(row.clone(), None)
+                .await
+                .unwrap();
+            rows.push(row);
+        }
+
+        assert_eq!(reconcile_once(&store, Utc::now()).await, 1);
+
+        let closed = store
+            .get(&rows[0].id)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(closed.outcome, LedgerOutcome::Rejected);
+        assert_eq!(closed.reason.as_deref(), Some(NEVER_TAKEN));
+        let unclear = store
+            .get(&rows[1].id)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(unclear.outcome, LedgerOutcome::Unconfirmed, "an unready agent-pay is asked again later");
+        assert!(!unclear.reconcile_failed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn held_payments_are_reconciled_before_cancelled_requests() {
+        let (store, dir) = store().await;
+        let gateway_id = gateway();
+        let client = Arc::new(Scripted::default());
+        install_test_client(&gateway_id, client.clone());
+        for minutes in [10, 9, 8, 7, 6] {
+            let mut cancelled = crate::payments_ledger::tests::row(
+                "s-1",
+                LedgerOutcome::Unconfirmed,
+                chrono::Duration::minutes(minutes),
+            );
+            cancelled.payment_gateway_id = gateway_id.clone();
+            cancelled.idempotency_key = Some(format!("key-{minutes}"));
+            store
+                .record_durable(cancelled, None)
+                .await
+                .unwrap();
+        }
+        let held = held_row(&gateway_id, LedgerOutcome::Unconfirmed, chrono::Duration::minutes(1));
+        store
+            .record_durable(held, None)
+            .await
+            .unwrap();
+
+        reconcile_once(&store, Utc::now()).await;
+
+        assert_eq!(
+            client
+                .queried
+                .lock()
+                .unwrap()
+                .first(),
+            Some(&SettlementQuery::Authorization("auth-1".to_string())),
+            "the newest row, which holds funds, is asked about first"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -304,8 +304,8 @@ that expose at least one payment surface, whichever side opened the connection; 
 are cached for 5 minutes, and `?force_refresh=true` asks each peer again. When agent-pay only holds the funds (`payment-authorization`), the gateway captures them after the
 Target delivers and voids them otherwise, and a reconciler on the Active node finishes any capture
 or void left open; see [Capture on delivery](CONFIGURATION_REFERENCE.md#capture-on-delivery).
-A streamed response is returned without waiting for the capture and is captured when the stream
-completes; an event stream ends with a `payment-receipt` event carrying the capture receipt. A
+A streamed response is returned without waiting for the capture and is captured once a result
+is passed on to the caller or the stream completes; an event stream ends with a `payment-receipt` event carrying the capture receipt. A
 caller whose payment was held for review polls its case at
 `<surface route>/.well-known/payment-cases/{case_id}`, answered only to the same authenticated
 caller ([Polling a held payment](CONFIGURATION_REFERENCE.md#polling-a-held-payment-caller)).

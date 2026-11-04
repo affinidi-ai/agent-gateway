@@ -466,8 +466,7 @@ fn is_chargeable_parsed(
             let filters = policy.charged_a2a_filters();
             let message_charged = |parsed: Option<&Value>| {
                 crate::x402::middleware::a2a_requires_payment_parsed(
-                    Some(filters.as_slice()),
-                    None,
+                    filters.as_slice(),
                     body_is_empty,
                     parsed,
                     "agent_pay",
@@ -704,7 +703,6 @@ impl Intake {
             .map(|rail| rail.as_str().to_string()),
             amount,
             currency,
-            response_header: None,
         };
         Some(Self {
             chargeable,
@@ -1968,10 +1966,11 @@ impl Receipt {
     /// Settles held funds by what a Target answered and adds the receipt to the
     /// answer. A buffered body is judged before it is returned and carries the
     /// capture receipt. A successful streamed body is returned at once, with the
-    /// authorization receipt in its headers and messages; it is captured when the
+    /// authorization receipt in its headers and messages; it is captured once a
+    /// JSON-RPC result (any body bytes, without JSON-RPC) is passed on or the
     /// stream completes without a JSON-RPC error event, voided when the upstream
-    /// stream fails or the client goes away first, and an event stream ends with
-    /// a `payment-receipt` event carrying the capture receipt.
+    /// stream fails or the client goes away before either, and an event stream
+    /// ends with a `payment-receipt` event carrying the capture receipt.
     pub(crate) async fn settle_response(
         &self,
         protocol: &ChannelProtocol,
@@ -3277,7 +3276,7 @@ impl Drop for Abandoned {
             "A paid request was cancelled before its payment was recorded; the reconciler settles it"
         );
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(crate::payments_ledger::record(row, tenant_id));
+            runtime.spawn(crate::payments_ledger::record_cancelled(row, tenant_id));
         }
     }
 }
@@ -4981,22 +4980,61 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_upstream_stream_voids() {
+    async fn a_failed_upstream_stream_voids_unless_a_result_was_passed_on() {
         use crate::payments_ledger::{SettleAction, settlement::SettlementStatus};
 
-        let (receipt, settlement) = streaming_held_receipt("auth-s3", SettlementStatus::Voided).await;
+        for (id, chunks, expected) in [
+            ("auth-s3", vec![Ok("data: {\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n\n"), Err("reset")], SettleAction::Void),
+            (
+                "auth-s3r",
+                vec![Ok("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"), Err("reset")],
+                SettleAction::Capture,
+            ),
+        ] {
+            let (receipt, settlement) = streaming_held_receipt(id, SettlementStatus::Captured).await;
+            let response = receipt
+                .settle_response(&ChannelProtocol::Mcp, event_stream(chunks))
+                .await;
+            assert!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(settled_actions(&settlement), vec![expected], "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_leaving_a_stream_after_a_result_was_passed_on_is_captured() {
+        use crate::payments_ledger::{SettleAction, settlement::SettlementStatus};
+
+        let (receipt, settlement) = streaming_held_receipt("auth-s6", SettlementStatus::Captured).await;
         let response = receipt
             .settle_response(
-                &ChannelProtocol::Mcp,
-                event_stream(vec![Ok("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"), Err("reset")]),
+                &ChannelProtocol::A2a,
+                event_stream(vec![
+                    Ok("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"kind\":\"task\"}}\n\n"),
+                    Ok("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"final\":true}}\n\n"),
+                ]),
             )
             .await;
-        assert!(
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .is_err()
-        );
-        assert_eq!(settled_actions(&settlement), vec![SettleAction::Void]);
+        let mut stream = response
+            .into_body()
+            .into_data_stream();
+        futures::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stream);
+        drop(receipt);
+        for _ in 0..200 {
+            if !settled_actions(&settlement).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(settled_actions(&settlement), vec![SettleAction::Capture], "captured once, never voided");
     }
 
     #[tokio::test]

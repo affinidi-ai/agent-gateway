@@ -56,8 +56,6 @@ pub struct ProxyState {
     pub policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
     pub gateway_policy_manager: Option<Arc<crate::policies::GatewayPolicyManager>>,
     pub didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
-    pub transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-    pub mpp_transaction_store: Option<Arc<crate::mpp::MppTransactionStore>>,
 
     /// Optional trust registry listener manager for agent trust OPA context building
     pub trust_registry_listener_manager: Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>,

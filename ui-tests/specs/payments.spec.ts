@@ -386,15 +386,20 @@ async function mockLedgerApis(page: Page, options: { legacy?: boolean } = {}) {
 }
 
 test.describe("Payments page while agent-pay is off", () => {
-  test("is not offered and sends a visit back to the dashboard", async ({
+  test("is still offered and shows the payments and the legacy history", async ({
     page,
   }) => {
     await withFeatureFlag(page, "agent_pay_delegation", false);
+    await mockLedgerApis(page, { legacy: true });
     await page.goto(`${BASE_URL}/x402payments`);
 
-    await expect(page.getByTestId("nav-payments")).toHaveCount(0);
-    await expect(page.getByTestId("page-payments")).toHaveCount(0);
-    await expect(page).not.toHaveURL(/\/payments/);
+    await expect(page).toHaveURL(/\/payments$/);
+    await expect(page.getByTestId("nav-payments")).toBeVisible();
+    await expect(page.getByTestId("page-payments")).toBeVisible();
+    await expect(page.getByTestId("payments-row-pay-1")).toContainText("Paid");
+    await expect(
+      page.getByTestId("payments-legacy-row-x402-tx-1"),
+    ).toContainText("$0.01");
   });
 });
 
