@@ -363,14 +363,14 @@ async fn forward_header_passes_on_only_a_verified_token() {
 
     let client = reqwest::Client::new();
     let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
-    let token = |issuer: &str, exp: u64| {
+    let sign = |issuer: &str, exp: u64| {
         sign_jwt(json!({"iss": issuer, "sub": "user-e2e", "aud": "any", "exp": exp, "iat": now_secs()}), &fixture.kid)
     };
 
     for (case, token, forwarded) in [
-        ("valid", token(&fixture.issuer, now_secs() + 300), true),
-        ("expired", token(&fixture.issuer, now_secs() - 3600), false),
-        ("another issuer", token("https://other-issuer.example", now_secs() + 300), false),
+        ("valid", sign(&fixture.issuer, now_secs() + 300), true),
+        ("expired", sign(&fixture.issuer, now_secs() - 3600), false),
+        ("another issuer", sign("https://other-issuer.example", now_secs() + 300), false),
     ] {
         let resp = client
             .post(&h.gateway_url)

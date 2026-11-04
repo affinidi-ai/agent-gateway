@@ -1519,10 +1519,9 @@ fn enforce_audience(
     }
 }
 
-/// [`enforce_audience`], then, for a tenant connection, refuse an audience an
-/// endpoint of a tenant it cannot reference serves, whatever its allowlist
-/// holds ([`crate::sts::resource_owners::ensure_client_may_target`]). The
-/// gateway's own issuer is no endpoint's resource, so it is not looked up.
+/// [`enforce_audience`], then
+/// [`crate::sts::resource_owners::ensure_client_may_target`] for any audience
+/// but the gateway's own issuer, whatever the allowlist holds.
 async fn enforce_audience_and_ownership(
     state: &StsState,
     record: &StsClientRecord,
@@ -1530,17 +1529,15 @@ async fn enforce_audience_and_ownership(
     self_issuer: &str,
 ) -> Result<(), StsError> {
     enforce_audience(record, audience, Some(self_issuer))?;
-    match audience.filter(|audience| *audience != self_issuer) {
-        Some(audience) => {
-            crate::sts::resource_owners::ensure_client_may_target(
-                state.resource_owners.as_ref(),
-                record.tenant_id.as_deref(),
-                audience,
-            )
-            .await
-        }
-        None => Ok(()),
-    }
+    let Some(audience) = audience.filter(|audience| *audience != self_issuer) else {
+        return Ok(());
+    };
+    crate::sts::resource_owners::ensure_client_may_target(
+        state.resource_owners.as_ref(),
+        record.tenant_id.as_deref(),
+        audience,
+    )
+    .await
 }
 
 /// Enforce a managed connection's optional subject-audience allowlist against a
@@ -2248,48 +2245,39 @@ mod tests {
         let theirs = "https://gateway.example/surfaces/b";
         let ours = "https://gateway.example/surfaces/a";
         let third_party = "https://api.example.com";
-        let stale = vec![theirs.to_string(), ours.to_string(), third_party.to_string()];
+        let exp = now_secs() + 90;
+        let grant = |jti: &str| json!({"iss": gateway, "sub": "user-123", "aud": gateway, "client_id": "agent-client", "jti": jti, "exp": exp});
 
-        for (tenant_id, allowed_audiences) in
-            [(Some("tenant-a"), Vec::new()), (Some("tenant-a"), stale.clone()), (None, Vec::new()), (None, stale)]
-        {
+        for (tenant_id, allowed_audiences) in [
+            (Some("tenant-a"), Vec::new()),
+            (Some("tenant-a"), vec![theirs.to_string(), ours.to_string(), third_party.to_string()]),
+            (None, Vec::new()),
+        ] {
             let mut record = base_record();
             record.tenant_id = tenant_id.map(Into::into);
             record.allowed_audiences = allowed_audiences.clone();
             record.issue_id_jag = true;
-            let cases = [
-                (theirs, TOKEN_TYPE_ACCESS_TOKEN, tenant_id.is_some()),
-                (theirs, TOKEN_TYPE_ID_JAG, tenant_id.is_some()),
-                (ours, TOKEN_TYPE_ACCESS_TOKEN, false),
-                (third_party, TOKEN_TYPE_ACCESS_TOKEN, false),
-                (gateway, TOKEN_TYPE_ID_JAG, false),
-            ];
-            let mut claims = HashMap::from([(
-                "subject-tok".to_string(),
-                json!({"iss": "https://idp.example/", "sub": "user-123", "exp": now_secs() + 90}),
-            )]);
-            let assertions: Vec<String> = cases
-                .iter()
-                .enumerate()
-                .map(|(index, _)| {
-                    let grant = json!({
-                        "iss": gateway, "sub": "user-123", "aud": gateway, "client_id": "agent-client",
-                        "jti": format!("grant-{index}"), "exp": now_secs() + 90
-                    });
-                    let assertion = id_jag_assertion(&grant);
-                    claims.insert(assertion.clone(), grant);
-                    assertion
-                })
+            let claims = [theirs, ours, third_party]
+                .map(|audience| (id_jag_assertion(&grant(audience)), grant(audience)))
+                .into_iter()
+                .chain([(
+                    "subject-tok".to_string(),
+                    json!({"iss": "https://idp.example/", "sub": "user-123", "exp": exp}),
+                )])
                 .collect();
             let state = StsState {
                 resource_owners: Arc::new(Declared),
                 ..state_with(claims, client(record, Some("s3cret")))
             };
 
-            for ((audience, requested, refused), assertion) in cases
-                .into_iter()
-                .zip(assertions)
-            {
+            for (audience, requested) in [
+                (theirs, TOKEN_TYPE_ACCESS_TOKEN),
+                (theirs, TOKEN_TYPE_ID_JAG),
+                (ours, TOKEN_TYPE_ACCESS_TOKEN),
+                (third_party, TOKEN_TYPE_ACCESS_TOKEN),
+                (gateway, TOKEN_TYPE_ID_JAG),
+            ] {
+                let refused = audience == theirs && tenant_id.is_some();
                 let case = format!("{tenant_id:?} {allowed_audiences:?} {audience} {requested}");
                 let mut exchange = exchange_form();
                 exchange.audience = Some(audience.into());
@@ -2298,7 +2286,7 @@ mod tests {
                 if requested == TOKEN_TYPE_ACCESS_TOKEN {
                     forms.push(TokenEndpointForm {
                         grant_type: Some(GRANT_TYPE_JWT_BEARER.into()),
-                        assertion: Some(assertion),
+                        assertion: Some(id_jag_assertion(&grant(audience))),
                         client_id: Some("agent-client".into()),
                         client_secret: Some("s3cret".into()),
                         audience: Some(audience.into()),

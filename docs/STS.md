@@ -235,10 +235,8 @@ Per-connection controls:
   genuinely external audiences still require an entry. On a connection that
   carries a `tenant_id`, the token endpoint refuses, with `invalid_target`,
   a resource served by a surface or standalone MCP Proxy of a tenant the
-  connection **cannot** reference, as the requested `audience` or `resource`
-  of a token exchange, an ID-JAG or a jwt-bearer redemption, whether
-  `allowed_audiences` is empty or lists it. This covers the base Access
-  Point, enabled variants and their Transit Points. Create and update reject such an entry
+  connection **cannot** reference. This covers the base Access Point, enabled
+  variants and their Transit Points. Create and update reject such an entry
   with `400` as early feedback. Minting checks again, so it also covers
   resources declared after the connection was saved and endpoints moved
   between tenants. A Resource Server accepts a token on issuer, audience and
@@ -252,7 +250,9 @@ Per-connection controls:
   be created before the surface it will target exists. Appliance-global
   connections are administrator-created and unrestricted. Ownership reads the
   network configuration loaded at startup, so restart after changing listener
-  `external_urls`.
+  `external_urls`. Every grant runs this ownership check: token exchange,
+  ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
+  empty or lists the resource.
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.
