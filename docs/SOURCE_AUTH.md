@@ -41,11 +41,18 @@ Point, identifies callers by the same claim.
 - Choose a claim that is unique to one person and that the identity provider never lets them
   change. Microsoft Entra's `sub` is different for each application, so a caller's `sub` in one
   application differs from their `sub` in another; use `oid`, which is the same across a
-  tenant's applications. A claim a person can edit, such as an email address they control, lets
-  them take another person's name.
+  tenant's applications. The issuer is part of the hash too, so set `expected_issuer` to the v2
+  issuer, `https://login.microsoftonline.com/{tenant-id}/v2.0`, and have the agent's API issue
+  v2 access tokens (`requestedAccessTokenVersion: 2` in its app registration manifest). A v1
+  access token carries `https://sts.windows.net/{tenant-id}/` instead, so the same `oid` would
+  be another caller, and the strategy refuses the token. A claim a person can edit, such as an
+  email address they control, lets them take another person's name.
 - The value must be a non-empty string. A token without the claim, or with a value that is
   empty or not a string, is valid but names no caller: an Access Point answers `403`
-  `identity-required` to a request that needs one, and no delegated credential is given.
+  `identity-required` to a request that needs one, and no delegated credential is given. A
+  policy still sees the request as authenticated, with `input.source_auth.subject` set to the
+  placeholder `<none>`, and every such caller shares the per-caller limit key `jwt:<none>`, as a
+  token without `sub` does under the default.
 - The claim name is printable ASCII with no spaces, up to 128 characters. It names a top-level
   claim, matched case-sensitively: `Sub` is not `sub`, and `a.b` is a claim named `a.b`, not a
   path into `a`. Claims that name the token, its issuer, audience, client, tenant, session or
@@ -59,6 +66,10 @@ Point, identifies callers by the same claim.
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
   use another claim, create a new strategy, point the surface at it, and have callers connect
   again.
+- A release older than `principal_claim` loads a strategy that sets it without the field, and
+  drops it the next time it saves the strategy. The strategy then names callers by `sub`, and
+  every caller's identity hash changes. Downgrade only with strategies that leave the claim
+  unset, or restore the field before callers return.
 - Two strategies for the same issuer that name different claims never share a caller: the
   claim's name is part of the hash, so the same person through each is a different caller, with
   credentials of their own, and one person's value in one claim never stands for another
@@ -667,7 +678,7 @@ is:
 
 | Method | Principal | So |
 | --- | --- | --- |
-| `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
+| `jwt_bearer` | The value of the strategy's [`principal_claim`](#which-claim-names-a-jwt-caller) (`sub` by default) | One caller per issuer, subject and principal claim. A token without a non-empty string in that claim names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
 | `mtls` | The principal the `identity_binding` derives | One caller per trusted CA (its subject and key, or the pinned certificate) and bound principal |
