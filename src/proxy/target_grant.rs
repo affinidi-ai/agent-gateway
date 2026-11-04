@@ -542,11 +542,7 @@ pub(crate) fn target_binding_violation(
         TargetBindingViolation::AtTheOriginRoot
     } else if view.target_auth().is_some() {
         TargetBindingViolation::TargetAuth
-    } else if view
-        .source_auth_methods()
-        .iter()
-        .any(|auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header))
-    {
+    } else if view.forwards_caller_credential() {
         TargetBindingViolation::CallerCredentialForwarded
     } else if view.charges_callers() {
         TargetBindingViolation::CallersCharged

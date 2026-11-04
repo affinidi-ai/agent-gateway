@@ -1089,7 +1089,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 /// ([`fabric_caller_delegation_warnings`]), and each with external consent
 /// that a variant keeps under its own settings
 /// ([`inherited_external_point_warnings`]), as the Access Point Target's
-/// binding with external consent ([`inherited_target_binding_warnings`]).
+/// binding with external consent ([`inherited_target_binding_warnings`]), and
+/// each enabled view that reaches that binding's vendor without it or a
+/// credential of its own ([`unbound_vendor_view_warnings`]).
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -1536,20 +1538,11 @@ fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
                 })
         })
         .filter(|(_, view)| {
-            view.target_external_credentials()
-                .is_none()
-                && view
-                    .target_auth()
-                    .is_none()
+            view.target_auth().is_none()
                 && view
                     .outbound_credentials
                     .is_empty()
-                && !view
-                    .source_auth_methods()
-                    .iter()
-                    .any(|auth| {
-                        matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header)
-                    })
+                && !view.forwards_caller_credential()
                 && origin(&view.target.endpoint).is_some_and(|view_origin| bound.contains(&view_origin))
         })
         .map(|(variant, view)| {
@@ -5805,6 +5798,16 @@ mod validation_tests {
                  https://mcp.vendor.example/mcp"
             )
         };
+        let api_key = serde_json::json!({ "type": "api_key",
+            "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "key" });
+        let jwt_bearer = |forward_header: bool| {
+            serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
+                "audiences": ["vendor"], "forward_header": forward_header })
+        };
+        let with_methods = |methods: serde_json::Value| {
+            serde_json::json!({ "outbound_credentials": [],
+                "access_point": { "caller_authentication": { "methods": methods } } })
+        };
         assert_eq!(
             unbound_vendor_view_warnings(&surface_with(
                 external.clone(),
@@ -5847,9 +5850,42 @@ mod validation_tests {
                         "static_secret": { "secret_id": "s", "header_name": "X-Api-Key" } } } } }),
                 ),
             ),
+            (
+                "a variant with another binding",
+                surface_with(
+                    external.clone(),
+                    true,
+                    serde_json::json!({ "outbound_credentials": [{ "credential_provider_id": "agent-keyed" }] }),
+                ),
+            ),
+            (
+                "a variant forwarding the caller's JWT on its first method",
+                surface_with(
+                    external.clone(),
+                    true,
+                    with_methods(serde_json::json!([jwt_bearer(true), api_key.clone()])),
+                ),
+            ),
+            (
+                "a variant forwarding the caller's JWT on a later method",
+                surface_with(
+                    external.clone(),
+                    true,
+                    with_methods(serde_json::json!([api_key.clone(), jwt_bearer(true)])),
+                ),
+            ),
         ] {
             assert!(unbound_vendor_view_warnings(&surface).is_empty(), "{case}");
         }
+        assert_eq!(
+            unbound_vendor_view_warnings(&surface_with(
+                external.clone(),
+                true,
+                with_methods(serde_json::json!([api_key.clone(), jwt_bearer(false)]))
+            )),
+            vec![warning("Variant 'copy'")],
+            "a JWT method that does not forward the caller's token is no credential of the variant's own"
+        );
     }
 
     /// A variant created from another keeps no binding with external consent

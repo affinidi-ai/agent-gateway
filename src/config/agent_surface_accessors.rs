@@ -83,6 +83,16 @@ impl AgentSurface {
             .map_or(&[], |ca| ca.methods.as_slice())
     }
 
+    /// Whether any caller-authentication method forwards the caller's own
+    /// credential to the Target (`jwt_bearer` with `forward_header`).
+    pub fn forwards_caller_credential(&self) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .any(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
     #[inline]
     pub fn has_source_auth(&self) -> bool {
         !self
