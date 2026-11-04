@@ -773,8 +773,7 @@ async fn direct_consent_keys_the_grant_by_the_caller_agent_without_the_switch() 
         state
             .agent_did
             .starts_with("did:"),
-        "{}",
-        state.agent_did
+        "the grant is kept under the agent DID the caller named"
     );
     assert_ne!(state.agent_did, SURFACE_ID);
     let grants = receiver.grants().await;
