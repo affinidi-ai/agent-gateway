@@ -461,6 +461,65 @@ async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_the
     assert_eq!(values("x-caller-context"), ["kept"], "headers that are not caller-info headers still pass");
 }
 
+/// The consent binding cookie never reaches a managed agent, and a managed
+/// agent cannot set one in the caller's browser: an Access Point passes no
+/// cookie either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_consent_binding_cookie_is_neither_forwarded_nor_set_by_the_agent() {
+    let target = helpers::RecordingTarget::start(
+        axum::http::StatusCode::OK,
+        &[
+            ("set-cookie", "agent_sid=1; Path=/"),
+            ("set-cookie", "__Host-ag_consent_planted=attacker; Path=/; Secure"),
+            ("set-cookie", "ag_consent=attacker"),
+        ],
+    )
+    .await;
+    let target_url = target.url.clone();
+    let h = GatewayHarness::start(move |_, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = target_url;
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("cookie", "app=1; __Host-ag_consent_abcdef=binding-secret; other=2")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 200);
+    let set: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(set.is_empty(), "{set:?}");
+
+    let received = target.received();
+    assert_eq!(received.len(), 1);
+    let cookies: Vec<_> = received[0]
+        .get_all("cookie")
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(cookies.is_empty(), "{cookies:?}");
+}
+
 // ── Surface variant URL routing (plan §2.3) ─────────────────────────────────
 
 /// Plan §2.3: a request whose URL matches `/route$alias[/rest]` selects the

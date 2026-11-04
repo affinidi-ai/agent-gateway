@@ -346,6 +346,14 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_response_iss_parameter_supported: Option<bool>,
 
+    /// The `iss` (RFC 9207) the authorization server of an authorization code
+    /// provider without an `issuer` puts on its authorization responses, set by
+    /// the operator. When set, a consent callback without this exact `iss` is
+    /// refused; when unset, `iss` is ignored. It does not make the provider an
+    /// external consent provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_response_issuer: Option<String>,
+
     /// How the scopes an external consent provider's token endpoint grants are
     /// compared with those asked for: exactly by default. An external consent
     /// provider only, fixed for its life.
@@ -534,6 +542,72 @@ impl CredentialProvider {
         self.issuer.is_some()
     }
 
+    /// Whether a person grants this provider's credential through the gateway's
+    /// consent start page and OAuth callback: an authorization code provider
+    /// without an `issuer`.
+    pub fn uses_legacy_consent(&self) -> bool {
+        self.provider_type == CredentialProviderType::OAuth2AuthorizationCode && self.issuer.is_none()
+    }
+
+    /// The redirect URI of the gateway's consent flow: `callback_url`, or
+    /// `gateway_base_url` followed by `callback_path`.
+    pub fn redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> String {
+        self.callback_url
+            .clone()
+            .unwrap_or_else(|| format!("{gateway_base_url}{}", self.callback_path))
+    }
+
+    /// The redirect URI parsed, when it is one the consent flow may use: an
+    /// https URL with a host and no credentials, query or fragment, whose path
+    /// ends in `callback_path`, the path the callback route answers on.
+    pub fn consent_redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> Result<url::Url, &'static str> {
+        let url = url::Url::parse(&self.redirect_uri(gateway_base_url))
+            .map_err(|_| "callback_url must be an https URL with a host")?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url) || url.host().is_none() {
+            return Err("callback_url must be an https URL with a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+            return Err("callback_url must not carry credentials, a query or a fragment");
+        }
+        if self.callback_path.is_empty()
+            || !url
+                .path()
+                .ends_with(&self.callback_path)
+        {
+            return Err("callback_url path must end in the provider's callback_path");
+        }
+        Ok(url)
+    }
+
+    /// Why `authorization_response_issuer` may not be stored on this provider:
+    /// only an authorization code provider without an `issuer` takes it, and
+    /// only as an https URL with a host and no credentials, query or fragment.
+    pub fn authorization_response_issuer_error(&self) -> Option<&'static str> {
+        let issuer = self
+            .authorization_response_issuer
+            .as_deref()?;
+        if !self.uses_legacy_consent() {
+            return Some(
+                "authorization_response_issuer is allowed only on an oauth2_authorization_code provider without issuer",
+            );
+        }
+        let valid = url::Url::parse(issuer).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        });
+        (!valid).then_some("authorization_response_issuer must be an https URL with a host and no query or fragment")
+    }
+
     /// Whether this provider may use a secret of `secret_tenant_id`. An
     /// external consent provider uses its own tenant's secrets only, an
     /// untenanted one untenanted secrets only, since its client authenticates
@@ -550,6 +624,65 @@ impl CredentialProvider {
         }
         crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
     }
+}
+
+/// Another consent-flow provider, of any tenant, whose redirect URI is
+/// `provider`'s. Each redirect URI names one provider, so the vendor's
+/// redirect identifies it.
+pub async fn redirect_uri_taken_by(
+    store: &dyn storage::CredentialProviderStorage,
+    provider: &CredentialProvider,
+    gateway_base_url: &str,
+) -> anyhow::Result<Option<CredentialProvider>> {
+    let Ok(own) = url::Url::parse(&provider.redirect_uri(gateway_base_url)) else {
+        return Ok(None);
+    };
+    Ok(store
+        .list()
+        .await?
+        .into_iter()
+        .find(|other| {
+            other.id != provider.id
+                && other.uses_legacy_consent()
+                && url::Url::parse(&other.redirect_uri(gateway_base_url)).is_ok_and(|url| url == own)
+        }))
+}
+
+/// Logs an ERROR for each pair of consent-flow providers that share a redirect
+/// URI, naming both by id only, and returns the pairs. Both providers' consent
+/// fails closed at the start page until one of them gets another redirect URI.
+pub fn log_redirect_uri_conflicts<'provider>(
+    providers: &'provider [CredentialProvider],
+    gateway_base_url: &str,
+) -> Vec<(&'provider str, &'provider str)> {
+    let redirect_uris: Vec<_> = providers
+        .iter()
+        .filter(|provider| provider.uses_legacy_consent())
+        .filter_map(|provider| {
+            url::Url::parse(&provider.redirect_uri(gateway_base_url))
+                .ok()
+                .map(|url| (provider.id.as_str(), url))
+        })
+        .collect();
+    let mut conflicts = Vec::new();
+    for (index, (id, url)) in redirect_uris
+        .iter()
+        .enumerate()
+    {
+        for (other_id, other_url) in &redirect_uris[index + 1..] {
+            if url == other_url {
+                tracing::error!(
+                    target: "credential_delegation",
+                    provider_id = %id,
+                    other_provider_id = %other_id,
+                    "Two credential providers share a redirect URI, so consent for both is refused; give one a \
+                     callback_url on a distinct host, or recreate it with a distinct provider_id"
+                );
+                conflicts.push((*id, *other_id));
+            }
+        }
+    }
+    conflicts
 }
 
 /// Request to create a new credential provider
@@ -602,6 +735,8 @@ pub struct CreateCredentialProviderRequest {
     pub scope_comparison: scope_comparison::ScopeComparison,
     #[serde(default)]
     pub revocation_ends_authorization: bool,
+    #[serde(default)]
+    pub authorization_response_issuer: Option<String>,
 }
 
 /// Request to update an existing credential provider
@@ -659,6 +794,9 @@ pub struct UpdateCredentialProviderRequest {
     /// Never changes a provider: a value other than the stored one is refused.
     #[serde(default)]
     pub revocation_ends_authorization: Option<bool>,
+    /// A blank value clears the stored one.
+    #[serde(default)]
+    pub authorization_response_issuer: Option<String>,
 }
 
 /// Request to check a provider before it is saved: the token endpoint's reachability and,
@@ -774,6 +912,72 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consent_provider(
+        id: &str,
+        slug: &str,
+        callback_url: Option<&str>,
+    ) -> CredentialProvider {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "tenant_id": format!("tenant-of-{id}"), "name": "N", "provider_id": slug,
+            "callback_path": format!("/v1/identity/oauth/callback/{slug}"), "callback_url": callback_url,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    /// Each pair of consent providers sharing a redirect URI is logged once as
+    /// an ERROR naming both by id, and nothing else about them; providers with
+    /// distinct redirect URIs, or outside the consent flow, are not.
+    #[test]
+    fn shared_redirect_uris_are_logged_as_errors_by_provider_id() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut client_credentials = consent_provider("cc", "github", None);
+        client_credentials.provider_type = CredentialProviderType::OAuth2ClientCredentials;
+        let distinct = [
+            consent_provider("a", "github", None),
+            consent_provider("b", "github", Some("https://other.example/v1/identity/oauth/callback/github")),
+            consent_provider("c", "gitlab", None),
+            client_credentials,
+        ];
+        assert!(log_redirect_uri_conflicts(&distinct, "https://gw.example").is_empty());
+        assert!(
+            !logs
+                .text()
+                .contains("redirect URI"),
+            "{}",
+            logs.text()
+        );
+
+        let shared = [
+            consent_provider("a", "github", None),
+            consent_provider("b", "github", None),
+            consent_provider("c", "github", Some("https://gw.example:443/v1/identity/oauth/callback/github")),
+            consent_provider("d", "gitlab", None),
+        ];
+        assert_eq!(log_redirect_uri_conflicts(&shared, "https://gw.example"), [("a", "b"), ("a", "c"), ("b", "c")]);
+        let lines: Vec<_> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("share a redirect URI"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("ERROR")),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("provider_id=a") && lines[0].contains("other_provider_id=b"), "{}", lines[0]);
+        assert!(
+            !logs
+                .text()
+                .contains("tenant-of-"),
+            "no tenant is named: {}",
+            logs.text()
+        );
+    }
 
     #[test]
     fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
@@ -987,6 +1191,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         }
@@ -1123,6 +1328,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         };

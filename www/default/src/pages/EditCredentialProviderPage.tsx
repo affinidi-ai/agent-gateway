@@ -23,6 +23,7 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
+  callbackUrlFor,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderForm extends JwtFormFields {
@@ -39,6 +40,8 @@ interface CredentialProviderForm extends JwtFormFields {
   additional_params: string;
   description: string;
   callback_host: string;
+  /** The callback path the gateway stored for an existing provider; empty for a new one. */
+  callback_path: string;
   /** The stored resource, shown only through the Entra warning; never sent on save. */
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
@@ -64,6 +67,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   additional_params: '',
   description: '',
   callback_host: '',
+  callback_path: '',
   resource: '',
   issuer: '',
   ...EMPTY_JWT_FIELDS,
@@ -161,6 +165,7 @@ const EditCredentialProviderPage: React.FC = () => {
           : '',
         description: data.description ?? '',
         callback_host: callbackHost,
+        callback_path: data.callback_path ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         ...jwtFieldsOf(data),
@@ -255,8 +260,12 @@ const EditCredentialProviderPage: React.FC = () => {
         form.callback_host &&
         routingConfig
       ) {
-        const callbackPath = `${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-        body.callback_url = `${form.callback_host}${callbackPath}`;
+        body.callback_url = callbackUrlFor(
+          form.callback_host,
+          routingConfig.oauth_callback_route,
+          form.provider_id,
+          form.callback_path
+        );
       }
 
       await run(
@@ -621,13 +630,23 @@ const EditCredentialProviderPage: React.FC = () => {
                       <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
                         <i className="fas fa-info-circle me-2"></i>
                         <strong>Callback URL:</strong>{' '}
-                        {`${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`}
+                        {callbackUrlFor(
+                          form.callback_host,
+                          routingConfig.oauth_callback_route,
+                          form.provider_id,
+                          form.callback_path
+                        )}
                         <button
                           type="button"
                           className="btn btn-xs ms-2"
                           style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
                           onClick={e => {
-                            const url = `${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
+                            const url = callbackUrlFor(
+                              form.callback_host,
+                              routingConfig.oauth_callback_route,
+                              form.provider_id,
+                              form.callback_path
+                            );
                             navigator.clipboard.writeText(url);
                             const btn = e.currentTarget as HTMLButtonElement;
                             const originalHtml = btn.innerHTML;

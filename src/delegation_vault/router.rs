@@ -71,25 +71,29 @@ pub fn create_delegation_vault_router(
     router.with_state(state)
 }
 
-/// Create the OAuth callback router.
-/// This is the only delegation-vault route that must remain public, because
-/// the user's browser is redirected here from the OAuth provider.
+/// Create the OAuth consent router: the consent start page and its POST, and
+/// the callback. These delegation-vault routes must remain public, because the
+/// person's browser opens the start page and the OAuth provider redirects it
+/// to the callback.
 pub fn create_delegation_vault_oauth_router(state: DelegationVaultState) -> Router {
     let callback_route = format!("{}/{{provider_id}}", state.oauth_callback_route);
     Router::new()
         .route(&callback_route, get(handlers::oauth_callback))
+        .route(&format!("{callback_route}/start"), get(handlers::consent_start_page).post(handlers::consent_start))
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::events::DelegationFailureReason;
     use crate::audit::producer::capture;
     use crate::auth::storage::{PasskeyStorage, UserData};
     use crate::auth::types::{UserRole, UserStatus};
     use crate::auth_manager::middleware::AuthGuardOk;
     use crate::auth_manager::pat::{PatContext, PatDelegationContext};
     use crate::credential_providers::CredentialProvider;
+    use crate::credential_providers::storage::CredentialProviderStorage as _;
     use crate::delegation_vault::audit::DelegationAuditAction;
     use crate::delegation_vault::storage::DelegationVaultStorage;
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
@@ -378,108 +382,89 @@ mod tests {
             .as_u16()
     }
 
-    /// A callback that fails before the credential is stored leaves its state
-    /// unused, so the user can retry the same callback instead of starting over.
+    /// A callback that is refused before the code is exchanged leaves its state
+    /// unused, so the same callback can be retried once the cause is fixed.
     #[tokio::test]
-    async fn a_callback_that_fails_before_storing_does_not_use_up_its_state() {
-        let state = crate::delegation_vault::OAuthState {
-            agent_did: "did:web:agent.example".to_string(),
-            user_identity_hash: "sha256:user".to_string(),
-            surface_id: "surface".to_string(),
-            credential_provider_id: "deleted-provider".to_string(),
-            provider_id: "github".to_string(),
-            nonce: uuid::Uuid::new_v4().to_string(),
-            expires_at: Utc::now() + chrono::Duration::minutes(10),
-            code_verifier: None,
-        };
-        let encoded = crate::delegation_vault::oauth::encode_oauth_state(&state).unwrap();
-        let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
+    async fn a_callback_refused_before_the_exchange_does_not_use_up_its_state() {
+        let fixture = consent::Fixture::new().await;
+        let (callback_state, cookie) = fixture.begin().await;
+        fixture
+            .providers
+            .delete(consent::PROVIDER_ID)
+            .await
+            .unwrap();
         for attempt in 0..2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/v1/identity/oauth/callback/github?code=code&state={encoded}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body = String::from_utf8_lossy(&body);
-            assert!(body.contains("Credential provider configuration not found"), "attempt {attempt}: {body}");
-            assert!(!body.contains("already used"), "attempt {attempt}: {body}");
+            let refused = fixture
+                .callback("github", &format!("code=code&state={callback_state}"), Some(&cookie))
+                .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&cookie)));
+            assert_eq!(fixture.token_calls(), 0, "attempt {attempt}");
+            assert_eq!(fixture.vault_records(), 0, "attempt {attempt}");
         }
+        let decoded = crate::delegation_vault::oauth::decode_callback_state(&callback_state).unwrap();
         assert!(
-            crate::delegation_vault::oauth::claim_oauth_state(&state).await,
-            "the failed callbacks left the state unused"
+            crate::delegation_vault::oauth::claim_oauth_state(&decoded).await,
+            "the refused callbacks left the state unused"
         );
     }
 
+    /// A vendor error shows the fixed page: `error` is logged only when it is
+    /// `[A-Za-z0-9_]{1,128}`, `error_description` never.
     #[tokio::test]
-    async fn a_callback_whose_path_names_another_provider_than_its_state_is_refused() {
-        let state = crate::delegation_vault::OAuthState {
-            agent_did: "did:web:agent.example".to_string(),
-            user_identity_hash: "sha256:user".to_string(),
-            surface_id: "surface".to_string(),
-            credential_provider_id: "deleted-provider".to_string(),
-            provider_id: "github".to_string(),
-            nonce: uuid::Uuid::new_v4().to_string(),
-            expires_at: Utc::now() + chrono::Duration::minutes(10),
-            code_verifier: None,
-        };
-        let encoded = crate::delegation_vault::oauth::encode_oauth_state(&state).unwrap();
-        let response = create_delegation_vault_oauth_router(state_with(Vec::new()))
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v1/identity/oauth/callback/gitlab?code=code&state={encoded}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("does not match its provider"), "{body}");
-        assert!(
-            crate::delegation_vault::oauth::claim_oauth_state(&state).await,
-            "the refused callback left the state unused"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_provider_error_on_the_callback_logs_only_the_oauth_error_code() {
+    async fn a_provider_error_on_the_callback_shows_the_fixed_page_and_logs_only_a_valid_code() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
-        let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
-        for query in [
-            "error=access_denied&error_description=description-marker",
-            "error=bad%22quote&error_description=description-marker",
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/v1/identity/oauth/callback/github?{query}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
+        let fixture = consent::Fixture::new().await;
+        let (results, events) = capture(async {
+            let mut results = Vec::new();
+            for query in [
+                "error=access_denied&error_description=description-marker",
+                "error=bad%22quote&error_description=%3Cscript%3Edescription-marker",
+                &format!("error={}", "a".repeat(129)),
+            ] {
+                results.push(
+                    fixture
+                        .callback("github", query, None)
+                        .await,
+                );
+            }
+            results
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+            assert!(
+                !refused
+                    .body
+                    .contains("description-marker"),
+                "{}",
+                refused.body
+            );
+            assert!(
+                !refused
+                    .body
+                    .contains("access_denied"),
+                "{}",
+                refused.body
+            );
         }
+        assert_eq!(
+            consent::reasons(&events),
+            [
+                DelegationFailureReason::ConsentDenied,
+                DelegationFailureReason::ConsentResponseInvalid,
+                DelegationFailureReason::ConsentResponseInvalid
+            ]
+        );
         let lines: Vec<_> = logs
             .text()
             .lines()
             .filter(|line| line.contains("OAuth provider returned an error"))
             .map(str::to_string)
             .collect();
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].contains("oauth_error=access_denied"), "{}", lines[0]);
         assert!(lines[1].contains("oauth_error=unrecognized_error"), "{}", lines[1]);
+        assert!(lines[2].contains("oauth_error=unrecognized_error"), "{}", lines[2]);
         assert!(
             !logs
                 .text()
@@ -488,10 +473,971 @@ mod tests {
             logs.text()
         );
         assert!(!logs.text().contains("quote"), "{}", logs.text());
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// Start page, start POST, vendor and callback in one browser store one
+    /// credential keyed by agent, user and provider, and clear the cookie. An
+    /// `iss` from a provider without a recorded issuer changes nothing.
+    #[tokio::test]
+    async fn consent_in_one_browser_stores_one_credential_and_clears_the_binding_cookie() {
+        let fixture = consent::Fixture::new().await;
+        let start_url = fixture.start_url();
+        let start = url::Url::parse(&start_url).unwrap();
+        assert_eq!(start.path(), "/v1/identity/oauth/callback/github/start");
+        assert_eq!(
+            start
+                .origin()
+                .ascii_serialization(),
+            "https://198.51.100.7"
+        );
+        let page = fixture
+            .get(&consent::local(&start_url), &[])
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+
+        let started = fixture
+            .start_post(&consent::start_state(&start_url), &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        assert_eq!(started.header("cache-control"), Some("no-store"));
+        assert_eq!(started.header("referrer-policy"), Some("no-referrer"));
+        let vendor = url::Url::parse(
+            started
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            vendor
+                .origin()
+                .ascii_serialization(),
+            "https://vendor.example"
+        );
+        let fields: std::collections::HashMap<_, _> = vendor
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(fields["client_id"], "github-client");
+        assert_eq!(fields["redirect_uri"], consent::REDIRECT_URI);
+        assert_eq!(fields["scope"], "repo read:user");
+        assert_eq!(fields["code_challenge_method"], "S256");
+        let set_cookie = started
+            .header("set-cookie")
+            .unwrap();
+        let (cookie, attributes) = set_cookie
+            .split_once(';')
+            .unwrap();
+        let name = consent::cookie_name(cookie);
+        assert!(name.starts_with("__Host-ag_consent_") && name.len() > "__Host-ag_consent_".len(), "{set_cookie}");
+        let max_age: i64 = attributes
+            .split(';')
+            .find_map(|attribute| {
+                attribute
+                    .trim()
+                    .strip_prefix("Max-Age=")
+            })
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((590..=600).contains(&max_age), "{set_cookie}");
+        assert_eq!(
+            attributes.replace(&format!(" Max-Age={max_age};"), ""),
+            " Path=/; Secure; HttpOnly; SameSite=Lax",
+            "a __Host- cookie on / with no Domain"
+        );
+        let start_state =
+            crate::delegation_vault::oauth::decode_start_state(&consent::start_state(&start_url)).unwrap();
+        let callback_state = crate::delegation_vault::oauth::decode_callback_state(&fields["state"]).unwrap();
+        assert!(callback_state.expires_at <= start_state.expires_at);
+        assert_ne!(callback_state.nonce, start_state.nonce);
+
+        let done = fixture
+            .callback(
+                "github",
+                &format!("code=vendor-code&state={}&iss=https%3A%2F%2Fattacker.example", fields["state"]),
+                Some(cookie),
+            )
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert_eq!(done.header("cache-control"), Some("no-store"));
+        assert_eq!(done.header("set-cookie"), Some(consent::cleared(&name).as_str()));
+        assert_eq!(fixture.token_calls(), 1);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            (
+                stored[0].agent_did.as_str(),
+                stored[0]
+                    .user_identity_hash
+                    .as_str(),
+                stored[0].provider_id.as_str()
+            ),
+            ("did:web:agent.example", "sha256:user", "github")
+        );
+    }
+
+    /// A forwarded or leaked callback URL, opened in a browser without the
+    /// binding cookie or with another one, is refused with 403 before the code
+    /// is exchanged.
+    #[tokio::test]
+    async fn a_callback_without_the_browsers_binding_cookie_is_refused() {
+        let fixture = consent::Fixture::new().await;
+        let (callback_state, own) = fixture.begin().await;
+        let (_, other_state) = fixture.begin().await;
+        let name = consent::cookie_name(&own);
+        let planted = format!("{}={}", consent::cookie_name(&other_state), own.split_once('=').unwrap().1);
+        let wrong_value = format!("{name}=not-a-binding");
+        let wrong_under_own_name = format!(
+            "{name}={}",
+            other_state
+                .split_once('=')
+                .unwrap()
+                .1
+        );
+        let query = format!("code=vendor-code&state={callback_state}");
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .callback("github", &query, None)
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&other_state))
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&planted))
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&wrong_value))
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&wrong_under_own_name))
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&format!("{wrong_value}; {own}")))
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::FORBIDDEN, Some(&name));
+        }
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::BrowserBindingMismatch; 6]);
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// Only a callback state, sealed by the start POST with a binding, reaches
+    /// the exchange: a start state and an older state without a binding are
+    /// refused at the callback, and a callback state at the start POST.
+    #[tokio::test]
+    async fn the_callback_and_the_start_post_each_take_only_their_own_stage_of_state() {
+        let fixture = consent::Fixture::new().await;
+        let start_state = consent::start_state(&fixture.start_url());
+        let older = crate::delegation_vault::oauth::encode_oauth_state(&crate::delegation_vault::OAuthState {
+            code_verifier: Some("verifier".to_string()),
+            ..crate::delegation_vault::oauth::decode_start_state(&start_state).unwrap()
+        })
+        .unwrap();
+        let (callback_state, cookie) = fixture.begin().await;
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .callback("github", &format!("code=c&state={start_state}"), Some(&cookie))
+                    .await,
+                fixture
+                    .callback("github", &format!("code=c&state={older}"), Some(&cookie))
+                    .await,
+                fixture
+                    .callback("github", "code=c", Some(&cookie))
+                    .await,
+                fixture
+                    .start_post(&callback_state, &[("origin", "https://198.51.100.7")])
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+        }
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid; 4]);
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// The callback's path must name the state's provider, and the provider the
+    /// state names must still have its id and slug and no `issuer`.
+    #[tokio::test]
+    async fn a_callback_for_another_or_a_changed_provider_is_refused() {
+        let fixture = consent::Fixture::new().await;
+        let (callback_state, cookie) = fixture.begin().await;
+        let query = format!("code=vendor-code&state={callback_state}");
+        let ((swapped, unplain), events) = capture(async {
+            (
+                fixture
+                    .callback("gitlab", &query, Some(&cookie))
+                    .await,
+                fixture
+                    .callback("git%3Bhub%0A", &query, Some(&cookie))
+                    .await,
+            )
+        })
+        .await;
+        let name = consent::cookie_name(&cookie);
+        consent::assert_refused(&swapped, StatusCode::BAD_REQUEST, Some(&name));
+        consent::assert_refused(&unplain, StatusCode::BAD_REQUEST, Some(&name));
+        let named: Vec<_> = events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::DelegationFailed { provider_id, .. } => provider_id.clone(),
+                _ => panic!("{event:?}"),
+            })
+            .collect();
+        assert_eq!(named, [Some("gitlab".to_string()), None], "only a plain slug from the path is recorded");
+
+        let mut external = fixture.provider();
+        external.issuer = Some("https://vendor.example".to_string());
+        let mut renamed = fixture.provider();
+        renamed.provider_id = "github-renamed".to_string();
+        let mut retyped = fixture.provider();
+        retyped.provider_type = crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials;
+        for changed in [external, renamed, retyped] {
+            fixture
+                .providers
+                .update(changed)
+                .await
+                .unwrap();
+            let (refused, events) = capture(async {
+                fixture
+                    .callback("github", &query, Some(&cookie))
+                    .await
+            })
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&name));
+            assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentProviderMismatch]);
+            assert_eq!(fixture.token_calls(), 0);
+            assert_eq!(fixture.vault_records(), 0);
+        }
+
+        fixture
+            .providers
+            .update(fixture.provider())
+            .await
+            .unwrap();
+        let accepted = fixture
+            .callback("github", &query, Some(&cookie))
+            .await;
+        assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+    }
+
+    /// The start page claims nothing and sets no cookie, so it may be fetched
+    /// any number of times; the start POST then succeeds once, and a second
+    /// POST of the same start state is refused.
+    #[tokio::test]
+    async fn the_start_page_has_no_side_effects_and_a_start_state_is_posted_once() {
+        let fixture = consent::Fixture::new().await;
+        let start_url = fixture.start_url();
+        for _ in 0..3 {
+            let page = fixture
+                .get(&consent::local(&start_url), &[])
+                .await;
+            assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+            assert_eq!(page.header("set-cookie"), None);
+            assert_eq!(page.header("cache-control"), Some("no-store"));
+            assert_eq!(page.header("referrer-policy"), Some("same-origin"));
+            assert_eq!(page.header("x-frame-options"), Some("DENY"));
+            assert!(
+                page.header("content-security-policy")
+                    .unwrap()
+                    .contains("frame-ancestors 'none'")
+            );
+            for shown in ["did:web:agent.example", "Agent Surface", "GitHub", "repo, read:user", "method=\"post\""] {
+                assert!(page.body.contains(shown), "{shown}: {}", page.body);
+            }
+        }
+        let state = consent::start_state(&start_url);
+        let first = fixture
+            .start_post(&state, &[("sec-fetch-site", "same-origin")])
+            .await;
+        assert_eq!(first.status, StatusCode::FOUND, "{}", first.body);
+        let (second, events) = capture(async {
+            fixture
+                .start_post(&state, &[("sec-fetch-site", "same-origin")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&second, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateReused]);
+        let after = fixture
+            .get(&consent::local(&start_url), &[])
+            .await;
+        assert_eq!(after.status, StatusCode::OK, "the page still shows the link it describes");
+    }
+
+    /// A start POST another site's page sends is refused, so a cross-site form
+    /// cannot skip the start page and bind a victim's browser to someone else's
+    /// link; nothing is claimed.
+    #[tokio::test]
+    async fn a_start_post_from_another_site_is_refused_and_claims_nothing() {
+        let fixture = consent::Fixture::new().await;
+        let state = consent::start_state(&fixture.start_url());
+        let (results, events) = capture(async {
+            let mut results = Vec::new();
+            for headers in [
+                vec![],
+                vec![("origin", "https://attacker.example")],
+                vec![("origin", "null")],
+                vec![("sec-fetch-site", "cross-site"), ("origin", "https://attacker.example")],
+                vec![("sec-fetch-site", "same-site")],
+                vec![("sec-fetch-site", "same-origin"), ("origin", "https://attacker.example")],
+            ] {
+                results.push(
+                    fixture
+                        .start_post(&state, &headers)
+                        .await,
+                );
+            }
+            results
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::FORBIDDEN, None);
+        }
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CrossSiteConsentStart; 6]);
+        let started = fixture
+            .start_post(&state, &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "the refused POSTs left the start state unused");
+    }
+
+    /// With the operator's `authorization_response_issuer` set, the callback
+    /// needs that exact `iss`: missing or different is refused before the
+    /// exchange.
+    #[tokio::test]
+    async fn a_recorded_issuer_makes_iss_required_and_exact() {
+        let fixture = consent::Fixture::new().await;
+        let mut provider = fixture.provider();
+        provider.authorization_response_issuer = Some("https://vendor.example".to_string());
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+        let (callback_state, cookie) = fixture.begin().await;
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .callback("github", &format!("code=c&state={callback_state}"), Some(&cookie))
+                    .await,
+                fixture
+                    .callback(
+                        "github",
+                        &format!("code=c&state={callback_state}&iss=https%3A%2F%2Fvendor.example%2F"),
+                        Some(&cookie),
+                    )
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&cookie)));
+        }
+        assert_eq!(
+            consent::reasons(&events),
+            [DelegationFailureReason::IssMissing, DelegationFailureReason::IssMismatch]
+        );
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+
+        let accepted = fixture
+            .callback(
+                "github",
+                &format!("code=c&state={callback_state}&iss=https%3A%2F%2Fvendor.example"),
+                Some(&cookie),
+            )
+            .await;
+        assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+        assert_eq!(fixture.token_calls(), 1);
+        assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// A stored provider whose redirect URI breaks the consent rules, or is
+    /// another provider's, is refused at the start page and the start POST,
+    /// before any cookie is set.
+    #[tokio::test]
+    async fn a_provider_with_a_non_conforming_or_shared_redirect_uri_is_refused_at_start() {
+        let fixture = consent::Fixture::new().await;
+        let start_url = fixture.start_url();
+        let state = consent::start_state(&start_url);
+        let mut other_tenant = fixture.provider();
+        other_tenant.id = "github-tenant-b".to_string();
+        other_tenant.tenant_id = Some("tenant-b".to_string());
+        fixture
+            .providers
+            .create(other_tenant)
+            .await
+            .unwrap();
+        let shared = fixture
+            .get(&consent::local(&start_url), &[])
+            .await;
+        consent::assert_refused(&shared, StatusCode::BAD_REQUEST, None);
+        fixture
+            .providers
+            .delete("github-tenant-b")
+            .await
+            .unwrap();
+
+        for callback_url in [
+            "http://198.51.100.7/v1/identity/oauth/callback/github",
+            "https://198.51.100.7/v1/identity/oauth/callback/github?x=1",
+            "https://198.51.100.7/elsewhere/github",
+        ] {
+            let mut provider = fixture.provider();
+            provider.callback_url = Some(callback_url.to_string());
+            fixture
+                .providers
+                .update(provider)
+                .await
+                .unwrap();
+            let (results, events) = capture(async {
+                vec![
+                    fixture
+                        .get(&consent::local(&start_url), &[])
+                        .await,
+                    fixture
+                        .start_post(&state, &[("sec-fetch-site", "same-origin")])
+                        .await,
+                ]
+            })
+            .await;
+            for refused in &results {
+                consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+            }
+            assert_eq!(consent::reasons(&events), [DelegationFailureReason::RedirectUriInvalid; 2], "{callback_url}");
+        }
+    }
+
+    /// Two consents for one provider started in one browser each have a
+    /// cookie of their own, so both complete.
+    #[tokio::test]
+    async fn two_consents_for_one_provider_in_one_browser_both_complete() {
+        let fixture = consent::Fixture::new().await;
+        let (first, first_cookie) = fixture.begin().await;
+        let (second, second_cookie) = fixture.begin().await;
+        assert_ne!(consent::cookie_name(&first_cookie), consent::cookie_name(&second_cookie));
+        let browser = format!("{first_cookie}; {second_cookie}");
+        for state in [first, second] {
+            let done = fixture
+                .callback("github", &format!("code=c&state={state}"), Some(&browser))
+                .await;
+            assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        }
+        assert_eq!(fixture.vault_records(), 2);
+    }
+
+    /// The token request sends exactly the `redirect_uri` the authorization
+    /// request sent, as the URL parser writes it.
+    #[tokio::test]
+    async fn the_token_request_sends_the_redirect_uri_the_authorization_request_sent() {
+        let fixture = consent::Fixture::new().await;
+        let mut provider = fixture.provider();
+        provider.callback_url = Some("https://198.51.100.7:443/v1/identity/oauth/callback/github".to_string());
+        fixture
+            .providers
+            .update(provider.clone())
+            .await
+            .unwrap();
+        let start_url = crate::delegation_vault::oauth::build_authorization_url(
+            &provider,
+            "did:web:agent.example",
+            "sha256:user",
+            "surface",
+            &[],
+            "https://198.51.100.7",
+        )
+        .unwrap();
+        let started = fixture
+            .start_post(&consent::start_state(&start_url), &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        let vendor = url::Url::parse(
+            started
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        let authorize_redirect = consent::query_value(&vendor, "redirect_uri");
+        assert_eq!(authorize_redirect, consent::REDIRECT_URI);
+        let cookie = started
+            .header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let done = fixture
+            .callback("github", &format!("code=c&state={}", consent::query_value(&vendor, "state")), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let forms = fixture.token_forms();
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0]["redirect_uri"], authorize_redirect);
+    }
+
+    /// A start POST whose client ID cannot be read, or whose authorization
+    /// endpoint breaks the rules, is refused and leaves its start state
+    /// unclaimed, so it completes once the provider is fixed.
+    #[tokio::test]
+    async fn a_start_post_refused_for_the_providers_settings_leaves_the_start_state_unclaimed() {
+        let fixture = consent::Fixture::new().await;
+        let state = consent::start_state(&fixture.start_url());
+        let mut no_client = fixture.provider();
+        no_client.client_id_secret_ref = Some("missing-client-id".to_string());
+        let mut insecure = fixture.provider();
+        insecure.authorization_endpoint = Some("http://vendor.example/authorize".to_string());
+        for (provider, reason) in [
+            (no_client, DelegationFailureReason::CredentialsUnavailable),
+            (insecure, DelegationFailureReason::AuthorizationUrlInvalid),
+        ] {
+            fixture
+                .providers
+                .update(provider)
+                .await
+                .unwrap();
+            let (refused, events) = capture(async {
+                fixture
+                    .start_post(&state, &[("origin", "https://198.51.100.7")])
+                    .await
+            })
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+            assert_eq!(consent::reasons(&events), [reason]);
+            let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+            assert!(!crate::delegation_vault::oauth::is_claimed(&start).await, "{reason:?} claimed the start state");
+        }
+        fixture
+            .providers
+            .update(fixture.provider())
+            .await
+            .unwrap();
+        let started = fixture
+            .start_post(&state, &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    }
+
+    /// An expired start state is refused at the start page and its POST.
+    #[tokio::test]
+    async fn an_expired_start_state_is_refused_at_start() {
+        let fixture = consent::Fixture::new().await;
+        let start =
+            crate::delegation_vault::oauth::decode_start_state(&consent::start_state(&fixture.start_url())).unwrap();
+        let expired = crate::delegation_vault::oauth::encode_oauth_state(&crate::delegation_vault::OAuthState {
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            ..start
+        })
+        .unwrap();
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .get(&format!("/v1/identity/oauth/callback/github/start?state={expired}"), &[])
+                    .await,
+                fixture
+                    .start_post(&expired, &[("origin", "https://198.51.100.7")])
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+        }
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid; 2]);
+    }
+
+    mod consent {
+        use super::*;
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        use crate::delegation_vault::audit::DelegationAuditEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        pub const PROVIDER_ID: &str = "cp-github";
+        pub const REDIRECT_URI: &str = "https://198.51.100.7/v1/identity/oauth/callback/github";
+        pub const CALLBACK_PATH: &str = "/v1/identity/oauth/callback/github";
+
+        /// The name of a `name=value` cookie pair.
+        pub fn cookie_name(pair: &str) -> String {
+            pair.split_once('=')
+                .map(|(name, _)| name.trim().to_string())
+                .unwrap()
+        }
+
+        /// The `Set-Cookie` that clears the binding cookie `name`.
+        pub fn cleared(name: &str) -> String {
+            format!("{name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
+        }
+
+        pub struct Fixture {
+            pub providers: Arc<FileSystemCredentialProviderStore>,
+            pub(super) vault: Arc<InMemoryVault>,
+            app: Router,
+            calls: Arc<AtomicUsize>,
+            forms: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
+            egress: crate::delegation_vault::oauth::TokenEgress,
+            token_endpoint: String,
+            _directory: tempfile::TempDir,
+        }
+
+        pub struct Answer {
+            pub status: StatusCode,
+            pub headers: axum::http::HeaderMap,
+            pub body: String,
+        }
+
+        impl Answer {
+            pub fn header(
+                &self,
+                name: &str,
+            ) -> Option<&str> {
+                self.headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+            }
+        }
+
+        /// A refusal: the status, the fixed page, no-store, no-referrer and,
+        /// when `cleared` names a binding cookie, that cookie cleared; no
+        /// other cookie is set.
+        pub fn assert_refused(
+            answer: &Answer,
+            status: StatusCode,
+            cleared: Option<&str>,
+        ) {
+            assert_eq!(answer.status, status, "{}", answer.body);
+            assert_eq!(answer.body, crate::delegation_vault::handlers::CONSENT_REFUSED_PAGE);
+            assert_eq!(answer.header("cache-control"), Some("no-store"));
+            assert_eq!(answer.header("referrer-policy"), Some("no-referrer"));
+            assert_eq!(answer.header("location"), None);
+            assert_eq!(
+                answer.header("set-cookie"),
+                cleared
+                    .map(cleared_cookie)
+                    .as_deref()
+            );
+        }
+
+        fn cleared_cookie(name: &str) -> String {
+            cleared(name)
+        }
+
+        pub fn reasons(events: &[DelegationAuditEvent]) -> Vec<DelegationFailureReason> {
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    DelegationAuditAction::DelegationFailed { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The path and query of a start URL, as the router sees it.
+        pub fn local(url: &str) -> String {
+            let url = url::Url::parse(url).unwrap();
+            format!(
+                "{}?{}",
+                url.path(),
+                url.query()
+                    .unwrap_or_default()
+            )
+        }
+
+        pub fn query_value(
+            url: &url::Url,
+            name: &str,
+        ) -> String {
+            url.query_pairs()
+                .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+                .unwrap()
+        }
+
+        pub fn start_state(url: &str) -> String {
+            url::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                .unwrap()
+        }
+
+        impl Fixture {
+            pub async fn new() -> Self {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let counter = calls.clone();
+                let forms = Arc::new(Mutex::new(Vec::new()));
+                let recorded = forms.clone();
+                let vendor = Router::new().route(
+                    "/token",
+                    post(move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
+                        let counter = counter.clone();
+                        let recorded = recorded.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            recorded
+                                .lock()
+                                .unwrap()
+                                .push(form);
+                            axum::Json(serde_json::json!({
+                                "access_token": "vendor-access", "token_type": "Bearer", "expires_in": 3600,
+                                "scope": "repo read:user"
+                            }))
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+                let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+                tokio::spawn(async move {
+                    axum::serve(listener, vendor)
+                        .await
+                        .unwrap();
+                });
+                let directory = tempfile::tempdir().unwrap();
+                let secrets = Arc::new(
+                    crate::secrets::FilesystemSecretsStore::new_async(
+                        directory
+                            .path()
+                            .join("secrets")
+                            .to_str()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                for (secret_id, value) in [("github-client-id", "github-client"), ("github-client-secret", "secret")] {
+                    secrets
+                        .create(CreateSecretRequest {
+                            tenant_id: None,
+                            name: secret_id.into(),
+                            secret_id: secret_id.into(),
+                            description: None,
+                            value: value.into(),
+                            secret_type: "General".into(),
+                            tags: vec![],
+                        })
+                        .await
+                        .unwrap();
+                }
+                let providers = Arc::new(
+                    FileSystemCredentialProviderStore::new(
+                        directory
+                            .path()
+                            .join("providers"),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let surfaces = Arc::new(
+                    crate::surfaces::FileSystemAgentSurfaceStore::new(
+                        directory
+                            .path()
+                            .join("surfaces"),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+                    "surface_id": "surface", "name": "Agent Surface",
+                    "access_point": {"listen_address": "https://gw.example", "route": "/mcp", "protocol": "mcp"},
+                    "target": {"endpoint": "https://203.0.113.9/mcp"}
+                }))
+                .unwrap();
+                crate::surfaces::AgentSurfaceStore::save(surfaces.as_ref(), &surface)
+                    .await
+                    .unwrap();
+                let vault = Arc::new(InMemoryVault { tokens: Mutex::new(Vec::new()) });
+                let mut fixture = Self {
+                    providers,
+                    vault: vault.clone(),
+                    app: Router::new(),
+                    calls,
+                    forms,
+                    egress: crate::delegation_vault::oauth::TokenEgress {
+                        timeout: std::time::Duration::from_secs(5),
+                        exact_allowlist: Some(token_endpoint.clone()),
+                        policy: Default::default(),
+                    },
+                    token_endpoint,
+                    _directory: directory,
+                };
+                fixture
+                    .providers
+                    .create(fixture.provider())
+                    .await
+                    .unwrap();
+                let mut state = state_with(Vec::new());
+                state.vault_store = vault;
+                state.provider_store = fixture.providers.clone();
+                state.secrets_store = secrets;
+                state.agent_surface_store = Some(surfaces);
+                state.gateway_base_url = "https://198.51.100.7".to_string();
+                fixture.app = create_delegation_vault_oauth_router(state)
+                    .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
+                fixture
+            }
+
+            /// The provider as first stored: an authorization code provider
+            /// without an issuer whose redirect URI follows the consent rules.
+            pub fn provider(&self) -> CredentialProvider {
+                let mut provider: CredentialProvider = serde_json::from_value(serde_json::json!({
+                    "id": PROVIDER_ID, "name": "GitHub", "provider_id": "github",
+                    "authorization_endpoint": "https://vendor.example/authorize",
+                    "client_id_secret_ref": "github-client-id", "client_secret_secret_ref": "github-client-secret",
+                    "default_scopes": ["repo"],
+                    "callback_path": CALLBACK_PATH, "callback_url": REDIRECT_URI,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap();
+                provider.token_endpoint = Some(self.token_endpoint.clone());
+                provider
+            }
+
+            pub fn start_url(&self) -> String {
+                crate::delegation_vault::oauth::build_authorization_url(
+                    &self.provider(),
+                    "did:web:agent.example",
+                    "sha256:user",
+                    "surface",
+                    &["repo".to_string(), "read:user".to_string()],
+                    "https://198.51.100.7",
+                )
+                .unwrap()
+            }
+
+            /// A callback state and the binding cookie of the browser that
+            /// posted its start page.
+            pub async fn begin(&self) -> (String, String) {
+                let started = self
+                    .start_post(&start_state(&self.start_url()), &[("origin", "https://198.51.100.7")])
+                    .await;
+                assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+                let vendor = url::Url::parse(
+                    started
+                        .header("location")
+                        .unwrap(),
+                )
+                .unwrap();
+                let cookie = started
+                    .header("set-cookie")
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                (start_state(vendor.as_str()), cookie)
+            }
+
+            pub async fn get(
+                &self,
+                uri: &str,
+                headers: &[(&str, &str)],
+            ) -> Answer {
+                self.send("GET", uri, headers, Body::empty())
+                    .await
+            }
+
+            pub async fn start_post(
+                &self,
+                state: &str,
+                headers: &[(&str, &str)],
+            ) -> Answer {
+                let mut headers = headers.to_vec();
+                headers.push(("content-type", "application/x-www-form-urlencoded"));
+                let body = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("state", state)
+                    .finish();
+                self.send("POST", "/v1/identity/oauth/callback/github/start", &headers, Body::from(body))
+                    .await
+            }
+
+            pub async fn callback(
+                &self,
+                provider: &str,
+                query: &str,
+                cookie: Option<&str>,
+            ) -> Answer {
+                let cookie = cookie.map(|pairs| format!("other=1; {pairs}"));
+                let headers = cookie
+                    .as_deref()
+                    .map(|cookie| vec![("cookie", cookie)])
+                    .unwrap_or_default();
+                self.get(&format!("/v1/identity/oauth/callback/{provider}?{query}"), &headers)
+                    .await
+            }
+
+            async fn send(
+                &self,
+                method: &str,
+                uri: &str,
+                headers: &[(&str, &str)],
+                body: Body,
+            ) -> Answer {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let response = self
+                    .egress
+                    .clone()
+                    .scope(
+                        self.app
+                            .clone()
+                            .oneshot(request.body(body).unwrap()),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                Answer {
+                    status,
+                    headers,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                }
+            }
+
+            /// The forms the token endpoint received.
+            pub fn token_forms(&self) -> Vec<std::collections::HashMap<String, String>> {
+                self.forms
+                    .lock()
+                    .unwrap()
+                    .clone()
+            }
+
+            pub fn token_calls(&self) -> usize {
+                self.calls
+                    .load(Ordering::SeqCst)
+            }
+
+            pub fn vault_records(&self) -> usize {
+                self.vault
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .len()
+            }
+        }
     }
 
     #[tokio::test]
-    async fn a_callbacks_provider_id_is_logged_escaped_and_bounded() {
+    async fn a_callbacks_provider_id_is_logged_only_as_a_plain_slug() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
         let padding = "a".repeat(400);
@@ -506,26 +1452,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         let text = logs.text();
-        let lines: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("provider_id="))
-            .collect();
-        assert_eq!(lines.len(), 4, "{text}");
-        assert!(
-            lines
-                .iter()
-                .all(|line| line.contains(r#"provider_id="github\r\nINFO forgedaaa"#)),
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("OAuth consent refused"))
+                .count(),
+            2,
             "{text}"
         );
-        assert!(
-            !text
-                .lines()
-                .any(|line| line.starts_with("INFO forged")),
-            "{text}"
-        );
+        assert!(!text.contains("provider_id="), "{text}");
+        assert!(!text.contains("forged"), "{text}");
         assert!(!text.contains(&padding), "{text}");
     }
 

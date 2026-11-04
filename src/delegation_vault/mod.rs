@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod connect_api;
 pub mod connects;
+pub mod consent_cookie;
 pub mod grants;
 pub mod handlers;
 pub mod jwt_assertion;
@@ -176,6 +177,13 @@ pub struct OAuthState {
     /// PKCE code_verifier — stored in encrypted state, sent during token exchange
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_verifier: Option<String>,
+    /// The scopes the consent start page shows and asks the vendor for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Base64url SHA-256 of the browser binding cookie set by the consent
+    /// start POST. A start state has none; a callback state must have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_binding: Option<String>,
 }
 
 impl std::fmt::Debug for OAuthState {
@@ -195,6 +203,14 @@ impl std::fmt::Debug for OAuthState {
                 "code_verifier",
                 &self
                     .code_verifier
+                    .as_ref()
+                    .map(|_| loggable::REDACTED),
+            )
+            .field("scopes", &self.scopes)
+            .field(
+                "browser_binding",
+                &self
+                    .browser_binding
                     .as_ref()
                     .map(|_| loggable::REDACTED),
             )
@@ -370,11 +386,15 @@ mod tests {
                 nonce: "csrf-nonce-value".to_string(),
                 expires_at: Utc::now(),
                 code_verifier: Some("pkce-code-verifier".to_string()),
+                scopes: vec!["repo".to_string()],
+                browser_binding: Some("browser-binding-hash".to_string()),
             }
         );
         assert!(state.contains(r#"surface_id: "surface-1""#), "{state}");
+        assert!(state.contains(r#"scopes: ["repo"]"#), "{state}");
         assert!(!state.contains("csrf-nonce-value"), "{state}");
         assert!(!state.contains("pkce-code-verifier"), "{state}");
+        assert!(!state.contains("browser-binding-hash"), "{state}");
     }
 
     #[test]
@@ -473,6 +493,8 @@ mod tests {
             nonce: "nonce-123".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: OAuthState = serde_json::from_str(&json).unwrap();

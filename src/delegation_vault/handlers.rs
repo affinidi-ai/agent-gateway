@@ -4,19 +4,22 @@ use super::{
     DelegationToken, DelegationTokenListItem, notifier::SharedVaultPopulationNotifier, oauth,
     storage::DelegationVaultStorage,
 };
+use crate::audit::events::DelegationFailureReason;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::PatDelegationContext;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::identity::VCIssuer;
 use crate::identity::ssi::vc_issuer::VcSigner;
-use crate::observability::loggable;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
 use axum::{
-    Extension, Json,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    Extension, Form, Json,
+    extract::{
+        Path, Query, State,
+        rejection::{FormRejection, QueryRejection},
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -254,177 +257,462 @@ pub struct OAuthCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
     pub error: Option<String>,
-    pub error_description: Option<String>,
+    pub iss: Option<String>,
+}
+
+/// The consent start state, in the start page's query or the start POST's form.
+#[derive(Deserialize)]
+pub struct ConsentStartParams {
+    pub state: String,
+}
+
+/// The only text a refused consent start or callback shows: nothing the
+/// request, the vendor or an error carried is reflected.
+pub(super) const CONSENT_REFUSED_PAGE: &str = r#"<!DOCTYPE html>
+<html><head><title>Authorization Failed</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h2>Authorization Failed</h2>
+<p>The authorization could not be completed.</p>
+<p>Please start again from the original application.</p>
+</body></html>"#;
+
+/// A consent refusal: its status and the reason the audit and the log name.
+struct ConsentRefusal {
+    status: StatusCode,
+    reason: DelegationFailureReason,
+}
+
+impl ConsentRefusal {
+    fn bad_request(reason: DelegationFailureReason) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            reason,
+        }
+    }
+}
+
+/// The fixed refusal page for `refusal`, with `Cache-Control: no-store`,
+/// `Referrer-Policy: no-referrer` and the binding cookie cleared on
+/// `cookie`, audited as `delegation_failed` with its reason and logged
+/// with the reason and the path's provider id only, when that is a plain slug.
+fn consent_refused(
+    refusal: ConsentRefusal,
+    provider_id: &str,
+    cookie: Option<&str>,
+) -> Response {
+    let ConsentRefusal { status, reason } = refusal;
+    let provider_id = plain_slug(provider_id);
+    warn!(
+        target: "credential_delegation",
+        provider_id,
+        reason = ?reason,
+        "OAuth consent refused"
+    );
+    super::audit::emit("delegation_failed", || {
+        super::audit::audit_event(
+            super::audit::DelegationAuditAction::DelegationFailed {
+                reason,
+                provider_id: provider_id.map(str::to_string),
+            },
+            None,
+            None,
+            provider_id,
+            None,
+        )
+    });
+    let mut response = (status, Html(CONSENT_REFUSED_PAGE)).into_response();
+    consent_page_headers(&mut response, "no-referrer");
+    if let Some(name) = cookie {
+        set_binding_cookie(&mut response, name, "", 0);
+    }
+    response
+}
+
+fn consent_page_headers(
+    response: &mut Response,
+    referrer_policy: &'static str,
+) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static(referrer_policy));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+}
+
+/// Sets the binding cookie `name`: `__Host-`, `Path=/`, no `Domain`, `Secure`,
+/// `HttpOnly`, `SameSite=Lax`, and marks the response as the gateway's own so
+/// the cookie guard keeps it.
+fn set_binding_cookie(
+    response: &mut Response,
+    name: &str,
+    value: &str,
+    max_age: i64,
+) {
+    let cookie = format!("{name}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax");
+    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, cookie);
+        response
+            .extensions_mut()
+            .insert(super::consent_cookie::GatewayConsentCookie);
+    }
+}
+
+/// `provider_id` when it is 1 to 128 bytes of ASCII letters, digits, `-`, `_`
+/// and `.`: the only path text a log, an audit record or a cookie path takes.
+fn plain_slug(provider_id: &str) -> Option<&str> {
+    (!provider_id.is_empty()
+        && provider_id.len() <= 128
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then_some(provider_id)
+}
+
+/// The provider a consent state names, checked against the path: the path's
+/// provider is the state's, and the stored provider still has the state's id
+/// and slug and is an authorization code provider without an issuer.
+async fn consent_provider(
+    state: &DelegationVaultState,
+    path_provider_id: &str,
+    oauth_state: &super::OAuthState,
+) -> Result<crate::credential_providers::CredentialProvider, ConsentRefusal> {
+    if path_provider_id != oauth_state.provider_id {
+        return Err(ConsentRefusal::bad_request(DelegationFailureReason::ConsentProviderMismatch));
+    }
+    match state
+        .provider_store
+        .get(&oauth_state.credential_provider_id)
+        .await
+    {
+        Ok(Some(provider))
+            if provider.id == oauth_state.credential_provider_id
+                && provider.provider_id == oauth_state.provider_id
+                && provider.uses_legacy_consent() =>
+        {
+            Ok(provider)
+        }
+        Ok(_) => Err(ConsentRefusal::bad_request(DelegationFailureReason::ConsentProviderMismatch)),
+        Err(e) => {
+            error!(target: "credential_delegation", error = %e, "Failed to load credential provider for consent");
+            Err(ConsentRefusal::bad_request(DelegationFailureReason::CredentialsUnavailable))
+        }
+    }
+}
+
+/// The start state's provider and its redirect URI, when the redirect URI
+/// follows the consent rules and no other provider uses it.
+async fn consent_start_provider(
+    state: &DelegationVaultState,
+    path_provider_id: &str,
+    start: &super::OAuthState,
+) -> Result<(crate::credential_providers::CredentialProvider, url::Url), ConsentRefusal> {
+    let provider = consent_provider(state, path_provider_id, start).await?;
+    let redirect_uri = provider
+        .consent_redirect_uri(&state.gateway_base_url)
+        .map_err(|_| ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid))?;
+    match crate::credential_providers::redirect_uri_taken_by(
+        state.provider_store.as_ref(),
+        &provider,
+        &state.gateway_base_url,
+    )
+    .await
+    {
+        Ok(None) => Ok((provider, redirect_uri)),
+        Ok(Some(_)) => Err(ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid)),
+        Err(e) => {
+            error!(target: "credential_delegation", error = %e, "Failed to list credential providers for consent");
+            Err(ConsentRefusal::bad_request(DelegationFailureReason::CredentialsUnavailable))
+        }
+    }
+}
+
+/// GET {oauth_callback_route}/{provider_id}/start
+///
+/// The consent start page: shows the agent, surface, provider and scopes a
+/// start link asks for, with a button that POSTs it back. It claims nothing and
+/// sets no cookie, so a link scanner may fetch it any number of times.
+pub async fn consent_start_page(
+    State(state): State<DelegationVaultState>,
+    Path(provider_id): Path<String>,
+    query: Result<Query<ConsentStartParams>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = query else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    let Ok(start) = oauth::decode_start_state(&params.state) else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    let provider = match consent_start_provider(&state, &provider_id, &start).await {
+        Ok((provider, _)) => provider,
+        Err(refusal) => return consent_refused(refusal, &provider_id, None),
+    };
+    let surface_name = match &state.agent_surface_store {
+        Some(store) => store
+            .get(&start.surface_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|surface| surface.name),
+        None => None,
+    }
+    .unwrap_or_else(|| start.surface_id.clone());
+    let scopes = if start.scopes.is_empty() {
+        "(none)".to_string()
+    } else {
+        start.scopes.join(", ")
+    };
+    let page = format!(
+        r#"<!DOCTYPE html>
+<html><head><title>Authorize {provider}</title></head>
+<body style="font-family: sans-serif; padding: 40px; max-width: 640px; margin: auto;">
+<h2>Authorize {provider}</h2>
+<p>An agent asks to use your {provider} account on your behalf.</p>
+<dl>
+<dt>Agent</dt><dd><code>{agent}</code></dd>
+<dt>Surface</dt><dd>{surface}</dd>
+<dt>Provider</dt><dd>{provider}</dd>
+<dt>Scopes</dt><dd><code>{scopes}</code></dd>
+</dl>
+<p>Continue only if you started this from your own application.</p>
+<form method="post" action="start">
+<input type="hidden" name="state" value="{state}">
+<button type="submit">Continue to {provider}</button>
+</form>
+</body></html>"#,
+        provider = html_escape(&provider.name),
+        agent = html_escape(&start.agent_did),
+        surface = html_escape(&surface_name),
+        scopes = html_escape(&scopes),
+        state = html_escape(&params.state),
+    );
+    let mut response = Html(page).into_response();
+    consent_page_headers(&mut response, "same-origin");
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
+/// Whether a start POST came from a page of `redirect_uri`'s origin: the
+/// browser says `Sec-Fetch-Site: same-origin`, or, when it sends no fetch
+/// metadata, an `Origin` of that origin. Any `Origin` sent must be that origin.
+fn same_origin_post(
+    headers: &HeaderMap,
+    redirect_uri: &url::Url,
+) -> bool {
+    let expected = redirect_uri
+        .origin()
+        .ascii_serialization();
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|value| value.as_bytes() == expected.as_bytes());
+    match headers.get("sec-fetch-site") {
+        Some(site) => site.as_bytes() == b"same-origin" && origin != Some(false),
+        None => origin == Some(true),
+    }
+}
+
+/// POST {oauth_callback_route}/{provider_id}/start
+///
+/// The person confirmed the start page: claim the start state, set the
+/// binding cookie on the callback's path and send the browser to the vendor.
+/// A start state is used once on this process.
+pub async fn consent_start(
+    State(state): State<DelegationVaultState>,
+    Path(provider_id): Path<String>,
+    headers: HeaderMap,
+    form: Result<Form<ConsentStartParams>, FormRejection>,
+) -> Response {
+    let Ok(Form(params)) = form else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    let Ok(start) = oauth::decode_start_state(&params.state) else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    let (provider, redirect_uri) = match consent_start_provider(&state, &provider_id, &start).await {
+        Ok(found) => found,
+        Err(refusal) => return consent_refused(refusal, &provider_id, None),
+    };
+    if !same_origin_post(&headers, &redirect_uri) {
+        return consent_refused(
+            ConsentRefusal {
+                status: StatusCode::FORBIDDEN,
+                reason: DelegationFailureReason::CrossSiteConsentStart,
+            },
+            &provider_id,
+            None,
+        );
+    }
+    let begun = match oauth::begin_consent(&provider, &start, &redirect_uri, &state.secrets_store).await {
+        Ok(begun) => begun,
+        Err(e) => {
+            let reason = if e.is::<oauth::ProviderSecretError>() {
+                DelegationFailureReason::CredentialsUnavailable
+            } else {
+                DelegationFailureReason::AuthorizationUrlInvalid
+            };
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                error = %e,
+                "Could not begin OAuth consent"
+            );
+            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None);
+        }
+    };
+    if !oauth::claim_oauth_state(&start).await {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused),
+            &provider_id,
+            None,
+        );
+    }
+    let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    info!(
+        target: "credential_delegation",
+        provider_id = %provider.provider_id,
+        action = "oauth_consent_start",
+        "OAuth consent started"
+    );
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, location);
+    consent_page_headers(&mut response, "no-referrer");
+    let max_age = (begun.expires_at - Utc::now())
+        .num_seconds()
+        .max(0);
+    set_binding_cookie(&mut response, &begun.cookie_name, &begun.cookie_value, max_age);
+    response
 }
 
 /// GET /v1/identity/oauth/callback/{provider_id}
 ///
-/// Handles the OAuth provider redirect after user consent.
-/// Exchanges the authorization code for tokens and stores them in the vault.
+/// Handles the OAuth provider redirect after user consent. Every check runs
+/// before the code is exchanged: the state is a callback state of this
+/// gateway, the path names its provider, the provider is unchanged, the
+/// browser holds the binding cookie the start POST set, and the `iss` is the
+/// one the operator recorded. The tokens are then stored in the vault.
 pub async fn oauth_callback(
     State(state): State<DelegationVaultState>,
     Path(provider_id): Path<String>,
-    Query(query): Query<OAuthCallbackQuery>,
-) -> impl IntoResponse {
-    let logged_provider_id = loggable::untrusted(&provider_id);
+    cookies: Option<Extension<super::consent_cookie::ConsentCookies>>,
+    query: Result<Query<OAuthCallbackQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid),
+            &provider_id,
+            None,
+        );
+    };
+    let callback_state = query
+        .state
+        .as_deref()
+        .and_then(|encoded| oauth::decode_callback_state(encoded).ok());
+    let cookie_name = callback_state
+        .as_ref()
+        .and_then(oauth::binding_cookie_name);
+    let refuse = |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref());
     info!(
         target: "credential_delegation",
-        provider_id = %logged_provider_id,
+        provider_id = plain_slug(&provider_id),
         has_code = %query.code.is_some(),
         has_error = %query.error.is_some(),
         action = "oauth_callback",
         "OAuth callback received"
     );
 
-    // Check for OAuth error response
     if let Some(error) = &query.error {
-        let desc = query
-            .error_description
-            .as_deref()
-            .unwrap_or("Unknown error");
+        let valid = !error.is_empty()
+            && error.len() <= 128
+            && error
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         warn!(
             target: "credential_delegation",
-            provider_id = %logged_provider_id,
-            oauth_error = %oauth::oauth_error_code(error),
+            provider_id = plain_slug(&provider_id),
+            oauth_error = %if valid { error.as_str() } else { oauth::UNRECOGNIZED_ERROR },
             "OAuth provider returned an error"
         );
-        return Html(format!(
-            r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>The OAuth provider returned an error: <strong>{}</strong></p>
-<p>{}</p>
-<p>You may close this window and try again.</p>
-</body></html>"#,
-            html_escape(error),
-            html_escape(desc)
-        ))
-        .into_response();
+        let reason = if valid {
+            DelegationFailureReason::ConsentDenied
+        } else {
+            DelegationFailureReason::ConsentResponseInvalid
+        };
+        return refuse(ConsentRefusal::bad_request(reason));
     }
 
-    // Validate required parameters
-    let code = match &query.code {
-        Some(c) => c.clone(),
-        None => {
-            return Html(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Missing authorization code. Please try again.</p>
-</body></html>"#
-                    .to_string(),
-            )
-            .into_response();
-        }
+    let (Some(oauth_state), Some(cookie_name)) = (callback_state, cookie_name.as_deref()) else {
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid));
+    };
+    let provider = match consent_provider(&state, &provider_id, &oauth_state).await {
+        Ok(provider) => provider,
+        Err(refusal) => return refuse(refusal),
     };
 
-    let state_encoded = match &query.state {
-        Some(s) => s.clone(),
-        None => {
-            return Html(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Missing state parameter. This may be a CSRF attack.</p>
-</body></html>"#
-                    .to_string(),
-            )
-            .into_response();
-        }
-    };
-
-    // Decode and validate state
-    let oauth_state = match oauth::decode_oauth_state(&state_encoded) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                provider_id = %logged_provider_id,
-                error = %e,
-                "Failed to decode OAuth state"
-            );
-            return Html(format!(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Invalid or expired state parameter: {}</p>
-<p>Please try again from the original application.</p>
-</body></html>"#,
-                html_escape(&e.to_string())
-            ))
-            .into_response();
-        }
-    };
-
-    if oauth_state.provider_id != provider_id {
-        warn!(
-            target: "credential_delegation",
-            provider_id = %logged_provider_id,
-            state_provider_id = %oauth_state.provider_id,
-            "OAuth callback path names another provider than its state"
-        );
-        return Html(
-            r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>This authorization link does not match its provider.</p>
-<p>Please try again from the original application.</p>
-</body></html>"#
-                .to_string(),
-        )
-        .into_response();
+    let presented = cookies
+        .as_ref()
+        .and_then(|Extension(cookies)| cookies.get(cookie_name));
+    if !oauth::browser_binding_matches(&oauth_state, presented) {
+        return refuse(ConsentRefusal {
+            status: StatusCode::FORBIDDEN,
+            reason: DelegationFailureReason::BrowserBindingMismatch,
+        });
     }
-
-    // Load the credential provider
-    let provider = match state
-        .provider_store
-        .get(&oauth_state.credential_provider_id)
-        .await
+    if let Some(expected) = provider
+        .authorization_response_issuer
+        .as_deref()
     {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            error!(
-                target: "credential_delegation",
-                provider_id = %logged_provider_id,
-                credential_provider_id = %oauth_state.credential_provider_id,
-                "Credential provider not found during callback"
-            );
-            return Html(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Credential provider configuration not found. It may have been deleted.</p>
-</body></html>"#
-                    .to_string(),
-            )
-            .into_response();
+        match query.iss.as_deref() {
+            None => return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMissing)),
+            Some(iss) if iss != expected => {
+                return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMismatch));
+            }
+            Some(_) => {}
         }
-        Err(e) => {
-            error!(
-                target: "credential_delegation",
-                error = %e,
-                "Failed to load credential provider during callback"
-            );
-            return Html(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Internal error loading provider configuration.</p>
-</body></html>"#
-                    .to_string(),
-            )
-            .into_response();
-        }
+    }
+    let Some(code) = query
+        .code
+        .filter(|code| !code.is_empty())
+    else {
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid));
     };
 
-    // Exchange authorization code for tokens (with PKCE code_verifier if present)
+    // Each state stores at most one credential, and the code is exchanged only
+    // for a state not used before.
+    if !oauth::claim_oauth_state(&oauth_state).await {
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused));
+    }
+
     let token_response = match oauth::exchange_code_for_tokens(
         &provider,
         &code,
@@ -440,21 +728,11 @@ pub async fn oauth_callback(
         Err(e) => {
             warn!(
                 target: "credential_delegation",
-                provider_id = %logged_provider_id,
+                provider_id = %provider.provider_id,
                 error = %e,
-                "Token exchange failed during callback"
+                "Token exchange failed during the OAuth callback"
             );
-            return Html(format!(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Failed to exchange authorization code for tokens.</p>
-<p>Error: {}</p>
-</body></html>"#,
-                html_escape(&e.to_string())
-            ))
-            .into_response();
+            return refuse(ConsentRefusal::bad_request(DelegationFailureReason::TokenExchangeFailed));
         }
     };
 
@@ -538,28 +816,6 @@ pub async fn oauth_callback(
         updated_at: now,
     };
 
-    // Each state stores one credential; a replayed one is refused. The claim
-    // comes last, so a callback that fails earlier, for example at the token
-    // exchange, can be retried with the same state.
-    if !oauth::claim_oauth_state(&oauth_state).await {
-        warn!(
-            target: "credential_delegation",
-            provider_id = %logged_provider_id,
-            "OAuth state was already used"
-        );
-        return Html(
-            r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>This authorization link was already used.</p>
-<p>Please try again from the original application.</p>
-</body></html>"#
-                .to_string(),
-        )
-        .into_response();
-    }
-
     match state
         .vault_store
         .store(delegation_token)
@@ -569,7 +825,7 @@ pub async fn oauth_callback(
             let delegation_token_id_for_audit = stored_token.id;
             info!(
                 target: "credential_delegation",
-                provider_id = %logged_provider_id,
+                provider_id = %provider.provider_id,
                 agent_did = %oauth_state.agent_did,
                 user_hash = %oauth_state.user_identity_hash,
                 scopes = ?granted_scopes,
@@ -668,7 +924,7 @@ pub async fn oauth_callback(
                                 warn!(
                                     target: "credential_delegation",
                                     agent_did = %oauth_state.agent_did,
-                                    provider_id = %logged_provider_id,
+                                    provider_id = %provider.provider_id,
                                     error = %e,
                                     "Failed to mint consent_granted workload-binding VP for audit log"
                                 );
@@ -699,21 +955,14 @@ pub async fn oauth_callback(
                 error = %e,
                 "Failed to store delegation token after successful OAuth"
             );
-            return Html(format!(
-                r#"<!DOCTYPE html>
-<html><head><title>Authorization Failed</title></head>
-<body style="font-family: sans-serif; padding: 40px; text-align: center;">
-<h2>Authorization Failed</h2>
-<p>Tokens were obtained but could not be stored: {}</p>
-</body></html>"#,
-                html_escape(&e.to_string())
-            ))
-            .into_response();
+            return refuse(ConsentRefusal {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                reason: DelegationFailureReason::VaultStoreRejected,
+            });
         }
     }
 
-    // Success page
-    Html(format!(
+    let mut response = Html(format!(
         r#"<!DOCTYPE html>
 <html><head><title>Authorization Successful</title></head>
 <body style="font-family: sans-serif; padding: 40px; text-align: center;">
@@ -730,7 +979,10 @@ setTimeout(function() {{ window.close(); }}, 3000);
         html_escape(&granted_scopes.join(", ")),
         html_escape(&provider.name)
     ))
-    .into_response()
+    .into_response();
+    consent_page_headers(&mut response, "no-referrer");
+    set_binding_cookie(&mut response, cookie_name, "", 0);
+    response
 }
 
 /// Resolve the authenticated management-API actor from the request extensions

@@ -42,6 +42,9 @@ pub struct CredentialProviderState {
     pub secrets_store: Arc<dyn SecretsStore>,
     pub identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     pub oauth_callback_route: String,
+    /// The gateway's base URL, which a provider without `callback_url` uses for
+    /// its redirect URI.
+    pub gateway_base_url: String,
     /// Reads the issuer's metadata an external consent provider is checked against.
     pub issuer_metadata: super::external::IssuerMetadata,
     /// The surfaces whose bindings keep a provider from being deleted.
@@ -504,6 +507,38 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
     }
 }
 
+/// The consent-flow rules a provider passes before it is stored: an
+/// `authorization_response_issuer` only where allowed, and for an authorization
+/// code provider without an `issuer`, a redirect URI the consent flow can use
+/// and that no other provider, in any tenant, uses.
+async fn consent_flow_error(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+) -> Option<Response> {
+    let refused =
+        |message: &str| Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response());
+    if let Some(message) = provider.authorization_response_issuer_error() {
+        return refused(message);
+    }
+    if !provider.uses_legacy_consent() {
+        return None;
+    }
+    if let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
+        return refused(message);
+    }
+    match super::redirect_uri_taken_by(state.store.as_ref(), provider, &state.gateway_base_url).await {
+        Ok(None) => None,
+        Ok(Some(_)) => refused("callback_url is already the redirect URI of another credential provider"),
+        Err(error) => {
+            warn!(target: "credential_delegation", %error, "Failed to check credential provider redirect URIs");
+            Some(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
+                    .into_response(),
+            )
+        }
+    }
+}
+
 /// POST /api/v1/credential-providers
 pub async fn create_provider(
     State(state): State<CredentialProviderState>,
@@ -589,6 +624,7 @@ pub async fn create_provider(
         client_id: req.client_id,
         allow_unadvertised_pkce: req.allow_unadvertised_pkce,
         authorization_response_iss_parameter_supported: None,
+        authorization_response_issuer: blank_to_none(req.authorization_response_issuer),
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
         created_at: now,
@@ -645,6 +681,9 @@ pub async fn create_provider(
         validate_provider_settings(&state, &provider, None, &TokenEgress::from_environment(), &context, &scope).await
     {
         return error.into_response();
+    }
+    if let Some(response) = consent_flow_error(&state, &provider).await {
+        return response;
     }
 
     if provider.is_external_consent() && tenant_context(&context).is_some() && state.issuers.is_none() {
@@ -961,6 +1000,10 @@ pub async fn update_provider(
         client_id: existing.client_id,
         allow_unadvertised_pkce: existing.allow_unadvertised_pkce,
         authorization_response_iss_parameter_supported: existing.authorization_response_iss_parameter_supported,
+        authorization_response_issuer: blank_to_none(
+            req.authorization_response_issuer
+                .or(existing.authorization_response_issuer),
+        ),
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
         created_at: existing.created_at,
@@ -988,6 +1031,9 @@ pub async fn update_provider(
     .await
     {
         return error.into_response();
+    }
+    if let Some(response) = consent_flow_error(&state, &updated).await {
+        return response;
     }
 
     let _bindings = if retypes_to_need_consent {
@@ -1566,6 +1612,7 @@ mod jwt_provider_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: None,
             vault: None,
@@ -1671,6 +1718,229 @@ mod jwt_provider_tests {
         add_secret(&state, "SA_JSON", &key_file(&test_keys::rsa_pkcs8().private_pem)).await;
         add_secret(&state, "BAD_JSON", &key_file("key-secret-marker")).await;
         state
+    }
+
+    async fn add_tenant_secret(
+        state: &CredentialProviderState,
+        tenant_id: &str,
+        secret_id: &str,
+    ) {
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some(tenant_id.into()),
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: "value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    fn authorization_code(provider_id: &str) -> Value {
+        json!({
+            "name": "GitHub", "provider_id": provider_id, "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+        })
+    }
+
+    fn with(
+        mut body: Value,
+        fields: Value,
+    ) -> Value {
+        for (name, value) in fields.as_object().unwrap() {
+            body[name] = value.clone();
+        }
+        body
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authorization_response_issuer_is_kept_on_a_consent_provider_without_making_it_external() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(
+            &state,
+            with(
+                authorization_code("github"),
+                json!({"authorization_response_issuer": "https://github.com/login/oauth"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["authorization_response_issuer"], "https://github.com/login/oauth");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.is_external_consent());
+        assert!(stored.uses_legacy_consent());
+
+        let (status, body) =
+            update(&state, &id, json!({"authorization_response_issuer": "https://github.com/login/oauth?x=1"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "authorization_response_issuer must be an https URL with a host and no query or fragment"
+        );
+        let (status, body) = update(&state, &id, json!({"authorization_response_issuer": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("authorization_response_issuer"), None, "a blank value clears it: {body}");
+        let (status, body) = update(&state, &id, json!({"name": "GitHub renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("authorization_response_issuer"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authorization_response_issuer_is_refused_unless_https_and_on_a_consent_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for issuer in [
+            "http://github.com/login/oauth",
+            "https://github.com/login/oauth#fragment",
+            "https://github.com/login/oauth?query=1",
+            "https://user@github.com/",
+            "github.com",
+        ] {
+            let (status, body) =
+                create(&state, with(authorization_code("github"), json!({"authorization_response_issuer": issuer})))
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer}: {body}");
+            assert_eq!(
+                body["error"],
+                "authorization_response_issuer must be an https URL with a host and no query or fragment"
+            );
+        }
+        let client_credentials = json!({
+            "name": "Svc", "provider_id": "svc", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://github.com/token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "authorization_response_issuer": "https://github.com"
+        });
+        let (status, body) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "authorization_response_issuer is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = update(
+            &state,
+            body["id"]
+                .as_str()
+                .unwrap(),
+            json!({"provider_type": "oauth2_client_credentials", "authorization_response_issuer": "https://github.com"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the rule holds on the merged provider: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_providers_callback_url_must_be_https_and_end_in_its_callback_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (callback_url, error) in [
+            ("http://198.51.100.7/oauth/callback/github", "callback_url must be an https URL with a host"),
+            (
+                "https://198.51.100.7/oauth/callback/github?x=1",
+                "callback_url must not carry credentials, a query or a fragment",
+            ),
+            (
+                "https://198.51.100.7/oauth/callback/github#f",
+                "callback_url must not carry credentials, a query or a fragment",
+            ),
+            ("https://198.51.100.7/oauth/callback/other", "callback_url path must end in the provider's callback_path"),
+            (
+                "https://198.51.100.7/oauth/callback/GitHub",
+                "callback_url path must end in the provider's callback_path",
+            ),
+        ] {
+            let (status, body) =
+                create(&state, with(authorization_code("github"), json!({"callback_url": callback_url}))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{callback_url}: {body}");
+            assert_eq!(body["error"], error, "{callback_url}");
+        }
+        let (status, body) = create(
+            &state,
+            with(
+                authorization_code("github"),
+                json!({"callback_url": "https://198.51.100.7/prefix/oauth/callback/github"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "a reverse proxy prefix is kept: {body}");
+        let (status, body) = update(
+            &state,
+            body["id"].as_str().unwrap(),
+            json!({"callback_url": "http://198.51.100.7/prefix/oauth/callback/github"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = create(&state, authorization_code("gitlab")).await;
+        assert_eq!(status, StatusCode::CREATED, "without callback_url the gateway's own URL is used: {body}");
+        let mut client_credentials = authorization_code("svc");
+        client_credentials["provider_type"] = json!("oauth2_client_credentials");
+        client_credentials["callback_url"] = json!("http://198.51.100.7/elsewhere");
+        let (status, body) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::CREATED, "the rule is for consent providers only: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_uri_names_one_consent_provider_across_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = with_key_material(&directory).await;
+        state.gateway_base_url = "https://198.51.100.9".into();
+        for tenant in ["tenant-a", "tenant-b"] {
+            add_tenant_secret(&state, tenant, &format!("{tenant}-id")).await;
+            add_tenant_secret(&state, tenant, &format!("{tenant}-secret")).await;
+        }
+        let tenant_provider = |tenant: &str, fields: Value| {
+            with(
+                authorization_code("github"),
+                with(
+                    json!({"tenant_id": tenant, "client_id_secret_ref": format!("{tenant}-id"),
+                        "client_secret_secret_ref": format!("{tenant}-secret")}),
+                    fields,
+                ),
+            )
+        };
+        let (status, body) = create(&state, tenant_provider("tenant-a", json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = create(&state, tenant_provider("tenant-b", json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the same slug in two tenants shares a redirect URI: {body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+        let (status, body) = create(
+            &state,
+            tenant_provider("tenant-b", json!({"callback_url": "https://198.51.100.9/oauth/callback/github"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an explicit URL equal to another's default: {body}");
+        let (status, body) = create(
+            &state,
+            tenant_provider("tenant-b", json!({"callback_url": "https://203.0.113.8/oauth/callback/github"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = update(
+            &state,
+            body["id"].as_str().unwrap(),
+            json!({"callback_url": "https://198.51.100.9/oauth/callback/github"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an update may not take another's redirect URI: {body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2964,6 +3234,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: Some(strategies.clone()),
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: None,
             vault: None,
@@ -3104,6 +3375,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: Some(Arc::new(
                 crate::surfaces::FileSystemAgentSurfaceStore::new(
@@ -3123,6 +3395,7 @@ mod consent_strategy_tests {
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "callback_path": "/oauth/callback/provider",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
         .unwrap();
@@ -3280,6 +3553,7 @@ mod external_provider_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: answering(answer),
             surfaces: None,
             vault: None,

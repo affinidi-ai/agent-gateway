@@ -974,6 +974,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
   `credential_policy.insecure_token_endpoints`, and that an unchanged stored one is still accepted
   while `token_endpoint_https` is `warn`. It does not block Save; the gateway decides on save.
+- The Callback URL of an authorization code provider is the chosen listen address followed by
+  the provider's stored `callback_path` when editing, or, when creating, the current
+  `oauth_callback_route` and the lowercased provider id, the path the gateway will store
+  (`callbackUrlFor`). The preview, the copy button and Save all use it, because the gateway refuses
+  a `callback_url` whose path does not end in the stored `callback_path`, or that is not `https`.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,

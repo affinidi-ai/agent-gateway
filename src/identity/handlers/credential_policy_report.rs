@@ -1,6 +1,7 @@
 //! Startup and reload report of the credential providers and surfaces that break a
-//! `[credential_policy]` rule or a Target authentication header rule. Log lines only: ids,
-//! tenants and rule names, never a secret value.
+//! `[credential_policy]` rule or a Target authentication header rule, and of the consent
+//! providers that share a redirect URI. Log lines only: ids, tenants and rule names, never a
+//! secret value.
 
 use std::collections::HashMap;
 
@@ -220,6 +221,16 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         },
         None => return,
     };
+    crate::credential_providers::log_redirect_uri_conflicts(
+        &providers,
+        &format!(
+            "https://{}",
+            state
+                .network_config
+                .did
+                .domain
+        ),
+    );
     let secrets = match &state.secrets_store {
         Some(store) => match store.list_all().await {
             Ok(secrets) => secrets,

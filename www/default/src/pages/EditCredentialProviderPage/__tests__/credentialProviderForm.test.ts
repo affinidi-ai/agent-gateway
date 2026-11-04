@@ -1,5 +1,6 @@
 import {
   EMPTY_JWT_FIELDS,
+  callbackUrlFor,
   ProviderFormValues,
   entraRejectsResource,
   jwtFieldsOf,
@@ -179,5 +180,24 @@ describe('credential provider form', () => {
       jwt_issuer: 'sa@example',
     });
     expect(jwtFieldsOf({ jwt_signing_algorithm: 'HS256' }).jwt_signing_algorithm).toBe('');
+  });
+});
+
+describe('callbackUrlFor', () => {
+  it('keeps the stored callback path of an existing provider', () => {
+    expect(
+      callbackUrlFor(
+        'https://gw.example',
+        '/v1/identity/oauth/callback',
+        'github',
+        '/old/route/github'
+      )
+    ).toBe('https://gw.example/old/route/github');
+  });
+
+  it('builds a new provider path from the lowercased provider id, as the gateway stores it', () => {
+    expect(
+      callbackUrlFor('https://gw.example', '/v1/identity/oauth/callback', ' GitHub ', '')
+    ).toBe('https://gw.example/v1/identity/oauth/callback/github');
   });
 });

@@ -166,7 +166,9 @@ claim other than `sub`; see _Credentials audit tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
-and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+and certificate from the secrets store, builds an authorization code provider's Callback URL from
+its stored `callback_path` (or, when creating, the lowercased provider id), and target
+authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 

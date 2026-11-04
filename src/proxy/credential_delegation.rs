@@ -1264,7 +1264,7 @@ async fn build_consent_required(
                 binding.scopes.clone()
             };
 
-            match oauth::build_authorization_url(
+            match oauth::mint_consent_link(
                 &provider,
                 agent_did,
                 user_identity_hash,
@@ -1272,6 +1272,7 @@ async fn build_consent_required(
                 &scopes,
                 gateway_base_url,
                 secrets_store,
+                provider_store.as_ref(),
             )
             .await
             {
@@ -1325,7 +1326,7 @@ async fn try_elicit_flow(
     channel_id: &str,
     provider: &CredentialProvider,
     vault_store: &Arc<dyn DelegationVaultStorage>,
-    _provider_store: &Arc<dyn CredentialProviderStorage>,
+    provider_store: &Arc<dyn CredentialProviderStorage>,
     secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
     audit_ctx: Option<&DelegationAuditContext>,
@@ -1369,7 +1370,7 @@ async fn try_elicit_flow(
     } else {
         binding.scopes.clone()
     };
-    let authorization_url = match oauth::build_authorization_url(
+    let authorization_url = match oauth::mint_consent_link(
         provider,
         agent_did,
         user_identity_hash,
@@ -1377,6 +1378,7 @@ async fn try_elicit_flow(
         &scopes,
         gateway_base_url,
         secrets_store,
+        provider_store.as_ref(),
     )
     .await
     {
@@ -1983,6 +1985,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         }
@@ -3331,7 +3334,7 @@ mod tests {
         // ConsentMode::Elicit + NO audit_ctx.mcp_session_id → try_elicit_flow
         // returns None and the caller invokes build_consent_required.
         // An empty MockSecretsStore cannot resolve the OAuth client_id secret, so no
-        // authorization URL can be built and the binding is unavailable.
+        // consent link is minted and the binding is unavailable.
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
         let providers = MockProviderStore::with_oauth_provider("cp-1");
         let secrets = empty_secrets();
@@ -3441,7 +3444,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         // As above: fallthrough → build_consent_required → secret resolution
-        // fails on an empty MockSecretsStore → no authorization URL → Unavailable.
+        // fails on an empty MockSecretsStore → no consent link → Unavailable.
         assert_eq!(result_tag(&results[0].result), "Unavailable");
     }
 
@@ -3491,13 +3494,123 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1);
-        // With an empty MockSecretsStore the authorization-URL build fails before we
+        // With an empty MockSecretsStore the consent link is not minted before we
         // ever attempt SSE delivery, so try_elicit_flow returns None and the
         // caller falls through to build_consent_required, which also fails
-        // on secrets → Unavailable. The no-SSE-stream branch itself is
-        // covered by integration tests where the secret store is real.
+        // on secrets → Unavailable.
         assert_eq!(result_tag(&results[0].result), "Unavailable");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+    }
+
+    /// No consent link is minted for a provider whose redirect URI another
+    /// provider has: the start page would refuse it, so the binding is
+    /// unavailable at once.
+    #[tokio::test]
+    async fn a_provider_sharing_its_redirect_uri_mints_no_consent_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        secrets
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "name": "Client id", "secret_id": "CLIENT_ID", "value": "client-id"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretsStore> = Arc::new(secrets);
+        let provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        let mut other_tenant = provider.clone();
+        other_tenant.id = "cp-1-tenant-b".to_string();
+        other_tenant.tenant_id = Some("tenant-b".to_string());
+        let resolve = |providers: Arc<MockProviderStore>| {
+            let secrets = secrets.clone();
+            async move {
+                resolve_delegation_credentials(
+                    &[elicit_binding("cp-1", crate::config::types::ElicitFallback::OnDemand)],
+                    "sha256:user1",
+                    "did:web:agent.example",
+                    "ch-1",
+                    crate::tenancy::SurfaceTenancy::configured(None),
+                    None,
+                    &(MockVaultStore::new(VaultLookupResult::NotFound) as Arc<dyn DelegationVaultStorage>),
+                    &(providers as Arc<dyn CredentialProviderStorage>),
+                    &secrets,
+                    "https://gw.example.com",
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+
+        let alone = resolve(MockProviderStore::with_stored(provider.clone())).await;
+        assert_start_url(&alone[0].result);
+
+        let shared = resolve(Arc::new(MockProviderStore {
+            providers: [(provider.id.clone(), provider), (other_tenant.id.clone(), other_tenant)].into(),
+        }))
+        .await;
+        assert_eq!(result_tag(&shared[0].result), "Unavailable");
+        assert_eq!(shared[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+    }
+
+    /// A consent result carries the gateway's consent start page for the
+    /// provider, with a sealed start state, never the vendor's URL.
+    fn assert_start_url(result: &DelegationLookupResult) {
+        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = result else {
+            panic!("expected a consent result, got {}", result_tag(result));
+        };
+        let url = url::Url::parse(authorization_url).unwrap();
+        assert_eq!(
+            url.origin()
+                .ascii_serialization(),
+            "https://gw.example.com",
+            "{authorization_url}"
+        );
+        assert_eq!(url.path(), "/oauth/callback/test-cp-1/start", "{authorization_url}");
+        let state = url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let state = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        assert_eq!(
+            (state.provider_id.as_str(), state.scopes.as_slice()),
+            ("test-cp-1", ["repo".to_string()].as_slice())
+        );
+    }
+
+    /// An accepted elicitation asks the person to open the gateway's consent
+    /// start page, and the pending answer that follows carries the same page.
+    #[tokio::test]
+    async fn an_elicitation_and_its_pending_answer_carry_the_consent_start_page() {
+        let (results, elicitation) = resolve_with_elicitation_reply(
+            "session-accepted",
+            crate::config::types::ElicitFallback::Fail,
+            Some(crate::mcp::elicitation::ElicitationResult::Accept {
+                content: serde_json::Value::Null,
+            }),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ElicitationAcceptedPending);
+        assert_start_url(&results[0].result);
+        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = &results[0].result else {
+            unreachable!()
+        };
+        let message = elicitation["params"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.ends_with(authorization_url.as_str()), "{message}");
     }
 
     /// Resolves an elicit binding for a client that advertises elicitation and
@@ -3507,7 +3620,7 @@ mod tests {
         session_id: &str,
         fallback: crate::config::types::ElicitFallback,
         reply: Option<crate::mcp::elicitation::ElicitationResult>,
-    ) -> Vec<DelegationResolution> {
+    ) -> (Vec<DelegationResolution>, serde_json::Value) {
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
 
@@ -3527,6 +3640,7 @@ mod tests {
             .await
             .unwrap();
         let client_session = session_id.to_string();
+        let (sent, elicitation) = tokio::sync::oneshot::channel();
         let client = tokio::spawn(async move {
             let mut body = axum::response::Sse::new(tokio_stream::wrappers::ReceiverStream::new(stream))
                 .into_response()
@@ -3546,6 +3660,8 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+            sent.send(request.clone())
+                .unwrap();
             match reply {
                 Some(reply) => {
                     crate::mcp::elicitation::global_pending_elicitation_registry()
@@ -3608,7 +3724,7 @@ mod tests {
         crate::mcp::streamable_sse::global_streamable_session_registry()
             .drop_session("ch-1", session_id)
             .await;
-        results
+        (results, elicitation.await.unwrap())
     }
 
     #[tokio::test]
@@ -3621,7 +3737,8 @@ mod tests {
         ] {
             for fallback in [crate::config::types::ElicitFallback::Fail, crate::config::types::ElicitFallback::OnDemand]
             {
-                let results = resolve_with_elicitation_reply(session_id, fallback.clone(), Some(reply.clone())).await;
+                let (results, _) =
+                    resolve_with_elicitation_reply(session_id, fallback.clone(), Some(reply.clone())).await;
 
                 assert_eq!(results.len(), 1);
                 assert_eq!(result_tag(&results[0].result), "Unavailable", "{session_id} {fallback:?}");
@@ -3632,7 +3749,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unanswered_elicitation_refuses_the_request_when_it_times_out() {
-        let results =
+        let (results, _) =
             resolve_with_elicitation_reply("session-timed-out", crate::config::types::ElicitFallback::Fail, None).await;
 
         assert_eq!(results.len(), 1);
