@@ -330,28 +330,21 @@ fn capped_hop_body(
     })
 }
 
-/// The hop's own 413: a JSON-RPC error for an MCP caller, an A2A problem
-/// otherwise.
-fn hop_body_too_large(
+/// The hop's own 413 for a body over the cap, or 400 for one the caller failed
+/// to send: a JSON-RPC error for an MCP caller, an A2A problem otherwise.
+fn hop_refusal(
+    fault: HopBodyFault,
     mcp: bool,
     max_bytes: usize,
 ) -> axum::response::Response {
-    if mcp {
-        return crate::mcp::modern_http::body_too_large_response();
+    match (fault, mcp) {
+        (HopBodyFault::TooLarge, true) => crate::mcp::modern_http::body_too_large_response(),
+        (HopBodyFault::TooLarge, false) => crate::proxy::body_too_large_response(max_bytes),
+        (HopBodyFault::ReadFailed, true) => crate::mcp::modern_http::body_read_failed_response(),
+        (HopBodyFault::ReadFailed, false) => {
+            crate::a2a::create_error_response(axum::http::StatusCode::BAD_REQUEST, "Failed to read request body")
+        }
     }
-    crate::a2a::create_error_response(
-        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-        &format!("Request body too large (max: {max_bytes})"),
-    )
-}
-
-/// The hop's own 400 for a body the caller failed to send: a JSON-RPC error
-/// for an MCP caller, an A2A problem otherwise.
-fn hop_body_read_failed(mcp: bool) -> axum::response::Response {
-    if mcp {
-        return crate::mcp::modern_http::body_read_failed_response();
-    }
-    crate::a2a::create_error_response(axum::http::StatusCode::BAD_REQUEST, "Failed to read request body")
 }
 
 /// Forwards a request on the inbound listener to the outbound listener that
@@ -379,24 +372,23 @@ pub(crate) async fn forward_shared_host_hop(
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
+    let path = req.uri().path().to_string();
     if declared_length.is_some_and(|length| length > hop.max_body_bytes as u64) {
         warn!(
             caller = %caller,
-            path = req.uri().path(),
+            path = %path,
             max = hop.max_body_bytes,
             "Shared-host hop refused a declared oversize body"
         );
-        return hop_body_too_large(mcp, hop.max_body_bytes);
+        return hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes);
     }
-    let path = req.uri().path().to_string();
-
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/")
-        .to_string();
-    let url = format!("{}{}", hop.target, path_and_query);
+    let url = format!(
+        "{}{}",
+        hop.target,
+        req.uri()
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+    );
     let mut builder = hop
         .client
         .request(req.method().clone(), &url);
@@ -438,11 +430,11 @@ pub(crate) async fn forward_shared_host_hop(
         Err(e) => match fault.get() {
             Some(HopBodyFault::TooLarge) if (e.is_body() || e.is_request()) && !e.is_timeout() => {
                 warn!(caller = %caller, path = %path, max = hop.max_body_bytes, "Shared-host hop refused an oversize body");
-                hop_body_too_large(mcp, hop.max_body_bytes)
+                hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes)
             }
             Some(HopBodyFault::ReadFailed) => {
                 warn!(caller = %caller, path = %path, "Shared-host hop could not read the caller's body");
-                hop_body_read_failed(mcp)
+                hop_refusal(HopBodyFault::ReadFailed, mcp, hop.max_body_bytes)
             }
             _ => {
                 if (e.is_body() || e.is_request()) && !e.is_connect() {

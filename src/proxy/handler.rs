@@ -1749,10 +1749,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .await
                 .map_err(|e| {
                     if crate::proxy::exceeds_length_limit(&e) {
-                        return create_error_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            &format!("Request body too large (max: {DID_AUTH_MAX_BODY_BYTES})"),
-                        );
+                        return crate::proxy::body_too_large_response(DID_AUTH_MAX_BODY_BYTES);
                     }
                     create_error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e))
                 })?;
@@ -2293,14 +2290,18 @@ async fn proxy_handler_with_mcp_runtime(
         connection_guard
             .decrement()
             .await;
-        return Err(create_error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &format!("Request body too large (max: {})", state.config.a2a.max_body_size),
-        ));
+        return Err(crate::proxy::body_too_large_response(state.config.a2a.max_body_size));
     }
     let mut body_bytes = body_read.map_err(|e| {
+        // An oversized body is an admission refusal, not a task error; any other read failure is the connection.
+        if let Some(policy) = &mcp_http
+            && crate::proxy::exceeds_length_limit(&e)
+        {
+            let error = policy.body_read_error(e);
+            crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+            return (*error).into_response();
+        }
         error!(channel = channel_name, error = %e, "Failed to read request body");
-        // Track error (connection guard will be dropped automatically)
         if let (Some(task_monitor), Some(task_id)) = (&state.task_monitor, &state.task_id) {
             let task_id = task_id.clone();
             let monitor = task_monitor.clone();
@@ -2311,14 +2312,8 @@ async fn proxy_handler_with_mcp_runtime(
                     .await;
             });
         }
-        // Connection guard will automatically decrement when dropped
         if let Some(policy) = &mcp_http {
-            let error = policy.body_read_error(e);
-            // Only an oversized body is a refusal; any other read failure is the connection.
-            if error.status == StatusCode::PAYLOAD_TOO_LARGE {
-                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
-            }
-            return (*error).into_response();
+            return (*policy.body_read_error(e)).into_response();
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
@@ -18337,6 +18332,99 @@ allow if {
         assert!(rejections.is_empty(), "{rejections:?}");
     }
 
+    /// A body refused for its size is an admission refusal and leaves the task's
+    /// error count alone, on an A2A and an MCP Access Point alike; a body the
+    /// caller fails to send counts as a task error.
+    async fn access_point_counts_only_failed_body_reads_as_task_errors(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+
+        const TASK: &str = "router-fixture";
+        const CAP: usize = 1024;
+        let monitor = Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running(TASK))
+            .await;
+        let mut capped_config = (*state.config).clone();
+        capped_config
+            .a2a
+            .max_body_size = CAP;
+        let state = crate::state::ProxyState {
+            config: Arc::new(capped_config),
+            task_monitor: Some(monitor.clone()),
+            ..state.clone()
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        )
+        .await;
+        let surface = |protocol: &str| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "task-errors", "name": "Task errors",
+                "mcp_http": if protocol == "mcp" { json!({"max_request_bytes": CAP}) } else { json!(null) },
+                "access_point": {"listen_address": "https://gateway.example", "route": "/errors", "protocol": protocol},
+                "target": {"endpoint": target.url()}
+            }))
+            .unwrap()
+        };
+        let send = |protocol: &'static str, body: axum::body::Body| {
+            let router = direct_router_state(&state, surface(protocol));
+            async move {
+                let mut request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/errors")
+                    .header("content-type", "application/json");
+                if protocol == "mcp" {
+                    request = request
+                        .header("accept", "application/json, text/event-stream")
+                        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+                        .header("mcp-method", "tools/list");
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request.body(body).unwrap(),
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        None,
+                    )),
+                )
+                .await
+                .expect("the Access Point must answer")
+                .status()
+            }
+        };
+        let error_count = || async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            monitor
+                .get_task(TASK)
+                .await
+                .unwrap()
+                .error_count
+        };
+        let broken = || {
+            axum::body::Body::from_stream(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"{")),
+                Err(std::io::Error::other("caller went away")),
+            ]))
+        };
+
+        for protocol in ["a2a", "mcp"] {
+            let status = send(protocol, axum::body::Body::from(vec![b' '; CAP + 1])).await;
+            assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{protocol}");
+            assert_eq!(error_count().await, 0, "{protocol}: a 413 is not a task error");
+        }
+        let status = send("mcp", broken()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error_count().await, 1, "a failed body read is a task error");
+        let status = send("a2a", broken()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error_count().await, 2, "a failed body read is a task error");
+    }
+
     /// Each refusal the Access Point answers itself is recorded as
     /// `request_rejected` with the status and JSON-RPC code the caller got.
     async fn access_point_records_request_refusals(state: &crate::state::ProxyState) {
@@ -19933,6 +20021,7 @@ allow if {
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
         access_point_caps_an_endless_body_as_it_reads_it(&state).await;
+        access_point_counts_only_failed_body_reads_as_task_errors(&state).await;
         access_point_requests_each_carry_their_own_request_id(&state).await;
         streamed_response_records_carry_the_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
