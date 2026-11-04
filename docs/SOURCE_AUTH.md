@@ -199,7 +199,9 @@ has one, otherwise the base. Variant responses carry it for that variant.
 They also carry a read-only `not_ready_reason` while the surface is refused for its API Key
 Provider keys: `provider_key_tenant`, or `api_key_store_unavailable` while the API key store
 cannot be read; see [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
-`access_point_status` stays `ready` for such a surface. The field is absent otherwise.
+`access_point_status` stays `ready` for such a surface, and the dashboard shows only
+`access_point_status`. `not_ready_reason` is the verdict of the gateway node that answered the
+request. The field is absent otherwise.
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -1032,11 +1034,20 @@ no secret.
 - Under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
   tenant, or the key of a surface with no tenant is not ready.
-- A key or owning surface that no longer exists is only reported: key ids are never reused.
-- While the API key store cannot be read, every surface naming an `atgk_` id that has not been
-  checked yet is not ready; a surface checked before the outage keeps its verdict. The outage is
-  logged once. Each request to an unchecked surface checks again, so it serves as soon as the
-  store can be read.
+- A key or owning surface that cannot be found is only reported. The key may exist on another
+  node that shares the storage and not be visible here yet, so the request after
+  `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
+  appeared by then is held to the rules above. Until then the verdict is kept, so a surface
+  naming a key that does not exist does not read the API key store on every request. Each read
+  of the API key store picks up the keys of a surface whose first key another node created; a
+  key another node adds for a surface whose keys this node already holds shows up only with
+  `cache_refresh_interval_secs` greater than `0`.
+- While the API key store cannot be read, a surface naming an `atgk_` id is not ready in either
+  mode unless it was checked before the outage and has not gone live again since; a surface that
+  goes live during the outage loses its earlier verdict. The outage is logged once. Each request
+  to an unchecked surface checks again, so it serves once a read succeeds.
+- If the API key store fails to start, the gateway runs without it until it restarts: every
+  surface naming an `atgk_` id stays not ready in either mode. Fix the store and restart.
 
 The check also covers a Caller Context API Key `secret_id` that starts with `atgk_` on a view
 whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is

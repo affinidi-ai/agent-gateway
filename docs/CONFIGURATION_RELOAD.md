@@ -259,7 +259,9 @@ credential provider; a reference to another tenant's is refused in both modes (s
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). A
 stored surface that derives a DID from another tenant's API Key Provider key, or from the key of
 a surface with no tenant, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
-[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live). An
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
+those surfaces, then restart with `"enforce"`. An
 unknown value fails startup, and an absent section means both rules are `"warn"`. The report also names a stored JWT Bearer provider without a subject under a third rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
