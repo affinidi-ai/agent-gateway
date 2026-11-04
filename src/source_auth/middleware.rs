@@ -1741,7 +1741,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
                 assert_eq!(subject, "00000000-0000-0000-0000-0000000000aa");
                 assert_eq!(principal_claim, "oid");
             }
-            other => panic!("expected JwtBearer identity, got: {other:?}"),
+            _ => panic!("expected a JwtBearer identity"),
         }
         assert_eq!(
             identity
