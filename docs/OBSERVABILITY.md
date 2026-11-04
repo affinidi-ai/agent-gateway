@@ -342,12 +342,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
   rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target) or `transit_point_caller` (a Transit Point's
-  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)). `retry_after_ms`
+  stream cap on the way to a fabric target), `transit_point_caller` (a Transit Point's
+  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)) or
+  `transit_point_overflow` (the bucket that per-caller limit's callers share while it holds as
+  many buckets as it may). `retry_after_ms`
   is the wait the caller is given, when there is one; the surface and per-caller limits also send
   it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
   (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
-  a request with no identified caller.
+  a request with no identified caller. A `transit_point_overflow` record names the Transit Point
+  and no caller.
 - `request_rejected`: the gateway refused the request before or while forwarding it.
   `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
   the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP

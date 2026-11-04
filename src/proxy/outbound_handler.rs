@@ -558,9 +558,9 @@ pub struct OutboundPipelineContext {
     /// Carries the original caller context from the inbound request.
     pub transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Claims of a valid transit token sent to a Transit Point that does not
-    /// require one. Only `input.transit.caller` and the Fabric hop count read
-    /// them: delegation, Workload Binding, stream expiry and the trace id keep
-    /// treating the call as carrying no token.
+    /// require one. Only `input.transit.caller`, the per-caller rate limit and
+    /// the Fabric hop count read them: delegation, Workload Binding, stream
+    /// expiry and the trace id keep treating the call as carrying no token.
     pub optional_transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Size in bytes of the upstream response body, captured by
     /// `step_process_response` before the body is consumed. Used by
@@ -877,7 +877,7 @@ fn changes_enforced_transit_policy(
         || (resolved
             .per_caller_rate_limit
             .is_some()
-            && base.per_caller_rate_limit != resolved.per_caller_rate_limit)
+            && !base.has_same_per_caller_rate_limit(resolved))
 }
 
 // ── Virtual channel resolution ──────────────────────────────────────────────
@@ -1293,9 +1293,9 @@ async fn validate_transit_token(
         // Per-TP opt-out: this transit point is configured to accept
         // calls without a transit token (e.g. dev/testing or a TP whose
         // callers cannot carry one). A token the agent sends anyway is still
-        // checked so policy sees the caller it names, and only policy: it
-        // does not drive delegation, Workload Binding, stream expiry or the
-        // trace id. One that does not verify is ignored and the caller stays
+        // checked so policy and the per-caller rate limit see the caller it
+        // names, and only those: it does not drive delegation, Workload
+        // Binding, stream expiry or the trace id. One that does not verify is ignored and the caller stays
         // anonymous. Each pass replaces the last, so a token the first pass
         // accepted within the clock leeway and the strict modern MCP pass
         // refuses no longer names the caller.
@@ -2242,31 +2242,47 @@ async fn step_rate_limit(
         .config_id()
         .unwrap_or("unknown");
 
-    if let Some(limiter) = pm
-        .caller_rate_limiter(config_id, &ctx.virtual_channel.alias)
+    match pm
+        .caller_rate_limit(config_id, &ctx.virtual_channel.alias)
         .await
     {
-        let caller = delegation_caller_hash(ctx);
-        if let Err(retry_after) = limiter.check(caller.as_deref()) {
-            debug!(request_id = %ctx.request_id, "Outbound rate limit exceeded (per caller)");
-            crate::audit::request_events::transit_point_caller_rate_limited(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: ctx
-                        .transit_token_claims
-                        .as_ref()
-                        .is_some_and(|claims| claims.fabric.is_some()),
-                },
-                &ctx.virtual_channel.alias,
-                caller.as_deref(),
-                Some(retry_after),
+        None => {}
+        Some(crate::policies::CallerLimit::Unenforceable) => {
+            warn!(
+                request_id = %ctx.request_id,
+                surface_id = %ctx.surface.surface_id,
+                transit_point = %ctx.virtual_channel.alias,
+                "Transit Point request refused: its per-caller rate limit cannot be enforced"
             );
-            return Err(OutboundPipelineError::CallerRateLimitExceeded {
-                retry_after,
-                mcp_request_id: mcp_id_before_body(ctx),
-            });
+            return Err(transit_point_unavailable(ctx));
+        }
+        // Refused by `step_refuse_variant_changing_enforced_policy` once the
+        // body names the JSON-RPC id, so it spends nothing of its caller's
+        // allowance first.
+        Some(crate::policies::CallerLimit::Enforced(_)) if ctx.variant_changes_enforced_policy => {}
+        Some(crate::policies::CallerLimit::Enforced(limiter)) => {
+            let caller = rate_limit_caller_hash(ctx);
+            if let Err(refusal) = limiter.check(caller.as_deref()) {
+                debug!(request_id = %ctx.request_id, overflow = refusal.overflow, "Outbound rate limit exceeded (per caller)");
+                crate::audit::request_events::transit_point_caller_rate_limited(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &ctx.surface.surface_id,
+                        channel_name: &ctx.surface.name,
+                        trace_id: Some(&ctx.request_id),
+                        via_fabric: ctx
+                            .transit_token_claims
+                            .as_ref()
+                            .is_some_and(|claims| claims.fabric.is_some()),
+                    },
+                    &ctx.virtual_channel.alias,
+                    caller.as_deref(),
+                    refusal,
+                );
+                return Err(OutboundPipelineError::CallerRateLimitExceeded {
+                    retry_after: refusal.retry_after,
+                    mcp_request_id: mcp_id_before_body(ctx),
+                });
+            }
         }
     }
 
@@ -4879,23 +4895,14 @@ pub(crate) fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<St
         .transit_token_claims
         .as_ref()
     {
-        if let Some(fabric) = &claims.fabric {
-            return fabric
-                .principal_hash
-                .clone()
-                .filter(|_| {
-                    ctx.virtual_channel
-                        .delegated_credentials_for_fabric_callers
-                        && ctx
-                            .surface
-                            .fabric_caller_authentication_gap()
-                            .is_none()
-                });
-        }
-        return claims
-            .user_identity_hash
-            .clone();
+        return token_caller_hash(ctx, claims);
     }
+    source_auth_client_hash(ctx)
+}
+
+/// The identity hash of the client the Transit Point's own `source_auth`
+/// verified on this call, if it names a subject.
+fn source_auth_client_hash(ctx: &OutboundPipelineContext) -> Option<String> {
     ctx.authenticated_identity
         .as_ref()
         .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::SourceAuth))
@@ -4906,6 +4913,45 @@ pub(crate) fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<St
                     .as_deref(),
             )
         })
+}
+
+/// The caller a transit token names, as [`delegation_caller_hash`] reads it.
+fn token_caller_hash(
+    ctx: &OutboundPipelineContext,
+    claims: &crate::proxy::transit_token::TransitTokenClaims,
+) -> Option<String> {
+    if let Some(fabric) = &claims.fabric {
+        return fabric
+            .principal_hash
+            .clone()
+            .filter(|_| {
+                ctx.virtual_channel
+                    .delegated_credentials_for_fabric_callers
+                    && ctx
+                        .surface
+                        .fabric_caller_authentication_gap()
+                        .is_none()
+            });
+    }
+    claims
+        .user_identity_hash
+        .clone()
+}
+
+/// The caller a Transit Point's per-caller rate limit counts a request
+/// against: the caller its transit token names, required or a verified
+/// optional one, read as [`delegation_caller_hash`] reads it, else the client
+/// the Transit Point's `source_auth` verified. Unlike a delegation key, a
+/// token that names no caller falls back to that client, since it only picks
+/// a bucket.
+fn rate_limit_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
+    ctx.transit_token_claims
+        .as_ref()
+        .or(ctx
+            .optional_transit_token_claims
+            .as_ref())
+        .and_then(|claims| token_caller_hash(ctx, claims))
+        .or_else(|| source_auth_client_hash(ctx))
 }
 
 /// The agent half of the vault key for a Transit Point's delegated
@@ -10168,6 +10214,16 @@ mod tests {
                 false,
             ),
             (
+                "restates the per-caller rate limit with its burst",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60, "burst": 5}}),
+                false,
+            ),
+            (
+                "sets another per-caller burst",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60, "burst": 10}}),
+                true,
+            ),
+            (
                 "sets another per-caller rate limit",
                 json!({"per_caller_rate_limit": {"requests": 50, "window_secs": 60}}),
                 true,
@@ -10814,6 +10870,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn an_optional_transit_token_gives_its_caller_a_bucket_of_their_own() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        let with_optional_token = |identity_hash: &str| {
+            let mut next = as_caller(&ctx, Some(identity_hash));
+            next.optional_transit_token_claims = next
+                .transit_token_claims
+                .take();
+            next
+        };
+        step_rate_limit(&state, &mut with_optional_token("alice-hash"))
+            .await
+            .unwrap();
+        let refused = step_rate_limit(&state, &mut with_optional_token("alice-hash"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
+        step_rate_limit(&state, &mut with_optional_token("bob-hash"))
+            .await
+            .expect("bob, named by his own optional token, is not held up by alice");
+    }
+
+    #[tokio::test]
+    async fn a_request_its_variant_refuses_spends_no_allowance() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        for _ in 0..3 {
+            let mut refused_later = as_caller(&ctx, Some("alice-hash"));
+            refused_later.variant_changes_enforced_policy = true;
+            step_rate_limit(&state, &mut refused_later)
+                .await
+                .unwrap();
+        }
+        step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .expect("alice's allowance is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_per_caller_limit_that_cannot_be_enforced_refuses_every_request() {
+        let (state, ctx) =
+            rate_limited_context(json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp",
+                                         "protocol": "mcp",
+                                         "per_caller_rate_limit": { "requests": 0, "window_secs": 60 } }))
+            .await;
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::TransitPointUnavailable { .. }), "{refused:?}");
     }
 
     #[tokio::test]
@@ -13514,6 +13620,35 @@ mod tests {
     ) {
         ctx.authenticated_identity = Some(identity);
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
+    }
+
+    #[test]
+    fn the_per_caller_rate_limit_counts_the_token_caller_else_the_source_auth_client() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let client_hash = rate_limit_caller_hash(&ctx).expect("the client the Transit Point verified is counted");
+
+        ctx.optional_transit_token_claims = Some(caller_claims(None, None, Some("alice-hash"), json!({})));
+        assert_eq!(
+            rate_limit_caller_hash(&ctx).as_deref(),
+            Some("alice-hash"),
+            "an optional token's caller wins over the client"
+        );
+
+        ctx.optional_transit_token_claims = None;
+        ctx.transit_token_claims = Some(caller_claims(None, None, Some("alice-hash"), json!({})));
+        assert_eq!(rate_limit_caller_hash(&ctx).as_deref(), Some("alice-hash"), "so does a required token's");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), None, json!({})));
+        assert_eq!(
+            rate_limit_caller_hash(&ctx),
+            Some(client_hash),
+            "a token that names no caller counts the client, unlike a delegation key"
+        );
     }
 
     /// A transit token that names no verified end user is not replaced by the

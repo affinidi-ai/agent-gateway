@@ -1663,6 +1663,30 @@ impl TransitPoint {
     #[allow(dead_code)]
     pub const ALIAS_PATTERN: &'static str = r"^[a-z][a-z0-9-]{0,62}$";
 
+    /// Whether `self` and `other` set the same per-caller rate limit, an unset
+    /// (or `0`) `burst` read as `requests`, the burst the limiter gives it.
+    pub fn has_same_per_caller_rate_limit(
+        &self,
+        other: &TransitPoint,
+    ) -> bool {
+        let in_force = |point: &TransitPoint| {
+            point
+                .per_caller_rate_limit
+                .as_ref()
+                .map(|limit| {
+                    (
+                        limit.requests,
+                        limit.window_secs,
+                        limit
+                            .burst
+                            .filter(|burst| *burst > 0)
+                            .unwrap_or(limit.requests),
+                    )
+                })
+        };
+        in_force(self) == in_force(other)
+    }
+
     /// Refuse a per-caller rate limit with `requests`, `window_secs` or
     /// `burst` of 0.
     pub fn validate_per_caller_rate_limit(&self) -> Result<(), String> {

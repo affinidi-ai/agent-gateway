@@ -344,6 +344,70 @@ describe('Transit Points changed through the API after a dashboard save', () => 
     expect(resaved.transit.points[0].rate_limit).toBeUndefined();
   });
 
+  describe('does not restore a Transit Point rate limit removed through the API', () => {
+    const bothLimits = {
+      id: 'rate-limit-transit-point-a2a-1',
+      type: 'rate-limit',
+      label: '',
+      configured: true,
+      config: {
+        requests: '100',
+        window_secs: '60',
+        caller_requests: '5',
+        caller_window_secs: '60',
+      },
+      parentId: 'transit-point-a2a-1',
+    };
+
+    it('the per-caller limit, keeping the shared one', () => {
+      const resaved = resaveAfter([...baseNodes, tp(1), bothLimits], stored => {
+        expect(stored.transit.points[0].per_caller_rate_limit).toEqual({
+          requests: 5,
+          window_secs: 60,
+        });
+        delete stored.transit.points[0].per_caller_rate_limit;
+      });
+
+      expect(resaved.transit.points[0].per_caller_rate_limit).toBeUndefined();
+      expect(resaved.transit.points[0].rate_limit).toEqual({ requests: 100, window_secs: 60 });
+    });
+
+    it('the shared limit, keeping the per-caller one', () => {
+      const resaved = resaveAfter([...baseNodes, tp(1), bothLimits], stored => {
+        delete stored.transit.points[0].rate_limit;
+      });
+
+      expect(resaved.transit.points[0].rate_limit).toBeUndefined();
+      expect(resaved.transit.points[0].per_caller_rate_limit).toEqual({
+        requests: 5,
+        window_secs: 60,
+      });
+    });
+
+    it('both limits', () => {
+      const resaved = resaveAfter([...baseNodes, tp(1), bothLimits], stored => {
+        delete stored.transit.points[0].rate_limit;
+        delete stored.transit.points[0].per_caller_rate_limit;
+      });
+
+      expect(resaved.transit.points[0].rate_limit).toBeUndefined();
+      expect(resaved.transit.points[0].per_caller_rate_limit).toBeUndefined();
+      expect(resaved.access_point?.rate_limit).toBeUndefined();
+    });
+
+    it('both limits, without taking a limit the API set elsewhere', () => {
+      const resaved = resaveAfter([...baseNodes, tp(1), bothLimits], stored => {
+        delete stored.transit.points[0].rate_limit;
+        delete stored.transit.points[0].per_caller_rate_limit;
+        stored.access_point.rate_limit = { requests: 7, window_secs: 60 };
+      });
+
+      expect(resaved.transit.points[0].rate_limit).toBeUndefined();
+      expect(resaved.transit.points[0].per_caller_rate_limit).toBeUndefined();
+      expect(resaved.access_point?.rate_limit).toEqual({ requests: 7, window_secs: 60 });
+    });
+  });
+
   it('keeps both rate limits of a Transit Point through a save and a reload', () => {
     const resaved = resaveAfter([...baseNodes, tp(1)], stored => {
       stored.transit.points[0].rate_limit = { requests: 100, window_secs: 60 };

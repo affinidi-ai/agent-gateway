@@ -4,8 +4,13 @@ import '../index';
 import RateLimitPanel from '../rate-limit/RateLimitPanel';
 import { rateLimitDefinition } from '../rate-limit/definition';
 import type { ConfigPanelProps } from '../types';
+import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 
-function showPanel(parent: { id: string; type: string } | null, config: Record<string, unknown>) {
+function showPanel(
+  parent: { id: string; type: string } | null,
+  config: Record<string, unknown>,
+  variant?: string
+) {
   const updateField = jest.fn();
   const node = {
     id: 'rate-limit-1',
@@ -22,7 +27,11 @@ function showPanel(parent: { id: string; type: string } | null, config: Record<s
     updateFields: jest.fn(),
     allNodes: parent ? [parent, node] : [node],
   } as unknown as ConfigPanelProps;
-  render(<RateLimitPanel {...props} />);
+  render(
+    <SurfaceMetaProvider value={{ surfaceId: 's', activeVariantAlias: variant } as any}>
+      <RateLimitPanel {...props} />
+    </SurfaceMetaProvider>
+  );
   return updateField;
 }
 
@@ -43,6 +52,22 @@ describe('RateLimitPanel per-caller limit', () => {
       target: { value: '30' },
     });
     expect(updateField).toHaveBeenCalledWith('caller_window_secs', '30');
+  });
+
+  it("is read-only on a named variant, which uses the base surface's", () => {
+    showPanel({ id: 'tp-1', type: 'transit-point-a2a' }, { caller_requests: '5' }, 'dev');
+
+    expect(screen.getByTestId('rate-limit-caller-requests-input')).toBeDisabled();
+    expect(screen.getByTestId('rate-limit-caller-window-secs-input')).toBeDisabled();
+    expect(screen.getByTestId('rate-limit-caller-burst-input')).toBeDisabled();
+    expect(screen.getByTestId('rate-limit-caller-base-only')).toBeInTheDocument();
+  });
+
+  it('is editable on the base surface', () => {
+    showPanel({ id: 'tp-1', type: 'transit-point-a2a' }, { caller_requests: '5' });
+
+    expect(screen.getByTestId('rate-limit-caller-requests-input')).toBeEnabled();
+    expect(screen.queryByTestId('rate-limit-caller-base-only')).not.toBeInTheDocument();
   });
 
   it('is not offered on the inbound limit', () => {

@@ -5,18 +5,27 @@ export interface RateLimitWire {
   burst?: number;
 }
 
+/** The Rate Limit panel's limit fields: the shared limit, then the per-caller one. */
+export const RATE_LIMIT_FIELDS = [
+  'requests',
+  'window_secs',
+  'burst',
+  'caller_requests',
+  'caller_window_secs',
+  'caller_burst',
+] as const;
+
 /** The Rate Limit panel's fields, as strings from its numeric inputs. */
-export type RateLimitPanelConfig = Partial<
-  Record<
-    | 'requests'
-    | 'window_secs'
-    | 'burst'
-    | 'caller_requests'
-    | 'caller_window_secs'
-    | 'caller_burst',
-    string
-  >
->;
+export type RateLimitPanelConfig = Partial<Record<(typeof RATE_LIMIT_FIELDS)[number], string>>;
+
+/**
+ * Whether a saved canvas copy of a Transit Point's rate-limit node carries a
+ * limit. The stored surface is the only source of those, so a copy that
+ * carries one the stored surface no longer has was removed through the API.
+ */
+export function carriesRateLimit(config: Record<string, unknown> | undefined): boolean {
+  return RATE_LIMIT_FIELDS.some(field => config?.[field] != null && config[field] !== '');
+}
 
 /**
  * The per-caller limit of a Transit Point (`transit.points[].per_caller_rate_limit`),

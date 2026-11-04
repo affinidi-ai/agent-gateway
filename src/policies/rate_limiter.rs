@@ -202,19 +202,46 @@ impl ShrinkableKeyedStateStore<String> for CallerBuckets {
 pub struct CallerRateLimiter {
     buckets: CallerBuckets,
     limiter: GovernorRateLimiter<String, CallerBuckets, DefaultClock>,
+    point: String,
     started: Instant,
     last_cleanup_secs: AtomicU64,
+    last_full_warning_secs: AtomicU64,
+}
+
+/// A request a [`CallerRateLimiter`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerRefusal {
+    /// The wait until the bucket that refused allows another request.
+    pub retry_after: Duration,
+    /// The shared overflow bucket refused it, not the caller's own.
+    pub overflow: bool,
 }
 
 impl CallerRateLimiter {
-    pub fn new(config: &RateLimitConfig) -> Result<Self, RateLimitError> {
+    /// A limiter for the Transit Point `point`, named in its logs as
+    /// `<surface id>/<alias>`. A bucket that would take longer than
+    /// [`MAX_BUCKET_REFILL_NANOS`] to refill is refused.
+    pub fn new(
+        config: &RateLimitConfig,
+        point: impl Into<String>,
+    ) -> Result<Self, RateLimitError> {
         let quota = quota_for(config)?;
+        if quota
+            .replenish_interval()
+            .as_nanos()
+            * u128::from(quota.burst_size().get())
+            > MAX_BUCKET_REFILL_NANOS
+        {
+            return Err(RateLimitError::InvalidConfig("window too long to count".to_string()));
+        }
         let buckets = CallerBuckets::default();
         Ok(Self {
             limiter: GovernorRateLimiter::new(quota, buckets.clone(), DefaultClock::default()),
             buckets,
+            point: point.into(),
             started: Instant::now(),
             last_cleanup_secs: AtomicU64::new(0),
+            last_full_warning_secs: AtomicU64::new(0),
         })
     }
 
@@ -223,7 +250,7 @@ impl CallerRateLimiter {
     pub fn check(
         &self,
         caller: Option<&str>,
-    ) -> Result<(), Duration> {
+    ) -> Result<(), CallerRefusal> {
         self.clean_up_when_due();
         let key = match caller {
             None => NO_CALLER_KEY,
@@ -232,7 +259,10 @@ impl CallerRateLimiter {
         };
         self.limiter
             .check_key(&key.to_string())
-            .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()))
+            .map_err(|not_until| CallerRefusal {
+                retry_after: not_until.wait_time_from(DefaultClock::default().now()),
+                overflow: key == OVERFLOW_KEY,
+            })
     }
 
     #[cfg(test)]
@@ -253,33 +283,41 @@ impl CallerRateLimiter {
         if self.limiter.len() < MAX_TRACKED_CALLERS {
             return false;
         }
-        if self.claim_cleanup(AT_BOUND_RECLAIM_INTERVAL) {
+        if self.claim(&self.last_cleanup_secs, AT_BOUND_RECLAIM_INTERVAL) {
             self.limiter.retain_recent();
         }
-        self.limiter.len() >= MAX_TRACKED_CALLERS
+        let full = self.limiter.len() >= MAX_TRACKED_CALLERS;
+        if full && self.claim(&self.last_full_warning_secs, AT_BOUND_RECLAIM_INTERVAL) {
+            warn!(
+                point = %self.point,
+                tracked_callers = MAX_TRACKED_CALLERS,
+                "Per-caller rate limit is at its bound: callers without a bucket share one until some recover"
+            );
+        }
+        full
     }
 
     fn clean_up_when_due(&self) {
-        if self.claim_cleanup(CLEANUP_INTERVAL) {
+        if self.claim(&self.last_cleanup_secs, CLEANUP_INTERVAL) {
             self.clean_up();
         }
     }
 
-    fn claim_cleanup(
+    /// Whether `interval` has passed since `last`, claiming it when it has, so
+    /// only one request acts on it.
+    fn claim(
         &self,
+        last: &AtomicU64,
         interval: Duration,
     ) -> bool {
         let now_secs = self
             .started
             .elapsed()
             .as_secs();
-        let last = self
-            .last_cleanup_secs
-            .load(Ordering::Relaxed);
-        now_secs.saturating_sub(last) >= interval.as_secs()
-            && self
-                .last_cleanup_secs
-                .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+        let previous = last.load(Ordering::Relaxed);
+        now_secs.saturating_sub(previous) >= interval.as_secs()
+            && last
+                .compare_exchange(previous, now_secs, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
     }
 
@@ -299,9 +337,6 @@ fn quota_for(config: &RateLimitConfig) -> Result<Quota, RateLimitError> {
         .burst
         .and_then(NonZeroU32::new)
         .unwrap_or(requests);
-    if replenishment_interval.as_nanos() * u128::from(burst_size.get()) > MAX_BUCKET_REFILL_NANOS {
-        return Err(RateLimitError::InvalidConfig("window too long to count".to_string()));
-    }
     Ok(Quota::with_period(replenishment_interval)
         .ok_or_else(|| RateLimitError::InvalidConfig("more requests than the window can count".to_string()))?
         .allow_burst(burst_size))
@@ -314,7 +349,7 @@ mod tests {
 
     #[test]
     fn each_caller_has_a_bucket_of_their_own() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 60).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 60).unwrap(), "partner").unwrap();
         assert!(
             limiter
                 .check(Some("alice"))
@@ -352,7 +387,7 @@ mod tests {
 
     #[test]
     fn requests_with_no_caller_share_one_bucket() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 60).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 60).unwrap(), "partner").unwrap();
         assert!(limiter.check(None).is_ok());
         assert!(limiter.check(None).is_ok());
         assert!(limiter.check(None).is_err(), "a request cannot avoid the limit by naming no caller");
@@ -366,13 +401,13 @@ mod tests {
 
     #[test]
     fn the_wait_is_the_time_until_that_callers_next_request() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1, 10).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1, 10).unwrap(), "partner").unwrap();
         assert!(
             limiter
                 .check(Some("alice"))
                 .is_ok()
         );
-        let Err(retry_after) = limiter.check(Some("alice")) else {
+        let Err(CallerRefusal { retry_after, overflow: false }) = limiter.check(Some("alice")) else {
             panic!("the second request is refused");
         };
         assert!(retry_after > Duration::from_secs(8) && retry_after <= Duration::from_secs(10), "{retry_after:?}");
@@ -380,7 +415,7 @@ mod tests {
 
     #[test]
     fn the_number_of_buckets_is_bounded_and_callers_past_the_bound_share_one() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1, 3600).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1, 3600).unwrap(), "partner").unwrap();
         for caller in 0..MAX_TRACKED_CALLERS {
             assert!(
                 limiter
@@ -406,7 +441,7 @@ mod tests {
 
     #[test]
     fn at_the_bound_a_caller_with_a_bucket_keeps_it() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 3600).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(2, 3600).unwrap(), "partner").unwrap();
         assert!(
             limiter
                 .check(Some("alice"))
@@ -448,10 +483,8 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            limiter
-                .check(Some("new-3"))
-                .is_err(),
-            "new callers share the overflow bucket"
+            matches!(limiter.check(Some("new-3")), Err(CallerRefusal { overflow: true, .. })),
+            "new callers share the overflow bucket, and its refusal says so"
         );
         assert!(
             limiter
@@ -459,17 +492,12 @@ mod tests {
                 .is_ok(),
             "bob keeps his own allowance while the overflow bucket is spent"
         );
-        assert!(
-            limiter
-                .check(Some("bob"))
-                .is_err(),
-            "and his own limit"
-        );
+        assert!(matches!(limiter.check(Some("bob")), Err(CallerRefusal { overflow: false, .. })), "and his own limit");
     }
 
     #[test]
     fn at_the_bound_recovered_buckets_are_reclaimed_for_new_callers() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1000, 1).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(1000, 1).unwrap(), "partner").unwrap();
         for caller in 0..MAX_TRACKED_CALLERS {
             assert!(
                 limiter
@@ -501,7 +529,7 @@ mod tests {
 
     #[test]
     fn a_caller_with_a_recovered_bucket_is_forgotten() {
-        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(100, 1).unwrap()).unwrap();
+        let limiter = CallerRateLimiter::new(&RateLimitConfig::new(100, 1).unwrap(), "partner").unwrap();
         assert!(
             limiter
                 .check(Some("alice"))
@@ -519,22 +547,30 @@ mod tests {
             window_secs: 60,
             burst: None,
         };
-        assert!(CallerRateLimiter::new(&zero).is_err());
+        assert!(CallerRateLimiter::new(&zero, "partner").is_err());
     }
 
     #[test]
     fn a_limit_whose_bucket_takes_too_long_to_refill_is_refused() {
         for (requests, window_secs, burst) in [(1, 20_000_000_000, None), (1, 1_000_000_000, Some(100))] {
             let config = RateLimitConfig { requests, window_secs, burst };
-            assert!(matches!(CallerRateLimiter::new(&config), Err(RateLimitError::InvalidConfig(_))), "{config:?}");
-            assert!(matches!(RateLimiter::new(config), Err(RateLimitError::InvalidConfig(_))));
+            assert!(
+                matches!(CallerRateLimiter::new(&config, "partner"), Err(RateLimitError::InvalidConfig(_))),
+                "{config:?}"
+            );
         }
         let a_year = RateLimitConfig {
             requests: 1,
             window_secs: 365 * 24 * 3600,
             burst: Some(100),
         };
-        assert!(CallerRateLimiter::new(&a_year).is_ok());
+        assert!(CallerRateLimiter::new(&a_year, "partner").is_ok());
+        let shared = RateLimitConfig {
+            requests: 1,
+            window_secs: 10_000_000_000,
+            burst: None,
+        };
+        assert!(RateLimiter::new(shared).is_ok(), "the shared limit keeps the range it had");
     }
 
     #[test]

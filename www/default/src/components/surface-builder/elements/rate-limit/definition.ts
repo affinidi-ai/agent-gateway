@@ -49,14 +49,13 @@ export const rateLimitDefinition: NodeDefinition = {
     title: 'Rate Limit',
     docLink: DOCS_URL.networkingElements,
     bodyHtml: `
-      <p>Cap how fast requests can flow through this Surface, shared across
-      every caller, not a separate allowance per caller. Once the cap is
-      hit the Gateway short-circuits with a throttling error (HTTP 429 for
-      HTTP-style protocols, or a JSON-RPC error for MCP) and the upstream
-      agent never sees the request.</p>
+      <p>Cap how fast requests can flow through this Surface or one of its
+      Transit Points. Once the cap is hit the Gateway short-circuits with a
+      throttling error (HTTP 429 for HTTP-style protocols, or a JSON-RPC
+      error for MCP) and the upstream agent never sees the request.</p>
       <p><strong>Where it docks:</strong> request side only. Drop on the
-      caller → access-point arrow to limit the inbound surface.
-      Per-Transit-Point limits live on the TP itself, not here.</p>
+      caller → access-point arrow to limit the inbound surface, or on a
+      Transit Point's arrow to limit that Transit Point.</p>
       <p><strong>Settings:</strong></p>
       <ul>
         <li><strong>Request limit</strong> and <strong>Time window
@@ -67,9 +66,8 @@ export const rateLimitDefinition: NodeDefinition = {
         <li><strong>Burst</strong> <em>(optional)</em>: allow short
         spikes above that steady rate before throttling kicks in</li>
       </ul>
-      <p>The limit is per-Surface and shared across every caller; capacity
-      refills continuously rather than resetting at a fixed point in
-      time.</p>
+      <p>This limit is shared across every caller; capacity refills
+      continuously rather than resetting at a fixed point in time.</p>
       <p>On a Transit Point, a rate limit can also carry an optional
       <strong>per-caller</strong> limit: each caller the Transit Point
       identifies gets an allowance of their own, so one caller cannot use up

@@ -3,10 +3,12 @@ import { Form } from 'react-bootstrap';
 import type { ConfigPanelProps } from '../types';
 import FieldHelp from '../../../shared/FieldHelp';
 import { registry } from '../registry';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
 const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField, allNodes }) => {
   const parent = allNodes?.find(n => n.id === node.parentId);
   const onTransitPoint = parent ? registry.isTransitPointType(parent.type) : false;
+  const inVariant = !!useOptionalSurfaceMeta()?.activeVariantAlias;
   return (
     <>
       <div className="config-section">
@@ -85,8 +87,9 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
             <FieldHelp testId="field-help-rate-limit-per-caller" ariaLabel="About Per caller">
               <p>
                 Each caller this Transit Point identifies gets a limit of their own, so one caller
-                cannot use up the allowance of the others. Requests with no identified caller share
-                one limit.
+                cannot use up the allowance of the others: the caller its transit token names, or
+                else the client its own caller authentication verified. Requests with no identified
+                caller share one limit.
               </p>
               <p>
                 It applies beside the limit above, and the stricter of the two decides. Leave empty
@@ -94,12 +97,22 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
               </p>
             </FieldHelp>
           </div>
+          {inVariant ? (
+            <Form.Text
+              className="text-muted d-block mb-2"
+              style={{ fontSize: '10px' }}
+              data-testid="rate-limit-caller-base-only"
+            >
+              Set on the base surface; every variant uses it.
+            </Form.Text>
+          ) : null}
           <Form.Group className="mb-2">
             <Form.Label className="small text-muted mb-1">
               Max requests per caller per window
             </Form.Label>
             <Form.Control
               data-testid="rate-limit-caller-requests-input"
+              disabled={inVariant}
               size="sm"
               type="number"
               min="1"
@@ -111,6 +124,7 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
             <Form.Label className="small text-muted mb-1">Per-caller window (seconds)</Form.Label>
             <Form.Control
               data-testid="rate-limit-caller-window-secs-input"
+              disabled={inVariant}
               size="sm"
               type="number"
               min="1"
@@ -122,6 +136,7 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
             <Form.Label className="small text-muted mb-1">Per-caller burst (optional)</Form.Label>
             <Form.Control
               data-testid="rate-limit-caller-burst-input"
+              disabled={inVariant}
               size="sm"
               type="number"
               min="1"

@@ -256,6 +256,9 @@ pub struct SurfaceTransitPointConfig {
     /// The Transit Point authenticates its target with the surface's
     /// `target_auth_provider`.
     pub target_auth_provider: bool,
+    /// Requests per minute the Transit Point admits from each caller
+    /// (`per_caller_rate_limit`).
+    pub per_caller_rate_limit_per_minute: Option<u32>,
 }
 
 impl SurfaceTransitPointConfig {
@@ -275,6 +278,7 @@ impl SurfaceTransitPointConfig {
             allow_unauthenticated_callers: true,
             delegated_credentials: false,
             target_auth_provider: false,
+            per_caller_rate_limit_per_minute: None,
         }
     }
 }

@@ -791,6 +791,30 @@ async fn vp_audit_log_records_surface_rate_limit_refusal(world: &mut SurfaceWorl
     .await;
 }
 
+#[then(
+    expr = "the VP Audit Log records the per-caller rate limit refusal of caller {string} on Transit Point {string}"
+)]
+async fn vp_audit_log_records_per_caller_rate_limit_refusal(
+    world: &mut SurfaceWorld,
+    caller: String,
+    transit_point: String,
+) {
+    let identity_hash = crate::steps::given::caller_identity_hash(&caller);
+    let surface_id = world
+        .surface_under_test_id
+        .clone()
+        .expect("the surface under test has an id");
+    let what = format!("a per-caller rate limit refusal of caller '{caller}' on Transit Point '{transit_point}'");
+    expect_vp_audit_record(world, &what, |event| {
+        let refusal = &event["event"]["rate_limited"];
+        refusal["scope"] == "transit_point_caller"
+            && refusal["transit_point"] == transit_point.as_str()
+            && event["user_identity_hash"] == identity_hash.as_str()
+            && event["surface_id"] == surface_id.as_str()
+    })
+    .await;
+}
+
 #[then("the VP Audit Log's MCP tool policy decisions name the surface by its id")]
 async fn vp_audit_log_mcp_tool_policy_decisions_name_surface_by_id(world: &mut SurfaceWorld) {
     let surface_name = world
@@ -2923,14 +2947,29 @@ fn named_managed_agent_received_exactly_n_requests(
     agent_name: String,
     expected: usize,
 ) {
-    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
-    let context = format!("managed agent '{}'", agent_name);
+    assert_received_exactly(world, "managed agent", &agent_name, TargetActorKind::ManagedAgent, expected);
+}
+
+#[then(expr = "MCP server {string} received exactly {int} request(s)")]
+fn named_mcp_server_received_exactly_n_requests(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    expected: usize,
+) {
+    assert_received_exactly(world, "MCP server", &server_name, TargetActorKind::McpServer, expected);
+}
+
+fn assert_received_exactly(
+    world: &mut SurfaceWorld,
+    role: &str,
+    name: &str,
+    kind: TargetActorKind,
+    expected: usize,
+) {
+    let target = get_observed_target_for_actor(world, name, kind);
+    let context = format!("{role} '{name}'");
     let actual = get_observed_target_requests(target, &context).len();
-    assert_eq!(
-        actual, expected,
-        "expected managed agent '{}' to receive exactly {} request(s), got {}",
-        agent_name, expected, actual
-    );
+    assert_eq!(actual, expected, "expected {context} to receive exactly {expected} request(s), got {actual}");
 }
 
 #[then(expr = "managed agent {string} received the request body {}")]

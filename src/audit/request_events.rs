@@ -86,22 +86,38 @@ pub fn rate_limited(
     })
 }
 
-/// A Transit Point refused a request with 429 because the caller reached the
-/// per-caller limit. `caller_hash` is the identity hash of the caller the
-/// Transit Point identified, absent for a request with no identified caller.
+/// A Transit Point refused a request with 429 because its per-caller limit
+/// was reached. `caller_hash` is the identity hash of the caller the Transit
+/// Point identified, absent for a request with no identified caller. A refusal
+/// by the bucket callers share while the limit holds as many buckets as it may
+/// is recorded with scope `transit_point_overflow` and names no caller, since
+/// the caller did not spend an allowance of their own.
 pub fn transit_point_caller_rate_limited(
     facts: &RequestFacts<'_>,
     transit_point: &str,
     caller_hash: Option<&str>,
-    retry_after: Option<Duration>,
+    refusal: crate::policies::CallerRefusal,
 ) {
     emit("rate_limited", || {
         let mut event = facts.record(DelegationAuditAction::RateLimited {
-            scope: RateLimitScope::TransitPointCaller,
-            retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            scope: if refusal.overflow {
+                RateLimitScope::TransitPointOverflow
+            } else {
+                RateLimitScope::TransitPointCaller
+            },
+            retry_after_ms: Some(
+                u64::try_from(
+                    refusal
+                        .retry_after
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            ),
             transit_point: Some(transit_point.to_string()),
         });
-        event.user_identity_hash = caller_hash.map(str::to_string);
+        event.user_identity_hash = caller_hash
+            .filter(|_| !refusal.overflow)
+            .map(str::to_string);
         event
     })
 }
@@ -441,17 +457,17 @@ mod tests {
     async fn a_transit_point_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
         use crate::audit::events::RateLimitScope;
         let ((), events) = crate::audit::producer::capture(async {
-            transit_point_caller_rate_limited(
-                &facts(),
-                "partner",
-                Some("caller-hash"),
-                Some(std::time::Duration::from_millis(2500)),
-            );
-            transit_point_caller_rate_limited(&facts(), "partner", None, None);
+            let refusal = |overflow| crate::policies::CallerRefusal {
+                retry_after: std::time::Duration::from_millis(2500),
+                overflow,
+            };
+            transit_point_caller_rate_limited(&facts(), "partner", Some("caller-hash"), refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", None, refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", Some("newcomer-hash"), refusal(true));
         })
         .await;
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         match &events[0].event {
             DelegationAuditAction::RateLimited {
                 scope,
@@ -471,6 +487,20 @@ mod tests {
             Some("caller-hash")
         );
         assert_eq!(events[1].user_identity_hash, None, "a request with no identified caller names none");
+        match &events[2].event {
+            DelegationAuditAction::RateLimited { scope, .. } => {
+                assert_eq!(*scope, RateLimitScope::TransitPointOverflow)
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[2].user_identity_hash, None,
+            "an overflow refusal names no caller, who spent no allowance of their own"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[2]).unwrap()["event"]["rate_limited"]["scope"],
+            "transit_point_overflow"
+        );
 
         let recorded = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(recorded["event"]["rate_limited"]["scope"], "transit_point_caller", "{recorded}");

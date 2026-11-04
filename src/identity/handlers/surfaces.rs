@@ -968,7 +968,7 @@ fn identify_transit_points(
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
         if let Some(limit) = &tp.per_caller_rate_limit
-            && let Err(error) = crate::policies::CallerRateLimiter::new(&limit.into())
+            && let Err(error) = crate::policies::CallerRateLimiter::new(&limit.into(), tp.alias.as_str())
         {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{place}transit.points[{idx}]: per_caller_rate_limit cannot be enforced: {error}"
@@ -2382,13 +2382,7 @@ fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<St
                     point
                         .per_caller_rate_limit
                         .is_some()
-                        && point
-                            .per_caller_rate_limit
-                            .as_ref()
-                            != base.and_then(|base| {
-                                base.per_caller_rate_limit
-                                    .as_ref()
-                            }),
+                        && !base.is_some_and(|base| base.has_same_per_caller_rate_limit(point)),
                 ),
             ];
             for (field, changed) in changed {
@@ -9283,8 +9277,13 @@ mod tests {
             "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
         }));
         let omitted = variant_point(serde_json::json!({}));
+        let burst_written_out = variant_point(
+            serde_json::json!({ "per_caller_rate_limit": { "requests": 5, "window_secs": 60, "burst": 5 } }),
+        );
 
-        for points in [serde_json::json!([restated]), serde_json::json!([omitted])] {
+        for points in
+            [serde_json::json!([restated]), serde_json::json!([omitted]), serde_json::json!([burst_written_out])]
+        {
             let surface = surface_with_variant_transit_points(points.clone());
             assert!(validate_surface_mcp_tool_gating(&surface).is_ok(), "{points}");
         }

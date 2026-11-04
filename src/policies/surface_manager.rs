@@ -3,7 +3,27 @@ use crate::policies::{CallerRateLimiter, CircuitBreaker, CompiledMcpToolGating, 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// A Transit Point's per-caller rate limit as installed.
+#[derive(Clone)]
+pub enum CallerLimit {
+    Enforced(Arc<CallerRateLimiter>),
+    /// The stored limit cannot be built, so the Transit Point refuses every
+    /// request until a valid one is saved.
+    Unenforceable,
+}
+
+/// Whether `key` is a Transit Point key under `prefix` (`vc:<surface id>:`),
+/// that is `prefix` and a bare alias. An alias holds no `:`, so the key of
+/// another surface whose id extends this one with `:` never matches.
+fn is_point_key(
+    key: &str,
+    prefix: &str,
+) -> bool {
+    key.strip_prefix(prefix)
+        .is_some_and(|alias| !alias.contains(':'))
+}
 
 /// Surface-level policy manager: handles surface OPA, rate limiting, and circuit breakers per surface.
 pub struct SurfacePolicyManager {
@@ -16,7 +36,7 @@ pub struct SurfacePolicyManager {
     rate_limiters: Arc<RwLock<HashMap<String, Arc<RateLimiter>>>>,
 
     /// Per-caller rate limiters of Transit Points, keyed `vc:{config_id}:{alias}`
-    caller_rate_limiters: Arc<RwLock<HashMap<String, Arc<CallerRateLimiter>>>>,
+    caller_rate_limiters: Arc<RwLock<HashMap<String, CallerLimit>>>,
 
     /// Circuit breakers per surface (keyed by config_id)
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
@@ -766,7 +786,7 @@ impl SurfacePolicyManager {
                 .write()
                 .await;
             let prefix = format!("vc:{}:", config_id);
-            limiters.retain(|k, _| !k.starts_with(&prefix));
+            limiters.retain(|k, _| !is_point_key(k, &prefix));
             for tp in surface.transit_points() {
                 let Some(rl) = tp.rate_limit.as_ref() else {
                     continue;
@@ -799,7 +819,7 @@ impl SurfacePolicyManager {
                 .caller_rate_limiters
                 .write()
                 .await;
-            caller_limiters.retain(|k, _| !k.starts_with(&prefix));
+            caller_limiters.retain(|k, _| !is_point_key(k, &prefix));
             for tp in surface.transit_points() {
                 let Some(limit) = tp
                     .per_caller_rate_limit
@@ -808,7 +828,7 @@ impl SurfacePolicyManager {
                     continue;
                 };
                 let limit = crate::policies::RateLimitConfig::from(limit);
-                match CallerRateLimiter::new(&limit) {
+                let installed = match CallerRateLimiter::new(&limit, format!("{config_id}/{}", tp.alias)) {
                     Ok(limiter) => {
                         info!(
                             surface_id = %config_id,
@@ -817,17 +837,20 @@ impl SurfacePolicyManager {
                             window_secs = limit.window_secs,
                             "Configuring per-caller rate limiter"
                         );
-                        caller_limiters.insert(format!("{}{}", prefix, tp.alias), Arc::new(limiter));
+                        CallerLimit::Enforced(Arc::new(limiter))
                     }
                     Err(error) => {
-                        warn!(
+                        error!(
                             surface_id = %config_id,
                             transit_point = %tp.alias,
                             error = %error,
-                            "Failed to create per-caller rate limiter"
+                            "Per-caller rate limit cannot be enforced; the Transit Point refuses every request \
+                             until a valid limit is saved"
                         );
+                        CallerLimit::Unenforceable
                     }
-                }
+                };
+                caller_limiters.insert(format!("{}{}", prefix, tp.alias), installed);
             }
         }
 
@@ -1138,14 +1161,14 @@ impl SurfacePolicyManager {
         Ok(())
     }
 
-    /// The per-caller rate limiter of the base surface's Transit Point
+    /// The per-caller rate limit of the base surface's Transit Point
     /// `transit_alias`, if it sets one. A surface variant's point of the same
     /// alias is limited by it too.
-    pub async fn caller_rate_limiter(
+    pub async fn caller_rate_limit(
         &self,
         channel_id: &str,
         transit_alias: &str,
-    ) -> Option<Arc<CallerRateLimiter>> {
+    ) -> Option<CallerLimit> {
         self.caller_rate_limiters
             .read()
             .await
@@ -1336,12 +1359,12 @@ impl SurfacePolicyManager {
         limiters.remove(channel_id);
         // Drop any per-VC limiters installed for this channel.
         let prefix = format!("vc:{}:", channel_id);
-        limiters.retain(|k, _| !k.starts_with(&prefix));
+        limiters.retain(|k, _| !is_point_key(k, &prefix));
         drop(limiters);
         self.caller_rate_limiters
             .write()
             .await
-            .retain(|k, _| !k.starts_with(&prefix));
+            .retain(|k, _| !is_point_key(k, &prefix));
         self.circuit_breakers
             .write()
             .await
@@ -1610,6 +1633,96 @@ allow if {
         ));
     }
 
+    fn per_caller_limited_surface(
+        surface_id: &str,
+        limit: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": surface_id, "name": surface_id, "description": "", "status": "active",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": format!("/{surface_id}"), "protocol": "mcp" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "points": [{ "alias": "partner", "target_endpoint": "https://partner.example.com/mcp",
+                "protocol": "mcp", "rate_limit": { "requests": 100, "window_secs": 60 },
+                "per_caller_rate_limit": limit }] }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stored_per_caller_limit_that_cannot_be_built_is_installed_as_unenforceable() {
+        let manager = SurfacePolicyManager::new();
+        manager
+            .update_channel_policy(&per_caller_limited_surface(
+                "on-disk",
+                serde_json::json!({ "requests": 0, "window_secs": 60 }),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .caller_rate_limit("on-disk", "partner")
+                .await,
+            Some(CallerLimit::Unenforceable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn saving_a_surface_leaves_the_limiters_of_a_surface_whose_id_extends_it_with_a_colon() {
+        let manager = SurfacePolicyManager::new();
+        let limit = serde_json::json!({ "requests": 1, "window_secs": 60 });
+        for surface_id in ["x:y", "x"] {
+            manager
+                .update_channel_policy(&per_caller_limited_surface(surface_id, limit.clone()))
+                .await
+                .unwrap();
+        }
+        assert!(
+            manager
+                .caller_rate_limit("x:y", "partner")
+                .await
+                .is_some(),
+            "saving 'x' keeps the per-caller limiter of 'x:y'"
+        );
+        assert!(
+            manager
+                .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:x:y:partner"),
+            "and its Transit Point's shared limiter"
+        );
+        manager
+            .remove_channel("x")
+            .await;
+        assert!(
+            manager
+                .caller_rate_limit("x:y", "partner")
+                .await
+                .is_some(),
+            "removing 'x' keeps it too"
+        );
+        assert!(
+            manager
+                .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:x:y:partner")
+        );
+        assert!(
+            !manager
+                .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:x:partner")
+        );
+        assert!(
+            manager
+                .caller_rate_limit("x", "partner")
+                .await
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn saving_a_surface_replaces_and_drops_a_transit_points_per_caller_limiter() {
         let manager = SurfacePolicyManager::new();
@@ -1630,10 +1743,16 @@ allow if {
         let check = |alias: &'static str| {
             let manager = &manager;
             async move {
-                manager
-                    .caller_rate_limiter("tp-caller", alias)
+                match manager
+                    .caller_rate_limit("tp-caller", alias)
                     .await
-                    .map_or(Ok(()), |limiter| limiter.check(Some("alice")))
+                {
+                    None => Ok(()),
+                    Some(CallerLimit::Enforced(limiter)) => limiter
+                        .check(Some("alice"))
+                        .map_err(drop),
+                    Some(CallerLimit::Unenforceable) => Err(()),
+                }
             }
         };
         manager

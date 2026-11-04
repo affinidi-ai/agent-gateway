@@ -287,7 +287,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   panel does not show it. Inputs: `rate-limit-caller-requests-input`,
   `rate-limit-caller-window-secs-input` and `rate-limit-caller-burst-input`; like the gateway,
   `validate` refuses a per-caller requests, window or burst below 1. A per-caller limit set
-  through the API is kept by a dashboard save.
+  through the API is kept by a dashboard save, and a limit removed through the API is not
+  restored: a Transit Point's rate-limit node takes its limits only from the stored surface,
+  never from the canvas blob. On a named variant the per-caller inputs are read-only, with the
+  hint `rate-limit-caller-base-only`, and show the base point's limit (`resolveVariant`);
+  `computeOverridesFromPayload` leaves `per_caller_rate_limit` out of a variant's points, since
+  the gateway enforces the base point's.
 - A Transit Point's **Inject outbound credential** binding (`_shared/TransitCredentialBindingSection.tsx`)
   keeps what its controls do not set: `elicit_timeout_secs`, `elicit_fallback` and an external
   consent binding's `subject` round-trip through the form, and the consent select

@@ -2588,11 +2588,21 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_its_token(
     agent_name: String,
     transit_point: String,
 ) {
+    ask_for_tools_through_transit_point_with_its_token(world, &agent_name, &transit_point).await;
+}
+
+/// Managed agent `agent_name` asks for available tools through
+/// `transit_point` with the transit token it holds.
+pub(crate) async fn ask_for_tools_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
     let headers = with_transit_token(world, Vec::new());
     send_mcp_request_through_transit_point_path_with_headers(
         world,
-        &agent_name,
+        agent_name,
         &format!("/transit/{transit_point}"),
         body,
         headers,
