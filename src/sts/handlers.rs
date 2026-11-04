@@ -366,10 +366,12 @@ fn strategies_for_client(
     }
 }
 
-/// Verifies `token` with each strategy from [`strategies_for_client`] in turn and
-/// returns the claims of the first that accepts it, named by that strategy's
-/// principal claim. A strategy whose stored claim names no caller accepts
-/// nothing.
+/// Verifies `token` with each strategy from [`strategies_for_client`] and
+/// returns its claims, named by the principal claim of the strategies that
+/// accept it. The subject must not depend on which strategy is tried first, so
+/// when strategies that accept the token name different claims, as during a
+/// move to a new strategy before the old one is deleted, the token is refused.
+/// A strategy whose stored claim names no caller accepts nothing.
 async fn verify_with_client_strategies(
     verifier: &crate::jwt_bearer::JwtBearerVerifier,
     strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
@@ -378,6 +380,8 @@ async fn verify_with_client_strategies(
     tenant_id: Option<&str>,
 ) -> Result<VerifiedAssertion, StsError> {
     let mut failure = None;
+    let mut verified: Option<VerifiedAssertion> = None;
+    let mut accepting = Vec::new();
     for strategy in strategies_for_client(strategies, issuer, tenant_id) {
         let principal_claim = match strategy.principal_claim_name() {
             Ok(claim) => claim.to_string(),
@@ -390,9 +394,30 @@ async fn verify_with_client_strategies(
             .validate(token, &strategy, &[])
             .await
         {
-            Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),
+            Ok(claims) => {
+                accepting.push((strategy.id, principal_claim.clone()));
+                verified.get_or_insert(VerifiedAssertion { claims, principal_claim });
+            }
             Err(error) => failure = Some(error),
         }
+    }
+    if let Some(verified) = verified {
+        if accepting
+            .iter()
+            .any(|(_, claim)| *claim != verified.principal_claim)
+        {
+            tracing::warn!(
+                issuer = %issuer,
+                strategies = ?accepting,
+                "JWT verification strategies for one issuer name callers by different claims; refusing the assertion"
+            );
+            return Err(StsError::InvalidGrant(
+                "the verification strategies for this issuer name callers by different claims; delete the one \
+                 no surface uses"
+                    .to_string(),
+            ));
+        }
+        return Ok(verified);
     }
     Err(match failure {
         Some(error) => StsError::InvalidGrant(format!("assertion verification failed: {error}")),
@@ -3766,6 +3791,36 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant", "{err}");
+    }
+
+    /// Strategies for one issuer that name different claims, as while a
+    /// surface moves to a new strategy and the old one remains, would make the
+    /// subject depend on which is tried first: the assertion is refused. Two
+    /// that name the same claim are one answer.
+    #[tokio::test]
+    async fn strategies_for_one_issuer_that_name_different_claims_refuse_the_assertion() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        let issuer = "https://idp.example";
+        let named = |id: &str, claim: Option<&str>| {
+            let mut strategy = static_okp_strategy(id, None, issuer, "k", ED25519_JWK_X);
+            strategy.principal_claim = claim.map(str::to_string);
+            strategy
+        };
+
+        let err = verify_signed_token_for(vec![named("old", None), named("new", Some("oid"))], issuer, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(
+            err.to_string()
+                .contains("different claims"),
+            "{err}"
+        );
+
+        let agreed = verify_signed_token_for(vec![named("one", Some("oid")), named("two", Some("oid"))], issuer, None)
+            .await
+            .unwrap();
+        assert_eq!(agreed.principal_claim, "oid");
     }
 
     /// A verifier whose strategies all name callers by `oid`.

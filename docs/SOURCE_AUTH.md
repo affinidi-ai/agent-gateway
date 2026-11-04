@@ -64,8 +64,11 @@ Point, identifies callers by the same claim.
 - `principal_claim` is fixed when the strategy is created. Changing it would change every
   caller's identity hash and orphan the credentials stored under the old ones, so an update that
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
-  use another claim, create a new strategy, point the surface at it, and have callers connect
-  again.
+  use another claim, create a new strategy, point the surface at it, have callers connect
+  again, and then delete the old strategy. While both exist, token exchange and `jwt-bearer`
+  redemption refuse that issuer's tokens with `invalid_grant`, since the subject would depend on
+  which strategy verified them, so the MCP OAuth path and its consents stop for that issuer
+  too.
 - A release older than `principal_claim` loads a strategy that sets it without the field, and
   drops it the next time it saves the strategy. The strategy then names callers by `sub`, and
   every caller's identity hash changes. Downgrade only with strategies that leave the claim
