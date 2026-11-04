@@ -3846,6 +3846,66 @@ mod tests {
         }
     }
 
+    /// On the MCP issuer, an exchanged subject token and a redeemed ID-JAG from
+    /// another issuer are bound to the issuer, the strategy's claim value and
+    /// the claim's name: `[iss, oid, "oid"]`, not the token's `sub`.
+    #[tokio::test]
+    async fn mcp_profile_binds_exchange_and_redemption_subjects_by_the_strategys_claim() {
+        use sha2::{Digest, Sha256};
+        let profile = crate::sts::mcp_profile::McpIssuerProfile {
+            issuer: "https://gateway.example/api/oauth2/mcp".into(),
+        };
+        let resource = "https://gateway.example/surfaces/alpha";
+        let expected = format!(
+            "urn:affinidi:mcp:subject:{}",
+            hex::encode(Sha256::digest(br#"["https://idp.example/","person-1","oid"]"#))
+        );
+        let expiry = now_secs() + 90;
+        let grant = json!({
+            "iss": "https://idp.example/", "sub": "pairwise", "oid": "person-1", "aud": profile.issuer,
+            "resource": resource, "exp": expiry, "jti": "oid-grant", "scope": "read", "client_id": "agent-client"
+        });
+        let assertion = id_jag_assertion(&grant);
+        let claims = HashMap::from([
+            (
+                "subject-tok".to_string(),
+                json!({ "iss": "https://idp.example/", "sub": "pairwise", "oid": "person-1",
+                    "aud": "identity-client", "exp": expiry }),
+            ),
+            (assertion.clone(), grant),
+        ]);
+        let mut record = base_record();
+        record.allowed_audiences = vec![resource.into()];
+        record.allowed_scopes = vec!["read".into()];
+        record.allowed_subject_audiences = vec!["identity-client".into()];
+        let mut state = state_with(HashMap::new(), client(record, Some("s3cret")));
+        state.verifier = Arc::new(OidNamingVerifier { claims });
+
+        let mut exchange = exchange_form();
+        exchange.resource = Some(resource.into());
+        exchange.scope = Some("read".into());
+        let response = dispatch_with_profile(&state, &HeaderMap::new(), exchange, Some(&profile))
+            .await
+            .expect("exchange succeeds");
+        let token: Value = serde_json::from_str(&response.access_token).unwrap();
+        assert_eq!(token["sub"], expected);
+
+        let redemption = TokenEndpointForm {
+            grant_type: Some(GRANT_TYPE_JWT_BEARER.into()),
+            assertion: Some(assertion),
+            client_id: Some("agent-client".into()),
+            client_secret: Some("s3cret".into()),
+            resource: Some(resource.into()),
+            scope: Some("read".into()),
+            ..Default::default()
+        };
+        let response = dispatch_with_profile(&state, &HeaderMap::new(), redemption, Some(&profile))
+            .await
+            .expect("redemption succeeds");
+        let token: Value = serde_json::from_str(&response.access_token).unwrap();
+        assert_eq!(token["sub"], expected);
+    }
+
     #[tokio::test]
     async fn token_exchange_names_the_subject_and_actor_by_the_strategys_claim() {
         let claims = HashMap::from([

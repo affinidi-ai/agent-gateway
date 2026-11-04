@@ -328,6 +328,30 @@ mod tests {
         assert_eq!(err.error_code(), "invalid_grant");
     }
 
+    /// The ID-JAG's subject is the value of the claim the accepting strategy
+    /// names, and an ID-JAG without it, or with it empty, names no subject.
+    #[test]
+    fn validate_id_jag_reads_the_subject_from_the_strategys_claim() {
+        let base = json!({ "iss": "i", "sub": "pairwise", "oid": "person-1", "aud": "https://gw.example",
+            "client_id": "agent0", "jti": "g", "exp": 5_000 });
+        let parsed = validate_id_jag(&base, "oid", "https://gw.example", 1_000).expect("valid");
+        assert_eq!(parsed.subject, "person-1");
+        for oid in [None, Some(json!("")), Some(json!(7))] {
+            let mut claims = base.clone();
+            match oid {
+                Some(value) => claims["oid"] = value,
+                None => {
+                    claims
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("oid");
+                }
+            }
+            let err = validate_id_jag(&claims, "oid", "https://gw.example", 1_000).unwrap_err();
+            assert_eq!(err.error_code(), "invalid_grant", "{claims}");
+        }
+    }
+
     #[test]
     fn validate_id_jag_requires_iss_sub_exp() {
         let base = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "client_id": "agent0", "jti": "g", "exp": 5_000 });
