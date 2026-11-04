@@ -15,8 +15,9 @@ use crate::auth_manager::middleware::{AuthGuardState, RbacGuard, require_session
 use crate::auth_manager::resource_scope::RequiredHeader;
 use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
 use crate::delegation_vault::DelegationToken;
+use crate::delegation_vault::audit::reading_audit_log_from;
 use crate::delegation_vault::handlers::DelegationVaultState;
-use crate::delegation_vault::read_scope::tests::provider;
+use crate::delegation_vault::read_scope::tests::{audit_log_of_two_tenants, provider};
 use crate::delegation_vault::router::create_delegation_vault_router;
 use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
 
@@ -31,7 +32,7 @@ struct Vault {
     tokens: Arc<FsAccessTokenStore>,
     vault: Arc<dyn DelegationVaultStorage>,
     admin_session: String,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 fn vault_token(
@@ -147,7 +148,7 @@ async fn vault() -> Vault {
         tokens,
         vault,
         admin_session,
-        _directory: directory,
+        directory,
     }
 }
 
@@ -307,4 +308,37 @@ async fn a_tenant_access_token_still_cannot_revoke_a_vault_token() {
             "{id} is kept"
         );
     }
+}
+
+async fn read_audit(
+    fixture: &Vault,
+    log: &std::path::Path,
+    bearer: &str,
+    tenant_id: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    reading_audit_log_from(log.to_path_buf(), send(&fixture.app, "GET", "/api/v1/delegation-audit", bearer, tenant_id))
+        .await
+}
+
+#[tokio::test]
+async fn a_tenant_access_token_reads_only_its_tenants_delegation_audit() {
+    let fixture = vault().await;
+    let log = audit_log_of_two_tenants(fixture.directory.path()).await;
+    let tenant_secret = tenant_access_token(&fixture.tokens, "tenant-a").await;
+    let header_secret = access_token(&fixture.tokens, None, tenant_header("tenant-a")).await;
+
+    let (status, page) = read_audit(&fixture, &log, &tenant_secret, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["events"][0]["provider_id"], "cp-a");
+    assert_eq!(page["category_counts"], serde_json::json!({"consent_granted": 1}));
+
+    let (status, page) = read_audit(&fixture, &log, &header_secret, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 0);
+    assert_eq!(page["events"], serde_json::json!([]));
+
+    let (status, page) = read_audit(&fixture, &log, &fixture.admin_session, None).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 6);
 }

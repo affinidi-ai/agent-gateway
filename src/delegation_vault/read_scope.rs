@@ -83,6 +83,57 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A VP Audit Log in `directory` holding, oldest first, a
+    /// `consent_granted` of `cp-a`, a `token_injected` of each of `cp-b`,
+    /// `cp-global` and the deleted `cp-deleted`, a `token_revoked` naming no
+    /// provider, a `consent_granted` naming the slug `github`, and a
+    /// `policy_decision`.
+    pub(crate) async fn audit_log_of_two_tenants(directory: &std::path::Path) -> std::path::PathBuf {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event, audit_policy_decision};
+        let event = |action, provider_id| {
+            audit_event(action, Some("did:web:agent.example"), Some("sha256:user-1"), provider_id, Some("surface-1"))
+        };
+        let mut events = vec![
+            event(DelegationAuditAction::ConsentGranted, Some("cp-a")),
+            event(DelegationAuditAction::TokenInjected, Some("cp-b")),
+            event(DelegationAuditAction::TokenInjected, Some("cp-global")),
+            event(DelegationAuditAction::TokenInjected, Some("cp-deleted")),
+            event(DelegationAuditAction::TokenRevoked, None),
+            event(DelegationAuditAction::ConsentGranted, Some("github")),
+        ];
+        let ((), decisions) = crate::audit::producer::capture(async {
+            audit_policy_decision(
+                "gateway",
+                "allow",
+                "policy-1",
+                None,
+                None,
+                None,
+                Some("surface-1"),
+                None,
+                Some("did:web:caller.example"),
+                Some("POST"),
+                Some("/"),
+                None,
+                "access_point",
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(decisions.len(), 1);
+        events.extend(decisions);
+        let path = directory.join("delegation-audit.jsonl");
+        let lines: String = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap() + "\n")
+            .collect();
+        std::fs::write(&path, lines).unwrap();
+        path
+    }
+
     /// Credential providers held in memory: `cp-a` of `tenant-a`, `cp-b` of
     /// `tenant-b` and the appliance-wide `cp-global`, all with the slug
     /// `github`; or a store that cannot be read.
@@ -159,7 +210,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn tenant(tenant_id: &str) -> PatTenantContext {
+    pub(crate) fn tenant(tenant_id: &str) -> PatTenantContext {
         PatTenantContext {
             token_id: "pat-t".to_string(),
             tenant_id: tenant_id.to_string(),
@@ -170,7 +221,7 @@ pub(crate) mod tests {
         PatResourceScope(Arc::new(regex::Regex::new(&format!("^TENANT:{tenant_id}:credential-providers:.*$")).unwrap()))
     }
 
-    fn delegation(resource_scoped: bool) -> PatDelegationContext {
+    pub(crate) fn delegation(resource_scoped: bool) -> PatDelegationContext {
         PatDelegationContext {
             token_id: "pat-t".to_string(),
             delegation_depth: 0,

@@ -22,7 +22,7 @@ async fn send(
         .unwrap_or_else(|error| panic!("{path} through admin API: {error}"))
 }
 
-async fn create_secret(
+pub(crate) async fn create_secret(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
@@ -41,7 +41,7 @@ async fn create_secret_with_value(
     assert_eq!(response.status, 201, "creating a secret for tenant {tenant:?}: {}", response.body);
 }
 
-async fn create_provider(
+pub(crate) async fn create_provider(
     world: &mut SurfaceWorld,
     provider_id: &str,
     token_endpoint: &str,

@@ -16,4 +16,14 @@ changes:
         can hold any tenant's callers' tokens. An access token scoped by required headers alone, or
         by a resource pattern without a tenant, reads none. Sessions and appliance-wide access
         tokens still read every token.
+    - timestamp: '2026-11-04T13:10:56Z'
+      title: Show a tenant's access token only its own tenant's delegation audit records
+      description: >-
+        GET /api/v1/delegation-audit and GET /v1/audit returned the whole audit log to a tenant's
+        access token. It now gets only records whose credential provider belongs to its tenant,
+        and totals, category counts and the text filter cover only those. Records without a
+        provider, such as policy decisions, and records of an appliance-wide, missing or deleted
+        provider are shown only to appliance-wide callers. An access token scoped by required
+        headers alone, or by a resource pattern without a tenant, reads none. Dashboard sessions
+        and appliance-wide access tokens still read the whole log.
   breaking: []

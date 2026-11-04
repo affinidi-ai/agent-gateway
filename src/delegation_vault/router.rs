@@ -89,8 +89,8 @@ mod tests {
     use crate::auth::types::{UserRole, UserStatus};
     use crate::auth_manager::middleware::AuthGuardOk;
     use crate::auth_manager::pat::{PatContext, PatDelegationContext};
-    use crate::delegation_vault::audit::DelegationAuditAction;
-    use crate::delegation_vault::read_scope::tests::InMemoryProviders;
+    use crate::delegation_vault::audit::{DelegationAuditAction, reading_audit_log_from, without_an_audit_log};
+    use crate::delegation_vault::read_scope::tests::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::storage::DelegationVaultStorage;
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
     use crate::rbac::RbacConfig;
@@ -984,16 +984,110 @@ mod tests {
     /// needs no provider, still reads.
     #[tokio::test]
     async fn a_tenant_read_fails_closed_when_the_provider_store_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
         let (app, _dir) = admin_reader(InMemoryProviders::unreadable()).await;
         for (uri, refusal) in [
             ("/api/v1/delegation-vault", r#"{"error":"Failed to list"}"#),
             ("/api/v1/delegation-vault/t-a", r#"{"error":"Failed to get"}"#),
+            ("/api/v1/delegation-audit", r#"{"error":"Failed to read audit log"}"#),
         ] {
-            let (status, body) = response_of(as_tenant(app.clone(), "tenant-a"), "GET", uri).await;
+            let (status, body) =
+                reading_audit_log_from(log.clone(), response_of(as_tenant(app.clone(), "tenant-a"), "GET", uri)).await;
             assert_eq!((status, body.as_str()), (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), refusal), "{uri}");
         }
-        let (status, body) = response_of(app, "GET", "/api/v1/delegation-vault").await;
+        let (status, body) = response_of(app.clone(), "GET", "/api/v1/delegation-vault").await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
         assert_eq!(listed_ids(&body), ["t-a", "t-b", "t-deleted", "t-global"]);
+        let (status, page) = audit_page(app, "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["total"], 6);
+    }
+
+    // ── A tenant's token reads only its own tenant's delegation audit ──
+
+    async fn audit_page(
+        app: Router,
+        uri: &str,
+        log: &std::path::Path,
+    ) -> (u16, serde_json::Value) {
+        let (status, body) = reading_audit_log_from(log.to_path_buf(), response_of(app, "GET", uri)).await;
+        (status, serde_json::from_str(&body).unwrap())
+    }
+
+    fn provider_ids(page: &serde_json::Value) -> Vec<Option<&str>> {
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["provider_id"].as_str())
+            .collect()
+    }
+
+    /// Totals and category counts count only the records the token reads, and
+    /// the text filter finds nothing among the others.
+    #[tokio::test]
+    async fn a_tenant_token_reads_only_its_own_tenants_delegation_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+
+        let (status, page) = audit_page(as_tenant(app.clone(), "tenant-a"), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(provider_ids(&page), [Some("cp-a")]);
+        assert_eq!((&page["total"], &page["total_pages"]), (&serde_json::json!(1), &serde_json::json!(1)));
+        assert_eq!(page["category_counts"], serde_json::json!({"consent_granted": 1}));
+
+        let (_, page) = audit_page(as_tenant(app.clone(), "tenant-b"), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(provider_ids(&page), [Some("cp-b")]);
+        assert_eq!(page["category_counts"], serde_json::json!({"token_injected": 1}));
+
+        let (status, page) = audit_page(as_tenant(app, "tenant-a"), "/api/v1/delegation-audit?filter=cp-b", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["events"], serde_json::json!([]));
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["category_counts"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_admin_session_reads_the_whole_delegation_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, page) = audit_page(app, "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["total"], 6);
+        assert_eq!(
+            provider_ids(&page),
+            [Some("github"), None, Some("cp-deleted"), Some("cp-global"), Some("cp-b"), Some("cp-a")]
+        );
+        assert_eq!(
+            page["category_counts"],
+            serde_json::json!({"consent_granted": 2, "token_injected": 3, "token_revoked": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_scoped_by_required_headers_alone_reads_no_delegation_audit_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, page) = audit_page(as_header_scoped(app), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["events"], serde_json::json!([]));
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["category_counts"], serde_json::json!({}));
+    }
+
+    /// A failed read of the audit log answers `500` with a fixed body: the
+    /// error's detail goes to the log only.
+    #[tokio::test]
+    async fn a_failed_delegation_audit_read_answers_without_its_detail() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, body) = without_an_audit_log(response_of(app, "GET", "/api/v1/delegation-audit")).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to read audit log"}"#)
+        );
     }
 }

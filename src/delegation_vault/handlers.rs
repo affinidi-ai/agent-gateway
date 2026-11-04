@@ -58,7 +58,7 @@ pub struct DelegationVaultState {
 /// What the caller may read of the agent-keyed tokens and the delegation
 /// audit. While the credential providers cannot be read, a caller that needs
 /// them is refused with `refusal` and no detail.
-async fn read_scope(
+async fn caller_read_scope(
     state: &DelegationVaultState,
     tenant: Option<&Extension<PatTenantContext>>,
     resource_scope: Option<&Extension<PatResourceScope>>,
@@ -104,7 +104,7 @@ pub async fn list_tokens(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
-    let reader = match read_scope(
+    let reader = match caller_read_scope(
         &state,
         tenant.as_ref(),
         resource_scope.as_ref(),
@@ -159,13 +159,19 @@ pub async fn get_token(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
-    let reader =
-        match read_scope(&state, tenant.as_ref(), resource_scope.as_ref(), delegation.as_ref(), "get", "Failed to get")
-            .await
-        {
-            Ok(reader) => reader,
-            Err(refused) => return refused,
-        };
+    let reader = match caller_read_scope(
+        &state,
+        tenant.as_ref(),
+        resource_scope.as_ref(),
+        delegation.as_ref(),
+        "get",
+        "Failed to get",
+    )
+    .await
+    {
+        Ok(reader) => reader,
+        Err(refused) => return refused,
+    };
 
     match state
         .vault_store
@@ -799,13 +805,32 @@ pub struct AuditLogQuery {
 }
 
 /// GET /api/v1/delegation-audit
-pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoResponse {
+pub async fn list_audit_events(
+    State(state): State<DelegationVaultState>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    tenant: Option<Extension<PatTenantContext>>,
+    resource_scope: Option<Extension<PatResourceScope>>,
+    Query(query): Query<AuditLogQuery>,
+) -> impl IntoResponse {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query
         .page_size
         .unwrap_or(25)
         .clamp(1, 100);
     let filter = query.filter.as_deref();
+    let reader = match caller_read_scope(
+        &state,
+        tenant.as_ref(),
+        resource_scope.as_ref(),
+        delegation.as_ref(),
+        "audit",
+        "Failed to read audit log",
+    )
+    .await
+    {
+        Ok(reader) => reader,
+        Err(refused) => return refused,
+    };
 
     // Exclude VP-audit categories (policy decisions / trust checks) up front so
     // `events`, `total`, and `total_pages` stay consistent — they belong to the
@@ -818,16 +843,14 @@ pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoR
             exclude_vp_audit: true,
             ..Default::default()
         },
+        &reader,
     )
     .await
     {
         Ok(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response(),
         Err(e) => {
-            warn!(target: "credential_delegation", error = %e, "Failed to read audit log");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to read audit log: {}", e)})),
-            )
+            warn!(target: "credential_delegation", action = "audit", error = %e, "Failed to read audit log");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to read audit log"})))
                 .into_response()
         }
     }

@@ -315,7 +315,9 @@ Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.js
 events (see [`INTEGRATIONS.md`](INTEGRATIONS.md)). Every sink selects the audit events it wants,
 and the selections are independent: an integration can receive an event the VP Audit Log does
 not keep, and the reverse. Nothing is selected on a fresh install, and a record nobody selects
-is never built.
+is never built. `/v1/audit` shows a tenant's access token only the records of its own tenant's
+credential providers, so no policy decision or other record without a provider; see
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records).
 
 **Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the

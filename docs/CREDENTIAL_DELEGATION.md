@@ -1717,10 +1717,11 @@ Nor can a provider move into a tenant that already has a provider with its `prov
 for its whole check and change, so no surface write binds the provider in between; a delete
 releases it before its grants are revoked.
 
-A move carries the provider's agent-keyed vault entries into the new tenant's view and out of
-the old one's, since an entry belongs to its provider's current tenant
+A move carries the provider's agent-keyed vault entries and delegation audit records into the
+new tenant's view and out of the old one's, since they belong to their provider's current tenant
 ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens)). An appliance-wide provider's
-entries can belong to any tenant's callers: revoke them before moving it into a tenant.
+entries and records can belong to any tenant's callers: revoke its entries before moving it into
+a tenant, which then also reads its audit history.
 
 ### Removing grants
 
@@ -1840,10 +1841,11 @@ leave out all four.
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
 | `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |
-| `GET /api/v1/delegation-audit` | The delegation audit log |
+| `GET /api/v1/delegation-audit` | The delegation audit log; a tenant's access token reads only its own tenant's records |
 
-A vault entry belongs to the tenant of its credential provider; see
-[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens).
+A vault entry and an audit record belong to the tenant of their credential provider; see
+[Delegation vault tokens](ACCESS_TOKENS.md#delegation-vault-tokens) and
+[Delegation audit records](ACCESS_TOKENS.md#delegation-audit-records) in `ACCESS_TOKENS.md`.
 
 ### Removing grants keyed by the old identity hash
 

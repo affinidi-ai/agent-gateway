@@ -142,6 +142,8 @@ pub struct SurfaceWorld {
     pub oauth_callback_query: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
+    /// The ids of the credential providers the operator created, by `provider_id` slug.
+    pub credential_provider_ids: HashMap<String, String>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -206,6 +208,7 @@ impl SurfaceWorld {
             a2a_stream_ended: false,
             oauth_callback_query: None,
             transit_token: None,
+            credential_provider_ids: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),
