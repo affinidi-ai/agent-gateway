@@ -1522,7 +1522,10 @@ pub async fn get_dashboard_stats(
                 last_activity,
                 target_auth: r.target_auth().cloned(),
                 trust_recorder: r.trust_recorder().cloned(),
-                source_auth: r.source_auth().cloned(),
+                source_auth: r
+                    .source_auth_methods()
+                    .first()
+                    .cloned(),
                 managed_identity: r_managed_identity,
                 issuer_id: r.issuer_id.clone(),
                 outbound_listen_address: r
@@ -2389,7 +2392,10 @@ async fn build_channel_list(
             last_activity,
             target_auth: r.target_auth().cloned(),
             trust_recorder: r.trust_recorder().cloned(),
-            source_auth: r.source_auth().cloned(),
+            source_auth: r
+                .source_auth_methods()
+                .first()
+                .cloned(),
             managed_identity: r_managed_identity,
             issuer_id: r.issuer_id.clone(),
             outbound_listen_address: r

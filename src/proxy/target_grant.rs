@@ -301,20 +301,22 @@ const PROTOCOL_HEADERS: [&str; 7] = [
 /// consent: only one of [`PROTOCOL_HEADERS`], and of those only what a Transit
 /// Point sends its vendor
 /// ([`crate::proxy::outbound_handler::should_forward_outbound_request_header`]),
-/// never the header the caller's credential came in. Every other header the
+/// never a header a caller-authentication method reads. Every other header the
 /// caller set stays behind: its cookies and credentials, a caller-info, DID,
 /// forwarding, path or method override header a vendor might read as another
 /// principal, host, path or method, and its trace id, beside the gateway's.
 pub(crate) fn forwards_caller_header(
     name: &str,
-    source_auth_header: Option<&str>,
+    source_auth_headers: &[&str],
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
 ) -> bool {
     PROTOCOL_HEADERS
         .iter()
         .any(|protocol| name.eq_ignore_ascii_case(protocol))
         && crate::proxy::outbound_handler::should_forward_outbound_request_header(name, header_metadata_mapping)
-        && source_auth_header.is_none_or(|header| !name.eq_ignore_ascii_case(header))
+        && !source_auth_headers
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 /// The refusal of a request about to reach a Target bound by external consent
@@ -540,12 +542,7 @@ pub(crate) fn target_binding_violation(
         TargetBindingViolation::AtTheOriginRoot
     } else if view.target_auth().is_some() {
         TargetBindingViolation::TargetAuth
-    } else if view
-        .source_auth()
-        .is_some_and(
-            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
-        )
-    {
+    } else if view.forwards_caller_credential() {
         TargetBindingViolation::CallerCredentialForwarded
     } else if view.charges_callers() {
         TargetBindingViolation::CallersCharged

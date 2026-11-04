@@ -1,0 +1,72 @@
+branch: fix/outbound-body-cap
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-03T18:00:00Z'
+      title: Refuse an a2a.max_body_size of 0 at startup
+      description: >-
+        An [a2a] max_body_size of 0 would refuse every request body. The gateway now refuses to
+        start with it and names the setting in the error; the minimum is 1 byte.
+    - timestamp: '2026-11-04T16:00:00Z'
+      title: Stop counting an oversize Access Point request body as a task error
+      description: >-
+        An MCP Access Point counted a request body over its mcp_http.max_request_bytes as an
+        error of its task on the Tasks page. A body refused for its size is an admission refusal,
+        like the other admission refusals, so neither an A2A nor an MCP Access Point counts it as
+        a task error now; a body the caller fails to send still counts.
+  fixed:
+    - timestamp: '2026-11-03T18:00:00Z'
+      title: Record an MCP Transit Point's refusal of an oversize body
+      description: >-
+        An MCP Transit Point answered a body over its mcp_http.max_request_bytes with 413 but
+        recorded nothing. It now records a request_rejected at admission with reason
+        body_too_large, as an MCP Access Point does.
+  removed: []
+  security:
+    - timestamp: '2026-11-03T15:00:00Z'
+      title: Cap request bodies read before authentication on the inbound port
+      description: >-
+        The /outbound/... hop an inbound listener runs when it shares a host name with an
+        outbound listener read the whole request body into memory before the Transit Point
+        authenticated the caller, buffered the whole response, forwarded an empty body when the
+        read failed and cut streams at a2a.timeout_seconds. It now streams both ways with no
+        overall timeout, refuses a declared length over a2a.max_body_size with 413 without
+        reading the body, leaves a longer one to the Transit Point's own 413 and recorded
+        refusal and stops it after the chunk that takes it 512 KiB past the limit, logs its own
+        refusals with the caller's address, and refuses a body the caller fails to send with
+        400, so the Transit Point refuses an unauthenticated caller after reading little of its
+        body. The hop's own 413 and 400 are a JSON-RPC error with no id for a request carrying an
+        MCP-Protocol-Version header, and an A2A problem otherwise. Access Points cap the body at
+        a2a.max_body_size as they read it, and the DID Auth challenge and
+        authenticate endpoints at 64 KiB, so an unauthenticated caller can no longer make the
+        gateway hold an unbounded body. An A2A or AP2 request refused this way is answered
+        before version negotiation and is no longer counted in
+        agent_gateway_a2a_protocol_version_total.
+  breaking:
+    - timestamp: '2026-11-03T16:30:00Z'
+      title: Refuse non-MCP Transit Point bodies over a2a.max_body_size with 413
+      description: >-
+        A Transit Point without mcp_http read the request body without a limit and answered 400
+        only when the read failed. It now reads at most a2a.max_body_size, answers a larger body
+        with HTTP 413 and records a request_rejected at admission with reason body_too_large;
+        other read failures are still 400. To accept larger bodies, raise [a2a] max_body_size
+        and restart the gateway.
+    - timestamp: '2026-11-03T16:30:00Z'
+      title: Refuse non-MCP fabric:// Access Point bodies over a2a.max_body_size
+      description: >-
+        A fabric:// Access Point skipped the request size check. One without mcp_http now refuses
+        a body over a2a.max_body_size with HTTP 413 as it reads it, and records a
+        request_rejected with reason body_too_large. An MCP fabric:// Access Point keeps reading
+        up to its mcp_http.max_request_bytes. To accept larger bodies, raise
+        [a2a] max_body_size and restart the gateway.
+    - timestamp: '2026-11-03T16:30:00Z'
+      title: Bound Transit Point bodies through the shared host by a2a.max_body_size
+      description: >-
+        An inbound listener that shares a host name with an outbound listener passes
+        /outbound/... requests on to it. Through it, a Transit Point request body is now bounded
+        by a2a.max_body_size, even for an MCP Transit Point whose mcp_http.max_request_bytes is
+        higher: a body declaring a larger Content-Length is refused with 413 without being read,
+        and a chunked body is cut once it is 512 KiB and one chunk past the limit, so such an MCP
+        Transit Point still accepts a chunked body up to that size. To send larger bodies to it,
+        raise [a2a] max_body_size and restart, or call the outbound listener's own port, where
+        its own limit holds.

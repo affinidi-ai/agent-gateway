@@ -363,11 +363,32 @@ export function baseSurfaceFromSnapshot(snapshot: any): BaseSurfaceView {
  * removes a variant there, `setCatalog` is called to register/drop
  * snapshots.
  */
+/**
+ * A stored variant without its own `outbound_credentials` keeps the base
+ * surface's bindings. While it still shows none and the base has none, the
+ * save leaves the list out so the variant keeps inheriting instead of
+ * pinning an empty list the operator never chose.
+ */
+function withoutUnchangedInheritedOutbound(
+  overrides: SurfaceOverrides,
+  inherits: boolean,
+  basePayload: any
+): SurfaceOverrides {
+  const own = overrides.outbound_credentials ?? [];
+  const base = Array.isArray(basePayload?.outbound_credentials)
+    ? basePayload.outbound_credentials
+    : [];
+  if (!inherits || own.length > 0 || base.length > 0) return overrides;
+  const { outbound_credentials: _omitted, ...rest } = overrides;
+  return rest;
+}
+
 export function useVariantSnapshots(): UseVariantSnapshotsResult {
   const [variants, setVariants] = useState<VariantMeta[]>([]);
   const [defaultVariantId, setDefaultVariantId] = useState<string | null>(null);
   const [activeVariantId, setActiveVariantId] = useState<string | null>(null);
   const snapshotsRef = useRef<Record<string, any>>({});
+  const inheritsOutboundRef = useRef<Set<string>>(new Set());
 
   const hydrateFromPayload = useCallback(
     (
@@ -393,6 +414,9 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       for (const v of list) {
         snapshots[v.id] = resolveVariant(payload, (v.overrides ?? {}) as SurfaceOverrides);
       }
+      inheritsOutboundRef.current = new Set(
+        list.filter(v => v.overrides?.outbound_credentials === undefined).map(v => v.id)
+      );
       // Default variant id: the named one if the wire pins it, else
       // null (which means "base is the default").
       const namedDefault =
@@ -570,7 +594,11 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
           name: v.name,
           ...(v.description ? { description: v.description } : {}),
           enabled: v.enabled !== false,
-          overrides: computeOverridesFromPayload(snapshot),
+          overrides: withoutUnchangedInheritedOutbound(
+            computeOverridesFromPayload(snapshot),
+            inheritsOutboundRef.current.has(v.id),
+            basePayload
+          ),
         };
       });
       // Backend allows `default_variant_id = null` even when variants[]

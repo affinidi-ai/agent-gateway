@@ -67,8 +67,11 @@ pub struct OutboundProxyState {
     /// connections, and errors so the dashboard can render TP rows under
     /// their parent surface group.
     pub task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    /// Byte cap for a buffered MCP upstream response (`a2a.max_body_size`).
+    /// Byte cap for a buffered upstream response (`a2a.max_body_size`).
     pub max_response_bytes: usize,
+    /// Byte cap for a request body on a Transit Point without `mcp_http`
+    /// (`a2a.max_body_size`).
+    pub max_request_bytes: usize,
     /// The test allow-list of fixtures a request carrying a grant by binding
     /// may reach over `http` or loopback; `None` in production.
     pub egress_allowlist: Option<String>,

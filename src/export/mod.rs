@@ -556,6 +556,81 @@ mod tests {
         );
     }
 
+    /// Every place a DID private key is stored outside the excluded paths: the
+    /// `key_N.json` files of Connection Points, issuers and trust registries,
+    /// in plaintext or encrypted form, and the key fields of issuer and
+    /// mediator records.
+    #[test]
+    fn an_export_carries_no_private_key_or_refresh_token() {
+        const PRIVATE: &str = "private-d-material";
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let secret = format!(
+            r#"{{"id":"did:web:x#key-1","type":"JsonWebKey2020","privateKeyJwk":{{"kty":"OKP","crv":"Ed25519","x":"pub","d":"{PRIVATE}"}}}}"#
+        );
+        for store in ["connection_points", "issuers", "trust_registries"] {
+            let keys = storage_root
+                .join(store)
+                .join("id-1");
+            fs::create_dir_all(&keys).unwrap();
+            fs::write(keys.join("key_0.json"), &secret).unwrap();
+            fs::write(keys.join("key_1.json.enc"), format!("ENC[{PRIVATE}]")).unwrap();
+            fs::write(keys.join("did.json"), r#"{"id":"did:web:x"}"#).unwrap();
+        }
+        fs::write(
+            storage_root
+                .join("issuers")
+                .join("id-1.json"),
+            format!(
+                r#"{{"id":"id-1","secrets":[{secret}],"key_pair":{{"public_key":{{"x":"pub"}},"private_key":{{"d":"{PRIVATE}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let mediators = storage_root.join("mediators");
+        fs::create_dir_all(&mediators).unwrap();
+        fs::write(mediators.join("m-1.json"), format!(r#"{{"id":"m-1","our_secrets":[{secret}]}}"#)).unwrap();
+        fs::write(mediators.join("tokens.json"), format!(r#"{{"refresh_token":"{PRIVATE}"}}"#)).unwrap();
+
+        let mut stats = ExportStats::default();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            let mut file = archive
+                .by_index(index)
+                .unwrap();
+            let name = file
+                .name()
+                .unwrap()
+                .into_owned();
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut file, &mut content).unwrap();
+            assert!(!content.contains(PRIVATE), "{name} carries private material: {content}");
+            names.push(name);
+        }
+
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("/key_")),
+            "{names:?}"
+        );
+        for kept in [
+            "connection_points/id-1/did.json",
+            "issuers/id-1/did.json",
+            "trust_registries/id-1/did.json",
+            "issuers/id-1.json",
+            "mediators/m-1.json",
+        ] {
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == kept),
+                "{kept} missing from {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_transit_token_key_file_is_excluded_by_name() {
         let dir = create_test_storage();

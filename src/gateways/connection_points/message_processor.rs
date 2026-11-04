@@ -4711,7 +4711,7 @@ async fn process_forward_request_in_request_scope(
                 None => surface.access_point.route.clone(),
             };
             if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp
-                || surface.source_auth().is_some()
+                || surface.has_source_auth()
                 || authorization.validate_endpoint(&origins, &expected_path).is_err()
                 || profile.validate_network(network).is_err()
             {
@@ -4763,7 +4763,8 @@ async fn process_forward_request_in_request_scope(
                 .map(to_header_iter)
                 .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
 
-            if let Some(auth_config) = surface.source_auth() {
+            if let Some(selection) = surface.source_auth_for_request(&axum_headers, None) {
+                let auth_config = selection.method;
                 let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
                     Ok(middleware) => middleware,
                     Err(e) => {
@@ -4804,10 +4805,14 @@ async fn process_forward_request_in_request_scope(
                     surface_id: &surface.surface_id,
                     variant_id: active_variant_id.as_deref(),
                 };
-                match sa_middleware
-                    .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
-                    .await
-                {
+                let verified = if selection.ambiguous {
+                    Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
+                } else {
+                    sa_middleware
+                        .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
+                        .await
+                };
+                match verified {
                     Ok(identity) => Some(identity),
                     // Caller-attributable failure. An Access Point that
                     // publishes protected resource metadata, or whose caller
@@ -4815,6 +4820,11 @@ async fn process_forward_request_in_request_scope(
                     // record the outcome for the policy layer and continue with
                     // no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
+                        // Beside protected resource metadata every failure is
+                        // refused: a failed JWT with the discovery refusal, any
+                        // other method plainly.
+                        let challenged = protected_resource.is_some()
+                            && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
                         let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(
                             config_id,
@@ -4829,7 +4839,7 @@ async fn process_forward_request_in_request_scope(
                             refused,
                             None,
                         );
-                        if let Some(protected_resource) = &protected_resource {
+                        if challenged && let Some(protected_resource) = &protected_resource {
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
                         }
                         if refused {
@@ -5722,8 +5732,6 @@ async fn process_forward_request_in_request_scope(
     // Track if content-type was set
     let mut has_content_type = false;
 
-    // Determine the source-auth credential header to strip (must not leak upstream).
-    let source_cred_header = surface.source_auth().and_then(|sa| sa.credential_header_name());
     let target_auth_header = crate::proxy::handler::target_auth_header_name(surface.target_auth());
     let header_metadata_mapping = surface.access_point.header_metadata_mapping.as_ref();
 
@@ -5753,10 +5761,9 @@ async fn process_forward_request_in_request_scope(
                 );
                 continue;
             }
-            // Skip the source-auth credential header — it was consumed by the
-            // gateway for authentication and must not be forwarded upstream.
-            if let Some(cred) = source_cred_header
-                && key.eq_ignore_ascii_case(cred) {
+            // Skip the source-auth credential headers — the gateway consumed
+            // them for authentication and they must not be forwarded upstream.
+            if surface.is_source_credential_header(key) {
                     channel_info!(
                         config_id,
                         "    Skipping source auth credential header: {}",
@@ -5975,9 +5982,8 @@ async fn process_forward_request_in_request_scope(
                     &base_url,
                     true, // via_fabric = true (G2G path)
                     None, // audit context not yet available in G2G path
-                    // The caller identity here is asserted by the peer gateway, not
-                    // verified against the consenting issuer, so it can never unlock
-                    // a modern consent record.
+                    // A Fabric request establishes no consent principal, so it never
+                    // unlocks a modern consent record.
                     None,
                 )
                 .await;

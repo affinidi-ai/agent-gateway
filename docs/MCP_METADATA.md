@@ -188,7 +188,7 @@ Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `allowed_origins` | `[]` | Additional exact serialized HTTP(S) origins, without paths, wildcards or credentials. |
-| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. |
+| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. On a Transit Point reached through the `/outbound/...` hop of an inbound listener that shares its host name, a body is also bounded by `[a2a] max_body_size`; see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). |
 | `max_header_bytes` | `16384` | Sum of header-name bytes, value bytes and four framing bytes per field. |
 | `max_accept_ranges` | `32` | Maximum nonempty parsed Accept media ranges across repeated fields. |
 | `max_response_bytes` | `1048576` | Maximum modern JSON response or normalized SSE event bytes. |
@@ -1482,7 +1482,13 @@ and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
 plus `error="invalid_token"` once a token was presented and `scope` when
 scopes are set. The body's detail is fixed and never says why a token failed.
 The audit records the failure as blocking. A valid token issued for the
-resource is attributed as before, and its identity reaches policy. Over
+resource is attributed as before, and its identity reaches policy. When the
+Access Point lists further caller authentication methods after the JWT Bearer
+method, a request that carries one of their credentials and none for the JWT
+Bearer method is checked by that method instead, and a failure is refused
+before policy with a plain `401`, without the challenge, so a bad credential
+gets no further than none; a request with no credential at all still gets the
+challenge. Over
 Fabric, the receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
 `source_auth::middleware::resolve_surface_audience`. The variant whose

@@ -261,6 +261,196 @@ fn shared_domain_proxy_forwards(
         && !header.eq_ignore_ascii_case(forwarded_cert_header)
 }
 
+/// The longest the shared-host hop waits on a read from the outbound listener:
+/// the largest stream idle timeout and stream lifetime a surface can set,
+/// 86400 seconds.
+const SHARED_HOST_HOP_READ_IDLE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// How far past `max_body_bytes` the hop streams a body without a declared
+/// length before it stops. More than hyper's largest write buffer (about
+/// 400 KiB), so the outbound listener has read past its own cap, refused the
+/// request and recorded the refusal before the hop aborts the connection.
+pub(crate) const SHARED_HOST_HOP_STREAM_MARGIN: usize = 512 * 1024;
+
+/// The shared-host `/outbound` hop: where it forwards, and the largest request
+/// body it passes on.
+pub(crate) struct SharedHostHop {
+    pub(crate) target: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) forwarded_cert_header: String,
+    pub(crate) max_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopBodyFault {
+    TooLarge,
+    ReadFailed,
+}
+
+/// The request body as a stream that records once more than `max_bytes` have
+/// been read, passes on the chunk that takes it past `max_bytes` plus
+/// [`SHARED_HOST_HOP_STREAM_MARGIN`] and fails on the next poll without reading
+/// further, and fails and records when the caller's body fails. So it reads at
+/// most `max_bytes` plus the margin plus one chunk.
+fn capped_hop_body(
+    body: axum::body::Body,
+    max_bytes: usize,
+    fault: Arc<OnceLock<HopBodyFault>>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    use futures::StreamExt;
+    let stop_after = max_bytes.saturating_add(SHARED_HOST_HOP_STREAM_MARGIN);
+    let mut chunks = body.into_data_stream();
+    let mut read = 0usize;
+    let mut ended = false;
+    futures::stream::poll_fn(move |cx| {
+        if ended {
+            return std::task::Poll::Ready(None);
+        }
+        if read > stop_after {
+            ended = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                "request body exceeds the shared-host hop limit",
+            ))));
+        }
+        match std::task::ready!(chunks.poll_next_unpin(cx)) {
+            Some(Ok(bytes)) => {
+                read = read.saturating_add(bytes.len());
+                if read > max_bytes {
+                    let _ = fault.set(HopBodyFault::TooLarge);
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            Some(Err(error)) => {
+                ended = true;
+                let _ = fault.set(HopBodyFault::ReadFailed);
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(error))))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    })
+}
+
+/// The hop's own 413 for a body over the cap, or 400 for one the caller failed
+/// to send: a JSON-RPC error for an MCP caller, an A2A problem otherwise.
+fn hop_refusal(
+    fault: HopBodyFault,
+    mcp: bool,
+    max_bytes: usize,
+) -> axum::response::Response {
+    match (fault, mcp) {
+        (HopBodyFault::TooLarge, true) => crate::mcp::modern_http::body_too_large_response(),
+        (HopBodyFault::TooLarge, false) => crate::proxy::body_too_large_response(max_bytes),
+        (HopBodyFault::ReadFailed, true) => crate::mcp::modern_http::body_read_failed_response(),
+        (HopBodyFault::ReadFailed, false) => {
+            crate::a2a::create_error_response(axum::http::StatusCode::BAD_REQUEST, "Failed to read request body")
+        }
+    }
+}
+
+/// Forwards a request on the inbound listener to the outbound listener that
+/// shares its host. The body is streamed, never buffered, so the outbound
+/// listener authenticates the caller before it is read. A declared length over
+/// `max_body_bytes` is refused with 413 without reading. A longer body is
+/// streamed until the outbound listener answers, at most to `max_body_bytes`
+/// plus [`SHARED_HOST_HOP_STREAM_MARGIN`]; when its answer is lost the hop
+/// answers 413 itself. One the caller fails to send is refused with 400, never
+/// forwarded empty. The response is streamed back.
+pub(crate) async fn forward_shared_host_hop(
+    hop: Arc<SharedHostHop>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    let caller = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(|| "unknown".to_string(), |info| info.0.to_string());
+    let mcp = req
+        .headers()
+        .contains_key("mcp-protocol-version");
+    let declared_length = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let path = req.uri().path().to_string();
+    if declared_length.is_some_and(|length| length > hop.max_body_bytes as u64) {
+        warn!(
+            caller = %caller,
+            path = %path,
+            max = hop.max_body_bytes,
+            "Shared-host hop refused a declared oversize body"
+        );
+        return hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes);
+    }
+    let url = format!(
+        "{}{}",
+        hop.target,
+        req.uri()
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+    );
+    let mut builder = hop
+        .client
+        .request(req.method().clone(), &url);
+    for (key, value) in req.headers() {
+        if shared_domain_proxy_forwards(key.as_str(), &hop.forwarded_cert_header)
+            && let Ok(v) = value.to_str()
+        {
+            builder = builder.header(key.as_str(), v);
+        }
+    }
+    let fault = Arc::new(OnceLock::new());
+    if !req.body().is_end_stream() {
+        builder = builder.body(reqwest::Body::wrap_stream(capped_hop_body(
+            req.into_body(),
+            hop.max_body_bytes,
+            fault.clone(),
+        )));
+    }
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status =
+                axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let mut response_builder = axum::response::Response::builder().status(status);
+            for (key, value) in resp.headers() {
+                if !crate::a2a::is_hop_by_hop_header(key.as_str()) {
+                    response_builder = response_builder.header(key.as_str(), value.as_bytes());
+                }
+            }
+            response_builder
+                .body(axum::body::Body::from_stream(resp.bytes_stream()))
+                .unwrap_or_else(|_| {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::BAD_GATEWAY)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                })
+        }
+        Err(e) => match fault.get() {
+            Some(HopBodyFault::TooLarge) if (e.is_body() || e.is_request()) && !e.is_timeout() => {
+                warn!(caller = %caller, path = %path, max = hop.max_body_bytes, "Shared-host hop refused an oversize body");
+                hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes)
+            }
+            Some(HopBodyFault::ReadFailed) => {
+                warn!(caller = %caller, path = %path, "Shared-host hop could not read the caller's body");
+                hop_refusal(HopBodyFault::ReadFailed, mcp, hop.max_body_bytes)
+            }
+            _ => {
+                if (e.is_body() || e.is_request()) && !e.is_connect() {
+                    debug!(error = %e.without_url(), url = %loggable::url(&url), "Outgoing proxy forward failed");
+                } else {
+                    warn!(error = %e.without_url(), url = %loggable::url(&url), "Outgoing proxy forward failed");
+                }
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::BAD_GATEWAY)
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
+            }
+        },
+    }
+}
+
 /// Whether callers on other hosts can use `url`: its host is not `localhost`
 /// or a loopback or unspecified address. A private or link-local address
 /// counts, as every workload on that network reaches it; so does any other
@@ -1191,7 +1381,6 @@ pub async fn run_port_server(
         if let Some(outbound_listener) = find_shared_outbound_listener(&network_config, port) {
             let outbound_target =
                 format!("http://{}", listener_socket_address(&outbound_listener.bind_address, outbound_listener.port)?);
-            let proxy_client = client.clone();
             info!(
                 inbound_port = port,
                 outbound_port = outbound_listener.port,
@@ -1199,82 +1388,18 @@ pub async fn run_port_server(
                 "Shared-domain detected: registering outbound transit-point proxy on inbound listener -> outbound listener"
             );
 
-            let outbound_target_arc = std::sync::Arc::new(outbound_target);
-            let forwarded_cert_header = std::sync::Arc::new(
-                config
+            let hop = Arc::new(SharedHostHop {
+                target: outbound_target,
+                client: crate::http_client::shared_host_hop(SHARED_HOST_HOP_READ_IDLE)?,
+                forwarded_cert_header: config
                     .tls
                     .client_auth
                     .forwarded_header
                     .header_name
                     .clone(),
-            );
-            let proxy_handler = move |req: axum::extract::Request| {
-                let target = outbound_target_arc.clone();
-                let http_client = proxy_client.clone();
-                let forwarded_cert_header = forwarded_cert_header.clone();
-                async move {
-                    let path_and_query = req
-                        .uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or("/")
-                        .to_string();
-                    let url = format!("{}{}", target, path_and_query);
-                    let method = reqwest::Method::from_bytes(
-                        req.method()
-                            .as_str()
-                            .as_bytes(),
-                    )
-                    .unwrap_or(reqwest::Method::POST);
-                    let mut builder = http_client.request(method, &url);
-                    for (key, value) in req.headers() {
-                        if shared_domain_proxy_forwards(key.as_str(), &forwarded_cert_header)
-                            && let Ok(v) = value.to_str()
-                        {
-                            builder = builder.header(key.as_str(), v);
-                        }
-                    }
-                    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-                        .await
-                        .unwrap_or_default();
-                    builder = builder.body(body);
-                    match builder.send().await {
-                        Ok(resp) => {
-                            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-                            let mut response_builder = axum::response::Response::builder().status(status);
-                            for (key, value) in resp.headers() {
-                                if !crate::a2a::is_hop_by_hop_header(key.as_str()) {
-                                    response_builder = response_builder.header(key.as_str(), value.as_bytes());
-                                }
-                            }
-                            let bytes = resp
-                                .bytes()
-                                .await
-                                .unwrap_or_default();
-                            response_builder
-                                .body(axum::body::Body::from(bytes))
-                                .unwrap_or_else(|_| {
-                                    axum::response::Response::builder()
-                                        .status(axum::http::StatusCode::BAD_GATEWAY)
-                                        .body(axum::body::Body::empty())
-                                        .unwrap()
-                                })
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e.without_url(),
-                                url = %loggable::url(&url),
-                                "Outgoing proxy forward failed"
-                            );
-                            axum::response::Response::builder()
-                                .status(axum::http::StatusCode::BAD_GATEWAY)
-                                .body(axum::body::Body::empty())
-                                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
-                        }
-                    }
-                }
-            };
+                max_body_bytes: config.a2a.max_body_size,
+            });
+            let proxy_handler = move |req: axum::extract::Request| forward_shared_host_hop(hop.clone(), req);
 
             let outbound_prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
             app = app
@@ -1798,6 +1923,7 @@ pub async fn run_outbound_port_server(
                 gateway_base_url: get_gateway_base_url(),
                 task_monitor: task_monitor.clone(),
                 max_response_bytes: config.a2a.max_body_size,
+                max_request_bytes: config.a2a.max_body_size,
                 egress_allowlist: crate::egress::bdd_egress_allowlist(),
                 vc_alias_override: vc
                     .listen_path
@@ -1959,6 +2085,9 @@ pub async fn run_outbound_port_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use futures::StreamExt;
 
     #[test]
     fn parse_cors_origins_keeps_valid_origins() {
@@ -3150,5 +3279,415 @@ mod tests {
             "/outbound",
             "changing this constant is a breaking change for all deployed transit points"
         );
+    }
+
+    /// A stand-in outbound listener: `/outbound/deny` answers 401 without
+    /// reading the body, `/outbound/stream` sends one event and holds the
+    /// stream open, and every other path reads the whole body and answers 201
+    /// with the method and body length. `started` counts requests that arrived,
+    /// `completed` those whose body was read to the end.
+    struct OutboundStub {
+        url: String,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn outbound_stub() -> OutboundStub {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (on_start, on_complete) = (started.clone(), completed.clone());
+        let app = axum::Router::new()
+            .route(
+                "/outbound/deny",
+                axum::routing::any(|| async { (StatusCode::UNAUTHORIZED, "Transit token missing or invalid") }),
+            )
+            .route(
+                "/outbound/stream",
+                axum::routing::any(|| async {
+                    let first = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: first\n\n"))
+                    });
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(first.chain(futures::stream::pending())))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/outbound/stall",
+                axum::routing::any(|request: axum::extract::Request| async {
+                    let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await;
+                    futures::future::pending::<()>().await;
+                }),
+            )
+            .fallback(move |request: axum::extract::Request| {
+                let (on_start, on_complete) = (on_start.clone(), on_complete.clone());
+                async move {
+                    on_start.fetch_add(1, Ordering::SeqCst);
+                    let method = request.method().clone();
+                    match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+                        Ok(body) => {
+                            on_complete.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::CREATED, [("x-stub", "echo")], format!("{method} {}", body.len()))
+                                .into_response()
+                        }
+                        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        OutboundStub { url, started, completed }
+    }
+
+    fn hop_to(
+        stub: &OutboundStub,
+        max_body_bytes: usize,
+    ) -> Arc<SharedHostHop> {
+        Arc::new(SharedHostHop {
+            target: stub.url.clone(),
+            client: crate::http_client::shared_host_hop(SHARED_HOST_HOP_READ_IDLE).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes,
+        })
+    }
+
+    const HOP_CHUNK: usize = 1024;
+
+    /// An endless body of `HOP_CHUNK`-byte chunks that counts every byte the
+    /// hop pulls from it.
+    fn endless_counted_body(pulled: Arc<std::sync::atomic::AtomicUsize>) -> axum::body::Body {
+        axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            pulled.fetch_add(HOP_CHUNK, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0u8; HOP_CHUNK]))
+        }))
+    }
+
+    async fn hop_call(
+        hop: Arc<SharedHostHop>,
+        request: axum::extract::Request,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), forward_shared_host_hop(hop, request))
+            .await
+            .expect("the hop must answer instead of reading an endless body");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the hop response must end")
+        .unwrap_or_default();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn hop_request(
+        method: &str,
+        path: &str,
+        content_length: Option<usize>,
+        body: axum::body::Body,
+    ) -> axum::extract::Request {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path);
+        if let Some(length) = content_length {
+            request = request.header("content-length", length);
+        }
+        request.body(body).unwrap()
+    }
+
+    fn failing_body() -> axum::body::Body {
+        axum::body::Body::from_stream(futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]))
+    }
+
+    /// The hop answers its own refusals as a JSON-RPC error with no id
+    /// when the request names an MCP protocol version, and as an A2A problem
+    /// otherwise.
+    #[tokio::test]
+    async fn the_hop_answers_its_refusals_in_the_shape_of_the_callers_protocol() {
+        let stub = outbound_stub().await;
+        let mcp = |mut request: axum::extract::Request| {
+            request
+                .headers_mut()
+                .insert("mcp-protocol-version", HeaderValue::from_static("2025-06-18"));
+            request
+        };
+
+        for (case, request, status, message) in [
+            (
+                "declared oversize",
+                mcp(hop_request("POST", "/outbound/echo", Some(4097), axum::body::Body::from(vec![0u8; 4097]))),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "MCP request body exceeds the configured limit",
+            ),
+            (
+                "failed body",
+                mcp(hop_request("POST", "/outbound/echo", None, failing_body())),
+                StatusCode::BAD_REQUEST,
+                "Failed to read MCP request body",
+            ),
+        ] {
+            let (answered, headers, body) = hop_call(hop_to(&stub, 4096), request).await;
+            assert_eq!(answered, status, "{case}: {body}");
+            assert_eq!(headers["content-type"], "application/json", "{case}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["jsonrpc"], "2.0", "{case}");
+            assert!(body.get("id").is_none(), "{case}: {body}");
+            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{case}");
+            assert_eq!(body["error"]["message"], message, "{case}");
+        }
+
+        for (case, request, status) in [
+            (
+                "declared oversize",
+                hop_request("POST", "/outbound/echo", Some(4097), axum::body::Body::from(vec![0u8; 4097])),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            ("failed body", hop_request("POST", "/outbound/echo", None, failing_body()), StatusCode::BAD_REQUEST),
+        ] {
+            let (answered, _, body) = hop_call(hop_to(&stub, 4096), request).await;
+            assert_eq!(answered, status, "{case}: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["type"], "https://a2a-protocol.org/errors/proxy-error", "{case}");
+            assert!(body.get("jsonrpc").is_none(), "{case}");
+        }
+    }
+
+    /// A hop whose wait for the outbound listener times out after the body
+    /// passed the cap answers 502, not 413; a send that fails on the body
+    /// past the cap answers 413.
+    #[tokio::test]
+    async fn the_hop_reports_too_large_only_when_the_body_failed_the_send() {
+        let stub = outbound_stub().await;
+        let past_the_cap = || {
+            axum::body::Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(
+                vec![0u8; 4096 + 1024],
+            ))]))
+        };
+        let stalling = Arc::new(SharedHostHop {
+            target: stub.url.clone(),
+            client: crate::http_client::shared_host_hop(std::time::Duration::from_millis(300)).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes: 4096,
+        });
+
+        let (status, _, body) = hop_call(stalling, hop_request("POST", "/outbound/stall", None, past_the_cap())).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request(
+                "POST",
+                "/outbound/echo",
+                None,
+                endless_counted_body(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    }
+
+    /// The hop's refusals are logged with the caller's socket address, and
+    /// never with the query.
+    #[tokio::test]
+    async fn the_hop_logs_its_refusals_with_the_callers_address() {
+        let stub = outbound_stub().await;
+        let caller: SocketAddr = "192.0.2.7:40123"
+            .parse()
+            .unwrap();
+        let with_caller = |mut request: axum::extract::Request| {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(caller));
+            request
+        };
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        hop_call(
+            hop_to(&stub, 4096),
+            with_caller(hop_request(
+                "POST",
+                "/outbound/echo?secret=query",
+                Some(4097),
+                axum::body::Body::from(vec![0u8; 4097]),
+            )),
+        )
+        .await;
+        hop_call(
+            hop_to(&stub, 4096),
+            with_caller(hop_request(
+                "POST",
+                "/outbound/echo?secret=query",
+                None,
+                endless_counted_body(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            )),
+        )
+        .await;
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches("caller=192.0.2.7:40123")
+                .count(),
+            2,
+            "{text}"
+        );
+        assert!(text.contains("refused a declared oversize body"), "{text}");
+        assert!(text.contains("refused an oversize body"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_hop_refuses_a_declared_oversize_body_without_reading_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request("POST", "/outbound/echo", Some(4097), endless_counted_body(pulled.clone())),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large (max: 4096)"), "{body}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stub.started
+                .load(Ordering::SeqCst),
+            0,
+            "the outbound listener was called"
+        );
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request("POST", "/outbound/echo", Some(4096), axum::body::Body::from(vec![0u8; 4096])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body, "POST 4096");
+    }
+
+    #[tokio::test]
+    async fn the_hop_cuts_an_endless_body_at_the_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let limit = 64 * 1024;
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, limit),
+            hop_request("POST", "/outbound/echo", None, endless_counted_body(pulled.clone())),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large"), "{body}");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(pulled <= limit + SHARED_HOST_HOP_STREAM_MARGIN + HOP_CHUNK, "pulled {pulled} bytes");
+        assert_eq!(
+            stub.completed
+                .load(Ordering::SeqCst),
+            0,
+            "a truncated body was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_stops_pulling_an_endless_body_the_outbound_listener_refuses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let limit = 10 * 1024 * 1024;
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, limit),
+            hop_request("POST", "/outbound/deny", None, endless_counted_body(pulled.clone())),
+        )
+        .await;
+        // The listener closes on the unread body, and the reset can reach the
+        // hop before its 401 does.
+        assert!([StatusCode::UNAUTHORIZED, StatusCode::BAD_GATEWAY].contains(&status), "{status}: {body}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let settled = pulled.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), settled, "the hop kept pulling the refused body");
+        assert!(
+            settled <= limit / 2,
+            "pulled {settled} bytes of a body the listener refused; only socket and transport buffers, well under the {limit}-byte cap, should be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_refuses_a_body_the_caller_fails_to_send_instead_of_forwarding_it_empty() {
+        use std::sync::atomic::Ordering;
+        let stub = outbound_stub().await;
+        let failing = axum::body::Body::from_stream(futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]));
+
+        let (status, _, body) =
+            hop_call(hop_to(&stub, 4096), hop_request("POST", "/outbound/echo", None, failing)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Failed to read request body"), "{body}");
+        assert_eq!(
+            stub.completed
+                .load(Ordering::SeqCst),
+            0,
+            "a body was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_passes_the_method_status_headers_and_body_through() {
+        let stub = outbound_stub().await;
+
+        for (method, body, expected) in [
+            ("PATCH", axum::body::Body::from("abc"), "PATCH 3"),
+            ("DELETE", axum::body::Body::from("abcd"), "DELETE 4"),
+            ("GET", axum::body::Body::empty(), "GET 0"),
+        ] {
+            let (status, headers, answer) =
+                hop_call(hop_to(&stub, 4096), hop_request(method, "/outbound/echo", None, body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{method}: {answer}");
+            assert_eq!(headers.get("x-stub").unwrap(), "echo", "{method}");
+            assert_eq!(answer, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hop_streams_the_response_before_the_outbound_listener_ends_it() {
+        let stub = outbound_stub().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            forward_shared_host_hop(
+                hop_to(&stub, 4096),
+                hop_request("GET", "/outbound/stream", None, axum::body::Body::empty()),
+            ),
+        )
+        .await
+        .expect("the hop must answer before the stream ends");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let mut body = response
+            .into_body()
+            .into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), body.next())
+            .await
+            .expect("the first event must arrive while the stream is open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"data: first\n\n");
     }
 }

@@ -1,0 +1,18 @@
+branch: fix/export-private-key-redaction
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Keep DID private keys and refresh tokens out of the support export
+      description: >-
+        The `.atgx` support export carried the private keys of Connection Point, issuer and trust
+        registry DIDs, stored as `key_<n>.json` beside their DID documents, and the private keys
+        inside issuer and mediator records, because redaction replaced only string values and
+        missed `privateKeyJwk`, `secrets`, `our_secrets` and `refresh_token`. The export now
+        leaves out every `key_<n>.json` file in plaintext, encrypted or leftover temporary form,
+        and replaces the whole value of a secret field, whether a string, an object or a list.
+        DID documents and the rest of each record are still exported.
+  breaking: []

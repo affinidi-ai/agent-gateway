@@ -251,20 +251,120 @@ impl SourceAuthConfig {
     /// from, if any. Used to strip the header before forwarding upstream — the
     /// source credential is consumed by the gateway and must not leak.
     pub fn credential_header_name(&self) -> Option<&str> {
+        match self.credential_source() {
+            CredentialSource::Header(name) => Some(name),
+            CredentialSource::McpMeta | CredentialSource::A2aExtension | CredentialSource::ClientCertificate => None,
+        }
+    }
+
+    /// Where this method reads the caller's credential.
+    pub fn credential_source(&self) -> CredentialSource<'_> {
         match self {
-            SourceAuthConfig::JwtBearer(c) => Some(c.token_header.as_str()),
-            SourceAuthConfig::ApiKey(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::ApiKeyProvider(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::DidAuth(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::Mtls(_) => None,
+            SourceAuthConfig::JwtBearer(c) => CredentialSource::Header(c.token_header.as_str()),
+            SourceAuthConfig::ApiKey(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::ApiKeyProvider(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::DidAuth(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::Mtls(_) => CredentialSource::ClientCertificate,
+        }
+    }
+
+    /// Whether the request carries this method's credential: a non-empty
+    /// header, or a client certificate. A JWT bearer header counts only when it
+    /// holds a token in the method's scheme, as its verifier reads it, so
+    /// another scheme on the same header, such as an MPP `Authorization:
+    /// Payment` credential, is not taken for the JWT.
+    pub(crate) fn is_presented(
+        &self,
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> bool {
+        if let SourceAuthConfig::JwtBearer(config) = self {
+            let header_value = headers
+                .get(config.token_header.as_str())
+                .and_then(|value| value.to_str().ok());
+            return crate::jwt_bearer::validator::extract_bearer_with_scheme(header_value, &config.token_scheme)
+                .is_ok();
+        }
+        match self.credential_source() {
+            CredentialSource::Header(name) => headers
+                .get(name)
+                .is_some_and(|value| {
+                    !value
+                        .as_bytes()
+                        .trim_ascii()
+                        .is_empty()
+                }),
+            CredentialSource::ClientCertificate => has_client_certificate,
+            CredentialSource::McpMeta | CredentialSource::A2aExtension => false,
         }
     }
 }
 
-fn extraction_header(extraction: &CredentialExtraction) -> Option<&str> {
-    match extraction {
-        CredentialExtraction::HttpHeader { field } => Some(field.as_str()),
-        CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
+/// Where a caller authentication method reads the caller's credential.
+#[derive(Debug, Clone, Copy)]
+pub enum CredentialSource<'a> {
+    Header(&'a str),
+    McpMeta,
+    A2aExtension,
+    ClientCertificate,
+}
+
+impl CredentialSource<'_> {
+    fn from_extraction(extraction: &CredentialExtraction) -> CredentialSource<'_> {
+        match extraction {
+            CredentialExtraction::HttpHeader { field } => CredentialSource::Header(field.as_str()),
+            CredentialExtraction::McpMeta => CredentialSource::McpMeta,
+            CredentialExtraction::A2aExtension => CredentialSource::A2aExtension,
+        }
+    }
+
+    /// Header names compare case-insensitively, as HTTP does.
+    pub fn same_as(
+        &self,
+        other: &CredentialSource<'_>,
+    ) -> bool {
+        match (self, other) {
+            (CredentialSource::Header(a), CredentialSource::Header(b)) => a.eq_ignore_ascii_case(b),
+            (CredentialSource::McpMeta, CredentialSource::McpMeta)
+            | (CredentialSource::A2aExtension, CredentialSource::A2aExtension)
+            | (CredentialSource::ClientCertificate, CredentialSource::ClientCertificate) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The caller authentication method chosen for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceAuthSelection<'a> {
+    /// The method whose credential the request carries, or the primary
+    /// (first) method when the request carries none or several.
+    pub method: &'a SourceAuthConfig,
+    /// The request carries credentials for more than one method. It then
+    /// fails without any method being verified.
+    pub ambiguous: bool,
+}
+
+/// Chooses the caller authentication method that verifies a request: the
+/// method whose credential the request carries, or the primary (first) method
+/// when it carries none. A request carrying credentials for several methods is
+/// ambiguous, so the caller can't pick the identity the gateway asserts. Only
+/// the chosen method is verified; a failure never falls through to another.
+pub fn select_source_auth_method<'a>(
+    methods: &'a [SourceAuthConfig],
+    headers: &axum::http::HeaderMap,
+    has_client_certificate: bool,
+) -> Option<SourceAuthSelection<'a>> {
+    let mut presented = methods
+        .iter()
+        .filter(|method| method.is_presented(headers, has_client_certificate));
+    match (presented.next(), presented.next()) {
+        (Some(method), None) => Some(SourceAuthSelection { method, ambiguous: false }),
+        (Some(_), Some(_)) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: true }),
+        (None, _) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: false }),
     }
 }
 
@@ -809,6 +909,54 @@ mod tests {
         assert!(other.jwt_claims().is_none());
     }
 
+    #[test]
+    fn the_identity_hash_has_fixed_values_for_known_callers() {
+        let jwt_subject = |subject: &str| AuthenticatedIdentity::JwtBearer {
+            subject: subject.to_string(),
+            claims: serde_json::json!({"iss": "https://login.example.com", "sub": subject}),
+        };
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f")
+        );
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738")
+        );
+        assert_eq!(
+            jwt_subject("a\"b\\c\u{e9}\n")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353")
+        );
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "partner-key".to_string(),
+            provider_agent_id: None,
+        };
+        assert_eq!(
+            api_key
+                .principal_hash(None)
+                .as_deref(),
+            Some("67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db")
+        );
+    }
+
+    #[test]
+    fn the_identity_hash_of_a_jwt_is_the_function_of_its_issuer_tenant_and_subject_alone() {
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", None, "alice"),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f".to_string())
+        );
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", Some("tenant-1"), "alice"),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738".to_string())
+        );
+    }
+
     /// The identity hash is the SHA-256 of `[method, issuer, tenant, subject]`,
     /// so a caller is told apart by each, and a JWT that names no subject has no
     /// hash at all.
@@ -1187,5 +1335,126 @@ mod tests {
         assert!(!json.contains("\"json_schema\""));
         let back: PayloadExtractionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    fn method(value: serde_json::Value) -> SourceAuthConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn jwt_and_api_key() -> Vec<SourceAuthConfig> {
+        vec![
+            method(
+                serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []}),
+            ),
+            method(serde_json::json!({
+                "type": "api_key",
+                "extraction": {"source": "http_header", "field": "X-API-Key"},
+                "secret_id": "keys"
+            })),
+        ]
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value))
+            })
+            .collect()
+    }
+
+    fn selected_tag(
+        methods: &[SourceAuthConfig],
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> (&'static str, bool) {
+        let selection = select_source_auth_method(methods, headers, has_client_certificate).unwrap();
+        (selection.method.method_tag(), selection.ambiguous)
+    }
+
+    #[test]
+    fn selection_picks_the_method_whose_credential_the_request_carries() {
+        let methods = jwt_and_api_key();
+
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("authorization", "Bearer t")]), false), ("jwt_bearer", false));
+    }
+
+    #[test]
+    fn selection_is_ambiguous_on_the_primary_method_when_several_credentials_are_present() {
+        let methods = jwt_and_api_key();
+        let both = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+
+        assert_eq!(selected_tag(&methods, &both, false), ("jwt_bearer", true));
+
+        let reversed: Vec<_> = methods
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(selected_tag(&reversed, &both, false), ("api_key", true));
+    }
+
+    #[test]
+    fn selection_counts_a_jwt_header_only_in_the_methods_scheme() {
+        let methods: Vec<_> = jwt_and_api_key()
+            .into_iter()
+            .rev()
+            .collect();
+        for other_scheme in ["Payment cred", "bearer t", "Bearer "] {
+            let request = headers(&[("x-api-key", "k"), ("authorization", other_scheme)]);
+            assert_eq!(selected_tag(&methods, &request, false), ("api_key", false), "{other_scheme}");
+        }
+        let request = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+        assert_eq!(selected_tag(&methods, &request, false), ("api_key", true));
+
+        let empty_key = headers(&[("x-api-key", " "), ("authorization", "Bearer t")]);
+        assert_eq!(
+            selected_tag(&methods, &empty_key, false),
+            ("jwt_bearer", false),
+            "an empty header is no credential"
+        );
+
+        let any_scheme = method(serde_json::json!({
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": [], "token_scheme": ""
+        }));
+        assert!(
+            any_scheme.is_presented(&headers(&[("authorization", "Payment cred")]), false),
+            "a method without a scheme reads any value"
+        );
+    }
+
+    #[test]
+    fn selection_falls_back_to_the_primary_method_when_no_credential_is_present() {
+        let methods = jwt_and_api_key();
+        assert_eq!(selected_tag(&methods, &headers(&[("x-other", "v")]), false), ("jwt_bearer", false));
+    }
+
+    #[test]
+    fn selection_counts_a_client_certificate_as_the_mtls_credential() {
+        let methods = vec![
+            jwt_and_api_key().remove(1),
+            method(serde_json::json!({
+                "type": "mtls",
+                "trust": {"type": "pinned", "certificate_ids": ["c1"]},
+                "identity_binding": {"type": "fingerprint"}
+            })),
+        ];
+        assert_eq!(selected_tag(&methods, &headers(&[]), true), ("mtls", false));
+        assert_eq!(selected_tag(&methods, &headers(&[]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), true), ("api_key", true));
+    }
+
+    #[test]
+    fn selection_is_none_without_methods() {
+        assert!(select_source_auth_method(&[], &headers(&[("authorization", "Bearer t")]), true).is_none());
+    }
+
+    #[test]
+    fn credential_sources_compare_header_names_case_insensitively() {
+        assert!(CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("x-api-key")));
+        assert!(!CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("Authorization")));
+        assert!(CredentialSource::McpMeta.same_as(&CredentialSource::McpMeta));
+        assert!(!CredentialSource::McpMeta.same_as(&CredentialSource::A2aExtension));
+        assert!(!CredentialSource::ClientCertificate.same_as(&CredentialSource::Header("Authorization")));
     }
 }

@@ -58,6 +58,11 @@ const SECRET_KEYS: &[&str] = &[
     "oob_url",
     "challenge",
     "token_secret_id",
+    "refresh_token",
+    "privatekeyjwk",
+    "private_key_jwk",
+    "secrets",
+    "our_secrets",
 ];
 
 /// JSON keys whose values are wallet/financial PII — replaced with `[REDACTED-WALLET]`
@@ -83,11 +88,29 @@ pub fn is_excluded_dir(dir_name: &str) -> bool {
     EXCLUDED_DIRS.contains(&dir_name)
 }
 
-/// Returns true if the given file name should be excluded from export.
+/// Returns true if the given file name should be excluded from export. A
+/// leading `.` is ignored, so a write's leftover `.{name}.{uuid}.tmp` file is
+/// excluded with the file it was replacing.
 pub fn is_excluded_file(file_name: &str) -> bool {
+    let name = file_name.trim_start_matches('.');
     EXCLUDED_FILES
         .iter()
-        .any(|excluded| file_name.starts_with(excluded))
+        .any(|excluded| name.starts_with(excluded))
+        || is_did_key_file(name)
+}
+
+/// Whether `name` is a `key_<n>.json` file, in any form: the private keys of a
+/// Connection Point, issuer or trust registry DID.
+fn is_did_key_file(name: &str) -> bool {
+    name.strip_prefix("key_")
+        .and_then(|rest| rest.split_once(".json"))
+        .is_some_and(|(index, suffix)| {
+            (suffix.is_empty() || suffix.starts_with('.'))
+                && !index.is_empty()
+                && index
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+        })
 }
 
 /// Produce a short correlation-safe hash of a DID value.
@@ -141,10 +164,14 @@ fn redact_json_inner(
                             *s = "[REDACTED]".to_string();
                         }
                     } else if SECRET_KEYS.contains(&key_lower.as_str()) {
-                        if let Value::String(s) = val
-                            && !s.is_empty()
-                        {
-                            *s = "[REDACTED-SECRET]".to_string();
+                        let holds_value = match val {
+                            Value::String(s) => !s.is_empty(),
+                            Value::Object(map) => !map.is_empty(),
+                            Value::Array(arr) => !arr.is_empty(),
+                            _ => false,
+                        };
+                        if holds_value {
+                            *val = Value::String("[REDACTED-SECRET]".to_string());
                         }
                     } else if WALLET_KEYS.contains(&key_lower.as_str()) {
                         if let Value::String(s) = val
@@ -225,6 +252,46 @@ mod tests {
         assert!(is_excluded_dir("avatars"));
         assert!(!is_excluded_dir("channels"));
         assert!(!is_excluded_dir("metrics"));
+    }
+
+    #[test]
+    fn did_key_files_are_excluded_in_every_form() {
+        for name in ["key_0.json", "key_12.json", "key_0.json.enc", ".key_1.json.3f2a.tmp", ".key_1.json.enc.3f2a.tmp"]
+        {
+            assert!(is_excluded_file(name), "{name} should be excluded");
+        }
+        for name in ["key_.json", "key_a.json", "key_0.jsonl", "monkey_0.json", "did.json", "keys.json"] {
+            assert!(!is_excluded_file(name), "{name} should be kept");
+        }
+    }
+
+    #[test]
+    fn a_staged_transit_token_key_file_is_excluded() {
+        assert!(is_excluded_file(".transit_token_key.json.3f2a.tmp"));
+    }
+
+    #[test]
+    fn secret_keys_holding_objects_or_arrays_are_redacted() {
+        let mut val = json!({
+            "key_pair": {
+                "public_key": {"kty": "OKP", "x": "public-x"},
+                "private_key": {"kty": "OKP", "x": "public-x", "d": "private-d"}
+            },
+            "secrets": [{"id": "k1", "privateKeyJwk": {"d": "private-d"}}],
+            "our_secrets": [{"id": "k2", "privateKeyJwk": {"d": "private-d"}}],
+            "wrapped": {"privateKeyJwk": {"kty": "EC", "d": "private-d"}, "private_key_jwk": {"d": "private-d"}},
+            "refresh_token": "vendor-refresh-token",
+            "secret": {}
+        });
+        redact_json(&mut val);
+        assert_eq!(val["key_pair"]["private_key"], "[REDACTED-SECRET]");
+        assert_eq!(val["key_pair"]["public_key"]["x"], "public-x");
+        assert_eq!(val["secrets"], "[REDACTED-SECRET]");
+        assert_eq!(val["our_secrets"], "[REDACTED-SECRET]");
+        assert_eq!(val["wrapped"]["privateKeyJwk"], "[REDACTED-SECRET]");
+        assert_eq!(val["wrapped"]["private_key_jwk"], "[REDACTED-SECRET]");
+        assert_eq!(val["refresh_token"], "[REDACTED-SECRET]");
+        assert_eq!(val["secret"], json!({}));
     }
 
     #[test]

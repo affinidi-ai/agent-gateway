@@ -89,7 +89,7 @@ External caller → Access Point → Target. Implemented in
 flowchart TB
     subgraph E["Edge"]
         direction LR
-        A1["Source auth, or Resource<br/>Server token"] --> A2[Rate limit] --> A3[Body extraction] --> A4[MCP wire validation]
+        A1["Source auth, or Resource<br/>Server token"] --> A2[Rate limit] --> A3["Body extraction<br/>(413 over the limit)"] --> A4[MCP wire validation]
     end
     subgraph G["Gateway plane"]
         direction LR
@@ -97,7 +97,7 @@ flowchart TB
     end
     subgraph P["Before forwarding"]
         direction LR
-        P1[Egress check] --> P2[Body-size limit] --> P3["Local x402 / MPP"] --> P4[MCP tool policies]
+        P1[Egress check] --> P2[Body-size re-check] --> P3["Local x402 / MPP"] --> P4[MCP tool policies]
     end
     subgraph C["Caller context"]
         direction LR
@@ -129,7 +129,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -141,7 +141,7 @@ logic.
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Egress check | Vetting the forward target before anything is charged locally | [`src/egress.rs`](src/egress.rs) |
-| Body-size limit | Refusing a body over `[a2a] max_body_size` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
+| Body-size limit | Refusing a body over `[a2a] max_body_size` with `413`, as it is read and again before forwarding; an MCP Access Point reads up to its `mcp_http.max_request_bytes` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Local payment | x402 and MPP verification and paywalls | [`src/x402/`](src/x402/), [`src/mpp/`](src/mpp/) |
 | MCP tool policies | Per-tool authorization, configured as `target.mcp_tool_policies` | [`src/policies/opa.rs`](src/policies/opa.rs) |
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
@@ -207,12 +207,14 @@ appliance-wide policies.
 Inbound:
 
 source auth (or, on an MCP surface with `mcp_http.authorization`, the Resource Server
-token, which refuses rather than passing to policy) → rate limit → body extraction → MCP
+token, which refuses rather than passing to policy) → rate limit → body extraction (`413`
+over `[a2a] max_body_size`, or over `mcp_http.max_request_bytes` on MCP) → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
 and request validation (A2A and AP2) → delegated `agent_pay` payment (a
 `fabric://` Target leaves here: its own paywall, MCP tool policies for MCP, then fabric
-dispatch) → forward-target egress check → body-size limit → local x402/MPP → MCP tool
+dispatch) → forward-target egress check → body-size re-check (a body the gateway grew, and an
+MCP Access Point's body over `max_body_size`) → local x402/MPP → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → identity and caller-info headers → transit token generation → MCP custom

@@ -95,8 +95,8 @@ Access Point panel and on the canvas, and names a new surface `<protocol>_surfac
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
-identified by the API key it presents, and blocks Save unless the first Caller Context method is
-API Key or API Key Provider; see _Surface Builder_ in
+identified by the API key it presents, and blocks Save unless every Caller Context method is API
+Key or API Key Provider; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
@@ -134,9 +134,13 @@ The Agent Cards view of an A2A or AP2 surface shows the managed agent's card bes
 and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
-The Caller Context editor of an MCP surface with JWT Bearer edits authorization server
-discovery (`caller_authentication.protected_resource`), and Save removes a setting the
-operator switched off in the same PUT; see _Authorization server discovery_ in
+The Caller Context element lists its caller authentication methods in order, in the sidebar and
+in the fullscreen editor, each row with a Configure button that opens that method's settings;
+see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
+authorization server discovery (`caller_authentication.protected_resource`), and Save removes
+a setting the operator switched off in the same PUT; see _Authorization server discovery_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Access Point panel's **Public access** switch writes `access_point.public`. A closed
@@ -179,12 +183,13 @@ are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
 a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
 (`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
-`reject`, and an MCP Access Point that publishes protected resource metadata (direct requests
-get the discovery challenge). The admin API creates every surface closed unless
-`access_point.public` is `true`; a closed surface without source authentication is not ready
-and refuses every request with `503`. Surfaces without `public` keep forwarding failed callers
-to policy unless `on_failure` is `reject`, and policy must deny
-`input.source_auth.method == "failed"` to reject them.
+`reject`, and an MCP Access Point that publishes protected resource metadata (a missing or
+refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
+credential of another method a plain `401`). The
+admin API creates every surface closed unless `access_point.public` is `true`; a closed
+surface without source authentication is not ready and refuses every request with `503`.
+Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is
+`reject`, and policy must deny `input.source_auth.method == "failed"` to reject them.
 See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
 [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 

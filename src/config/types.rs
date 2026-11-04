@@ -432,6 +432,9 @@ impl A2aConfig {
         if self.max_inflight_dispatches == 0 {
             return Err("a2a.max_inflight_dispatches must be > 0".to_string());
         }
+        if self.max_body_size == 0 {
+            return Err("a2a.max_body_size must be at least 1 byte".to_string());
+        }
         if !(1..=86_400).contains(&self.stream_max_lifetime_secs) {
             return Err("a2a.stream_max_lifetime_secs must be between 1 and 86400".to_string());
         }
@@ -3991,6 +3994,24 @@ mod a2a_validate_tests {
     fn validate_ok_when_expires_strictly_greater_than_timeout() {
         let c = cfg(60_000, 90);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn max_body_size_must_be_at_least_one_byte() {
+        for good in [1, A2aConfig::default().max_body_size] {
+            let c = A2aConfig {
+                max_body_size: good,
+                ..A2aConfig::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "{good} should be accepted");
+        }
+        let err = A2aConfig {
+            max_body_size: 0,
+            ..A2aConfig::default()
+        }
+        .validate()
+        .expect_err("0 must be refused");
+        assert_eq!(err, "a2a.max_body_size must be at least 1 byte");
     }
 
     #[test]

@@ -820,7 +820,7 @@ API, the grants report and their removal take `"hop": "target"`.
 | No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |
 | No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |
 | `target.endpoint` | A public `https` URL with the origin of the provider's `resource`, as a Transit Point's `target_endpoint`; never `fabric://`, `proxy://` or `a2a-proxy://`. On an A2A or AP2 Access Point, whose requests carry the grant at or under the endpoint path, not the root of its origin (`/` or no path), where that would be every path of the vendor's: the A2A operation paths (`/tasks`, `/v1/...`) are ones a vendor's other APIs use too |
-| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it, and is created disabled, with a `Warning` header (`299`) saying so, since it keeps the copied Target and would send it requests without the grant. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
+| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it, and is created disabled, with a `Warning` header (`299`) saying so, since it keeps the copied Target and would send it requests without the grant. While the binding is served, every save that leaves an enabled view sending requests to its Target's origin without the binding or a credential of its own (`target.auth`, another binding, or `forward_header` on every caller authentication method) answers with a `Warning` header (`299`) naming it, since that view sends the vendor its callers' own headers and no grant: enabling such a copy, a variant with `outbound_credentials: []`, or the surface's own route beside a variant that holds the binding, unless a `default_variant_id` serves the base route instead. The dashboard shows it in the save-warnings banner. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
 
 A save that breaks a rule, or the rules every binding with external consent keeps (encryption
 at rest, the identity hash pepper, a permitted resource and issuer), is refused with `400` on
@@ -1180,6 +1180,41 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 ```sh
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
+
+#### Computing the identity hash outside the gateway
+
+A system that runs the connect for a caller, such as the page that hosts the person's connect
+and the authorization server's redirect, passes the caller's identity hash as the `principal`
+of a connect and of a grant removal, and reads it from a grant report. It computes the hash
+itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
+computed outside the gateway: take the token's `iss` and `sub`, and the surface's `tenant_id`
+(or `null`).
+
+The form is a compatibility surface. It is not changed without a documented migration, since
+a changed form orphans every stored grant. No pepper and no configuration setting is part of
+it: the same inputs always give the same hash, on every gateway. (The pepper derives the ids
+grants are stored under, never the hash itself.) These values are held by
+tests, and a change to the form fails them:
+
+| `method` | `issuer` | `tenant` | `subject` | Identity hash |
+| --- | --- | --- | --- | --- |
+| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
+| `api_key` | `""` | `null` | `partner-key` | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
+
+The third row shows RFC 8785 escaping: the subject is written with `\"` for the quote, `\\` for the
+backslash, the character `é` as itself in UTF-8, and `\n` for the line feed.
+
+The `hint` of a `connect_required` refusal for a caller is computed from the identity hash the
+same way on both sides: the first 16 bytes of the SHA-256 of the UTF-8 text
+`agent-gateway-connect-hint`, a line feed, and the identity hash as its lowercase hex text,
+written as base64url without padding (22 characters). It has the same compatibility promise:
+
+| Identity hash | Hint |
+| --- | --- |
+| `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` | `WXYw1wqFnUD93SdLiPtFyA` |
+| `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` | `YvFEO7T_9N80_y4j8sxMVA` |
 
 Delegated credentials stored by a release that keyed them by an earlier form of the identity
 hash are never looked up again, but their access and refresh tokens stay in the vault until
