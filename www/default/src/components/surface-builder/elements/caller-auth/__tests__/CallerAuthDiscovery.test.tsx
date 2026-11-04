@@ -54,6 +54,17 @@ interface HarnessProps {
   onSave?: (config: Record<string, unknown>) => void;
 }
 
+function readAudiences(config: Record<string, unknown> | undefined): unknown {
+  const methods = config?.methods;
+  if (Array.isArray(methods)) {
+    const firstMethod = methods[0];
+    return firstMethod && typeof firstMethod === 'object'
+      ? (firstMethod as Record<string, unknown>).audiences
+      : undefined;
+  }
+  return config?.audiences;
+}
+
 /** Renders a caller-auth panel over config it keeps in state, as the builder does. */
 const Harness: React.FC<HarnessProps> = ({
   initial,
@@ -350,7 +361,7 @@ describe('Caller Context accepted audiences', () => {
     fireEvent.change(input, { target: { value: 'https://api.exa' } });
     fireEvent.blur(input);
 
-    expect(latest.config?.audiences).toEqual([]);
+    expect(readAudiences(latest.config)).toEqual([]);
     expect(input).toHaveValue('https://api.exa');
   });
 
@@ -358,7 +369,7 @@ describe('Caller Context accepted audiences', () => {
     const savedAudiences: unknown[] = [];
     await openEditor({
       initial: jwtConfig(),
-      onSave: config => savedAudiences.push(config.audiences),
+      onSave: config => savedAudiences.push(readAudiences(config)),
     });
     const input = screen.getByPlaceholderText('e.g. https://api.example.com');
 
@@ -379,7 +390,7 @@ describe('Caller Context accepted audiences', () => {
 
     expect(notPrevented).toBe(true);
     expect(save).not.toHaveBeenCalled();
-    expect(latest.config?.audiences).toEqual([]);
+    expect(readAudiences(latest.config)).toEqual([]);
   });
 
   it('does not add an empty or whitespace-only audience on blur', async () => {
@@ -389,7 +400,7 @@ describe('Caller Context accepted audiences', () => {
     fireEvent.change(input, { target: { value: '   ' } });
     fireEvent.blur(input);
 
-    expect(latest.config?.audiences).toEqual([]);
+    expect(readAudiences(latest.config)).toEqual([]);
     expect(screen.getByText(/No audience configured/)).toBeInTheDocument();
   });
 
@@ -402,7 +413,7 @@ describe('Caller Context accepted audiences', () => {
     fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
     fireEvent.blur(input);
 
-    expect(latest.config?.audiences).toEqual(['https://api.example.com']);
+    expect(readAudiences(latest.config)).toEqual(['https://api.example.com']);
   });
 
   it('does not add an audience while authorization server discovery is on', async () => {
@@ -412,7 +423,7 @@ describe('Caller Context accepted audiences', () => {
     fireEvent.change(input, { target: { value: 'https://api.example.com' } });
     fireEvent.blur(input);
 
-    expect(latest.config?.audiences).toEqual([]);
+    expect(readAudiences(latest.config)).toEqual([]);
   });
 });
 
