@@ -326,7 +326,8 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
+at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
@@ -341,10 +342,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
   rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target) or `transit_caller` (a Transit Point's
+  stream cap on the way to a fabric target) or `transit_point_caller` (a Transit Point's
   [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)). `retry_after_ms`
   is the wait the caller is given, when there is one; the surface and per-caller limits also send
-  it as `Retry-After` in whole seconds. A `transit_caller` record also names the Transit Point
+  it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
   (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
   a request with no identified caller.
 - `request_rejected`: the gateway refused the request before or while forwarding it.

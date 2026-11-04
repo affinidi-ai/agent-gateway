@@ -89,7 +89,7 @@ pub fn rate_limited(
 /// A Transit Point refused a request with 429 because the caller reached the
 /// per-caller limit. `caller_hash` is the identity hash of the caller the
 /// Transit Point identified, absent for a request with no identified caller.
-pub fn transit_caller_rate_limited(
+pub fn transit_point_caller_rate_limited(
     facts: &RequestFacts<'_>,
     transit_point: &str,
     caller_hash: Option<&str>,
@@ -97,7 +97,7 @@ pub fn transit_caller_rate_limited(
 ) {
     emit("rate_limited", || {
         let mut event = facts.record(DelegationAuditAction::RateLimited {
-            scope: RateLimitScope::TransitCaller,
+            scope: RateLimitScope::TransitPointCaller,
             retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
             transit_point: Some(transit_point.to_string()),
         });
@@ -438,16 +438,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transit_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
+    async fn a_transit_point_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
         use crate::audit::events::RateLimitScope;
         let ((), events) = crate::audit::producer::capture(async {
-            transit_caller_rate_limited(
+            transit_point_caller_rate_limited(
                 &facts(),
                 "partner",
                 Some("caller-hash"),
                 Some(std::time::Duration::from_millis(2500)),
             );
-            transit_caller_rate_limited(&facts(), "partner", None, None);
+            transit_point_caller_rate_limited(&facts(), "partner", None, None);
         })
         .await;
 
@@ -458,7 +458,7 @@ mod tests {
                 retry_after_ms,
                 transit_point,
             } => {
-                assert_eq!(*scope, RateLimitScope::TransitCaller);
+                assert_eq!(*scope, RateLimitScope::TransitPointCaller);
                 assert_eq!(*retry_after_ms, Some(2500));
                 assert_eq!(transit_point.as_deref(), Some("partner"));
             }
@@ -471,6 +471,17 @@ mod tests {
             Some("caller-hash")
         );
         assert_eq!(events[1].user_identity_hash, None, "a request with no identified caller names none");
+
+        let recorded = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(recorded["event"]["rate_limited"]["scope"], "transit_point_caller", "{recorded}");
+        let read_back: crate::delegation_vault::audit::DelegationAuditEvent = serde_json::from_value(recorded).unwrap();
+        assert_eq!(
+            read_back
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash"),
+            "the audit log reads the record back with its caller"
+        );
     }
 
     fn rejected(

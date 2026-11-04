@@ -147,11 +147,12 @@ pub(crate) enum OutboundPipelineError {
     #[error("Target authentication credentials unavailable")]
     TargetAuthUnavailable { mcp_request_id: Option<serde_json::Value> },
 
-    /// The request's surface variant sets another policy, response policy or
-    /// MCP tool gating on its Transit Point than the base surface does; those
-    /// are enforced only as the base surface configures them. Why is logged,
-    /// never shown to the caller. `mcp_request_id` is set, to the id the
-    /// JSON-RPC error answers, when the Transit Point speaks MCP.
+    /// The request's surface variant sets another policy, response policy,
+    /// MCP tool gating or per-caller rate limit on its Transit Point than the
+    /// base surface does; those are enforced only as the base surface
+    /// configures them. Why is logged, never shown to the caller.
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
     #[error("This Transit Point variant is unavailable")]
     TransitVariantPolicyChanged { mcp_request_id: Option<serde_json::Value> },
 
@@ -853,8 +854,9 @@ impl OutboundPipelineContext {
 }
 
 /// Whether `resolved`, a variant's Transit Point, has another policy, response
-/// policy or MCP tool gating than `base`, the base surface's Transit Point of the
-/// same alias. Those are compiled from the base surface's Transit Points only.
+/// policy, MCP tool gating or per-caller rate limit than `base`, the base
+/// surface's Transit Point of the same alias. Those are compiled from the base
+/// surface's Transit Points only.
 fn changes_enforced_transit_policy(
     base: &TransitPoint,
     resolved: &TransitPoint,
@@ -872,6 +874,10 @@ fn changes_enforced_transit_policy(
             .response_policy
             .is_some()
             && serialized(&base.response_policy) != serialized(&resolved.response_policy))
+        || (resolved
+            .per_caller_rate_limit
+            .is_some()
+            && base.per_caller_rate_limit != resolved.per_caller_rate_limit)
 }
 
 // ── Virtual channel resolution ──────────────────────────────────────────────
@@ -1207,10 +1213,10 @@ async fn outbound_proxy_handler_in_request_scope(
 // Each step is an independent `async fn`. Steps that are not yet
 // implemented are stubs returning `Ok(())`.
 
-/// Refuse a request whose surface variant sets another policy, response policy
-/// or MCP tool gating on its Transit Point than the base surface does, before
-/// anything is sent to the target: those are enforced only as the base surface
-/// configures them.
+/// Refuse a request whose surface variant sets another policy, response policy,
+/// MCP tool gating or per-caller rate limit on its Transit Point than the base
+/// surface does, before anything is sent to the target: those are enforced only
+/// as the base surface configures them.
 fn step_refuse_variant_changing_enforced_policy(ctx: &OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
     if !ctx.variant_changes_enforced_policy {
         return Ok(());
@@ -1220,7 +1226,8 @@ fn step_refuse_variant_changing_enforced_policy(ctx: &OutboundPipelineContext) -
         transit_point = %ctx.virtual_channel.alias,
         variant = ?ctx.active_variant_alias,
         "Transit Point request refused: its surface variant changes the Transit Point's policy, response \
-         policy or MCP tool gating, which are enforced only as the base surface configures them"
+         policy, MCP tool gating or per-caller rate limit, which are enforced only as the base surface \
+         configures them"
     );
     Err(OutboundPipelineError::TransitVariantPolicyChanged {
         mcp_request_id: mcp_refusal_id(ctx),
@@ -2213,20 +2220,20 @@ async fn step_rate_limit(
         .virtual_channel
         .rate_limit
         .is_some();
-    let caller_rl = ctx
-        .virtual_channel
-        .per_caller_rate_limit
-        .is_some();
-    if !channel_rl && !vc_rl && !caller_rl {
-        return Ok(());
-    }
-
     let Some(pm) = state.policy_manager.as_ref() else {
-        // Rate limit configured but no policy manager — log and allow.
-        warn!(
-            request_id = %ctx.request_id,
-            "Outbound rate limit configured but SurfacePolicyManager not available"
-        );
+        if channel_rl
+            || vc_rl
+            || ctx
+                .virtual_channel
+                .per_caller_rate_limit
+                .is_some()
+        {
+            // Rate limit configured but no policy manager — log and allow.
+            warn!(
+                request_id = %ctx.request_id,
+                "Outbound rate limit configured but SurfacePolicyManager not available"
+            );
+        }
         return Ok(());
     };
 
@@ -2235,18 +2242,14 @@ async fn step_rate_limit(
         .config_id()
         .unwrap_or("unknown");
 
-    if caller_rl {
+    if let Some(limiter) = pm
+        .caller_rate_limiter(config_id, &ctx.virtual_channel.alias)
+        .await
+    {
         let caller = delegation_caller_hash(ctx);
-        if let Err(error) = pm
-            .check_caller_rate_limit(config_id, &ctx.virtual_channel.alias, caller.as_deref())
-            .await
-        {
-            let retry_after = match error {
-                crate::policies::RateLimitError::Exceeded { retry_after } => Some(retry_after),
-                crate::policies::RateLimitError::InvalidConfig(_) => None,
-            };
+        if let Err(retry_after) = limiter.check(caller.as_deref()) {
             debug!(request_id = %ctx.request_id, "Outbound rate limit exceeded (per caller)");
-            crate::audit::request_events::transit_caller_rate_limited(
+            crate::audit::request_events::transit_point_caller_rate_limited(
                 &crate::audit::request_events::RequestFacts {
                     surface_id: &ctx.surface.surface_id,
                     channel_name: &ctx.surface.name,
@@ -2258,10 +2261,10 @@ async fn step_rate_limit(
                 },
                 &ctx.virtual_channel.alias,
                 caller.as_deref(),
-                retry_after,
+                Some(retry_after),
             );
             return Err(OutboundPipelineError::CallerRateLimitExceeded {
-                retry_after: retry_after.unwrap_or_default(),
+                retry_after,
                 mcp_request_id: mcp_id_before_body(ctx),
             });
         }
@@ -10141,7 +10144,8 @@ mod tests {
         let base = point(json!({
             "mcp_tool_gating": gating,
             "policy": {"policy_definition_id": "base-policy"},
-            "response_policy": {"policy_definition_id": "base-response"}
+            "response_policy": {"policy_definition_id": "base-response"},
+            "per_caller_rate_limit": {"requests": 5, "window_secs": 60}
         }));
 
         for (case, variant, changes) in [
@@ -10158,12 +10162,29 @@ mod tests {
                 true,
             ),
             ("sets another response policy", json!({"response_policy": {"policy_definition_id": "other"}}), true),
+            (
+                "restates the per-caller rate limit",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60}}),
+                false,
+            ),
+            (
+                "sets another per-caller rate limit",
+                json!({"per_caller_rate_limit": {"requests": 50, "window_secs": 60}}),
+                true,
+            ),
         ] {
             assert_eq!(changes_enforced_transit_policy(&base, &point(variant)), changes, "{case}");
         }
         assert!(
             changes_enforced_transit_policy(&point(json!({})), &point(json!({"mcp_tool_gating": gating}))),
             "gating on a variant point whose base has none"
+        );
+        assert!(
+            changes_enforced_transit_policy(
+                &point(json!({})),
+                &point(json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60}}))
+            ),
+            "a per-caller rate limit on a variant point whose base has none"
         );
     }
 
@@ -10673,11 +10694,21 @@ mod tests {
         protocol: &str,
         requests: u32,
     ) -> (OutboundProxyState, OutboundPipelineContext) {
-        let surface = transit_surface(
-            json!([{ "alias": "partner", "target_endpoint": "https://partner.example/mcp", "protocol": protocol,
-                     "per_caller_rate_limit": { "requests": requests, "window_secs": 60 } }]),
-            json!([]),
-        );
+        rate_limited_context(
+            json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp", "protocol": protocol,
+                    "per_caller_rate_limit": { "requests": requests, "window_secs": 60 } }),
+        )
+        .await
+    }
+
+    async fn rate_limited_context(point: serde_json::Value) -> (OutboundProxyState, OutboundPipelineContext) {
+        rate_limited_variant_context(transit_surface(json!([point]), json!([])), None).await
+    }
+
+    async fn rate_limited_variant_context(
+        surface: crate::config::agent_surface::AgentSurface,
+        variant: Option<&str>,
+    ) -> (OutboundProxyState, OutboundPipelineContext) {
         let manager = crate::policies::SurfacePolicyManager::new();
         manager
             .update_channel_policy(&surface)
@@ -10685,7 +10716,7 @@ mod tests {
             .unwrap();
         let mut state = test_outbound_state();
         state.policy_manager = Some(Arc::new(manager));
-        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let (resolved, point) = resolved_transit_point(&surface, variant, "partner");
         (state, legacy_delegation_context(resolved, point))
     }
 
@@ -10749,14 +10780,40 @@ mod tests {
 
     #[tokio::test]
     async fn a_transit_point_without_a_per_caller_limit_is_not_limited_per_caller() {
-        let (state, mut ctx) = per_caller_limited_context("mcp", 1).await;
-        ctx.virtual_channel
-            .per_caller_rate_limit = None;
+        let (state, ctx) =
+            rate_limited_context(json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp",
+                                         "protocol": "mcp" }))
+            .await;
         for _ in 0..5 {
             step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_variant_point_that_omits_the_per_caller_limit_is_limited_by_the_surfaces() {
+        let surface = transit_surface(
+            json!([{ "alias": "partner", "target_endpoint": "https://partner.example/mcp", "protocol": "mcp",
+                     "per_caller_rate_limit": { "requests": 1, "window_secs": 60 } }]),
+            json!([{ "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true,
+                     "overrides": { "transit": { "points": [{ "alias": "partner",
+                         "target_endpoint": "https://partner-dev.example/mcp", "protocol": "mcp" }] } } }]),
+        );
+        let (state, ctx) = rate_limited_variant_context(surface, Some("dev")).await;
+        assert!(
+            ctx.virtual_channel
+                .per_caller_rate_limit
+                .is_none(),
+            "the variant's point leaves the limit out"
+        );
+        step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap();
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
     }
 
     #[tokio::test]
@@ -10811,13 +10868,23 @@ mod tests {
                 .as_deref(),
             Some("alice-hash")
         );
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some(
+                ctx.surface
+                    .surface_id
+                    .as_str()
+            )
+        );
         match &events[0].event {
             crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                 scope,
                 transit_point,
                 retry_after_ms,
             } => {
-                assert_eq!(*scope, crate::audit::events::RateLimitScope::TransitCaller);
+                assert_eq!(*scope, crate::audit::events::RateLimitScope::TransitPointCaller);
                 assert_eq!(transit_point.as_deref(), Some("partner"));
                 assert!(retry_after_ms.is_some());
             }

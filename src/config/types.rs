@@ -1250,7 +1250,7 @@ pub enum CredentialInjection {
 }
 
 /// Rate limit configuration for a channel
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     /// Maximum number of requests
     pub requests: u32,

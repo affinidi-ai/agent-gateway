@@ -727,11 +727,7 @@ impl SurfacePolicyManager {
                 "Configuring rate limiter for channel"
             );
 
-            let rl_config = crate::policies::RateLimitConfig {
-                requests: rate_limit_config.requests,
-                window_secs: rate_limit_config.window_secs,
-                burst: rate_limit_config.burst,
-            };
+            let rl_config = crate::policies::RateLimitConfig::from(rate_limit_config);
 
             let rate_limiter =
                 RateLimiter::new(rl_config).map_err(|e| format!("Failed to create rate limiter: {}", e))?;
@@ -775,11 +771,7 @@ impl SurfacePolicyManager {
                 let Some(rl) = tp.rate_limit.as_ref() else {
                     continue;
                 };
-                let rl_config = crate::policies::RateLimitConfig {
-                    requests: rl.requests,
-                    window_secs: rl.window_secs,
-                    burst: rl.burst,
-                };
+                let rl_config = crate::policies::RateLimitConfig::from(rl);
                 match RateLimiter::new(rl_config) {
                     Ok(rate_limiter) => {
                         let key = format!("{}{}", prefix, tp.alias);
@@ -815,11 +807,7 @@ impl SurfacePolicyManager {
                 else {
                     continue;
                 };
-                let limit = crate::policies::RateLimitConfig {
-                    requests: limit.requests,
-                    window_secs: limit.window_secs,
-                    burst: limit.burst,
-                };
+                let limit = crate::policies::RateLimitConfig::from(limit);
                 match CallerRateLimiter::new(&limit) {
                     Ok(limiter) => {
                         info!(
@@ -1150,25 +1138,19 @@ impl SurfacePolicyManager {
         Ok(())
     }
 
-    /// Check a Transit Point's per-caller rate limit for `caller`, the
-    /// identity hash of the caller the Transit Point identified, if any.
-    /// A Transit Point with no per-caller limit allows everything.
-    pub async fn check_caller_rate_limit(
+    /// The per-caller rate limiter of the base surface's Transit Point
+    /// `transit_alias`, if it sets one. A surface variant's point of the same
+    /// alias is limited by it too.
+    pub async fn caller_rate_limiter(
         &self,
         channel_id: &str,
         transit_alias: &str,
-        caller: Option<&str>,
-    ) -> Result<(), crate::policies::RateLimitError> {
-        let limiter = self
-            .caller_rate_limiters
+    ) -> Option<Arc<CallerRateLimiter>> {
+        self.caller_rate_limiters
             .read()
             .await
             .get(&format!("vc:{channel_id}:{transit_alias}"))
-            .cloned();
-        match limiter {
-            Some(limiter) => limiter.check(caller),
-            None => Ok(()),
-        }
+            .cloned()
     }
 
     /// Test-only boolean convenience over [`Self::evaluate_policy_decision`].
@@ -1645,25 +1627,27 @@ allow if {
             }))
             .unwrap()
         };
+        let check = |alias: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .caller_rate_limiter("tp-caller", alias)
+                    .await
+                    .map_or(Ok(()), |limiter| limiter.check(Some("alice")))
+            }
+        };
         manager
             .update_channel_policy(&with_limit(serde_json::json!({ "requests": 1, "window_secs": 60 })))
             .await
             .unwrap();
+        assert!(check("partner").await.is_ok());
         assert!(
-            manager
-                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            manager
-                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
+            check("partner")
                 .await
                 .is_err()
         );
         assert!(
-            manager
-                .check_caller_rate_limit("tp-caller", "other-point", Some("alice"))
+            check("other-point")
                 .await
                 .is_ok(),
             "a point with no limit allows everything"
@@ -1672,25 +1656,13 @@ allow if {
             .update_channel_policy(&with_limit(serde_json::json!({ "requests": 5, "window_secs": 60 })))
             .await
             .unwrap();
-        assert!(
-            manager
-                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
-                .await
-                .is_ok(),
-            "the saved limit is the one in force"
-        );
+        assert!(check("partner").await.is_ok(), "the saved limit is the one in force");
         manager
             .update_channel_policy(&with_limit(serde_json::Value::Null))
             .await
             .unwrap();
         for _ in 0..20 {
-            assert!(
-                manager
-                    .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
-                    .await
-                    .is_ok(),
-                "a limit that was removed no longer applies"
-            );
+            assert!(check("partner").await.is_ok(), "a limit that was removed no longer applies");
         }
     }
 

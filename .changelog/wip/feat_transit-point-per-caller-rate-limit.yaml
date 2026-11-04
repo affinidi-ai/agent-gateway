@@ -8,9 +8,11 @@ changes:
         to give each caller it identifies a rate limit of their own, so one caller cannot use up the
         allowance of the others. The caller is the identity hash that keys their delegated
         credentials. Requests with no identified caller share one bucket, the number of buckets is
-        bounded, and the limit applies beside the point's rate_limit. A refused request answers 429
+        bounded (a caller who has a bucket keeps it), and the limit applies beside the point's
+        rate_limit. A surface variant's Transit Point is limited by the surface's per-caller limit
+        and a variant that sets another is refused on save. A refused request answers 429
         with Retry-After, as a JSON-RPC error on an MCP Transit Point, and is recorded as a
-        rate_limited audit event with scope transit_caller, the Transit Point and the caller's
+        rate_limited audit event with scope transit_point_caller, the Transit Point and the caller's
         identity hash. The Surface Builder's Rate Limit panel on a Transit Point has the setting.
   changed: []
   fixed: []

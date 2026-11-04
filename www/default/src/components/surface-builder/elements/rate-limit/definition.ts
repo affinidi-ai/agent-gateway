@@ -3,6 +3,7 @@ import { registry } from '../registry';
 import type { NodeDefinition } from '../types';
 import { positiveIntError } from '../validators';
 import RateLimitPanel from './RateLimitPanel';
+import type { RateLimitPanelConfig } from './wire';
 import { DOCS_URL } from '../../../../config/docs';
 
 /**
@@ -19,8 +20,9 @@ export function rateLimitConfigToWire(c: any): Record<string, any> | undefined {
   };
 }
 
-const hasShared = (c: any): boolean => Boolean(c?.requests || c?.window_secs || c?.burst);
-const hasPerCaller = (c: any): boolean =>
+const hasShared = (c: RateLimitPanelConfig | undefined): boolean =>
+  Boolean(c?.requests || c?.window_secs || c?.burst);
+const hasPerCaller = (c: RateLimitPanelConfig | undefined): boolean =>
   Boolean(c?.caller_requests || c?.caller_window_secs || c?.caller_burst);
 
 export const rateLimitDefinition: NodeDefinition = {
@@ -82,13 +84,10 @@ export const rateLimitDefinition: NodeDefinition = {
     dropOnEdge: [Cap.RATE_LIMIT_TARGET],
   },
   incompleteReason: c => {
-    if (hasPerCaller(c) && !hasShared(c)) {
-      if (!c.caller_requests) return 'Per-caller request limit is required';
-      if (!c.caller_window_secs) return 'Per-caller time window is required';
-      return null;
+    if (hasShared(c) || !hasPerCaller(c)) {
+      if (!c.requests) return 'Request limit is required';
+      if (!c.window_secs) return 'Time window is required';
     }
-    if (!c.requests) return 'Request limit is required';
-    if (!c.window_secs) return 'Time window is required';
     if (hasPerCaller(c)) {
       if (!c.caller_requests) return 'Per-caller request limit is required';
       if (!c.caller_window_secs) return 'Per-caller time window is required';
@@ -112,6 +111,8 @@ export const rateLimitDefinition: NodeDefinition = {
         'Per-caller time window'
       );
       if (w) errs.push(w);
+      const b = positiveIntError('caller_burst', c.caller_burst, 'Per-caller burst');
+      if (b) errs.push(b);
     }
     return errs;
   },

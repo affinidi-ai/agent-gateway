@@ -967,6 +967,13 @@ fn identify_transit_points(
         if let Err(msg) = tp.validate_per_caller_rate_limit() {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
+        if let Some(limit) = &tp.per_caller_rate_limit
+            && let Err(error) = crate::policies::CallerRateLimiter::new(&limit.into())
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{place}transit.points[{idx}]: per_caller_rate_limit cannot be enforced: {error}"
+            )));
+        }
         if !seen.insert(tp.alias.clone()) {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{place}transit.points[{idx}]: duplicate alias '{}'. Each transit point alias must be unique within \
@@ -2340,9 +2347,10 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
     Ok(())
 }
 
-/// A variant's Transit Point is enforced with the MCP tool gating, policy and
-/// response policy of the surface's Transit Point of the same alias, so one that
-/// sets any of them to something else is refused rather than silently ignored.
+/// A variant's Transit Point is enforced with the MCP tool gating, policy,
+/// response policy and per-caller rate limit of the surface's Transit Point of
+/// the same alias, so one that sets any of them to something else is refused
+/// rather than silently ignored.
 fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<String> {
     let mut errors = Vec::new();
     for variant in &surface.variants {
@@ -2368,6 +2376,19 @@ fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<St
                 (
                     "response_policy",
                     changes_policy(point.response_policy.as_ref(), base.and_then(|base| base.response_policy.as_ref())),
+                ),
+                (
+                    "per_caller_rate_limit",
+                    point
+                        .per_caller_rate_limit
+                        .is_some()
+                        && point
+                            .per_caller_rate_limit
+                            .as_ref()
+                            != base.and_then(|base| {
+                                base.per_caller_rate_limit
+                                    .as_ref()
+                            }),
                 ),
             ];
             for (field, changed) in changed {
@@ -6477,6 +6498,21 @@ mod validation_tests {
             ("no requests", serde_json::json!({ "requests": 0, "window_secs": 60 }), "requests"),
             ("no window", serde_json::json!({ "requests": 5, "window_secs": 0 }), "window_secs"),
             ("a zero burst", serde_json::json!({ "requests": 5, "window_secs": 60, "burst": 0 }), "burst"),
+            (
+                "more requests than the window can count",
+                serde_json::json!({ "requests": 4_000_000_000_u32, "window_secs": 1 }),
+                "cannot be enforced",
+            ),
+            (
+                "a window too long to count",
+                serde_json::json!({ "requests": 1, "window_secs": 20_000_000_000_u64 }),
+                "cannot be enforced",
+            ),
+            (
+                "a burst too long to refill",
+                serde_json::json!({ "requests": 1, "window_secs": 1_000_000_000_u64, "burst": 100 }),
+                "cannot be enforced",
+            ),
         ] {
             let mut on_surface =
                 surface_with_transit_points(serde_json::json!([point(limit.clone())]), serde_json::json!([]));
@@ -9213,7 +9249,8 @@ mod tests {
                 "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
                 "policy": { "policy_definition_id": "partner-policy" },
                 "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
-                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] },
+                "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
             }] },
             "variants": [{ "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true,
                 "overrides": { "transit": { "points": points } } }]
@@ -9242,7 +9279,8 @@ mod tests {
         let restated = variant_point(serde_json::json!({
             "policy": { "policy_definition_id": "partner-policy" },
             "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
-                "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+                "action": { "effect": "deny", "patterns": ["^admin_"] } }] },
+            "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
         }));
         let omitted = variant_point(serde_json::json!({}));
 
@@ -9268,6 +9306,17 @@ mod tests {
             (
                 "response_policy",
                 variant_point(serde_json::json!({ "response_policy": { "policy_definition_id": "dev-response" } })),
+            ),
+            (
+                "per_caller_rate_limit",
+                variant_point(serde_json::json!({ "per_caller_rate_limit": { "requests": 50, "window_secs": 60 } })),
+            ),
+            (
+                "per_caller_rate_limit",
+                serde_json::json!({
+                    "alias": "dev-only", "target_endpoint": "https://dev-only.example.com/mcp", "protocol": "mcp",
+                    "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
+                }),
             ),
             (
                 "policy",

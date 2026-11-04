@@ -1663,9 +1663,8 @@ impl TransitPoint {
     #[allow(dead_code)]
     pub const ALIAS_PATTERN: &'static str = r"^[a-z][a-z0-9-]{0,62}$";
 
-    /// Validate that the alias is non-empty and matches `ALIAS_PATTERN`.
-    /// Returns the offending alias text in the error so the caller can
-    /// echo it back to the user verbatim.
+    /// Refuse a per-caller rate limit with `requests`, `window_secs` or
+    /// `burst` of 0.
     pub fn validate_per_caller_rate_limit(&self) -> Result<(), String> {
         let Some(limit) = &self.per_caller_rate_limit else {
             return Ok(());
@@ -1682,6 +1681,9 @@ impl TransitPoint {
         Ok(())
     }
 
+    /// Validate that the alias is non-empty and matches `ALIAS_PATTERN`.
+    /// Returns the offending alias text in the error so the caller can
+    /// echo it back to the user verbatim.
     pub fn validate_alias(alias: &str) -> Result<(), String> {
         if alias.is_empty() {
             return Err("alias is required".to_string());

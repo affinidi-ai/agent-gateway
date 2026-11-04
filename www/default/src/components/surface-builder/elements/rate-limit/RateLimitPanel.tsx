@@ -80,18 +80,26 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
       </div>
       {onTransitPoint ? (
         <div className="config-section" data-testid="per-caller-rate-limit">
-          <label>Per caller (optional)</label>
-          <Form.Text className="text-muted d-block mb-2" style={{ fontSize: '10px' }}>
-            Each caller this Transit Point identifies gets a limit of their own, so one caller
-            cannot use up the allowance of the others. Requests with no identified caller share one
-            limit. It applies beside the limit above, and the stricter of the two decides. Leave
-            empty for no per-caller limit. Counted on each gateway node.
-          </Form.Text>
+          <div className="d-flex align-items-center gap-1">
+            <label>Per caller (optional)</label>
+            <FieldHelp testId="field-help-rate-limit-per-caller" ariaLabel="About Per caller">
+              <p>
+                Each caller this Transit Point identifies gets a limit of their own, so one caller
+                cannot use up the allowance of the others. Requests with no identified caller share
+                one limit.
+              </p>
+              <p>
+                It applies beside the limit above, and the stricter of the two decides. Leave empty
+                for no per-caller limit. Counted on each gateway node.
+              </p>
+            </FieldHelp>
+          </div>
           <Form.Group className="mb-2">
             <Form.Label className="small text-muted mb-1">
               Max requests per caller per window
             </Form.Label>
             <Form.Control
+              data-testid="rate-limit-caller-requests-input"
               size="sm"
               type="number"
               min="1"
@@ -102,6 +110,7 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
           <Form.Group className="mb-2">
             <Form.Label className="small text-muted mb-1">Per-caller window (seconds)</Form.Label>
             <Form.Control
+              data-testid="rate-limit-caller-window-secs-input"
               size="sm"
               type="number"
               min="1"
@@ -112,9 +121,10 @@ const RateLimitPanel: React.FC<ConfigPanelProps> = ({ node, config, updateField,
           <Form.Group className="mb-2">
             <Form.Label className="small text-muted mb-1">Per-caller burst (optional)</Form.Label>
             <Form.Control
+              data-testid="rate-limit-caller-burst-input"
               size="sm"
               type="number"
-              min="0"
+              min="1"
               value={config.caller_burst ?? ''}
               onChange={e => updateField('caller_burst', e.target.value)}
             />
