@@ -53,6 +53,47 @@ pub struct JwtVerificationStrategyRequest {
     pub principal_claim: Option<String>,
 }
 
+/// A `Warning` header for each other strategy of `saved`'s tenant scope that
+/// names callers of the same issuer by a different claim. An issuer names
+/// callers by one claim in a tenant, so token exchange and `jwt-bearer`
+/// redemption refuse that issuer's tokens until one of them is deleted.
+async fn mixed_claim_warnings(
+    store: &dyn JwtVerificationStrategyStorage,
+    saved: &JwtVerificationStrategy,
+) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    let Ok(claim) = saved.principal_claim_name() else {
+        return headers;
+    };
+    let Ok(strategies) = store.list().await else {
+        return headers;
+    };
+    for other in strategies
+        .iter()
+        .filter(|other| {
+            other.id != saved.id && other.tenant_id == saved.tenant_id && other.expected_issuer == saved.expected_issuer
+        })
+    {
+        let Ok(other_claim) = other.principal_claim_name() else {
+            continue;
+        };
+        if other_claim == claim {
+            continue;
+        }
+        let warning = format!(
+            "JWT verification strategy '{}' names callers of issuer '{}' by '{other_claim}', and this one by \
+             '{claim}': an issuer names callers by one claim in a tenant, so token exchange and jwt-bearer \
+             redemption refuse its tokens until one of the two is deleted",
+            other.id, saved.expected_issuer
+        );
+        warn!(strategy_id = %saved.id, other_strategy_id = %other.id, "{warning}");
+        if let Some(value) = crate::identity::handlers::surfaces::warning_header(&warning) {
+            headers.append(axum::http::header::WARNING, value);
+        }
+    }
+    headers
+}
+
 /// Error response body.
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -176,7 +217,8 @@ pub async fn create_strategy(
     match store.create(strategy).await {
         Ok(created) => {
             info!(id = %created.id, name = %created.name, "JWT verification strategy created");
-            (StatusCode::CREATED, Json(created)).into_response()
+            let warnings = mixed_claim_warnings(store.as_ref(), &created).await;
+            (StatusCode::CREATED, warnings, Json(created)).into_response()
         }
         Err(e) => {
             error!("Failed to create JWT verification strategy: {}", e);
@@ -373,7 +415,8 @@ pub async fn update_strategy(
     match store.update(updated).await {
         Ok(strategy) => {
             info!(id = %strategy.id, name = %strategy.name, "JWT verification strategy updated");
-            (StatusCode::OK, Json(strategy)).into_response()
+            let warnings = mixed_claim_warnings(store.as_ref(), &strategy).await;
+            (StatusCode::OK, warnings, Json(strategy)).into_response()
         }
         Err(e) => {
             error!("Failed to update JWT verification strategy {}: {}", id, e);
@@ -1062,6 +1105,75 @@ mod tests {
                 .get("principal_claim")
                 .is_none()
         );
+    }
+
+    /// A strategy that names callers of an issuer by a claim another strategy
+    /// of its tenant scope does not is saved with a warning, since STS then
+    /// refuses that issuer's tokens; one that agrees is not warned of.
+    #[tokio::test]
+    async fn a_second_claim_for_one_issuer_is_saved_with_a_warning() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let create = |claim: Option<&str>| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jwt-verification-strategies")
+                .header("content-type", "application/json")
+                .body(Body::from(strategy_body(claim).to_string()))
+                .unwrap()
+        };
+        let warnings = |response: &axum::response::Response| -> Vec<String> {
+            response
+                .headers()
+                .get_all(axum::http::header::WARNING)
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        let by_sub = router
+            .clone()
+            .oneshot(create(None))
+            .await
+            .unwrap();
+        assert_eq!(by_sub.status(), StatusCode::CREATED);
+        assert!(warnings(&by_sub).is_empty());
+        let by_sub_id = response_body(by_sub).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let by_oid = router
+            .clone()
+            .oneshot(create(Some("oid")))
+            .await
+            .unwrap();
+        assert_eq!(by_oid.status(), StatusCode::CREATED);
+        let found = warnings(&by_oid);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("299 - "), "{found:?}");
+        assert!(found[0].contains(&by_sub_id) && found[0].contains("one claim in a tenant"), "{found:?}");
+
+        let second_oid = router
+            .clone()
+            .oneshot(create(Some("oid")))
+            .await
+            .unwrap();
+        let found = warnings(&second_oid);
+        assert_eq!(found.len(), 1, "only the strategy naming sub disagrees: {found:?}");
+        assert!(found[0].contains(&by_sub_id), "{found:?}");
     }
 
     /// A strategy written to storage by hand skips the API's checks: naming

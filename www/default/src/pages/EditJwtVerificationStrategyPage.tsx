@@ -7,6 +7,8 @@ import { validateUrl } from '../utils/urlValidation';
 import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
+import { showToast } from '../utils/toaster';
+import { joinWarnings, parseWarningHeader } from '../utils/warningHeader';
 
 interface JwksSourceForm {
   type: 'remote' | 'static';
@@ -216,6 +218,10 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
         throw new Error(formatApiError(response.status, text, response.statusText));
       }
 
+      const warnings = parseWarningHeader(response.headers?.get('Warning'));
+      if (warnings.length > 0) {
+        showToast('warning', joinWarnings(warnings), { autoRemove: false });
+      }
       navigate('/settings?tab=strategies');
     } catch (e: any) {
       setError(e.message ?? 'Save failed');

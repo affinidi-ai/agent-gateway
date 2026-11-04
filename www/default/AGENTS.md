@@ -685,7 +685,8 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
 (`jwt-strategy-editor-principal-claim-input`), the strategy's `principal_claim`. A new strategy
 sends the trimmed value only when it is not blank, so a blank field means `sub`. On an existing
 strategy the field shows the stored claim, is disabled, and is left out of the update, since the
-gateway refuses a change to it.
+gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
+same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
 
 ## Credentials audit tab
 

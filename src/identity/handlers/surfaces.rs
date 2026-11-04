@@ -1127,7 +1127,7 @@ async fn save_warnings(
 }
 
 /// A `Warning` header (code 299) carrying `warning`.
-fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
+pub(crate) fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
     let quoted = warning
         .replace('\\', "\\\\")
         .replace('"', "\\\"");

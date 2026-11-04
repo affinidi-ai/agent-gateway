@@ -5,6 +5,9 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { PageTitleProvider } from '../../context/PageTitleContext';
 import EditJwtVerificationStrategyPage from '../EditJwtVerificationStrategyPage';
+import { showToast } from '../../utils/toaster';
+
+jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 jest.mock('../../api', () => ({
   apiClient: {
@@ -84,6 +87,28 @@ describe('EditJwtVerificationStrategyPage caller identity claim', () => {
 
     await screen.findByTestId('settings-page');
     expect(sentBody('POST').principal_claim).toBe('oid');
+  });
+
+  it("shows a save's warning, such as another claim for the same issuer", async () => {
+    (apiClient.fetch as jest.Mock).mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        statusText: 'Created',
+        headers: { get: () => '299 - "an issuer names callers by one claim in a tenant"' },
+        json: () => Promise.resolve(storedStrategy),
+        text: () => Promise.resolve(JSON.stringify(storedStrategy)),
+      })
+    );
+    renderPage('/jwt-verification-strategies/new');
+    fillNewStrategy('oid');
+    fireEvent.click(screen.getByTestId('jwt-strategy-editor-save-button'));
+
+    await screen.findByTestId('settings-page');
+    expect(showToast).toHaveBeenCalledWith(
+      'warning',
+      'an issuer names callers by one claim in a tenant',
+      expect.anything()
+    );
   });
 
   it('sends no claim for a new strategy whose field is blank', async () => {
