@@ -971,6 +971,7 @@ mod tests {
             claims: serde_json::json!({"email": "ada@example.com"}),
         };
         let carried = crate::delegation_vault::audit::AuditCallerContext {
+            principal: None,
             auth_method: "transit_token".to_string(),
             iss: None,
             aud: None,
