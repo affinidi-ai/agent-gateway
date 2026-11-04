@@ -457,8 +457,9 @@ impl AuthenticatedIdentity {
         }
     }
 
-    /// The caller's name as the credential states it: the JWT `sub`, the API
-    /// key name, the DID, or the mTLS principal.
+    /// The caller's name as the credential states it: the value of the JWT
+    /// strategy's principal claim (`sub` by default), the API key name, the
+    /// DID, or the mTLS principal.
     pub fn principal(&self) -> &str {
         match self {
             AuthenticatedIdentity::JwtBearer { subject, .. } => subject,
@@ -471,10 +472,12 @@ impl AuthenticatedIdentity {
     /// This caller's `user_identity_hash` on a surface of `tenant_id`: the
     /// [`caller_identity_hash`] of the method, the issuer (the JWT `iss`, the
     /// API Key Provider agent, a hash of the subject and key of the CA an mTLS
-    /// client certificate was verified against) and the principal. The
-    /// transit token, policy input and delegated credentials
-    /// key callers by it. `None` when the credential names no subject, such as
-    /// a JWT without a `sub`: such a caller has no delegated credentials.
+    /// client certificate was verified against) and the principal, with a JWT
+    /// strategy's principal claim when it is not `sub`
+    /// ([`jwt_caller_identity_hash`]). The transit token, policy input and
+    /// delegated credentials key callers by it. `None` when the credential names
+    /// no subject, such as a JWT without a string in its principal claim: such a
+    /// caller has no delegated credentials.
     pub fn principal_hash(
         &self,
         tenant_id: Option<&str>,
@@ -492,10 +495,10 @@ impl AuthenticatedIdentity {
                 let named = claims
                     .get(principal_claim.as_str())
                     .and_then(Value::as_str)?;
-                if named != subject {
+                if named != subject || subject.is_empty() {
                     return None;
                 }
-                ("jwt_bearer", issuer, subject.as_str())
+                return jwt_caller_identity_hash(issuer, tenant_id, subject, principal_claim);
             }
             AuthenticatedIdentity::ApiKey {
                 key_name,
@@ -553,6 +556,26 @@ pub fn caller_identity_hash(
 ) -> Option<String> {
     use sha2::{Digest, Sha256};
     let encoded = serde_json_canonicalizer::to_vec(&(method, issuer, tenant_id, subject)).ok()?;
+    Some(hex::encode(Sha256::digest(encoded)))
+}
+
+/// The identity hash of a JWT caller whose verification strategy names it by
+/// `principal_claim`: the [`caller_identity_hash`] for `sub`, and for any other
+/// claim the same array with the claim's name appended,
+/// `[method, issuer, tenant, subject, claim]`. So one value in two claims, such
+/// as a `sub` and another person's `preferred_username`, is two callers.
+pub fn jwt_caller_identity_hash(
+    issuer: &str,
+    tenant_id: Option<&str>,
+    subject: &str,
+    principal_claim: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM {
+        return caller_identity_hash("jwt_bearer", issuer, tenant_id, subject);
+    }
+    let encoded =
+        serde_json_canonicalizer::to_vec(&("jwt_bearer", issuer, tenant_id, subject, principal_claim)).ok()?;
     Some(hex::encode(Sha256::digest(encoded)))
 }
 
@@ -946,20 +969,19 @@ mod tests {
             by_oid
                 .principal_hash(Some("tenant-1"))
                 .as_deref(),
-            caller_identity_hash(
-                "jwt_bearer",
+            jwt_caller_identity_hash(
                 "https://login.example.com",
                 Some("tenant-1"),
-                "00000000-0000-0000-0000-0000000000aa"
+                "00000000-0000-0000-0000-0000000000aa",
+                "oid"
             )
             .as_deref()
         );
-        assert_eq!(
-            by_oid
-                .principal_hash(None)
-                .as_deref(),
-            Some("b35c6f7bd8d2ba63e7fcf70cc1275e4cd5760452021617db32372775e318dcad")
-        );
+        let oid_hash = by_oid
+            .principal_hash(None)
+            .unwrap();
+        assert_eq!(oid_hash, "37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f");
+        assert_eq!(crate::delegation_vault::release::connect_hint(&oid_hash), "bjXra_R6O-9aJ7DUY5xpnA");
         assert_ne!(
             by_oid.principal_hash(None),
             jwt_named_by("sub", claims()).principal_hash(None),
@@ -975,6 +997,26 @@ mod tests {
             by_oid.principal_hash(None),
             jwt_named_by("oid", other_app).principal_hash(None),
             "the same oid from another application is the same caller"
+        );
+    }
+
+    /// Two strategies for one issuer that name different claims can see one
+    /// value in both: one person's `sub` and another's `preferred_username`.
+    /// The claim's name keeps them two callers.
+    #[test]
+    fn one_value_in_two_claims_is_two_callers() {
+        let alice = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        let mallory = jwt_named_by(
+            "preferred_username",
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "m-1", "preferred_username": "alice" }),
+        );
+        assert_ne!(alice.principal_hash(Some("tenant-1")), mallory.principal_hash(Some("tenant-1")));
+        assert_eq!(
+            alice
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"),
+            "sub keeps the hash it always had"
         );
     }
 

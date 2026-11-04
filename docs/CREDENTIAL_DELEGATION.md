@@ -1153,7 +1153,12 @@ certificate identity therefore shares one set of delegated tokens.
 ### The caller's identity hash
 
 `user_identity_hash` is the lowercase hex SHA-256 of the JSON array
-`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces):
+`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces). For a
+`jwt_bearer` caller whose verification strategy names a `principal_claim` other than `sub`, the
+claim's name is appended: `[method, issuer, tenant, subject, claim]`. One value in two claims, such
+as one person's `sub` and another person's `preferred_username` under two strategies for the same
+issuer, is therefore two callers. A strategy that names `sub`, or no claim, keeps the four-element
+form and every hash it gave before.
 
 | Source authentication | `method` | `issuer` | `subject` |
 | --- | --- | --- | --- |
@@ -1188,23 +1193,27 @@ A system that runs the connect for a caller, such as the page that hosts the per
 and the authorization server's redirect, passes the caller's identity hash as the `principal`
 of a connect and of a grant removal, and reads it from a grant report. It computes the hash
 itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
-computed outside the gateway: take the token's `iss` and `sub`, and the surface's `tenant_id`
-(or `null`).
+computed outside the gateway: take the token's `iss`, the surface's `tenant_id` (or `null`),
+and the value of the strategy's `principal_claim` (`sub` by default), followed by the claim's
+name when it is not `sub`.
 
 The form is a compatibility surface. It is not changed without a documented migration, since
-a changed form orphans every stored grant. No pepper and no configuration setting is part of
-it: the same inputs always give the same hash, on every gateway. (The pepper derives the ids
+a changed form orphans every stored grant. No pepper is part of it, and the
+only setting that is, the strategy's `principal_claim`, is fixed when the strategy is created:
+the same inputs always give the same hash, on every gateway. (The pepper derives the ids
 grants are stored under, never the hash itself.) These values are held by
 tests, and a change to the form fails them:
 
-| `method` | `issuer` | `tenant` | `subject` | Identity hash |
-| --- | --- | --- | --- | --- |
-| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
-| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
-| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
-| `jwt_bearer`, with the strategy's `principal_claim` set to `oid` | `https://login.example.com` | `null` | the `oid` value `00000000-0000-0000-0000-0000000000aa` | `b35c6f7bd8d2ba63e7fcf70cc1275e4cd5760452021617db32372775e318dcad` |
-| `api_key` | `""` | `null` | `partner-key` | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
+| `method` | `issuer` | `tenant` | `subject` | `claim` | Identity hash |
+| --- | --- | --- | --- | --- | --- |
+| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | none (`sub`) | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | none (`sub`) | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | none (`sub`) | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
+| `jwt_bearer` | `https://login.example.com` | `null` | `00000000-0000-0000-0000-0000000000aa` | `oid` | `37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f` |
+| `api_key` | `""` | `null` | `partner-key` | none | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
 
+The fourth row is the hash of
+`["jwt_bearer","https://login.example.com",null,"00000000-0000-0000-0000-0000000000aa","oid"]`.
 The third row shows RFC 8785 escaping: the subject is written with `\"` for the quote, `\\` for the
 backslash, the character `é` as itself in UTF-8, and `\n` for the line feed.
 
@@ -1217,6 +1226,7 @@ written as base64url without padding (22 characters). It has the same compatibil
 | --- | --- |
 | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` | `WXYw1wqFnUD93SdLiPtFyA` |
 | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` | `YvFEO7T_9N80_y4j8sxMVA` |
+| `37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f` | `bjXra_R6O-9aJ7DUY5xpnA` |
 
 Delegated credentials stored by a release that keyed them by an earlier form of the identity
 hash are never looked up again, but their access and refresh tokens stay in the vault until

@@ -32,7 +32,8 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 
 A JWT verification strategy names the claim that identifies a caller with `principal_claim`
 (default `sub`; the API field may be left out). The claim's value is the caller's subject in the
-[identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash), so it decides which
+[identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash), and a claim other than `sub`
+adds its name to the hash, so it decides which
 delegated credentials a caller uses, `input.source_auth.subject`, and the caller key of
 per-caller limits. Every method that points at the strategy, on an Access Point or a Transit
 Point, identifies callers by the same claim.
@@ -58,8 +59,10 @@ Point, identifies callers by the same claim.
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
   use another claim, create a new strategy, point the surface at it, and have callers connect
   again.
-- Two strategies for the same issuer that name different claims identify the same person as
-  different callers, each with credentials of their own.
+- Two strategies for the same issuer that name different claims never share a caller: the
+  claim's name is part of the hash, so the same person through each is a different caller, with
+  credentials of their own, and one person's value in one claim never stands for another
+  person's value in the other. A surface save warns when its methods do this.
 - Token exchange ([STS](STS.md)) keeps reading `sub`, as RFC 8693 does: it passes the subject
   token's `sub` on and does not key credentials by the identity hash.
 
@@ -622,7 +625,7 @@ limit or resolves a credential:
 | Method | On a Transit Point |
 | --- | --- |
 | `api_key`, `api_key_provider` | Read from an HTTP header only |
-| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer and subject, so a caller verified through another strategy that names the same `expected_issuer`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 

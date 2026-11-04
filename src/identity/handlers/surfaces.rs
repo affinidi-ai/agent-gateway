@@ -1262,7 +1262,7 @@ fn jwt_bearer_methods(
 async fn jwt_strategy_issuers(
     state: &IdentityApiState,
     surface: &AgentSurface,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, StrategyCallerNaming> {
     let mut issuers = std::collections::HashMap::new();
     let Some(store) = state
         .jwt_verification_strategy_store
@@ -1282,11 +1282,29 @@ async fn jwt_strategy_issuers(
                 continue;
             }
             if let Ok(Some(strategy)) = store.get(id).await {
-                issuers.insert(id.clone(), strategy.expected_issuer);
+                let principal_claim = strategy
+                    .principal_claim
+                    .clone()
+                    .unwrap_or_else(|| crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string());
+                issuers.insert(
+                    id.clone(),
+                    StrategyCallerNaming {
+                        issuer: strategy.expected_issuer,
+                        principal_claim,
+                    },
+                );
             }
         }
     }
     issuers
+}
+
+/// The issuer a JWT verification strategy accepts and the claim it names
+/// callers by: together they decide which callers of two strategies are one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrategyCallerNaming {
+    issuer: String,
+    principal_claim: String,
 }
 
 /// Each Transit Point, on the surface or in an enabled variant, whose
@@ -1297,7 +1315,7 @@ async fn jwt_strategy_issuers(
 /// delegated credentials.
 fn shared_issuer_warnings(
     surface: &AgentSurface,
-    issuers: &std::collections::HashMap<String, String>,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     for (variant, view) in surface_views(surface) {
@@ -1319,20 +1337,37 @@ fn shared_issuer_warnings(
             let strategy = config
                 .jwt_verification_strategy_id
                 .as_str();
-            let Some(issuer) = issuers.get(strategy) else {
+            let Some(naming) = issuers.get(strategy) else {
                 continue;
             };
-            for other in accepted
+            let issuer = &naming.issuer;
+            for (other, other_naming) in accepted
                 .iter()
-                .filter(|other| **other != strategy && issuers.get(**other) == Some(issuer))
+                .filter(|other| **other != strategy)
+                .filter_map(|other| {
+                    issuers
+                        .get(*other)
+                        .filter(|other_naming| other_naming.issuer == *issuer)
+                        .map(|other_naming| (other, other_naming))
+                })
             {
                 let name = transit_point_name(surface, variant.as_deref(), alias);
-                let warning = format!(
-                    "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
-                     strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
-                     with the same subject through either is one caller, with the same delegated credentials; use \
-                     one strategy per issuer"
-                );
+                let warning = if other_naming.principal_claim == naming.principal_claim {
+                    format!(
+                        "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
+                         strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
+                         with the same subject through either is one caller, with the same delegated credentials; \
+                         use one strategy per issuer"
+                    )
+                } else {
+                    format!(
+                        "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
+                         strategy '{strategy}', and this surface accepts that issuer through '{other}' too, but they \
+                         name callers by different claims ('{}' and '{}'): the same person through either is two \
+                         callers, each with delegated credentials of their own; use one strategy per issuer",
+                        naming.principal_claim, other_naming.principal_claim
+                    )
+                };
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
@@ -1408,7 +1443,7 @@ fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
 /// Transit Point releases no delegated credential to Fabric callers.
 fn fabric_caller_delegation_warnings(
     surface: &AgentSurface,
-    issuers: &std::collections::HashMap<String, String>,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     for (variant, view) in surface_views(surface) {
@@ -1434,7 +1469,12 @@ fn fabric_caller_delegation_warnings(
                     .find(|strategy| {
                         issuers
                             .get(*strategy)
-                            .is_none_or(|issuer| issuer.trim().is_empty())
+                            .is_none_or(|naming| {
+                                naming
+                                    .issuer
+                                    .trim()
+                                    .is_empty()
+                            })
                     })
                     .map(|strategy| {
                         format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read")
@@ -5549,9 +5589,9 @@ mod validation_tests {
             .unwrap()
         };
         let issuers = std::collections::HashMap::from([
-            ("workforce".to_string(), "https://login.example".to_string()),
-            ("partner-keys".to_string(), "https://login.example".to_string()),
-            ("own-issuer".to_string(), "https://crm.example".to_string()),
+            ("workforce".to_string(), naming("https://login.example", "sub")),
+            ("partner-keys".to_string(), naming("https://login.example", "sub")),
+            ("own-issuer".to_string(), naming("https://crm.example", "sub")),
         ]);
         let warning = |name: &str| {
             format!(
@@ -5572,6 +5612,31 @@ mod validation_tests {
             .unwrap()
             .points = vec![serde_json::from_value(point("partner-keys")).unwrap()];
         assert_eq!(shared_issuer_warnings(&inherited, &issuers), vec![warning("'crm'")]);
+
+        let by_other_claims = std::collections::HashMap::from([
+            ("workforce".to_string(), naming("https://login.example", "sub")),
+            ("partner-keys".to_string(), naming("https://login.example", "oid")),
+        ]);
+        assert_eq!(
+            shared_issuer_warnings(&inherited, &by_other_claims),
+            vec![
+                "Transit Point 'crm' accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategy 'partner-keys', and this surface accepts that issuer through 'workforce' too, but they \
+                 name callers by different claims ('oid' and 'sub'): the same person through either is two \
+                 callers, each with delegated credentials of their own; use one strategy per issuer"
+                    .to_string()
+            ]
+        );
+    }
+
+    fn naming(
+        issuer: &str,
+        principal_claim: &str,
+    ) -> StrategyCallerNaming {
+        StrategyCallerNaming {
+            issuer: issuer.to_string(),
+            principal_claim: principal_claim.to_string(),
+        }
     }
 
     /// A Transit Point that releases delegated credentials to Fabric callers
@@ -6262,8 +6327,8 @@ mod validation_tests {
     #[test]
     fn a_transit_point_that_opts_fabric_callers_in_is_warned_of_where_the_surface_cannot_tell_users_apart() {
         let issuers = std::collections::HashMap::from([
-            ("idp".to_string(), "https://idp.example".to_string()),
-            ("blank".to_string(), String::new()),
+            ("idp".to_string(), naming("https://idp.example", "sub")),
+            ("blank".to_string(), naming("", "sub")),
         ]);
         let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
         let mtls = serde_json::json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["cert"] },

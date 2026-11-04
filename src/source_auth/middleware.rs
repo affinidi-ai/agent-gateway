@@ -1747,11 +1747,11 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             identity
                 .principal_hash(Some("tenant-1"))
                 .as_deref(),
-            crate::source_auth::models::caller_identity_hash(
-                "jwt_bearer",
+            crate::source_auth::models::jwt_caller_identity_hash(
                 "https://issuer.example.com",
                 Some("tenant-1"),
-                "00000000-0000-0000-0000-0000000000aa"
+                "00000000-0000-0000-0000-0000000000aa",
+                "oid"
             )
             .as_deref()
         );
