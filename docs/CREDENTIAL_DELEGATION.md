@@ -811,8 +811,9 @@ path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent ca
 Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
 `forbidden`. A `target.auth` or Transit Point `target_auth` credential that is withheld or
 cannot be obtained is recorded in the VP Audit Log as a `request_rejected` record with reason
-`target_auth_failed` (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)); a
-request refused for leaving the Target base path is logged as a warning only. An
+`target_auth_failed` (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)), and
+so is a request refused for leaving the Target base path, with outcome `rejected` whatever the
+`fallback`. An
 `a2a-proxy://` Target sends its A2A proxy's Direct Line credential rather than `target.auth`:
 that credential follows `target_source_auth` (withheld with a warning, the request goes on
 without it and no audit record is written), on the direct path and Fabric receive alike, and
@@ -1068,7 +1069,8 @@ grant.
 The Target credential is sent only to URLs under the Target endpoint, and a Target's redirect is
 returned, never followed. A request whose path climbs out, such as `{route}/%2e%2e/admin` against
 `https://api.example.com/base`, is refused with 502 and nothing is forwarded, whatever the
-`fallback`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
+`fallback`, and recorded in the VP Audit Log as a `target_auth_failed` refusal with outcome
+`rejected`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
 tool calls; the rules and each path's answer are in
 [Target Credential Scope](PROTOCOLS.md#target-credential-scope).
 

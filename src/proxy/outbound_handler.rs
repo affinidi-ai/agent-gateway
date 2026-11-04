@@ -1432,12 +1432,7 @@ fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundP
                 "Refusing a Transit Point call that would pass the Fabric hop limit"
             );
             crate::audit::request_events::request_rejected(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: false,
-                },
+                &transit_audit_facts(ctx),
                 crate::audit::request_events::RejectionStage::Forward,
                 crate::audit::request_events::RejectionReason::FabricChainTooLong,
                 refusal.status_code().as_u16(),
@@ -1648,12 +1643,7 @@ async fn authenticate_transit_caller(
                 "Transit Point caller authentication failed"
             );
             crate::audit::request_events::auth_failed(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: false,
-                },
+                &transit_audit_facts(ctx),
                 crate::audit::request_events::source_auth_scheme(&config),
                 crate::audit::request_events::source_auth_reason(&error),
                 true,
@@ -2377,12 +2367,7 @@ async fn step_extract_protocol_context_with_versions(
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &crate::audit::request_events::RequestFacts {
-                surface_id: &ctx.surface.surface_id,
-                channel_name: &ctx.surface.name,
-                trace_id: Some(&ctx.request_id),
-                via_fabric: false,
-            },
+            &transit_audit_facts(ctx),
             None,
         )
         .await
@@ -2631,9 +2616,7 @@ async fn transit_request_headers(
     let mut headers = HeaderMap::new();
     for (name, value) in &ctx.original_headers {
         if should_forward_outbound_request_header(name.as_str(), mapping)
-            && !credential_headers
-                .iter()
-                .any(|credential| crate::proxy::handler::is_target_auth_header(name.as_str(), Some(credential)))
+            && !crate::proxy::handler::is_credential_header(name.as_str(), &credential_headers)
         {
             headers.append(name.clone(), value.clone());
         }
@@ -2717,12 +2700,7 @@ async fn transit_target_auth_header(
         Err(error) => {
             warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
             crate::proxy::handler::record_target_auth_failure(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: false,
-                },
+                &transit_audit_facts(ctx),
                 Some(&ctx.virtual_channel.alias),
                 target_auth,
                 &error,
@@ -2732,6 +2710,15 @@ async fn transit_target_auth_header(
             }
             Ok(None)
         }
+    }
+}
+
+fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_events::RequestFacts<'_> {
+    crate::audit::request_events::RequestFacts {
+        surface_id: &ctx.surface.surface_id,
+        channel_name: &ctx.surface.name,
+        trace_id: Some(&ctx.request_id),
+        via_fabric: false,
     }
 }
 
@@ -4891,12 +4878,7 @@ fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
          partner - refusing the request"
     );
     crate::audit::request_events::request_rejected(
-        &crate::audit::request_events::RequestFacts {
-            surface_id: &ctx.surface.surface_id,
-            channel_name: &ctx.surface.name,
-            trace_id: Some(&ctx.request_id),
-            via_fabric: false,
-        },
+        &transit_audit_facts(ctx),
         crate::audit::request_events::RejectionStage::Admission,
         crate::audit::request_events::RejectionReason::ConsentNotAvailableForPartners,
         refusal.status_code().as_u16(),
@@ -5680,13 +5662,18 @@ async fn step_forward_request_fabric(
     } else {
         format!("/{}", remainder)
     };
-    if ctx
+    if let Some(target_auth) = ctx
         .virtual_channel
         .target_auth
-        .is_some()
+        .as_ref()
         && !crate::proxy::paths::appended_path_stays_below_base(&path)
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
+        crate::proxy::handler::record_target_base_refusal(
+            &transit_audit_facts(ctx),
+            Some(&ctx.virtual_channel.alias),
+            target_auth,
+        );
         return Err(target_auth_unavailable(ctx));
     }
 
@@ -5851,6 +5838,17 @@ async fn step_forward_request_http(
         )
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
+        if let Some(target_auth) = ctx
+            .virtual_channel
+            .target_auth
+            .as_ref()
+        {
+            crate::proxy::handler::record_target_base_refusal(
+                &transit_audit_facts(ctx),
+                Some(&ctx.virtual_channel.alias),
+                target_auth,
+            );
+        }
         return Err(target_auth_unavailable(ctx));
     }
 
@@ -19906,6 +19904,69 @@ mod tests {
                 )],
                 "{fallback}"
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_request_outside_its_base_path_is_recorded_as_rejected_on_either_leg_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (fallback, endpoint) in [
+            ("reject", "http://127.0.0.1:9/base"),
+            ("passthrough", "http://127.0.0.1:9/base"),
+            ("reject", "fabric://peer-gateway/partner"),
+            ("passthrough", "fabric://peer-gateway/partner"),
+        ] {
+            let mut ctx = credential_header_case(
+                &state,
+                None,
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_endpoint = endpoint.to_string();
+            ctx.virtual_channel
+                .target_auth = Some(
+                serde_json::from_value(json!({
+                    "method": {"static_secret": {"secret_id": "target-key", "header_name": "X-Vendor-Key"}},
+                    "fallback": fallback
+                }))
+                .unwrap(),
+            );
+            let alias = ctx
+                .virtual_channel
+                .alias
+                .clone();
+            let (refused, events) = crate::audit::producer::capture(async {
+                if endpoint.starts_with("fabric://") {
+                    step_forward_request_fabric(&state, &mut ctx)
+                        .await
+                        .is_err()
+                } else {
+                    step_forward_request_http(&state, &mut ctx)
+                        .await
+                        .is_err()
+                }
+            })
+            .await;
+            assert!(refused, "{fallback} {endpoint}");
+            let records: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(records, vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
         }
     }
 

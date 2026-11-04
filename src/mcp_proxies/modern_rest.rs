@@ -448,7 +448,7 @@ fn request_headers(
                 .keys()
                 .any(|existing| {
                     existing != name
-                        && crate::proxy::handler::is_target_auth_header(name.as_str(), Some(existing.as_str()))
+                        && crate::config::target_auth_rules::same_header_name(name.as_str(), existing.as_str())
                 })
         {
             return Err(RestError::Arguments);

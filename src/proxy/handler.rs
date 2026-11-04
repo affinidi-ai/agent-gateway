@@ -103,17 +103,6 @@ fn should_forward_header(
     should_forward_ap_request_header_with_mapping(name, source_auth_headers, None, None)
 }
 
-/// Whether `name` is the header the gateway fills with the Target credential, compared without
-/// regard to case or to `_` against `-`, since some servers read both spellings as one. A
-/// caller's header of that name is never forwarded, whether or not the gateway then adds its own
-/// value.
-pub(crate) fn is_target_auth_header(
-    name: &str,
-    target_auth_header: Option<&str>,
-) -> bool {
-    target_auth_header.is_some_and(|credential| crate::config::target_auth_rules::same_header_name(name, credential))
-}
-
 fn should_forward_ap_request_header_with_mapping(
     name: &str,
     source_auth_headers: &[&str],
@@ -206,15 +195,17 @@ fn forwards_ap_caller_header(
     ) && !is_credential_header(name, credential_headers)
 }
 
-/// Whether `name` is one of `credential_headers`, compared without regard to case or to `_`
-/// against `-`.
+/// Whether `name` is one of `credential_headers`, the headers the gateway fills with a
+/// credential, compared without regard to case or to `_` against `-`, since some servers read
+/// both spellings as one. A caller's header of that name is never forwarded, whether or not the
+/// gateway then adds its own value.
 pub(crate) fn is_credential_header(
     name: &str,
-    credential_headers: &[&str],
+    credential_headers: &[impl AsRef<str>],
 ) -> bool {
     credential_headers
         .iter()
-        .any(|credential| crate::config::target_auth_rules::same_header_name(name, credential))
+        .any(|credential| crate::config::target_auth_rules::same_header_name(name, credential.as_ref()))
 }
 
 /// The headers that carry an Access Point Target's credentials: its `target_auth` header and
@@ -904,11 +895,38 @@ pub(crate) fn record_target_auth_failure(
         crate::config::TargetAuthFallback::Reject => TargetAuthOutcome::Rejected,
         crate::config::TargetAuthFallback::Passthrough => TargetAuthOutcome::Passthrough,
     };
+    record_target_auth_outcome(facts, transit_point, target_auth, outcome, error.oauth_error());
+}
+
+/// Records in the VP Audit Log that a request that would carry the Target credential of
+/// `target_auth` outside the Target's base path was refused. Nothing is forwarded, whatever the
+/// `fallback`.
+pub(crate) fn record_target_base_refusal(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+) {
+    record_target_auth_outcome(
+        facts,
+        transit_point,
+        target_auth,
+        crate::audit::request_events::TargetAuthOutcome::Rejected,
+        None,
+    );
+}
+
+fn record_target_auth_outcome(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+    outcome: crate::audit::request_events::TargetAuthOutcome,
+    oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
+) {
     let provider_id = match &target_auth.method {
         crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
         _ => None,
     };
-    crate::audit::request_events::target_auth_failed(facts, transit_point, provider_id, outcome, error.oauth_error());
+    crate::audit::request_events::target_auth_failed(facts, transit_point, provider_id, outcome, oauth_error);
 }
 
 /// A Target credential header the gateway attaches, and the issued service token behind it,
@@ -984,7 +1002,16 @@ pub(crate) struct SentServiceToken<'a> {
     pub surface_id: &'a str,
 }
 
-impl SentServiceToken<'_> {
+impl<'a> SentServiceToken<'a> {
+    /// The token sent to the Target of `surface_id`, if `issued` is one.
+    pub(crate) fn of(
+        vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+        issued: Option<&'a crate::delegation_vault::service_token::IssuedToken>,
+        surface_id: &'a str,
+    ) -> Option<Self> {
+        issued.map(|issued| Self { vault, issued, surface_id })
+    }
+
     /// [`forget_refused_target_token`] for the Target's answer `status` and `headers`.
     pub(crate) async fn forget_if_refused(
         &self,
@@ -6873,6 +6900,7 @@ async fn proxy_handler_with_mcp_runtime(
                 channel = channel_name,
                 "Refusing a request outside the Target base path: it would carry the Target credential"
             );
+            record_target_base_refusal(&audit_facts, None, target_auth);
             return Ok(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
@@ -7765,15 +7793,13 @@ async fn proxy_handler_with_mcp_runtime(
             .map_err(|_| {
                 create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare MCP proxy request")
             })?;
-        let sent_token = target_token
-            .as_ref()
-            .map(|issued| SentServiceToken {
-                vault: state
-                    .delegation_vault_store
-                    .as_deref(),
-                issued,
-                surface_id: &state.surface.surface_id,
-            });
+        let sent_token = SentServiceToken::of(
+            state
+                .delegation_vault_store
+                .as_deref(),
+            target_token.as_ref(),
+            &state.surface.surface_id,
+        );
         let execute = crate::mcp_proxies::handlers::handle_modern_surface_http_request(
             &proxy,
             &state.surface,
@@ -12815,6 +12841,12 @@ async fn handle_fabric_request(
         &target_credential_header_names(&state.surface),
     );
 
+    let fabric_send_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     if let Some(target_auth) = state.surface.target_auth() {
@@ -12823,6 +12855,7 @@ async fn handle_fabric_request(
                 channel = channel_name,
                 "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
             );
+            record_target_base_refusal(&fabric_send_facts, None, target_auth);
             connection_guard
                 .decrement()
                 .await;
@@ -12852,17 +12885,7 @@ async fn handle_fabric_request(
             Ok(None) => {}
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target auth for fabric forwarding");
-                record_target_auth_failure(
-                    &crate::audit::request_events::RequestFacts {
-                        surface_id: config_id,
-                        channel_name,
-                        trace_id: Some(&trace_id),
-                        via_fabric: false,
-                    },
-                    None,
-                    target_auth,
-                    &e,
-                );
+                record_target_auth_failure(&fabric_send_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
                         connection_guard
@@ -15979,6 +16002,12 @@ async fn handle_mcp_proxy_request(
         }
     }
 
+    let audit_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
     // Resolve target auth header if configured on the channel
     let target_credential = if let Some(target_auth) = state.surface.target_auth() {
         match resolve_target_credential(
@@ -15992,17 +16021,7 @@ async fn handle_mcp_proxy_request(
             Ok(credential) => credential,
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target auth for MCP proxy");
-                record_target_auth_failure(
-                    &crate::audit::request_events::RequestFacts {
-                        surface_id: config_id,
-                        channel_name,
-                        trace_id: Some(&trace_id),
-                        via_fabric: false,
-                    },
-                    None,
-                    target_auth,
-                    &e,
-                );
+                record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
                         return Err(create_error_response(
@@ -16026,15 +16045,13 @@ async fn handle_mcp_proxy_request(
 
     let (target_auth_header, issued) =
         target_credential.map_or((None, None), |credential| (Some(credential.header), credential.issued));
-    let sent_token = issued
-        .as_ref()
-        .map(|issued| SentServiceToken {
-            vault: state
-                .delegation_vault_store
-                .as_deref(),
-            issued,
-            surface_id: &state.surface.surface_id,
-        });
+    let sent_token = SentServiceToken::of(
+        state
+            .delegation_vault_store
+            .as_deref(),
+        issued.as_ref(),
+        &state.surface.surface_id,
+    );
     // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)
     match crate::mcp_proxies::handlers::handle_mcp_request_with_policies(
         &proxy,
@@ -16296,6 +16313,9 @@ async fn handle_mcp_proxy_request(
             Ok(axum::response::Json(response_json).into_response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            if let Some(target_auth) = state.surface.target_auth() {
+                record_target_base_refusal(&audit_facts, None, target_auth);
+            }
             Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
@@ -22221,11 +22241,12 @@ allow if {
 
     #[test]
     fn a_caller_header_named_like_the_credential_header_is_not_forwarded() {
-        use super::is_target_auth_header;
-        assert!(is_target_auth_header("X-Api-Key", Some("X-Api-Key")));
-        assert!(is_target_auth_header("x-api-key", Some("X-API-KEY")));
-        assert!(!is_target_auth_header("x-other", Some("X-Api-Key")));
-        assert!(!is_target_auth_header("x-api-key", None));
+        use super::is_credential_header;
+        assert!(is_credential_header("X-Api-Key", &["X-Api-Key"]));
+        assert!(is_credential_header("x-api-key", &["X-API-KEY"]));
+        assert!(is_credential_header("x-api-key", &["X-Other".to_string(), "X-Api-Key".to_string()]));
+        assert!(!is_credential_header("x-other", &["X-Api-Key"]));
+        assert!(!is_credential_header("x-api-key", None::<&str>.as_slice()));
     }
 
     #[test]
@@ -22376,12 +22397,12 @@ allow if {
     #[test]
     fn a_target_auth_header_matches_its_name_in_any_case_and_with_underscores() {
         for name in ["X-Api-Key", "x-api-key", "X_API_KEY", "x_api-key"] {
-            assert!(crate::proxy::handler::is_target_auth_header(name, Some("X-Api-Key")), "{name}");
+            assert!(crate::proxy::handler::is_credential_header(name, &["X-Api-Key"]), "{name}");
         }
         for name in ["X-Api-Keys", "X-Api", "XApiKey", "X.Api.Key"] {
-            assert!(!crate::proxy::handler::is_target_auth_header(name, Some("X-Api-Key")), "{name}");
+            assert!(!crate::proxy::handler::is_credential_header(name, &["X-Api-Key"]), "{name}");
         }
-        assert!(!crate::proxy::handler::is_target_auth_header("X-Api-Key", None));
+        assert!(!crate::proxy::handler::is_credential_header("X-Api-Key", None::<&str>.as_slice()));
     }
 
     #[test]

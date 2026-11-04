@@ -5793,6 +5793,7 @@ async fn process_forward_request_in_request_scope(
             surface.agent_card_location_path(),
         ) {
             channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
+            crate::proxy::handler::record_target_base_refusal(&audit_facts, None, target_auth);
             return target_auth_failed_result();
         }
         // Build a secrets store from the storage path passed via message context
@@ -6296,11 +6297,8 @@ async fn process_forward_request_in_request_scope(
             )).await,
         };
         let vault = get_delegation_vault_store();
-        let sent_token = target_token.as_ref().map(|issued| crate::proxy::handler::SentServiceToken {
-            vault: vault.as_deref(),
-            issued,
-            surface_id: &surface.surface_id,
-        });
+        let sent_token =
+            crate::proxy::handler::SentServiceToken::of(vault.as_deref(), target_token.as_ref(), &surface.surface_id);
         let execute = crate::mcp_proxies::handlers::handle_modern_surface_http_request(
             &proxy, &surface, request, prepared, &client,
             crate::mcp::request_validation::runtime_policy_for(
@@ -8610,6 +8608,16 @@ async fn handle_mcp_proxy_forward(
     // Get policy manager for circuit breaker support
     let policy_manager = GLOBAL_POLICY_MANAGER.get();
 
+    let audit_facts = crate::audit::request_events::RequestFacts {
+        surface_id: &surface.surface_id,
+        channel_name: &surface.name,
+        trace_id: message
+            .message_body
+            .get("otel_context")
+            .and_then(|context| context.get("trace_id"))
+            .and_then(serde_json::Value::as_str),
+        via_fabric: true,
+    };
     // Resolve target auth header if configured on the channel
     let vault = get_delegation_vault_store();
     let target_credential = if let Some(target_auth) = surface.target_auth() {
@@ -8649,21 +8657,7 @@ async fn handle_mcp_proxy_forward(
             Ok(credential) => credential,
             Err(e) => {
                 channel_error!(config_id, "Failed to resolve target auth for MCP proxy: {}", e);
-                crate::proxy::handler::record_target_auth_failure(
-                    &crate::audit::request_events::RequestFacts {
-                        surface_id: &surface.surface_id,
-                        channel_name: &surface.name,
-                        trace_id: message
-                            .message_body
-                            .get("otel_context")
-                            .and_then(|context| context.get("trace_id"))
-                            .and_then(serde_json::Value::as_str),
-                        via_fabric: true,
-                    },
-                    None,
-                    target_auth,
-                    &e,
-                );
+                crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
                         let error_body = serde_json::json!({
@@ -8691,13 +8685,8 @@ async fn handle_mcp_proxy_forward(
 
     let (target_auth_header, issued) =
         target_credential.map_or((None, None), |credential| (Some(credential.header), credential.issued));
-    let sent_token = issued
-        .as_ref()
-        .map(|issued| crate::proxy::handler::SentServiceToken {
-            vault: vault.as_deref(),
-            issued,
-            surface_id: &surface.surface_id,
-        });
+    let sent_token =
+        crate::proxy::handler::SentServiceToken::of(vault.as_deref(), issued.as_ref(), &surface.surface_id);
     // Use handle_mcp_request_with_policies to apply all surface policies
     // This ensures MCP channels have feature parity with A2A (timeout, retry, circuit breaker, mirroring)
     match crate::mcp_proxies::handlers::handle_mcp_request_with_policies(
@@ -8843,7 +8832,12 @@ async fn handle_mcp_proxy_forward(
                 response_body: response_body_json,
             }
         }
-        Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => target_auth_failed_result(),
+        Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            if let Some(target_auth) = surface.target_auth() {
+                crate::proxy::handler::record_target_base_refusal(&audit_facts, None, target_auth);
+            }
+            target_auth_failed_result()
+        }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(error_msg)) => {
             let config_id = surface
                 .config_id()

@@ -402,23 +402,27 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
             );
             async move {
                 let policy: &'static CredentialPolicyConfig = Box::leak(Box::default());
-                let result = TEST_CREDENTIAL_POLICY
-                    .scope(policy, async {
-                        tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
-                            .await
-                            .expect("Fabric receive handler timed out")
-                    })
+                let (result, events) = TEST_CREDENTIAL_POLICY
+                    .scope(
+                        policy,
+                        crate::audit::producer::capture(async {
+                            tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                                .await
+                                .expect("Fabric receive handler timed out")
+                        }),
+                    )
                     .await;
                 let ProcessingResult::RequiresResponse { response_body, .. } = result else {
                     panic!("expected a ForwardResponse, got {result:?}");
                 };
-                response_body["status"]
+                let status = response_body["status"]
                     .as_u64()
-                    .unwrap_or_else(|| panic!("no status in {response_body}"))
+                    .unwrap_or_else(|| panic!("no status in {response_body}"));
+                (status, credential_records(&events))
             }
         };
 
-        assert_eq!(receive("/x").await, 200);
+        assert_eq!(receive("/x").await, (200, Vec::new()));
         let received = receiver.target.received();
         assert_eq!(received.len(), 1);
         assert_eq!(
@@ -437,7 +441,7 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
         );
 
         for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/..%252Fadmin"] {
-            assert_eq!(receive(path).await, 502, "{path}");
+            assert_eq!(receive(path).await, (502, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
         }
         assert_eq!(
             receiver

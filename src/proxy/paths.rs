@@ -286,7 +286,8 @@ pub fn appended_path_stays_below_base(path: &str) -> bool {
     )
 }
 
-/// A Target endpoint without a scheme is forwarded over https.
+/// A Target endpoint without a scheme is read as `https://`, the scheme the protocol router
+/// names for it; the router's forward URL keeps no scheme, so no request reaches it.
 fn parse_target_endpoint(target_endpoint: &str) -> Option<url::Url> {
     if target_endpoint.contains("://") {
         url::Url::parse(target_endpoint).ok()

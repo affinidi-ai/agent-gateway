@@ -712,7 +712,7 @@ impl TargetCardFetch<'_> {
                     crate::proxy::target_grant::forwards_caller_header(key.as_str(), &source_cred_headers, None)
                 }
                 None => {
-                    !super::is_target_auth_header(key.as_str(), target_auth_header)
+                    !super::is_credential_header(key.as_str(), target_auth_header.as_slice())
                         && super::should_forward_header(key.as_str(), &source_cred_headers)
                 }
             };
@@ -885,7 +885,7 @@ fn fabric_card_fetch_headers(
     let mut forwarded_headers = headers
         .iter()
         .filter(|(key, _)| {
-            !super::is_target_auth_header(key.as_str(), target_auth_header)
+            !super::is_credential_header(key.as_str(), target_auth_header.as_slice())
                 && super::should_forward_header(key.as_str(), &source_cred_headers)
         })
         .filter_map(|(key, value)| {

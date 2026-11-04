@@ -120,6 +120,44 @@ async fn a_credential_withheld_by_an_enforced_rule_is_recorded() {
     );
 }
 
+#[tokio::test]
+async fn a_request_outside_the_target_base_path_is_recorded_as_rejected_whatever_the_fallback() {
+    let target = agent().await;
+    for fallback in ["reject", "passthrough"] {
+        let surface =
+            surface(&format!("{}/base", target.url()), json!({"method": "credential_lookup", "fallback": fallback}));
+        let (answered, events) = send(router(surface), "/a2a/%2e%2e/admin").await;
+        assert_eq!(answered.as_u16(), 502, "{fallback}");
+        assert_eq!(
+            target_auth_records(&events),
+            vec![(
+                RejectionStage::Forward,
+                Some(502),
+                None,
+                Some("trace".to_string()),
+                detail(TargetAuthOutcome::Rejected, None)
+            )],
+            "{fallback}"
+        );
+    }
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_request_inside_the_target_base_path_records_no_refusal() {
+    let target = agent().await;
+    let surface =
+        surface(&format!("{}/base", target.url()), json!({"method": "credential_lookup", "fallback": "reject"}));
+    let (answered, events) = send(router(surface), "/a2a/inside").await;
+    assert_eq!(answered.as_u16(), 200);
+    assert_eq!(target_auth_records(&events), Vec::new());
+}
+
 /// A token endpoint that refuses every request with an OAuth error whose description and echo
 /// carry secret text.
 async fn refusing_token_endpoint() -> (String, tokio::task::JoinSet<()>) {

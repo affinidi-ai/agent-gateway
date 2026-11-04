@@ -811,7 +811,8 @@ origin is also allowed; any other method there is refused.
 
 On the MCP proxy, a path parameter value containing `{` or `}` is also refused while the
 credential is attached, because the OpenAPI client substitutes parameters one at a time. A refused
-request reaches neither the Target nor any other host. A surface without `target.auth`, or a
+request reaches neither the Target nor any other host, and is recorded in the VP Audit Log as a
+`target_auth_failed` refusal with outcome `rejected`, whatever the `fallback`. A surface without `target.auth`, or a
 Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
 each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
 below a non-root `base_url` path, one that makes an ambiguous segment above (for example
