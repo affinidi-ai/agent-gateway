@@ -1555,10 +1555,9 @@ fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
             let named =
                 variant.map_or_else(|| "The surface's own route".to_string(), |alias| format!("Variant '{alias}'"));
             format!(
-                "{named} sends its Target requests to {}, where the Access Point Target's binding with \
-                 consent_mode external sends its grant, without that binding or a credential of its own: the vendor \
-                 is sent its callers' own headers and no grant; give it another Target, a credential of its own \
-                 (target.auth, another binding or forward_header), or the binding",
+                "{named} sends requests to the vendor of the external consent binding without the binding or a \
+                 credential of its own: callers' headers reach the vendor with no grant. Give it another Target or \
+                 its own credential (target.auth, a binding or forward_header). Target: {}",
                 view.target.endpoint
             )
         })
@@ -5799,10 +5798,10 @@ mod validation_tests {
         };
         let warning = |named: &str| {
             format!(
-                "{named} sends its Target requests to https://mcp.vendor.example/mcp, where the Access Point \
-                 Target's binding with consent_mode external sends its grant, without that binding or a credential \
-                 of its own: the vendor is sent its callers' own headers and no grant; give it another Target, a \
-                 credential of its own (target.auth, another binding or forward_header), or the binding"
+                "{named} sends requests to the vendor of the external consent binding without the binding or a \
+                 credential of its own: callers' headers reach the vendor with no grant. Give it another Target or \
+                 its own credential (target.auth, a binding or forward_header). Target: \
+                 https://mcp.vendor.example/mcp"
             )
         };
         assert_eq!(
