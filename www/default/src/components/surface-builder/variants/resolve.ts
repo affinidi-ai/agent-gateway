@@ -233,9 +233,12 @@ export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
   if (slots && typeof slots === 'object' && Object.keys(slots).length > 0) {
     out.identity_slots = slots;
   }
-  if (Array.isArray(payload?.outbound_credentials)) {
-    out.outbound_credentials = payload.outbound_credentials;
-  }
+  // Always emitted, an empty list included: the gateway keeps the base
+  // surface's bindings for a variant that leaves the list out, even a
+  // complete one, while this snapshot (like `resolveVariant`) has none.
+  out.outbound_credentials = Array.isArray(payload?.outbound_credentials)
+    ? payload.outbound_credentials
+    : [];
   return out;
 }
 
