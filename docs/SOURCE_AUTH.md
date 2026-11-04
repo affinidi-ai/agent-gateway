@@ -882,6 +882,41 @@ Points sends, keeps a stored base block with empty `points` holding only its lif
 a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
 to 300 seconds.
 
+### Per-caller rate limit on a Transit Point
+
+A Transit Point's `rate_limit` is one bucket for the point, shared by every caller. Give the point
+a `per_caller_rate_limit` (`requests`, `window_secs` and an optional `burst`, as for `rate_limit`)
+to give each caller a bucket of their own, so one caller cannot spend the allowance of the others:
+
+```json
+{
+  "alias": "linear",
+  "rate_limit": { "requests": 600, "window_secs": 60 },
+  "per_caller_rate_limit": { "requests": 60, "window_secs": 60 }
+}
+```
+
+- **Who a caller is.** The caller is the identity hash of the caller the Transit Point identified:
+  the one in the transit token, or of the credential its own `source_auth` verified (the same
+  value that keys a caller's delegated credentials). A request over Fabric counts as an
+  identified caller only where it does for delegated credentials.
+- **No identified caller.** Requests with no identified caller share one bucket of their own, so
+  a request cannot avoid the limit by naming no caller, and an identified caller is not held up
+  by them.
+- **Both limits apply.** A request is checked against its caller's bucket first, then the
+  point's and the surface's, so a caller who is over their limit does not use up the allowance of
+  the others. The stricter limit decides.
+- **Refusals.** A refused request answers `429` with `Retry-After` in whole seconds, rounded up:
+  a JSON-RPC error with code `-32000` on an MCP Transit Point, and a plain `429` otherwise. The
+  answer names no caller. It is recorded as a `rate_limited` audit event with scope
+  `transit_caller`, the Transit Point's alias, the caller's identity hash and `retry_after_ms`.
+- **Bounded memory.** At most 10,000 callers have a bucket at once, and a bucket that has fully
+  recovered is forgotten. While that many callers are all still limited, further callers share one
+  bucket until some recover.
+- **Counting.** Counting is per gateway node, and a saved change to the surface starts every
+  bucket of its Transit Points again. A `requests` or `window_secs` of `0`, or a `burst` of `0`,
+  is refused when the surface is saved, on the surface and in a variant's own points.
+
 ### Headers through a Transit Point
 
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,

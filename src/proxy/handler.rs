@@ -19302,6 +19302,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::SseSessions,
                         retry_after_ms: None,
+                        ..
                     }
                 )),
             "the refused SSE session is audited: {audit:?}"
@@ -21723,6 +21724,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::FabricCapacity,
                         retry_after_ms: Some(5000),
+                        ..
                     }
                 )),
             "the full Fabric stream cap is audited: {audit:?}"

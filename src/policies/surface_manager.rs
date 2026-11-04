@@ -1,5 +1,5 @@
 use crate::policies::policy_definitions::FileSystemPolicyDefinitionStore;
-use crate::policies::{CircuitBreaker, CompiledMcpToolGating, OpaEngine, RateLimiter};
+use crate::policies::{CallerRateLimiter, CircuitBreaker, CompiledMcpToolGating, OpaEngine, RateLimiter};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -14,6 +14,9 @@ pub struct SurfacePolicyManager {
 
     /// Rate limiters per surface (keyed by config_id)
     rate_limiters: Arc<RwLock<HashMap<String, Arc<RateLimiter>>>>,
+
+    /// Per-caller rate limiters of Transit Points, keyed `vc:{config_id}:{alias}`
+    caller_rate_limiters: Arc<RwLock<HashMap<String, Arc<CallerRateLimiter>>>>,
 
     /// Circuit breakers per surface (keyed by config_id)
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
@@ -33,6 +36,7 @@ impl SurfacePolicyManager {
         Self {
             opa_engines: std::sync::RwLock::new(HashMap::new()),
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            caller_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             mcp_tool_gating: std::sync::RwLock::new(HashMap::new()),
             policy_definition_store: std::sync::RwLock::new(None),
@@ -798,6 +802,45 @@ impl SurfacePolicyManager {
                     }
                 }
             }
+            drop(limiters);
+            let mut caller_limiters = self
+                .caller_rate_limiters
+                .write()
+                .await;
+            caller_limiters.retain(|k, _| !k.starts_with(&prefix));
+            for tp in surface.transit_points() {
+                let Some(limit) = tp
+                    .per_caller_rate_limit
+                    .as_ref()
+                else {
+                    continue;
+                };
+                let limit = crate::policies::RateLimitConfig {
+                    requests: limit.requests,
+                    window_secs: limit.window_secs,
+                    burst: limit.burst,
+                };
+                match CallerRateLimiter::new(&limit) {
+                    Ok(limiter) => {
+                        info!(
+                            surface_id = %config_id,
+                            transit_point = %tp.alias,
+                            requests = limit.requests,
+                            window_secs = limit.window_secs,
+                            "Configuring per-caller rate limiter"
+                        );
+                        caller_limiters.insert(format!("{}{}", prefix, tp.alias), Arc::new(limiter));
+                    }
+                    Err(error) => {
+                        warn!(
+                            surface_id = %config_id,
+                            transit_point = %tp.alias,
+                            error = %error,
+                            "Failed to create per-caller rate limiter"
+                        );
+                    }
+                }
+            }
         }
 
         // Handle circuit breaker
@@ -1107,6 +1150,27 @@ impl SurfacePolicyManager {
         Ok(())
     }
 
+    /// Check a Transit Point's per-caller rate limit for `caller`, the
+    /// identity hash of the caller the Transit Point identified, if any.
+    /// A Transit Point with no per-caller limit allows everything.
+    pub async fn check_caller_rate_limit(
+        &self,
+        channel_id: &str,
+        transit_alias: &str,
+        caller: Option<&str>,
+    ) -> Result<(), crate::policies::RateLimitError> {
+        let limiter = self
+            .caller_rate_limiters
+            .read()
+            .await
+            .get(&format!("vc:{channel_id}:{transit_alias}"))
+            .cloned();
+        match limiter {
+            Some(limiter) => limiter.check(caller),
+            None => Ok(()),
+        }
+    }
+
     /// Test-only boolean convenience over [`Self::evaluate_policy_decision`].
     /// Production code calls `evaluate_policy_decision` directly so it can also
     /// record the deny reason in the policy-decision audit event.
@@ -1292,6 +1356,10 @@ impl SurfacePolicyManager {
         let prefix = format!("vc:{}:", channel_id);
         limiters.retain(|k, _| !k.starts_with(&prefix));
         drop(limiters);
+        self.caller_rate_limiters
+            .write()
+            .await
+            .retain(|k, _| !k.starts_with(&prefix));
         self.circuit_breakers
             .write()
             .await
@@ -1561,6 +1629,72 @@ allow if {
     }
 
     #[tokio::test]
+    async fn saving_a_surface_replaces_and_drops_a_transit_points_per_caller_limiter() {
+        let manager = SurfacePolicyManager::new();
+        let with_limit = |limit: serde_json::Value| -> crate::config::agent_surface::AgentSurface {
+            let mut point = serde_json::json!({ "alias": "partner", "target_endpoint": "https://partner.example.com/mcp",
+                "protocol": "mcp" });
+            if !limit.is_null() {
+                point["per_caller_rate_limit"] = limit;
+            }
+            serde_json::from_value(serde_json::json!({
+                "surface_id": "tp-caller", "name": "tp-caller", "description": "", "status": "active",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/tp-caller", "protocol": "mcp" },
+                "target": { "endpoint": "http://localhost:9000" },
+                "transit": { "points": [point] }
+            }))
+            .unwrap()
+        };
+        manager
+            .update_channel_policy(&with_limit(serde_json::json!({ "requests": 1, "window_secs": 60 })))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .check_caller_rate_limit("tp-caller", "other-point", Some("alice"))
+                .await
+                .is_ok(),
+            "a point with no limit allows everything"
+        );
+        manager
+            .update_channel_policy(&with_limit(serde_json::json!({ "requests": 5, "window_secs": 60 })))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
+                .await
+                .is_ok(),
+            "the saved limit is the one in force"
+        );
+        manager
+            .update_channel_policy(&with_limit(serde_json::Value::Null))
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            assert!(
+                manager
+                    .check_caller_rate_limit("tp-caller", "partner", Some("alice"))
+                    .await
+                    .is_ok(),
+                "a limit that was removed no longer applies"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn removing_a_surface_evicts_its_transit_point_policies_gates_limiters_and_circuit_breaker() {
         let manager = SurfacePolicyManager::new();
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
@@ -1570,6 +1704,7 @@ allow if {
             "transit": { "points": [{
                 "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
                 "rate_limit": { "requests": 10, "window_secs": 60 },
+                "per_caller_rate_limit": { "requests": 5, "window_secs": 60 },
                 "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
                     "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
             }] }
@@ -1589,6 +1724,13 @@ allow if {
         assert!(
             manager
                 .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:doomed:partner")
+        );
+        assert!(
+            manager
+                .caller_rate_limiters
                 .read()
                 .await
                 .contains_key("vc:doomed:partner")
@@ -1615,6 +1757,13 @@ allow if {
         assert!(
             !manager
                 .rate_limiters
+                .read()
+                .await
+                .contains_key("vc:doomed:partner")
+        );
+        assert!(
+            !manager
+                .caller_rate_limiters
                 .read()
                 .await
                 .contains_key("vc:doomed:partner")

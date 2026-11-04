@@ -19,6 +19,7 @@ import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
+import { rateLimitConfigFromWire } from './rate-limit/wire';
 import { workloadBindingApiToForm } from './workload-binding/config';
 
 export interface DependencyWarning {
@@ -843,15 +844,15 @@ class ElementRegistry {
       // uses string-typed numeric inputs so coerce wire numbers back to
       // strings on hydration.
       const tpRl = tp?.rate_limit;
-      if (tpRl && typeof tpRl === 'object' && tpRl.requests != null) {
+      const tpCallerRl = tp?.per_caller_rate_limit;
+      const hasTpRl = tpRl && typeof tpRl === 'object' && tpRl.requests != null;
+      const hasTpCallerRl =
+        tpCallerRl && typeof tpCallerRl === 'object' && tpCallerRl.requests != null;
+      if (hasTpRl || hasTpCallerRl) {
         const rlDef = this.get('rate-limit');
         const panelConfig = rlDef?.configFromPayload
           ? rlDef.configFromPayload(tpRl, payload)
-          : {
-              requests: String(tpRl.requests),
-              window_secs: String(tpRl.window_secs ?? 60),
-              ...(tpRl.burst != null ? { burst: String(tpRl.burst) } : {}),
-            };
+          : rateLimitConfigFromWire(hasTpRl ? tpRl : null, hasTpCallerRl ? tpCallerRl : null);
         nodes.push({
           id: `rate-limit-${tpId}`,
           type: 'rate-limit' as SurfaceNodeType,

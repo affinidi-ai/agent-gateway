@@ -964,6 +964,9 @@ fn identify_transit_points(
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
+        if let Err(msg) = tp.validate_per_caller_rate_limit() {
+            return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
+        }
         if !seen.insert(tp.alias.clone()) {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{place}transit.points[{idx}]: duplicate alias '{}'. Each transit point alias must be unique within \
@@ -6459,6 +6462,44 @@ mod validation_tests {
                 other => panic!("{case}: expected a 400, got {other:?}"),
             }
         }
+    }
+
+    /// A Transit Point's per-caller rate limit is checked when the surface is
+    /// saved, on the surface and in a variant's own points: a limit that could
+    /// never admit a request, or has no window, is refused with the point named.
+    #[test]
+    fn a_save_refuses_a_per_caller_rate_limit_that_cannot_work() {
+        let point = |limit: serde_json::Value| {
+            serde_json::json!({ "alias": "partner", "target_endpoint": "https://partner.example",
+                "require_transit_token": true, "per_caller_rate_limit": limit })
+        };
+        for (case, limit, expected) in [
+            ("no requests", serde_json::json!({ "requests": 0, "window_secs": 60 }), "requests"),
+            ("no window", serde_json::json!({ "requests": 5, "window_secs": 0 }), "window_secs"),
+            ("a zero burst", serde_json::json!({ "requests": 5, "window_secs": 60, "burst": 0 }), "burst"),
+        ] {
+            let mut on_surface =
+                surface_with_transit_points(serde_json::json!([point(limit.clone())]), serde_json::json!([]));
+            match validate_transit_points(&mut on_surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(
+                        message.starts_with("transit.points[0]: ") && message.contains(expected),
+                        "{case}: {message}"
+                    )
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+            let mut in_variant = surface_with_transit_points(serde_json::json!([]), serde_json::json!([point(limit)]));
+            assert!(
+                matches!(validate_transit_points(&mut in_variant, 30, None), Err(SurfaceApiError::BadRequest(_))),
+                "{case} in a variant"
+            );
+        }
+        let mut fine = surface_with_transit_points(
+            serde_json::json!([point(serde_json::json!({ "requests": 5, "window_secs": 60, "burst": 10 }))]),
+            serde_json::json!([]),
+        );
+        assert!(validate_transit_points(&mut fine, 30, None).is_ok());
     }
 
     /// A save refuses `transit_token_mode: reference`, on the surface or in a

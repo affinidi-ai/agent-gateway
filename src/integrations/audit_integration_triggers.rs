@@ -552,6 +552,7 @@ mod tests {
             DelegationAuditAction::RateLimited {
                 scope: RateLimitScope::Surface,
                 retry_after_ms: None,
+                transit_point: None,
             },
             DelegationAuditAction::RequestRejected {
                 stage: RejectionStage::Routing,

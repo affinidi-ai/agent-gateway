@@ -81,7 +81,28 @@ pub fn rate_limited(
         facts.record(DelegationAuditAction::RateLimited {
             scope,
             retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            transit_point: None,
         })
+    })
+}
+
+/// A Transit Point refused a request with 429 because the caller reached the
+/// per-caller limit. `caller_hash` is the identity hash of the caller the
+/// Transit Point identified, absent for a request with no identified caller.
+pub fn transit_caller_rate_limited(
+    facts: &RequestFacts<'_>,
+    transit_point: &str,
+    caller_hash: Option<&str>,
+    retry_after: Option<Duration>,
+) {
+    emit("rate_limited", || {
+        let mut event = facts.record(DelegationAuditAction::RateLimited {
+            scope: RateLimitScope::TransitCaller,
+            retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            transit_point: Some(transit_point.to_string()),
+        });
+        event.user_identity_hash = caller_hash.map(str::to_string);
+        event
     })
 }
 
@@ -403,7 +424,7 @@ mod tests {
         let recorded: Vec<_> = events
             .iter()
             .map(|event| match &event.event {
-                DelegationAuditAction::RateLimited { scope, retry_after_ms } => (*scope, *retry_after_ms),
+                DelegationAuditAction::RateLimited { scope, retry_after_ms, .. } => (*scope, *retry_after_ms),
                 other => panic!("expected RateLimited, got {other:?}"),
             })
             .collect();
@@ -414,6 +435,42 @@ mod tests {
                 .as_deref(),
             Some("surf-1")
         );
+    }
+
+    #[tokio::test]
+    async fn a_transit_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
+        use crate::audit::events::RateLimitScope;
+        let ((), events) = crate::audit::producer::capture(async {
+            transit_caller_rate_limited(
+                &facts(),
+                "partner",
+                Some("caller-hash"),
+                Some(std::time::Duration::from_millis(2500)),
+            );
+            transit_caller_rate_limited(&facts(), "partner", None, None);
+        })
+        .await;
+
+        assert_eq!(events.len(), 2);
+        match &events[0].event {
+            DelegationAuditAction::RateLimited {
+                scope,
+                retry_after_ms,
+                transit_point,
+            } => {
+                assert_eq!(*scope, RateLimitScope::TransitCaller);
+                assert_eq!(*retry_after_ms, Some(2500));
+                assert_eq!(transit_point.as_deref(), Some("partner"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[0]
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash")
+        );
+        assert_eq!(events[1].user_identity_hash, None, "a request with no identified caller names none");
     }
 
     fn rejected(

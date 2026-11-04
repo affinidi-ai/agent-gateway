@@ -19,6 +19,10 @@ export function rateLimitConfigToWire(c: any): Record<string, any> | undefined {
   };
 }
 
+const hasShared = (c: any): boolean => Boolean(c?.requests || c?.window_secs || c?.burst);
+const hasPerCaller = (c: any): boolean =>
+  Boolean(c?.caller_requests || c?.caller_window_secs || c?.caller_burst);
+
 export const rateLimitDefinition: NodeDefinition = {
   type: 'rate-limit',
   label: 'Rate Limit',
@@ -64,6 +68,10 @@ export const rateLimitDefinition: NodeDefinition = {
       <p>The limit is per-Surface and shared across every caller; capacity
       refills continuously rather than resetting at a fixed point in
       time.</p>
+      <p>On a Transit Point, a rate limit can also carry an optional
+      <strong>per-caller</strong> limit: each caller the Transit Point
+      identifies gets an allowance of their own, so one caller cannot use up
+      the others'.</p>
     `,
   },
   // Rate limiting only makes sense on the request side (we don't throttle
@@ -74,23 +82,50 @@ export const rateLimitDefinition: NodeDefinition = {
     dropOnEdge: [Cap.RATE_LIMIT_TARGET],
   },
   incompleteReason: c => {
+    if (hasPerCaller(c) && !hasShared(c)) {
+      if (!c.caller_requests) return 'Per-caller request limit is required';
+      if (!c.caller_window_secs) return 'Per-caller time window is required';
+      return null;
+    }
     if (!c.requests) return 'Request limit is required';
     if (!c.window_secs) return 'Time window is required';
+    if (hasPerCaller(c)) {
+      if (!c.caller_requests) return 'Per-caller request limit is required';
+      if (!c.caller_window_secs) return 'Per-caller time window is required';
+    }
     return null;
   },
   validate: c => {
     const errs: Array<{ field?: string; message: string }> = [];
-    const r = positiveIntError('requests', c.requests, 'Request limit');
-    if (r) errs.push(r);
-    const w = positiveIntError('window_secs', c.window_secs, 'Time window');
-    if (w) errs.push(w);
+    if (hasShared(c) || !hasPerCaller(c)) {
+      const r = positiveIntError('requests', c.requests, 'Request limit');
+      if (r) errs.push(r);
+      const w = positiveIntError('window_secs', c.window_secs, 'Time window');
+      if (w) errs.push(w);
+    }
+    if (hasPerCaller(c)) {
+      const r = positiveIntError('caller_requests', c.caller_requests, 'Per-caller request limit');
+      if (r) errs.push(r);
+      const w = positiveIntError(
+        'caller_window_secs',
+        c.caller_window_secs,
+        'Per-caller time window'
+      );
+      if (w) errs.push(w);
+    }
     return errs;
   },
   ConfigPanel: RateLimitPanel,
   payloadPath: 'access_point.rate_limit',
   // Pre-fill defaults so a freshly-dropped rate limit "just works".
   defaultConfig: () => ({ requests: '1000', window_secs: '60' }),
-  summary: c => (c?.requests ? `${c.requests}/${c.window_secs || 60}s` : null),
+  summary: c => {
+    const shared = c?.requests ? `${c.requests}/${c.window_secs || 60}s` : null;
+    const perCaller = c?.caller_requests
+      ? `${c.caller_requests}/${c.caller_window_secs || 60}s each`
+      : null;
+    return [shared, perCaller].filter(Boolean).join(' · ') || null;
+  },
   buildPayload: ctx => {
     // Slot identity is the source of truth: the AP→MA `request:rate-limit`
     // slot is `ownedBy: 'source'` so an inbound rate limit always carries

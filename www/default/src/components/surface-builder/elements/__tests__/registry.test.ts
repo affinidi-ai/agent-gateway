@@ -486,6 +486,50 @@ describe('ElementRegistry', () => {
       expect(out.transit.points[0].rate_limit).toEqual({ requests: 50, window_secs: 30 });
     });
 
+    it('writes a transit point per-caller rate limit beside its shared one, and either alone', () => {
+      const out = registry.buildPayload(
+        makeCtx([
+          {
+            id: 'rl-both',
+            type: 'rate-limit',
+            parentId: 'transit-point-a2a-1',
+            config: {
+              requests: '50',
+              window_secs: '30',
+              caller_requests: '5',
+              caller_window_secs: '10',
+              caller_burst: '8',
+            },
+          },
+          {
+            id: 'transit-point-a2a-1',
+            type: 'transit-point-a2a',
+            config: { name: 'h1', target_endpoint: 'http://a' },
+          },
+          {
+            id: 'rl-caller-only',
+            type: 'rate-limit',
+            parentId: 'transit-point-a2a-2',
+            config: { caller_requests: '7', caller_window_secs: '20' },
+          },
+          {
+            id: 'transit-point-a2a-2',
+            type: 'transit-point-a2a',
+            config: { name: 'h2', target_endpoint: 'http://b' },
+          },
+        ])
+      );
+      expect(out.transit.points[0].rate_limit).toEqual({ requests: 50, window_secs: 30 });
+      expect(out.transit.points[0].per_caller_rate_limit).toEqual({
+        requests: 5,
+        window_secs: 10,
+        burst: 8,
+      });
+      expect(out.transit.points[1].rate_limit).toBeUndefined();
+      expect(out.transit.points[1].per_caller_rate_limit).toEqual({ requests: 7, window_secs: 20 });
+      expect(out.access_point.rate_limit).toBeUndefined();
+    });
+
     it('aggregates custom-metadata entries from multiple nodes', () => {
       const out = registry.buildPayload(
         makeCtx([

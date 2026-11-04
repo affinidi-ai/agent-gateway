@@ -331,6 +331,32 @@ describe('Transit Points changed through the API after a dashboard save', () => 
     expect(resaved.access_point?.rate_limit).toBeUndefined();
   });
 
+  it('keeps a per-caller rate limit set through the API when the Transit Point is saved again', () => {
+    const resaved = resaveAfter([...baseNodes, tp(1)], stored => {
+      stored.transit.points[0].per_caller_rate_limit = { requests: 5, window_secs: 60, burst: 8 };
+    });
+
+    expect(resaved.transit.points[0].per_caller_rate_limit).toEqual({
+      requests: 5,
+      window_secs: 60,
+      burst: 8,
+    });
+    expect(resaved.transit.points[0].rate_limit).toBeUndefined();
+  });
+
+  it('keeps both rate limits of a Transit Point through a save and a reload', () => {
+    const resaved = resaveAfter([...baseNodes, tp(1)], stored => {
+      stored.transit.points[0].rate_limit = { requests: 100, window_secs: 60 };
+      stored.transit.points[0].per_caller_rate_limit = { requests: 5, window_secs: 60 };
+    });
+
+    expect(resaved.transit.points[0].rate_limit).toEqual({ requests: 100, window_secs: 60 });
+    expect(resaved.transit.points[0].per_caller_rate_limit).toEqual({
+      requests: 5,
+      window_secs: 60,
+    });
+  });
+
   it('does not turn the Fabric credential switch back on after the API turned it off', () => {
     const fabric = 'fabric://peer-gateway/upstream';
     const resaved = resaveAfter(

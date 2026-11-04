@@ -86,7 +86,7 @@ pub use mcp_tool_gating::CompiledMcpToolGating;
 pub use opa::OpaEngine;
 pub use opa::PolicyDecision;
 pub use policy_definitions::{FileSystemPolicyDefinitionStore, PolicyAttestation};
-pub use rate_limiter::{RateLimitConfig, RateLimitError, RateLimiter};
+pub use rate_limiter::{CallerRateLimiter, RateLimitConfig, RateLimitError, RateLimiter};
 pub use surface_manager::SurfacePolicyManager;
 
 #[cfg(test)]

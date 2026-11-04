@@ -19,6 +19,7 @@ pub enum RateLimitScope {
     Surface,
     SseSessions,
     FabricCapacity,
+    TransitCaller,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
