@@ -6240,7 +6240,8 @@ async fn proxy_handler_with_mcp_runtime(
         .is_some_and(
             |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
         )
-        && resource_authorization.is_none();
+        && resource_authorization.is_none()
+        && authenticated_identity.is_some();
     // A Target bound by external consent is a third party: it is sent only
     // what a Transit Point sends its vendor, no caller-info or DID header, and
     // is asked for an answer the gateway can read as it is sent.
