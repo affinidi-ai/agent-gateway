@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::jwt_bearer::models::JwtVerificationStrategy;
@@ -90,14 +90,12 @@ impl FileSystemJwtVerificationStrategyStore {
             .await
             .context("Failed to open JWT verification strategy storage")?;
         let store = Self { storage };
-        info!(
-            "Initialised FileSystemJwtVerificationStrategyStore with {} strategy/strategies",
-            store
-                .storage
-                .list_all()
-                .await?
-                .len()
-        );
+        let strategies = store
+            .storage
+            .list_all()
+            .await?;
+        info!("Initialised FileSystemJwtVerificationStrategyStore with {} strategy/strategies", strategies.len());
+        warn_of_unusable_principal_claims(&strategies);
         Ok(store)
     }
 
@@ -110,7 +108,28 @@ impl FileSystemJwtVerificationStrategyStore {
         info!("Reloading JWT verification strategy store from disk");
         self.storage
             .refresh_from_disk()
-            .await
+            .await?;
+        warn_of_unusable_principal_claims(
+            &self
+                .storage
+                .list_all()
+                .await?,
+        );
+        Ok(())
+    }
+}
+
+/// Logs each strategy whose stored `principal_claim` the API would refuse,
+/// such as one written to storage by hand: it names no caller, so its callers
+/// see only `500`s.
+fn warn_of_unusable_principal_claims(strategies: &[JwtVerificationStrategy]) {
+    for strategy in strategies {
+        if let Err(error) = strategy.principal_claim_name() {
+            warn!(
+                strategy_id = %strategy.id,
+                "JWT verification strategy names no caller: {error}; create a strategy that names another claim"
+            );
+        }
     }
 }
 

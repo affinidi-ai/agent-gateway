@@ -1081,7 +1081,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]), each to a peer
+/// accepts through another ([`shared_issuer_warnings`]), each whose stored
+/// principal claim names no caller ([`unusable_principal_claim_warnings`]),
+/// each to a peer
 /// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]),
 /// each that opts Fabric callers in to delegated credentials without a
 /// managed identity ([`fabric_delegation_identity_warnings`]), each that
@@ -1108,6 +1110,7 @@ async fn save_warnings(
         )
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(unusable_principal_claim_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
         .chain(fabric_hop_limit_warnings(surface))
         .chain(fabric_delegation_identity_warnings(surface))
@@ -1283,9 +1286,14 @@ async fn jwt_strategy_issuers(
             }
             if let Ok(Some(strategy)) = store.get(id).await {
                 let principal_claim = strategy
-                    .principal_claim
-                    .clone()
-                    .unwrap_or_else(|| crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string());
+                    .principal_claim_name()
+                    .map(str::to_string)
+                    .map_err(|_| {
+                        strategy
+                            .principal_claim
+                            .clone()
+                            .unwrap_or_default()
+                    });
                 issuers.insert(
                     id.clone(),
                     StrategyCallerNaming {
@@ -1301,18 +1309,24 @@ async fn jwt_strategy_issuers(
 
 /// The issuer a JWT verification strategy accepts and the claim it names
 /// callers by: together they decide which callers of two strategies are one.
+/// A stored claim the API refuses is `Err` with that claim: such a strategy
+/// names no caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StrategyCallerNaming {
     issuer: String,
-    principal_claim: String,
+    principal_claim: Result<String, String>,
 }
 
 /// Each Transit Point, on the surface or in an enabled variant, whose
 /// `jwt_bearer` strategy names the same issuer, in `issuers`, as another
 /// strategy the same view accepts, on its Access Point or another Transit
-/// Point. The identity hash keys a JWT caller by its issuer and subject, so
-/// callers verified through either strategy are one caller, with the same
-/// delegated credentials.
+/// Point, and each pair of Access Point methods whose strategies name one
+/// issuer but different claims. The identity hash keys a JWT caller by its
+/// issuer, subject and principal claim, so callers verified through two
+/// strategies naming one claim are one caller, with the same delegated
+/// credentials, and through two naming different claims are two. A strategy
+/// whose stored claim names no caller is warned of on its own
+/// ([`unusable_principal_claim_warnings`]).
 fn shared_issuer_warnings(
     surface: &AgentSurface,
     issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
@@ -1337,22 +1351,20 @@ fn shared_issuer_warnings(
             let strategy = config
                 .jwt_verification_strategy_id
                 .as_str();
-            let Some(naming) = issuers.get(strategy) else {
+            let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
                 continue;
             };
-            let issuer = &naming.issuer;
-            for (other, other_naming) in accepted
+            for (other, other_claim) in accepted
                 .iter()
                 .filter(|other| **other != strategy)
                 .filter_map(|other| {
-                    issuers
-                        .get(*other)
-                        .filter(|other_naming| other_naming.issuer == *issuer)
-                        .map(|other_naming| (other, other_naming))
+                    usable_naming(issuers, other)
+                        .filter(|(other_issuer, _)| *other_issuer == issuer)
+                        .map(|(_, other_claim)| (other, other_claim))
                 })
             {
                 let name = transit_point_name(surface, variant.as_deref(), alias);
-                let warning = if other_naming.principal_claim == naming.principal_claim {
+                let warning = if other_claim == claim {
                     format!(
                         "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
                          strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
@@ -1365,12 +1377,110 @@ fn shared_issuer_warnings(
                          strategy '{strategy}', and this surface accepts that issuer through '{other}' too, but they \
                          name callers by different claims ('{}' and '{}'): the same person through either is two \
                          callers, each with delegated credentials of their own; use one strategy per issuer",
-                        naming.principal_claim, other_naming.principal_claim
+                        claim, other_claim
                     )
                 };
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
+            }
+        }
+        let access_point_strategies: Vec<&str> = access_point
+            .iter()
+            .map(|config| {
+                config
+                    .jwt_verification_strategy_id
+                    .as_str()
+            })
+            .collect();
+        for (index, strategy) in access_point_strategies
+            .iter()
+            .enumerate()
+        {
+            let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
+                continue;
+            };
+            for other in access_point_strategies
+                .iter()
+                .skip(index + 1)
+            {
+                let Some((other_issuer, other_claim)) = usable_naming(issuers, other) else {
+                    continue;
+                };
+                if other_issuer != issuer || other_claim == claim {
+                    continue;
+                }
+                let location = variant
+                    .as_deref()
+                    .map_or_else(
+                        || "The Access Point".to_string(),
+                        |alias| format!("The Access Point in variant '{alias}'"),
+                    );
+                let warning = format!(
+                    "{location} accepts tokens from issuer '{issuer}' through JWT verification strategies \
+                     '{strategy}' and '{other}', which name callers by different claims ('{claim}' and \
+                     '{other_claim}'): the same person through either is two callers, each with delegated \
+                     credentials of their own; use one strategy per issuer"
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
+        }
+    }
+    warnings
+}
+
+/// The issuer and principal claim of `strategy` in `issuers`, unless its
+/// stored claim names no caller.
+fn usable_naming<'a>(
+    issuers: &'a std::collections::HashMap<String, StrategyCallerNaming>,
+    strategy: &str,
+) -> Option<(&'a str, &'a str)> {
+    let naming = issuers.get(strategy)?;
+    let claim = naming
+        .principal_claim
+        .as_deref()
+        .ok()?;
+    Some((naming.issuer.as_str(), claim))
+}
+
+/// Each JWT verification strategy a view of the surface accepts, on its
+/// Access Point or a Transit Point, whose stored `principal_claim` is one the
+/// API refuses, such as one written to storage by hand: it names no caller,
+/// so JWT source authentication through it answers `500`.
+fn unusable_principal_claim_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (variant, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, variant.as_deref());
+        for strategy in access_point.iter().chain(
+            transit_points
+                .iter()
+                .map(|(_, config)| config),
+        ) {
+            let strategy = strategy
+                .jwt_verification_strategy_id
+                .as_str();
+            let Some(Err(stored)) = issuers
+                .get(strategy)
+                .map(|naming| {
+                    naming
+                        .principal_claim
+                        .as_ref()
+                })
+            else {
+                continue;
+            };
+            let warning = format!(
+                "JWT verification strategy '{strategy}' names callers by '{stored}', a claim the API refuses: it \
+                 identifies no caller, and JWT source authentication through it answers 500; create a strategy \
+                 that names another claim"
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
@@ -5635,8 +5745,60 @@ mod validation_tests {
     ) -> StrategyCallerNaming {
         StrategyCallerNaming {
             issuer: issuer.to_string(),
-            principal_claim: principal_claim.to_string(),
+            principal_claim: Ok(principal_claim.to_string()),
         }
+    }
+
+    /// Two Access Point methods whose strategies name one issuer but different
+    /// claims split one person into two callers, and a strategy stored with a
+    /// claim the API refuses names nobody: a save says both, and neither is
+    /// mistaken for a claim the other strategies are compared with.
+    #[test]
+    fn a_save_warns_of_access_point_methods_naming_different_claims_and_of_an_unusable_claim() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "agent",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                "caller_authentication": { "methods": [
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "by-sub", "audiences": ["api://agent"] },
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "by-oid", "audiences": ["api://agent"],
+                        "token_header": "X-Entra-Token" },
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "hand-edited", "audiences": ["api://agent"],
+                        "token_header": "X-Other-Token" }
+                ] } },
+            "target": { "endpoint": "https://agent.internal" }
+        }))
+        .unwrap();
+        let issuers = std::collections::HashMap::from([
+            ("by-sub".to_string(), naming("https://login.example", "sub")),
+            ("by-oid".to_string(), naming("https://login.example", "oid")),
+            (
+                "hand-edited".to_string(),
+                StrategyCallerNaming {
+                    issuer: "https://login.example".to_string(),
+                    principal_claim: Err("iss".to_string()),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            shared_issuer_warnings(&surface, &issuers),
+            vec![
+                "The Access Point accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategies 'by-sub' and 'by-oid', which name callers by different claims ('sub' and 'oid'): the \
+                 same person through either is two callers, each with delegated credentials of their own; use one \
+                 strategy per issuer"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            unusable_principal_claim_warnings(&surface, &issuers),
+            vec![
+                "JWT verification strategy 'hand-edited' names callers by 'iss', a claim the API refuses: it \
+                 identifies no caller, and JWT source authentication through it answers 500; create a strategy that \
+                 names another claim"
+                    .to_string()
+            ]
+        );
     }
 
     /// A Transit Point that releases delegated credentials to Fabric callers
