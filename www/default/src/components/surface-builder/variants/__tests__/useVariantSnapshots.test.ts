@@ -383,6 +383,62 @@ describe('useVariantSnapshots', () => {
     });
   });
 
+  it('buildVariantsWireSlice leaves outbound_credentials out of a stored variant that inherits none', () => {
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload({
+        ...samplePayload,
+        variants: [
+          ...samplePayload.variants,
+          { id: 'v3', alias: 'none', name: 'None', overrides: { outbound_credentials: [] } },
+        ],
+      });
+    });
+    const wire = result.current.buildVariantsWireSlice(samplePayload);
+    const byId = (id: string) => wire.variants.find(v => v.id === id)!.overrides!;
+    expect('outbound_credentials' in byId('v1')).toBe(false);
+    expect('outbound_credentials' in byId('v2')).toBe(false);
+    expect(byId('v3').outbound_credentials).toEqual([]);
+  });
+
+  it('buildVariantsWireSlice sends an empty list when the operator clears inherited bindings', () => {
+    const binding = { credential_provider_id: 'p1', place: 'target' };
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload({ ...samplePayload, outbound_credentials: [binding] });
+    });
+    act(() => {
+      result.current.switchVariant('v2', samplePayload);
+    });
+    const liveV2 = {
+      access_point: { rate_limit: { rpm: 99 } },
+      target: { endpoint: 'https://fast/y', auth: { kind: 'none' } },
+      outbound_credentials: [],
+    };
+    const wire = result.current.buildVariantsWireSlice(liveV2);
+    const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+    expect(v2Wire.overrides?.outbound_credentials).toEqual([]);
+  });
+
+  it('buildVariantsWireSlice sends a binding the operator added to an inheriting variant', () => {
+    const binding = { credential_provider_id: 'p1', place: 'target' };
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload(samplePayload);
+    });
+    act(() => {
+      result.current.switchVariant('v2', samplePayload);
+    });
+    const liveV2 = {
+      access_point: { rate_limit: { rpm: 99 } },
+      target: { endpoint: 'https://fast/y', auth: { kind: 'none' } },
+      outbound_credentials: [binding],
+    };
+    const wire = result.current.buildVariantsWireSlice(liveV2);
+    const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+    expect(v2Wire.overrides?.outbound_credentials).toEqual([binding]);
+  });
+
   it('returns the base snapshot when there are no variants', () => {
     const { result } = renderHook(() => useVariantSnapshots());
     let activePayload: any;

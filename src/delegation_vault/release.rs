@@ -1097,3 +1097,31 @@ fn audit_refresh(
         },
     );
 }
+
+#[cfg(test)]
+mod connect_hint_tests {
+    use super::connect_hint;
+
+    #[test]
+    fn the_connect_hint_has_fixed_values_for_known_principals() {
+        assert_eq!(
+            connect_hint("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"),
+            "WXYw1wqFnUD93SdLiPtFyA"
+        );
+        assert_eq!(
+            connect_hint("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738"),
+            "YvFEO7T_9N80_y4j8sxMVA"
+        );
+    }
+
+    #[test]
+    fn the_connect_hint_is_sixteen_bytes_of_unpadded_base64url() {
+        let hint = connect_hint("owner");
+        assert_eq!(hint.len(), 22);
+        assert!(
+            hint.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_ne!(connect_hint("owner"), connect_hint("another"));
+    }
+}

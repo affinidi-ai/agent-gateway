@@ -909,6 +909,54 @@ mod tests {
         assert!(other.jwt_claims().is_none());
     }
 
+    #[test]
+    fn the_identity_hash_has_fixed_values_for_known_callers() {
+        let jwt_subject = |subject: &str| AuthenticatedIdentity::JwtBearer {
+            subject: subject.to_string(),
+            claims: serde_json::json!({"iss": "https://login.example.com", "sub": subject}),
+        };
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f")
+        );
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738")
+        );
+        assert_eq!(
+            jwt_subject("a\"b\\c\u{e9}\n")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353")
+        );
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "partner-key".to_string(),
+            provider_agent_id: None,
+        };
+        assert_eq!(
+            api_key
+                .principal_hash(None)
+                .as_deref(),
+            Some("67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db")
+        );
+    }
+
+    #[test]
+    fn the_identity_hash_of_a_jwt_is_the_function_of_its_issuer_tenant_and_subject_alone() {
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", None, "alice"),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f".to_string())
+        );
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", Some("tenant-1"), "alice"),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738".to_string())
+        );
+    }
+
     /// The identity hash is the SHA-256 of `[method, issuer, tenant, subject]`,
     /// so a caller is told apart by each, and a JWT that names no subject has no
     /// hash at all.

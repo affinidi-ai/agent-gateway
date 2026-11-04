@@ -139,6 +139,16 @@ export const credentialDelegationDefinition: NodeDefinition = {
       : [];
     return { outbound_credentials_form: rows };
   },
+  // The stored `outbound_credentials` alone decide the rows, so a binding
+  // moved or removed outside the dashboard is never restored from a stale
+  // canvas blob. An element whose rows name no provider yet was never saved,
+  // so it survives a reload.
+  payloadOwnsConfig: true,
+  isBlobPlaceholder: c =>
+    !Array.isArray(c?.outbound_credentials_form) ||
+    (c.outbound_credentials_form as OutboundCredentialFormRow[]).every(
+      row => !row?.credential_provider_id
+    ),
   buildPayload: ctx => {
     const node = ctx.firstNodeOfType('credential-delegation');
     if (!node) return undefined;

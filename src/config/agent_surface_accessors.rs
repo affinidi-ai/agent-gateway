@@ -83,6 +83,28 @@ impl AgentSurface {
             .map_or(&[], |ca| ca.methods.as_slice())
     }
 
+    /// Whether any caller-authentication method forwards the caller's own
+    /// credential to the Target (`jwt_bearer` with `forward_header`).
+    pub fn forwards_caller_credential(&self) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .any(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
+    /// Whether every caller-authentication method forwards the caller's own
+    /// credential to the Target: a request is forwarded with the credential of
+    /// the method it matched, so a method that forwards none leaves its callers
+    /// without one.
+    pub fn forwards_every_caller_credential(&self) -> bool {
+        let methods = self.source_auth_methods();
+        !methods.is_empty()
+            && methods.iter().all(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
     #[inline]
     pub fn has_source_auth(&self) -> bool {
         !self
