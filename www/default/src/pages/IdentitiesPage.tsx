@@ -34,6 +34,32 @@ const metadataAgentName = (metadata?: { agent_name?: unknown }): string | undefi
   typeof metadata?.agent_name === 'string' && metadata.agent_name !== ''
     ? metadata.agent_name
     : undefined;
+type SectionsByDid = Record<string, Set<string>>;
+
+/** Open sections keyed by each entry's current primary DID. */
+const remapSections = (
+  sections: SectionsByDid,
+  primaryDidFor: (did: string) => string
+): SectionsByDid => {
+  const byPrimary: SectionsByDid = {};
+  Object.entries(sections).forEach(([did, open]) => {
+    byPrimary[primaryDidFor(did)] = open;
+  });
+  return byPrimary;
+};
+
+/** `sections` without any stored key of the entry whose primary DID is `primaryDid`. */
+const withoutEntry = (
+  sections: SectionsByDid,
+  primaryDid: string,
+  primaryDidFor: (did: string) => string
+): SectionsByDid => {
+  const next: SectionsByDid = {};
+  Object.entries(sections).forEach(([did, open]) => {
+    if (primaryDidFor(did) !== primaryDid) next[did] = open;
+  });
+  return next;
+};
 
 const IdentitiesPage: React.FC = () => {
   const { actions, getCurrentStats } = useApp();
@@ -182,43 +208,60 @@ const IdentitiesPage: React.FC = () => {
   // Grouping needs the dashboard identities; until they load every DID is its own primary.
   const identitiesLoaded = stats?.identities !== undefined;
 
-  // Handle deep linking to a specific identity: an earlier DID opens its surface entry's versions
-  useEffect(() => {
-    if (identitiesLoaded && linkedDid && linkedPrimaryDid) {
-      const opensVersions = linkedDid !== linkedPrimaryDid;
-      setExpandedIdentityDids(prev =>
-        prev.has(linkedPrimaryDid) ? prev : new Set(prev).add(linkedPrimaryDid)
-      );
-      setExpandedSections(prev => {
-        const current = prev[linkedPrimaryDid];
-        if (current && (!opensVersions || current.has('versions'))) return prev;
-        const next = new Set(current ?? ['summary']);
-        if (opensVersions) next.add('versions');
-        return { ...prev, [linkedPrimaryDid]: next };
-      });
+  // Expansion is stored under the primary DID at the time it was opened. Read it through
+  // `primaryDidFor` so an open entry stays open when another of its DIDs becomes primary.
+  const expandedPrimaryDids = useMemo(
+    () => new Set(Array.from(expandedIdentityDids, primaryDidFor)),
+    [expandedIdentityDids, primaryDidFor]
+  );
+  const sectionsByPrimary = useMemo(
+    () => remapSections(expandedSections, primaryDidFor),
+    [expandedSections, primaryDidFor]
+  );
 
-      // Scroll to the identity after a short delay to ensure rendering
-      setTimeout(() => {
-        const element = identityRefs.current[linkedPrimaryDid];
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      }, 100);
+  // Handle deep linking to a specific identity: an earlier DID opens its surface entry's versions.
+  // Acts once per link, so a later primary change doesn't undo what the user closed.
+  const handledDeepLink = useRef<string>();
+  useEffect(() => {
+    if (!linkedDid) {
+      handledDeepLink.current = undefined;
+      return;
     }
-  }, [identitiesLoaded, linkedDid, linkedPrimaryDid]);
+    if (!identitiesLoaded || !linkedPrimaryDid || handledDeepLink.current === linkedDid) return;
+    handledDeepLink.current = linkedDid;
+    const opensVersions = linkedDid !== linkedPrimaryDid;
+    setExpandedIdentityDids(prev =>
+      Array.from(prev).some(did => primaryDidFor(did) === linkedPrimaryDid)
+        ? prev
+        : new Set(prev).add(linkedPrimaryDid)
+    );
+    setExpandedSections(prev => {
+      const current = remapSections(prev, primaryDidFor)[linkedPrimaryDid];
+      if (current && (!opensVersions || current.has('versions'))) return prev;
+      const next = new Set(current ?? ['summary']);
+      if (opensVersions) next.add('versions');
+      return { ...withoutEntry(prev, linkedPrimaryDid, primaryDidFor), [linkedPrimaryDid]: next };
+    });
+
+    // Scroll to the identity after a short delay to ensure rendering
+    setTimeout(() => {
+      const element = identityRefs.current[linkedPrimaryDid];
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 100);
+  }, [identitiesLoaded, linkedDid, linkedPrimaryDid, primaryDidFor]);
 
   const toggleIdentityDetails = (did: string) => {
-    const isOpen = expandedIdentityDids.has(did);
+    const isOpen = expandedPrimaryDids.has(did);
     setExpandedIdentityDids(prev => {
-      const next = new Set(prev);
-      if (isOpen) next.delete(did);
-      else next.add(did);
+      const next = new Set(Array.from(prev).filter(stored => primaryDidFor(stored) !== did));
+      if (!isOpen) next.add(did);
       return next;
     });
     setExpandedSections(prev => {
-      const next = { ...prev };
-      if (isOpen) delete next[did];
-      else next[did] = new Set(['summary']);
+      const next = withoutEntry(prev, did, primaryDidFor);
+      if (!isOpen) next[did] = new Set(['summary']);
       return next;
     });
     navigate(isOpen ? '/identities' : `/identities/${encodeURIComponent(did)}`);
@@ -227,15 +270,14 @@ const IdentitiesPage: React.FC = () => {
   // Toggle a specific section within an identity
   const toggleSection = (did: string, section: string) => {
     setExpandedSections(prev => {
-      const sections = prev[did] || new Set();
-      const newSections = new Set(sections);
+      const newSections = new Set(remapSections(prev, primaryDidFor)[did]);
       if (newSections.has(section)) {
         newSections.delete(section);
       } else {
         newSections.add(section);
       }
       return {
-        ...prev,
+        ...withoutEntry(prev, did, primaryDidFor),
         [did]: newSections,
       };
     });
@@ -244,7 +286,7 @@ const IdentitiesPage: React.FC = () => {
   const openSurface = (surfaceId: string) => navigate(`/surfaces/${surfaceId}`);
 
   const isSectionExpanded = (did: string, section: string) => {
-    return expandedSections[did]?.has(section) || false;
+    return sectionsByPrimary[did]?.has(section) || false;
   };
 
   /**
@@ -515,7 +557,7 @@ const IdentitiesPage: React.FC = () => {
                           </thead>
                           <tbody>
                             {filteredIdentities.map(identity => {
-                              const isExpanded = expandedIdentityDids.has(identity.did);
+                              const isExpanded = expandedPrimaryDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
                               const sharedManagedDid = isSharedManagedDid(identity);
                               const versions = versionsFor(identity.did);
