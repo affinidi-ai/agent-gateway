@@ -295,7 +295,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   refuses a presentation of the agent beside one. Beside such a binding it disables **Add
   credential** (`credential-delegation-add`), with a line saying it is the Target's only binding
   (`credential-delegation-add-blocked`), and shows no gateway callback URL for it, since its
-  grant arrives through the connect API's own redirect.
+  grant arrives through the connect API's own redirect. Its rows come only from the stored
+  `outbound_credentials` (`payloadOwnsConfig`), so a binding moved to a variant or removed through
+  the API never comes back from the canvas blob; an empty element in the blob (no rows,
+  `isBlobPlaceholder`) is kept. A variant save always sends `outbound_credentials`, `[]` when the
+  variant has no binding, since the gateway reads a missing list as keeping the surface's.
 - **Target authentication** on the Managed Agent (fullscreen editor) and on a Transit Point
   takes its credential from a static secret or from a credential provider. The Managed Agent
   editor has a **Credential Source** select (`managed-agent-target-auth-source`: Static secret,
