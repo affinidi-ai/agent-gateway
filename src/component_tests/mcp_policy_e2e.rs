@@ -1520,6 +1520,7 @@ async fn access_point_tool_scoped_credentials_flow() {
                             "id": "provider", "name": "Provider", "provider_id": "provider",
                             "authorization_endpoint": "https://provider.example/authorize",
                             "client_id_secret_ref": "provider-client-id",
+                            "callback_path": "/v1/identity/oauth/callback/provider",
                             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                         }))
                         .expect("provider"),

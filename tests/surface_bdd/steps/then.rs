@@ -2192,7 +2192,17 @@ fn response_includes_authorization_url(
         .get("authorization_url")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("consent entry for '{provider}' should include authorization_url, got {entry}"));
-    assert!(url.contains("/authorize"), "authorization_url should point at OAuth authorization endpoint, got {url}");
+    let url = url::Url::parse(url).unwrap_or_else(|_| panic!("authorization_url should be a URL, got {url}"));
+    assert_eq!(
+        url.path(),
+        format!("/v1/identity/oauth/callback/{provider}/start"),
+        "authorization_url should point at the gateway's consent start page, got {url}"
+    );
+    assert!(
+        url.query_pairs()
+            .any(|(name, value)| name == "state" && !value.is_empty()),
+        "the consent start page URL should carry a state, got {url}"
+    );
 }
 
 #[then(expr = "the response includes delegated credential scopes {string}")]

@@ -1,0 +1,80 @@
+branch: fix/legacy-consent-callback
+changes:
+  added:
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Add authorization_response_issuer to authorization code providers
+      description: >-
+        An oauth2_authorization_code provider without an issuer takes an optional
+        authorization_response_issuer, the RFC 9207 iss its authorization server sends, set
+        through the API as an https URL with a host and no query or fragment. When set, the
+        consent callback requires that exact iss; when unset, iss is ignored. It does not make
+        the provider an external consent provider.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Offer delegation_failed as a selectable audit and integration event
+      description: >-
+        A refused OAuth consent start or callback is recorded as a delegation_failed audit
+        event with a reason code, and governance audit sinks and integrations can now select
+        that event, which was listed but never produced before.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: ⭐ Bind each OAuth consent callback to the browser that confirmed the start page
+      description: >-
+        Consent now starts on a gateway page that shows the agent, surface, provider and
+        scopes. Its POST, accepted only from the page's own origin, sets a per-consent
+        __Host-ag_consent_<id> cookie (Path=/, no Domain, Secure, HttpOnly, SameSite=Lax) and
+        seals its hash into the state, so a forwarded or leaked callback or vendor URL opened in
+        another browser is refused with 403 before the code is exchanged. A start link is used
+        once per gateway process; the page itself has no side effects, so link scanners do not
+        use it up.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Keep the consent binding cookie away from agents, targets and peers
+      description: >-
+        Every inbound and outbound listener now takes any ag_consent cookie off a request
+        before it is relayed, and strips any ag_consent Set-Cookie the gateway did not write
+        from a relayed response, so a managed agent, target or Fabric peer never sees the
+        binding cookie and cannot plant one in the person's browser.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Check the OAuth consent callback's provider, state and iss before the exchange
+      description: >-
+        The callback now refuses, before any token request, a path that names another provider
+        than its state, a provider that changed or gained an issuer, a state that is not a
+        callback state, and a missing or different iss from a provider with an
+        authorization_response_issuer. The token request sends exactly the redirect_uri the
+        authorization request sent. Every refusal shows one fixed page with no-store and
+        no-referrer that reflects no vendor or error text, and is audited as delegation_failed
+        with a reason.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Refuse unsafe authorization endpoints and reserved additional_params
+      description: >-
+        The vendor authorization URL is built only for an https authorization_endpoint with a
+        host and no credentials or fragment, whose query and additional_params hold at most 32
+        parameters and repeat none of the ones the gateway sets, such as state, redirect_uri or
+        code_challenge. A consent link is not minted for a provider that would fail these
+        checks; the binding is unavailable instead.
+  breaking:
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Point the consent_required authorization URL at the gateway's start page
+      description: >-
+        The authorization_url in a consent_required answer and in an MCP elicitation is now
+        the gateway's {callback URL}/start page, not the vendor's authorization URL, so agents
+        that checked it for the vendor's host, and vendor mobile-app handoff from that link,
+        no longer work. Remedy: open the URL as given; a reverse proxy in front of the gateway
+        must also forward {oauth_callback_route}/{provider_id}/start.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Refuse a non-conforming or shared callback_url on authorization code providers
+      description: >-
+        Creating or updating an oauth2_authorization_code provider without an issuer now
+        needs an https callback_url with no query or fragment whose path ends in the
+        provider's stored callback_path, and a redirect URI no other provider in any tenant
+        uses. Two stored providers sharing a redirect URI, such as two tenants' providers with
+        the same provider_id and no callback_url, both fail closed at consent, and the gateway
+        logs an ERROR naming each pair by provider id at startup and reload; the first tenant to
+        create a provider_id on the gateway's own host keeps it. Remedy: give one provider a
+        callback_url on a distinct host, or recreate it with a distinct provider_id, and
+        register the new redirect URI with the vendor. The dashboard's Credential Provider
+        editor now builds the callback URL from the stored callback_path (or, when creating,
+        the lowercased provider id), so an existing provider saved from the dashboard keeps a
+        conforming path.

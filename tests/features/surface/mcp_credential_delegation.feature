@@ -42,7 +42,7 @@ Feature: MCP credential delegation
     Given the surface requires delegated credentials from OAuth provider "calendar"
     And caller "alice" has started OAuth consent for provider "calendar"
     When OAuth provider "calendar" redirects the caller back <callback condition>
-    Then the OAuth callback response status is 200
+    Then the OAuth callback response status is 400
     And the OAuth callback response shows an authorization failure page
     And OAuth provider "calendar" was not asked to exchange an authorization code
 
@@ -58,7 +58,7 @@ Feature: MCP credential delegation
     And caller "alice" has started OAuth consent for provider "calendar"
     And caller "alice" has completed OAuth consent for provider "calendar"
     When OAuth provider "calendar" redirects the caller back again with the same state
-    Then the OAuth callback response status is 200
+    Then the OAuth callback response status is 400
     And the OAuth callback response shows an authorization failure page
 
   Scenario: Delegated credentials are injected into the MCP server request after consent

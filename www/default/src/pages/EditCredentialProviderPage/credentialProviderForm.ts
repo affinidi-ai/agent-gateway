@@ -247,3 +247,18 @@ export function externalProviderUpdate(form: {
     token_refresh_enabled: form.token_refresh_enabled,
   };
 }
+
+/**
+ * The callback URL of an authorization code provider: `host` followed by the path the
+ * gateway stored for it (`storedPath`), or, for a new provider, the callback route followed
+ * by the lowercased provider id, which is the path the gateway will store.
+ */
+export function callbackUrlFor(
+  host: string,
+  route: string,
+  providerId: string,
+  storedPath: string
+): string {
+  const path = storedPath || `${route}/${providerId.trim().toLowerCase()}`;
+  return `${host}${path}`;
+}

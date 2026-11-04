@@ -9302,6 +9302,7 @@ mod tests {
                     "id": "provider", "name": "Provider", "provider_id": "provider",
                     "authorization_endpoint": "https://provider.example/authorize",
                     "client_id_secret_ref": "provider-client-id",
+                    "callback_path": "/v1/identity/oauth/callback/provider",
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
                 .unwrap(),
@@ -21307,7 +21308,8 @@ mod tests {
             json!({"id": "broken-key", "name": "Broken key", "provider_id": "broken-key",
                 "provider_type": "api_key", "api_key_secret_ref": "missing-secret"}),
             json!({"id": "consent", "name": "Consent", "provider_id": "consent",
-                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id"}),
+                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id",
+                "callback_path": "/v1/identity/oauth/callback/consent"}),
         ] {
             let mut provider = provider;
             provider["created_at"] = json!("2026-10-01T00:00:00Z");
@@ -21567,6 +21569,7 @@ mod tests {
                         "id": provider, "name": provider, "provider_id": provider, "tenant_id": tenant,
                         "authorization_endpoint": "https://provider.example/authorize",
                         "client_id_secret_ref": "client-id",
+                        "callback_path": format!("/v1/identity/oauth/callback/{provider}"),
                         "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -21690,13 +21693,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/consent-required");
         assert_eq!(body["consent_required"][0]["provider_name"], "Consent");
-        assert!(
+        let start = url::Url::parse(
             body["consent_required"][0]["authorization_url"]
                 .as_str()
-                .unwrap()
-                .starts_with("https://provider.example/authorize?"),
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            start
+                .origin()
+                .ascii_serialization(),
+            "https://gateway.example",
             "{body}"
         );
+        assert_eq!(start.path(), "/v1/identity/oauth/callback/consent/start", "{body}");
+        let state = start
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let state = crate::delegation_vault::oauth::decode_start_state(&state).expect("a sealed start state");
+        assert_eq!((state.provider_id.as_str(), state.browser_binding), ("consent", None));
         assert_eq!(
             body.as_object()
                 .unwrap()

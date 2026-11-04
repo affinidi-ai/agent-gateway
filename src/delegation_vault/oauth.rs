@@ -21,75 +21,60 @@ use crate::identity::ssi::vc_issuer::VcSigner;
 use crate::secrets::SecretsStore;
 use std::sync::Arc;
 
-/// Build the authorization URL with resolved client_id from secrets store
-pub async fn build_authorization_url(
+/// How long a consent start link, and the callback state it leads to, stay usable.
+const CONSENT_STATE_LIFETIME_MINUTES: i64 = 10;
+
+/// The prefix of the cookie that binds a consent callback to the browser that
+/// confirmed the consent start page. `__Host-` keeps it on the gateway's own
+/// host, on `Path=/`, so a sibling subdomain cannot set it.
+pub const CONSENT_COOKIE_PREFIX: &str = "__Host-ag_consent_";
+
+/// The binding cookie of `state`: [`CONSENT_COOKIE_PREFIX`] followed by the
+/// first 16 characters of its sealed browser binding, so each consent has a
+/// cookie of its own and the callback reads only that one.
+pub fn binding_cookie_name(state: &OAuthState) -> Option<String> {
+    state
+        .browser_binding
+        .as_deref()
+        .and_then(|binding| binding.get(..16))
+        .map(|id| format!("{CONSENT_COOKIE_PREFIX}{id}"))
+}
+
+/// The gateway's consent start page for `provider`: `{redirect URI}/start`
+/// with a sealed start state. The person opens it and confirms; only then does
+/// the gateway build the vendor's authorization URL.
+pub fn build_authorization_url(
     provider: &CredentialProvider,
     agent_did: &str,
     user_identity_hash: &str,
-    channel_id: &str,
+    surface_id: &str,
     scopes: &[String],
     gateway_base_url: &str,
-    secrets_store: &Arc<dyn SecretsStore>,
 ) -> Result<String> {
-    let auth_endpoint = provider
-        .authorization_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no authorization_endpoint", provider.provider_id))?;
-
-    // Resolve client_id from secrets store
-    let client_id_ref = provider
-        .client_id_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
-        .await
-        .context("Failed to resolve client_id secret")?;
-
-    let nonce = Uuid::new_v4().to_string();
-
-    // Generate PKCE code_verifier (RFC 7636 §4.1: 43-128 chars, unreserved charset)
-    let code_verifier = generate_pkce_verifier();
-    let code_challenge = generate_pkce_challenge(&code_verifier);
-
-    let state = OAuthState {
-        agent_did: agent_did.to_string(),
-        user_identity_hash: user_identity_hash.to_string(),
-        surface_id: channel_id.to_string(),
-        credential_provider_id: provider.id.clone(),
-        provider_id: provider.provider_id.clone(),
-        nonce,
-        expires_at: Utc::now() + Duration::minutes(10),
-        code_verifier: Some(code_verifier),
-    };
-
-    let state_encoded = encode_oauth_state(&state)?;
-
-    let callback_url = provider
-        .callback_url
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
-
+    let mut url = provider
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
     let effective_scopes = if scopes.is_empty() {
         &provider.default_scopes
     } else {
         scopes
     };
-    let scope_string = effective_scopes.join(" ");
-
-    let mut url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-        auth_endpoint,
-        urlencoding::encode(&client_id),
-        urlencoding::encode(&callback_url),
-        urlencoding::encode(&scope_string),
-        urlencoding::encode(&state_encoded),
-        urlencoding::encode(&code_challenge),
-    );
-
-    for (key, value) in &provider.additional_params {
-        url.push_str(&format!("&{}={}", urlencoding::encode(key), urlencoding::encode(value)));
-    }
+    let state = OAuthState {
+        agent_did: agent_did.to_string(),
+        user_identity_hash: user_identity_hash.to_string(),
+        surface_id: surface_id.to_string(),
+        credential_provider_id: provider.id.clone(),
+        provider_id: provider.provider_id.clone(),
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES),
+        code_verifier: None,
+        scopes: effective_scopes.to_vec(),
+        browser_binding: None,
+    };
+    let start_path = format!("{}/start", url.path());
+    url.set_path(&start_path);
+    url.query_pairs_mut()
+        .append_pair("state", &encode_oauth_state(&state)?);
 
     info!(
         target: "credential_delegation",
@@ -97,10 +82,236 @@ pub async fn build_authorization_url(
         agent_did = %agent_did,
         user_hash = %user_identity_hash,
         scopes = ?effective_scopes,
-        "Built OAuth authorization URL with resolved client_id"
+        "Built OAuth consent start URL"
     );
 
+    Ok(url.into())
+}
+
+/// The consent start page for `provider` ([`build_authorization_url`]), minted
+/// only when the start POST could complete: the redirect URI follows the
+/// consent rules and no other provider has it, the client ID resolves, and the
+/// vendor's authorization URL can be built.
+#[allow(clippy::too_many_arguments)]
+pub async fn mint_consent_link(
+    provider: &CredentialProvider,
+    agent_did: &str,
+    user_identity_hash: &str,
+    surface_id: &str,
+    scopes: &[String],
+    gateway_base_url: &str,
+    secrets_store: &Arc<dyn SecretsStore>,
+    provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+) -> Result<String> {
+    let redirect_uri = provider
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
+    if crate::credential_providers::redirect_uri_taken_by(provider_store, provider, gateway_base_url)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!("Provider '{}' shares its redirect URI with another provider", provider.provider_id));
+    }
+    let client_id_ref = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
+    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
+        .await
+        .context("Failed to resolve client_id secret")?;
+    let effective_scopes = if scopes.is_empty() {
+        &provider.default_scopes
+    } else {
+        scopes
+    };
+    vendor_authorization_url(provider, &client_id, redirect_uri.as_str(), effective_scopes, "preflight", "preflight")?;
+    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url)
+}
+
+/// What the consent start POST answers with: the vendor's authorization URL,
+/// the binding cookie's value and when the callback state expires.
+pub struct ConsentStart {
+    pub vendor_url: url::Url,
+    pub cookie_name: String,
+    pub cookie_value: zeroize::Zeroizing<String>,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+/// Begin consent from a decoded start state: resolve the client id, make a
+/// PKCE verifier and 32 random binding bytes, seal a callback state that holds
+/// the verifier and the bytes' SHA-256 under a fresh nonce, and build the
+/// vendor's authorization URL. Nothing is claimed: the caller claims the start
+/// nonce once this succeeds.
+pub async fn begin_consent(
+    provider: &CredentialProvider,
+    start: &OAuthState,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<ConsentStart> {
+    let client_id_ref = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
+    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
+        .await
+        .context("Failed to resolve client_id secret")?;
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rng().fill(&mut binding[..]);
+    let expires_at = start
+        .expires_at
+        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES));
+    let callback = OAuthState {
+        nonce: Uuid::new_v4().to_string(),
+        expires_at,
+        code_verifier: Some(code_verifier),
+        browser_binding: Some(base64_url_encode_bytes(&Sha256::digest(binding.as_slice()))),
+        ..start.clone()
+    };
+    let vendor_url = vendor_authorization_url(
+        provider,
+        &client_id,
+        redirect_uri.as_str(),
+        &start.scopes,
+        &encode_oauth_state(&callback)?,
+        &code_challenge,
+    )?;
+    Ok(ConsentStart {
+        vendor_url,
+        cookie_name: binding_cookie_name(&callback).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
+        cookie_value: zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
+        expires_at,
+    })
+}
+
+/// The authorization request parameters the gateway sets itself, which neither
+/// the endpoint's own query nor `additional_params` may repeat.
+const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
+    ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"];
+
+/// The vendor's authorization URL. The endpoint must be an https URL with a
+/// host and no credentials or fragment; it and `additional_params` together
+/// hold at most 32 parameters, none reserved or repeated, names of at most 128
+/// bytes and values of at most 2048.
+fn vendor_authorization_url(
+    provider: &CredentialProvider,
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &[String],
+    state: &str,
+    code_challenge: &str,
+) -> Result<url::Url> {
+    let endpoint = provider
+        .authorization_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no authorization_endpoint", provider.provider_id))?;
+    let mut url = url::Url::parse(endpoint)
+        .map_err(|_| anyhow!("Provider '{}' has an invalid authorization_endpoint", provider.provider_id))?;
+    if !crate::url_validation::is_https_or_bdd_allowed(&url)
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "Provider '{}' authorization_endpoint must be an https URL with a host and no credentials or fragment",
+            provider.provider_id
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut count = 0usize;
+    let endpoint_params = url
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    for (name, value) in endpoint_params
+        .iter()
+        .map(|(name, value)| (name, value))
+        .chain(&provider.additional_params)
+    {
+        count += 1;
+        if count > 32
+            || RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str())
+            || name.len() > 128
+            || value.len() > 2048
+            || !names.insert(name.as_str())
+        {
+            return Err(anyhow!(
+                "Provider '{}' authorization_endpoint query or additional_params repeat a reserved or duplicate \
+                 parameter, or exceed the limits",
+                provider.provider_id
+            ));
+        }
+    }
+    url.query_pairs_mut()
+        .extend_pairs([
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", scopes.join(" ").as_str()),
+            ("state", state),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .extend_pairs(&provider.additional_params);
     Ok(url)
+}
+
+/// Decode a consent start state: one with neither a browser binding nor a PKCE
+/// verifier, which only [`build_authorization_url`] seals.
+pub fn decode_start_state(encoded: &str) -> Result<OAuthState> {
+    let state = decode_oauth_state(encoded)?;
+    if state
+        .browser_binding
+        .is_some()
+        || state.code_verifier.is_some()
+    {
+        return Err(anyhow!("OAuth state is not a consent start state"));
+    }
+    Ok(state)
+}
+
+/// Decode a consent callback state: one with a browser binding and a PKCE
+/// verifier, which only [`begin_consent`] seals.
+pub fn decode_callback_state(encoded: &str) -> Result<OAuthState> {
+    let state = decode_oauth_state(encoded)?;
+    if state
+        .browser_binding
+        .is_none()
+        || state.code_verifier.is_none()
+    {
+        return Err(anyhow!("OAuth state is not a consent callback state"));
+    }
+    Ok(state)
+}
+
+/// Whether `cookie_value`, the value of `state`'s own binding cookie, is the
+/// browser binding `state` was sealed with: 32 base64url bytes whose SHA-256 is
+/// the state's, compared in constant time.
+pub fn browser_binding_matches(
+    state: &OAuthState,
+    cookie_value: Option<&str>,
+) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(expected) = state
+        .browser_binding
+        .as_deref()
+        .and_then(|binding| base64_url_decode(binding).ok())
+        .filter(|binding| binding.len() == 32)
+    else {
+        return false;
+    };
+    cookie_value
+        .and_then(|value| base64_url_decode(value).ok())
+        .filter(|bytes| bytes.len() == 32)
+        .is_some_and(|bytes| {
+            bool::from(
+                Sha256::digest(&bytes)
+                    .as_slice()
+                    .ct_eq(&expected),
+            )
+        })
 }
 
 /// Exchange an OAuth authorization code for tokens
@@ -165,10 +376,9 @@ async fn exchange_code_for_tokens_with(
     .context("Failed to resolve client_secret")?;
 
     let callback_url = provider
-        .callback_url
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?
+        .to_string();
     crate::url_validation::validate_oauth_endpoint_url(&callback_url)
         .map_err(|e| anyhow!("Blocked callback_url for provider '{}': {}", provider.provider_id, e))?;
     let (http_client, token_url) = egress
@@ -1338,6 +1548,12 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .is_fresh()
 }
 
+/// Whether `state`'s nonce was already claimed on this process.
+#[cfg(test)]
+pub(crate) async fn is_claimed(state: &OAuthState) -> bool {
+    USED_STATE_NONCES.contains_key(&state.nonce)
+}
+
 /// Why a provider's secret could not be read.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProviderSecretError {
@@ -1423,6 +1639,8 @@ mod tests {
             nonce: "nonce-42".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1449,6 +1667,8 @@ mod tests {
             nonce: "nonce".to_string(),
             expires_at: Utc::now() - Duration::minutes(1), // already expired
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1458,6 +1678,188 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("expired"), "Error should mention expiry, got: {}", err_msg);
+    }
+
+    fn consent_provider() -> CredentialProvider {
+        serde_json::from_value(json!({
+            "id": "cp-1", "name": "GitHub", "provider_id": "github",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize?allow_signup=false",
+            "default_scopes": ["repo"], "callback_path": "/v1/identity/oauth/callback/github",
+            "additional_params": {"prompt": "consent"},
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_vendor_url_carries_the_gateways_parameters_once_after_the_endpoints_own() {
+        let url = vendor_authorization_url(
+            &consent_provider(),
+            "client",
+            "https://gw.example/v1/identity/oauth/callback/github",
+            &["repo".to_string(), "read:user".to_string()],
+            "sealed",
+            "challenge",
+        )
+        .unwrap();
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("allow_signup", "false"),
+            ("response_type", "code"),
+            ("client_id", "client"),
+            ("redirect_uri", "https://gw.example/v1/identity/oauth/callback/github"),
+            ("scope", "repo read:user"),
+            ("state", "sealed"),
+            ("code_challenge", "challenge"),
+            ("code_challenge_method", "S256"),
+            ("prompt", "consent"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(pairs, expected);
+        assert_eq!(
+            url.origin()
+                .ascii_serialization(),
+            "https://github.com"
+        );
+    }
+
+    #[test]
+    fn the_vendor_url_refuses_an_unsafe_endpoint_and_reserved_or_oversized_parameters() {
+        let build = |provider: &CredentialProvider| {
+            vendor_authorization_url(provider, "client", "https://gw.example/cb", &[], "sealed", "challenge")
+        };
+        for endpoint in [
+            "http://github.com/login/oauth/authorize",
+            "https://user:pass@github.com/authorize",
+            "https://github.com/authorize#fragment",
+            "https://github.com/authorize?state=forged",
+            "https://github.com/authorize?a=1&a=2",
+            "not a url",
+        ] {
+            let mut provider = consent_provider();
+            provider.authorization_endpoint = Some(endpoint.to_string());
+            assert!(build(&provider).is_err(), "{endpoint}");
+        }
+        for (name, value) in [
+            ("redirect_uri", "https://attacker.example".to_string()),
+            ("code_challenge", "x".to_string()),
+            ("allow_signup", "true".to_string()),
+            ("long", "v".repeat(2049)),
+            (&"n".repeat(129), "v".to_string()),
+        ] {
+            let mut provider = consent_provider();
+            provider
+                .additional_params
+                .insert(name.to_string(), value);
+            assert!(build(&provider).is_err(), "{name}");
+        }
+        let mut provider = consent_provider();
+        provider.additional_params = (0..32)
+            .map(|index| (format!("p{index}"), "v".to_string()))
+            .collect();
+        assert!(build(&provider).is_err(), "33 parameters with the endpoint's own");
+        provider
+            .additional_params
+            .remove("p0");
+        assert!(build(&provider).is_ok(), "32 parameters");
+        let mut provider = consent_provider();
+        provider.authorization_endpoint = None;
+        assert!(build(&provider).is_err());
+    }
+
+    #[test]
+    fn the_consent_url_is_the_gateways_start_page_with_a_start_state() {
+        let mut provider = consent_provider();
+        provider.callback_url = Some("https://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
+        let url = url::Url::parse(
+            &build_authorization_url(
+                &provider,
+                "did:web:agent",
+                "sha256:user",
+                "surface",
+                &[],
+                "https://ignored.example",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            url.origin()
+                .ascii_serialization(),
+            "https://gw.example"
+        );
+        assert_eq!(url.path(), "/prefix/v1/identity/oauth/callback/github/start");
+        let state = url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let start = decode_start_state(&state).unwrap();
+        assert_eq!(start.scopes, ["repo"]);
+        assert_eq!((start.code_verifier, start.browser_binding), (None, None));
+        assert!(decode_callback_state(&state).is_err(), "a start state is not a callback state");
+
+        provider.callback_url = Some("http://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
+        assert!(
+            build_authorization_url(&provider, "did:web:agent", "sha256:user", "surface", &[], "https://gw.example")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn each_consent_stage_decodes_only_its_own_state() {
+        let start = OAuthState {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            code_verifier: None,
+            ..sample_state()
+        };
+        let older = sample_state();
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        let binding_only = OAuthState {
+            code_verifier: None,
+            ..callback.clone()
+        };
+        let [start, older, callback, binding_only] =
+            [start, older, callback, binding_only].map(|state| encode_oauth_state(&state).unwrap());
+        assert!(decode_start_state(&start).is_ok());
+        assert!(decode_callback_state(&callback).is_ok());
+        for refused in [&older, &callback, &binding_only] {
+            assert!(decode_start_state(refused).is_err());
+        }
+        for refused in [&start, &older, &binding_only] {
+            assert!(decode_callback_state(refused).is_err());
+        }
+    }
+
+    #[test]
+    fn only_the_browsers_own_binding_bytes_match_their_state() {
+        let bytes = [7u8; 32];
+        let state = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest(bytes))),
+            ..sample_state()
+        };
+        let cookie = base64_url_encode_bytes(&bytes);
+        assert!(browser_binding_matches(&state, Some(cookie.as_str())));
+        let other = base64_url_encode_bytes(&[8u8; 32]);
+        let hash_itself = state
+            .browser_binding
+            .clone()
+            .unwrap();
+        let short = base64_url_encode_bytes(&bytes[..16]);
+        for refused in [other.as_str(), hash_itself.as_str(), short.as_str(), "", "!!"] {
+            assert!(!browser_binding_matches(&state, Some(refused)), "{refused}");
+        }
+        assert!(!browser_binding_matches(&state, None));
+        assert!(!browser_binding_matches(&sample_state(), Some(cookie.as_str())), "a state without a binding");
+        assert_eq!(binding_cookie_name(&state).unwrap(), format!("__Host-ag_consent_{}", &hash_itself[..16]));
+        assert_eq!(binding_cookie_name(&sample_state()), None);
     }
 
     #[test]
@@ -1476,6 +1878,8 @@ mod tests {
             nonce: "nonce-42".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: Some("pkce-verifier".to_string()),
+            scopes: Vec::new(),
+            browser_binding: None,
         }
     }
 
@@ -1821,7 +2225,7 @@ mod tests {
         ) -> CredentialProvider {
             let mut value = json!({
                 "id": "cp", "name": "Provider", "provider_id": "provider",
-                "token_endpoint": token_endpoint,
+                "token_endpoint": token_endpoint, "callback_path": "/v1/identity/oauth/callback/provider",
                 "jwt_signing_key_secret_ref": "SIGNING_KEY",
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             });
@@ -2532,6 +2936,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         };
@@ -2583,6 +2988,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         };
@@ -2688,6 +3094,8 @@ mod tests {
             nonce: "nonce-pkce".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: Some("test_verifier_value_12345678901234567890".to_string()),
+            scopes: Vec::new(),
+            browser_binding: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -2706,6 +3114,8 @@ mod tests {
             nonce: "nonce-no-pkce".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -2758,6 +3168,7 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
         };
