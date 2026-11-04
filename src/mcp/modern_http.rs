@@ -169,16 +169,24 @@ impl EndpointHttpPolicy {
         &self,
         error: axum::Error,
     ) -> Box<McpRequestValidationError> {
-        if std::error::Error::source(&error).is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) {
+        if crate::proxy::exceeds_length_limit(&error) {
             BODY_TOO_LARGE.into_validation_error(None)
         } else {
-            HttpAdmissionError {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to read MCP request body",
-            }
-            .into_validation_error(None)
+            BODY_READ_FAILED.into_validation_error(None)
         }
     }
+}
+
+/// The JSON-RPC error, with no id, an MCP endpoint answers a request body over
+/// its limit with.
+pub fn body_too_large_response() -> axum::response::Response {
+    BODY_TOO_LARGE.into_response(None)
+}
+
+/// The JSON-RPC error, with no id, an MCP endpoint answers a request body it
+/// could not read with.
+pub fn body_read_failed_response() -> axum::response::Response {
+    BODY_READ_FAILED.into_response(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +240,10 @@ const HEADERS_TOO_LARGE: HttpAdmissionError = HttpAdmissionError {
 const BODY_TOO_LARGE: HttpAdmissionError = HttpAdmissionError {
     status: StatusCode::PAYLOAD_TOO_LARGE,
     message: "MCP request body exceeds the configured limit",
+};
+const BODY_READ_FAILED: HttpAdmissionError = HttpAdmissionError {
+    status: StatusCode::BAD_REQUEST,
+    message: "Failed to read MCP request body",
 };
 
 const NON_POST_BODY: HttpAdmissionError = HttpAdmissionError {

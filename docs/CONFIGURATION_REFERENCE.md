@@ -159,7 +159,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
-| `[a2a]` | Default A2A revision, body size, timeouts, fabric timeouts and envelope lifetime, inbound cache sizing |
+| `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
@@ -223,11 +223,32 @@ included), makes them so, and so does the same on an inbound listener that share
 with it, because that inbound listener passes `/outbound/...` requests on to it. Two external
 URLs share a host name when their hosts match, ignoring case and port; an IPv6 address matches
 only the same address, however it is written (`[2001:db8::1]` and `[2001:DB8:0::1]` match,
-`[2001:db8::1]` and `[2001:db8::2]` do not). A Transit Point that serves callers it does not
-authenticate and is reachable that way is reported in the admin API's answer and the log. A
-Transit Point that authenticates callers by client certificate takes the certificate from the
-outbound listener's own TLS handshake or from a proxy in `tls.client_auth.trusted_proxies`,
-never through an inbound listener. See
+`[2001:db8::1]` and `[2001:db8::2]` do not). The inbound listener streams
+the request and the response, so the outbound listener authenticates the caller before the
+body is read and an event stream arrives as it is sent. It sets no overall timeout, leaving
+the stream deadlines to the outbound listener, and keeps the request method. A Transit Point
+body through it is bounded by `[a2a] max_body_size`, even an MCP Transit Point's with a larger
+`mcp_http.max_request_bytes`, which holds in full only on the outbound listener's own port:
+exactly for a body that declares its `Content-Length`, and to within 512 KiB and one chunk for a
+chunked body, which such an MCP Transit Point still accepts. A
+body that declares a larger `Content-Length` is refused with `413` without being read. A
+longer body is streamed on, and the Transit Point refuses it with its own `413` and records
+the refusal; the hop stops it after the chunk that takes it 512 KiB past the limit, which only
+an MCP Transit Point with a larger limit reaches. Those two hop refusals, the declared length
+and the MCP limit above `max_body_size`, are not recorded as `request_rejected`; the hop logs
+them with the caller's address. A body the caller fails to send is refused with `400`. The
+hop's own `413` and `400` are a JSON-RPC error with no `id` and code `-32600` when the
+request carries an `MCP-Protocol-Version` header, as an MCP endpoint answers, and an A2A
+problem (`application/problem+json`) otherwise. A refusal the outbound listener answers
+before it reads the whole body (a transit token `401` or `403`, a rate limit `429`, or an
+MCP Transit Point's own `413` for a body over its `mcp_http.max_request_bytes` but within
+`max_body_size`) can reach the caller as `502` when the body is large, because the reset of
+the unread body can overtake the answer, or as the hop's `413` when the body is also over
+`max_body_size`. A Transit
+Point that serves callers it does not authenticate and is reachable that way is reported in
+the admin API's answer and the log. A Transit Point that authenticates callers by
+client certificate takes the certificate from the outbound listener's own TLS handshake or
+from a proxy in `tls.client_auth.trusted_proxies`, never through an inbound listener. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers).
 
 ![An inbound listener route-matching to two Access Points, and an outbound listener route-matching to two Transit Points](assets/diagrams/listeners-route-matching.png)

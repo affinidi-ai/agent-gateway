@@ -13,6 +13,7 @@
 //! | [`health_checker`] | 10 s | follows | Health-check probes (endpoints may redirect) |
 //! | [`with_timeout`] | caller-supplied | `none` | Pipe executors with per-target timeouts |
 //! | [`proxy_with_timeout`] | caller-supplied | `none` | Internal proxy hop with connection pooling |
+//! | [`shared_host_hop`] | none; caller-supplied read idle | `none` | Shared-host `/outbound` hop to the outbound listener |
 
 use std::time::Duration;
 
@@ -69,6 +70,27 @@ pub fn proxy_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
         .user_agent("Affinidi-Fabric-Agent-Gateway/1.0")
         .build()
         .context("Failed to build proxy HTTP client")
+}
+
+/// Client for the shared-host `/outbound` hop from an inbound listener to the
+/// outbound listener on the same host.
+///
+/// - No total timeout: the outbound listener owns the request and stream
+///   deadlines, so a stream it allows is never cut at the hop
+/// - Caller-supplied read idle timeout, reset by every read
+/// - Redirects disabled
+pub fn shared_host_hop(read_idle: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_idle)
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(60))
+        .user_agent("Affinidi-Fabric-Agent-Gateway/1.0")
+        .build()
+        .context("Failed to build shared-host hop HTTP client")
 }
 
 #[cfg(test)]

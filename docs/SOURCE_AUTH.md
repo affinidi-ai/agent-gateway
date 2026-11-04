@@ -275,7 +275,8 @@ An XFCC header from any other source is not trusted.
 ### DID Auth
 
 A two-step ceremony: `POST /authenticate/challenge` issues a challenge, and
-`POST /authenticate` accepts a JWS over it.
+`POST /authenticate` accepts a JWS over it. Either request body may hold at most 64 KiB; a
+larger one is refused with HTTP `413` before it is parsed.
 
 ```mermaid
 sequenceDiagram
