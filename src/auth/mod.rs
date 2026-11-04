@@ -12,6 +12,7 @@ pub mod session;
 pub mod session_cleanup;
 pub mod session_cookie;
 pub mod session_finalizer;
+pub mod setup_token;
 pub mod state;
 pub mod storage;
 #[cfg(debug_assertions)]
