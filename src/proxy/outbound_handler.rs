@@ -18169,6 +18169,30 @@ mod tests {
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/connect-required");
         assert!(vendor.requests().is_empty());
 
+        let oid_caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "00000000-0000-0000-0000-0000000000aa".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
+                "oid": "00000000-0000-0000-0000-0000000000aa" }),
+        }
+        .principal_hash(None)
+        .unwrap();
+        let mut ctx = external_grant_context(&mcp, VENDOR_HOP, Some(&oid_caller));
+        let response = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err()
+            .into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["error"]["data"]["hint"], "bjXra_R6O-9aJ7DUY5xpnA",
+            "an oid caller's hint is the contract's, from the hash with the claim's name"
+        );
+
         let owner = fixture_surface(&vendor, "owner", "mcp");
         store_grant(
             &state,
@@ -19095,6 +19119,17 @@ mod tests {
                 "a caller named by `sub` is not the caller named by `oid`"
             );
         }
+        let without_oid = AuthenticatedIdentity::JwtBearer {
+            subject: "<none>".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
+        };
+        assert!(
+            step_inject_credentials(&state, &mut context(without_oid))
+                .await
+                .is_err(),
+            "a token without the strategy's claim names no caller, so the Transit Point gives no credential"
+        );
     }
 
     /// The `credential_delegation` lines that refuse a Transit Point call for

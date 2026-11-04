@@ -394,7 +394,10 @@ async fn an_access_point_refuses_delegation_to_a_token_without_the_strategys_cla
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/identity-required", "{claims}");
     }
     let named = call_access_point(&h, &caller_jwt(&fixture, json!({ "sub": "alice", "oid": "person-1" }))).await;
-    let named_status = named.status();
-    let body = named.text().await.unwrap();
-    assert!(!body.contains("identity-required"), "a token with the claim is a caller ({named_status}): {body}");
+    assert_eq!(named.status(), 503, "a token with the claim is a caller, and goes on to delegation");
+    let body: serde_json::Value = named.json().await.unwrap();
+    assert_eq!(
+        body["type"], "https://affinidi.com/atg/errors/delegated-credentials-unavailable",
+        "past the caller check, this harness has no vault to give a credential from: {body}"
+    );
 }
