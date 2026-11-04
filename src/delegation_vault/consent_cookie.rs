@@ -10,16 +10,22 @@ use axum::{
     response::Response,
 };
 
-/// Whether `name` is a consent binding cookie's name, `ag_consent…` with or
-/// without a `__Secure-` or `__Host-` prefix, in any case.
-pub fn is_consent_cookie_name(name: &str) -> bool {
-    let name = name
-        .trim()
-        .to_ascii_lowercase();
-    name.strip_prefix("__host-")
-        .or_else(|| name.strip_prefix("__secure-"))
-        .unwrap_or(&name)
-        .starts_with("ag_consent")
+/// Whether `name`, raw header bytes, is a consent binding cookie's name:
+/// `ag_consent…` with or without a `__Secure-` or `__Host-` prefix, in any
+/// ASCII case. Bytes, not text, so a byte outside visible ASCII anywhere in a
+/// header never hides a consent cookie.
+fn is_consent_name(name: &[u8]) -> bool {
+    let name = name.trim_ascii();
+    let starts_with = |bytes: &[u8], prefix: &[u8]| {
+        bytes
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let bare = [&b"__host-"[..], b"__secure-"]
+        .into_iter()
+        .find(|prefix| starts_with(name, prefix))
+        .map_or(name, |prefix| &name[prefix.len()..]);
+    starts_with(bare, b"ag_consent")
 }
 
 /// The consent cookies a request carried, as `(name, value)`, taken off its
@@ -66,65 +72,92 @@ pub async fn guard(
     response
 }
 
-/// Removes the consent cookie pairs from `headers`' `Cookie` values, keeping
-/// every other pair, and returns them.
+/// Removes the consent cookie pairs from `headers`' `Cookie` values, judged by
+/// their bytes, and returns them; every other pair is kept byte for byte, and a
+/// `Cookie` header left with none is dropped.
 pub fn take_consent_cookies(headers: &mut HeaderMap) -> Vec<(String, String)> {
     let mut taken = Vec::new();
     let mut kept = Vec::new();
+    let mut changed = false;
     for value in headers.get_all(header::COOKIE) {
-        let Ok(text) = value.to_str() else {
-            kept.push(value.clone());
-            continue;
-        };
-        let mut others = Vec::new();
-        for pair in text
-            .split(';')
-            .map(str::trim)
+        let mut others: Vec<&[u8]> = Vec::new();
+        for pair in value
+            .as_bytes()
+            .split(|byte| *byte == b';')
+            .map(<[u8]>::trim_ascii)
             .filter(|pair| !pair.is_empty())
         {
-            match pair.split_once('=') {
-                Some((name, value)) if is_consent_cookie_name(name) => {
-                    taken.push((name.trim().to_string(), value.trim().to_string()));
-                }
-                _ => others.push(pair),
+            let (name, cookie) = match pair
+                .iter()
+                .position(|byte| *byte == b'=')
+            {
+                Some(at) => (&pair[..at], Some(&pair[at + 1..])),
+                None => (pair, None),
+            };
+            if !is_consent_name(name) {
+                others.push(pair);
+                continue;
+            }
+            changed = true;
+            if let Some(cookie) = cookie {
+                taken.push((
+                    String::from_utf8_lossy(name.trim_ascii()).into_owned(),
+                    String::from_utf8_lossy(cookie.trim_ascii()).into_owned(),
+                ));
             }
         }
         if !others.is_empty()
-            && let Ok(value) = HeaderValue::from_str(&others.join("; "))
+            && let Ok(value) = HeaderValue::from_bytes(&others.join(&b"; "[..]))
         {
             kept.push(value);
         }
     }
-    if taken.is_empty() {
-        return taken;
-    }
-    headers.remove(header::COOKIE);
-    for value in kept {
-        headers.append(header::COOKIE, value);
+    if changed {
+        headers.remove(header::COOKIE);
+        for value in kept {
+            headers.append(header::COOKIE, value);
+        }
     }
     taken
 }
 
-/// Removes every `Set-Cookie` whose cookie is a consent cookie.
+/// Whether a `Set-Cookie` sets a consent cookie, judged by its bytes: its name,
+/// or, for a nameless one (no `=`, or nothing before it), its value.
+fn sets_consent_cookie(value: &HeaderValue) -> bool {
+    let bytes = value.as_bytes();
+    let pair = bytes
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or(bytes);
+    match pair
+        .iter()
+        .position(|byte| *byte == b'=')
+    {
+        Some(at)
+            if !pair[..at]
+                .trim_ascii()
+                .is_empty() =>
+        {
+            is_consent_name(&pair[..at])
+        }
+        Some(at) => is_consent_name(&pair[at + 1..]),
+        None => is_consent_name(pair),
+    }
+}
+
+/// Removes every `Set-Cookie` that sets a consent cookie.
 pub fn strip_consent_set_cookies(headers: &mut HeaderMap) {
-    let consent = |value: &HeaderValue| {
-        value
-            .to_str()
-            .ok()
-            .and_then(|text| text.split_once('='))
-            .is_some_and(|(name, _)| is_consent_cookie_name(name))
-    };
     if !headers
         .get_all(header::SET_COOKIE)
         .iter()
-        .any(consent)
+        .any(sets_consent_cookie)
     {
         return;
     }
     let kept: Vec<HeaderValue> = headers
         .get_all(header::SET_COOKIE)
         .iter()
-        .filter(|value| !consent(value))
+        .filter(|value| !sets_consent_cookie(value))
         .cloned()
         .collect();
     headers.remove(header::SET_COOKIE);
@@ -144,11 +177,12 @@ mod tests {
         for name in
             ["ag_consent", "__Host-ag_consent_abc", "__Secure-ag_consent", "__host-AG_CONSENT_x", " ag_consent_1"]
         {
-            assert!(is_consent_cookie_name(name), "{name}");
+            assert!(is_consent_name(name.as_bytes()), "{name}");
         }
         for name in ["session", "__Host-session", "consent", "xag_consent", "__Secure-ag_consen"] {
-            assert!(!is_consent_cookie_name(name), "{name}");
+            assert!(!is_consent_name(name.as_bytes()), "{name}");
         }
+        assert!(is_consent_name(b"__HOST-AG_CONSENT_\xff"), "a high byte after the name");
     }
 
     /// A relay behind the guard: what reached it, and an upstream answer that
@@ -206,6 +240,65 @@ mod tests {
             .map(|value| value.to_str().unwrap())
             .collect();
         assert_eq!(cookies, ["a=1; b=2"]);
+    }
+
+    /// A header holding a byte outside visible ASCII is judged by its bytes too:
+    /// a consent cookie in it is still taken off the request or the response,
+    /// and the other cookies in it pass byte for byte.
+    #[tokio::test]
+    async fn headers_with_non_ascii_bytes_carry_no_consent_cookie_either() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = Router::new()
+            .route(
+                "/relay",
+                get(move |headers: HeaderMap| async move {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(headers);
+                    let mut response = Response::new(Body::empty());
+                    for value in [
+                        &b"__Host-ag_consent_abc=planted; Path=/; Secure; X=caf\xc3\xa9"[..],
+                        b" __HOST-AG_CONSENT_x=planted\xff",
+                        b"=__Host-ag_consent_abc=planted; Path=/",
+                        b"__Secure-ag_consent",
+                        b"pref=caf\xc3\xa9; Path=/",
+                        b"lb=node-2",
+                    ] {
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, HeaderValue::from_bytes(value).unwrap());
+                    }
+                    response
+                }),
+            )
+            .layer(axum::middleware::from_fn(guard));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/relay")
+                    .header("cookie", HeaderValue::from_bytes(b"pref=caf\xc3\xa9; __Host-ag_consent_x=SECRET").unwrap())
+                    .header("cookie", HeaderValue::from_bytes(b"__Host-ag_consent_y=caf\xc3\xa9").unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let set: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        assert_eq!(set, [b"pref=caf\xc3\xa9; Path=/".to_vec(), b"lb=node-2".to_vec()]);
+        let seen = seen.lock().unwrap();
+        let cookies: Vec<_> = seen[0]
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        assert_eq!(cookies, [b"pref=caf\xc3\xa9".to_vec()]);
     }
 
     /// The gateway's own consent responses keep their cookie, and the callback

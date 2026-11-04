@@ -262,3 +262,30 @@ export function callbackUrlFor(
   const path = storedPath || `${route}/${providerId.trim().toLowerCase()}`;
   return `${host}${path}`;
 }
+
+/**
+ * The callback URL to save: the stored one, reverse proxy prefix and all, while the chosen
+ * `host` is still its host; otherwise the URL `callbackUrlFor` builds.
+ */
+export function callbackUrlToSave(
+  storedUrl: string,
+  host: string,
+  route: string,
+  providerId: string,
+  storedPath: string
+): string {
+  try {
+    const stored = new URL(storedUrl);
+    if (
+      stored.origin === new URL(host).origin &&
+      stored.protocol === 'https:' &&
+      storedPath !== '' &&
+      stored.pathname.endsWith(storedPath)
+    ) {
+      return storedUrl;
+    }
+  } catch {
+    // no stored URL, or one that does not parse: build it
+  }
+  return callbackUrlFor(host, route, providerId, storedPath);
+}

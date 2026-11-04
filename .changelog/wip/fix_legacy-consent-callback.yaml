@@ -75,6 +75,8 @@ changes:
         create a provider_id on the gateway's own host keeps it. Remedy: give one provider a
         callback_url on a distinct host, or recreate it with a distinct provider_id, and
         register the new redirect URI with the vendor. The dashboard's Credential Provider
-        editor now builds the callback URL from the stored callback_path (or, when creating,
-        the lowercased provider id), so an existing provider saved from the dashboard keeps a
-        conforming path.
+        editor now keeps an existing provider's stored callback_url, reverse proxy prefix
+        included, while its host is unchanged and it already conforms, and otherwise builds it
+        from the stored
+        callback_path (or, when creating, the lowercased provider id), so a provider saved
+        from the dashboard keeps a conforming path.
