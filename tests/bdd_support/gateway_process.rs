@@ -11,6 +11,8 @@ use crate::bdd_support::config::ReservedPort;
 pub const SURFACE_TEST_AUTH_TOKEN: &str = "surface-bdd-test-token-32-plus-chars";
 pub const G2G_TEST_AUTH_TOKEN: &str = "g2g-bdd-test-token-32-plus-characters";
 
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub enum OutputMode {
     Piped,
     GatewayLog,
@@ -128,6 +130,51 @@ impl GatewayProcess {
         wait_for_gateway_process(&mut self.child, self.port, timeout).await
     }
 
+    /// Waits until this gateway has written `own_file`, a file in its own storage that no other
+    /// process writes, then until its port accepts a connection, and fails unless the process is
+    /// still running after that. A connection another process accepts on the port before this
+    /// gateway has started that far cannot pass for this gateway.
+    pub async fn wait_until_ready_after_writing(
+        &mut self,
+        own_file: &Path,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !own_file.exists() {
+            if let Some(status) = self.child.try_wait()? {
+                bail!("gateway process exited before writing {}: {status}", own_file.display());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("gateway did not write {} within {timeout:?}", own_file.display());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        wait_for_gateway_process(&mut self.child, self.port, remaining).await?;
+        if let Some(status) = self.child.try_wait()? {
+            bail!("gateway process exited after port {} became ready: {status}", self.port);
+        }
+        Ok(())
+    }
+
+    /// Waits for this gateway process to exit and returns its exit status, failing when it is
+    /// still running after `timeout`.
+    pub async fn wait_for_exit(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("gateway process was still running after {timeout:?}");
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Polls until a secondary listener of this same gateway process accepts a
     /// TCP connection, failing fast if the process exits before the port
     /// becomes ready instead of waiting out the full timeout.
@@ -193,6 +240,7 @@ pub fn spawn_gateway_binary(
         }
     }
 
+    let _handover = crate::bdd_support::config::socket_handover();
     command
         .spawn()
         .expect("failed to spawn gateway binary")
@@ -216,7 +264,7 @@ async fn wait_for_gateway_process(
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(_) => return Ok(()),
             Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             Err(e) => bail!("gateway did not become ready on port {port}: {e}"),
         }

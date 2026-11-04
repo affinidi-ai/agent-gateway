@@ -328,6 +328,7 @@ pub fn create_identity_api_router(
                     // Auth mode endpoint (unauthenticated)
                     .route("/v1/auth/mode", get(crate::auth::mode_handler::get_auth_mode))
                     .layer(Extension(auth_mode.clone()))
+                    .layer(Extension(auth_state_arc.clone()))
                     .merge(
                         Router::new()
                             .route("/auth/register/start", post(crate::auth::handlers::register_start))

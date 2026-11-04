@@ -9,13 +9,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use webauthn_rs::prelude::*;
 
 use super::state::{AuthState, ChallengeState};
+use super::storage::UserData;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
 };
+use crate::config::types::SecretValue;
 
 use crate::metrics::MetricsStore;
 
@@ -23,7 +25,13 @@ use crate::metrics::MetricsStore;
 #[derive(Debug, Deserialize)]
 pub struct RegisterStartRequest {
     pub username: String,
+    /// Required while no user exists.
+    #[serde(default)]
+    pub setup_token: Option<SecretValue>,
 }
+
+/// The one answer to a first registration without the valid setup token, missing or wrong.
+pub(crate) const SETUP_TOKEN_REQUIRED: &str = "A valid setup token is required to register the first administrator";
 
 /// Response from registration start
 #[derive(Debug, Serialize)]
@@ -39,11 +47,15 @@ pub struct RegisterFinishRequest {
     pub credential: RegisterPublicKeyCredential,
     #[serde(default)]
     pub accepted_terms: Vec<crate::terms::AcceptedTermsVersion>,
+    /// Required while no user exists.
+    #[serde(default)]
+    pub setup_token: Option<SecretValue>,
 }
 
 pub(crate) enum RegisterFinishError {
     Status(StatusCode),
     Terms(crate::terms::TermsError),
+    SetupTokenRequired,
 }
 
 impl From<StatusCode> for RegisterFinishError {
@@ -63,6 +75,7 @@ impl IntoResponse for RegisterFinishError {
         match self {
             Self::Status(status) => status.into_response(),
             Self::Terms(error) => error.into_response(),
+            Self::SetupTokenRequired => (StatusCode::FORBIDDEN, SETUP_TOKEN_REQUIRED).into_response(),
         }
     }
 }
@@ -114,11 +127,36 @@ pub struct AuthCheckResponse {
     pub consent_required: bool,
 }
 
-/// Start passkey registration
+/// Start passkey registration. While no user exists, only a request with the setup token gets a
+/// challenge.
 pub async fn register_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<RegisterStartRequest>,
 ) -> Result<Json<RegisterStartResponse>, (StatusCode, String)> {
+    let users = auth_state
+        .storage
+        .list_users()
+        .await
+        .map_err(|e| {
+            error!("Failed to list users before starting a registration: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start registration".to_string())
+        })?;
+
+    if users.is_empty()
+        && !auth_state
+            .setup_token
+            .matches(req.setup_token.as_deref())
+    {
+        warn!("Refused to start registering the first administrator without a valid setup token");
+        return Err((StatusCode::FORBIDDEN, SETUP_TOKEN_REQUIRED.to_string()));
+    }
+
+    // Enforce the appliance user limit before starting a new registration.
+    if let Err(e) = crate::config::global_limits().check_can_add("users", users.len()) {
+        crate::config::log_limit_reached("users", &e);
+        return Err((StatusCode::FORBIDDEN, e.message()));
+    }
+
     let existing_user = auth_state
         .storage
         .load_user(&req.username)
@@ -127,17 +165,6 @@ pub async fn register_start(
             error!("Failed to check whether user exists: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start registration".to_string())
         })?;
-
-    // Enforce the appliance user limit before starting a new registration.
-    if let Ok(users) = auth_state
-        .storage
-        .list_users()
-        .await
-        && let Err(e) = crate::config::global_limits().check_can_add("users", users.len())
-    {
-        crate::config::log_limit_reached("users", &e);
-        return Err((StatusCode::FORBIDDEN, e.message()));
-    }
 
     if let Some(existing_user) = &existing_user {
         error!("Registration requested for the username of existing user_id: {}", existing_user.user_id);
@@ -234,37 +261,9 @@ pub async fn register_finish(
         .validate_registration(&terms_request)
         .await?;
 
-    let user_write_guard = auth_state
-        .storage
-        .user_write_guard()
-        .await;
-    let user = auth_state
-        .storage
-        .prepare_user_with_passkey(username.as_str(), passkey)
-        .await
-        .map_err(|e| {
-            error!("Failed to prepare passkey user: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    auth_state
-        .terms_manager
-        .accept(&user.user_id, crate::terms::AcceptanceContext::Registration, terms_request)
-        .await?;
-    auth_state
-        .storage
-        .save_user(&user)
-        .await
-        .map_err(|e| {
-            error!(user_id = %user.user_id, error = %e, "Failed to store passkey user; any recorded Terms acceptance is retained");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    if user.is_primary {
-        info!("First user_id '{}' registered as Primary Administrator (cannot be deleted or demoted)", user.user_id);
-    } else {
-        info!("New user_id '{}' registered with status 'new' - requires approval", user.user_id);
-    }
-    drop(user_write_guard);
+    let user =
+        persist_registration(&auth_state, username.as_str(), vec![passkey], terms_request, req.setup_token.as_deref())
+            .await?;
 
     info!("Successfully registered passkey for user_id: {}", user.user_id);
 
@@ -354,6 +353,99 @@ pub async fn register_finish(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Stores a verified registration. The first user becomes the Primary Administrator only with the
+/// setup token, checked again under the user write guard, only while the user directory on disk
+/// holds no user, which another gateway sharing it may have stored, and only after this gateway
+/// claimed the token file, so a token is used once even by gateways sharing storage.
+pub(crate) async fn persist_registration(
+    auth_state: &AuthState,
+    username: &str,
+    passkeys: Vec<Passkey>,
+    terms_request: crate::terms::AcceptTermsRequest,
+    setup_token: Option<&str>,
+) -> Result<UserData, RegisterFinishError> {
+    let _user_write_guard = auth_state
+        .storage
+        .user_write_guard()
+        .await;
+    let user = auth_state
+        .storage
+        .prepare_user_with_passkeys(username, passkeys)
+        .await
+        .map_err(|e| {
+            error!("Failed to prepare passkey user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if user.is_primary
+        && !auth_state
+            .setup_token
+            .matches(setup_token)
+    {
+        warn!("Refused to register the first administrator without a valid setup token");
+        return Err(RegisterFinishError::SetupTokenRequired);
+    }
+    if user.is_primary {
+        match auth_state
+            .storage
+            .has_user_records_on_disk()
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                warn!("Refused to register the first administrator: the user directory already holds a user");
+                return Err(RegisterFinishError::SetupTokenRequired);
+            }
+            Err(e) => {
+                error!("Failed to check the user directory before registering the first administrator: {:#}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+            }
+        }
+    }
+
+    auth_state
+        .terms_manager
+        .accept(&user.user_id, crate::terms::AcceptanceContext::Registration, terms_request)
+        .await?;
+    if user.is_primary {
+        match auth_state
+            .setup_token
+            .claim()
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Refused to register the first administrator: the setup token file was missing or held another \
+                     token, because it was used already or another gateway is claiming it"
+                );
+                return Err(RegisterFinishError::SetupTokenRequired);
+            }
+            Err(e) => {
+                error!("Failed to use the setup token: {:#}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
+            }
+        }
+    }
+    auth_state
+        .storage
+        .save_user(&user)
+        .await
+        .map_err(|e| {
+            if user.is_primary {
+                error!(user_id = %user.user_id, error = %e, "Failed to store the first administrator after using the setup token; restart the gateway to generate a new setup token");
+            } else {
+                error!(user_id = %user.user_id, error = %e, "Failed to store passkey user; any recorded Terms acceptance is retained");
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if user.is_primary {
+        info!("First user_id '{}' registered as Primary Administrator (cannot be deleted or demoted)", user.user_id);
+    } else {
+        info!("New user_id '{}' registered with status 'new' - requires approval", user.user_id);
+    }
+    Ok(user)
 }
 
 /// Start passkey authentication
@@ -590,15 +682,21 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_start, register_start};
+    use super::{
+        LoginFinishResponse, LoginStartRequest, RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
+        SETUP_TOKEN_REQUIRED, login_start, persist_registration, register_start,
+    };
     use crate::auth::{
         AuthState,
         storage::UserData,
         types::{UserRole, UserStatus},
     };
-    use axum::{Json, extract::State};
+    use crate::config::types::SecretValue;
+    use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
+
+    const SETUP_TOKEN: &str = "handlers-test-setup-token-0123456789-abcdefghijk";
 
     async fn test_auth_state() -> (TempDir, Arc<AuthState>) {
         let temp_dir = tempdir().unwrap();
@@ -622,11 +720,78 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             std::sync::Arc::new(crate::terms::TermsManager::disabled()),
+            Some(SecretValue::from(SETUP_TOKEN)),
         )
         .await
         .unwrap();
 
         (temp_dir, Arc::new(state))
+    }
+
+    fn setup_token_file(directory: &TempDir) -> std::path::PathBuf {
+        directory
+            .path()
+            .join("users")
+            .join("setup-token")
+    }
+
+    async fn start(
+        state: &Arc<AuthState>,
+        username: &str,
+        setup_token: Option<&str>,
+    ) -> Result<RegisterStartResponse, (StatusCode, String)> {
+        register_start(
+            State(state.clone()),
+            Json(RegisterStartRequest {
+                username: username.to_string(),
+                setup_token: setup_token.map(SecretValue::from),
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+    }
+
+    async fn register(
+        state: &AuthState,
+        username: &str,
+        setup_token: Option<&str>,
+    ) -> Result<UserData, (StatusCode, String)> {
+        let terms = crate::terms::AcceptTermsRequest { accepted_terms: Vec::new() };
+        match persist_registration(state, username, Vec::new(), terms, setup_token).await {
+            Ok(user) => Ok(user),
+            Err(error) => {
+                let response = error.into_response();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                Err((status, String::from_utf8(body.to_vec()).unwrap()))
+            }
+        }
+    }
+
+    async fn stored_users(state: &AuthState) -> Vec<UserData> {
+        let mut users = Vec::new();
+        for user_id in state
+            .storage
+            .list_users()
+            .await
+            .unwrap()
+        {
+            users.push(
+                state
+                    .storage
+                    .load_user_by_id(&user_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        users
+    }
+
+    fn setup_token_refusal() -> (StatusCode, String) {
+        (StatusCode::FORBIDDEN, SETUP_TOKEN_REQUIRED.to_string())
     }
 
     async fn save_user(
@@ -751,6 +916,7 @@ mod tests {
             State(state.clone()),
             Json(RegisterStartRequest {
                 username: "existing-user".to_string(),
+                setup_token: None,
             }),
         )
         .await
@@ -776,6 +942,7 @@ mod tests {
             State(state.clone()),
             Json(RegisterStartRequest {
                 username: "new-user".to_string(),
+                setup_token: Some(SecretValue::from(SETUP_TOKEN)),
             }),
         )
         .await
@@ -791,6 +958,322 @@ mod tests {
                     .registration_state
                     .is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn register_start_without_a_setup_token_is_refused_while_no_user_exists() {
+        let (_temp_dir, state) = test_auth_state().await;
+
+        let refusal = start(&state, "first-admin", None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal, setup_token_refusal());
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty(),
+            "no challenge may be created without the setup token"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_start_with_a_wrong_setup_token_gets_the_same_refusal() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let wrong_same_length = SETUP_TOKEN.replace('h', "H");
+
+        for wrong in [wrong_same_length.as_str(), &SETUP_TOKEN[1..], ""] {
+            let refusal = start(&state, "first-admin", Some(wrong))
+                .await
+                .unwrap_err();
+            assert_eq!(refusal, setup_token_refusal(), "{wrong:?}");
+        }
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn register_start_needs_no_setup_token_once_a_user_exists() {
+        let (_temp_dir, state) = test_auth_state().await;
+        save_user(&state, "existing-user", UserStatus::Approved).await;
+
+        let response = start(&state, "second-user", None)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .get(&response.challenge_id)
+                .is_some_and(|challenge| challenge
+                    .registration_state
+                    .is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_registration_with_the_setup_token_becomes_the_primary_administrator() {
+        let (directory, state) = test_auth_state().await;
+
+        let user = register(&state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap();
+
+        assert_eq!(user.role, UserRole::Administrator);
+        assert_eq!(user.status, UserStatus::Approved);
+        assert!(user.is_primary);
+        assert_eq!(
+            stored_users(&state)
+                .await
+                .len(),
+            1
+        );
+        assert!(!setup_token_file(&directory).exists(), "the token file is removed");
+        assert!(
+            !state
+                .setup_required()
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .setup_token
+                .matches(Some(SETUP_TOKEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_registration_without_a_setup_token_is_refused_and_saves_no_user() {
+        let (directory, state) = test_auth_state().await;
+
+        let refusal = register(&state, "first-admin", None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal, setup_token_refusal());
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty()
+        );
+        assert!(setup_token_file(&directory).exists());
+    }
+
+    #[tokio::test]
+    async fn the_first_registration_with_a_wrong_setup_token_is_refused_and_keeps_the_token() {
+        let (directory, state) = test_auth_state().await;
+
+        let refusal = register(&state, "first-admin", Some(&SETUP_TOKEN.replace('h', "H")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal, setup_token_refusal());
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty()
+        );
+        assert!(setup_token_file(&directory).exists());
+        assert!(
+            state
+                .setup_token
+                .matches(Some(SETUP_TOKEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_after_setup_needs_no_setup_token_and_lands_as_new() {
+        let (_temp_dir, state) = test_auth_state().await;
+        register(&state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap();
+
+        let second = register(&state, "second-user", None)
+            .await
+            .unwrap();
+
+        assert_eq!(second.role, UserRole::User);
+        assert_eq!(second.status, UserStatus::New);
+        assert!(!second.is_primary);
+    }
+
+    #[tokio::test]
+    async fn the_setup_token_works_only_once() {
+        let (_temp_dir, state) = test_auth_state().await;
+        register(&state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap();
+        state
+            .storage
+            .delete_user("first-admin")
+            .await
+            .unwrap();
+
+        let start_again = start(&state, "second-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap_err();
+        let register_again = register(&state, "second-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap_err();
+
+        assert_eq!(start_again, setup_token_refusal());
+        assert_eq!(register_again, setup_token_refusal());
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_registration_is_refused_when_another_gateway_already_stored_a_user() {
+        let (directory, state) = test_auth_state().await;
+        let other_gateway = crate::auth::storage::PasskeyStorage::new(
+            directory
+                .path()
+                .join("users")
+                .to_string_lossy()
+                .into_owned(),
+            directory
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        other_gateway
+            .save_user(&UserData {
+                user_id: uuid::Uuid::new_v4().to_string(),
+                username: "other-admin".to_string(),
+                passkeys: Vec::new(),
+                role: UserRole::Administrator,
+                status: UserStatus::Approved,
+                is_primary: true,
+                first_name: None,
+                last_name: None,
+                email: None,
+                department: None,
+                job_title: None,
+                avatar_path: None,
+                created_at: now,
+                updated_at: now,
+                last_logged_in: None,
+                saml_id: None,
+            })
+            .await
+            .unwrap();
+
+        let refusal = register(&state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal, setup_token_refusal());
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty(),
+            "this gateway's cache never saw the other gateway's user"
+        );
+        let user_records = std::fs::read_dir(directory.path().join("users"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".json")
+            })
+            .count();
+        assert_eq!(user_records, 1, "no second user is stored");
+        assert!(setup_token_file(&directory).exists(), "the refusal does not use the token up");
+        assert!(state.setup_token.is_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_registrations_with_one_token_create_one_primary_administrator() {
+        let (_temp_dir, state) = test_auth_state().await;
+
+        let registrations = ["first-admin", "second-admin"].map(|username| {
+            let state = state.clone();
+            tokio::spawn(async move { register(&state, username, Some(SETUP_TOKEN)).await })
+        });
+        for registration in registrations {
+            registration
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let users = stored_users(&state).await;
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            users
+                .iter()
+                .filter(|user| user.is_primary && user.role == UserRole::Administrator)
+                .count(),
+            1
+        );
+        assert_eq!(
+            users
+                .iter()
+                .filter(|user| !user.is_primary && user.status == UserStatus::New)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_registration_whose_claim_was_taken_elsewhere_is_refused() {
+        let (directory, state) = test_auth_state().await;
+        std::fs::remove_file(setup_token_file(&directory)).unwrap();
+
+        let refusal = register(&state, "first-admin", Some(SETUP_TOKEN))
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal, setup_token_refusal());
+        assert!(
+            stored_users(&state)
+                .await
+                .is_empty()
+        );
+        assert!(state.setup_token.is_pending(), "a claim that finds no token file keeps the token");
+    }
+
+    #[test]
+    fn register_requests_redact_the_setup_token_in_debug_output() {
+        let start: RegisterStartRequest =
+            serde_json::from_value(serde_json::json!({"username": "first-admin", "setup_token": SETUP_TOKEN})).unwrap();
+        let finish: RegisterFinishRequest = serde_json::from_value(serde_json::json!({
+            "challenge_id": "challenge",
+            "credential": {
+                "id": "AAAA",
+                "rawId": "AAAA",
+                "response": {"attestationObject": "AAAA", "clientDataJSON": "AAAA"},
+                "type": "public-key",
+                "extensions": {}
+            },
+            "setup_token": SETUP_TOKEN
+        }))
+        .unwrap();
+
+        let rendered = format!("{start:?} {finish:?}");
+
+        assert_eq!(start.setup_token.as_deref(), Some(SETUP_TOKEN));
+        assert_eq!(finish.setup_token.as_deref(), Some(SETUP_TOKEN));
+        assert!(!rendered.contains(SETUP_TOKEN), "{rendered}");
     }
 
     #[test]

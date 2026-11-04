@@ -14,6 +14,7 @@ use crate::storage::filesystem::{StorableEntity, StorageBackend, cached_storage}
 /// authentication request but written infrequently.
 pub struct PasskeyStorage {
     storage: Box<dyn StorageBackend<UserData>>,
+    users_dir: PathBuf,
     avatars_path: String,
     user_write_lock: Mutex<()>,
 }
@@ -80,10 +81,12 @@ impl PasskeyStorage {
             tracing::info!("Copied default avatar to: {}", default_avatar_dest);
         }
 
-        let storage = cached_storage(PathBuf::from(&storage_path), "passkey_user").await?;
+        let users_dir = PathBuf::from(&storage_path);
+        let storage = cached_storage(users_dir.clone(), "passkey_user").await?;
 
         Ok(Self {
             storage,
+            users_dir,
             avatars_path,
             user_write_lock: Mutex::new(()),
         })
@@ -134,11 +137,11 @@ impl PasskeyStorage {
             .await
     }
 
-    /// Prepare a user with their initial passkey for persistence after consent succeeds.
-    pub(crate) async fn prepare_user_with_passkey(
+    /// Prepare a user with their initial passkeys for persistence after consent succeeds.
+    pub(crate) async fn prepare_user_with_passkeys(
         &self,
         username: &str,
-        passkey: Passkey,
+        passkeys: Vec<Passkey>,
     ) -> Result<UserData> {
         // Check if this is the first user
         let users = self.list_users().await?;
@@ -161,7 +164,7 @@ impl PasskeyStorage {
         let user_data = UserData {
             user_id: uuid::Uuid::new_v4().to_string(),
             username: username.to_string(),
-            passkeys: vec![passkey],
+            passkeys,
             role: if is_first_user {
                 UserRole::Administrator
             } else {
@@ -272,6 +275,27 @@ impl PasskeyStorage {
             .await?
             .map(|data| data.passkeys)
             .unwrap_or_default())
+    }
+
+    /// Whether the user directory holds any user record, read from the directory rather than the
+    /// cache, so a user another gateway sharing the directory stored counts, and so does a record
+    /// that cannot be read.
+    pub(crate) async fn has_user_records_on_disk(&self) -> Result<bool> {
+        let mut entries = tokio::fs::read_dir(&self.users_dir)
+            .await
+            .with_context(|| format!("Failed to read the user directory {}", self.users_dir.display()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_context(|| format!("Failed to read the user directory {}", self.users_dir.display()))?
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".json") || name.ends_with(".json.enc") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// List all user_ids from cache
@@ -408,5 +432,45 @@ mod tests {
         assert!(text.contains(&format!("Permanently deleted user_id: {}", user.user_id)), "{text}");
         assert!(!text.contains(USERNAME), "{text}");
         assert_eq!(missing.to_string(), "User not found");
+    }
+
+    #[tokio::test]
+    async fn user_records_on_disk_count_even_when_the_cache_does_not_hold_them() {
+        let temp_dir = tempdir().unwrap();
+        let users = temp_dir.path().join("users");
+        let storage = PasskeyStorage::new(
+            users
+                .to_string_lossy()
+                .into_owned(),
+            temp_dir
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(users.join("setup-token"), "token\n").unwrap();
+
+        let without_records = storage
+            .has_user_records_on_disk()
+            .await
+            .unwrap();
+        std::fs::write(users.join("written-by-another-gateway.json"), "not a readable user").unwrap();
+        let with_a_record = storage
+            .has_user_records_on_disk()
+            .await
+            .unwrap();
+
+        assert!(!without_records, "files other than user records do not count");
+        assert!(with_a_record);
+        assert!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the cache does not hold the record"
+        );
     }
 }

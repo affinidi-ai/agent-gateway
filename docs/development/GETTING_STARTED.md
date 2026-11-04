@@ -109,9 +109,16 @@ The default local authentication mode is passkey authentication.
 
 1. Open the configured WebAuthn origin, normally through the browser window opened by the script.
 2. Start registration from the onboarding screen.
-3. Follow the browser's passkey prompt.
-4. Approve registration with Touch ID or another supported authenticator.
-5. Continue into the management dashboard.
+3. While no user exists, the form asks for the setup token. Copy it from
+   `envs/local/_storage/passkeys/setup-token` (`envs/local-<name>/` for a named instance), for
+   example with `cat envs/local/_storage/passkeys/setup-token`. The server log names the file at
+   startup but never shows the token.
+4. Follow the browser's passkey prompt.
+5. Approve registration with Touch ID or another supported authenticator.
+6. Continue into the management dashboard.
+
+The first account becomes the primary administrator, and its registration removes the token file.
+Accounts registered later need no setup token and wait for an administrator's approval.
 
 The browser interaction is required. Starting the process does not register a passkey or log you in automatically.
 
@@ -155,6 +162,8 @@ make clean-local-storage
 make run-debug
 ```
 
+The next start creates a new setup token in `envs/local/_storage/passkeys/setup-token`.
+
 Cleanup targets delete local data. Review the command before running it if the environment contains work you need to retain.
 
 ## Troubleshooting
@@ -167,6 +176,7 @@ Cleanup targets delete local data. Review the command before running it if the e
 | The setup waits after asking for a public URL | Press Enter for the local default unless you intentionally need a public tunnel. |
 | The dashboard does not open | Open the WebAuthn `external_origin` from `envs/local/config/gateway.json`. Do not assume the default port for a named instance or public URL override. |
 | Passkey registration does not prompt | Use a WebAuthn-capable browser and ensure Touch ID or another platform/security-key authenticator is available. |
+| Registration fails with `403` and "A valid setup token is required to register the first administrator" | No user exists yet. Enter the token from `envs/local/_storage/passkeys/setup-token`, exactly as it is in the file. |
 | `/api/v1/health` returns `503` | The instance is not ready. Wait for startup to finish and inspect the server log. A Standby instance intentionally remains unready. |
 | `curl` reports a certificate error | Use `curl -k` for the generated local development certificate. Do not use insecure certificate handling for production endpoints. |
 | Startup reports an occupied port | Stop the process using that port or use a named instance as described in [`DEVELOPMENT.md`](DEVELOPMENT.md#named-instances). |

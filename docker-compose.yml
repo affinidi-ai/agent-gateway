@@ -21,6 +21,8 @@
 #   Dashboard: https://localhost:8443/    (accept the self-signed certificate)
 #   Readiness: curl -k https://localhost:8443/api/v1/health
 #   Liveness:  curl -k https://localhost:8443/api/v1/alive
+#   Setup token, asked for by the first registration:
+#     docker compose exec agent-gateway cat /app/_storage/passkeys/setup-token
 #
 # Storage lives at envs/docker/_storage on the host (created on first run),
 # alongside the generated config. To start clean, delete it:

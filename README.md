@@ -118,8 +118,9 @@ make run-debug
 ```
 
 Complete passkey registration in the browser window opened by the run script. It uses the
-WebAuthn origin generated in `envs/local/config/gateway.json`. Then check the local HTTPS
-backend:
+WebAuthn origin generated in `envs/local/config/gateway.json`. The first registration asks
+for the setup token: paste the content of `envs/local/_storage/passkeys/setup-token`. Then
+check the local HTTPS backend:
 
 ```bash
 curl -k https://localhost:8443/api/v1/health

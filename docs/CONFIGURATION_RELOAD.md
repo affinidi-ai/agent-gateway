@@ -218,6 +218,13 @@ Both modes build the source authentication middleware at startup, so a node whos
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
 
+Both modes also prepare the passkey setup token at startup and answer passkey registration on
+their HTTP listeners. Nodes sharing the passkeys directory share the `setup-token` file, and only
+the node that removes it registers the primary administrator. A node that started before the first
+administrator registered elsewhere sees no user until it restarts or its cache refreshes, and
+refuses registration meanwhile (see
+[Primary administrator](RBAC.md#primary-administrator)).
+
 The default API mount exposes `GET /api/v1/health` (200 when Active and ready, 503 when Standby)
 and `GET /api/v1/alive` (always 200); the router-relative paths are `/v1/health` and `/v1/alive`.
 

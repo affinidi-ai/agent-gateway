@@ -4547,6 +4547,7 @@ async fn initialize_auth_state(
         .storage_paths
         .sessions
         .clone();
+    let operator_setup_token = crate::auth::setup_token::operator_token_from_env().await?;
     let auth_state = crate::auth::AuthState::new(
         rp_id,
         rp_origin,
@@ -4555,6 +4556,7 @@ async fn initialize_auth_state(
         session_timeout_minutes,
         sessions_path,
         terms_manager,
+        operator_setup_token,
     )
     .await?;
 

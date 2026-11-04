@@ -497,6 +497,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_first_saml_sign_in_becomes_primary_without_a_setup_token() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let token_file = dir
+            .path()
+            .join("users")
+            .join("setup-token");
+        std::fs::write(&token_file, "a-passkey-setup-token-the-saml-sign-in-never-reads\n").unwrap();
+
+        let provisioned =
+            provision_user_from_saml(&storage, &saml_attributes("saml-1", "jane"), &test_saml_config(), &avatars)
+                .await
+                .unwrap();
+
+        assert!(matches!(provisioned.change, SignInChange::Created));
+        assert!(provisioned.user.is_primary);
+        assert_eq!(provisioned.user.role, UserRole::Administrator);
+        assert_eq!(provisioned.user.status, UserStatus::Approved);
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            "a-passkey-setup-token-the-saml-sign-in-never-reads\n",
+            "SAML provisioning leaves the passkey setup token file alone"
+        );
+    }
+
+    #[tokio::test]
     async fn a_later_sign_in_reports_the_user_as_it_was_before() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;

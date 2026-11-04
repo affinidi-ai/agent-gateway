@@ -381,7 +381,10 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 ## Managing the gateway
 
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
-deployments, SAML single sign-on. A SAML sign-in must return from the identity provider within
+deployments, SAML single sign-on. The first user becomes the primary administrator, who cannot
+be deleted or demoted. With passkeys, that first registration needs the single-use setup token
+the gateway keeps in `_storage/passkeys/setup-token` while no user exists, or the one set in
+`AG_SETUP_TOKEN`; see [`RBAC.md`](RBAC.md#primary-administrator). A SAML sign-in must return from the identity provider within
 five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
@@ -517,10 +520,19 @@ See [`DEVELOPMENT.md`](development/DEVELOPMENT.md#storage-export-and-backup).
 ### High availability
 
 A gateway starts in **active** or **standby** mode. A standby instance holds no
-listeners and reports itself unready, so a load balancer sends it no traffic. `SIGUSR1`
-promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep their
-caches in step with a periodic refresh. See
+connection-point or trust registry listeners and reports itself unready, so a load balancer
+sends it no traffic. `SIGUSR1` promotes it and `SIGUSR2` steps it down. Two instances sharing
+storage can keep their caches in step with a periodic refresh. See
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
+
+Instances sharing storage also share the setup token file while no user exists. An instance
+claims the token by moving the file aside and uses it up only when the file holds its own
+token, so only one instance can register the primary administrator with it; another instance
+refuses the token while the file is gone, cannot claim a token file that holds another token,
+such as one a restarted instance generated after that, and registers no primary administrator
+once the shared user directory holds a user. With `AG_SETUP_TOKEN` still set, a restarted
+instance writes the same token again, which is why it must be unset after setup; the check for
+a user in the shared directory still refuses a second primary administrator.
 
 Instances sharing storage also share the key that signs transit tokens, kept beside the
 gateway's own keys, so a managed agent's Transit Point calls are accepted by whichever

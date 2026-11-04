@@ -1,0 +1,34 @@
+branch: fix/first-admin-setup-token
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T13:30:00Z'
+      title: Stop anyone who reaches a new gateway from claiming its primary administrator
+      description: >-
+        While no user existed, anyone who reached the gateway's HTTPS port could register a
+        passkey and become the primary administrator, who cannot be deleted or demoted. Passkey
+        registration now needs a single-use setup token while no user exists. The gateway keeps
+        it in `setup-token` in the `[storage_paths] passkeys` directory, readable by its own user
+        only, logs the file's path but never the token, and compares it in constant time; its
+        long-lived state holds only the token's SHA-256 digest, and `AG_SETUP_TOKEN`, when set,
+        stays in the process environment until the gateway restarts without it. The first
+        registration that presents it removes the
+        file, so the token works once, also across gateways sharing storage. `GET
+        /v1/auth/mode` reports `setup_required`, and the dashboard asks for the token. SAML
+        sign-in is unchanged.
+  breaking:
+    - timestamp: '2026-11-04T13:30:00Z'
+      title: ⭐ Require a setup token to register the first passkey administrator
+      description: >-
+        While no user exists, `/auth/register/start` and `/auth/register/finish` answer 403
+        unless the request body carries `setup_token`, the token in
+        `_storage/passkeys/setup-token` (the `[storage_paths] passkeys` directory). A scripted
+        install can choose the token with `AG_SETUP_TOKEN`, a value or loader reference of 43 to
+        256 printable ASCII characters, where an empty or whitespace-only value counts as unset;
+        an invalid value, or one that differs from an existing token file, stops the gateway at
+        startup, and so does a token file that other users can still read or write. The passkeys
+        directory must support hard links.
+        Registrations after the first need no token.

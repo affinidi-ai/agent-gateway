@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 pub mod a2a_proxy;
 pub mod agent_surface;
@@ -38,6 +38,19 @@ static NEXT_TEST_PORT_OFFSET: LazyLock<AtomicUsize> = LazyLock::new(|| {
     AtomicUsize::new(process_offset)
 });
 
+/// Held while a reserved port's listener is opened or closed and while a gateway is spawned. On
+/// macOS a socket is marked close-on-exec only after it is created, and a process being spawned
+/// holds every descriptor of this one until it starts, so without this a gateway could keep
+/// another test's released port listening, where it accepts the readiness probe meant for the
+/// gateway that is about to bind that port.
+static SOCKET_HANDOVER: Mutex<()> = Mutex::new(());
+
+pub(crate) fn socket_handover() -> MutexGuard<'static, ()> {
+    SOCKET_HANDOVER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 pub struct ReservedPort {
     port_number: u16,
     reason: String,
@@ -47,6 +60,7 @@ pub struct ReservedPort {
 
 impl ReservedPort {
     pub fn release_listener(&mut self) {
+        let _handover = socket_handover();
         self.listener.take();
     }
 
@@ -66,6 +80,7 @@ impl Debug for ReservedPort {
 
 impl Drop for ReservedPort {
     fn drop(&mut self) {
+        self.release_listener();
         let _ = std::fs::remove_file(&self.lock_path);
     }
 }
@@ -86,7 +101,11 @@ pub fn reserve_free_port(reason: &str) -> (u16, ReservedPort) {
             continue;
         };
 
-        match TcpListener::bind(("0.0.0.0", port as u16)) {
+        let bound = {
+            let _handover = socket_handover();
+            TcpListener::bind(("0.0.0.0", port as u16))
+        };
+        match bound {
             Ok(listener) => {
                 return (
                     port as u16,

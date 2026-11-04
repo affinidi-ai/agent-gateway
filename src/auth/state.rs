@@ -4,7 +4,9 @@ use tokio::sync::RwLock;
 use webauthn_rs::prelude::*;
 
 use crate::auth::session::SessionManager;
+use crate::auth::setup_token::SetupToken;
 use crate::auth::storage::PasskeyStorage;
+use crate::config::types::SecretValue;
 
 /// State for the authentication system
 #[derive(Clone)]
@@ -26,6 +28,9 @@ pub struct AuthState {
 
     /// Terms enforcement for human authentication.
     pub terms_manager: Arc<crate::terms::TermsManager>,
+
+    /// The token that registers the first administrator while no user exists.
+    pub setup_token: Arc<SetupToken>,
 }
 
 /// Temporary state for WebAuthn challenges
@@ -55,13 +60,20 @@ impl AuthState {
         session_timeout_minutes: u64,
         sessions_storage_path: String,
         terms_manager: Arc<crate::terms::TermsManager>,
+        operator_setup_token: Option<SecretValue>,
     ) -> anyhow::Result<Self> {
         // Build WebAuthn instance
         let builder = WebauthnBuilder::new(&rp_id, &rp_origin)?;
         let webauthn = Arc::new(builder.build()?);
 
         // Initialize storage
-        let storage = Arc::new(PasskeyStorage::new(storage_path, avatars_path).await?);
+        let storage = Arc::new(PasskeyStorage::new(storage_path.clone(), avatars_path).await?);
+        let has_users = !storage
+            .list_users()
+            .await?
+            .is_empty();
+        let setup_token =
+            Arc::new(SetupToken::prepare(std::path::Path::new(&storage_path), has_users, operator_setup_token).await?);
 
         // Initialize session manager with configured timeout and filesystem persistence
         let session_manager = Arc::new(
@@ -76,7 +88,17 @@ impl AuthState {
             challenges: Arc::new(RwLock::new(HashMap::new())),
             notification_store: Arc::new(RwLock::new(None)),
             terms_manager,
+            setup_token,
         })
+    }
+
+    /// Whether no user exists yet, so registering one needs the setup token.
+    pub async fn setup_required(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .storage
+            .list_users()
+            .await?
+            .is_empty())
     }
 
     /// Clean up expired challenges (should be called periodically)

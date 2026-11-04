@@ -190,7 +190,16 @@ the network and port mappings.
 ### Storage and stopping
 
 Both run paths persist storage to `envs/docker/_storage` on the host, beside the
-generated `envs/docker/config` and `envs/docker/certs`. Stop the container with:
+generated `envs/docker/config` and `envs/docker/certs`. Until the first administrator
+registers, the dashboard asks for the setup token. The file belongs to the container's
+user and only it can read it, so read it through the container:
+
+```bash
+docker compose exec agent-gateway cat /app/_storage/passkeys/setup-token   # `docker compose up`
+docker exec agent-gateway cat /app/_storage/passkeys/setup-token           # `make docker-run`
+```
+
+Stop the container with:
 
 ```bash
 docker compose down          # for `docker compose up` (keep the key exported)
@@ -202,6 +211,8 @@ To start from a clean slate, remove the storage directory as well:
 ```bash
 rm -rf envs/docker/_storage
 ```
+
+The next start creates a new setup token.
 
 On Linux the container runs as a non-root user (uid 999); if it cannot write to
 the bind-mounted storage, make the directory writable once with

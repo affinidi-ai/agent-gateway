@@ -17,6 +17,32 @@ Management PAT authorization further intersects the bound user's role with the P
 Resource and tenant constraints are separate authorization dimensions; they do not change the
 shape of the RBAC permissions response.
 
+## Primary administrator
+
+The first user of a gateway becomes its primary administrator: an approved `administrator` whose
+role and status cannot be changed and who cannot be deleted
+([`auth_manager/handlers.rs`](../src/auth_manager/handlers.rs)). Later passkey users start as
+`new` users and wait for an administrator's approval.
+
+With passkeys, the first registration must present the setup token while no user exists, at
+`/auth/register/start` and again at `/auth/register/finish`; without it, or with a wrong one, both
+answer `403` with the same body, and start creates no challenge. The gateway keeps the token in the
+`setup-token` file of the `[storage_paths] passkeys` directory; its long-lived state holds only the
+token's SHA-256 digest, and `AG_SETUP_TOKEN`, when set, stays in the process environment until the
+gateway restarts without it. The gateway removes the file when the primary administrator is
+created, so the token works once. Gateways sharing that directory share the token: a gateway
+claims it by moving the file aside, and uses it up only when the file holds that gateway's own
+token, putting any other file back. So only one gateway creates the primary administrator, a
+gateway whose token was used cannot claim a token file that holds another token, such as one a
+restarted gateway generated after it, and none creates one once the directory holds a user, even
+when `AG_SETUP_TOKEN`, still set, brings the same token back
+([`setup_token.rs`](../src/auth/setup_token.rs)). `GET /v1/auth/mode`
+reports `setup_required: true` while no user exists, so the dashboard asks for the token. See
+[`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md#network).
+
+With SAML, the first user to sign in through the identity provider becomes the primary
+administrator, without a setup token (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#samljson)).
+
 ## Permissions endpoint
 
 `GET /v1/permissions` returns a flat JSON object whose keys are dashboard feature names and whose

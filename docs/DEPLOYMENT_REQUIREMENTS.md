@@ -83,10 +83,15 @@ storage next to `_storage`, never inside it: a restore empties `_storage`. A ful
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
 [Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). The volume must
-support hard links where `[storage_paths] vc_keys` points: the gateway creates its transit
-token key there on its first start by linking a complete copy into place, and stops with an
-error saying so on a filesystem without them, such as an object-store mount. Local disks,
-EFS and NFS support them.
+support hard links where `[storage_paths] vc_keys` and `[storage_paths] passkeys` point:
+the gateway creates its transit token key in `vc_keys` on its first start, and the setup
+token file in `passkeys` while no user exists, by linking a complete copy into place, and
+stops with an error saying so on a filesystem without them, such as an object-store mount.
+Local disks, EFS and NFS support them. The gateway also stops at startup, naming the file,
+while the setup token file stays readable or writable by users other than its owner after the
+gateway restricted it. Make it readable by its owner only or delete it; on a mount that ignores
+`chmod`, give files an owner-only mode through mount options (for example CIFS
+`file_mode=0600,dir_mode=0700`), or put the passkeys directory on a volume that honours `chmod`.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat
@@ -127,11 +132,26 @@ you open any listener:
   `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. The
   balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
   or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
-- **Register the first administrator before anyone else can reach the gateway.** The
-  first account to register, by passkey or SAML, becomes the primary administrator and
-  cannot be deleted or demoted. Allow only your own address to reach 8443 and 8080,
-  register at the public URL (passkeys require the browser origin to match
-  `webauthn.external_origin`), then open the ports to everyone else.
+- **Register the first administrator with the setup token.** The first account to
+  register becomes the primary administrator and cannot be deleted or demoted. While no
+  user exists, passkey registration needs the setup token: the gateway keeps it in
+  `setup-token` in the `[storage_paths] passkeys` directory (`_storage/passkeys/setup-token`
+  by default), readable by the gateway's user only, and logs that file's path at startup,
+  never the token. Read the file, enter the token on the dashboard's registration form at
+  the public URL (passkeys require the browser origin to match `webauthn.external_origin`),
+  and register. The first registration with the token removes the file, and the token is
+  then worthless; later registrations need no token and wait for an administrator's
+  approval. A restart before then keeps the token, and emptying the passkeys directory
+  creates a new one at the next start, while `AG_SETUP_TOKEN` is unset. Each start also
+  deletes copies of the file that an interrupted claim or creation left in that directory
+  (`setup-token.<id>.claim`, `setup-token.<id>.new` and `.setup-token.<id>.new.<id>.tmp`)
+  once they are five minutes old. For a scripted
+  install, set a random token yourself with `AG_SETUP_TOKEN`, for example from
+  `openssl rand -base64 32` (see [Environment variables](CONFIGURATION_REFERENCE.md#environment-variables)),
+  and unset it once you have registered. Still allow only your own address to reach 8443
+  and 8080 until then. With SAML there is no setup token: the first account your identity
+  provider signs in becomes the primary administrator, so sign in before the identity
+  provider admits anyone else.
 - **Keep port 9000 private, unless every Transit Point on it authenticates its callers.** It
   adds your Transit Points' credentials to the calls it forwards, so only callers you trust
   should reach it. Set its `bind_address` to an internal address, and remove the `localhost`

@@ -2,9 +2,11 @@
 //!
 //! The token is kept in `setup-token` in the passkey user directory, readable by its owner only,
 //! so only someone who can read the gateway's storage can register the Primary Administrator.
-//! Gateways sharing that directory share the token, and removing the file claims it, so only one
-//! of them can create the Primary Administrator with it. Memory holds only its SHA-256 digest.
-#![allow(dead_code)]
+//! Gateways sharing that directory share the token, and moving the file aside claims it, so only
+//! one of them can create the Primary Administrator with it; a gateway that finds the file moved
+//! aside by another's claim keeps its token, and a gateway whose token was used cannot claim a
+//! token file holding another token, such as one generated after that. Long-lived state holds only
+//! the token's SHA-256 digest.
 
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
