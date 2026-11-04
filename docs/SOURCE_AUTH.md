@@ -62,15 +62,23 @@ Point, identifies callers by the same claim.
   `azp`, `client_id`, `tid`, `idp`, `scope`, `scp`, `nonce`, `sid`, `act`, `cnf`, `typ`, `ver`,
   `auth_time`, `amr` and `acr`. Naming `sub` is the default, and is not stored.
 - A strategy whose stored `principal_claim` is one the API refuses, such as one written to
-  `_storage/` by hand, names no caller: JWT source authentication through it answers `500`.
+  `_storage/` by hand, names no caller: the gateway logs a warning for it at startup, a surface
+  save that uses it answers with a `Warning` header, and JWT source authentication through it
+  answers `500`.
 - `principal_claim` is fixed when the strategy is created. Changing it would change every
   caller's identity hash and orphan the credentials stored under the old ones, so an update that
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
-  use another claim, create a new strategy, point the surface at it, have callers connect
-  again, and then delete the old strategy. While both exist, token exchange and `jwt-bearer`
-  redemption refuse that issuer's tokens with `invalid_grant`, since the subject would depend on
-  which strategy verified them, so the MCP OAuth path and its consents stop for that issuer
-  too.
+  use another claim:
+  1. Create a new strategy for the issuer that names the claim.
+  2. Point every surface method, and every credential provider whose
+     `consent_identity_strategy_id` names the old strategy, at the new one.
+  3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
+     would answer its consents with not found.
+  4. Have callers connect again, since their identity hashes have changed.
+
+  From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens
+  with `invalid_grant`, and with them the MCP OAuth path and its consents, so run those steps
+  back to back.
 - A release older than `principal_claim` ignores the field from the moment it loads the
   strategy: while it runs, the strategy names callers by `sub`, so every caller has another
   identity hash and the grants stored under the claim's hashes are not found. It also removes
@@ -82,7 +90,13 @@ Point, identifies callers by the same claim.
 - Two strategies for the same issuer that name different claims never share a caller: the
   claim's name is part of the hash, so the same person through each is a different caller, with
   credentials of their own, and one person's value in one claim never stands for another
-  person's value in the other. A surface save warns when its methods do this.
+  person's value in the other. A surface save warns when its Access Point, on the surface or in
+  a variant, or a Transit Point accepts the issuer through both.
+- For token exchange an issuer names callers by one claim in a tenant scope: a tenant's own
+  strategies, or the appliance-global ones for a tenant with none. While two strategies of the
+  scope name the issuer's callers by different claims, STS refuses that issuer's tokens, for
+  every surface in the scope, even one that uses only one of them. Creating or updating such a
+  strategy answers with a `Warning` header.
 - Token exchange and `jwt-bearer` redemption ([STS](STS.md)) name a subject or actor token's
   subject by the principal claim of the strategy that verified it too, so an exchanged token's
   `sub` and `act.sub` carry that claim's value; on the MCP issuer, a subject from another issuer

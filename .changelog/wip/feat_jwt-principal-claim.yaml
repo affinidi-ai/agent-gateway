@@ -17,7 +17,10 @@ changes:
         leaves it out keeps it. Claims that name a token, client, tenant, session or lifetime are
         refused. A strategy stored with a refused claim, such as one edited by hand, is logged when
         it loads, a surface save warns of it, and JWT source authentication through it answers 500.
-        STS refuses an assertion when strategies for its issuer name different claims. For a
+        An issuer names callers by one claim in a tenant scope for token exchange: STS refuses its
+        tokens while two strategies of the scope name it by different claims, and creating or
+        updating such a strategy, or saving a surface that accepts the issuer through both, warns.
+        For a
         strategy naming another claim, the audit record keeps the token's sub and adds the claim's
         value as principal, which the Credentials audit tab shows. The Edit JWT Verification
         Strategy page has the field, read-only after creation.
