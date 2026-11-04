@@ -913,6 +913,71 @@ describe('IdentitiesPage', () => {
       );
     });
 
+    describe('when another DID becomes the primary', () => {
+      const gpt5 = payloadVersion(
+        'did:webvh:zQmNewest:gateway.example.com:surface:alpha',
+        'gpt-5',
+        '2026-01-05T00:00:00Z',
+        '2026-01-06T00:00:00Z'
+      );
+
+      const renderLive = (identities: any[], path: string) => {
+        let stats = statsWith(identities);
+        const page = () => (
+          <MemoryRouter initialEntries={[path]}>
+            <AppContext.Provider
+              value={{ ...mockAppContext, getCurrentStats: jest.fn(() => stats) }}
+            >
+              <Routes>
+                <Route path="/identities" element={<IdentitiesPage />} />
+                <Route path="/identities/:did" element={<IdentitiesPage />} />
+              </Routes>
+            </AppContext.Provider>
+          </MemoryRouter>
+        );
+        const view = render(page());
+        return {
+          update: (next: any[]) => {
+            stats = statsWith(next);
+            view.rerender(page());
+          },
+        };
+      };
+
+      it('keeps an open entry open', async () => {
+        const { update } = renderLive([gpt4o, gpt41, callerNamed], '/identities');
+        fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+        // Open another row so the URL no longer links to this entry.
+        fireEvent.click(screen.getByTestId(`identities-row-${callerNamed.did}`));
+
+        update([gpt4o, gpt41, gpt5, callerNamed]);
+
+        expect(await screen.findByTestId(`identities-row-${gpt5.did}`)).toHaveAttribute(
+          'aria-expanded',
+          'true'
+        );
+        expect(screen.getByTestId('identities-version-history-toggle')).toBeInTheDocument();
+      });
+
+      it('does not reopen a section the user closed on a deep-linked entry', async () => {
+        const { update } = renderLive(
+          [gpt4o, gpt41],
+          `/identities/${encodeURIComponent(gpt4o.did)}`
+        );
+        expect(await screen.findByTestId('identities-version-history')).toBeInTheDocument();
+        fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+        expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+
+        update([gpt4o, gpt41, gpt5]);
+
+        expect(await screen.findByTestId(`identities-row-${gpt5.did}`)).toHaveAttribute(
+          'aria-expanded',
+          'true'
+        );
+        expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+      });
+    });
+
     it('keeps an external caller row without versions', async () => {
       renderWithStats([externalCallerFixture]);
 

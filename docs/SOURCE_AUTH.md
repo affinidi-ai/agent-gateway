@@ -1099,8 +1099,9 @@ On each use of a credential-derived managed identity, the gateway compares the c
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer
 changed; editing only its name or tags does not. A secret-store API key counts as rotated
 whenever its `updated_at` changes, because its value is never stored; its rotations have
-no `previous` fields. The secret store also bumps `updated_at` when only the key's tags,
-type or tenant change, so the Identities page lists these entries as "Credential updated"
+no `previous` fields. The secret store also bumps `updated_at` when only the key's name,
+description, tags, type or tenant change, or when the same value is saved again, so the
+Identities page lists these entries as "Credential updated"
 rather than as a changed value. `atgk_` API keys are never rotated in place: a new key is a new id, so
 it mints a new DID. The record's `identity_fields` then hold the current certificate's
 values.

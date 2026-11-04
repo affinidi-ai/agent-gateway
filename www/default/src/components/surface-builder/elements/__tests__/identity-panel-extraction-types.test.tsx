@@ -1,7 +1,8 @@
 import React from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import IdentityPanel from '../identity/IdentityPanel';
+import { identityConfigToWire, identityDefinition } from '../identity/definition';
 import { apiClient } from '../../../../api';
 
 jest.mock('../../../../api', () => ({
@@ -10,19 +11,21 @@ jest.mock('../../../../api', () => ({
 
 const mockedApi = apiClient as unknown as { fetch: jest.Mock };
 
-function showPanel(slotId: string, config: Record<string, unknown> = {}) {
+function showPanel(slotId: string, config: Record<string, unknown> = {}, nodeId = 'identity') {
+  const updateField = jest.fn();
   render(
     <IdentityPanel
       {...({
-        node: { id: 'identity', type: 'identity', slotId, label: '', configured: true, config },
+        node: { id: nodeId, type: 'identity', slotId, label: '', configured: true, config },
         config,
-        updateField: jest.fn(),
+        updateField,
         updateFields: jest.fn(),
         protocol: 'mcp',
         allNodes: [],
       } as any)}
     />
   );
+  return { updateField };
 }
 
 const apiKeyOption = () =>
@@ -46,6 +49,22 @@ describe('IdentityPanel From API Key placement', () => {
     expect(apiKeyOption()).toBeDisabled();
   });
 
+  it('disables From API Key on a legacy identity-protected node', () => {
+    showPanel('response:identity', {}, 'identity-protected');
+
+    expect(apiKeyOption()).toBeDisabled();
+  });
+
+  it('ignores a change to From API Key on the Managed Agent response identity', () => {
+    const { updateField } = showPanel('response:identity-protected');
+
+    fireEvent.change(screen.getByLabelText('Identity Extraction Type'), {
+      target: { value: 'from_api_key' },
+    });
+
+    expect(updateField).not.toHaveBeenCalled();
+  });
+
   it.each(['request:identity-inbound', 'response:identity-external'])(
     'still offers From API Key on %s',
     slotId => {
@@ -59,5 +78,12 @@ describe('IdentityPanel From API Key placement', () => {
     showPanel('response:identity-protected', { type: 'from_api_key', api_key_id: 'key-1' });
 
     expect(await screen.findByRole('option', { name: 'client-1 — agent-1' })).toBeInTheDocument();
+  });
+
+  it('keeps the key id of a stored protected From API Key identity on the wire', () => {
+    const stored = { type: 'from_api_key', api_key_id: 'key-1' };
+    const config = identityDefinition.configFromPayload?.(stored);
+
+    expect(identityConfigToWire(config)).toEqual(stored);
   });
 });

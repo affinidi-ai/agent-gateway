@@ -40,7 +40,10 @@ const lastUse = (identity: Identity): string | undefined =>
 
 const usageOf = (identity: Identity): number => identity.usage_count || identity.use_count || 0;
 
-/** `mtls`, `api_key` or `jwt_claim` for a credential-derived identity, `payload` otherwise. */
+/**
+ * `mtls`, `api_key` or `jwt_claim` for a credential-derived identity, `a2a_proxy` for a
+ * managed synthetic identity, `payload` otherwise.
+ */
 const sourceOf = (identity: Identity): string => {
   const type = identity.agent_identity?.credential_type;
   return typeof type === 'string' ? type : 'payload';

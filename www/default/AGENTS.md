@@ -112,8 +112,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
 - The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
-  Managed Agent response identity (`response:identity-protected`), since no caller API key
-  identifies the Managed Agent; the inbound and external slots still offer it. A protected
+  Managed Agent response identity (`response:identity-protected`), since the key picker lists
+  API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
+  external slots still offer it. A protected
   identity already set to From API Key keeps showing its key selector. Transit Point
   identities offer only From Payload.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to

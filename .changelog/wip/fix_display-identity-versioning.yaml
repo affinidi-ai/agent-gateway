@@ -20,11 +20,10 @@ changes:
         updated_at, and a list of rotations with their time and, for a certificate, the
         fingerprint, subject or issuer they replaced; the record's identity fields follow the
         current certificate. Identities rows carry the optional slot and rotations fields, with
-        only the latest 20 rotations kept. An API key's value is not compared, so any update of
-        the stored key, including an edit of only its tags or type, is listed as "Credential
-        updated". Concurrent requests no longer overwrite each other's usage, origin or rotation
-        updates to the same record. Rotations before this release were not recorded; a
-        certificate change found on the first use after it is recorded once, without a time.
+        only the latest 20 rotations kept. An API key's value is not compared, so any edit of
+        the stored key's details is listed as "Credential updated". Rotations before this
+        release were not recorded; a certificate change found on the first use after it is
+        recorded once, without a time.
   changed:
     - timestamp: '2026-11-03T12:00:00Z'
       title: Stop offering From API Key on the Managed Agent's response identity
@@ -40,6 +39,13 @@ changes:
         The button waited for a uuid field the backend never sends, and its modal read a
         response shape the history endpoint does not return. The button and modal are removed;
         an identity's versions are listed in its expanded row instead.
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Stop concurrent requests from losing identity usage counts
+      description: >-
+        Two requests that used the same identity at once could each read the record and save
+        it, so one request's usage count, channel usage or origin was lost. Within one gateway
+        process, usage, origin and rotation updates to one identity record, including those for
+        external callers, are now serialised per identity hash.
   removed: []
   security: []
   breaking: []

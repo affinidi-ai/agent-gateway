@@ -534,6 +534,7 @@ impl IdentityStore for FilesystemIdentityStore {
             Some(found) => found.identity_hash,
             None => format!("external:{}", did),
         };
+        // Re-read under the lock, so a concurrent request's usage or rotation update isn't lost
         let _guard = self
             .record_lock(&identity_hash)
             .lock()
@@ -1372,6 +1373,73 @@ mod tests {
             .unwrap();
         assert_eq!(record.usage_count, requests);
         assert_eq!(record.rotations.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_external_did_and_usage_updates_are_not_lost() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FilesystemIdentityStore::new(temp_dir.path())
+                .await
+                .unwrap(),
+        );
+        let managed = local_record("h");
+        let managed_did = managed.did.clone();
+        store
+            .create(managed)
+            .await
+            .unwrap();
+        let external_did = "did:web:caller.example";
+
+        let requests = 16;
+        let tasks: Vec<_> = (0..requests)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let managed_did = managed_did.clone();
+                tokio::spawn(async move {
+                    store
+                        .store_external_did(
+                            external_did,
+                            std::collections::HashMap::new(),
+                            Some("surface-1".to_string()),
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    store
+                        .store_external_did(
+                            &managed_did,
+                            std::collections::HashMap::new(),
+                            Some("surface-1".to_string()),
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    store
+                        .update_usage("h", Some("surface-1".to_string()))
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let external = store
+            .find_by_hash(&format!("external:{external_did}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(external.usage_count, requests);
+        assert_eq!(external.channel_usage[0].usage_count, requests);
+        let managed = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed.usage_count, 2 * requests);
+        assert_eq!(managed.channel_usage[0].usage_count, 2 * requests);
     }
 
     #[tokio::test]

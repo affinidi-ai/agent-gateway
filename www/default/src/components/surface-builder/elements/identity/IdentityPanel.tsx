@@ -57,7 +57,8 @@ const typeOptionsForPlacement = (
     disabled:
       option.disabled ||
       (isTransitPointIdentity && option.value !== 'from_payload') ||
-      // MA → AP response leg: no caller API key identifies the Managed Agent.
+      // MA → AP response leg: the key picker lists API keys issued to callers, and none of
+      // them identifies the Managed Agent.
       (isProtectedIdentity && option.value === 'from_api_key') ||
       undefined,
   }));

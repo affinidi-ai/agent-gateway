@@ -140,6 +140,10 @@ backend sends on each identity; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
 
+The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,
+and a stored one keeps working; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Caller Context element lists its caller authentication methods in order, in the sidebar and
 in the fullscreen editor, each row with a Configure button that opens that method's settings;
 see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
