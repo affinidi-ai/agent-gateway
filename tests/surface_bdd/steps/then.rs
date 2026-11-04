@@ -895,7 +895,8 @@ fn admin_api_response_status_is(
     world: &mut SurfaceWorld,
     expected: u16,
 ) {
-    assert_response_status(Some(get_admin_response(world).status), expected);
+    let response = get_admin_response(world);
+    assert_status_with_body(response.status, expected, &response.body, "admin API response");
 }
 
 #[then(expr = "the surface lookup response status is {int}")]
