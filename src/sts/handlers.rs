@@ -1076,7 +1076,7 @@ async fn handle_token_exchange(
             .audience
             .clone()
             .or_else(|| req.resource.clone());
-        enforce_audience(&record, audience.as_deref(), Some(issuer.as_str()))?;
+        enforce_audience_and_ownership(state, &record, audience.as_deref(), &issuer).await?;
         audience
     };
 
@@ -1301,7 +1301,7 @@ async fn handle_jwt_bearer(
         }
         Some(resource)
     } else {
-        enforce_audience(&record, legacy_audience.as_deref(), Some(issuer.as_str()))?;
+        enforce_audience_and_ownership(state, &record, legacy_audience.as_deref(), &issuer).await?;
         legacy_audience
     };
 
@@ -1516,6 +1516,30 @@ fn enforce_audience(
         }
         Some(a) => Err(StsError::InvalidTarget(format!("audience not allowed: {a}"))),
         None => Err(StsError::InvalidTarget("audience or resource is required".to_string())),
+    }
+}
+
+/// [`enforce_audience`], then, for a tenant connection, refuse an audience an
+/// endpoint of a tenant it cannot reference serves, whatever its allowlist
+/// holds ([`crate::sts::resource_owners::ensure_client_may_target`]). The
+/// gateway's own issuer is no endpoint's resource, so it is not looked up.
+async fn enforce_audience_and_ownership(
+    state: &StsState,
+    record: &StsClientRecord,
+    audience: Option<&str>,
+    self_issuer: &str,
+) -> Result<(), StsError> {
+    enforce_audience(record, audience, Some(self_issuer))?;
+    match audience.filter(|audience| *audience != self_issuer) {
+        Some(audience) => {
+            crate::sts::resource_owners::ensure_client_may_target(
+                state.resource_owners.as_ref(),
+                record.tenant_id.as_deref(),
+                audience,
+            )
+            .await
+        }
+        None => Ok(()),
     }
 }
 
@@ -2194,6 +2218,106 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// Without the MCP profile, token exchange, ID-JAG issuance and jwt-bearer
+    /// redemption refuse a tenant connection an audience another tenant's
+    /// endpoint serves, whether its allowlist is empty or was saved before that
+    /// endpoint declared it. Its own tenant's resource, a third-party audience
+    /// and the gateway's own issuer still pass, as does every audience for an
+    /// appliance-global connection.
+    #[tokio::test]
+    async fn non_mcp_grants_refuse_an_audience_another_tenant_serves() {
+        struct Declared;
+
+        #[async_trait::async_trait]
+        impl crate::sts::resource_owners::StsResourceOwners for Declared {
+            async fn declaring_tenants(
+                &self,
+                resource: &str,
+            ) -> anyhow::Result<Vec<Option<String>>> {
+                Ok(match resource {
+                    "https://gateway.example/surfaces/a" => vec![Some("tenant-a".into())],
+                    "https://gateway.example/surfaces/b" => vec![Some("tenant-b".into())],
+                    _ => Vec::new(),
+                })
+            }
+        }
+
+        let gateway = "did:webvh:example:gw";
+        let theirs = "https://gateway.example/surfaces/b";
+        let ours = "https://gateway.example/surfaces/a";
+        let third_party = "https://api.example.com";
+        let stale = vec![theirs.to_string(), ours.to_string(), third_party.to_string()];
+
+        for (tenant_id, allowed_audiences) in
+            [(Some("tenant-a"), Vec::new()), (Some("tenant-a"), stale.clone()), (None, Vec::new()), (None, stale)]
+        {
+            let mut record = base_record();
+            record.tenant_id = tenant_id.map(Into::into);
+            record.allowed_audiences = allowed_audiences.clone();
+            record.issue_id_jag = true;
+            let cases = [
+                (theirs, TOKEN_TYPE_ACCESS_TOKEN, tenant_id.is_some()),
+                (theirs, TOKEN_TYPE_ID_JAG, tenant_id.is_some()),
+                (ours, TOKEN_TYPE_ACCESS_TOKEN, false),
+                (third_party, TOKEN_TYPE_ACCESS_TOKEN, false),
+                (gateway, TOKEN_TYPE_ID_JAG, false),
+            ];
+            let mut claims = HashMap::from([(
+                "subject-tok".to_string(),
+                json!({"iss": "https://idp.example/", "sub": "user-123", "exp": now_secs() + 90}),
+            )]);
+            let assertions: Vec<String> = cases
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let grant = json!({
+                        "iss": gateway, "sub": "user-123", "aud": gateway, "client_id": "agent-client",
+                        "jti": format!("grant-{index}"), "exp": now_secs() + 90
+                    });
+                    let assertion = id_jag_assertion(&grant);
+                    claims.insert(assertion.clone(), grant);
+                    assertion
+                })
+                .collect();
+            let state = StsState {
+                resource_owners: Arc::new(Declared),
+                ..state_with(claims, client(record, Some("s3cret")))
+            };
+
+            for ((audience, requested, refused), assertion) in cases
+                .into_iter()
+                .zip(assertions)
+            {
+                let case = format!("{tenant_id:?} {allowed_audiences:?} {audience} {requested}");
+                let mut exchange = exchange_form();
+                exchange.audience = Some(audience.into());
+                exchange.requested_token_type = Some(requested.into());
+                let mut forms = vec![exchange];
+                if requested == TOKEN_TYPE_ACCESS_TOKEN {
+                    forms.push(TokenEndpointForm {
+                        grant_type: Some(GRANT_TYPE_JWT_BEARER.into()),
+                        assertion: Some(assertion),
+                        client_id: Some("agent-client".into()),
+                        client_secret: Some("s3cret".into()),
+                        audience: Some(audience.into()),
+                        ..Default::default()
+                    });
+                }
+                for form in forms {
+                    let grant = form.grant_type.clone();
+                    match dispatch(&state, &HeaderMap::new(), form).await {
+                        Err(StsError::InvalidTarget(_)) if refused => {}
+                        Ok(response) if !refused => {
+                            let token: Value = serde_json::from_str(&response.access_token).unwrap();
+                            assert_eq!(token["aud"], audience, "{case} {grant:?}");
+                        }
+                        other => panic!("{case} {grant:?}: {other:?}"),
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

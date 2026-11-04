@@ -212,19 +212,15 @@ pub async fn ensure_client_may_target(
         .declaring_tenants(resource)
         .await
         .map_err(|error| {
-            tracing::error!(%error, "Failed to read endpoints while checking an MCP resource's owner");
-            StsError::ServerError("MCP resource ownership is unavailable".into())
+            tracing::error!(%error, "Failed to read endpoints while checking a resource's owner");
+            StsError::ServerError("resource ownership is unavailable".into())
         })?;
     if tenants
         .iter()
         .any(|tenant| !crate::tenancy::can_reference(Some(client_tenant_id), tenant.as_deref()))
     {
-        tracing::warn!(
-            resource,
-            tenant_id = client_tenant_id,
-            "Refused an MCP resource token for a resource another tenant serves"
-        );
-        return Err(StsError::InvalidTarget("MCP resource is not available to this client".into()));
+        tracing::warn!(resource, tenant_id = client_tenant_id, "Refused a token for a resource another tenant serves");
+        return Err(StsError::InvalidTarget("resource is not available to this client".into()));
     }
     Ok(())
 }

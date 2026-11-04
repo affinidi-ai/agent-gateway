@@ -235,8 +235,10 @@ Per-connection controls:
   genuinely external audiences still require an entry. On a connection that
   carries a `tenant_id`, the token endpoint refuses, with `invalid_target`,
   a resource served by a surface or standalone MCP Proxy of a tenant the
-  connection **cannot** reference. This covers the base Access Point, enabled
-  variants and their Transit Points. Create and update reject such an entry
+  connection **cannot** reference, as the requested `audience` or `resource`
+  of a token exchange, an ID-JAG or a jwt-bearer redemption, whether
+  `allowed_audiences` is empty or lists it. This covers the base Access
+  Point, enabled variants and their Transit Points. Create and update reject such an entry
   with `400` as early feedback. Minting checks again, so it also covers
   resources declared after the connection was saved and endpoints moved
   between tenants. A Resource Server accepts a token on issuer, audience and

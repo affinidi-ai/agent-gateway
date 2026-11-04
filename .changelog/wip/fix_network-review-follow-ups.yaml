@@ -44,4 +44,14 @@ changes:
         as an expired one or one from another issuer, was still sent on to the Target whenever
         policy let the failed caller through. The token now reaches the Target only when it passed
         verification.
+    - timestamp: '2026-11-04T09:30:00Z'
+      title: Check a tenant connection's audience owner on every STS grant
+      description: >-
+        A tenant's STS connection was checked against the tenant that serves the requested
+        resource only when minting MCP resource tokens. Token exchange, ID-JAG issuance and
+        jwt-bearer redemption outside the MCP profile ran only the connection's audience
+        allowlist, so with an empty list, or one saved before another tenant's surface declared
+        the resource, a connection could mint a token that tenant's endpoint would accept. Every
+        grant now refuses such an audience; the gateway's own issuer, third-party audiences and
+        appliance-wide connections work as before.
   breaking: []
