@@ -32,6 +32,14 @@ changes:
         receive sends no delegated credential. Fabric receive releases none of that view's
         per-user grants. The save is
         not refused, as for a Transit Point that sets the same switch.
+    - timestamp: '2026-11-04T18:00:00Z'
+      title: Add the Release per-user grants to Fabric callers switch to the dashboard
+      description: >-
+        The Managed Agent panel shows a Release per-user grants to Fabric callers switch for an
+        HTTP or HTTPS Target on a surface with credential bindings. It is off by default, writes
+        target.delegated_credentials_for_fabric_callers, round-trips through variants, and warns
+        while on that a paired gateway sending a person's own token gets that person's grant. A
+        dashboard save drops the field for any other Target.
   changed:
     - timestamp: '2026-11-04T17:15:00Z'
       title: Key a Fabric request's delegated credentials by the receiving surface

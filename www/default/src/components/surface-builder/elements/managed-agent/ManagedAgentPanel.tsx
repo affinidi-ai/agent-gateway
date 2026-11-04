@@ -12,6 +12,7 @@ import FabricDelegatedCredentialsSection, {
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
 import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
+import PartnerGrantReleaseSection, { isHttpTarget } from './PartnerGrantReleaseSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 
 interface Gateway {
@@ -546,6 +547,13 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
               ?.name
           }
           onChange={next => updateField('fabric_delegated_credentials', next)}
+        />
+      )}
+
+      {isHttpTarget(config.endpoint) && hasOutboundCredentialBindings(allNodes) && (
+        <PartnerGrantReleaseSection
+          checked={config.delegated_credentials_for_fabric_callers === true}
+          onChange={next => updateField('delegated_credentials_for_fabric_callers', next)}
         />
       )}
 

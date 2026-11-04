@@ -626,9 +626,15 @@ it on only beside a JWT with an audience or resource tokens, and only for peers 
 exposed to on purpose: a partner that holds several people's valid tokens can use each one's grant
 while the tokens last, swap one person's token for another's, and learn from the refusals which of
 them have connected. A save of a surface whose Target sets the switch, on the surface or in an
-enabled variant, where that view's caller authentication cannot tell a partner's users apart, or
-whose JWT verification strategy names no issuer, is accepted with a `Warning` header naming the
-view and the reason; Fabric callers then get none of that view's per-user grants.
+enabled variant, is accepted with a `Warning` header naming the view and the reason where the
+switch releases nothing: that view's caller authentication cannot tell a partner's users apart,
+its JWT verification strategy names no issuer, or its Target is not an `http://` or `https://`
+URL, to which Fabric receive sends no delegated credential. Only the save reads the
+strategy's issuer. Each request checks the switch, the Target's scheme and the caller
+authentication rule, never the issuer, and a strategy that names no issuer, or cannot be read,
+verifies no caller with an identity hash, so its requests get no grant either. In the dashboard
+the switch is **Release per-user grants to Fabric callers** on the Managed Agent panel, shown for
+an HTTP or HTTPS Target on a surface with credential bindings.
 
 A legacy Fabric request a binding applies to is refused with `403`, before the Target is called,
 when:

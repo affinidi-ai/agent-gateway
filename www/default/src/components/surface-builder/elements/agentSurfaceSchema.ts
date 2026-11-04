@@ -91,6 +91,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'target.mpp_auto_pay',
   'target.mpp_auto_pay_max_amount',
   'target.fabric_delegated_credentials',
+  'target.delegated_credentials_for_fabric_callers',
 
   // ── Transit (SharedTransitConfig is flattened into transit.*) ────
   'transit.points',
