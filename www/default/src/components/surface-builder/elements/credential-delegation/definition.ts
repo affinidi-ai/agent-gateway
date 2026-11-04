@@ -9,6 +9,7 @@ import {
 import CredentialDelegationPanel from './CredentialDelegationPanel';
 import CredentialDelegationFullscreenPanel from './CredentialDelegationFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import { readMethods } from '../caller-auth/methods';
 
 /**
  * Credential Delegation — drops on the Managed Agent → External arrow.
@@ -162,7 +163,7 @@ export const credentialDelegationDefinition: NodeDefinition = {
  * check.
  */
 export function surfaceHasSourceAuth(nodes: CanvasNode[]): boolean {
-  return nodes.some(n => n.type === 'caller-auth' && !!n.config?.method_type);
+  return nodes.some(n => n.type === 'caller-auth' && readMethods(n.config).length > 0);
 }
 
 /**

@@ -28,9 +28,108 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 | DID Auth | `did_auth` | A DID Auth session token |
 | mTLS | `mtls` | A TLS client certificate |
 
-`methods` is a list, but the inbound pipeline enforces only its first entry
-([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
-are accepted and ignored.
+### Several methods on one Access Point
+
+`methods` is a list, so one surface can accept callers with different credentials, for
+example a JWT for internal users and an API key for partner agents, and the managed agent
+keeps one identity. The first entry is the primary method. The gateway selects one method
+per request ([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only
+that method:
+
+1. The method is the one whose credential the request carries: its header is present and not
+   empty (for JWT bearer, `token_header` holding a token in `token_scheme`, so an MPP
+   `Authorization: Payment` credential is not a JWT; otherwise `extraction.field`), or, for
+   mTLS, a client certificate reached the gateway. No credential is read from the body, so a
+   method that extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
+2. A request that carries no method's credential is checked against the primary method, so
+   it fails as a missing credential of that method.
+3. A request that carries credentials for more than one method fails source authentication
+   as the primary method, audited as `ambiguous_credentials`, and neither credential is
+   verified, so a caller can't choose the identity the gateway asserts. Like any failed
+   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
+   protected resource metadata, and otherwise passed to policy as
+   `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
+   connection that presents a client certificate, on a surface that also accepts mTLS, and an
+   MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
+   `Authorization`: the gateway cannot tell whose token it is.
+4. A rejected credential is never retried with another method.
+
+The order of the other methods has no effect.
+
+Policy sees the method that verified the caller as `input.source_auth.method`, so a rule can
+treat callers differently by method:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if input.source_auth.method == "jwt_bearer"
+
+allow if {
+    input.source_auth.method == "api_key"
+    input.source_auth.key_name == "partner-keys"
+}
+```
+
+For `api_key`, `key_name` is the method's `secret_id`. An `api_key_provider` caller also
+reports `method: "api_key"`, with the provider's key id as `key_name`, so a policy tells the
+two API key methods apart by `key_name`.
+
+Creating or saving a surface, and each of its enabled variants as resolved, refuses:
+
+- two methods that read the same credential location: the same header, compared without
+  regard to case, both `mcp_meta`, both `a2a_extension`, or two mTLS methods;
+- a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
+  it could never be selected;
+- more than one `did_auth` method, because the `/authenticate` endpoints serve one;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
+  method is `jwt_bearer`;
+- an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
+- on an Access Point that publishes protected resource metadata, a JWT bearer method other
+  than the primary: the discovery audience and challenge belong to the primary method.
+
+Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
+`from_api_key` a verified key. So a surface mixing JWT and API key callers takes a stored or
+static inbound identity, and policy tells its callers apart by `input.source_auth.method` and
+`key_name`.
+
+On an Access Point that publishes protected resource metadata, every caller-attributable
+failure is refused before policy: a failed JWT with the discovery challenge, and a failed
+credential of any other method with a plain `401`, so a bad credential never gets further
+than none. This holds directly and over Fabric.
+
+**Upgrading and rolling back.** Upgrading turns on every method of a stored surface: earlier
+releases enforced only the first and ignored the rest, so a caller presenting a later method's
+credential, which failed before, is now authenticated. Audit `caller_authentication.methods`,
+on each surface and each variant override, before upgrading. At startup the gateway logs, at
+`WARN`, one line per surface and per variant with more than one method, naming the methods
+after the first ([`additional_source_auth_method_notices`](../src/config/proxy.rs)); the line
+repeats on every start.
+
+Surfaces stored before these rules may break them, because the gateway then enforced only the
+first method and ignored the rest. Wherever surfaces load, at startup (from local storage,
+DynamoDB or its cache), on a configuration or single-surface reload, and when a storage event
+applies a surface another process wrote, a stored surface whose methods break them keeps only
+its first method, when that method is valid alone, and so does each enabled variant overriding
+its caller authentication ([`fall_back_to_first_source_auth_method`](../src/config/proxy.rs)).
+The gateway logs an error naming the surface, the rule and each dropped method by tag,
+credential location and non-secret references (strategy, secret, provider agent,
+certificates), so it can be rebuilt. An active node's load persists the correction to local
+storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
+node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
+`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_api_key` identity beside a method other than an API key, is logged as a warning at
+startup and refused on the next save.
+
+Before rolling back to a release that enforces only the first method, remove every method but
+the first. That release strips only the first method's header, so it would forward a later
+method's credential, such as a partner's `X-API-Key`, to the Target.
+
+The credential headers of every method are stripped before a request is forwarded, on each
+inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
+forwards its header only when it was the method selected for that request, so a request
+carrying several credentials forwards none.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
@@ -857,7 +956,9 @@ Per-key caller identity therefore needs an API Key Provider.
 A save (`POST`, `PUT`, `PATCH`, and each enabled variant) refuses an inbound `from_api_key`
 with `400` when:
 
-- the first Caller Context method is not API Key or API Key Provider;
+- a Caller Context method is not API Key or API Key Provider: a caller verified another way
+  presents no key to identify it, and the request path refuses it with `500`. At startup a
+  stored surface breaking this rule loads with a warning;
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
 - the target is an MCP `proxy://` MCP Proxy.
 

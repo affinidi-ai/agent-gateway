@@ -239,15 +239,35 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`identity-panel-inbound-api-key-note`);
   `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
   the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
-  Save unless the first Caller Context method is API Key or API Key Provider, with the gateway's
+  Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
+- **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
+  `caller_authentication.methods`, the first being the primary method, and `protected_resource`,
+  which belongs to the primary;
+  `readMethods` in `caller-auth/methods.ts` also reads an older canvas that kept the first method
+  on the element and the rest as `additional_methods`. The sidebar and the fullscreen editor show
+  the same list (`CallerAuthMethodList.tsx`): one row per method with a ready or problem icon, its
+  short name, what it reads (or its problem), and a **Configure ↗** button, then **Add method**,
+  a menu of method types that adds one and opens it. Configure in the sidebar opens the
+  fullscreen editor on that method (`selectedMethod.ts`, never saved); the editor's list adds
+  **Make primary** (which moves a method first and keeps the rest in order) and remove buttons
+  (a sole method cannot be removed) and shows the selected method's
+  settings below it (`CallerAuthMethodFields.tsx`, one method at a time, so its ids stay
+  `caller-auth-*`). With several methods the first carries a Primary badge. While authorization
+  server discovery is on, the primary stays primary and carries a discovery badge. `methods.ts`
+  mirrors the gateway's save rules (each method reads its own credential location, only a sole
+  method reads the request body, at most one DID Auth, and, while authorization server discovery
+  is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
+  primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
+  unconfigured as `Method <n>: <reason>`. Loading a surface always replaces `methods`, so a stale
+  canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
-  method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener
-  URL plus its route (left empty otherwise), empties Accepted Audiences, turns token forwarding
-  off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
+  first method is JWT Bearer; additional methods never show it. Turning it on prefills the
+  resource with the Access Point's https listener URL plus its route (left empty otherwise),
+  empties Accepted Audiences, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
   locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
   scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
   gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
@@ -319,6 +339,17 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `SurfaceFormShell`, which then moves focus to the destination's sidebar view button (or the Agent
   Cards heading when the sidebar is collapsed); a click on a sidebar view button leaves focus where
   it is.
+
+Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `caller-auth-editor`
+(fullscreen editor):
+
+| Caller Context methods element      | Test id                                                                                 |
+| ----------------------------------- | --------------------------------------------------------------------------------------- |
+| Method list, one method row         | `<area>-methods`, `<area>-method-<index>`                                               |
+| A row's status icon and Configure   | `<area>-method-<index>-status`, `<area>-method-<index>-configure-button`                |
+| A row's Make primary and remove     | `<area>-method-<index>-make-primary-button`, `-remove-button` (editor)                  |
+| Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
+| Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
 
 ## Trust Check
 

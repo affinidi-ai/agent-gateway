@@ -18,6 +18,11 @@ pub enum SourceAuthError {
     #[error("Invalid credential: {reason}")]
     InvalidCredential { reason: String },
 
+    /// The request carries credentials for more than one source
+    /// authentication method, so none is verified.
+    #[error("Ambiguous credentials: the request carries credentials for more than one source authentication method")]
+    AmbiguousCredentials,
+
     /// The referenced authentication configuration was not found.
     #[error("Auth config not found: {id}")]
     ConfigNotFound { id: String },
@@ -65,7 +70,12 @@ impl SourceAuthError {
     /// fetch, storage). Caller-attributable failures are handed to the policy
     /// layer instead of being blocked at the source-auth stage.
     pub fn is_caller_attributable(&self) -> bool {
-        matches!(self, SourceAuthError::MissingCredential { .. } | SourceAuthError::InvalidCredential { .. })
+        matches!(
+            self,
+            SourceAuthError::MissingCredential { .. }
+                | SourceAuthError::InvalidCredential { .. }
+                | SourceAuthError::AmbiguousCredentials
+        )
     }
 
     /// HTTP status for a blocking denial. Caller-credential failures map to

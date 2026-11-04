@@ -258,7 +258,9 @@ it creates unless it is public), and one whose `caller_authentication.on_failure
 refuse a missing or invalid credential with `401` before policy, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
 does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+`{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
+the method selected for the request (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
@@ -266,17 +268,18 @@ vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
-metadata never reaches policy with a failed credential, direct or over Fabric: a direct
-request is refused with a `401` challenge pointing at that metadata, and a Fabric request
-with a `401` without it, see
+metadata never reaches policy with a failed credential, direct or over Fabric: a failed JWT
+bearer credential is refused with a `401` challenge pointing at that metadata on a direct
+request, and with a `401` without it over Fabric, and a failed credential of another method
+on that Access Point with a plain `401`, see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 A Transit Point's own `source_auth` is different: it refuses a missing or invalid credential
 itself, with `401`, before any policy runs, so an outbound policy never sees
 `"method": "failed"` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)).
 
-Over Fabric, the sending Gateway strips the credential header its own surface consumed
-before forwarding. A receiving surface without protected resource metadata that requires
+Over Fabric, the sending Gateway strips the credential headers of every method its own
+surface configures before forwarding. A receiving surface without protected resource metadata that requires
 source authentication on that same header therefore sees every Fabric caller as failed and
 forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.

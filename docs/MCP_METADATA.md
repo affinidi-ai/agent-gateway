@@ -1482,7 +1482,13 @@ and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
 plus `error="invalid_token"` once a token was presented and `scope` when
 scopes are set. The body's detail is fixed and never says why a token failed.
 The audit records the failure as blocking. A valid token issued for the
-resource is attributed as before, and its identity reaches policy. Over
+resource is attributed as before, and its identity reaches policy. When the
+Access Point lists further caller authentication methods after the JWT Bearer
+method, a request that carries one of their credentials and none for the JWT
+Bearer method is checked by that method instead, and a failure is refused
+before policy with a plain `401`, without the challenge, so a bad credential
+gets no further than none; a request with no credential at all still gets the
+challenge. Over
 Fabric, the receiving gateway binds the token audience to the same resource,
 because both paths resolve the accepted audiences in
 `source_auth::middleware::resolve_surface_audience`. The variant whose

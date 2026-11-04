@@ -68,9 +68,7 @@ fn delegation_headers(
     surface: &crate::config::agent_surface::AgentSurface,
     headers: &HeaderMap,
 ) -> std::collections::HashMap<String, String> {
-    let source_credential = surface
-        .source_auth()
-        .and_then(|auth| auth.credential_header_name());
+    let source_credentials = surface.source_credential_headers();
     let resource_authorization = surface
         .mcp_http
         .as_ref()
@@ -80,18 +78,18 @@ fn delegation_headers(
         .header_metadata_mapping_if_supported();
     let mut delegated = headers
         .iter()
-        .filter_map(|(name, value)| {
-            let value = value.to_str().ok()?;
+        .filter_map(|(name, raw_value)| {
+            let value = raw_value.to_str().ok()?;
             let forwarded = if name == axum::http::header::AUTHORIZATION {
                 !resource_authorization
-                    && !source_credential.is_some_and(|credential| credential.eq_ignore_ascii_case(name.as_str()))
+                    && !surface.takes_source_credential(name, raw_value)
                     && value.starts_with("Payment ")
             } else {
                 super::should_forward_ap_request_header_with_mapping(
                     name.as_str(),
-                    source_credential,
+                    &source_credentials,
                     header_metadata_mapping,
-                    false,
+                    None,
                 )
             };
             forwarded.then(|| (name.as_str().to_uppercase(), value.to_string()))
@@ -883,6 +881,68 @@ mod tests {
             .map(|(_, value)| value.as_str())
             .collect();
         assert_eq!(hops, ["1"]);
+    }
+
+    #[test]
+    fn delegated_payment_strips_every_source_credential_header() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "paid", "name": "Paid", "access_point": {
+                "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                "caller_authentication": {"methods": [
+                    {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_header": "X-User-Token"},
+                    {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"}
+                ]}
+            }, "target": {"endpoint": "https://target.example/a2a"}
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", "Bearer user".parse().unwrap());
+        headers.insert("x-api-key", "partner".parse().unwrap());
+        headers.insert(
+            "payment-signature",
+            "payment-proof"
+                .parse()
+                .unwrap(),
+        );
+
+        let delegated = delegation_headers(&surface, &headers);
+        assert!(!delegated.contains_key("X-USER-TOKEN"));
+        assert!(!delegated.contains_key("X-API-KEY"));
+        assert_eq!(
+            delegated
+                .get("PAYMENT-SIGNATURE")
+                .map(String::as_str),
+            Some("payment-proof")
+        );
+    }
+
+    #[test]
+    fn a_payment_credential_is_delegated_beside_a_jwt_method_on_authorization() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "paid", "name": "Paid", "access_point": {
+                "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                "caller_authentication": {"methods": [
+                    {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"},
+                    {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+                ]}
+            }, "target": {"endpoint": "https://target.example/a2a"}
+        }))
+        .unwrap();
+        let delegated_authorization = |authorization: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", "partner".parse().unwrap());
+            headers.insert(axum::http::header::AUTHORIZATION, authorization.parse().unwrap());
+            delegation_headers(&surface, &headers)
+                .get("AUTHORIZATION")
+                .cloned()
+        };
+
+        assert_eq!(
+            delegated_authorization("Payment cred").as_deref(),
+            Some("Payment cred"),
+            "the paying partner's MPP credential reaches the payment gateway"
+        );
+        assert_eq!(delegated_authorization("Bearer token"), None, "the JWT method's credential stays at the gateway");
     }
 
     #[tokio::test]
