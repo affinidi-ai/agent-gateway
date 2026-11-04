@@ -911,11 +911,78 @@ pub(crate) async fn post_token_request_within(
         .map_err(|_| TokenPostFailure::TimedOut)?
 }
 
+/// How a token request that was sent to a token endpoint ended: the `outcome` label of the
+/// credential provider token request counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenRequestOutcome {
+    Success,
+    /// The endpoint answered with a non-2xx status, or the connection failed before any answer.
+    Refused,
+    Timeout,
+    /// The answer could not be parsed, was over the size limit, lacked a usable `expires_in`
+    /// or token, or granted scopes other than requested.
+    InvalidResponse,
+}
+
+impl TokenRequestOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Refused => "refused",
+            Self::Timeout => "timeout",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// The `(provider_type, outcome)` pairs recorded inside a test's scope.
+    pub(crate) static TEST_TOKEN_REQUESTS: Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>;
+}
+
+/// Counts one service token request that was sent to `provider`'s token endpoint. No URL,
+/// provider id, secret or tenant is a label.
+pub(crate) fn record_token_request(
+    provider: &CredentialProvider,
+    outcome: TokenRequestOutcome,
+) {
+    use crate::credential_providers::CredentialProviderType as Type;
+    let provider_type = match provider.provider_type {
+        Type::OAuth2ClientCredentials => "oauth2_client_credentials",
+        Type::OAuth2JwtBearer => "oauth2_jwt_bearer",
+        Type::OAuth2ClientCredentialsJwtAuth => "oauth2_client_credentials_jwt_auth",
+        Type::OAuth2AuthorizationCode => "oauth2_authorization_code",
+        Type::ApiKey => "api_key",
+    };
+    crate::metrics::backends::prometheus::track_credential_provider_token_request(provider_type, outcome.label());
+    #[cfg(test)]
+    let _ = TEST_TOKEN_REQUESTS.try_with(|recorded| {
+        if let Ok(mut recorded) = recorded.lock() {
+            recorded.push((provider_type, outcome.label()));
+        }
+    });
+}
+
+impl TokenPostFailure {
+    /// The token request counter's outcome for a request that was sent and failed.
+    fn outcome(&self) -> TokenRequestOutcome {
+        match self {
+            Self::Unreachable(error) if !error.is_timeout() => TokenRequestOutcome::Refused,
+            Self::ResponseFailed(error) if !error.is_timeout() => TokenRequestOutcome::InvalidResponse,
+            Self::TooLarge => TokenRequestOutcome::InvalidResponse,
+            Self::Unreachable(_) | Self::ResponseFailed(_) | Self::TimedOut => TokenRequestOutcome::Timeout,
+        }
+    }
+}
+
 /// POST a token request through the egress's pinned client ([`post_token_request_within`])
 /// and read its JSON response, the whole request within the egress timeout. The access
 /// token must be a non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
-/// an error, and only its OAuth `error` code is logged.
+/// an error, and only its OAuth `error` code is logged. A failed service token request that
+/// reached the endpoint is counted here; [`TokenRequestOutcome::Success`] is counted by the
+/// caller that also checks the granted scopes.
 async fn request_token(
     provider: &CredentialProvider,
     endpoint: &str,
@@ -923,55 +990,80 @@ async fn request_token(
     refresh: bool,
     egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
-    {
-        let started = tokio::time::Instant::now();
-        let (client, url) = tokio::time::timeout(egress.timeout, egress.pinned_client(endpoint))
-            .await
-            .map_err(|_| TokenPostFailure::TimedOut)??;
-        let remaining = egress
-            .timeout
-            .saturating_sub(started.elapsed());
-        let TokenEndpointAnswer { status, body: bytes } =
-            post_token_request_within(&client, url.as_str(), params, None, remaining).await?;
-        if !status.is_success() {
-            warn!(
-                target: "credential_delegation",
-                provider_id = %provider.provider_id,
-                status = %status,
-                reason = %token_error_code(&String::from_utf8_lossy(&bytes)),
-                "Provider token request rejected"
-            );
+    let started = tokio::time::Instant::now();
+    let (client, url) = tokio::time::timeout(egress.timeout, egress.pinned_client(endpoint))
+        .await
+        .map_err(|_| TokenPostFailure::TimedOut)??;
+    let remaining = egress
+        .timeout
+        .saturating_sub(started.elapsed());
+    let answer = match post_token_request_within(&client, url.as_str(), params, None, remaining).await {
+        Ok(answer) => answer,
+        Err(failure) => {
+            if !refresh {
+                record_token_request(provider, failure.outcome());
+            }
+            return Err(failure.into());
         }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid provider token response")?;
-        if refresh
-            && status == reqwest::StatusCode::BAD_REQUEST
-            && value
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                == Some("invalid_grant")
-        {
-            return Ok(None);
-        }
-        anyhow::ensure!(status.is_success(), "Provider token request rejected");
-        let response: OAuthTokenResponse = serde_json::from_value(value).context("Invalid provider token response")?;
-        anyhow::ensure!(
-            !response
-                .access_token
-                .is_empty()
-                && response
-                    .token_type
-                    .eq_ignore_ascii_case("Bearer")
-                && response
-                    .expires_in
-                    .is_some_and(|seconds| seconds > 0 && seconds <= 366 * 86400)
-                && response
-                    .refresh_token
-                    .as_deref()
-                    .is_none_or(|token| !token.is_empty()),
-            "Invalid provider token credential"
+    };
+    let refused = !answer.status.is_success();
+    let result = read_token_answer(provider, answer, refresh);
+    if !refresh && result.is_err() {
+        record_token_request(
+            provider,
+            if refused {
+                TokenRequestOutcome::Refused
+            } else {
+                TokenRequestOutcome::InvalidResponse
+            },
         );
-        Ok(Some(response))
     }
+    result
+}
+
+fn read_token_answer(
+    provider: &CredentialProvider,
+    TokenEndpointAnswer { status, body: bytes }: TokenEndpointAnswer,
+    refresh: bool,
+) -> Result<Option<OAuthTokenResponse>> {
+    if !status.is_success() {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            status = %status,
+            reason = %token_error_code(&String::from_utf8_lossy(&bytes)),
+            "Provider token request rejected"
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid provider token response")?;
+    if refresh
+        && status == reqwest::StatusCode::BAD_REQUEST
+        && value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            == Some("invalid_grant")
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(status.is_success(), "Provider token request rejected");
+    let response: OAuthTokenResponse = serde_json::from_value(value).context("Invalid provider token response")?;
+    anyhow::ensure!(
+        !response
+            .access_token
+            .is_empty()
+            && response
+                .token_type
+                .eq_ignore_ascii_case("Bearer")
+            && response
+                .expires_in
+                .is_some_and(|seconds| seconds > 0 && seconds <= 366 * 86400)
+            && response
+                .refresh_token
+                .as_deref()
+                .is_none_or(|token| !token.is_empty()),
+        "Invalid provider token credential"
+    );
+    Ok(Some(response))
 }
 
 /// Build a consent-required payload for protocol-aware signaling
@@ -1686,6 +1778,7 @@ mod tests {
                 json!({
                 "provider_type": "oauth2_jwt_bearer",
                 "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                "jwt_subject": "admin@example.com",
                 "jwt_key_id": "google-key-id"
                 }),
             );
@@ -1716,6 +1809,13 @@ mod tests {
             );
             let claims = claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url);
             assert_eq!(claims["iss"], "agent@project.iam.gserviceaccount.com");
+            assert_eq!(claims["sub"], "admin@example.com");
+            assert!(
+                claims["jti"]
+                    .as_str()
+                    .is_some_and(|jti| uuid::Uuid::parse_str(jti).is_ok()),
+                "{claims}"
+            );
             assert_eq!(claims["scope"], "https://www.googleapis.com/auth/cloud-platform");
             assert_eq!(
                 claims["exp"]

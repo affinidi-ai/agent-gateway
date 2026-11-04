@@ -37,7 +37,7 @@ The bootstrap `[a2a]` table maps to `A2aConfig` in [`src/config/types.rs`](../sr
 | --- | --- | --- |
 | `default_version` | `"1.0"` | The `protocolVersion` of the agent cards the Gateway generates. Must resolve on `Major.Minor` to `0.3` or `1.0` (`1.0.1` resolves to `1.0`). It is installed once at startup and held in a `OnceLock`, so a configuration reload does not change it; changing it needs a restart. It does not change which versions are accepted (each A2A surface sets that), and a Managed Agent's own card keeps its own version. A generated card never names a version its endpoint refuses: the A2A proxy card names only the versions its surface accepts, whatever this setting says. |
 | `validate_messages` | — | Deprecated. Validation is set per A2A surface (`access_point.a2a.validation`; see [A2A surface settings](PROTOCOLS.md#a2a-surface-settings)). It is only applied to A2A surfaces loaded without their own settings, which are then written with `validation = "off"` when it is `false` and `"envelope"` otherwise (A2A-proxy surfaces always get `"envelope"`). It applies only with `channel_config_source = "local"`; with DynamoDB it is not applied, and the startup warning says so. A startup warning names it; remove it once every surface has its own settings. |
-| `max_body_size` | `10485760` (10 MiB) | On the direct inbound path, request bodies larger than this are refused with HTTP `413`. The check runs after `fabric://` dispatch, so it does not apply to fabric targets. It also caps every upstream response the gateway buffers (HTTP `502` when larger), on the Access Point, Transit Point and Fabric receive paths alike, including agent-card fetches, and one incomplete event of an event stream the gateway parses. A Legacy SSE session and MCP Proxy tool discovery always use the default (10 MiB), whatever is configured. It is read once at startup, and a reload keeps that value, so changing it needs a restart on every path. |
+| `max_body_size` | `10485760` (10 MiB) | At least `1`; `0` is refused at startup. Caps a request body as it is read, and a larger one is refused with HTTP `413`: on an Access Point, `fabric://` targets included, on a Transit Point (recorded as a `request_rejected` with reason `body_too_large`), and on the `/outbound/...` hop an inbound listener sharing a host name with an outbound listener passes on, which refuses a larger declared `Content-Length` without reading the body and streams a longer body on, so the Transit Point refuses and records it, stopping it after the chunk that takes it 512 KiB past the cap (see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)). An MCP Transit Point takes its `mcp_http.max_request_bytes` instead, above or below this value, except on that hop, where a larger limit holds only up to 512 KiB and one chunk past this value, for a chunked body. An MCP Access Point reads up to its `mcp_http.max_request_bytes` and, unless its target is `fabric://`, still refuses a body over this value. It also caps every upstream response the gateway buffers (HTTP `502` when larger), on the Access Point, Transit Point and Fabric receive paths alike, including agent-card fetches, and one incomplete event of an event stream the gateway parses. A Legacy SSE session and MCP Proxy tool discovery always use the default (10 MiB), whatever is configured. It is read once at startup, and a reload keeps that value, so changing it needs a restart on every path. |
 | `timeout_seconds` | `30` | Request timeout in seconds. |
 | `stream_max_lifetime_secs` | `3600` | Longest an A2A event stream from a direct Target is forwarded, in seconds; must be between `1` and `86400`. A stream still open at that point ends with an error event, and a streaming call to the Target is bounded by this plus the request timeout; the Target's headers must arrive within the request timeout. See [Event streams](PROTOCOLS.md#event-streams). |
 | `fabric_gateway_timeout_ms` | `60000` | How long the sending gateway waits for a response over the fabric when the surface sets no request timeout. |
@@ -94,9 +94,12 @@ Gateway process:
    state, and the state of one that no longer has any, because it was deleted, disabled or
    emptied, is retired, so its routes refuse each request with `404`.
 6. Bind new inbound and outbound listeners, retaining each inbound listener's
-   `MultiSurfaceProxyState` for later single-surface updates. An outbound port with no active
-   Transit Points is bound with no proxy routes, as at startup, so its liveness route remains
-   available.
+   `MultiSurfaceProxyState` for later single-surface updates. Only active surfaces' Transit
+   Points are served, so a deleted or disabled surface's never are. An outbound port with no
+   active Transit Points is bound with no proxy routes, as at startup, so its liveness route
+   remains available. The reload returns only once each rebuilt outbound listener has
+   registered its surfaces' outbound state, so a surface deleted right after it is retired
+   there too.
 
 Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services
 that are not owned by those listener tasks continue running, but their routers are attached to the
@@ -105,7 +108,9 @@ new listeners when those listeners are created.
 A plain HTTP listener closes the connections kept alive on it when it stops. A TLS listener's
 connections outlive it, still served by its old routes; because those routes hold the outbound
 state updated in step 5, a removed Transit Point refuses the next request on such a connection
-with `404`, and a changed one is served with its new configuration.
+with `404`, and a changed one is served with its new configuration. Likewise an Access Point
+route held by such a connection refuses with `404` a request to a surface that has since been
+disabled or deleted, rather than serving the copy the connection holds.
 
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
@@ -151,16 +156,17 @@ answers, whichever path applies it:
 
 1. Retire the surface's outbound state: every route still holding it, on a new connection or
    one kept alive, refuses each request with `404`.
-2. Evict the surface's compiled policies, MCP tool gating and rate limiters, its variants' and
-   its Transit Points' included.
+2. Evict the surface's compiled policies, MCP tool gating, rate limiters and circuit breaker,
+   its variants' and its Transit Points' included.
 
 A surface without variants is removed in place: its Access Point leaves the running inbound
 listener and no listener is rebound, so the outbound listener its Transit Points shared with
 other surfaces' keeps serving them without interruption, and its retired routes stay on that
 listener, refusing with `404`, until the listener is next rebuilt. Deleting a surface with
 variants takes a full reload, because its variant routes are baked into the inbound listener.
-Disabling a surface, or removing all of its Transit Points, retires its outbound state the same
-way, but does not evict its compiled policies.
+Disabling a surface retires its outbound state and evicts its compiled policies, MCP tool
+gating, rate limiters and circuit breaker the same way. Removing all of a surface's Transit
+Points retires its outbound state, but does not evict its compiled policies.
 
 A request admitted before the delete has already read the surface, so it can still reach the
 Transit Point's target, with its credentials, until it completes or times out. A `tools/call` to
@@ -251,7 +257,7 @@ configurations that break a rule are refused on save. `"enforce"` also refuses t
 `tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
 credential provider; a reference to another tenant's is refused in both modes (see
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
-unknown value fails startup, and an absent section means both rules are `"warn"`. A provider with
+unknown value fails startup, and an absent section means both rules are `"warn"`. The report also names a stored JWT Bearer provider without a subject under a third rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
 `token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and

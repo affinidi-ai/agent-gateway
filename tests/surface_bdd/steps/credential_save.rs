@@ -27,7 +27,16 @@ async fn create_secret(
     secret_id: &str,
     tenant: Option<&str>,
 ) {
-    let body = json!({"name": secret_id, "secret_id": secret_id, "value": "bdd-secret-value", "tenant_id": tenant});
+    create_secret_with_value(world, secret_id, tenant, "bdd-secret-value").await;
+}
+
+async fn create_secret_with_value(
+    world: &mut SurfaceWorld,
+    secret_id: &str,
+    tenant: Option<&str>,
+    value: &str,
+) {
+    let body = json!({"name": secret_id, "secret_id": secret_id, "value": value, "tenant_id": tenant});
     let response = send(world, Method::POST, "/v1/secrets/new", Some(&body)).await;
     assert_eq!(response.status, 201, "creating a secret for tenant {tenant:?}: {}", response.body);
 }
@@ -47,6 +56,62 @@ async fn create_provider(
     });
     let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
     world.admin_response = Some(response);
+}
+
+async fn create_jwt_bearer_provider(
+    world: &mut SurfaceWorld,
+    provider_id: &str,
+    signing_key_secret: &str,
+    subject: Option<&str>,
+) {
+    let mut body = json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_jwt_bearer",
+        "token_endpoint": "https://192.0.2.1/token",
+        "jwt_issuer": "bdd-issuer@example.com",
+        "jwt_signing_key_secret_ref": signing_key_secret,
+        "jwt_key_id": "bdd-key-id",
+    });
+    if let Some(subject) = subject {
+        body["jwt_subject"] = json!(subject);
+    }
+    let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+async fn validate_jwt_bearer_provider(
+    world: &mut SurfaceWorld,
+    signing_key_secret: &str,
+    subject: Option<&str>,
+) {
+    let mut body = json!({
+        "provider_type": "oauth2_jwt_bearer",
+        "token_endpoint": "https://192.0.2.1/token",
+        "jwt_issuer": "bdd-issuer@example.com",
+        "jwt_signing_key_secret_ref": signing_key_secret,
+        "jwt_key_id": "bdd-key-id",
+    });
+    if let Some(subject) = subject {
+        body["jwt_subject"] = json!(subject);
+    }
+    let response = send(world, Method::POST, "/v1/credential-providers/validate", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+#[when(expr = "the operator validates a JWT Bearer provider using the secret {string} without a subject")]
+async fn operator_validates_jwt_bearer_without_subject(
+    world: &mut SurfaceWorld,
+    secret: String,
+) {
+    validate_jwt_bearer_provider(world, &secret, None).await;
+}
+
+#[when(expr = "the operator validates a JWT Bearer provider using the secret {string} with subject {string}")]
+async fn operator_validates_jwt_bearer_with_subject(
+    world: &mut SurfaceWorld,
+    secret: String,
+    subject: String,
+) {
+    validate_jwt_bearer_provider(world, &secret, Some(&subject)).await;
 }
 
 fn static_secret(secret_id: &str) -> Value {
@@ -133,6 +198,15 @@ async fn appliance_holds_secret(
     create_secret(world, &secret_id, None).await;
 }
 
+#[given(expr = "the appliance holds the signing key {string}")]
+async fn appliance_holds_signing_key(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    let key = crate::bdd_support::config::target_auth::target_auth_signing_key();
+    create_secret_with_value(world, &secret_id, None, &key.private_pem).await;
+}
+
 #[given(expr = "tenant {string} holds the secret {string}")]
 async fn tenant_holds_secret(
     world: &mut SurfaceWorld,
@@ -196,6 +270,25 @@ async fn operator_creates_tenant_provider(
         (&client_id_secret, &client_secret_secret),
     )
     .await;
+}
+
+#[when(expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}")]
+async fn operator_creates_jwt_bearer_provider_with_subject(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    signing_key_secret: String,
+    subject: String,
+) {
+    create_jwt_bearer_provider(world, &provider_id, &signing_key_secret, Some(&subject)).await;
+}
+
+#[when(expr = "the operator creates the JWT Bearer provider {string} using the secret {string} without a subject")]
+async fn operator_creates_jwt_bearer_provider_without_subject(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    signing_key_secret: String,
+) {
+    create_jwt_bearer_provider(world, &provider_id, &signing_key_secret, None).await;
 }
 
 #[when(expr = "the operator saves the surface authenticating its target with secret {string}")]

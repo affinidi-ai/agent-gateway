@@ -344,8 +344,10 @@ async fn token_grant(
             .iter()
             .any(|scope| !granted.contains(scope))
     {
+        oauth::record_token_request(provider, oauth::TokenRequestOutcome::InvalidResponse);
         return Err(ServiceTokenError::ScopeMismatch);
     }
+    oauth::record_token_request(provider, oauth::TokenRequestOutcome::Success);
     Ok((response, granted))
 }
 
@@ -2849,5 +2851,126 @@ mod tests {
             ("issued".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
+    }
+
+    type Recorded = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
+
+    async fn recording<F: std::future::Future>(body: F) -> (F::Output, Vec<(&'static str, &'static str)>) {
+        let recorded: Recorded = Arc::default();
+        let output = oauth::TEST_TOKEN_REQUESTS
+            .scope(recorded.clone(), body)
+            .await;
+        let recorded = recorded
+            .lock()
+            .unwrap()
+            .clone();
+        (output, recorded)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sent_token_request_is_counted_once_and_a_cache_hit_is_not() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let now = Utc::now();
+        let (freshness, recorded) = recording(async {
+            let first = issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await,
+            );
+            let second = issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await,
+            );
+            (first.1, second.1)
+        })
+        .await;
+        assert_eq!(freshness, (Freshness::Fresh, Freshness::Cached));
+        assert_eq!(recorded, vec![("oauth2_client_credentials", "success")]);
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_error_status_is_counted_as_refused_and_a_backoff_skip_is_not_counted() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.fail(true);
+        let now = Utc::now();
+        let (errors, recorded) = recording(async {
+            let first = fixture
+                .acquire(&provider, &["read"], now)
+                .await
+                .err();
+            let held_back = fixture
+                .acquire(&provider, &["read"], after(now, 100))
+                .await
+                .err();
+            (first, held_back)
+        })
+        .await;
+        assert_eq!(errors, (Some(ServiceTokenError::TokenRequestFailed), Some(ServiceTokenError::TokenRequestFailed)));
+        assert_eq!(recorded, vec![("oauth2_client_credentials", "refused")]);
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_slower_than_the_timeout_is_counted_as_timeout() {
+        let mut fixture = Fixture::new().await;
+        fixture.egress.timeout = std::time::Duration::from_secs(1);
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture
+            .endpoint
+            .delay_millis
+            .store(2_500, Ordering::SeqCst);
+        let (error, recorded) = recording(fixture.acquire(&provider, &["read"], Utc::now())).await;
+        assert_eq!(error.err(), Some(ServiceTokenError::TokenRequestFailed));
+        assert_eq!(recorded, vec![("oauth2_client_credentials", "timeout")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_without_expires_in_or_with_wider_scopes_is_counted_as_invalid_response() {
+        let fixture = Fixture::new().await;
+        let jwt = fixture
+            .provider(json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "sa@example",
+                             "jwt_signing_key_secret_ref": "SIGNING_KEY"}))
+            .await;
+        fixture.respond(json!({"access_token": "forever", "token_type": "Bearer"}));
+        let (error, recorded) = recording(fixture.acquire(&jwt, &[], Utc::now())).await;
+        assert_eq!(error.err(), Some(ServiceTokenError::TokenRequestFailed));
+        assert_eq!(recorded, vec![("oauth2_jwt_bearer", "invalid_response")]);
+
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture.respond(
+            json!({"access_token": "wide", "token_type": "Bearer", "expires_in": 3600, "scope": "read write"}),
+        );
+        let (error, recorded) = recording(fixture.acquire(&provider, &["read"], Utc::now())).await;
+        assert_eq!(error.err(), Some(ServiceTokenError::ScopeMismatch));
+        assert_eq!(recorded, vec![("oauth2_client_credentials", "invalid_response")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_that_never_reaches_the_endpoint_is_not_counted() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        fixture
+            .observed
+            .lookups_before_missing
+            .store(0, Ordering::SeqCst);
+        let (error, recorded) = recording(fixture.acquire(&provider, &["read"], Utc::now())).await;
+        assert_eq!(error.err(), Some(ServiceTokenError::SecretUnavailable));
+        assert!(recorded.is_empty());
+        assert!(fixture.requests().is_empty());
     }
 }

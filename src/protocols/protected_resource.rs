@@ -630,6 +630,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovery_allows_further_methods_but_jwt_bearer_only_first() {
+        let resource = json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]});
+        let with_methods = |second: Value| {
+            let mut surface = discovery_surface(jwt_bearer_method(), Some(resource.clone()));
+            surface
+                .access_point
+                .caller_authentication
+                .as_mut()
+                .unwrap()
+                .methods
+                .push(serde_json::from_value(second).unwrap());
+            surface
+        };
+
+        let api_key = with_methods(json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"
+        }));
+        assert_eq!(api_key.validate_protected_resource(), Ok(()));
+
+        let second_jwt = with_methods(json!({
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "internal", "audiences": ["internal"],
+            "token_header": "X-Internal-Token", "forward_header": true
+        }));
+        assert_eq!(
+            second_jwt.validate_protected_resource(),
+            Err("allows JWT Bearer only as the first caller authentication method: the discovery audience and \
+                 challenge belong to that method"
+                .to_string())
+        );
+    }
+
+    #[test]
     fn protected_resource_settings_take_only_https_issuers_and_bounded_scopes() {
         assert_eq!(protected_resource("https://gateway.example/mcp/alpha").validate(), Ok(()));
         let trailing_slash = ProtectedResourceConfig {
@@ -761,7 +793,8 @@ mod tests {
             Some(json!({"resource": "https://gateway.example/mcp/alpha", "authorization_servers": [ISSUER]})),
         );
         let method = surface
-            .source_auth()
+            .source_auth_methods()
+            .first()
             .cloned()
             .unwrap();
         for (alias, audience) in

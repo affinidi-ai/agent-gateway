@@ -27,9 +27,10 @@ fn is_loopback_or_unspecified_v4(ip: std::net::Ipv4Addr) -> bool {
     ip.is_loopback() || ip.is_unspecified()
 }
 
-/// Returns `true` if `ip` is a loopback or unspecified IPv6 address.
+/// Returns `true` if `ip` is a loopback or unspecified IPv6 address, or carries
+/// a loopback or unspecified IPv4 address in a form [`embedded_ipv4`] decodes.
 fn is_loopback_or_unspecified_v6(ip: std::net::Ipv6Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified()
+    ip.is_loopback() || ip.is_unspecified() || embedded_ipv4(ip).is_some_and(is_loopback_or_unspecified_v4)
 }
 
 /// Returns `true` if the given IPv4 address is a cloud metadata endpoint.
@@ -37,16 +38,23 @@ fn is_cloud_metadata_v4(ip: std::net::Ipv4Addr) -> bool {
     CLOUD_METADATA_IPV4.contains(&ip)
 }
 
+/// The IPv4 address an IPv6 address carries in its IPv4-mapped (`::ffff:0:0/96`),
+/// 6to4 (`2002::/16`) or NAT64 form: the well-known prefix (`64:ff9b::/96`), or
+/// a `/96` of the local-use prefix (`64:ff9b:1::/96`). The classifiers below treat
+/// such an address like the IPv4 address it carries.
+fn embedded_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let [_, _, a, b, c, d, .., w, x, y, z] = ip.octets();
+    match ip.segments() {
+        [0, 0, 0, 0, 0, 0xffff, ..] | [0x64, 0xff9b, 0 | 1, 0, 0, 0, ..] => Some(std::net::Ipv4Addr::new(w, x, y, z)),
+        [0x2002, ..] => Some(std::net::Ipv4Addr::new(a, b, c, d)),
+        _ => None,
+    }
+}
+
 /// Returns `true` if the given IPv6 address is a cloud metadata endpoint,
-/// including IPv4-mapped forms (e.g. `::ffff:169.254.169.254`).
+/// including the forms [`embedded_ipv4`] decodes (e.g. `::ffff:169.254.169.254`).
 fn is_cloud_metadata_v6(ip: std::net::Ipv6Addr) -> bool {
-    if CLOUD_METADATA_IPV6.contains(&ip) {
-        return true;
-    }
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return is_cloud_metadata_v4(mapped);
-    }
-    false
+    CLOUD_METADATA_IPV6.contains(&ip) || embedded_ipv4(ip).is_some_and(is_cloud_metadata_v4)
 }
 
 /// Returns `true` if the hostname matches a cloud metadata hostname.
@@ -79,15 +87,7 @@ fn is_blocked_host(host: &Host<&str>) -> bool {
     }
     match host {
         Host::Ipv4(ip) => is_loopback_or_unspecified_v4(*ip),
-        Host::Ipv6(ip) => {
-            if is_loopback_or_unspecified_v6(*ip) {
-                return true;
-            }
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_loopback_or_unspecified_v4(mapped);
-            }
-            false
-        }
+        Host::Ipv6(ip) => is_loopback_or_unspecified_v6(*ip),
         Host::Domain(domain) => {
             let h = domain.to_ascii_lowercase();
             let h = h
@@ -158,19 +158,14 @@ pub fn validate_url_not_cloud_metadata(raw: &str) -> Result<Url, String> {
 }
 
 /// Returns `true` if the resolved `IpAddr` is a cloud-provider metadata
-/// endpoint (including IPv4-mapped forms), ignoring loopback / private ranges.
+/// endpoint (including embedded IPv4 forms), ignoring loopback / private ranges.
 ///
 /// Metadata is the one class that is *never* relaxed by any egress policy or
 /// test allow-list, so [`crate::egress`] vets allow-listed targets through this.
 pub(crate) fn is_cloud_metadata_resolved_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_cloud_metadata_v4(v4),
-        std::net::IpAddr::V6(v6) => {
-            is_cloud_metadata_v6(v6)
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(is_cloud_metadata_v4)
-        }
+        std::net::IpAddr::V6(v6) => is_cloud_metadata_v6(v6),
     }
 }
 
@@ -181,15 +176,7 @@ pub(crate) fn is_cloud_metadata_resolved_ip(ip: std::net::IpAddr) -> bool {
 pub(crate) fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_cloud_metadata_v4(v4) || is_loopback_or_unspecified_v4(v4),
-        std::net::IpAddr::V6(v6) => {
-            if is_cloud_metadata_v6(v6) || is_loopback_or_unspecified_v6(v6) {
-                return true;
-            }
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_cloud_metadata_v4(mapped) || is_loopback_or_unspecified_v4(mapped);
-            }
-            false
-        }
+        std::net::IpAddr::V6(v6) => is_cloud_metadata_v6(v6) || is_loopback_or_unspecified_v6(v6),
     }
 }
 
@@ -280,17 +267,7 @@ fn validate_resolved_url_inner(
         let blocked = if block_loopback {
             is_blocked_resolved_ip(ip)
         } else {
-            match ip {
-                std::net::IpAddr::V4(v4) => is_cloud_metadata_v4(v4),
-                std::net::IpAddr::V6(v6) => {
-                    if is_cloud_metadata_v6(v6) {
-                        true
-                    } else {
-                        v6.to_ipv4_mapped()
-                            .is_some_and(is_cloud_metadata_v4)
-                    }
-                }
-            }
+            is_cloud_metadata_resolved_ip(ip)
         };
         if blocked {
             let reason = if block_loopback {
@@ -434,7 +411,9 @@ fn is_private_or_link_local_v4(ip: std::net::Ipv4Addr) -> bool {
 /// reachable from a webhook-style outbound call:
 /// - Unique-local (fc00::/7)
 /// - Link-local (fe80::/10)
-/// - IPv4-mapped private/link-local
+/// - The NAT64 local-use prefix (64:ff9b:1::/48), which translates only
+///   non-global IPv4 addresses
+/// - Private/link-local IPv4 in a form [`embedded_ipv4`] decodes
 fn is_private_or_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
     let [a, b, ..] = ip.octets();
     // fc00::/7 (unique-local)
@@ -445,11 +424,10 @@ fn is_private_or_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
     if a == 0xfe && (b & 0xc0) == 0x80 {
         return true;
     }
-    // IPv4-mapped (::ffff:x.x.x.x)
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return is_private_or_link_local_v4(mapped);
+    if matches!(ip.segments(), [0x64, 0xff9b, 1, ..]) {
+        return true;
     }
-    false
+    embedded_ipv4(ip).is_some_and(is_private_or_link_local_v4)
 }
 
 /// Strict SSRF validator for webhook-style outbound endpoints
@@ -463,7 +441,7 @@ fn is_private_or_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
 /// - Full IPv4 link-local (169.254/16, including metadata IPs)
 /// - IPv6 unique-local (fc00::/7)
 /// - IPv6 link-local (fe80::/10)
-/// - IPv4-mapped forms of any of the above
+/// - IPv4-mapped, 6to4 and NAT64 forms of any of the above
 ///
 /// Returns the parsed [`Url`] on success, or a human-readable error string.
 pub fn validate_webhook_url(raw: &str) -> Result<Url, String> {
@@ -500,15 +478,7 @@ pub(crate) fn is_blocked_resolved_webhook_ip(ip: std::net::IpAddr) -> bool {
     }
     match ip {
         std::net::IpAddr::V4(v4) => is_private_or_link_local_v4(v4),
-        std::net::IpAddr::V6(v6) => {
-            if is_private_or_link_local_v6(v6) {
-                return true;
-            }
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_private_or_link_local_v4(mapped);
-            }
-            false
-        }
+        std::net::IpAddr::V6(v6) => is_private_or_link_local_v6(v6),
     }
 }
 
@@ -525,7 +495,7 @@ pub(crate) fn is_blocked_resolved_webhook_ip(ip: std::net::IpAddr) -> bool {
 /// - RFC 1918 private ranges (10/8, 172.16/12, 192.168/16)
 /// - Full IPv4 link-local (169.254/16)
 /// - IPv6 unique-local (fc00::/7) and link-local (fe80::/10)
-/// - IPv4-mapped forms of any of the above
+/// - IPv4-mapped, 6to4 and NAT64 forms of any of the above
 ///
 /// DNS failures (NXDOMAIN, timeout, empty response) are returned as errors.
 ///
@@ -594,9 +564,18 @@ mod tests {
         let metadata: Vec<IpAddr> = CLOUD_METADATA_IPV4
             .iter()
             .map(|ip| IpAddr::V4(*ip))
-            .chain(["fd00:ec2::254", "::ffff:169.254.169.254", "::ffff:100.100.100.200"].map(|ip| ip.parse().unwrap()))
+            .chain(
+                [
+                    "fd00:ec2::254",
+                    "::ffff:169.254.169.254",
+                    "::ffff:100.100.100.200",
+                    "2002:a9fe:a9fe::1",
+                    "64:ff9b::a9fe:a9fe",
+                ]
+                .map(|ip| ip.parse().unwrap()),
+            )
             .collect();
-        assert_eq!(metadata.len(), 7);
+        assert_eq!(metadata.len(), 9);
         for ip in metadata {
             assert!(is_cloud_metadata_resolved_ip(ip), "{ip} must be a metadata address");
         }
@@ -691,6 +670,42 @@ mod tests {
         must_block("http://[::ffff:127.0.0.1]/");
         must_block("http://[::ffff:192.0.0.192]/");
         must_block("http://[::ffff:100.100.100.200]/");
+    }
+
+    // ── 6to4 and NAT64 IPv6 ─────────────────────────────────────────────
+
+    #[test]
+    fn embedded_ipv4_decodes_the_mapped_6to4_and_nat64_forms_only() {
+        let decode = |ip: &str| embedded_ipv4(ip.parse().unwrap());
+        let v4 = |a, b, c, d| Some(std::net::Ipv4Addr::new(a, b, c, d));
+        assert_eq!(decode("::ffff:169.254.169.254"), v4(169, 254, 169, 254));
+        assert_eq!(decode("2002:a9fe:a9fe::1"), v4(169, 254, 169, 254));
+        assert_eq!(decode("2002:a00:1:5::9"), v4(10, 0, 0, 1));
+        assert_eq!(decode("64:ff9b::a9fe:a9fe"), v4(169, 254, 169, 254));
+        assert_eq!(decode("64:ff9b::c0a8:101"), v4(192, 168, 1, 1));
+        assert_eq!(decode("64:ff9b:1::a9fe:a9fe"), v4(169, 254, 169, 254));
+        for ip in ["2001:db8::a9fe:a9fe", "64:ff9b:1:1::a9fe:a9fe", "2003:a9fe:a9fe::1", "::1", "fe80::1"] {
+            assert_eq!(decode(ip), None, "{ip} carries no IPv4 address");
+        }
+    }
+
+    #[test]
+    fn blocks_6to4_and_nat64_metadata_and_loopback() {
+        must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
+        must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
+        must_block("http://[64:ff9b::6464:64c8]/");
+        must_block("http://[2002:7f00:1::]/");
+        must_block("http://[64:ff9b::7f00:1]/");
+        must_block("http://[64:ff9b:1::a9fe:a9fe]/latest/meta-data/");
+        forwarding_must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
+        forwarding_must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
+    }
+
+    #[test]
+    fn allows_6to4_and_nat64_addresses_of_public_ipv4() {
+        must_allow("http://[2002:102:304::1]/");
+        must_allow("http://[64:ff9b::102:304]/");
+        forwarding_must_allow("http://[64:ff9b::102:304]/");
     }
 
     // ── Numeric obfuscation (url crate normalizes to dotted-decimal) ───
@@ -1060,6 +1075,29 @@ mod tests {
         webhook_must_block("http://[::ffff:10.0.0.1]/hook");
         webhook_must_block("http://[::ffff:192.168.1.1]/hook");
         webhook_must_block("http://[::ffff:172.16.0.1]/hook");
+    }
+
+    #[test]
+    fn webhook_blocks_6to4_and_nat64_private_and_metadata() {
+        webhook_must_block("http://[2002:a00:1::1]/pay");
+        webhook_must_block("http://[2002:c0a8:101::1]/hook");
+        webhook_must_block("http://[64:ff9b::ac10:1]/hook");
+        webhook_must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
+        webhook_must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
+        webhook_must_block("http://[64:ff9b:1::a00:1]/hook");
+        webhook_must_block("http://[64:ff9b:1:ab::102:304]/hook");
+        webhook_must_allow("http://[2002:102:304::1]/hook");
+        webhook_must_allow("http://[64:ff9b::102:304]/hook");
+    }
+
+    #[test]
+    fn resolved_6to4_and_nat64_addresses_are_classified_by_their_ipv4() {
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        assert!(is_blocked_resolved_ip(ip("64:ff9b::7f00:1")));
+        assert!(!is_blocked_resolved_ip(ip("2002:a00:1::1")));
+        assert!(is_blocked_resolved_webhook_ip(ip("2002:a00:1::1")));
+        assert!(is_blocked_resolved_webhook_ip(ip("64:ff9b::c0a8:101")));
+        assert!(!is_blocked_resolved_webhook_ip(ip("64:ff9b::102:304")));
     }
 
     // ── validate_resolved_webhook_url ────────────────────────────────────────

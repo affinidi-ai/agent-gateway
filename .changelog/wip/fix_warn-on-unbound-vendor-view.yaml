@@ -1,0 +1,41 @@
+branch: fix/warn-on-unbound-vendor-view
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Take a surface's credential bindings from the surface, not its canvas layout
+      description: >-
+        The Surface Builder rebuilt the Credential Delegation element from the canvas layout
+        saved with a surface whenever the surface itself held no outbound_credentials. A binding
+        moved to a variant or removed through the API therefore came back on the next dashboard
+        save. For an Access Point Target binding with consent_mode external, this put the binding
+        in two places, and the gateway refused the save with 400. The element now takes its
+        bindings from the stored outbound_credentials alone. A Credential Delegation element
+        whose rows name no provider yet, which no save stored, is still kept through a reload.
+    - timestamp: '2026-11-04T10:00:00Z'
+      title: Save a variant without credential bindings as having none
+      description: >-
+        The Surface Builder left outbound_credentials out of a variant that had no credential
+        bindings on its canvas. The gateway reads a missing list as keeping the base surface's
+        bindings, even for a complete variant, so such a variant went on sending the surface's
+        credentials, an external consent grant included, while the dashboard showed it with
+        none. A dashboard save now sends the variant an empty list, so it has no bindings, as
+        the dashboard shows. A stored variant that inherits the surface's list keeps inheriting
+        while it shows no binding and the surface has none.
+  removed: []
+  security:
+    - timestamp: '2026-11-03T16:00:00Z'
+      title: Warn when a surface or variant reaches a bound Target's vendor without its grant
+      description: >-
+        While an Access Point Target's consent_mode external binding is served, a save, such as
+        enabling a variant, answers with a Warning header for the surface's own route and each enabled variant that sends
+        requests to that Target's origin without the binding or a credential of its own
+        (target.auth, another binding or forward_header). Such a view, a variant copied from the
+        one holding the binding and then enabled, one with outbound_credentials set to an empty
+        list, or the surface's own route beside a variant that holds the binding when no
+        default variant serves that route, sends the vendor its callers' own headers and no
+        grant. A caller credential counts only when every caller authentication method forwards
+        one. The dashboard shows the warning in the
+        save-warnings banner. The save itself is not refused.
+  breaking: []

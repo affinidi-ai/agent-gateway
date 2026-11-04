@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "agent-gateway"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "affinidi-did-common 0.4.3",
  "affinidi-did-resolver-cache-sdk",
@@ -734,6 +734,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sha256",
+ "socket2 0.6.4",
  "solana-sdk",
  "ssi",
  "ssi-claims-core",

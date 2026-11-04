@@ -166,14 +166,14 @@ the Managed Agent it reaches must share a version.
 
 On an A2A or AP2 surface the Gateway resolves the `A2A-Version` request header right after gateway
 OPA and the AP2 gate, and then runs [JSON-RPC and request-shape validation](#error-mapping). All
-three come before the forward-target egress check, the `max_body_size` limit, any payment and
-forwarding. So a request refused with
+three come before any payment, the forward-target egress check and forwarding. So a request refused with
 any of the [errors below](#error-mapping) is never charged, and those errors take precedence over an egress
-block or HTTP `413`; the [protocol-version metric](OBSERVABILITY.md#a2a-protocol-version-metric)
-also counts requests that are refused later. A delegated `agent_pay` payment is taken last, just
-before forwarding (see [Payment](#payment)), so a request refused by Trust Check, surface policy,
-target authentication or credential delegation is not charged, while one it paid for can still
-fail upstream.
+block; the [protocol-version metric](OBSERVABILITY.md#a2a-protocol-version-metric)
+also counts requests that are refused later. A body over `max_body_size` is refused with HTTP
+`413` as it is read, before gateway OPA, so no policy decision is recorded for it. A delegated
+`agent_pay` payment is taken last, just before forwarding (see [Payment](#payment)), so a request
+refused by Trust Check, surface policy, target authentication or credential delegation is not
+charged, while one it paid for can still fail upstream.
 
 Negotiation runs on every request that reaches that point, whatever the HTTP method, and applies
 to Managed Agent, `a2a-proxy://` and `fabric://` targets alike, each against its surface's

@@ -276,7 +276,9 @@ it creates unless it is public), and one whose `caller_authentication.on_failure
 refuse a missing or invalid credential with `401` before policy, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
 does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+`{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
+the method selected for the request (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
@@ -284,17 +286,18 @@ vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
-metadata never reaches policy with a failed credential, direct or over Fabric: a direct
-request is refused with a `401` challenge pointing at that metadata, and a Fabric request
-with a `401` without it, see
+metadata never reaches policy with a failed credential, direct or over Fabric: a failed JWT
+bearer credential is refused with a `401` challenge pointing at that metadata on a direct
+request, and with a `401` without it over Fabric, and a failed credential of another method
+on that Access Point with a plain `401`, see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 A Transit Point's own `source_auth` is different: it refuses a missing or invalid credential
 itself, with `401`, before any policy runs, so an outbound policy never sees
 `"method": "failed"` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)).
 
-Over Fabric, the sending Gateway strips the credential header its own surface consumed
-before forwarding. A receiving surface without protected resource metadata that requires
+Over Fabric, the sending Gateway strips the credential headers of every method its own
+surface configures before forwarding. A receiving surface without protected resource metadata that requires
 source authentication on that same header therefore sees every Fabric caller as failed and
 forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
@@ -390,7 +393,7 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
 | | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
-| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a public discovery `GET`. A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT that names no `sub`. |
@@ -445,10 +448,16 @@ allow if {
 }
 ```
 
+### Fabric callers on a Transit Point
+
 A request a partner gateway sent over Fabric reaches the managed agent with a transit token
-that opens the Transit Points setting `allow_fabric_callers`, so its agent can call them. A rule
-on `verification == "transit_token"` never matches such a request, whichever DID it names. To
-admit one partner's requests on a Transit Point:
+that opens every Transit Point of the surface, so its agent can call them; which partners reach
+a surface is set by peer exposure ([`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)).
+Such a call is a `fabric_peer` caller. A rule on `verification == "transit_token"` never matches
+it, whichever DID it names, but a rule that refuses only anonymous callers admits it, and one
+that admits any `verified` caller admits it whenever the receiving surface verified the
+partner's caller. Review such rules on the Transit Points of surfaces a partner reaches, and match
+`verification` explicitly. To admit one partner's requests on a Transit Point:
 
 ```rego
 package surface.policy
@@ -502,6 +511,14 @@ too, under the stricter save-time policy (see _Other pinned egress sinks_). A
 blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
+
+Every address check in [`src/url_validation.rs`](../src/url_validation.rs), on a URL literal or
+a resolved address, treats an IPv6 address that carries an IPv4 address like that IPv4
+address: the IPv4-mapped (`::ffff:0:0/96`), 6to4 (`2002::/16`) and NAT64 forms, on the
+well-known prefix (`64:ff9b::/96`) or a `/96` of the local-use prefix (`64:ff9b:1::/96`). So
+`[64:ff9b::a9fe:a9fe]` and `[2002:a9fe:a9fe::1]` are blocked as `169.254.169.254`, and the
+webhook checks block `[2002:a00:1::1]` as `10.0.0.1`. The webhook checks also block the whole
+local-use prefix `64:ff9b:1::/48`, which translates only non-global IPv4 addresses.
 
 A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
 more: the outbound forward sends it only to the origin of its provider's `resource`, through
@@ -791,8 +808,15 @@ stored. They do not record which policy a request ends up under:
 - A variant saved with `complete: true` (the surface builder saves every variant this way)
   replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
   records show only the policies it sets.
-- A variant's transit overrides (shared or per transit point) are recorded as written, but the
-  runtime compiles transit policies from the base surface only, so they are not enforced.
+- A variant's shared transit overrides are recorded as written, but the runtime compiles
+  transit policies from the base surface only, so they are not enforced. A variant's Transit
+  Point cannot change the `policy` or `response_policy` of the surface's Transit Point of the
+  same alias: the admin API refuses such a write with `400`, also when the surface has no
+  Transit Point of that alias, and a stored variant whose Transit Point sets a different
+  one has the requests through that Transit Point refused with `403`. A variant Transit
+  Point that leaves them out is enforced with the surface Transit Point's policies. See
+  [`MCP_TOOL_GATING.md`](MCP_TOOL_GATING.md), which applies the same rule to
+  `mcp_tool_gating`.
 
 A surface change record names the slot it wrote in `surface_variant`: the variant's alias for a
 slot in a variant's overrides, or `_base_` for a slot on the base surface. A base change also

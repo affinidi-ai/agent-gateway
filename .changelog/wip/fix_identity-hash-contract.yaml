@@ -1,0 +1,16 @@
+branch: fix/identity-hash-contract
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Pin the caller identity hash and connect hint with documented test values
+      description: >-
+        The credential delegation reference now states that the caller identity hash and the connect
+        hint are a compatibility surface for systems that run a connect for a caller, with no pepper
+        or setting in either, and lists fixed example values for a JWT caller (with and without a
+        tenant, and with a subject that needs escaping), an API key caller and the hints for them.
+        Tests hold the same values, so a change to either form fails them.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

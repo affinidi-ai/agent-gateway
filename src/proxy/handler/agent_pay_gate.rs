@@ -1011,9 +1011,7 @@ pub(crate) fn held_payments_unpollable(surface: &AgentSurface) -> bool {
     surface
         .agent_pay_policy()
         .is_some()
-        && surface
-            .source_auth()
-            .is_none()
+        && !surface.has_source_auth()
 }
 
 /// The answer to a caller's poll of its held payment: its outcome, live review

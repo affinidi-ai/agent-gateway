@@ -13,14 +13,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Form;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Form};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::identity::VCIssuer;
+use crate::source_auth::client_ip::{ClientIp, FromTrustedProxy};
 use crate::sts::errors::StsError;
 use crate::sts::id_jag::{IdJagParams, build_id_jag_claims, validate_id_jag};
 use crate::sts::policy::{AllowAllPolicyEvaluator, GatewayPolicyEvaluator, StsPolicyEvaluator, build_policy_input};
@@ -134,20 +135,24 @@ pub trait StsSigner: Send + Sync {
     async fn public_jwks(&self) -> Result<Value, StsError>;
 }
 
-/// Verifies a JWT-shaped assertion and returns its verified claims.
+/// Verifies a JWT-shaped assertion for a client of `tenant_id` (`None` for an
+/// appliance-global client) and returns its verified claims.
 #[async_trait::async_trait]
 pub trait StsSubjectVerifier: Send + Sync {
     async fn verify_jwt(
         &self,
         token: &str,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError>;
 
     async fn verify_mcp_jwt(
         &self,
         token: &str,
         _profile: &crate::sts::mcp_profile::McpIssuerProfile,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
-        self.verify_jwt(token).await
+        self.verify_jwt(token, tenant_id)
+            .await
     }
 }
 
@@ -226,8 +231,8 @@ impl StsSigner for VcIssuerSigner {
 }
 
 /// [`StsSubjectVerifier`] backed by `src/jwt_bearer`. Resolves the verification
-/// strategy by matching the token's (unverified) `iss` against a registered
-/// strategy's `expected_issuer`, then verifies the signature and standard claims.
+/// strategies the client may use for the token's (unverified) `iss` (see
+/// [`strategies_for_client`]), then verifies the signature and standard claims.
 pub struct JwtBearerSubjectVerifier {
     verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
     strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
@@ -274,6 +279,7 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
     async fn verify_jwt(
         &self,
         token: &str,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         let iss = decode_unverified_issuer(token)
             .ok_or_else(|| StsError::InvalidGrant("assertion missing a readable iss claim".to_string()))?;
@@ -299,20 +305,14 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             .list()
             .await
             .map_err(|e| StsError::ServerError(format!("strategy store error: {e}")))?;
-        let strategy = strategies
-            .into_iter()
-            .find(|s| s.expected_issuer == iss)
-            .ok_or_else(|| StsError::InvalidGrant(format!("no verification strategy for issuer {iss}")))?;
-        self.verifier
-            .validate(token, &strategy, &[])
-            .await
-            .map_err(|e| StsError::InvalidGrant(format!("assertion verification failed: {e}")))
+        verify_with_client_strategies(&self.verifier, strategies, token, &iss, tenant_id).await
     }
 
     async fn verify_mcp_jwt(
         &self,
         token: &str,
         profile: &crate::sts::mcp_profile::McpIssuerProfile,
+        tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         profile.validate()?;
         if decode_unverified_issuer(token).as_deref() == Some(profile.issuer.as_str()) {
@@ -320,8 +320,55 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
                 .verify_local_jwt(token, &profile.issuer)
                 .await;
         }
-        self.verify_jwt(token).await
+        self.verify_jwt(token, tenant_id)
+            .await
     }
+}
+
+/// The strategies a client of `tenant_id` may verify an `issuer`'s tokens with: its
+/// tenant's own strategies for that issuer or, when the tenant has none, the
+/// appliance-global ones. An appliance-global client uses only appliance-global
+/// strategies, so no tenant can shadow another tenant's issuer, or the appliance's.
+fn strategies_for_client(
+    strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+    issuer: &str,
+    tenant_id: Option<&str>,
+) -> Vec<crate::jwt_bearer::models::JwtVerificationStrategy> {
+    let (own, global): (Vec<_>, Vec<_>) = strategies
+        .into_iter()
+        .filter(|strategy| strategy.expected_issuer == issuer)
+        .filter(|strategy| crate::tenancy::can_reference(tenant_id, strategy.tenant_id.as_deref()))
+        .partition(|strategy| strategy.tenant_id.is_some());
+    if own.is_empty() {
+        global
+    } else {
+        own
+    }
+}
+
+/// Verifies `token` with each strategy from [`strategies_for_client`] in turn and
+/// returns the claims of the first that accepts it.
+async fn verify_with_client_strategies(
+    verifier: &crate::jwt_bearer::JwtBearerVerifier,
+    strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+    token: &str,
+    issuer: &str,
+    tenant_id: Option<&str>,
+) -> Result<Value, StsError> {
+    let mut failure = None;
+    for strategy in strategies_for_client(strategies, issuer, tenant_id) {
+        match verifier
+            .validate(token, &strategy, &[])
+            .await
+        {
+            Ok(claims) => return Ok(claims),
+            Err(error) => failure = Some(error),
+        }
+    }
+    Err(match failure {
+        Some(error) => StsError::InvalidGrant(format!("assertion verification failed: {error}")),
+        None => StsError::InvalidGrant(format!("no verification strategy for issuer {issuer}")),
+    })
 }
 
 /// A [`StsSubjectVerifier`] that always fails closed. Used when no JWT
@@ -333,6 +380,7 @@ impl StsSubjectVerifier for DisabledSubjectVerifier {
     async fn verify_jwt(
         &self,
         _token: &str,
+        _tenant_id: Option<&str>,
     ) -> Result<Value, StsError> {
         Err(StsError::InvalidGrant("subject token verification is not configured on this gateway".to_string()))
     }
@@ -454,7 +502,7 @@ pub struct StsState {
     pub trust_checker: Arc<dyn StsTrustChecker>,
     /// Single-use guard: rejects a replayed ID-JAG within its validity window.
     pub replay: Arc<dyn crate::sts::replay::ReplayProtection>,
-    /// Throttle: bounds repeated attempts per client id and source address.
+    /// Throttle: bounds repeated attempts per client id per source, and per source.
     pub throttle: Arc<crate::sts::throttle::TokenEndpointThrottle>,
     /// Which tenants declare an MCP resource, checked before minting for it.
     pub resource_owners: Arc<dyn crate::sts::resource_owners::StsResourceOwners>,
@@ -466,14 +514,18 @@ pub struct StsState {
 /// `POST /oauth2/token` — RFC 8693 token exchange and RFC 7523 ID-JAG redemption.
 pub async fn token_endpoint(
     State(state): State<StsState>,
+    client_ip: Option<Extension<ClientIp>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
     Form(form): Form<TokenEndpointForm>,
 ) -> Response {
-    serve_token_endpoint(&state, &headers, form, None).await
+    serve_token_endpoint(&state, Caller::from_extensions(client_ip, trusted_proxy), &headers, form, None).await
 }
 
 pub async fn mcp_token_endpoint(
     State(state): State<StsState>,
+    client_ip: Option<Extension<ClientIp>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
     crate::sts::mcp_profile::McpTokenForm(form): crate::sts::mcp_profile::McpTokenForm,
 ) -> Response {
@@ -484,11 +536,66 @@ pub async fn mcp_token_endpoint(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_token_endpoint(&state, &headers, form, Some(profile)).await
+    serve_token_endpoint(&state, Caller::from_extensions(client_ip, trusted_proxy), &headers, form, Some(profile)).await
+}
+
+/// The caller as [`crate::source_auth::client_ip`] resolved it: forwarded headers count only
+/// from `client_ip.trusted_proxies`.
+#[derive(Debug, Clone, Copy)]
+struct Caller {
+    ip: Option<std::net::IpAddr>,
+    from_trusted_proxy: bool,
+}
+
+impl Caller {
+    fn from_extensions(
+        client_ip: Option<Extension<ClientIp>>,
+        trusted_proxy: Option<Extension<FromTrustedProxy>>,
+    ) -> Self {
+        Self {
+            ip: client_ip.map(|Extension(ClientIp(ip))| ip),
+            from_trusted_proxy: trusted_proxy.is_some(),
+        }
+    }
+
+    /// Whether this caller's lockout should name `client_ip.trusted_proxies`: behind a load
+    /// balancer that is not listed there, every caller shares the balancer's address and so its
+    /// limits.
+    fn lockout_needs_proxy_hint(
+        self,
+        locked_out: bool,
+    ) -> bool {
+        locked_out && self.ip.is_some() && !self.from_trusted_proxy
+    }
+}
+
+const LOCKOUT_PROXY_HINT: &str = "STS token endpoint locked out a caller after repeated attempts; if a load \
+                                  balancer or proxy forwards callers to the gateway, list it in \
+                                  client_ip.trusted_proxies, or every caller it forwards shares this limit";
+
+/// Counts one token-endpoint attempt, and logs [`LOCKOUT_PROXY_HINT`] when it locks out a
+/// caller that did not come through a trusted proxy.
+fn record_attempt(
+    state: &StsState,
+    client_id: Option<&str>,
+    caller: Caller,
+    now: u64,
+) {
+    state
+        .throttle
+        .record(client_id, caller.ip, now);
+    let locked_out = state
+        .throttle
+        .retry_after(client_id, caller.ip, now)
+        .is_some();
+    if caller.lockout_needs_proxy_hint(locked_out) {
+        tracing::warn!("{LOCKOUT_PROXY_HINT}");
+    }
 }
 
 async fn serve_token_endpoint(
     state: &StsState,
+    caller: Caller,
     headers: &HeaderMap,
     form: TokenEndpointForm,
     profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>,
@@ -498,12 +605,10 @@ async fn serve_token_endpoint(
 
     // Throttle: reject a client / source that is over its configured limit.
     let throttle_client = resolve_client_credentials(headers, &form).0;
-    let throttle_ip = client_source_ip(headers);
     let throttle_now = now_secs();
-    if let Some(retry_after) =
-        state
-            .throttle
-            .retry_after(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now)
+    if let Some(retry_after) = state
+        .throttle
+        .retry_after(throttle_client.as_deref(), caller.ip, throttle_now)
     {
         crate::metrics::backends::prometheus::track_sts_token_exchange(
             grant,
@@ -521,9 +626,7 @@ async fn serve_token_endpoint(
                 .throttle
                 .failed_attempts_only()
             {
-                state
-                    .throttle
-                    .record(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now);
+                record_attempt(state, throttle_client.as_deref(), caller, throttle_now);
             }
             crate::metrics::backends::prometheus::track_sts_token_exchange(
                 grant,
@@ -544,9 +647,7 @@ async fn serve_token_endpoint(
                 .failed_attempts_only()
                 || matches!(e, StsError::InvalidClient(_))
             {
-                state
-                    .throttle
-                    .record(throttle_client.as_deref(), throttle_ip.as_deref(), throttle_now);
+                record_attempt(state, throttle_client.as_deref(), caller, throttle_now);
             }
             // A server fault is `error`; every client-side rejection (bad client,
             // policy/target/scope/grant denial, malformed request) is `denied`.
@@ -571,6 +672,7 @@ async fn serve_token_endpoint(
 pub async fn authorization_server_metadata(
     State(state): State<StsState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
     headers: HeaderMap,
 ) -> Response {
     let issuer = state
@@ -591,7 +693,7 @@ pub async fn authorization_server_metadata(
             .as_deref(),
         uri.path(),
     )
-    .or_else(|| metadata_base_url(&headers, uri.path()));
+    .or_else(|| metadata_base_url(&headers, uri.path(), trusted_proxy.is_some()));
     let token_endpoint = match &base {
         Some(base) => format!("{base}/oauth2/token"),
         None => "/oauth2/token".to_string(),
@@ -616,21 +718,27 @@ pub async fn authorization_server_metadata(
 /// request, so `token_endpoint` / `jwks_uri` are absolute and reflect the actual
 /// mount prefix (e.g. `/api`).
 ///
-/// The public host is resolved from the proxy-forwarded value first —
-/// `X-Forwarded-Host`, then the RFC 7239 `Forwarded host=` directive — and only
-/// falls back to the request `Host` when neither is present. Behind a
-/// terminating proxy or tunnel the direct `Host` is the gateway's *internal*
-/// address (e.g. `127.0.0.1:8080`), so the forwarded value is authoritative. The
-/// scheme comes from `X-Forwarded-Proto`, then `Forwarded proto=`, else defaults
-/// to `https`. Returns `None` when no host can be resolved, in which case the
-/// caller falls back to relative paths.
+/// From a trusted proxy (`from_trusted_proxy`), the public host is resolved from
+/// the forwarded value first — `X-Forwarded-Host`, then the RFC 7239
+/// `Forwarded host=` directive — and only falls back to the request `Host` when
+/// neither is present, since behind a terminating proxy or tunnel the direct
+/// `Host` is the gateway's *internal* address (e.g. `127.0.0.1:8080`). The scheme
+/// comes from `X-Forwarded-Proto`, then `Forwarded proto=`, else defaults to
+/// `https`. Any other caller's forwarded headers are ignored: its `Host` and
+/// `https` are used. Returns `None` when no host can be resolved, in which case
+/// the caller falls back to relative paths.
 fn metadata_base_url(
     headers: &HeaderMap,
     request_path: &str,
+    from_trusted_proxy: bool,
 ) -> Option<String> {
     let prefix = metadata_mount_prefix(request_path)?;
-    let host = first_forwarded_token(headers, "x-forwarded-host")
-        .or_else(|| forwarded_directive(headers, "host"))
+    let forwarded = |header_name: &str, directive: &str| {
+        from_trusted_proxy
+            .then(|| first_forwarded_token(headers, header_name).or_else(|| forwarded_directive(headers, directive)))
+            .flatten()
+    };
+    let host = forwarded("x-forwarded-host", "host")
         .or_else(|| {
             headers
                 .get(header::HOST)
@@ -638,9 +746,7 @@ fn metadata_base_url(
                 .map(|s| s.trim().to_string())
         })
         .filter(|s| !s.is_empty())?;
-    let scheme = first_forwarded_token(headers, "x-forwarded-proto")
-        .or_else(|| forwarded_directive(headers, "proto"))
-        .unwrap_or_else(|| "https".to_string());
+    let scheme = forwarded("x-forwarded-proto", "proto").unwrap_or_else(|| "https".to_string());
     Some(format!("{scheme}://{host}{prefix}"))
 }
 
@@ -876,7 +982,9 @@ async fn handle_token_exchange(
         ));
     }
     let gateway_did = state.signer.issuer().await?;
-    let subject_claims = verify_assertion(state, req.subject_token_type, &req.subject_token, profile).await?;
+    let subject_claims =
+        verify_assertion(state, req.subject_token_type, &req.subject_token, profile, record.tenant_id.as_deref())
+            .await?;
     let mut assertion_expiry = None;
     if req
         .subject_token_type
@@ -914,7 +1022,8 @@ async fn handle_token_exchange(
                     "MCP exchange accepts JWT or ID-token actors; redeem ID-JAG through jwt-bearer".into(),
                 ));
             }
-            let actor_claims = verify_assertion(state, actor_type, actor_token, profile).await?;
+            let actor_claims =
+                verify_assertion(state, actor_type, actor_token, profile, record.tenant_id.as_deref()).await?;
             if actor_type.is_jwt_shaped() {
                 reject_self_issued(state, &gateway_did, profile, "actor", actor_token, &actor_claims)?;
                 let actor_expiry = match profile {
@@ -1128,17 +1237,25 @@ async fn handle_jwt_bearer(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| StsError::InvalidRequest("assertion is required".to_string()))?;
 
+    let (client_id, client_secret) = resolve_client_credentials(headers, &form);
+    let client_id = client_id.ok_or_else(|| StsError::InvalidClient("client authentication required".to_string()))?;
+    let record = state
+        .clients
+        .authenticate(&client_id, client_secret.as_deref())
+        .await?;
+
+    let tenant_id = record.tenant_id.as_deref();
     let claims = match profile {
         Some(profile) => {
             state
                 .verifier
-                .verify_mcp_jwt(assertion, profile)
+                .verify_mcp_jwt(assertion, profile, tenant_id)
                 .await?
         }
         None => {
             state
                 .verifier
-                .verify_jwt(assertion)
+                .verify_jwt(assertion, tenant_id)
                 .await?
         }
     };
@@ -1158,13 +1275,6 @@ async fn handle_jwt_bearer(
         Some(profile) => profile.bound_subject(&claims)?,
         None => id_jag.subject.clone(),
     };
-
-    let (client_id, client_secret) = resolve_client_credentials(headers, &form);
-    let client_id = client_id.ok_or_else(|| StsError::InvalidClient("client authentication required".to_string()))?;
-    let record = state
-        .clients
-        .authenticate(&client_id, client_secret.as_deref())
-        .await?;
 
     if id_jag.client_id != client_id {
         return Err(StsError::InvalidGrant("ID-JAG was not issued to this client".to_string()));
@@ -1344,19 +1454,20 @@ async fn verify_assertion(
     token_type: TokenType,
     token: &str,
     profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>,
+    tenant_id: Option<&str>,
 ) -> Result<Value, StsError> {
     if token_type.is_jwt_shaped() {
         match profile {
             Some(profile) => {
                 state
                     .verifier
-                    .verify_mcp_jwt(token, profile)
+                    .verify_mcp_jwt(token, profile, tenant_id)
                     .await
             }
             None => {
                 state
                     .verifier
-                    .verify_jwt(token)
+                    .verify_jwt(token, tenant_id)
                     .await
             }
         }
@@ -1624,12 +1735,6 @@ fn grant_label(grant_type: Option<&str>) -> &'static str {
     }
 }
 
-/// The client source address for throttling, resolved from proxy-forwarded
-/// headers (`X-Forwarded-For` first entry, then RFC 7239 `Forwarded for=`).
-fn client_source_ip(headers: &HeaderMap) -> Option<String> {
-    first_forwarded_token(headers, "x-forwarded-for").or_else(|| forwarded_directive(headers, "for"))
-}
-
 /// A `429 Too Many Requests` response carrying `Retry-After` for a throttled caller.
 fn throttled_response(retry_after: u64) -> Response {
     let body = json!({
@@ -1740,6 +1845,7 @@ mod tests {
         async fn verify_jwt(
             &self,
             token: &str,
+            _tenant_id: Option<&str>,
         ) -> Result<Value, StsError> {
             self.claims
                 .get(token)
@@ -1929,6 +2035,8 @@ mod tests {
         form.resource = Some(resource.into());
         let response = mcp_token_endpoint(
             State(state.clone()),
+            None,
+            None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
         )
@@ -1937,6 +2045,8 @@ mod tests {
         state.config.mcp_issuer = Some(profile.clone());
         let response = mcp_token_endpoint(
             State(state.clone()),
+            None,
+            None,
             HeaderMap::new(),
             crate::sts::mcp_profile::McpTokenForm(form.clone()),
         )
@@ -1950,7 +2060,7 @@ mod tests {
         let claims: Value = serde_json::from_str(&response.access_token).unwrap();
         assert_eq!(claims["iss"], profile.issuer);
         assert_eq!(claims["aud"], resource);
-        let response = token_endpoint(State(state.clone()), HeaderMap::new(), Form(form.clone())).await;
+        let response = token_endpoint(State(state.clone()), None, None, HeaderMap::new(), Form(form.clone())).await;
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
             .unwrap();
@@ -1959,7 +2069,8 @@ mod tests {
         assert_eq!(claims["iss"], "did:webvh:example:gw");
         form.grant_type = Some("authorization_code".into());
         let response =
-            mcp_token_endpoint(State(state), HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form)).await;
+            mcp_token_endpoint(State(state), None, None, HeaderMap::new(), crate::sts::mcp_profile::McpTokenForm(form))
+                .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await
@@ -2992,7 +3103,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", false).as_deref(),
             Some("https://gw.example:8443/api")
         );
     }
@@ -3003,7 +3114,7 @@ mod tests {
         headers.insert(header::HOST, "gw.example".parse().unwrap());
         headers.insert("x-forwarded-proto", "http".parse().unwrap());
         assert_eq!(
-            metadata_base_url(&headers, "/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/.well-known/oauth-authorization-server", true).as_deref(),
             Some("http://gw.example")
         );
     }
@@ -3011,7 +3122,7 @@ mod tests {
     #[test]
     fn metadata_base_url_none_without_host() {
         assert!(
-            metadata_base_url(&HeaderMap::new(), "/.well-known/oauth-authorization-server").is_none(),
+            metadata_base_url(&HeaderMap::new(), "/.well-known/oauth-authorization-server", true).is_none(),
             "no Host ⇒ fall back to relative paths"
         );
     }
@@ -3033,9 +3144,9 @@ mod tests {
         );
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example/api"),
-            "X-Forwarded-Host must win over the tunnel's internal Host",
+            "X-Forwarded-Host from a trusted proxy must win over the tunnel's internal Host",
         );
     }
 
@@ -3055,7 +3166,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example"),
         );
     }
@@ -3076,9 +3187,215 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server").as_deref(),
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", true).as_deref(),
             Some("https://gw.public.example/api"),
         );
+    }
+
+    #[tokio::test]
+    async fn failed_client_logins_lock_out_only_their_own_source_whatever_x_forwarded_for_says() {
+        let mut claims = HashMap::new();
+        claims.insert("subject-tok".to_string(), json!({ "sub": "user-1" }));
+        let state = state_with(claims, client(base_record(), Some("s3cret")));
+        let attacker = "203.0.113.9".parse().unwrap();
+        let legitimate = "198.51.100.7"
+            .parse()
+            .unwrap();
+        let mut wrong_secret = exchange_form();
+        wrong_secret.client_secret = Some("guess".to_string());
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert(
+            "x-forwarded-for",
+            "198.51.100.7"
+                .parse()
+                .unwrap(),
+        );
+
+        for _ in 0..11 {
+            token_endpoint(
+                State(state.clone()),
+                Some(Extension(ClientIp(attacker))),
+                None,
+                spoofed.clone(),
+                Form(wrong_secret.clone()),
+            )
+            .await;
+        }
+        let attacker_retry = token_endpoint(
+            State(state.clone()),
+            Some(Extension(ClientIp(attacker))),
+            None,
+            spoofed.clone(),
+            Form(exchange_form()),
+        )
+        .await;
+        assert_eq!(attacker_retry.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let legitimate_call = token_endpoint(
+            State(state.clone()),
+            Some(Extension(ClientIp(legitimate))),
+            None,
+            HeaderMap::new(),
+            Form(exchange_form()),
+        )
+        .await;
+        assert_eq!(legitimate_call.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn metadata_base_url_ignores_forwarded_headers_from_an_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "gw.example".parse().unwrap());
+        headers.insert(
+            "x-forwarded-host",
+            "attacker.example"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        headers.insert(
+            "forwarded",
+            "proto=http;host=other.attacker.example"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            metadata_base_url(&headers, "/api/.well-known/oauth-authorization-server", false).as_deref(),
+            Some("https://gw.example/api"),
+        );
+    }
+
+    /// Sends `request` from `peer` to the STS token and discovery routes behind the real client
+    /// IP layer, trusting `trusted_proxies`.
+    async fn through_client_ip_layer(
+        state: StsState,
+        trusted_proxies: &[&str],
+        peer: &str,
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> Response {
+        use tower::ServiceExt;
+        let config = crate::config::types::ClientIpConfig {
+            trusted_proxies: trusted_proxies
+                .iter()
+                .map(|cidr| cidr.parse().unwrap())
+                .collect(),
+        };
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(peer.parse().unwrap()));
+        axum::Router::new()
+            .route("/oauth2/token", axum::routing::post(token_endpoint))
+            .route("/api/.well-known/oauth-authorization-server", axum::routing::get(authorization_server_metadata))
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(config),
+                crate::source_auth::client_ip::resolve_client_ip_layer,
+            ))
+            .oneshot(request)
+            .await
+            .unwrap()
+    }
+
+    fn token_request(
+        secret: &str,
+        forwarded_for: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", GRANT_TYPE_TOKEN_EXCHANGE)
+            .append_pair("subject_token", "subject-tok")
+            .append_pair("subject_token_type", TOKEN_TYPE_JWT)
+            .append_pair("client_id", "agent-client")
+            .append_pair("client_secret", secret)
+            .finish();
+        axum::http::Request::post("/oauth2/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", forwarded_for)
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn callers_behind_a_trusted_proxy_are_throttled_by_their_own_address() {
+        let claims = HashMap::from([("subject-tok".to_string(), json!({ "sub": "user-1" }))]);
+        let state = state_with(claims, client(base_record(), Some("s3cret")));
+        let proxy = "10.0.0.5:40000";
+        for _ in 0..11 {
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("guess", "203.0.113.9")).await;
+        }
+
+        let attacker =
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("s3cret", "203.0.113.9"))
+                .await;
+        assert_eq!(attacker.status(), StatusCode::TOO_MANY_REQUESTS);
+        let other_caller =
+            through_client_ip_layer(state.clone(), &["10.0.0.0/8"], proxy, token_request("s3cret", "198.51.100.7"))
+                .await;
+        assert_eq!(other_caller.status(), StatusCode::OK);
+
+        let untrusted_peer_claiming_the_other_caller = through_client_ip_layer(
+            state,
+            &["10.0.0.0/8"],
+            "203.0.113.9:40000",
+            token_request("s3cret", "198.51.100.7"),
+        )
+        .await;
+        assert_eq!(untrusted_peer_claiming_the_other_caller.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    async fn advertised_token_endpoint(
+        trusted_proxies: &[&str],
+        peer: &str,
+    ) -> String {
+        let state = state_with(HashMap::new(), InMemoryStsClientRegistry::new());
+        let request = axum::http::Request::get("/api/.well-known/oauth-authorization-server")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header("x-forwarded-host", "gw.public.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = through_client_ip_layer(state, trusted_proxies, peer, request).await;
+        let body = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["token_endpoint"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_x_forwarded_host_only_from_a_trusted_proxy() {
+        assert_eq!(
+            advertised_token_endpoint(&["10.0.0.0/8"], "10.1.2.3:40000").await,
+            "https://gw.public.example/api/oauth2/token"
+        );
+        assert_eq!(
+            advertised_token_endpoint(&["10.0.0.0/8"], "203.0.113.9:40000").await,
+            "https://127.0.0.1:8080/api/oauth2/token"
+        );
+        assert_eq!(advertised_token_endpoint(&[], "10.1.2.3:40000").await, "https://127.0.0.1:8080/api/oauth2/token");
+    }
+
+    #[test]
+    fn a_lockout_names_client_ip_trusted_proxies_only_for_a_caller_no_trusted_proxy_forwarded() {
+        let direct = Caller {
+            ip: Some("10.0.0.5".parse().unwrap()),
+            from_trusted_proxy: false,
+        };
+        let forwarded = Caller {
+            from_trusted_proxy: true,
+            ..direct
+        };
+        let unknown = Caller {
+            ip: None,
+            from_trusted_proxy: false,
+        };
+
+        assert!(direct.lockout_needs_proxy_hint(true));
+        assert!(!direct.lockout_needs_proxy_hint(false));
+        assert!(!forwarded.lockout_needs_proxy_hint(true));
+        assert!(!unknown.lockout_needs_proxy_hint(true));
+        assert!(LOCKOUT_PROXY_HINT.contains("client_ip.trusted_proxies"));
+        assert!(!LOCKOUT_PROXY_HINT.contains("  "), "the continued lines join with single spaces");
     }
 
     #[test]
@@ -3236,6 +3553,228 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.error_code(), "unauthorized_client");
+    }
+
+    /// Verifier mock that records the tenant each verification was asked for.
+    struct TenantRecordingVerifier {
+        claims: HashMap<String, Value>,
+        tenants: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StsSubjectVerifier for TenantRecordingVerifier {
+        async fn verify_jwt(
+            &self,
+            token: &str,
+            tenant_id: Option<&str>,
+        ) -> Result<Value, StsError> {
+            self.tenants
+                .lock()
+                .unwrap()
+                .push(tenant_id.map(str::to_string));
+            self.claims
+                .get(token)
+                .cloned()
+                .ok_or_else(|| StsError::InvalidGrant("unknown test token".to_string()))
+        }
+    }
+
+    fn tenant_recording_state(
+        claims: HashMap<String, Value>,
+        tenant_id: &str,
+    ) -> (StsState, Arc<TenantRecordingVerifier>) {
+        let verifier = Arc::new(TenantRecordingVerifier {
+            claims,
+            tenants: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut record = base_record();
+        record.tenant_id = Some(tenant_id.to_string());
+        let mut state = state_with(HashMap::new(), client(record, Some("s3cret")));
+        state.verifier = verifier.clone();
+        (state, verifier)
+    }
+
+    #[tokio::test]
+    async fn token_exchange_verifies_subject_and_actor_for_the_client_tenant() {
+        let claims = HashMap::from([
+            ("subject-tok".to_string(), json!({ "sub": "did:example:user" })),
+            ("actor-tok".to_string(), json!({ "sub": "did:example:agent" })),
+        ]);
+        let (state, verifier) = tenant_recording_state(claims, "tenant-a");
+        let mut form = exchange_form();
+        form.actor_token = Some("actor-tok".to_string());
+        form.actor_token_type = Some(TOKEN_TYPE_JWT.to_string());
+
+        dispatch(&state, &HeaderMap::new(), form)
+            .await
+            .expect("exchange succeeds");
+
+        assert_eq!(
+            *verifier
+                .tenants
+                .lock()
+                .unwrap(),
+            vec![Some("tenant-a".to_string()), Some("tenant-a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn jwt_bearer_authenticates_the_client_before_verifying_for_its_tenant() {
+        let id_jag = json!({
+            "iss": "did:webvh:example:gw", "sub": "did:example:user", "aud": "did:webvh:example:gw",
+            "client_id": "agent-client", "jti": "grant-tenant", "exp": now_secs() + 120
+        });
+        let assertion = id_jag_assertion(&id_jag);
+        let (state, verifier) = tenant_recording_state(HashMap::from([(assertion.clone(), id_jag)]), "tenant-a");
+        let form = TokenEndpointForm {
+            grant_type: Some(GRANT_TYPE_JWT_BEARER.to_string()),
+            assertion: Some(assertion),
+            client_id: Some("agent-client".to_string()),
+            client_secret: Some("wrong".to_string()),
+            ..Default::default()
+        };
+
+        let err = dispatch(&state, &HeaderMap::new(), form.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_client");
+        assert!(
+            verifier
+                .tenants
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an unauthenticated client's assertion is never verified"
+        );
+
+        let form = TokenEndpointForm {
+            client_secret: Some("s3cret".to_string()),
+            ..form
+        };
+        dispatch(&state, &HeaderMap::new(), form)
+            .await
+            .expect("redeem succeeds");
+        assert_eq!(
+            *verifier
+                .tenants
+                .lock()
+                .unwrap(),
+            vec![Some("tenant-a".to_string())]
+        );
+    }
+
+    #[test]
+    fn strategies_for_client_never_offers_another_tenants_strategy() {
+        use crate::jwt_bearer::test_utils::static_okp_strategy;
+        let issuer = "https://idp.example";
+        let strategies = || {
+            vec![
+                static_okp_strategy("a", Some("tenant-a"), issuer, "k", "x"),
+                static_okp_strategy("b", Some("tenant-b"), issuer, "k", "x"),
+                static_okp_strategy("global", None, issuer, "k", "x"),
+                static_okp_strategy("other-issuer", Some("tenant-a"), "https://other.example", "k", "x"),
+            ]
+        };
+        let ids = |tenant: Option<&str>| {
+            strategies_for_client(strategies(), issuer, tenant)
+                .into_iter()
+                .map(|strategy| strategy.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(Some("tenant-a")), vec!["a"]);
+        assert_eq!(ids(Some("tenant-b")), vec!["b"]);
+        assert_eq!(ids(Some("tenant-c")), vec!["global"]);
+        assert_eq!(ids(None), vec!["global"]);
+    }
+
+    async fn verify_signed_token_for(
+        strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
+        issuer: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Value, StsError> {
+        let token = crate::jwt_bearer::test_utils::sign_ed25519_jwt(
+            &json!({ "iss": issuer, "sub": "alice", "exp": now_secs() + 300 }),
+            "k",
+        );
+        let verifier = crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new()));
+        verify_with_client_strategies(&verifier, strategies, &token, issuer, tenant_id).await
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_shadow_another_tenants_issuer() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        const VICTIM_IDP_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+        let issuer = "https://idp.tenant-b.example";
+        let strategies = || {
+            vec![
+                static_okp_strategy("attacker", Some("tenant-a"), issuer, "k", ED25519_JWK_X),
+                static_okp_strategy("victim", Some("tenant-b"), issuer, "k", VICTIM_IDP_KEY),
+            ]
+        };
+
+        let err = verify_signed_token_for(strategies(), issuer, Some("tenant-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(
+            err.to_string()
+                .contains("assertion verification failed"),
+            "{err}"
+        );
+        for tenant in [None, Some("tenant-c")] {
+            let err = verify_signed_token_for(strategies(), issuer, tenant)
+                .await
+                .unwrap_err();
+            assert_eq!(err.error_code(), "invalid_grant");
+            assert!(
+                err.to_string()
+                    .contains("no verification strategy"),
+                "client of {tenant:?}: {err}"
+            );
+        }
+
+        let claims = verify_signed_token_for(strategies(), issuer, Some("tenant-a"))
+            .await
+            .expect("a tenant's own strategy still verifies for its own clients");
+        assert_eq!(claims["sub"], "alice");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_falls_back_to_global_strategies_only_without_its_own() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        let issuer = "https://idp.example";
+        let global = static_okp_strategy("global", None, issuer, "k", ED25519_JWK_X);
+
+        let claims = verify_signed_token_for(vec![global.clone()], issuer, Some("tenant-a"))
+            .await
+            .expect("a tenant without its own strategy uses the global one");
+        assert_eq!(claims["sub"], "alice");
+
+        let own =
+            static_okp_strategy("own", Some("tenant-a"), issuer, "k", "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+        let err = verify_signed_token_for(vec![own, global], issuer, Some("tenant-a"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("assertion verification failed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_of_a_tenants_strategies_for_one_issuer_can_verify() {
+        use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        let issuer = "https://idp.example";
+        let strategies = vec![
+            static_okp_strategy("old", Some("tenant-a"), issuer, "k", "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"),
+            static_okp_strategy("new", Some("tenant-a"), issuer, "k", ED25519_JWK_X),
+        ];
+        let claims = verify_signed_token_for(strategies, issuer, Some("tenant-a"))
+            .await
+            .expect("the second strategy holds the signing key");
+        assert_eq!(claims["sub"], "alice");
     }
 
     #[test]

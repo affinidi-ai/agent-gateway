@@ -503,6 +503,10 @@ pub struct FileSystemDelegationVaultStore {
     /// [`super::grants::pepper_fingerprint`] of this gateway's pepper, kept
     /// beside the grants it writes.
     pepper_fingerprint: String,
+    /// Whether the grants stored with no fingerprint recorded were found
+    /// written under another pepper, so lookups do not read every grant again.
+    /// Cleared when a grant is removed.
+    unrecorded_grants_mismatch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How the pepper the stored grants were written under compares with ours.
@@ -515,6 +519,34 @@ enum StoredPepper {
     Ours,
     /// The fingerprint names another pepper.
     Another,
+}
+
+/// What the grants stored with no fingerprint recorded say of this pepper.
+#[derive(Debug)]
+enum UnrecordedGrants {
+    /// No grant is stored.
+    None,
+    /// Every grant stored was written under this pepper.
+    Ours,
+    /// At least one grant was written under another pepper.
+    Mismatch,
+    /// No grant was written under another pepper, but one cannot be read, so
+    /// which pepper the grants were written under is not known.
+    Unreadable(anyhow::Error),
+}
+
+/// Context marking a failure to read the grants stored, rather than their
+/// pepper fingerprint, while checking which pepper they were written under.
+#[derive(Debug)]
+struct GrantsUnreadable;
+
+impl std::fmt::Display for GrantsUnreadable {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str("A delegated grant stored cannot be read")
+    }
 }
 
 impl FileSystemDelegationVaultStore {
@@ -583,6 +615,7 @@ impl FileSystemDelegationVaultStore {
             encrypted,
             stable_grant_ids,
             pepper_fingerprint: super::grants::pepper_fingerprint(),
+            unrecorded_grants_mismatch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Only grants by binding depend on the fingerprint, so failing to read
         // it never keeps the vault, and its agent-keyed tokens, from starting.
@@ -607,6 +640,14 @@ impl FileSystemDelegationVaultStore {
                  pepper they were written under, or they are purged (DELETE /api/v1/delegation-vault/grants/{{id}}, \
                  the ids being the file names in the delegated_grants directory without .json.enc, or by deleting \
                  that directory, which leaves them unrevoked at the vendor)"
+            ),
+            Err(error) if error.is::<GrantsUnreadable>() => tracing::error!(
+                target: "credential_delegation",
+                path = %store.grants_directory.display(),
+                error = ?format!("{error:#}"),
+                "A delegated grant cannot be read: no grant by binding is stored, and a lookup or removal that finds \
+                 no grant fails rather than answering none, until it can be read or is purged; agent-keyed delegated \
+                 tokens are unaffected"
             ),
             Err(error) => tracing::error!(
                 target: "credential_delegation",
@@ -669,30 +710,101 @@ impl FileSystemDelegationVaultStore {
         }
     }
 
-    /// With no fingerprint recorded, whether this pepper is the one the grants
-    /// stored were written under: true when none is stored, or one that can be
-    /// read has the id this pepper derives for it. A fingerprint lost with
-    /// grants beside it, under a wrong pepper, then never passes for ours.
-    async fn unrecorded_grants_are_ours(&self) -> Result<bool> {
+    /// With no fingerprint recorded, what the grants stored say of this pepper:
+    /// [`UnrecordedGrants::Ours`] only when every one of them has the id this
+    /// pepper derives for it, [`UnrecordedGrants::Mismatch`] as soon as one
+    /// does not, and [`UnrecordedGrants::Unreadable`] when none mismatches but
+    /// one cannot be read. A fingerprint lost with grants beside it, under a
+    /// wrong pepper, then never passes for ours.
+    async fn unrecorded_grants_are_ours(&self) -> Result<UnrecordedGrants> {
         let ids = self
             .grant_ids_with_prefix("")
             .await?;
         if ids.is_empty() {
-            return Ok(true);
+            return Ok(UnrecordedGrants::None);
         }
+        let mut unreadable = None;
         for id in ids {
-            if let Ok(Some(grant)) = self.grants.get(&id).await
-                && grant.key().record_id() == grant.id
-            {
-                return Ok(true);
+            match self.grants.get(&id).await {
+                Ok(Some(grant)) if grant.key().record_id() != grant.id => return Ok(UnrecordedGrants::Mismatch),
+                Ok(_) => {}
+                Err(error) => {
+                    unreadable.get_or_insert_with(|| unreadable_or_unavailable(error, &id));
+                }
             }
         }
-        Ok(false)
+        Ok(match unreadable {
+            Some(error) => UnrecordedGrants::Unreadable(error.context(GrantsUnreadable)),
+            None => UnrecordedGrants::Ours,
+        })
+    }
+
+    /// With no fingerprint recorded, whether the grants stored were written
+    /// under another pepper. Every grant is read at most once: grants all
+    /// written under this pepper get its fingerprint recorded, so later checks
+    /// read the fingerprint alone, and a mismatch is kept in memory until a
+    /// grant is removed.
+    async fn unrecorded_pepper_mismatch(&self) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+
+        if self
+            .unrecorded_grants_mismatch
+            .load(Ordering::Acquire)
+        {
+            return Ok(true);
+        }
+        match self
+            .unrecorded_grants_are_ours()
+            .await?
+        {
+            UnrecordedGrants::None => Ok(false),
+            UnrecordedGrants::Ours => {
+                if let Err(error) = self
+                    .record_pepper_fingerprint()
+                    .await
+                {
+                    warn!(
+                        target: "credential_delegation",
+                        error = ?format!("{error:#}"),
+                        "The delegated grants stored were all written under this gateway's identity hash pepper, but \
+                         its fingerprint could not be recorded; they will be read again on the next check"
+                    );
+                }
+                Ok(false)
+            }
+            UnrecordedGrants::Mismatch => {
+                self.unrecorded_grants_mismatch
+                    .store(true, Ordering::Release);
+                Ok(true)
+            }
+            UnrecordedGrants::Unreadable(error) => Err(error),
+        }
+    }
+
+    /// Forget a mismatch found in the grants stored with no fingerprint
+    /// recorded, after a grant is removed, so a purge takes effect at once.
+    fn forget_unrecorded_pepper_mismatch(&self) {
+        self.unrecorded_grants_mismatch
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Record this gateway's pepper beside the grants.
+    async fn record_pepper_fingerprint(&self) -> Result<()> {
+        crate::storage::filesystem::atomic_write_file_with_mode(
+            &self
+                .grants_directory
+                .join(PEPPER_FINGERPRINT_FILE),
+            self.pepper_fingerprint
+                .as_bytes(),
+            Some(0o600),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to record the delegated grants' pepper fingerprint: {error:?}"))
     }
 
     /// Whether grants are stored that were written under another pepper: the
-    /// fingerprint names another, or none is recorded and no stored grant has
-    /// this pepper's id ([`Self::unrecorded_grants_are_ours`]).
+    /// fingerprint names another, or none is recorded and a stored grant does
+    /// not have this pepper's id ([`Self::unrecorded_pepper_mismatch`]).
     async fn pepper_mismatch(&self) -> Result<bool> {
         match self.stored_pepper().await? {
             StoredPepper::Ours => Ok(false),
@@ -700,9 +812,10 @@ impl FileSystemDelegationVaultStore {
                 .grant_ids_with_prefix("")
                 .await?
                 .is_empty()),
-            StoredPepper::Unrecorded => Ok(!self
-                .unrecorded_grants_are_ours()
-                .await?),
+            StoredPepper::Unrecorded => {
+                self.unrecorded_pepper_mismatch()
+                    .await
+            }
         }
     }
 
@@ -726,16 +839,8 @@ impl FileSystemDelegationVaultStore {
                  stored; it now names this gateway's"
             );
         }
-        crate::storage::filesystem::atomic_write_file_with_mode(
-            &self
-                .grants_directory
-                .join(PEPPER_FINGERPRINT_FILE),
-            self.pepper_fingerprint
-                .as_bytes(),
-            Some(0o600),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("Failed to record the delegated grants' pepper fingerprint: {error:?}"))
+        self.record_pepper_fingerprint()
+            .await
     }
 
     /// Read the grants with these record ids, failing with [`UnreadableGrant`]
@@ -1510,6 +1615,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
                 .grant_refreshes
                 .delete(&id)
                 .await?;
+            store.forget_unrecorded_pepper_mismatch();
             if existed {
                 info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted without reading it");
             }
@@ -1539,6 +1645,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
                 .grant_refreshes
                 .delete(&id)
                 .await?;
+            store.forget_unrecorded_pepper_mismatch();
             info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted");
             Ok(Some(grant))
         })
@@ -1719,6 +1826,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
                 .grant_refreshes
                 .delete(&id)
                 .await?;
+            store.forget_unrecorded_pepper_mismatch();
             info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted: the vendor refused it");
             Ok(Some(grant))
         })
@@ -1754,6 +1862,7 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
                 .grant_refreshes
                 .delete(&id)
                 .await?;
+            store.forget_unrecorded_pepper_mismatch();
             info!(target: "credential_delegation", grant_id = %id, "Delegated grant deleted");
             Ok(Some(grant))
         })
@@ -3208,6 +3317,156 @@ mod tests {
                 .unwrap()
                 .access_token,
             "again-access"
+        );
+    }
+
+    fn other_key() -> super::super::grants::GrantKey {
+        super::super::grants::GrantKey::owner(Some("tenant-a"), "surface", "transit-point-id", "provider-b")
+    }
+
+    /// With no fingerprint recorded, one grant written under another pepper
+    /// among grants written under this one makes the store a mismatch: a
+    /// grant of this pepper never vouches for the rest. The mismatch is kept
+    /// until the grant is purged, which takes effect at once.
+    #[tokio::test]
+    async fn one_grant_of_another_pepper_makes_unrecorded_grants_a_mismatch_until_it_is_purged() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let ours = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        configure_pepper_bytes_for_tests(&[2; 32]);
+        encrypted_vault(theirs.path())
+            .await
+            .store_grant(grant(&other_key(), "their-access"))
+            .await
+            .unwrap();
+        let their_id = other_key().record_id();
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        encrypted_vault(ours.path())
+            .await
+            .store_grant(grant(&key(), "our-access"))
+            .await
+            .unwrap();
+        let grants = ours
+            .path()
+            .join("delegated_grants");
+        std::fs::copy(
+            theirs
+                .path()
+                .join(format!("delegated_grants/{their_id}.json.enc")),
+            grants.join(format!("{their_id}.json.enc")),
+        )
+        .unwrap();
+        std::fs::remove_file(grants.join("pepper-fingerprint")).unwrap();
+
+        let logs = FormattedLogs::capture();
+        let vault = encrypted_vault(ours.path()).await;
+        let startup = logs.text();
+        assert!(startup.contains("written under another identity hash pepper"), "{startup}");
+        assert!(
+            vault
+                .store_grant(grant(&key(), "again-access"))
+                .await
+                .unwrap_err()
+                .is::<super::super::grants::PepperMismatch>()
+        );
+        assert!(
+            !grants
+                .join("pepper-fingerprint")
+                .exists()
+        );
+
+        assert!(
+            vault
+                .purge_grant(&their_id, Some("tenant-a"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            vault
+                .derives_stored_grant_ids()
+                .await
+                .unwrap(),
+            "the purge takes effect without a restart"
+        );
+        assert_eq!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "our-access"
+        );
+    }
+
+    /// With no fingerprint recorded, grants all written under this pepper are
+    /// read once, and its fingerprint is then recorded so later checks read the
+    /// fingerprint alone.
+    #[tokio::test]
+    async fn unrecorded_grants_all_of_this_pepper_get_its_fingerprint_recorded() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let directory = tempfile::tempdir().unwrap();
+        let fingerprint = directory
+            .path()
+            .join("delegated_grants/pepper-fingerprint");
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        let first = encrypted_vault(directory.path()).await;
+        first
+            .store_grant(grant(&key(), "first-access"))
+            .await
+            .unwrap();
+        first
+            .store_grant(grant(&other_key(), "other-access"))
+            .await
+            .unwrap();
+        let recorded = std::fs::read_to_string(&fingerprint).unwrap();
+        std::fs::remove_file(&fingerprint).unwrap();
+
+        let vault = encrypted_vault(directory.path()).await;
+
+        assert_eq!(std::fs::read_to_string(&fingerprint).unwrap(), recorded);
+        assert!(
+            vault
+                .derives_stored_grant_ids()
+                .await
+                .unwrap()
+        );
+    }
+
+    /// With no fingerprint recorded and no grant that can be read, which pepper
+    /// the grants were written under is not known: a check fails with the read
+    /// error, never as a pepper mismatch, and the startup log names the read
+    /// failure alone.
+    #[tokio::test]
+    async fn unreadable_unrecorded_grants_fail_as_unreadable_not_as_a_pepper_mismatch() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::tests::key;
+        use crate::identity::credential_identity::configure_pepper_bytes_for_tests;
+        let directory = tempfile::tempdir().unwrap();
+        configure_pepper_bytes_for_tests(&[1; 32]);
+        encrypted_vault(directory.path()).await;
+        corrupt(directory.path(), &key().record_id());
+
+        let logs = FormattedLogs::capture();
+        let vault = encrypted_vault(directory.path()).await;
+        let startup = logs.text();
+        assert!(startup.contains("A delegated grant cannot be read"), "{startup}");
+        assert!(!startup.contains("pepper"), "{startup}");
+
+        let refused = vault
+            .grant(&other_key())
+            .await
+            .unwrap_err();
+        assert!(!refused.is::<super::super::grants::PepperMismatch>(), "{refused}");
+        assert!(refused.is::<super::super::grants::UnreadableGrant>(), "{refused}");
+        assert!(
+            !directory
+                .path()
+                .join("delegated_grants/pepper-fingerprint")
+                .exists()
         );
     }
 

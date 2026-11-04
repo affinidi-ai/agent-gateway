@@ -120,6 +120,13 @@ you open any listener:
 - **Restrict ports 8443 and 8080 with a firewall or security group.** Each listener sets
   its own `bind_address`, and the example `gateway.json` binds every listener, port 9000
   included, to `0.0.0.0`.
+- **List your load balancer in `client_ip.trusted_proxies` in `gateway.json`.** Until it
+  is listed, the gateway sees every caller as the balancer's address, so the STS token
+  endpoint throttle, which is on by default, counts them all as one source: a burst of
+  failed client logins through the balancer locks every STS client out for
+  `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. The
+  balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
+  or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
 - **Register the first administrator before anyone else can reach the gateway.** The
   first account to register, by passkey or SAML, becomes the primary administrator and
   cannot be deleted or demoted. Allow only your own address to reach 8443 and 8080,

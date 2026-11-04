@@ -619,6 +619,7 @@ fn mtls_failure_reason(err: &SourceAuthError) -> &'static str {
                 "invalid_cert"
             }
         }
+        SourceAuthError::AmbiguousCredentials => "ambiguous_credentials",
         SourceAuthError::ConfigNotFound { .. } => "trust_misconfigured",
         SourceAuthError::Internal { .. } => "internal_error",
     }

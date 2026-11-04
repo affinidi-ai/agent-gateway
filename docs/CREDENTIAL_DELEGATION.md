@@ -106,7 +106,7 @@ record that misses a required one.
 | `jwt_signing_key_secret_ref` | Required: a PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC), or a Google service account JSON key file, whose `private_key` is used | Required |
 | `jwt_signing_algorithm` | `RS256` (default) or `ES256` | `PS256` (default) or `RS256` |
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
-| `jwt_subject` | Optional `sub` (domain-wide delegation) | Not used |
+| `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
 | `client_id_secret_ref` | Not used | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
@@ -123,9 +123,9 @@ answers `"key_material": "ok"` beside the token endpoint's reachability. JWK key
 accepted. The provider API never returns the key or certificate; the list leaves out
 their references too.
 
-Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, and for a
-client assertion `nbf` and a random `jti`); only the issued access token is cached. A JWT
-Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, a random
+UUID `jti` so the issuer can refuse a replayed assertion, and for a client assertion `nbf`);
+only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
 `common`. An update that sends a reference or JWT field as an empty string clears it, which
 is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
@@ -445,14 +445,28 @@ with `outbound_credentials` ignores `transit_credentials`.
 
 A Transit Point sends its target at most one value of each credential header, by the same
 rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
-`Authorization` and `Cookie` and without a header named like the Transit Point's
-`target_auth` header, whether or not the gateway adds that header to this request. It then
-adds the `target_auth` header, and then the `bearer_header` and `custom_header` credentials of
-its bindings, each replacing any earlier header of the same name. On a `2026-07-28` MCP
-request, the credentials prepared for `outbound_credentials` are applied last in the same
-way. So the managed agent can neither supply nor replace a credential, and a delegated
-credential under the same name as `target_auth` replaces it; give them different names to
-send both.
+`Authorization` and `Cookie`, and without any header, every value of it, compared without
+regard to case, named like the Transit Point's `target_auth` header or like the
+`custom_header` of any credential binding that can apply on it: every binding in the
+surface's `outbound_credentials`, `tools` bindings included, or else its own
+`transit_credentials`. Those headers are withheld whether or not the gateway adds a value to
+this request. It then adds the `target_auth` header, and then the `bearer_header` and
+`custom_header` credentials of its bindings, each replacing any earlier header of the same
+name. On a `2026-07-28` MCP request, the credentials prepared for `outbound_credentials` are
+applied last in the same way. So the managed agent can neither supply nor replace a
+credential, and a delegated credential under the same name as `target_auth` replaces it;
+give them different names to send both.
+
+A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
+target can carry only text header values, so a Transit Point refuses a Fabric request whose
+`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+cannot be carried with `503`, rather than forwarding it without the credential.
+
+An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
+header named like the Target's `target_auth` header is never forwarded, including
+`Authorization` kept by `forward_source_auth_header`, and the `target_auth` header and each
+delegated credential header the gateway adds replace every value of that header already on
+the request, so the target receives one value of each, the gateway's.
 
 ### The caller on a Transit Point
 
@@ -500,8 +514,7 @@ either, so such a call needs the Transit Point's managed identity: its own `mana
 or the surface's when the Transit Point injects a VP, in any mode but `from_jwt_claim`. Without
 one, a binding that applies refuses every Fabric caller with `403`, and a save of a Transit
 Point that sets the switch, on the surface or in an enabled variant, answers with a `Warning`
-header saying so. The switch has an effect only on a Transit Point that also sets
-`allow_fabric_callers`, since a token issued for a partner's request opens no other.
+header saying so.
 
 The switch releases anything only when the receiving surface verifies a per-user credential on
 each Fabric request. Only two kinds of caller authentication can tell a partner's users apart: a
@@ -704,7 +717,10 @@ also refused on a surface whose Access Point takes the gateway's resource access
 (`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
 gateway's issuer, so callers of two identity providers with the same subject would share a
 grant. An `owner` binding may be used there. A surface stored outside the API that breaks one
-of these rules answers `connector_unavailable` and reads no grant.
+of these rules answers `connector_unavailable` and reads no grant, and so does one saved through
+the API before these rules applied. Its grants are kept, not revoked: none is released while
+the rule is broken. Tightening the caller authentication (`allowed_dids`, `audiences`) releases
+them again. Removing the binding removes them and revokes them at the vendor.
 
 A request through such a Transit Point needs a caller it identifies, as every delegated
 credential does: a transit token naming one, or a caller its `source_auth` verified; without
@@ -804,7 +820,7 @@ API, the grants report and their removal take `"hop": "target"`.
 | No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |
 | No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |
 | `target.endpoint` | A public `https` URL with the origin of the provider's `resource`, as a Transit Point's `target_endpoint`; never `fabric://`, `proxy://` or `a2a-proxy://`. On an A2A or AP2 Access Point, whose requests carry the grant at or under the endpoint path, not the root of its origin (`/` or no path), where that would be every path of the vendor's: the A2A operation paths (`/tasks`, `/v1/...`) are ones a vendor's other APIs use too |
-| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it, and is created disabled, with a `Warning` header (`299`) saying so, since it keeps the copied Target and would send it requests without the grant. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
+| One place | The binding is held in the surface's `outbound_credentials` or in one variant's `overrides.outbound_credentials`, never in two: its grants are kept under one hop and used under one place's settings. A variant created from one that holds it does not copy it, and is created disabled, with a `Warning` header (`299`) saying so, since it keeps the copied Target and would send it requests without the grant. While the binding is served, every save that leaves an enabled view sending requests to its Target's origin without the binding or a credential of its own (`target.auth`, another binding, or `forward_header` on every caller authentication method) answers with a `Warning` header (`299`) naming it, since that view sends the vendor its callers' own headers and no grant: enabling such a copy, a variant with `outbound_credentials: []`, or the surface's own route beside a variant that holds the binding, unless a `default_variant_id` serves the base route instead. The dashboard shows it in the save-warnings banner. A variant that keeps the surface's `outbound_credentials` serves the surface's binding, and is checked with its own Target, Access Point and Transit Points. For an `owner` binding, whose every caller acts as the owner, such a variant keeps what of the surface's chooses those callers: its caller authentication, `access_point.inbound_policy`, `access_point.trust_check_list` and `target.policy`. One of its own, or one a `complete` override clears, is refused, enabled or not, since which is wider cannot be told. A save adds a `Warning` header (`299`) for an enabled variant that keeps the binding while it overrides its Access Point or Target otherwise, since its callers then use the Target's grants under the variant's own tool gating and response policy, and, for a `caller` binding, its own caller authentication and policies |
 
 A save that breaks a rule, or the rules every binding with external consent keeps (encryption
 at rest, the identity hash pepper, a permitted resource and issuer), is refused with `400` on
@@ -876,7 +892,8 @@ session revision. A request that arrived over Fabric is refused `403` as one who
 gateway did not identify, before any payment is asked for or verified: the caller a peer gateway
 asserts never keys a grant. A public discovery read over Fabric is refused the same way, since
 it would carry the peer's headers, its caller's cookies among them, to the vendor, and no request
-over Fabric can use the Target. A surface whose binding breaks a rule above, as one edited by hand
+over Fabric can use the Target. Each such refusal is audited `request_rejected` at admission, as
+`consent_identity_required`. A surface whose binding breaks a rule above, as one edited by hand
 might, answers `connector_unavailable` before any payment is asked for or settled, and reads no
 grant.
 
@@ -985,29 +1002,33 @@ authenticated caller, the consent mode decides what happens the first time.
 
 `elicit` needs an MCP client that advertised the `elicitation` capability during
 `initialize`, and a capability record for its session. `elicit_fallback` decides
-what happens when either is missing: `on_demand`, the default, degrades to the 401
-response, and `fail` records `elicitation_unsupported` and forwards the tool call without
-the credential. Elicit falls back when:
+what happens when either is missing, or when the client has no open stream to send the
+prompt on: `on_demand`, the default, degrades to the 401 response, and `fail` records
+`elicitation_unsupported` and refuses the tool call as a credential that cannot be resolved
+(see below), never forwarding it without the credential. Elicit falls back when:
 
 - the client did not advertise `elicitation`;
 - the upstream returned a session id already in use on the surface (see "MCP session
   ownership" in `docs/MCP_METADATA.md`);
 - the gateway has no capability record for the session, because the upstream answered
   `initialize` with SSE, sent an unusable `Mcp-Session-Id`, or the gateway restarted
-  after the session opened.
+  after the session opened;
+- the session has no open SSE stream to deliver `elicitation/create` on.
 
 A user who declines or cancels the elicitation, or does not answer before
-`elicit_timeout_secs`, also has the call forwarded without it.
+`elicit_timeout_secs`, has the call refused the same way, whatever `elicit_fallback` says;
+the delegation audit records `elicitation_declined`, `elicitation_cancelled` or
+`elicitation_timed_out`.
 
 ### When a credential cannot be resolved
 
 A binding that applies but whose credential cannot be resolved refuses the request rather
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
-error, and consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`. A failed token request
-records `client_credentials_failed`, `jwt_bearer_failed` or `client_credentials_jwt_auth_failed`
-by provider type. An Access Point and
+error, consent that is needed but cannot be asked for because no authorization URL can be
+built, for example when the provider has no `authorization_endpoint`, and an `elicit` prompt
+that fails as described above. A failed token request records `client_credentials_failed`,
+`jwt_bearer_failed` or `client_credentials_jwt_auth_failed` by provider type. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
 body. The delegation audit records the binding's outcome, and `provider_unavailable` names a
@@ -1022,14 +1043,17 @@ delegation), or for which neither its managed identity nor the transit token's c
 the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
-`application/problem+json` body. A missing token still gets the consent answer above. A
-Transit Point forwards a `GET` of a public discovery path, such as an agent card, without
-checking a transit token, so it carries no caller, and it is forwarded without a delegated
-credential, as it is without the `target_auth` one.
+`application/problem+json` body. A missing token still gets the consent answer above.
+
+A Transit Point discovery read, a `GET` or `HEAD` of a discovery document directly below the
+Transit Point (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), is forwarded without a
+transit token check, so it carries no caller, and without a delegated credential or the
+`target_auth` one. Any other path, a discovery document below another segment included,
+needs a transit token and carries the credentials.
 
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores
-are not available, and on the `elicit` outcomes above. Fabric receive refuses a request whose
+are not available. Fabric receive refuses a request whose
 caller its surface did not verify, any per-user binding, and consent (see [The caller on Fabric receive](#the-caller-on-fabric-receive)).
 A Target bound by external consent is the exception: what cannot be released is refused, never
 forwarded without the grant ([External consent on the Access Point
@@ -1157,6 +1181,41 @@ puts it in `user_hash`. To compute it for a JWT subject `alice` from
 printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256
 ```
 
+#### Computing the identity hash outside the gateway
+
+A system that runs the connect for a caller, such as the page that hosts the person's connect
+and the authorization server's redirect, passes the caller's identity hash as the `principal`
+of a connect and of a grant removal, and reads it from a grant report. It computes the hash
+itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
+computed outside the gateway: take the token's `iss` and `sub`, and the surface's `tenant_id`
+(or `null`).
+
+The form is a compatibility surface. It is not changed without a documented migration, since
+a changed form orphans every stored grant. No pepper and no configuration setting is part of
+it: the same inputs always give the same hash, on every gateway. (The pepper derives the ids
+grants are stored under, never the hash itself.) These values are held by
+tests, and a change to the form fails them:
+
+| `method` | `issuer` | `tenant` | `subject` | Identity hash |
+| --- | --- | --- | --- | --- |
+| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
+| `api_key` | `""` | `null` | `partner-key` | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
+
+The third row shows RFC 8785 escaping: the subject is written with `\"` for the quote, `\\` for the
+backslash, the character `é` as itself in UTF-8, and `\n` for the line feed.
+
+The `hint` of a `connect_required` refusal for a caller is computed from the identity hash the
+same way on both sides: the first 16 bytes of the SHA-256 of the UTF-8 text
+`agent-gateway-connect-hint`, a line feed, and the identity hash as its lowercase hex text,
+written as base64url without padding (22 characters). It has the same compatibility promise:
+
+| Identity hash | Hint |
+| --- | --- |
+| `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` | `WXYw1wqFnUD93SdLiPtFyA` |
+| `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` | `YvFEO7T_9N80_y4j8sxMVA` |
+
 Delegated credentials stored by a release that keyed them by an earlier form of the identity
 hash are never looked up again, but their access and refresh tokens stay in the vault until
 they are removed. After upgrading, list the vault (`GET /api/v1/delegation-vault`, or the
@@ -1236,9 +1295,17 @@ every change that removes an external consent binding or deletes an external con
 with `503`: it cannot find their grants under its own ids. Restore the pepper the grants were
 written under, or [purge them](#removing-grants). A fingerprint with no grant
 beside it is replaced by the next gateway that stores one. When the fingerprint file is missing
-while grants are stored, the grants decide: unless one the gateway can read has the id its
-pepper derives, the gateway treats them as written under another pepper in every way above, and
-never records its own fingerprint over them.
+while grants are stored, the grants decide, and every one of them is read:
+
+- If any grant does not have the id the gateway's pepper derives, the gateway treats them all as
+  written under another pepper in every way above, and never records its own fingerprint over
+  them. It remembers this until a grant is removed, so a purge takes effect without a restart.
+- If every grant has that id, the gateway records its fingerprint, and later checks read the
+  fingerprint alone.
+- If no grant has another pepper's id but one cannot be read, which pepper they were written
+  under is not known. The startup `ERROR` names the unreadable grant, not the pepper, and a
+  release, removal or provider delete that finds no grant fails as the vault being unavailable
+  until that grant can be read or is purged.
 
 A fingerprint, or a `delegated_grants` directory, that cannot be read at startup is named in an
 `ERROR`, and the vault starts all the same: agent-keyed tokens are unaffected. Each grant

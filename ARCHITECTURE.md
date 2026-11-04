@@ -89,7 +89,7 @@ External caller → Access Point → Target. Implemented in
 flowchart TB
     subgraph E["Edge"]
         direction LR
-        A1["Source auth, or Resource<br/>Server token"] --> A2[Rate limit] --> A3[Body extraction] --> A4[MCP wire validation]
+        A1["Source auth, or Resource<br/>Server token"] --> A2[Rate limit] --> A3["Body extraction<br/>(413 over the limit)"] --> A4[MCP wire validation]
     end
     subgraph G["Gateway plane"]
         direction LR
@@ -97,7 +97,7 @@ flowchart TB
     end
     subgraph P["Before forwarding"]
         direction LR
-        P1[Egress check] --> P2[Body-size limit] --> P4[MCP tool policies]
+        P1[Egress check] --> P2[Body-size re-check] --> P4[MCP tool policies]
     end
     subgraph C["Caller context"]
         direction LR
@@ -139,7 +139,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -150,7 +150,7 @@ logic.
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Egress check | Vetting the forward target before the request is charged or forwarded | [`src/egress.rs`](src/egress.rs) |
-| Body-size limit | Refusing a body over `[a2a] max_body_size` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
+| Body-size limit | Refusing a body over `[a2a] max_body_size` with `413`, as it is read and again before forwarding; an MCP Access Point reads up to its `mcp_http.max_request_bytes` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | MCP tool policies | Per-tool authorization, configured as `target.mcp_tool_policies` | [`src/policies/opa.rs`](src/policies/opa.rs) |
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
@@ -196,32 +196,35 @@ flowchart TB
         D0[Credential injection] --> D1[Forward] --> D2["Response and<br/>agent-card rewrite"] --> D3[Metrics]
     end
     E --> I --> P --> F
-    I -. discovery GET .-> F
+    I -. discovery read .-> F
 ```
 
 Every Transit Point authenticates its caller in the first stage, with its `source_auth` or
 Resource Server token, or in the second, with the transit token, unless it is marked
 `allow_unauthenticated_callers`; one that cannot be enforced refuses every request there,
 before anything is forwarded or any credential resolved (see
-[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). Public discovery GETs,
-such as an agent card, skip transit token validation and the trust and policy group, and are
-forwarded without credentials. They still meet a Transit Point's `source_auth` or Resource
-Server token, but on a Transit Point that authenticates its callers with the transit token
-alone, a discovery GET is forwarded with no caller authentication at all. The outbound path does not
-evaluate the appliance-wide policies.
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). A discovery read, a `GET`
+or `HEAD` of a discovery document such as an agent card directly below the Transit Point,
+skips transit token validation and the trust and policy group, and is forwarded without
+credentials. It still meets a Transit Point's `source_auth` or Resource Server token, but on a
+Transit Point that authenticates its callers with the transit token alone, a discovery read is
+forwarded with no caller authentication at all. The outbound path does not evaluate the
+appliance-wide policies.
 
 ## Full order
 
 Inbound:
 
 source auth (or, on an MCP surface with `mcp_http.authorization`, the Resource Server
-token, which refuses rather than passing to policy) → rate limit → body extraction → MCP
+token, which refuses rather than passing to policy) → rate limit → body extraction (`413`
+over `[a2a] max_body_size`, or over `mcp_http.max_request_bytes` on MCP) → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
 and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
 MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
 payment, then fabric dispatch) →
-forward-target egress check → body-size limit → MCP tool
+forward-target egress check → body-size re-check (a body the gateway grew, and an
+MCP Access Point's body over `max_body_size`) → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → consent preparation (modern MCP) → identity and caller-info headers → transit
@@ -236,13 +239,15 @@ Outbound:
 caller authentication (a Transit Point whose caller authentication cannot be enforced, or
 whose surface sets `transit.source_auth`, is refused here; otherwise its `source_auth`, or on
 a Transit Point with `mcp_http.authorization` the Resource Server token) →
-transit token validation → rate limit → protocol context → Fabric hop check (a `fabric://`
-Transit Point refuses a call past the hop limit with `508`) → Transit Point header mapping
+transit token validation → rate limit → protocol context → variant check (a variant whose
+Transit Point sets other gating or policies than the base surface's is refused with `403`) →
+Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit with `508`) →
+Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for public discovery GETs.
+tool gating are skipped for discovery reads.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
@@ -314,9 +319,9 @@ as from a legacy-only endpoint.
 On receive, sender authorization, envelope admission, meaning expiry and replay checks,
 and the hop count check run **before** surface lookup and source auth; a framed stream resolves
 its surface and variant when it opens, so it reads the hop count after them. A request forwarded to
-an HTTP(S) Target of a surface with a Transit Point that sets `allow_fabric_callers` carries a
-transit token the receiving gateway issued, naming the peer, the hop count and any caller the
-receiving surface verified, and opening only those Transit Points (see
+an HTTP(S) Target of a surface with Transit Points carries a transit token the receiving
+gateway issued, naming the peer, the hop count and any caller the receiving surface verified,
+and opening the surface's Transit Points as an Access Point's token does (see
 [`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways)). Each gateway keeps its own trust
 boundary: an identity presentation is attributed to the caller only when its issuer is
 one of that connection's issuers.
@@ -338,9 +343,9 @@ Breaking one of these is a correctness bug, not a style question.
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). | An unauthenticated caller would reach the Target with the operator's credential. |
-| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a public discovery `GET` without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
+| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a discovery read, a `GET` or `HEAD` of a discovery document directly below the Transit Point, without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | A managed agent receives the caller-info and `did:webvh` identity headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent, and a Transit Point sends its target none of them. | The agent, or a Transit Point's target, could not rely on these headers. |
-| A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a `sub`, and its only principal (`fabric.principal_hash`) is the caller the receiving surface's own source authentication verified, set only when that authentication tells a partner's users apart; nothing the peer says about its caller becomes one. It opens only the Transit Points that allow Fabric callers, keys a delegated credential only on one that sets `delegated_credentials_for_fabric_callers`, and the agent gets only the token this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
+| A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a `sub`, and its only principal (`fabric.principal_hash`) is the caller the receiving surface's own source authentication verified, set only when that authentication tells a partner's users apart; nothing the peer says about its caller becomes one. It opens the Transit Points of the surface that served the request, as an Access Point's token does, keys a delegated credential only on one that sets `delegated_credentials_for_fabric_callers`, and the agent gets only the token this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
 | Fabric receive never releases its Target's per-user delegated credentials, and never starts consent for a legacy Fabric request. A Transit Point's `delegated_credentials_for_fabric_callers` releases a grant only beside caller authentication that tells a partner's users apart, checked when the token is issued and again on the call, and a Transit Point never starts consent, legacy or `2026-07-28`, for a caller a Fabric-issued token names: it releases only a grant that already exists. | One partner credential would key one grant for all of the partner's users, or an authorization URL relayed through a partner would let it bind its own account. |
 | Every Fabric send sets its own hop count, never a copy a caller, agent or peer sent, and a request past 8 Fabric crossings is refused. | Agents that call each other through their gateways could pass a request back and forth without end. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |

@@ -3956,8 +3956,8 @@ pub(super) fn fabric_response_workload_binding(
 
 /// The transit token the managed agent behind `surface` gets with a request a
 /// Fabric peer sent: when `target_url`, the Target, is the agent itself, by
-/// HTTP or HTTPS, and a Transit Point of the surface sets
-/// `allow_fabric_callers`. The token opens only those Transit Points. A Target
+/// HTTP or HTTPS, and the surface has a Transit Point. The token names every
+/// Transit Point of the surface, as the Access Point's token does. A Target
 /// the gateway runs has no agent to hold one, and an agent card fetch is no
 /// request of the agent's own. `max_lifetime_secs` is the appliance's
 /// `transit_token_max_lifetime_secs`. Its only principal,
@@ -3980,7 +3980,6 @@ pub(super) fn fabric_receive_transit_token(
     let allowed_transit_points: Vec<String> = surface
         .transit_points()
         .iter()
-        .filter(|point| point.allow_fabric_callers)
         .map(|point| point.alias.clone())
         .collect();
     if allowed_transit_points.is_empty() || !agent_target || agent_card_request {
@@ -4841,7 +4840,7 @@ async fn process_charged_forward_request(
                 None => surface.access_point.route.clone(),
             };
             if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp
-                || surface.source_auth().is_some()
+                || surface.has_source_auth()
                 || authorization.validate_endpoint(&origins, &expected_path).is_err()
                 || profile.validate_network(network).is_err()
             {
@@ -4877,7 +4876,8 @@ async fn process_charged_forward_request(
             // as the direct handler.
             let axum_headers = gate_request_headers(stream_request.as_ref(), headers.as_ref());
 
-            if let Some(auth_config) = surface.source_auth() {
+            if let Some(selection) = surface.source_auth_for_request(&axum_headers, None) {
+                let auth_config = selection.method;
                 let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
                     Ok(middleware) => middleware,
                     Err(e) => {
@@ -4918,10 +4918,14 @@ async fn process_charged_forward_request(
                     surface_id: &surface.surface_id,
                     variant_id: active_variant_id.as_deref(),
                 };
-                match sa_middleware
-                    .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
-                    .await
-                {
+                let verified = if selection.ambiguous {
+                    Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
+                } else {
+                    sa_middleware
+                        .authenticate(&resolved_auth_config, &axum_headers, &surface.name, view, None)
+                        .await
+                };
+                match verified {
                     Ok(identity) => Some(identity),
                     // Caller-attributable failure. An Access Point that
                     // publishes protected resource metadata, or whose caller
@@ -4929,6 +4933,11 @@ async fn process_charged_forward_request(
                     // record the outcome for the policy layer and continue with
                     // no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
+                        // Beside protected resource metadata every failure is
+                        // refused: a failed JWT with the discovery refusal, any
+                        // other method plainly.
+                        let challenged = protected_resource.is_some()
+                            && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
                         let refused = protected_resource.is_some() || surface.rejects_failed_caller_authentication();
                         channel_warn!(
                             config_id,
@@ -4943,7 +4952,7 @@ async fn process_charged_forward_request(
                             refused,
                             None,
                         );
-                        if let Some(protected_resource) = &protected_resource {
+                        if challenged && let Some(protected_resource) = &protected_resource {
                             return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
                         }
                         if refused {
@@ -5315,7 +5324,7 @@ async fn process_charged_forward_request(
     // the peer gateway asserts, so such a request is refused before any
     // payment is asked for or settled, and so is a discovery read, which
     // would carry the peer's headers to the vendor.
-    if let Some(refused) = crate::proxy::target_grant::refuse_over_fabric(&surface, &body_bytes) {
+    if let Some(refused) = crate::proxy::target_grant::refuse_over_fabric(&surface, &body_bytes, &audit_facts) {
         return axum_response_to_forward_result(refused).await;
     }
 
@@ -5796,8 +5805,7 @@ async fn process_charged_forward_request(
     // Track if content-type was set
     let mut has_content_type = false;
 
-    // Determine the source-auth credential header to strip (must not leak upstream).
-    let source_cred_header = surface.source_auth().and_then(|sa| sa.credential_header_name());
+    let target_auth_header = crate::proxy::handler::target_auth_header_name(surface.target_auth());
     let header_metadata_mapping = surface.access_point.header_metadata_mapping.as_ref();
 
     // Add headers if provided
@@ -5826,10 +5834,9 @@ async fn process_charged_forward_request(
                 );
                 continue;
             }
-            // Skip the source-auth credential header — it was consumed by the
-            // gateway for authentication and must not be forwarded upstream.
-            if let Some(cred) = source_cred_header
-                && key.eq_ignore_ascii_case(cred) {
+            // Skip the source-auth credential headers — the gateway consumed
+            // them for authentication and they must not be forwarded upstream.
+            if surface.is_source_credential_header(key) {
                     channel_info!(
                         config_id,
                         "    Skipping source auth credential header: {}",
@@ -5839,6 +5846,9 @@ async fn process_charged_forward_request(
                 }
             if crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(key) {
                 channel_info!(config_id, "    Skipping caller-info header: {}", key);
+                continue;
+            }
+            if target_auth_header.is_some_and(|credential| key.eq_ignore_ascii_case(credential)) {
                 continue;
             }
             if header_metadata_mapping.is_some_and(|mapping| {
@@ -5911,7 +5921,7 @@ async fn process_charged_forward_request(
         .await
         {
             Ok(Some((header_name, header_value))) => {
-                req = req.header(&header_name, &header_value);
+                req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
                 channel_info!(config_id, "Injected target authentication header: {}", header_name);
             }
             Ok(None) => {
@@ -6051,9 +6061,8 @@ async fn process_charged_forward_request(
                     &base_url,
                     true, // via_fabric = true (G2G path)
                     None, // audit context not yet available in G2G path
-                    // The caller identity here is asserted by the peer gateway, not
-                    // verified against the consenting issuer, so it can never unlock
-                    // a modern consent record.
+                    // A Fabric request establishes no consent principal, so it never
+                    // unlocks a modern consent record.
                     None,
                 )
                 .await;
@@ -6143,7 +6152,7 @@ async fn process_charged_forward_request(
                                 }
                             }
                             crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
-                                req = req.header(name, value);
+                                req = crate::proxy::handler::replace_request_header(req, name, value);
                                 channel_info!(
                                     config_id,
                                     "GW2: Injected delegated credential header: {}",

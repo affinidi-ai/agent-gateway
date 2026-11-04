@@ -342,6 +342,8 @@ This section covers only commands and archive distinctions implemented by this s
 | `.atgx` | Diagnostic sharing | Excludes sensitive directories, redacts remaining data, then encrypts to a recipient public key |
 | `.agbak` | Full restore | Contains appliance storage needed for restoration, including sensitive records, and is encrypted with the configured backup encryption key |
 
+The `.atgx` export leaves out the storage paths configured for `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions`, `avatars`, `delegation_vault` and `identity_hash_pepper` under `[storage_paths]`, matched by their resolved path whatever they are named, any directory named `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions` or `avatars`, every `transit_token_key.json` or `transit_token_key.json.enc` file, and every `key_<n>.json` or `key_<n>.json.enc` file, which hold the private keys of Connection Point, issuer and trust registry DIDs. In the records it keeps, the export replaces the whole value of a secret field, such as `private_key`, `privateKeyJwk`, `secrets`, `our_secrets` or `refresh_token`, whether it is a string, an object or a list.
+
 Use `.atgx` when sharing diagnostic state with a trusted recipient. Use `.agbak` for controlled backup and restore. A redacted `.atgx` export cannot restore an appliance, and a `.agbak` file must not be treated as sanitized support data.
 
 ### Create A Redacted `.atgx` Export

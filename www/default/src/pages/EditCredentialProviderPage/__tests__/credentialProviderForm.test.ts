@@ -29,6 +29,7 @@ const jwtBearer = form({
   jwt_issuer: ' sa@project.iam.gserviceaccount.com ',
   jwt_signing_key_secret_ref: 'SA_KEY',
   jwt_key_id: 'kid-1',
+  jwt_subject: 'user@example.com',
 });
 
 const jwtAuth = form({
@@ -70,6 +71,10 @@ describe('credential provider form', () => {
     expect(missingProviderField({ ...jwtBearer, jwt_signing_key_secret_ref: '' })).toBe(
       'Signing key secret is required.'
     );
+    expect(missingProviderField({ ...jwtBearer, jwt_subject: ' ' })).toBe(
+      'Subject is required for JWT Bearer providers.'
+    );
+    expect(missingProviderField({ ...jwtBearer, jwt_subject: 'user@example.com' })).toBeNull();
     expect(missingProviderField(jwtAuth)).toBeNull();
     expect(missingProviderField({ ...jwtAuth, jwt_certificate_secret_ref: '' })).toBeNull();
     expect(missingProviderField({ ...jwtAuth, client_id_secret_ref: '' })).toBe(
@@ -89,7 +94,7 @@ describe('credential provider form', () => {
       jwt_audience: '',
       jwt_key_id: 'kid-1',
       jwt_issuer: 'sa@project.iam.gserviceaccount.com',
-      jwt_subject: '',
+      jwt_subject: 'user@example.com',
       jwt_signing_algorithm: undefined,
     });
   });

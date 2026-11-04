@@ -1,4 +1,5 @@
-//! Renders credentials, request URIs and endpoint URLs in a form that is safe to log.
+//! Renders credentials, request URIs, endpoint URLs and caller-supplied values in a form that
+//! is safe to log.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,22 @@ const SECRET_PREFIX_CHARS: usize = 8;
 
 /// Path segments followed by a capability id, such as an onboarding session id.
 const CAPABILITY_PARENT_SEGMENTS: &[&str] = &["onboard", "delete-temp-channel"];
+
+/// Characters of a caller-supplied value that are logged.
+const UNTRUSTED_MAX_CHARS: usize = 256;
+
+/// `value`, sent by a caller, as one quoted token that can neither forge a log line nor
+/// flood the log: control characters, quotes and backslashes escaped, and cut after its
+/// first [`UNTRUSTED_MAX_CHARS`] characters.
+pub fn untrusted(value: &str) -> String {
+    match value
+        .char_indices()
+        .nth(UNTRUSTED_MAX_CHARS)
+    {
+        Some((end, _)) => format!("{:?}...", &value[..end]),
+        None => format!("{value:?}"),
+    }
+}
 
 /// `value`, such as a session token, as it may appear in logs: its first characters, or
 /// [`REDACTED`] when the value is too short for a prefix to leave most of it hidden.
@@ -112,6 +129,20 @@ pub fn record_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_escapes_line_breaks_and_quotes_into_one_token() {
+        assert_eq!(untrusted("/a\r\nWARN forged \"line\""), r#""/a\r\nWARN forged \"line\"""#);
+        assert_eq!(untrusted("/plain"), r#""/plain""#);
+    }
+
+    #[test]
+    fn untrusted_cuts_a_long_value_at_a_character_boundary() {
+        let long = "é".repeat(UNTRUSTED_MAX_CHARS + 10);
+        assert_eq!(untrusted(&long), format!("{:?}...", "é".repeat(UNTRUSTED_MAX_CHARS)));
+        let exact = "a".repeat(UNTRUSTED_MAX_CHARS);
+        assert_eq!(untrusted(&exact), format!("{exact:?}"));
+    }
 
     #[test]
     fn test_secret_keeps_prefix_of_long_value() {

@@ -28,9 +28,108 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 | DID Auth | `did_auth` | A DID Auth session token |
 | mTLS | `mtls` | A TLS client certificate |
 
-`methods` is a list, but the inbound pipeline enforces only its first entry
-([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
-are accepted and ignored.
+### Several methods on one Access Point
+
+`methods` is a list, so one surface can accept callers with different credentials, for
+example a JWT for internal users and an API key for partner agents, and the managed agent
+keeps one identity. The first entry is the primary method. The gateway selects one method
+per request ([`select_source_auth_method`](../src/source_auth/models.rs)) and verifies only
+that method:
+
+1. The method is the one whose credential the request carries: its header is present and not
+   empty (for JWT bearer, `token_header` holding a token in `token_scheme`, so an MPP
+   `Authorization: Payment` credential is not a JWT; otherwise `extraction.field`), or, for
+   mTLS, a client certificate reached the gateway. No credential is read from the body, so a
+   method that extracts from `mcp_meta` or `a2a_extension` is allowed only as the sole method.
+2. A request that carries no method's credential is checked against the primary method, so
+   it fails as a missing credential of that method.
+3. A request that carries credentials for more than one method fails source authentication
+   as the primary method, audited as `ambiguous_credentials`, and neither credential is
+   verified, so a caller can't choose the identity the gateway asserts. Like any failed
+   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
+   protected resource metadata, and otherwise passed to policy as
+   `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
+   connection that presents a client certificate, on a surface that also accepts mTLS, and an
+   MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
+   `Authorization`: the gateway cannot tell whose token it is.
+4. A rejected credential is never retried with another method.
+
+The order of the other methods has no effect.
+
+Policy sees the method that verified the caller as `input.source_auth.method`, so a rule can
+treat callers differently by method:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if input.source_auth.method == "jwt_bearer"
+
+allow if {
+    input.source_auth.method == "api_key"
+    input.source_auth.key_name == "partner-keys"
+}
+```
+
+For `api_key`, `key_name` is the method's `secret_id`. An `api_key_provider` caller also
+reports `method: "api_key"`, with the provider's key id as `key_name`, so a policy tells the
+two API key methods apart by `key_name`.
+
+Creating or saving a surface, and each of its enabled variants as resolved, refuses:
+
+- two methods that read the same credential location: the same header, compared without
+  regard to case, both `mcp_meta`, both `a2a_extension`, or two mTLS methods;
+- a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
+  it could never be selected;
+- more than one `did_auth` method, because the `/authenticate` endpoints serve one;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
+  method is `jwt_bearer`;
+- an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
+- on an Access Point that publishes protected resource metadata, a JWT bearer method other
+  than the primary: the discovery audience and challenge belong to the primary method.
+
+Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
+`from_api_key` a verified key. So a surface mixing JWT and API key callers takes a stored or
+static inbound identity, and policy tells its callers apart by `input.source_auth.method` and
+`key_name`.
+
+On an Access Point that publishes protected resource metadata, every caller-attributable
+failure is refused before policy: a failed JWT with the discovery challenge, and a failed
+credential of any other method with a plain `401`, so a bad credential never gets further
+than none. This holds directly and over Fabric.
+
+**Upgrading and rolling back.** Upgrading turns on every method of a stored surface: earlier
+releases enforced only the first and ignored the rest, so a caller presenting a later method's
+credential, which failed before, is now authenticated. Audit `caller_authentication.methods`,
+on each surface and each variant override, before upgrading. At startup the gateway logs, at
+`WARN`, one line per surface and per variant with more than one method, naming the methods
+after the first ([`additional_source_auth_method_notices`](../src/config/proxy.rs)); the line
+repeats on every start.
+
+Surfaces stored before these rules may break them, because the gateway then enforced only the
+first method and ignored the rest. Wherever surfaces load, at startup (from local storage,
+DynamoDB or its cache), on a configuration or single-surface reload, and when a storage event
+applies a surface another process wrote, a stored surface whose methods break them keeps only
+its first method, when that method is valid alone, and so does each enabled variant overriding
+its caller authentication ([`fall_back_to_first_source_auth_method`](../src/config/proxy.rs)).
+The gateway logs an error naming the surface, the rule and each dropped method by tag,
+credential location and non-secret references (strategy, secret, provider agent,
+certificates), so it can be rebuilt. An active node's load persists the correction to local
+storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
+node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
+`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_api_key` identity beside a method other than an API key, is logged as a warning at
+startup and refused on the next save.
+
+Before rolling back to a release that enforces only the first method, remove every method but
+the first. That release strips only the first method's header, so it would forward a later
+method's credential, such as a partner's `X-API-Key`, to the Target.
+
+The credential headers of every method are stripped before a request is forwarded, on each
+inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
+forwards its header only when it was the method selected for that request, so a request
+carrying several credentials forwards none.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
@@ -176,7 +275,8 @@ An XFCC header from any other source is not trusted.
 ### DID Auth
 
 A two-step ceremony: `POST /authenticate/challenge` issues a challenge, and
-`POST /authenticate` accepts a JWS over it.
+`POST /authenticate` accepts a JWS over it. Either request body may hold at most 64 KiB; a
+larger one is refused with HTTP `413` before it is parsed.
 
 ```mermaid
 sequenceDiagram
@@ -195,7 +295,7 @@ sequenceDiagram
 | --- | --- | --- |
 | `allowed_dids` | empty | Empty means any DID is accepted, so a surface with it takes no binding with external consent ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point)) |
 | `challenge_ttl_seconds` | 300 | Capped at 3600. A longer challenge widens the replay window. |
-| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. A save that sets a value above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds, and a save that keeps it is accepted. |
+| `session_ttl_seconds` | 86400 | Capped at 86400. A session is a bearer token. Only the first caller-authentication method mints sessions, so the cap applies to the surface's first method and to each variant's own. A save that sets a value above the cap is refused; a stored value above it still loads, is named in a `WARN` at startup, and its sessions last 86400 seconds, and a save that keeps it is accepted. |
 | `allowed_algorithms` | `["EdDSA"]` | The verifier recognises `EdDSA` and `ES256`; a value outside that set is rejected at validation time |
 
 `IAT_SKEW_SECONDS` is 120 ([`verify.rs`](../src/didauth/verify.rs)). A JWS is rejected
@@ -375,8 +475,11 @@ JSON otherwise; the reason is logged.
 
 `transit.source_auth`, on the surface's `transit` block rather than a Transit Point, is not
 enforced. The admin API refuses a surface that sets it, on the surface or in a variant's
-overrides, with `400`. A surface stored with it still loads, with a warning in the log, but
-its Transit Points refuse every request with `503` in the same way.
+overrides, with `400`. A surface stored with it, on the surface or in a variant's overrides,
+still loads, with a warning in the log, but its Transit Points refuse every request with `503`
+in the same way; one set only in a variant refuses that variant's requests. A variant never
+lifts the surface's refusal, a complete variant whose shared transit settings leave
+`source_auth` out included.
 
 The Surface Builder's Transit Point panel has a **Who can call this Transit Point** section
 with the transit token switch, a **Caller authentication** choice (an API key from the secret
@@ -395,10 +498,10 @@ Point does not support. The panel applies the rules above before the save: a Tra
 authenticates no caller and is not open, one that is open beside the token or a method, and a
 method that is missing its secret, header, strategy or audience cannot be saved, and the panel
 says why. A refusal from the admin API shows in the same section in plain words. Turning
-caller authentication off sends `"source_auth": null`. The panel shows neither
-`allow_fabric_callers` nor `delegated_credentials_for_fabric_callers`; a dashboard save keeps
-both, the second while the Transit Point still requires the transit token and the surface's
-caller authentication still tells a partner's users apart.
+caller authentication off sends `"source_auth": null`. The panel does not show
+`delegated_credentials_for_fabric_callers`; a dashboard save keeps it while the Transit Point
+still requires the transit token and the surface's caller authentication still tells a
+partner's users apart.
 
 These rules hold for a `PUT` of the surface and for a `PUT`
 of one variant (`PUT /v1/surfaces/{id}/variants/{variant_id}`), for the Transit Points its
@@ -495,7 +598,8 @@ name only its own tenant's or appliance-wide ones (see
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)).
 
 Unlike an Access Point, a Transit Point refuses a caller whose credential is missing or
-refused, with `401` and a problem JSON saying only `Caller credential missing or invalid`;
+refused, with `401` saying only `Caller credential missing or invalid`, as a JSON-RPC error
+(`-32001`, id `null`) on an MCP Transit Point and a problem JSON on any other;
 which check failed is logged, and the refusal is recorded as an `auth_failed` audit event (see
 [`OBSERVABILITY.md`](OBSERVABILITY.md)). Failed attempts are not throttled: protect a Transit
 Point reachable from untrusted networks with a strong key or certificate, and watch those
@@ -581,8 +685,10 @@ When a surface has Transit Points, its Access Point adds an `X-Transit-Token` he
 request it forwards to the managed agent, and the agent sends it back on its Transit Point
 calls ([`transit_token.rs`](../src/proxy/transit_token.rs)). The token is an HS256 JWT:
 signed, not encrypted, so the agent can read every claim. It names the surface, the
-caller, a hash of the caller's authenticated identity, the Transit Points it opens and the
-trace, and expires its surface's [transit token lifetime](#transit-token-lifetime) after
+caller, how the caller's identity was established (`identity_source`), the caller's DNA UAI
+when resolved (`caller_dna_uai`), a hash of the caller's authenticated identity, the
+operator-configured caller context fields captured on the Access Point
+(`caller_context_fields`), the Transit Points it opens and the trace, and expires its surface's [transit token lifetime](#transit-token-lifetime) after
 it is issued, 300 seconds unless the surface sets another. The agent may send the same
 token on any number of calls to that surface's Transit Points until then. The header is
 never forwarded to a Transit Point's target.
@@ -597,7 +703,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with a Transit Point that sets `allow_fabric_callers`, but not for a public discovery `GET` such as an agent card fetch. The token lists only those Transit Points. When one should be issued and cannot be, the request is refused with `503` |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 
@@ -615,7 +721,7 @@ so its agent gets exactly one. It differs from an Access Point token:
 | --- | --- |
 | `sub` | Never present, so a release that predates the `fabric` claim never reads the peer's caller as one this gateway verified |
 | `identity_source` | `fabric-presentation` when a presentation signed by one of the connection's issuers carried the caller DID, `fabric-asserted` otherwise |
-| `allowed_transit_points` | Only the surface's Transit Points that set `allow_fabric_callers` |
+| `allowed_transit_points` | Every Transit Point of the surface, as in the Access Point's token |
 | `user_identity_hash`, `caller_dna_uai` | Never present. `user_identity_hash` names a caller an Access Point verified; a Fabric token's principal is `fabric.principal_hash` |
 | `caller_context_fields` | The claims the surface's Transit Points allowlist (their enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`), taken from the JWT the receiving surface's own `source_auth` or resource token verified on the request. Never anything the peer's presentation or payload says |
 | `trace_id` | The trace this gateway sends on to its agent, so the agent's Transit Point calls continue it |
@@ -668,9 +774,17 @@ A Transit Point refuses the call with `401` unless the token:
 
 A `2026-07-28` MCP request must also carry exactly one token, and allows no clock difference.
 The refusal says only that the transit token is missing or invalid; which check it failed is
-logged. A `GET` of a public discovery path, such as an agent card, is forwarded without a
-transit token check, and so without any credential (see
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+logged.
+
+A discovery read is forwarded without a transit token check, and so without any credential
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+It is a `GET` or `HEAD` whose path below the Transit Point, which is the path the target
+receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
+`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
+`agent.json` or `discovery`, with at most one trailing slash. A document below another
+segment, such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\`
+or `.` and `..` segments are not discovery reads, whatever the target resolves them to, so
+they need a transit token.
 
 Transit Point policies see the caller the token carries in `input.transit.caller`, and a
 client the Transit Point verified itself apart from it, in `input.transit.client`; see
@@ -686,9 +800,16 @@ a filesystem that supports hard links; one that does not stops the first start w
 saying so. A key file that cannot be read stops the gateway from starting. Every token names
 the key in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
-accepts the tokens the Active instance issued. A portable backup carries the key, so a
+accepts the tokens the Active instance issued; instances that do not share it refuse each
+other's tokens, so every instance that serves a managed agent's Transit Point calls must share
+`vc_keys` with the one that served its inbound request. Instances sharing the directory must
+also agree on encryption at rest: when one creates the plaintext key and another the
+encrypted one at the same time, the one that finds the other's file beside its own removes its
+own and fails to start with an error saying so. The directory is synced after the key file is
+created. A portable backup carries the key only when `vc_keys` is under `_storage`, so a
 gateway restored from it accepts the tokens the original issued. To replace the key, stop
-every instance, delete the file, and start them again; every token issued before is refused.
+every instance, delete both `transit_token_key.json` and `transit_token_key.json.enc`, and
+start them again; every token issued before is refused.
 
 #### Transit token lifetime
 
@@ -766,16 +887,20 @@ to 300 seconds.
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
 except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
-`Authorization` and its `Cookie`, the caller-info and `did:webvh` identity headers
+`Authorization` and its `Cookie`, its `Forwarded`, `X-Real-IP` and every `X-Forwarded-*`
+header, the caller-info and `did:webvh` identity headers
 (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
 `x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
-like the Transit Point's `target_auth` header, and any header a Header Metadata Mapping is set to
-strip. Other headers, such as an API key header the agent sends for the target itself, pass. The credentials the gateway adds
-are described in
+like the Transit Point's `target_auth` header or like the `custom_header` of a credential
+binding that can apply on it, and any header a Header Metadata Mapping is set to strip. Other
+headers, such as an API key header the agent sends for the target itself under another name,
+pass. The gateway sets none of the forwarding headers either, so a target that trusts it as its
+proxy never takes a caller's claim about its address, host or scheme. The credentials the gateway
+adds are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
-The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`
-and `WWW-Authenticate`, so a target cannot set cookies in the agent or send it to
+The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`,
+`Set-Cookie2`, `WWW-Authenticate` and `Authentication-Info`, so a target cannot set cookies in the agent or send it to
 authenticate with the target directly. The response status is unchanged.
 
 ## Managed identity
@@ -832,7 +957,9 @@ Per-key caller identity therefore needs an API Key Provider.
 A save (`POST`, `PUT`, `PATCH`, and each enabled variant) refuses an inbound `from_api_key`
 with `400` when:
 
-- the first Caller Context method is not API Key or API Key Provider;
+- a Caller Context method is not API Key or API Key Provider: a caller verified another way
+  presents no key to identify it, and the request path refuses it with `500`. At startup a
+  stored surface breaking this rule loads with a warning;
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
 - the target is an MCP `proxy://` MCP Proxy.
 

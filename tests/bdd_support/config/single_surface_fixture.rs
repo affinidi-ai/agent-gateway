@@ -20,6 +20,8 @@ pub struct SurfaceConfigBuilder {
     pub registered_routes: Vec<String>,
     pub seed_surface: bool,
     pub source_auth: Option<SurfaceSourceAuthConfig>,
+    /// Source authentication methods after `source_auth`, in order.
+    pub additional_source_auth: Vec<SurfaceSourceAuthConfig>,
     pub alternate_variant_source_auth: Option<SurfaceSourceAuthConfig>,
     pub alternate_variant_target_timeout_secs: Option<u64>,
     pub alternate_variant_complete_mode: bool,
@@ -88,6 +90,7 @@ impl Default for SurfaceConfigBuilder {
             registered_routes: vec!["/smoke".to_string()],
             seed_surface: true,
             source_auth: None,
+            additional_source_auth: Vec::new(),
             alternate_variant_source_auth: None,
             alternate_variant_target_timeout_secs: None,
             alternate_variant_complete_mode: false,
@@ -359,6 +362,8 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// A JWT Bearer provider's signing-key secret holds a whole service account JSON key
     /// file whose `private_key_id` names the key, and the provider sets no key id itself.
     pub signing_key_is_service_account_file: bool,
+    /// The `jwt_subject` a JWT Bearer provider stores; the grant's `sub` claim.
+    pub jwt_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +383,7 @@ impl SurfaceTargetAuthProviderConfig {
             insecure_token_endpoint: false,
             authenticates_surface_target: true,
             signing_key_is_service_account_file: false,
+            jwt_subject: Some("bdd-subject@example.com".to_string()),
         }
     }
 }

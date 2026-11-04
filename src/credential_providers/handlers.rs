@@ -204,8 +204,9 @@ async fn validate_secret_references(
     Ok(())
 }
 
-/// The required fields, algorithm and audience of an `oauth2_jwt_bearer` or
-/// `oauth2_client_credentials_jwt_auth` provider; other types pass unchecked.
+/// The required fields (`jwt_subject` included for a JWT Bearer grant), algorithm and
+/// audience of an `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` provider;
+/// other types pass unchecked.
 fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
     let required = match provider.provider_type {
         CredentialProviderType::OAuth2JwtBearer => vec![
@@ -260,6 +261,9 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
         .find(|(_, value)| value.is_none_or(|value| value.trim().is_empty()))
     {
         return Err(ProviderValidationError::Missing(field));
+    }
+    if provider.lacks_jwt_subject() {
+        return Err(ProviderValidationError::Missing("jwt_subject"));
     }
     if provider.provider_type == CredentialProviderType::OAuth2ClientCredentialsJwtAuth
         && provider
@@ -1209,6 +1213,13 @@ async fn validate_key_material_request(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<Option<JwtSigningAlgorithm>, ProviderValidationError> {
     let jwt = req.jwt.clone().normalized();
+    if req
+        .provider_type
+        .as_ref()
+        .is_some_and(|provider_type| jwt.lacks_subject_for(provider_type))
+    {
+        return Err(ProviderValidationError::Missing("jwt_subject"));
+    }
     let algorithm = req
         .provider_type
         .as_ref()
@@ -1415,6 +1426,7 @@ mod jwt_provider_tests {
             "name": "Vertex", "provider_id": provider_id, "provider_type": "oauth2_jwt_bearer",
             "token_endpoint": "https://oauth2.googleapis.com/token",
             "jwt_issuer": " agent@project.iam.gserviceaccount.com ",
+            "jwt_subject": "admin@example.com",
             "jwt_signing_key_secret_ref": "SA_KEY",
             "jwt_key_id": "key-1",
             "default_scopes": ["https://www.googleapis.com/auth/cloud-platform"]
@@ -1540,6 +1552,7 @@ mod jwt_provider_tests {
             (jwt_bearer("c"), "token_endpoint"),
             (jwt_auth("d"), "client_id_secret_ref"),
             (jwt_auth("f"), "jwt_signing_key_secret_ref"),
+            (jwt_bearer("h"), "jwt_subject"),
         ] {
             body.as_object_mut()
                 .unwrap()
@@ -1553,6 +1566,115 @@ mod jwt_provider_tests {
         let (status, response) = create(&state, blank_issuer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_issuer is required for this provider type");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_jwt_bearer_provider_needs_a_subject_to_be_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut blank_subject = jwt_bearer("blank");
+        blank_subject["jwt_subject"] = json!("  ");
+        let (status, response) = create(&state, blank_subject).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        assert!(
+            state
+                .store
+                .find_by_provider_id(None, "blank")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, response) = create(&state, jwt_bearer("named")).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        assert_eq!(response["jwt_subject"], "admin@example.com");
+        let mut without_subject = jwt_auth("client-assertion");
+        without_subject
+            .as_object_mut()
+            .unwrap()
+            .remove("jwt_subject");
+        assert_eq!(
+            create(&state, without_subject)
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_jwt_bearer_provider_without_a_subject_is_refused_on_update_until_it_names_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored-vertex", "name": "Vertex", "provider_id": "stored-vertex",
+            "provider_type": "oauth2_jwt_bearer", "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_issuer": "agent@project.iam.gserviceaccount.com", "jwt_signing_key_secret_ref": "SA_KEY",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(stored.lacks_jwt_subject());
+        state
+            .store
+            .create(stored.clone())
+            .await
+            .unwrap();
+        let (status, response) = update(&state, "stored-vertex", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        let unchanged = state
+            .store
+            .find_by_provider_id(None, "stored-vertex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.name, "Vertex");
+        assert!(unchanged.lacks_jwt_subject());
+        let (status, response) =
+            update(&state, "stored-vertex", json!({"name": "Renamed", "jwt_subject": "admin@example.com"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["jwt_subject"], "admin@example.com");
+        let updated = state
+            .store
+            .find_by_provider_id(None, "stored-vertex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(
+            updated
+                .jwt
+                .jwt_subject
+                .as_deref(),
+            Some("admin@example.com")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_the_subject_of_a_jwt_bearer_provider_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, response) = create(&state, jwt_bearer("named")).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let id = response["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id = id.as_str();
+        let (status, response) = update(&state, id, json!({"jwt_subject": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        let kept = state
+            .store
+            .find_by_provider_id(None, "named")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.jwt
+                .jwt_subject
+                .as_deref(),
+            Some("admin@example.com")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2004,7 +2126,7 @@ mod jwt_provider_tests {
     fn validate_jwt_bearer(signing_key: &str) -> Value {
         json!({
             "provider_type": "oauth2_jwt_bearer", "token_endpoint": "http://192.0.2.1/token",
-            "jwt_signing_key_secret_ref": signing_key
+            "jwt_subject": "admin@example.com", "jwt_signing_key_secret_ref": signing_key
         })
     }
 
@@ -2035,6 +2157,24 @@ mod jwt_provider_tests {
                 .is_none(),
             "{response}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_a_jwt_bearer_provider_without_a_subject_before_any_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let mut body = validate_jwt_bearer("SA_KEY");
+        body.as_object_mut()
+            .unwrap()
+            .remove("jwt_subject");
+        let (status, response) = validate(&state, &http, None, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_subject is required for this provider type");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

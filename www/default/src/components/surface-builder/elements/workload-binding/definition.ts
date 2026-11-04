@@ -10,6 +10,7 @@ import {
 } from './config';
 import WorkloadBindingPanel from './WorkloadBindingPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import { readMethods } from '../caller-auth/methods';
 
 /**
  * Workload Binding — binds the managed-agent identity plus a caller-context
@@ -95,7 +96,11 @@ export const workloadBindingDefinition: NodeDefinition = {
         'caller_source=did sources the caller identity from a DID-authenticated session, so the surface must authenticate the caller with DID Auth',
       condition: c => c?.enabled === true && c?.caller_source === 'did',
       check: (_c, ctx) =>
-        ctx.allNodes.some(n => n.type === 'caller-auth' && n.config?.method_type === 'did_auth'),
+        ctx.allNodes.some(
+          n =>
+            n.type === 'caller-auth' &&
+            readMethods(n.config).some(m => m.method_type === 'did_auth')
+        ),
       severity: 'error',
       message: 'caller_source=did requires a Caller Context element using DID Auth on this surface',
     },

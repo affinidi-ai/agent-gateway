@@ -20,9 +20,11 @@ const TEXT_EXTENSIONS: &[&str] = &["log", "txt", "toml", "yaml", "yml", "md", "c
 /// Run the full export: walk storage → redact → zip → encrypt → write.
 ///
 /// `storage_root` is the path to the `_storage` directory.
+/// `excluded_paths` are the configured secret storage paths, from [`excluded_storage_paths`].
 /// `output_path` is where the encrypted ATGX file will be written.
 pub fn export_storage(
     storage_root: &Path,
+    excluded_paths: &[PathBuf],
     output_path: &Path,
 ) -> Result<()> {
     if !storage_root.is_dir() {
@@ -37,7 +39,7 @@ pub fn export_storage(
 
     // Build ZIP in memory
     let mut stats = ExportStats::default();
-    let zip_bytes = build_redacted_zip(storage_root, &mut stats)?;
+    let zip_bytes = build_redacted_zip(storage_root, excluded_paths, &mut stats)?;
 
     eprintln!(
         "  {} files included, {} files excluded, {} directories skipped",
@@ -89,6 +91,7 @@ pub fn decrypt_export(
 /// and returns the encrypted ATGX bytes directly.
 pub fn build_encrypted_export(
     storage_root: &Path,
+    excluded_paths: &[PathBuf],
     pubkey_pem: &str,
 ) -> Result<Vec<u8>> {
     if !storage_root.is_dir() {
@@ -98,7 +101,7 @@ pub fn build_encrypted_export(
     let pubkey = crypto::parse_ed25519_pubkey_pem(pubkey_pem).context("Invalid Ed25519 public key PEM")?;
 
     let mut stats = ExportStats::default();
-    let zip_bytes = build_redacted_zip(storage_root, &mut stats)?;
+    let zip_bytes = build_redacted_zip(storage_root, excluded_paths, &mut stats)?;
 
     tracing::info!(
         "Storage export: {} files included, {} excluded, {} dirs skipped, ZIP {} bytes",
@@ -120,9 +123,47 @@ struct ExportStats {
     excluded_dirs: u64,
 }
 
+/// The storage paths holding keys, secrets, credentials or personal files,
+/// resolved against `base_folder` as [`resolve_storage_root`] resolves the
+/// storage root. The export leaves them out wherever they are configured, as
+/// well as any directory named in [`redact::EXCLUDED_DIRS`].
+pub fn excluded_storage_paths(
+    paths: &crate::config::StoragePaths,
+    base_folder: &str,
+) -> Vec<PathBuf> {
+    [
+        &paths.identities,
+        &paths.secrets,
+        &paths.vc_keys,
+        &paths.passkeys,
+        &paths.apikeys,
+        &paths.certificates,
+        &paths.sessions,
+        &paths.avatars,
+        &paths.delegation_vault,
+        &paths.identity_hash_pepper,
+    ]
+    .into_iter()
+    .map(|path| {
+        if base_folder.is_empty() {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from(base_folder).join(path)
+        }
+    })
+    .collect()
+}
+
+/// `path` with symbolic links and relative components resolved, or unchanged
+/// when it does not exist.
+fn canonical_or_unchanged(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Build a ZIP archive in memory from the storage directory, applying redaction.
 fn build_redacted_zip(
     storage_root: &Path,
+    excluded_paths: &[PathBuf],
     stats: &mut ExportStats,
 ) -> Result<Vec<u8>> {
     let buf = Vec::new();
@@ -131,7 +172,11 @@ fn build_redacted_zip(
 
     let options: SimpleFileOptions = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    walk_and_add(storage_root, storage_root, &mut zip, options, stats)?;
+    let excluded_paths: Vec<PathBuf> = excluded_paths
+        .iter()
+        .map(|path| canonical_or_unchanged(path))
+        .collect();
+    walk_and_add(storage_root, storage_root, &excluded_paths, &mut zip, options, stats)?;
 
     let cursor = zip
         .finish()
@@ -143,6 +188,7 @@ fn build_redacted_zip(
 fn walk_and_add(
     base: &Path,
     dir: &Path,
+    excluded_paths: &[PathBuf],
     zip: &mut ZipWriter<Cursor<Vec<u8>>>,
     options: SimpleFileOptions,
     stats: &mut ExportStats,
@@ -162,6 +208,7 @@ fn walk_and_add(
         let relative_str = relative
             .to_string_lossy()
             .replace('\\', "/");
+        let excluded_path = excluded_paths.contains(&canonical_or_unchanged(&path));
 
         if path.is_dir() {
             let dir_name = path
@@ -172,15 +219,22 @@ fn walk_and_add(
                 })
                 .unwrap_or_default();
 
-            if redact::is_excluded_dir(&dir_name) {
+            if excluded_path || redact::is_excluded_dir(&dir_name) {
                 stats.excluded_dirs += 1;
                 continue;
             }
 
-            walk_and_add(base, &path, zip, options, stats)?;
+            walk_and_add(base, &path, excluded_paths, zip, options, stats)?;
         } else if path.is_file() {
             // Check if any ancestor directory is excluded
-            if is_under_excluded_dir(relative) {
+            if excluded_path
+                || is_under_excluded_dir(relative)
+                || redact::is_excluded_file(
+                    &entry
+                        .file_name()
+                        .to_string_lossy(),
+                )
+            {
                 stats.excluded_files += 1;
                 continue;
             }
@@ -350,7 +404,7 @@ mod tests {
         let storage_root = dir.path().join("_storage");
 
         let mut stats = ExportStats::default();
-        let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
 
         assert!(stats.excluded_dirs >= 4, "should exclude secrets, identities, avatars, sessions");
         assert!(stats.included >= 4, "should include channels, metrics, logs, gateways");
@@ -432,7 +486,7 @@ mod tests {
         fs::write(deferred.join("revocation-1.json"), r#"{"grant":{"refresh_token":"vendor-refresh-token"}}"#).unwrap();
 
         let mut stats = ExportStats::default();
-        let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
         let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
         for index in 0..archive.len() {
             let mut file = archive
@@ -455,13 +509,162 @@ mod tests {
         }
     }
 
+    fn zip_entry_names(zip_bytes: Vec<u8>) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn configured_secret_storage_paths_are_excluded_whatever_their_name() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let issuer_keys = storage_root.join("issuer_signing_keys");
+        fs::create_dir_all(&issuer_keys).unwrap();
+        fs::write(issuer_keys.join("transit_token_key.json"), r#"{"kid":"k1","key":"c2VjcmV0"}"#).unwrap();
+        fs::write(issuer_keys.join("key_0.json"), r#"{"d":"base64secret"}"#).unwrap();
+        fs::write(storage_root.join("pepper"), "0123456789abcdef").unwrap();
+        let paths = crate::config::types::StoragePaths {
+            vc_keys: "_storage/issuer_signing_keys".to_string(),
+            identity_hash_pepper: "_storage/pepper".to_string(),
+            ..Default::default()
+        };
+        let excluded = excluded_storage_paths(&paths, dir.path().to_str().unwrap());
+
+        let mut stats = ExportStats::default();
+        let names = zip_entry_names(build_redacted_zip(&storage_root, &excluded, &mut stats).unwrap());
+
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("issuer_signing_keys") || n == "pepper"),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "channels/ch1.json"),
+            "{names:?}"
+        );
+    }
+
+    /// Every place a DID private key is stored outside the excluded paths: the
+    /// `key_N.json` files of Connection Points, issuers and trust registries,
+    /// in plaintext or encrypted form, and the key fields of issuer and
+    /// mediator records.
+    #[test]
+    fn an_export_carries_no_private_key_or_refresh_token() {
+        const PRIVATE: &str = "private-d-material";
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let secret = format!(
+            r#"{{"id":"did:web:x#key-1","type":"JsonWebKey2020","privateKeyJwk":{{"kty":"OKP","crv":"Ed25519","x":"pub","d":"{PRIVATE}"}}}}"#
+        );
+        for store in ["connection_points", "issuers", "trust_registries"] {
+            let keys = storage_root
+                .join(store)
+                .join("id-1");
+            fs::create_dir_all(&keys).unwrap();
+            fs::write(keys.join("key_0.json"), &secret).unwrap();
+            fs::write(keys.join("key_1.json.enc"), format!("ENC[{PRIVATE}]")).unwrap();
+            fs::write(keys.join("did.json"), r#"{"id":"did:web:x"}"#).unwrap();
+        }
+        fs::write(
+            storage_root
+                .join("issuers")
+                .join("id-1.json"),
+            format!(
+                r#"{{"id":"id-1","secrets":[{secret}],"key_pair":{{"public_key":{{"x":"pub"}},"private_key":{{"d":"{PRIVATE}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let mediators = storage_root.join("mediators");
+        fs::create_dir_all(&mediators).unwrap();
+        fs::write(mediators.join("m-1.json"), format!(r#"{{"id":"m-1","our_secrets":[{secret}]}}"#)).unwrap();
+        fs::write(mediators.join("tokens.json"), format!(r#"{{"refresh_token":"{PRIVATE}"}}"#)).unwrap();
+
+        let mut stats = ExportStats::default();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            let mut file = archive
+                .by_index(index)
+                .unwrap();
+            let name = file
+                .name()
+                .unwrap()
+                .into_owned();
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut file, &mut content).unwrap();
+            assert!(!content.contains(PRIVATE), "{name} carries private material: {content}");
+            names.push(name);
+        }
+
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("/key_")),
+            "{names:?}"
+        );
+        for kept in [
+            "connection_points/id-1/did.json",
+            "issuers/id-1/did.json",
+            "trust_registries/id-1/did.json",
+            "issuers/id-1.json",
+            "mediators/m-1.json",
+        ] {
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == kept),
+                "{kept} missing from {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transit_token_key_file_is_excluded_by_name() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let elsewhere = storage_root.join("misc");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("transit_token_key.json"), r#"{"kid":"k1","key":"c2VjcmV0"}"#).unwrap();
+        fs::write(elsewhere.join("transit_token_key.json.enc"), "ENC[...]").unwrap();
+        fs::write(elsewhere.join("notes.json"), r#"{"name":"kept"}"#).unwrap();
+
+        let mut stats = ExportStats::default();
+        let names = zip_entry_names(build_redacted_zip(&storage_root, &[], &mut stats).unwrap());
+
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("transit_token_key")),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "misc/notes.json"),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn test_build_redacted_zip_redacts_json() {
         let dir = create_test_storage();
         let storage_root = dir.path().join("_storage");
 
         let mut stats = ExportStats::default();
-        let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
 
         let cursor = Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).unwrap();
@@ -503,7 +706,7 @@ mod tests {
         let storage_root = dir.path().join("_storage");
 
         let mut stats = ExportStats::default();
-        let zip_bytes = build_redacted_zip(&storage_root, &mut stats).unwrap();
+        let zip_bytes = build_redacted_zip(&storage_root, &[], &mut stats).unwrap();
 
         let cursor = Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).unwrap();

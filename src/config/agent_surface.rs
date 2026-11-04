@@ -1839,17 +1839,12 @@ pub struct TransitPoint {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fabric_delegated_credentials: bool,
 
-    /// Lets the managed agent call this Transit Point while it serves a
-    /// request a paired gateway sent over Fabric: the transit token issued for
-    /// that request opens only the Transit Points that set it. Off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_fabric_callers: bool,
     /// Releases delegated per-user credentials for a call whose transit token
     /// this gateway issued for a request a paired gateway sent over Fabric,
     /// keyed by the caller the receiving surface's own `source_auth` or
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
-    /// may set it, and it has an effect only beside `allow_fabric_callers`.
+    /// may set it.
     /// The admin API refuses it on a surface whose caller authentication
     /// cannot tell a partner's users apart
     /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
@@ -2236,6 +2231,11 @@ fn default_true() -> bool {
 }
 
 // ─── Conversion from Legacy ChannelMapping ──────────────────────────────────
+
+/// Why [`AgentSurface::validate_protected_resource`] refuses a JWT Bearer
+/// method other than the first beside protected resource metadata.
+pub const LATER_JWT_BEARER_BESIDE_DISCOVERY: &str = "allows JWT Bearer only as the first caller authentication \
+                                                     method: the discovery audience and challenge belong to that method";
 
 impl AgentSurface {
     /// Compute the base URL for this surface given the gateway's external host.
@@ -3714,6 +3714,19 @@ impl AgentSurface {
     /// enforced caller authentication method reads JWT Bearer tokens from the
     /// `Authorization` header, where RFC 9728 clients send them, and keeps
     /// them from the Target: MCP forbids passing a client's token through.
+    /// Whether the Access Point publishes protected resource metadata and has a
+    /// JWT Bearer method other than the first, which
+    /// [`Self::validate_protected_resource`] refuses.
+    pub fn has_later_jwt_bearer_beside_discovery(&self) -> bool {
+        self.protected_resource()
+            .is_some()
+            && self
+                .source_auth_methods()
+                .iter()
+                .skip(1)
+                .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
+    }
+
     pub fn validate_protected_resource(&self) -> Result<(), String> {
         let Some(protected) = self.protected_resource() else {
             return Ok(());
@@ -3722,7 +3735,13 @@ impl AgentSurface {
             return Err("requires an MCP Access Point".into());
         }
         protected.validate()?;
-        match self.source_auth() {
+        if self.has_later_jwt_bearer_beside_discovery() {
+            return Err(LATER_JWT_BEARER_BESIDE_DISCOVERY.into());
+        }
+        match self
+            .source_auth_methods()
+            .first()
+        {
             Some(SourceAuthConfig::JwtBearer(jwt))
                 if jwt
                     .token_header
@@ -3857,7 +3876,7 @@ impl AgentSurface {
     }
 
     fn authenticates_callers(&self) -> bool {
-        self.source_auth().is_some()
+        self.has_source_auth()
             || self
                 .mcp_http
                 .as_ref()
@@ -3912,7 +3931,7 @@ impl AgentSurface {
                 return Err("mcp_http requires an MCP Access Point".to_string());
             }
             config.validate()?;
-            if config.authorization.is_some() && self.source_auth().is_some() {
+            if config.authorization.is_some() && self.has_source_auth() {
                 return Err("MCP resource authorization cannot be combined with legacy source_auth".into());
             }
         }
@@ -6254,7 +6273,6 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
-                        allow_fabric_callers: false,
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
@@ -6287,7 +6305,6 @@ mod tests {
                         allow_unauthenticated_callers: false,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                         fabric_delegated_credentials: false,
-                        allow_fabric_callers: false,
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,

@@ -30,6 +30,20 @@ pub use protocol_router::*;
 pub use rules_engine::*;
 pub use surface_manager::SurfaceTaskManager;
 
+/// Whether reading a request body failed because it passed the length limit
+/// it was read with.
+pub(crate) fn exceeds_length_limit(error: &axum::Error) -> bool {
+    std::error::Error::source(error).is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+}
+
+/// The gateway's 413 for a request body over `max_bytes`, as an A2A problem.
+pub(crate) fn body_too_large_response(max_bytes: usize) -> axum::response::Response {
+    crate::a2a::create_error_response(
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        &format!("Request body too large (max: {max_bytes})"),
+    )
+}
+
 // ── Shared identity engine compilation ──────────────────────────────────────
 
 /// Compiled identity engines (rules engine + selector) for a channel or variant.

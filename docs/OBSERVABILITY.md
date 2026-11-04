@@ -141,9 +141,12 @@ counter incremented once for each A2A or AP2 request that reaches
 [version negotiation](PROTOCOLS.md#version-negotiation), whether its `A2A-Version` negotiates or is
 refused. A request answered before that step is not counted: for example agent-card discovery, and
 refusals by source authentication, rate limiting, gateway or appliance-wide policy, or the AP2 gate.
-A request later refused by delegated payment, the egress guard or the request-body size limit
-(HTTP `413`) is counted. A request to a `fabric://` target is negotiated and counted on the sending
-gateway; the receiving gateway does not count it again.
+A request body over `[a2a] max_body_size` is refused with HTTP `413` as it is read, before version
+negotiation, and is not counted. A request later refused by delegated payment or the egress guard
+is counted, and so is one whose body grows past the size limit only once the gateway changes it
+(an AP2 transformation or injected metadata) and is then refused with `413`. A request to a
+`fabric://` target is negotiated and counted on the sending gateway; the receiving gateway does not
+count it again.
 
 | Label | Value |
 | --- | --- |
@@ -157,6 +160,32 @@ stopped accepting `0.3`. Callers a surface refuses appear as `negotiated_version
 with `method_era` showing which method names they send. Requests later refused by JSON-RPC or
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
+
+## Credential provider token request metric
+
+`agent_gateway_credential_provider_token_requests_total{provider_type,outcome}` is a Prometheus
+counter incremented once for each service token request the gateway sends to a credential
+provider's token endpoint: a client credentials, JWT Bearer or Client Credentials JWT grant for
+[target authentication](CREDENTIAL_DELEGATION.md) or for a delegated credential binding. A cached token served without a request, a
+request held back by the retry backoff, and a request refused before it is sent (a missing
+secret, an endpoint the egress policy or the https rule refuses, or whose host does not resolve in time) are not counted. Refreshes and
+code exchanges of delegated user tokens are not counted either.
+
+| Label | Value |
+| --- | --- |
+| `provider_type` | `oauth2_client_credentials`, `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` |
+| `outcome` | `success`; `refused` (the endpoint answered with a non-2xx status, or the connection failed before any answer; a connection that times out is `timeout`); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (an answer over 64 KiB, or a 2xx answer that is not valid JSON, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
+
+No label carries a URL, provider id, secret or tenant.
+
+## Transit Point call outcomes
+
+A Transit Point call that reaches the forward step is recorded in the dashboard's traffic as
+successful only when the target answers with a 2xx and, on a streamed MCP response, the stream
+completes. It is recorded as failed when the target answers with another status, the stream
+fails, the target cannot be reached or does not answer in time, or the gateway cannot read or
+process its response, as when a `2026-07-28` MCP response is not valid MCP. A streamed response that the managed agent stops reading before
+it ends is not recorded.
 
 ## Logging initialization
 
@@ -320,7 +349,7 @@ fault, rejected request or Trust Recorder write, so it leaves the dashboard metr
 At startup and on every configuration reload (including the reload that follows a surface
 change) the gateway logs one `WARN` line per credential provider or surface whose stored
 configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
-find what to fix before the rules are enforced. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
+find what to fix before the rules are enforced. The `jwt_subject` rule, which names a stored JWT Bearer provider without a subject, is report-only: it always warns and has no setting. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
 (for example a variant that cannot be resolved) is not checked: it logs one `WARN` line naming
 its `id`, `tenant` and the `error`, and the `INFO` line then says the rest are clean and how many
 surfaces could not be inspected.
@@ -332,7 +361,7 @@ endpoint URL.
 | `subject` | `credential_provider` or `surface` |
 | `id` | The provider's `id` or the surface's `surface_id` |
 | `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
-| `rule` | `token_endpoint_https` or `tenant_credential_isolation` |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
@@ -342,6 +371,10 @@ secret outside its own tenant: a tenant provider holding an appliance-wide or an
 appliance-wide provider holding a tenant's secret. A surface breaks `tenant_credential_isolation` when it
 belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
 or provider that no longer exists is not reported.
+
+An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
+signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
+for this rule.
 
 ## Governance audit forwarding
 
@@ -420,7 +453,12 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
     resolves its surface and variant when it opens, so one to a surface or variant that is not
     available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
-  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+  - `admission`: `body_too_large` (an Access Point or Transit Point request body over its limit,
+    MCP or not; the shared-host `/outbound` hop's own refusals, of a declared `Content-Length`
+    over `[a2a] max_body_size` and of a body above it for an MCP Transit Point with a larger
+    limit, are logged with the caller's address and not recorded, and a DID Auth challenge or
+    authenticate body over its 64 KiB limit is refused before any record is built),
+    `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
     `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol

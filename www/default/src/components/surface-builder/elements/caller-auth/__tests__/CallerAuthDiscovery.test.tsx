@@ -17,15 +17,23 @@ const SETTING = {
   scopes: ['tools'],
 };
 
-const jwtConfig = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
-  method_type: 'jwt_bearer',
-  jwt_strategy_id: 'idp',
-  audiences: [],
-  jwt_token_header: 'Authorization',
-  jwt_token_scheme: 'Bearer',
-  jwt_forward_header: false,
-  ...extra,
-});
+const jwtConfig = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
+  const { protected_resource, ...fields } = extra;
+  return {
+    methods: [
+      {
+        method_type: 'jwt_bearer',
+        jwt_strategy_id: 'idp',
+        audiences: [],
+        jwt_token_header: 'Authorization',
+        jwt_token_scheme: 'Bearer',
+        jwt_forward_header: false,
+        ...fields,
+      },
+    ],
+    ...(protected_resource !== undefined ? { protected_resource } : {}),
+  };
+};
 
 const accessPoint: CanvasNode = {
   id: 'access-point',
@@ -84,6 +92,9 @@ const Harness: React.FC<HarnessProps> = ({
   );
 };
 
+const firstMethod = (latest: HarnessProps['latest']) =>
+  (latest.config?.methods as Record<string, unknown>[] | undefined)?.[0];
+
 async function openEditor(props: Omit<HarnessProps, 'latest'>) {
   const latest: HarnessProps['latest'] = {};
   render(<Harness {...props} latest={latest} />);
@@ -137,6 +148,8 @@ describe('Caller Context editor: authorization server discovery', () => {
 
     expect(latest.config).toMatchObject({
       protected_resource: { resource: RESOURCE, authorization_servers: [], scopes: [] },
+    });
+    expect(firstMethod(latest)).toMatchObject({
       audiences: [],
       jwt_forward_header: false,
       jwt_token_header: 'Authorization',
@@ -222,7 +235,8 @@ describe('Caller Context editor: authorization server discovery', () => {
     fireEvent.change(screen.getByLabelText('Authentication Method'), {
       target: { value: 'did_auth' },
     });
-    expect(latest.config).toMatchObject({ method_type: 'did_auth', protected_resource: null });
+    expect(latest.config).toMatchObject({ protected_resource: null });
+    expect(firstMethod(latest)).toMatchObject({ method_type: 'did_auth' });
   });
 
   it('shows the resource the active variant advertises', async () => {
@@ -322,16 +336,11 @@ describe('Caller Context sidebar: authorization server discovery', () => {
     expect(screen.getByTestId('caller-auth-panel-discovery-save-error')).toHaveTextContent(refused);
   });
 
-  it('reports discovery off, and drops it when the method leaves JWT Bearer', async () => {
-    const latest = await openEditor({ initial: jwtConfig(), Panel: CallerAuthPanel });
+  it('reports discovery off beside the JWT Bearer method row', async () => {
+    await openEditor({ initial: jwtConfig(), Panel: CallerAuthPanel });
     expect(screen.getByTestId('caller-auth-panel-discovery-status')).toHaveTextContent(
       'Authorization server discovery: off'
     );
-
-    fireEvent.change(screen.getByLabelText('Authentication Method'), {
-      target: { value: 'api_key' },
-    });
-    expect(latest.config).toMatchObject({ method_type: 'api_key', protected_resource: null });
-    expect(screen.queryByTestId('caller-auth-panel-discovery-status')).toBeNull();
+    expect(screen.getByTestId('caller-auth-panel-method-0')).toHaveTextContent('JWT');
   });
 });

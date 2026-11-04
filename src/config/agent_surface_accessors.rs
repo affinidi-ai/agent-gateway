@@ -74,15 +74,125 @@ impl AgentSurface {
 
     // ── Target shorthands ───────────────────────────────────────────────────
 
-    /// First caller-authentication method on the access point. Mirrors the
-    /// legacy `ChannelMapping::source_auth` field, which carried only the
-    /// first configured method.
+    /// Caller-authentication methods on the access point, in configured order.
     #[inline]
-    pub fn source_auth(&self) -> Option<&crate::source_auth::SourceAuthConfig> {
+    pub fn source_auth_methods(&self) -> &[crate::source_auth::SourceAuthConfig] {
         self.access_point
             .caller_authentication
             .as_ref()
-            .and_then(|ca| ca.methods.first())
+            .map_or(&[], |ca| ca.methods.as_slice())
+    }
+
+    /// Whether any caller-authentication method forwards the caller's own
+    /// credential to the Target (`jwt_bearer` with `forward_header`).
+    pub fn forwards_caller_credential(&self) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .any(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
+    /// Whether every caller-authentication method forwards the caller's own
+    /// credential to the Target: a request is forwarded with the credential of
+    /// the method it matched, so a method that forwards none leaves its callers
+    /// without one.
+    pub fn forwards_every_caller_credential(&self) -> bool {
+        let methods = self.source_auth_methods();
+        !methods.is_empty()
+            && methods.iter().all(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
+    #[inline]
+    pub fn has_source_auth(&self) -> bool {
+        !self
+            .source_auth_methods()
+            .is_empty()
+    }
+
+    /// The caller-authentication method chosen for this request; see
+    /// [`crate::source_auth::models::select_source_auth_method`].
+    pub fn source_auth_for_request(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer_cert: Option<&crate::source_auth::models::PeerCertInfo>,
+    ) -> Option<crate::source_auth::models::SourceAuthSelection<'_>> {
+        crate::source_auth::models::select_source_auth_method(self.source_auth_methods(), headers, peer_cert.is_some())
+    }
+
+    /// The DID Auth method, which serves the `/authenticate` endpoints.
+    pub fn did_auth_config(&self) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+        self.source_auth_methods()
+            .iter()
+            .find_map(|method| match method {
+                crate::source_auth::SourceAuthConfig::DidAuth(config) => Some(config),
+                _ => None,
+            })
+    }
+
+    /// Every header a caller-authentication method reads. The gateway consumes
+    /// these credentials, so none of them is forwarded.
+    pub fn source_credential_headers(&self) -> Vec<&str> {
+        self.source_auth_methods()
+            .iter()
+            .filter_map(|method| method.credential_header_name())
+            .collect()
+    }
+
+    /// Whether `name` is a header a caller-authentication method reads.
+    pub fn is_source_credential_header(
+        &self,
+        name: &str,
+    ) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .filter_map(|method| method.credential_header_name())
+            .any(|header| name.eq_ignore_ascii_case(header))
+    }
+
+    /// The DID Auth configurations that mint sessions: the Access Point's DID
+    /// Auth caller-authentication method, of which there is at most one, on the
+    /// surface and in each variant whose overrides set the Access Point's caller
+    /// authentication, with that variant. That method serves `/authenticate`,
+    /// and a Transit Point mints no session.
+    pub fn session_did_auth_configs(
+        &self
+    ) -> Vec<(Option<&super::agent_surface_variants::SurfaceVariant>, &crate::source_auth::models::DidAuthAuthConfig)>
+    {
+        fn did_auth(
+            authentication: &super::agent_surface::CallerAuthentication
+        ) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+            authentication
+                .methods
+                .iter()
+                .find_map(|method| match method {
+                    crate::source_auth::SourceAuthConfig::DidAuth(config) => Some(config),
+                    _ => None,
+                })
+        }
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .and_then(did_auth)
+            .map(|config| (None, config))
+            .into_iter()
+            .chain(
+                self.variants
+                    .iter()
+                    .filter_map(move |variant| {
+                        variant
+                            .overrides
+                            .access_point
+                            .as_ref()?
+                            .caller_authentication
+                            .as_ref()
+                            .and_then(did_auth)
+                            .map(|config| (Some(variant), config))
+                    }),
+            )
+            .collect()
     }
 
     /// Whether any of the Access Point's caller-authentication methods
@@ -939,6 +1049,21 @@ impl AgentSurface {
                 errors.push(format!("{prefix}{error}"));
             }
         }
+        for variant in &self.variants {
+            if variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.shared.as_ref())
+                .is_some_and(|shared| shared.source_auth.is_some())
+            {
+                errors.push(format!(
+                    "variant '{}': {}",
+                    variant.alias,
+                    crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED
+                ));
+            }
+        }
 
         errors
     }
@@ -1097,6 +1222,48 @@ mod tests {
                 "transit": transit(&["fabric://gw-variant-transit/s", "fabric:///nothing"]),
             })));
         assert_eq!(s.fabric_gateway_ids(), vec!["gw-target", "gw-variant", "gw-transit", "gw-variant-transit"]);
+    }
+
+    fn surface_with_methods(methods: serde_json::Value) -> AgentSurface {
+        let mut surface = surface(SurfaceProtocol::A2a);
+        surface
+            .access_point
+            .caller_authentication =
+            Some(serde_json::from_value(serde_json::json!({ "methods": methods })).expect("caller authentication"));
+        surface
+    }
+
+    #[test]
+    fn did_auth_config_is_found_at_any_position() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session-Token"}}
+        ]));
+        assert!(
+            surface
+                .did_auth_config()
+                .is_some()
+        );
+        assert!(
+            surface_with_methods(serde_json::json!([]))
+                .did_auth_config()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_method_header_is_a_source_credential_header() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"},
+            {"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}
+        ]));
+        assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
+        assert!(surface.is_source_credential_header("authorization"));
+        assert!(surface.is_source_credential_header("x-api-key"));
+        assert!(!surface.is_source_credential_header("x-trace"));
+        assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
+        assert!(surface.has_source_auth());
     }
 
     fn surface(protocol: SurfaceProtocol) -> AgentSurface {
@@ -1373,5 +1540,32 @@ mod tests {
         );
         assert!(!s.has_agent_keyed_outbound_credentials());
         assert_eq!(providers(s.outbound_credentials()), vec!["vendor"], "the display keeps every binding");
+    }
+
+    #[test]
+    fn validate_outbound_warns_about_transit_source_auth_set_by_a_variant() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surf-1", "name": "test", "status": "active",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/test", "protocol": "a2a" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "outbound_listen_address": "http://localhost:9001",
+                "points": [{ "alias": "partner", "target_endpoint": "http://localhost:9002" }] },
+            "variants": [
+                { "id": "v1", "alias": "staging", "name": "Staging", "enabled": true,
+                    "overrides": { "transit": { "shared": { "source_auth": {
+                        "type": "api_key",
+                        "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    } } } } },
+                { "id": "v2", "alias": "plain", "name": "Plain", "enabled": true,
+                    "overrides": { "transit": { "shared": { "sign_requests": true } } } }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            surface.validate_outbound(),
+            vec![format!("variant 'staging': {}", crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED)]
+        );
     }
 }

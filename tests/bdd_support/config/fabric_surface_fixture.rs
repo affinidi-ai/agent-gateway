@@ -47,9 +47,6 @@ pub struct TransitPointSpec {
     /// The Transit Point requires the transit token its gateway gave the managed
     /// agent; otherwise it is open to any caller.
     pub require_transit_token: bool,
-    /// The managed agent may call it while serving a request a paired gateway
-    /// sent over Fabric (`allow_fabric_callers`).
-    pub allow_fabric_callers: bool,
 }
 
 impl TransitPointSpec {
@@ -65,7 +62,6 @@ impl TransitPointSpec {
             header_metadata_mapping: Default::default(),
             managed_identity_fields: None,
             require_transit_token: false,
-            allow_fabric_callers: false,
         }
     }
 }
