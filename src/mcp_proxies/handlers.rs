@@ -2131,10 +2131,12 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut forwarded = ReqwestHeaderMap::new();
     for (key, value) in headers.iter() {
         let name = key.as_str().to_lowercase();
-        // Skip hop-by-hop, content-length, host, and accept headers
+        // Skip hop-by-hop, content-length, host and accept headers, and the
+        // caller's cookies, which belong to the host it called (the dashboard's).
         if matches!(
             name.as_str(),
-            "connection"
+            "cookie"
+                | "connection"
                 | "keep-alive"
                 | "proxy-authenticate"
                 | "proxy-authorization"
@@ -3831,6 +3833,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_rest_backend_never_receives_the_callers_cookies() {
+        let mut caller = axum::http::HeaderMap::new();
+        caller.insert("cookie", axum::http::HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
+        caller.insert("x-api-key", axum::http::HeaderValue::from_static("backend-key"));
+        caller.insert("authorization", axum::http::HeaderValue::from_static("Bearer backend-token"));
+
+        let forwarded = super::extract_forwardable_headers(&caller);
+
+        assert!(!forwarded.contains_key("cookie"));
+        assert_eq!(forwarded["x-api-key"], "backend-key");
+        assert_eq!(forwarded["authorization"], "Bearer backend-token");
+    }
+
     #[tokio::test]
     async fn owned_modern_dispatch_surface_uses_target_headers_and_surface_limits() {
         use serde_json::json;
@@ -3886,6 +3902,7 @@ mod tests {
             client
                 .post(format!("proxy://{}", proxy.id))
                 .header("authorization", "Bearer target-test-credential")
+                .header("cookie", "__Host-session_token=dashboard-session")
                 .header("mcp-session-id", "never-forward")
                 .header("last-event-id", "never-forward")
                 .header("mcp-param-unknown", "never-send-to-rest")
@@ -3911,7 +3928,7 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer target-test-credential")
         );
-        for name in ["mcp-session-id", "last-event-id", "mcp-param-unknown"] {
+        for name in ["cookie", "mcp-session-id", "last-event-id", "mcp-param-unknown"] {
             assert!(
                 !received
                     .headers

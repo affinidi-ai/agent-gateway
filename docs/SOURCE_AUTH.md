@@ -132,7 +132,9 @@ forwards its header only when it was the method selected for that request, so a 
 carrying several credentials forwards none.
 
 An Access Point never forwards its caller's `Cookie` to the managed agent, directly or over
-Fabric, and a gateway receiving a Fabric request drops a `Cookie` its peer sent. The cookies
+Fabric, a gateway receiving a Fabric request drops a `Cookie` its peer sent, and an MCP Proxy
+never forwards its caller's `Cookie` to its REST API; a REST API that takes a cookie gets it
+from a tool argument its OpenAPI specification declares. The cookies
 belong to the host the caller called, which serves the dashboard too, so its session cookie
 would otherwise reach the agent. For the same reason an Access Point's answer carries no
 `Set-Cookie` the agent sent, so the agent cannot set a cookie on the dashboard's host.

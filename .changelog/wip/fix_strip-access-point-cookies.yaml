@@ -13,6 +13,14 @@ changes:
         sent. Its answers no longer carry a Set-Cookie the agent sent. Access Points share their
         host with the dashboard, so the dashboard session cookie reached the agent, and the agent
         could set cookies on the dashboard's host.
+    - timestamp: '2026-11-04T15:30:00Z'
+      title: Keep the caller's cookies away from an MCP Proxy's REST API
+      description: >-
+        An MCP Proxy no longer forwards its caller's Cookie header to the REST API it calls.
+        MCP Proxy routes share their host with the dashboard, so the dashboard session cookie
+        reached the REST API, and a tool that takes a cookie argument failed whenever the caller
+        also sent a Cookie. A REST API that needs a cookie still gets it from the tool argument
+        its OpenAPI specification declares.
     - timestamp: '2026-11-04T11:15:42Z'
       title: Harden the dashboard session cookie with Secure and the __Host- prefix
       description: >-
