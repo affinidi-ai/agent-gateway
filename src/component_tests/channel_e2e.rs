@@ -342,8 +342,9 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
 }
 
 /// With `forward_header`, the caller's token reaches the target only when it
-/// verified; an expired token, or one from another issuer, is still forwarded
-/// with no policy denying it, but without the token.
+/// verified; an expired token, one from another issuer, or a second token
+/// beside a valid one is still forwarded with no policy denying it, but
+/// without any token.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_header_passes_on_only_a_verified_token() {
     let fixture = JwksFixture::start().await;
@@ -367,15 +368,20 @@ async fn forward_header_passes_on_only_a_verified_token() {
         sign_jwt(json!({"iss": issuer, "sub": "user-e2e", "aud": "any", "exp": exp, "iat": now_secs()}), &fixture.kid)
     };
 
-    for (case, token, forwarded) in [
-        ("valid", sign(&fixture.issuer, now_secs() + 300), true),
-        ("expired", sign(&fixture.issuer, now_secs() - 3600), false),
-        ("another issuer", sign("https://other-issuer.example", now_secs() + 300), false),
+    let valid = sign(&fixture.issuer, now_secs() + 300);
+    let expired = sign(&fixture.issuer, now_secs() - 3600);
+    for (case, tokens, forwarded) in [
+        ("valid", vec![valid.clone()], true),
+        ("expired", vec![expired.clone()], false),
+        ("another issuer", vec![sign("https://other-issuer.example", now_secs() + 300)], false),
+        ("valid then expired", vec![valid, expired], false),
     ] {
-        let resp = client
-            .post(&h.gateway_url)
+        let resp = tokens
+            .iter()
+            .fold(client.post(&h.gateway_url), |request, token| {
+                request.header("authorization", format!("Bearer {token}"))
+            })
             .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
             .body(body)
             .send()
             .await
@@ -395,7 +401,7 @@ async fn forward_header_passes_on_only_a_verified_token() {
                 .get("authorization")
                 .map(String::as_str),
             forwarded
-                .then(|| format!("Bearer {token}"))
+                .then(|| format!("Bearer {}", tokens[0]))
                 .as_deref(),
             "{case}"
         );

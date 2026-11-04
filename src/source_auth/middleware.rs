@@ -222,9 +222,17 @@ impl SourceAuthMiddleware {
         channel_name: &str,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         // 1. Extract bearer token from the configured header / scheme
-        let header_value = headers
-            .get(config.token_header.as_str())
+        let mut header_values = headers
+            .get_all(config.token_header.as_str())
+            .iter();
+        let header_value = header_values
+            .next()
             .and_then(|v| v.to_str().ok());
+        if header_values.next().is_some() {
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "More than one bearer token".to_string(),
+            });
+        }
         let token = crate::jwt_bearer::validator::extract_bearer_with_scheme(header_value, &config.token_scheme)
             .map_err(SourceAuthError::from)?;
 

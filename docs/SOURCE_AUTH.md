@@ -137,7 +137,8 @@ ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's 
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
 each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
 list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called.
+metadata, where `aud` must name the resource of the route called. A request that carries the
+method's token header more than once fails, whatever the values.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
