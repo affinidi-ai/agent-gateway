@@ -45,8 +45,10 @@ Point, identifies callers by the same claim.
   issuer, `https://login.microsoftonline.com/{tenant-id}/v2.0`, and have the agent's API issue
   v2 access tokens (`requestedAccessTokenVersion: 2` in its app registration manifest). A v1
   access token carries `https://sts.windows.net/{tenant-id}/` instead, so the same `oid` would
-  be another caller, and the strategy refuses the token. A claim a person can edit, such as an
-  email address they control, lets them take another person's name.
+  be another caller, and the strategy refuses the token. The issuer names one Entra tenant, and
+  a user's `oid` differs in each tenant too, so an agent API that serves several tenants needs
+  one strategy per tenant, each its own method. A claim a person can edit, such as an email
+  address they control, lets them take another person's name.
 - The value must be a non-empty string. A token without the claim, or with a value that is
   empty or not a string, is valid but names no caller: an Access Point answers `403`
   `identity-required` to a request that needs one, and no delegated credential is given. A
@@ -69,10 +71,14 @@ Point, identifies callers by the same claim.
   redemption refuse that issuer's tokens with `invalid_grant`, since the subject would depend on
   which strategy verified them, so the MCP OAuth path and its consents stop for that issuer
   too.
-- A release older than `principal_claim` loads a strategy that sets it without the field, and
-  drops it the next time it saves the strategy. The strategy then names callers by `sub`, and
-  every caller's identity hash changes. Downgrade only with strategies that leave the claim
-  unset, or restore the field before callers return.
+- A release older than `principal_claim` ignores the field from the moment it loads the
+  strategy: while it runs, the strategy names callers by `sub`, so every caller has another
+  identity hash and the grants stored under the claim's hashes are not found. It also removes
+  the field from storage the next time it saves the strategy. The API cannot restore it, since
+  an update naming the claim is refused as a change: after upgrading again, edit
+  `principal_claim` back into the strategy's record under `_storage/jwt_verification_strategies/`
+  and restart the gateway (or see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md) for when
+  a reload picks the edit up). Downgrade only with strategies that leave the claim unset.
 - Two strategies for the same issuer that name different claims never share a caller: the
   claim's name is part of the hash, so the same person through each is a different caller, with
   credentials of their own, and one person's value in one claim never stands for another

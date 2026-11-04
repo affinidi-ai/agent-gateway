@@ -1197,7 +1197,10 @@ of a connect and of a grant removal, and reads it from a grant report. It comput
 itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
 computed outside the gateway: take the token's `iss`, the surface's `tenant_id` (or `null`),
 and the value of the strategy's `principal_claim` (`sub` by default), followed by the claim's
-name when it is not `sub`.
+name when it is not `sub`. The ID token must carry that claim with the same value, and the same
+`iss`, as the tokens the agent's callers present. Microsoft Entra puts `oid` in an ID token only
+when the sign-in requests the `profile` scope, and its `iss` is the v2 issuer only from the v2.0
+endpoint, which must match the strategy's `expected_issuer`.
 
 The form is a compatibility surface. It is not changed without a documented migration, since
 a changed form orphans every stored grant. No pepper is part of it, and the

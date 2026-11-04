@@ -642,9 +642,11 @@ default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCI
 JWT the value of its verification strategy's `principal_claim`, `sub` by default; the API key
 name, DID, mTLS principal, or on a Transit Point the caller the transit token carries), and all
 four are empty when the request had no caller context (no source auth, or a
-Transit Point whose token carries no caller). For a JWT caller whose strategy names a claim
-other than `sub`, the `caller` context keeps the token's own `sub` in `sub`, so it matches the
-identity provider's logs, and adds the claim's value as `principal`. The policy variables describe the policy that made
+Transit Point whose token carries no caller). For a JWT caller that the Access Point's own
+source authentication verified through a strategy naming a claim other than `sub`, the `caller`
+context keeps the token's own `sub` in `sub`, so it matches the identity provider's logs, and
+adds the claim's value as `principal`. A Transit Point record takes its caller from the transit
+token, which carries no `principal`. The policy variables describe the policy that made
 a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
 for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
 policy") and are empty for other records; see

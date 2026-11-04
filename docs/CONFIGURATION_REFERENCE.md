@@ -469,7 +469,7 @@ issuer and the keys, one field decides who a caller is:
 
 | Field | Values | Behaviour |
 | --- | --- | --- |
-| `principal_claim` | A top-level claim name, case-sensitive, printable ASCII without spaces, up to 128 characters | The claim whose value names a JWT caller, in the identity hash, STS subjects and consent. Absent means `sub`, and naming `sub` is stored as absent. Fixed when the strategy is created: an update naming another claim gets `400`. A claim that names a token, client, tenant, session or lifetime, such as `iss`, `aud` or `tid`, is refused, and a record edited by hand to name one names no caller. A release older than the field drops it on its next save. |
+| `principal_claim` | A top-level claim name, case-sensitive, printable ASCII without spaces, up to 128 characters | The claim whose value names a JWT caller, in the identity hash, STS subjects and consent. Absent means `sub`, and naming `sub` is stored as absent. Fixed when the strategy is created: an update naming another claim gets `400`. A claim that names a token, client, tenant, session or lifetime, such as `iss`, `aud` or `tid`, is refused, and a record edited by hand to name one names no caller. A release older than the field names callers by `sub` while it runs and removes the field when it saves the strategy; restore it by editing the record. |
 
 See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller).
 
