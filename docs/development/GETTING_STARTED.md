@@ -177,6 +177,7 @@ Cleanup targets delete local data. Review the command before running it if the e
 | The dashboard does not open | Open the WebAuthn `external_origin` from `envs/local/config/gateway.json`. Do not assume the default port for a named instance or public URL override. |
 | Passkey registration does not prompt | Use a WebAuthn-capable browser and ensure Touch ID or another platform/security-key authenticator is available. |
 | Registration fails with `403` and "A valid setup token is required to register the first administrator" | No user exists yet. Enter the token from `envs/local/_storage/passkeys/setup-token`, exactly as it is in the file. |
+| Registration fails with `429` | The passkey registration limit allows 5 requests per 15 minutes per client IP on each registration step. Wait for the time in `Retry-After`, or raise `registration_throttle.per_ip.requests` in `envs/local/config/gateway.json` and restart. |
 | `/api/v1/health` returns `503` | The instance is not ready. Wait for startup to finish and inspect the server log. A Standby instance intentionally remains unready. |
 | `curl` reports a certificate error | Use `curl -k` for the generated local development certificate. Do not use insecure certificate handling for production endpoints. |
 | Startup reports an occupied port | Stop the process using that port or use a named instance as described in [`DEVELOPMENT.md`](DEVELOPMENT.md#named-instances). |

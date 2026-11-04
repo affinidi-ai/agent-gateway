@@ -100,6 +100,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
 
+    /// Per-client-IP limit on each passkey registration endpoint, on by default.
+    #[serde(default)]
+    pub registration_throttle: crate::config::types::RegistrationThrottleConfig,
+
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
@@ -682,6 +686,80 @@ mod url_mapping_tests {
             cfg.client_ip
                 .trusted_proxies
                 .is_empty()
+        );
+    }
+
+    fn cfg_with_registration_throttle(registration_throttle: serde_json::Value) -> NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+            "registration_throttle": registration_throttle,
+        }))
+        .expect("network config with registration_throttle should deserialize")
+    }
+
+    #[test]
+    fn the_registration_throttle_is_on_by_default_at_five_per_fifteen_minutes() {
+        let cfg = cfg_with_listeners(serde_json::json!([]));
+
+        assert!(
+            cfg.registration_throttle
+                .enabled
+        );
+        assert_eq!(
+            cfg.registration_throttle
+                .per_ip
+                .requests,
+            5
+        );
+        assert_eq!(
+            cfg.registration_throttle
+                .per_ip
+                .window_secs,
+            900
+        );
+    }
+
+    #[test]
+    fn a_registration_throttle_block_without_enabled_stays_on() {
+        let cfg = cfg_with_registration_throttle(serde_json::json!({
+            "per_ip": { "requests": 10, "window_secs": 60 }
+        }));
+
+        assert!(
+            cfg.registration_throttle
+                .enabled
+        );
+        assert_eq!(
+            cfg.registration_throttle
+                .per_ip
+                .requests,
+            10
+        );
+        assert_eq!(
+            cfg.registration_throttle
+                .per_ip
+                .window_secs,
+            60
+        );
+    }
+
+    #[test]
+    fn the_registration_throttle_can_be_switched_off() {
+        let cfg = cfg_with_registration_throttle(serde_json::json!({ "enabled": false }));
+
+        assert!(
+            !cfg.registration_throttle
+                .enabled
+        );
+        assert_eq!(
+            cfg.registration_throttle
+                .per_ip
+                .requests,
+            5
         );
     }
 

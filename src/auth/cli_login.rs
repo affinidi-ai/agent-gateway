@@ -222,7 +222,7 @@ pub fn cli_login_router(
 const THROTTLED_MESSAGE: &str = "too many CLI login requests; retry later";
 
 /// `429` with `Retry-After`, never cached.
-fn throttled(
+pub(crate) fn throttled(
     retry_after: u64,
     body: impl IntoResponse,
 ) -> Response {

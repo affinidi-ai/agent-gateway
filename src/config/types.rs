@@ -1303,9 +1303,48 @@ impl Default for LoginThrottleConfig {
     }
 }
 
+/// Per-client-IP limit on each passkey registration endpoint. On unless switched off, also when
+/// a `gateway.json` block leaves `enabled` out, unlike [`LoginThrottleConfig`]. The IP is resolved
+/// by [`crate::source_auth::client_ip`] from the proxies in [`ClientIpConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationThrottleConfig {
+    /// Master switch for the throttle. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-client-IP limit on each endpoint. A client over it waits until its window rolls off.
+    #[serde(default = "default_registration_throttle_per_ip")]
+    pub per_ip: RateLimitConfig,
+}
+
+impl Default for RegistrationThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_ip: default_registration_throttle_per_ip(),
+        }
+    }
+}
+
+impl From<&RegistrationThrottleConfig> for LoginThrottleConfig {
+    fn from(config: &RegistrationThrottleConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            per_ip: config.per_ip.clone(),
+        }
+    }
+}
+
+fn default_registration_throttle_per_ip() -> RateLimitConfig {
+    RateLimitConfig {
+        requests: 5,
+        window_secs: 900,
+        burst: None,
+    }
+}
+
 /// Which proxies may report the caller's address for per-client-IP limits (the SAML and CLI
-/// login throttles). Separate from `tls.client_auth.trusted_proxies`, which only gates forwarded
-/// client certificates.
+/// login throttles and the passkey registration throttle). Separate from
+/// `tls.client_auth.trusted_proxies`, which only gates forwarded client certificates.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientIpConfig {
     /// Proxy CIDRs whose `X-Forwarded-For` is read, or RFC 7239 `Forwarded` when a request has no

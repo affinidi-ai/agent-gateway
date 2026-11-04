@@ -178,6 +178,13 @@
       "window_secs": 60
     }
   },
+  "registration_throttle": {
+    "enabled": true,
+    "per_ip": {
+      "requests": 5,
+      "window_secs": 900
+    }
+  },
   "logging": {
     "level": "debug",
     "json": false,

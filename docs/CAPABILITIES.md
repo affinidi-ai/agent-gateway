@@ -384,15 +384,17 @@ Everything is managed from a web dashboard, signed into with a passkey or, for e
 deployments, SAML single sign-on. The first user becomes the primary administrator, who cannot
 be deleted or demoted. With passkeys, that first registration needs the single-use setup token
 the gateway keeps in `_storage/passkeys/setup-token` while no user exists, or the one set in
-`AG_SETUP_TOKEN`; see [`RBAC.md`](RBAC.md#primary-administrator). A SAML sign-in must return from the identity provider within
-five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
+`AG_SETUP_TOKEN`; see [`RBAC.md`](RBAC.md#primary-administrator). Each passkey
+registration endpoint takes 5 requests per client IP per 15 minutes by default
+(`registration_throttle` in `gateway.json`), answering 429 with `Retry-After` past that.
+A SAML sign-in must return from the identity provider within five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
 `saml.json` for 20 sign-ins per client IP per minute (the default `per_ip`), with 429 and
 `Retry-After` past that.
 
-The SAML login and CLI login limits count by client IP, taken from the TCP connection.
-`X-Forwarded-For` is only read when the connection comes from an address in
+The SAML login, CLI login and passkey registration limits count by client IP, taken from the
+TCP connection. `X-Forwarded-For` is only read when the connection comes from an address in
 `client_ip.trusted_proxies` (`gateway.json`), and then from the right, skipping trusted hops.
 Every listed proxy must append the address it saw to `X-Forwarded-For`, or overwrite the
 header. A proxy that passes the client's own `X-Forwarded-For` through unchanged (default
@@ -400,7 +402,9 @@ nginx, or an ALB in `preserve` mode) lets each client choose the address it is c
 RFC 7239 `Forwarded` is read only when a request has no `X-Forwarded-For`, so listed proxies
 must write `X-Forwarded-For`. A gateway behind a load balancer or reverse proxy must list it
 there before enabling a login limit; otherwise every user is counted as the balancer's address
-and shares one limit, and the gateway logs a warning at startup. This list is separate from
+and shares one limit, and the gateway logs a warning at startup. The registration limit is on by
+default, so it logs no startup warning; it logs one naming `client_ip.trusted_proxies` when it
+locks out a caller that did not come through a listed proxy. This list is separate from
 `tls.client_auth.trusted_proxies`, which only gates forwarded client certificates.
 
 An IPv4 address counts on its own, and an IPv6 address counts by its /64 prefix, so one host

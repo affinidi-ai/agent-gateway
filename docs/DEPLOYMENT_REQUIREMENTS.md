@@ -129,9 +129,18 @@ you open any listener:
   is listed, the gateway sees every caller as the balancer's address, so the STS token
   endpoint throttle, which is on by default, counts them all as one source: a burst of
   failed client logins through the balancer locks every STS client out for
-  `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. The
-  balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
-  or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
+  `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. So
+  does the passkey registration limit, which is on by default (`registration_throttle`, 5
+  requests per 15 minutes per client IP on each of `/auth/register/start` and
+  `/auth/register/finish`): until the balancer is listed, a few registrations through it,
+  including someone else's, can keep your own first-administrator registration answering `429`
+  until the 15-minute window ends, and for as long as someone keeps sending requests through
+  it. The registration limit tracks about 10,000 client IPs; while that many are active, every
+  new one gets `429` for up to the 15-minute window. When the STS throttle or the registration
+  limit locks out a caller that did not come through a listed proxy, the gateway logs a warning
+  naming `client_ip.trusted_proxies`. The balancer must append the caller's address to
+  `X-Forwarded-For` or overwrite it, and set or strip `X-Forwarded-Host` and
+  `X-Forwarded-Proto` rather than pass a caller's through.
 - **Register the first administrator with the setup token.** The first account to
   register becomes the primary administrator and cannot be deleted or demoted. While no
   user exists, passkey registration needs the setup token: the gateway keeps it in

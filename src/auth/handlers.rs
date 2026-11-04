@@ -1,11 +1,13 @@
 use axum::{
-    Extension, Json,
-    extract::State,
+    Extension, Json, Router,
+    extract::{Request, State},
     http::{
         StatusCode,
         header::{HeaderMap, HeaderValue, SET_COOKIE},
     },
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::post,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -17,7 +19,10 @@ use super::storage::UserData;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
 };
-use crate::config::types::SecretValue;
+use crate::config::types::{LoginThrottleConfig, RegistrationThrottleConfig, SecretValue};
+use crate::source_auth::client_ip::{ClientIp, FromTrustedProxy};
+use crate::sts::handlers::Caller;
+use crate::sts::throttle::TokenEndpointThrottle;
 
 use crate::metrics::MetricsStore;
 
@@ -125,6 +130,57 @@ pub struct AuthCheckResponse {
     pub authenticated: bool,
     pub username: Option<String>,
     pub consent_required: bool,
+}
+
+const REGISTRATION_THROTTLED: &str = "too many passkey registration requests; retry later";
+
+const REGISTRATION_LOCKOUT_PROXY_HINT: &str = "Passkey registration locked out a caller after repeated requests; if \
+                                               a load balancer or proxy forwards callers to the gateway, list it in \
+                                               client_ip.trusted_proxies, or every caller it forwards shares this \
+                                               limit";
+
+/// The passkey registration routes, each limited per client IP by its own throttle, so a client's
+/// retries of one step do not use up the other's budget.
+pub(crate) fn registration_router(throttle: &RegistrationThrottleConfig) -> Router<Arc<AuthState>> {
+    let throttle = LoginThrottleConfig::from(throttle);
+    let limited = || {
+        axum::middleware::from_fn_with_state(
+            Arc::new(TokenEndpointThrottle::per_client_ip(&throttle)),
+            limit_by_client_ip,
+        )
+    };
+    Router::new()
+        .route("/auth/register/start", post(register_start).layer(limited()))
+        .route("/auth/register/finish", post(register_finish).layer(limited()))
+}
+
+/// Counts every request against the caller's IP before its body is read, so malformed requests
+/// count too, and answers `429` with `Retry-After` while the IP is over its limit. The request that
+/// locks out a caller that did not come through a trusted proxy logs
+/// [`REGISTRATION_LOCKOUT_PROXY_HINT`]. A full table of tracked IPs also refuses a new IP without
+/// locking it out, so the hint is logged only when the IP is actually locked out afterwards.
+async fn limit_by_client_ip(
+    State(throttle): State<Arc<TokenEndpointThrottle>>,
+    client_ip: Option<Extension<ClientIp>>,
+    trusted_proxy: Option<Extension<FromTrustedProxy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let caller = Caller::from_extensions(client_ip, trusted_proxy);
+    let now = crate::sts::handlers::now_secs();
+    if let Some(retry_after) = throttle.retry_after(None, caller.ip, now) {
+        return crate::auth::cli_login::throttled(retry_after, REGISTRATION_THROTTLED);
+    }
+    if let Some(retry_after) = throttle.record_client_attempt(caller.ip) {
+        let locked_out = throttle
+            .retry_after(None, caller.ip, now)
+            .is_some();
+        if caller.lockout_needs_proxy_hint(locked_out) {
+            warn!("{REGISTRATION_LOCKOUT_PROXY_HINT}");
+        }
+        return crate::auth::cli_login::throttled(retry_after, REGISTRATION_THROTTLED);
+    }
+    next.run(request).await
 }
 
 /// Start passkey registration. While no user exists, only a request with the setup token gets a
@@ -1250,6 +1306,233 @@ mod tests {
                 .is_empty()
         );
         assert!(state.setup_token.is_pending(), "a claim that finds no token file keeps the token");
+    }
+
+    const TRUSTED_PROXY_CIDR: &str = "10.0.0.0/8";
+    const TRUSTED_PROXY: &str = "10.0.0.5";
+    const CLIENT: &str = "203.0.113.7";
+    const OTHER_CLIENT: &str = "198.51.100.4";
+    const START: &str = "/auth/register/start";
+    const FINISH: &str = "/auth/register/finish";
+    const START_BODY: &str = r#"{"username":"first-admin"}"#;
+    const MALFORMED_FINISH_BODY: &str = "{}";
+
+    fn registration_app(
+        state: Arc<AuthState>,
+        throttle: crate::config::types::RegistrationThrottleConfig,
+    ) -> axum::Router {
+        super::registration_router(&throttle)
+            .layer(axum::Extension(None::<Arc<crate::metrics::MetricsStore>>))
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(crate::config::types::ClientIpConfig {
+                    trusted_proxies: vec![
+                        TRUSTED_PROXY_CIDR
+                            .parse()
+                            .unwrap(),
+                    ],
+                }),
+                crate::source_auth::client_ip::resolve_client_ip_layer,
+            ))
+    }
+
+    /// Posts `body` to `path` as if it arrived on a TCP connection from `peer`.
+    async fn post_from(
+        app: &axum::Router,
+        peer: &str,
+        forwarded_for: Option<&str>,
+        path: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        let mut request = axum::http::Request::post(path).header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(value) = forwarded_for {
+            request = request.header("x-forwarded-for", value);
+        }
+        let mut request = request
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                format!("{peer}:40000")
+                    .parse()
+                    .unwrap(),
+            ));
+        tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap()
+    }
+
+    fn assert_throttled(response: &axum::response::Response) -> u64 {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response.headers()[axum::http::header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=900).contains(&retry_after), "retry-after {retry_after}");
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        retry_after
+    }
+
+    async fn use_up_budget(
+        app: &axum::Router,
+        peer: &str,
+        forwarded_for: Option<&str>,
+        path: &str,
+        body: &str,
+        expected: StatusCode,
+    ) {
+        for _ in 0..5 {
+            assert_eq!(
+                post_from(app, peer, forwarded_for, path, body)
+                    .await
+                    .status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn register_start_answers_429_with_retry_after_for_a_source_over_its_limit() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state.clone(), Default::default());
+        use_up_budget(&app, CLIENT, None, START, START_BODY, StatusCode::FORBIDDEN).await;
+
+        let with_the_token = format!(r#"{{"username":"first-admin","setup_token":"{SETUP_TOKEN}"}}"#);
+        let over = post_from(&app, CLIENT, None, START, &with_the_token).await;
+
+        let retry_after = assert_throttled(&over);
+        assert!(
+            retry_after > 840,
+            "the default window is 15 minutes, so the first lockout lasts about 900 s: {retry_after}"
+        );
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .is_empty(),
+            "a throttled request creates no challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_finish_answers_429_with_retry_after_for_a_source_over_its_limit() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        use_up_budget(&app, CLIENT, None, FINISH, MALFORMED_FINISH_BODY, StatusCode::UNPROCESSABLE_ENTITY).await;
+
+        assert_throttled(&post_from(&app, CLIENT, None, FINISH, MALFORMED_FINISH_BODY).await);
+    }
+
+    #[tokio::test]
+    async fn the_registration_limit_counts_each_source_separately() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        use_up_budget(&app, CLIENT, None, START, START_BODY, StatusCode::FORBIDDEN).await;
+
+        assert_throttled(&post_from(&app, CLIENT, None, START, START_BODY).await);
+        assert_eq!(
+            post_from(&app, OTHER_CLIENT, None, START, START_BODY)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_from(&app, TRUSTED_PROXY, Some(OTHER_CLIENT), START, START_BODY)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+            "a caller a trusted proxy forwards is counted by its own address"
+        );
+        assert_throttled(&post_from(&app, TRUSTED_PROXY, Some(CLIENT), START, START_BODY).await);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_changes_x_forwarded_for_without_a_trusted_proxy_is_still_limited() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        for hop in 1..=5 {
+            assert_eq!(
+                post_from(&app, CLIENT, Some(&format!("198.51.100.{hop}")), START, START_BODY)
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        assert_throttled(&post_from(&app, CLIENT, Some("198.51.100.6"), START, START_BODY).await);
+    }
+
+    #[tokio::test]
+    async fn registration_start_and_finish_have_separate_budgets() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        use_up_budget(&app, CLIENT, None, START, START_BODY, StatusCode::FORBIDDEN).await;
+
+        assert_throttled(&post_from(&app, CLIENT, None, START, START_BODY).await);
+        assert_eq!(
+            post_from(&app, CLIENT, None, FINISH, MALFORMED_FINISH_BODY)
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_registration_throttle_limits_no_source() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(
+            state,
+            crate::config::types::RegistrationThrottleConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..10 {
+            assert_eq!(
+                post_from(&app, CLIENT, None, START, START_BODY)
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lockout_of_a_caller_no_trusted_proxy_forwarded_logs_the_proxy_hint_once() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        use_up_budget(&app, CLIENT, None, START, START_BODY, StatusCode::FORBIDDEN).await;
+
+        assert_throttled(&post_from(&app, CLIENT, None, START, START_BODY).await);
+        assert_throttled(&post_from(&app, CLIENT, None, START, START_BODY).await);
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches(super::REGISTRATION_LOCKOUT_PROXY_HINT)
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(super::REGISTRATION_LOCKOUT_PROXY_HINT.contains("client_ip.trusted_proxies"));
+        assert!(!super::REGISTRATION_LOCKOUT_PROXY_HINT.contains("  "), "the continued lines join with single spaces");
+    }
+
+    #[tokio::test]
+    async fn a_lockout_of_a_caller_a_trusted_proxy_forwarded_logs_no_proxy_hint() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let app = registration_app(state, Default::default());
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        use_up_budget(&app, TRUSTED_PROXY, Some(CLIENT), START, START_BODY, StatusCode::FORBIDDEN).await;
+
+        assert_throttled(&post_from(&app, TRUSTED_PROXY, Some(CLIENT), START, START_BODY).await);
+
+        let text = logs.text();
+        assert!(!text.contains("client_ip.trusted_proxies"), "{text}");
     }
 
     #[test]

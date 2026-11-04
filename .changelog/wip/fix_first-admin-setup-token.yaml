@@ -19,6 +19,17 @@ changes:
         file, so the token works once, also across gateways sharing storage. `GET
         /v1/auth/mode` reports `setup_required`, and the dashboard asks for the token. SAML
         sign-in is unchanged.
+    - timestamp: '2026-11-04T15:30:00Z'
+      title: Rate limit passkey registration per client IP by default
+      description: >-
+        `/auth/register/start` and `/auth/register/finish` each take 5 requests per client IP
+        per 15 minutes by default, malformed requests included, and answer 429 with
+        `Retry-After` past that, so a caller cannot flood registration challenges, new-user
+        sign-ups or WebAuthn verification. Set `registration_throttle` in `gateway.json` to
+        change or switch off the limit. Behind a load balancer, list it in
+        `client_ip.trusted_proxies`, or every caller shares its budget; when the limit locks
+        out a caller that did not come through a listed proxy, the gateway logs a warning
+        saying so.
   breaking:
     - timestamp: '2026-11-04T13:30:00Z'
       title: ⭐ Require a setup token to register the first passkey administrator

@@ -542,13 +542,13 @@ pub async fn mcp_token_endpoint(
 /// The caller as [`crate::source_auth::client_ip`] resolved it: forwarded headers count only
 /// from `client_ip.trusted_proxies`.
 #[derive(Debug, Clone, Copy)]
-struct Caller {
-    ip: Option<std::net::IpAddr>,
+pub(crate) struct Caller {
+    pub(crate) ip: Option<std::net::IpAddr>,
     from_trusted_proxy: bool,
 }
 
 impl Caller {
-    fn from_extensions(
+    pub(crate) fn from_extensions(
         client_ip: Option<Extension<ClientIp>>,
         trusted_proxy: Option<Extension<FromTrustedProxy>>,
     ) -> Self {
@@ -561,7 +561,7 @@ impl Caller {
     /// Whether this caller's lockout should name `client_ip.trusted_proxies`: behind a load
     /// balancer that is not listed there, every caller shares the balancer's address and so its
     /// limits.
-    fn lockout_needs_proxy_hint(
+    pub(crate) fn lockout_needs_proxy_hint(
         self,
         locked_out: bool,
     ) -> bool {
@@ -1778,7 +1778,7 @@ fn emit_issuance_audit(
     );
 }
 
-pub(super) fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

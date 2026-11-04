@@ -687,3 +687,27 @@ async fn a_gateway_with_a_user_reports_setup_not_required() {
     assert!(!required_after);
     assert_eq!(registration.status(), reqwest::StatusCode::OK);
 }
+
+#[tokio::test]
+async fn the_gateway_limits_registration_starts_from_one_client() {
+    let (_temp_dir, gateway) = start_fresh_gateway(&HashMap::new()).await;
+
+    let mut within_the_limit = Vec::new();
+    for _ in 0..5 {
+        within_the_limit.push(
+            start_registration(&gateway, None)
+                .await
+                .status(),
+        );
+    }
+    let over_the_limit = start_registration(&gateway, None).await;
+
+    assert_eq!(within_the_limit, vec![reqwest::StatusCode::FORBIDDEN; 5], "the first five reach the setup token check");
+    assert_eq!(over_the_limit.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = over_the_limit.headers()[reqwest::header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=900).contains(&retry_after), "retry-after {retry_after}");
+}

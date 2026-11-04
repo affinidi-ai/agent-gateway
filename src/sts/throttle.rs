@@ -1,10 +1,10 @@
 //! Throttle for the token endpoint: bounds repeated attempts per client id from
 //! each source, and per source, so credential guessing is rate-limited without
 //! letting one source lock a client id out for every other. A source is an IPv4
-//! address or an IPv6 /64, since one host usually holds the whole /64. SAML and CLI
-//! login reuse it per source only, with a bound on tracked sources. Every caller's
-//! IP comes from [`crate::source_auth::client_ip`], which trusts forwarded headers
-//! only from `client_ip.trusted_proxies`.
+//! address or an IPv6 /64, since one host usually holds the whole /64. SAML login,
+//! CLI login and passkey registration reuse it per source only, with a bound on
+//! tracked sources. Every caller's IP comes from [`crate::source_auth::client_ip`],
+//! which trusts forwarded headers only from `client_ip.trusted_proxies`.
 //!
 //! Process-local, like the other runtime caches. Counters roll over a
 //! configurable window; a key that exceeds its limit is blocked for a

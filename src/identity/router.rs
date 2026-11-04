@@ -331,8 +331,11 @@ pub fn create_identity_api_router(
                     .layer(Extension(auth_state_arc.clone()))
                     .merge(
                         Router::new()
-                            .route("/auth/register/start", post(crate::auth::handlers::register_start))
-                            .route("/auth/register/finish", post(crate::auth::handlers::register_finish))
+                            .merge(crate::auth::handlers::registration_router(
+                                &state
+                                    .network_config
+                                    .registration_throttle,
+                            ))
                             .route("/auth/login/start", post(crate::auth::handlers::login_start))
                             .route("/auth/login/finish", post(crate::auth::handlers::login_finish))
                             .route("/auth/check", get(crate::auth::handlers::check_auth))
