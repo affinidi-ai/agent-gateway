@@ -2287,3 +2287,58 @@ async fn a_legacy_caller_secret_named_like_a_key_needs_the_api_key_store() {
     assert_eq!(status, 409, "{body}");
     assert_eq!(body, json!({"error": "API key store is not configured"}));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_another_node_created_after_startup_is_checked_on_save() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    let mut client = None;
+    let mut keys_dir = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        keys_dir = Some(api_keys_dir(bootstrap));
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+    let mut owners = Vec::new();
+    for (route, tenant) in [("/smoke/later-owner-a", "tenant-a"), ("/smoke/later-owner-b", "tenant-b")] {
+        owners.push(
+            api.created_id(&api.surface(route, Some(tenant), json!({})))
+                .await,
+        );
+    }
+    let other_node = crate::api_keys::FileSystemApiKeyStore::new(
+        &keys_dir
+            .unwrap()
+            .to_string_lossy(),
+    )
+    .await
+    .unwrap();
+    let mut keys = Vec::new();
+    for owner in &owners {
+        keys.push(
+            other_node
+                .create(owner, "client", None, "other-node")
+                .await
+                .unwrap()
+                .key_id,
+        );
+    }
+    let naming = |route: &str, key_id: &str| {
+        api.surface(route, Some("tenant-a"), json!({"identity_slots": {"protected": from_api_key(key_id)}}))
+    };
+
+    assert_saved(
+        api.create(&naming("/smoke/later-own", &keys[0]))
+            .await,
+    );
+    api.assert_create_refused(&naming("/smoke/later-cross", &keys[1]), NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+}

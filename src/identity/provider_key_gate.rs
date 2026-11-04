@@ -1,14 +1,15 @@
 //! Readiness of a surface that derives a DID from an API Key Provider key id. The request path
 //! derives such a DID with no key lookup, so a stored surface naming a key it may not use is
 //! held back here: under `tenant_credential_isolation: warn` it is only logged, under `enforce`
-//! it is not ready, and while the API key store cannot be read every surface naming a key id is
-//! not ready. Verdicts are taken when a surface goes live and on the first request that finds none
-//! for the key ids the served surface names, and kept per surface id; a key id judged while the
-//! store could not be read is judged again on the next request.
+//! it is not ready, and while the API key store cannot be read a surface naming a key id that has
+//! not been checked is not ready. Verdicts are taken when a surface goes live and on the first
+//! request that finds none for the key ids the served surface names, and kept per surface id; a
+//! key id judged while the store could not be read is judged again on the next request.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tracing::{info, warn};
@@ -26,44 +27,69 @@ pub const PROVIDER_KEY_TENANT_RULE: &str = "provider_key_tenant";
 /// The reason a surface naming a key id is not ready while the API key store cannot be read.
 pub const API_KEY_STORE_UNAVAILABLE: &str = "api_key_store_unavailable";
 
+/// How long a key id found missing, or whose owning surface was missing, is kept as judged
+/// without `cache_refresh_interval_secs`. A key another node creates shows up in this node's
+/// API key store at the next listing, so the id is judged again after this long, but no sooner:
+/// a surface naming a key that does not exist lists the API key store at most this often.
+const MISSING_KEY_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a missing key id is kept as judged: `cache_refresh_interval_secs` when set, the
+/// interval at which this node's stores pick up other nodes' writes, else
+/// [`MISSING_KEY_RECHECK`].
+fn missing_key_recheck() -> std::time::Duration {
+    match crate::storage::filesystem::cache_refresh_interval_secs() {
+        0 => MISSING_KEY_RECHECK,
+        secs => std::time::Duration::from_secs(secs),
+    }
+}
+
 #[derive(Clone, Default)]
 struct Sources {
     api_keys: Option<Arc<dyn crate::api_keys::store::ApiKeyStore>>,
     surfaces: Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
 }
 
-/// The key ids judged for a surface of `tenant_id`, those of them it may not use, and whether the
-/// last judgment could not read the stores.
+/// The key ids judged for a surface of `tenant_id`, those of them it may not use, when each id
+/// found missing is judged again, and whether the last judgment could not read the stores.
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     tenant_id: Option<String>,
     judged: HashSet<String>,
     refused: HashSet<String>,
+    recheck: HashMap<String, Instant>,
     store_unavailable: bool,
 }
 
 impl Entry {
-    /// Whether the entry judged every id of `ids` for `tenant_id`, and if so whether one is refused.
+    /// Whether the entry judged every id of `ids` for `tenant_id`, none of them missing since
+    /// before `now`'s recheck, and if so whether one is refused.
     fn decides(
         &self,
         tenant_id: Option<&str>,
         ids: &ProviderKeyIds,
+        now: Instant,
     ) -> Option<bool> {
         (self.tenant_id.as_deref() == tenant_id
-            && ids
-                .all()
-                .all(|id| self.judged.contains(id)))
+            && ids.all().all(|id| {
+                self.judged.contains(id)
+                    && self
+                        .recheck
+                        .get(id)
+                        .is_none_or(|at| now < *at)
+            }))
         .then(|| {
             ids.all()
                 .any(|id| self.refused.contains(id))
         })
     }
 
-    /// The verdict `issues` gives for `ids`, keeping no id the stores could not judge.
+    /// The verdict `issues` gives for `ids`, keeping no id the stores could not judge, and
+    /// judging an id found missing again at `recheck_at`.
     fn of(
         surface: &AgentSurface,
         ids: &ProviderKeyIds,
         verdict: &Verdict,
+        recheck_at: Instant,
     ) -> Self {
         let unjudged: HashSet<&str> = verdict
             .issues
@@ -84,12 +110,20 @@ impl Entry {
                 .filter(|issue| issue.kind.is_breach() && issue.kind != ProviderKeyIssueKind::StoreUnavailable)
                 .map(|issue| issue.key_id.clone())
                 .collect(),
+            recheck: verdict
+                .issues
+                .iter()
+                .filter(|issue| {
+                    matches!(issue.kind, ProviderKeyIssueKind::MissingKey | ProviderKeyIssueKind::MissingOwner)
+                })
+                .map(|issue| (issue.key_id.clone(), recheck_at))
+                .collect(),
             store_unavailable: verdict.store_unavailable,
         }
     }
 
-    /// Takes in a later judgment of the same surface: for the same tenant it adds what it
-    /// judged, for another it replaces the entry.
+    /// Takes in a later judgment of the same surface: for the same tenant its verdict replaces
+    /// the kept one for every id it judged, for another tenant it replaces the entry.
     fn merge(
         &mut self,
         later: Self,
@@ -98,10 +132,16 @@ impl Entry {
             *self = later;
             return;
         }
+        for id in &later.judged {
+            self.refused.remove(id);
+            self.recheck.remove(id);
+        }
         self.judged
             .extend(later.judged);
         self.refused
             .extend(later.refused);
+        self.recheck
+            .extend(later.recheck);
         self.store_unavailable = later.store_unavailable;
     }
 }
@@ -128,6 +168,8 @@ pub struct ProviderKeyGate {
     sources: std::sync::RwLock<Sources>,
     entries: DashMap<String, Entry>,
     store_outage_logged: AtomicBool,
+    #[cfg(test)]
+    missing_key_recheck: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 static GATE: std::sync::LazyLock<ProviderKeyGate> = std::sync::LazyLock::new(ProviderKeyGate::default);
@@ -195,7 +237,7 @@ impl ProviderKeyGate {
             .judge(surface, &ids)
             .await;
         self.entries
-            .insert(surface.surface_id.clone(), Entry::of(surface, &ids, &verdict));
+            .insert(surface.surface_id.clone(), Entry::of(surface, &ids, &verdict, self.recheck_at()));
     }
 
     /// Drops the verdict of a surface that no longer serves.
@@ -220,14 +262,14 @@ impl ProviderKeyGate {
         if let Some(refused) = self
             .entries
             .get(&surface.surface_id)
-            .and_then(|entry| entry.decides(surface.tenant_id.as_deref(), &ids))
+            .and_then(|entry| entry.decides(surface.tenant_id.as_deref(), &ids, Instant::now()))
         {
             return refused.then_some(NotReadyReason::ProviderKeyTenant);
         }
         let verdict = self
             .judge(surface, &ids)
             .await;
-        let judged = Entry::of(surface, &ids, &verdict);
+        let judged = Entry::of(surface, &ids, &verdict, self.recheck_at());
         match self
             .entries
             .entry(surface.surface_id.clone())
@@ -254,7 +296,7 @@ impl ProviderKeyGate {
         let entry = self
             .entries
             .get(&surface.surface_id)?;
-        match entry.decides(surface.tenant_id.as_deref(), &ids) {
+        match entry.decides(surface.tenant_id.as_deref(), &ids, Instant::now()) {
             Some(true) => Some(PROVIDER_KEY_TENANT_RULE),
             None if entry.store_unavailable => Some(API_KEY_STORE_UNAVAILABLE),
             _ => None,
@@ -269,6 +311,19 @@ impl ProviderKeyGate {
     ) -> bool {
         self.entries
             .contains_key(surface_id)
+    }
+
+    /// When a key id found missing now is judged again.
+    fn recheck_at(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(recheck) = *self
+            .missing_key_recheck
+            .lock()
+            .unwrap()
+        {
+            return Instant::now() + recheck;
+        }
+        Instant::now() + missing_key_recheck()
     }
 
     async fn judge(
@@ -503,17 +558,25 @@ mod tests {
 
     #[test]
     fn an_entry_decides_only_for_its_tenant_and_the_ids_it_judged() {
+        let now = Instant::now();
         let entry = Entry {
             tenant_id: Some("tenant-a".into()),
-            judged: [KEY_A.to_string(), KEY_B.to_string()].into(),
+            judged: [KEY_A.to_string(), KEY_B.to_string(), "atgk_missing".to_string()].into(),
             refused: [KEY_B.to_string()].into(),
+            recheck: [("atgk_missing".to_string(), now + std::time::Duration::from_secs(30))].into(),
             store_unavailable: false,
         };
-        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A])), Some(false));
-        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, KEY_B])), Some(true));
-        assert_eq!(entry.decides(Some("tenant-b"), &ids(&[KEY_A])), None, "another tenant is judged again");
-        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, "atgk_new"])), None, "a new id is judged");
-        assert_eq!(entry.decides(None, &ids(&[KEY_A])), None);
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A]), now), Some(false));
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, KEY_B]), now), Some(true));
+        assert_eq!(entry.decides(Some("tenant-b"), &ids(&[KEY_A]), now), None, "another tenant is judged again");
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, "atgk_new"]), now), None, "a new id is judged");
+        assert_eq!(entry.decides(None, &ids(&[KEY_A]), now), None);
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&["atgk_missing"]), now), Some(false));
+        assert_eq!(
+            entry.decides(Some("tenant-a"), &ids(&["atgk_missing"]), now + std::time::Duration::from_secs(30)),
+            None,
+            "a missing key is judged again once its recheck is due"
+        );
     }
 
     #[tokio::test]
@@ -763,6 +826,69 @@ mod tests {
                 .recorded_refusal(&late),
             Some(API_KEY_STORE_UNAVAILABLE)
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_is_judged_again_only_after_its_recheck_interval() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        let later = "atgk_gate_later";
+        let naming_later = naming("later", "tenant-a", external(later));
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&naming_later)
+                .await,
+            None,
+            "a missing key is no breach"
+        );
+        enforced
+            .api_keys
+            .create_with_material("owner-b", later.to_string(), "atgs_later".to_string(), "client", None, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&naming_later)
+                .await,
+            None,
+            "within the interval the missing verdict is kept"
+        );
+
+        *enforced
+            .gate
+            .missing_key_recheck
+            .lock()
+            .unwrap() = Some(std::time::Duration::ZERO);
+        enforced
+            .gate
+            .entries
+            .get_mut("later")
+            .unwrap()
+            .recheck
+            .values_mut()
+            .for_each(|at| *at = Instant::now());
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&naming_later)
+                .await,
+            Some(NotReadyReason::ProviderKeyTenant),
+            "once due, the key is judged again and is another tenant's"
+        );
+        let entry = enforced
+            .gate
+            .entries
+            .get("later")
+            .unwrap();
+        assert!(entry.recheck.is_empty() && entry.refused.contains(later), "{entry:?}");
+    }
+
+    #[test]
+    fn the_missing_key_recheck_follows_the_cache_refresh_interval() {
+        assert_eq!(missing_key_recheck(), MISSING_KEY_RECHECK);
     }
 
     #[tokio::test]
