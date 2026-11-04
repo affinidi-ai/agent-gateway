@@ -366,12 +366,14 @@ fn strategies_for_client(
     }
 }
 
-/// Verifies `token` with each strategy from [`strategies_for_client`] and
-/// returns its claims, named by the principal claim of the strategies that
-/// accept it. The subject must not depend on which strategy is tried first, so
-/// when strategies that accept the token name different claims, as during a
-/// move to a new strategy before the old one is deleted, the token is refused.
-/// A strategy whose stored claim names no caller accepts nothing.
+/// Verifies `token` with the strategies from [`strategies_for_client`] and
+/// returns the claims of the first that accepts it, named by that strategy's
+/// principal claim. An issuer names callers by one claim in a tenant scope, so
+/// when the candidate strategies are configured with different claims, as
+/// while a surface moves to a new strategy before the old one is deleted, the
+/// token is refused before any is tried: the subject never depends on which
+/// strategy is tried first or whose keys could be fetched. A strategy whose
+/// stored claim names no caller accepts nothing.
 async fn verify_with_client_strategies(
     verifier: &crate::jwt_bearer::JwtBearerVerifier,
     strategies: Vec<crate::jwt_bearer::models::JwtVerificationStrategy>,
@@ -380,44 +382,43 @@ async fn verify_with_client_strategies(
     tenant_id: Option<&str>,
 ) -> Result<VerifiedAssertion, StsError> {
     let mut failure = None;
-    let mut verified: Option<VerifiedAssertion> = None;
-    let mut accepting = Vec::new();
+    let mut candidates = Vec::new();
     for strategy in strategies_for_client(strategies, issuer, tenant_id) {
-        let principal_claim = match strategy.principal_claim_name() {
-            Ok(claim) => claim.to_string(),
-            Err(error) => {
-                failure = Some(error);
-                continue;
-            }
-        };
-        match verifier
-            .validate(token, &strategy, &[])
-            .await
-        {
-            Ok(claims) => {
-                accepting.push((strategy.id, principal_claim.clone()));
-                verified.get_or_insert(VerifiedAssertion { claims, principal_claim });
+        match strategy.principal_claim_name() {
+            Ok(claim) => {
+                let claim = claim.to_string();
+                candidates.push((strategy, claim));
             }
             Err(error) => failure = Some(error),
         }
     }
-    if let Some(verified) = verified {
-        if accepting
+    if candidates
+        .iter()
+        .any(|(_, claim)| *claim != candidates[0].1)
+    {
+        let named: Vec<(&str, &str)> = candidates
             .iter()
-            .any(|(_, claim)| *claim != verified.principal_claim)
+            .map(|(strategy, claim)| (strategy.id.as_str(), claim.as_str()))
+            .collect();
+        tracing::warn!(
+            issuer = %issuer,
+            strategies = ?named,
+            "JWT verification strategies for one issuer name callers by different claims; refusing the assertion"
+        );
+        return Err(StsError::InvalidGrant(
+            "the verification strategies for this issuer name callers by different claims; an issuer names \
+             callers by one claim in a tenant"
+                .to_string(),
+        ));
+    }
+    for (strategy, principal_claim) in candidates {
+        match verifier
+            .validate(token, &strategy, &[])
+            .await
         {
-            tracing::warn!(
-                issuer = %issuer,
-                strategies = ?accepting,
-                "JWT verification strategies for one issuer name callers by different claims; refusing the assertion"
-            );
-            return Err(StsError::InvalidGrant(
-                "the verification strategies for this issuer name callers by different claims; delete the one \
-                 no surface uses"
-                    .to_string(),
-            ));
+            Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),
+            Err(error) => failure = Some(error),
         }
-        return Ok(verified);
     }
     Err(match failure {
         Some(error) => StsError::InvalidGrant(format!("assertion verification failed: {error}")),
@@ -3793,34 +3794,70 @@ mod tests {
         assert_eq!(err.error_code(), "invalid_grant", "{err}");
     }
 
-    /// Strategies for one issuer that name different claims, as while a
-    /// surface moves to a new strategy and the old one remains, would make the
-    /// subject depend on which is tried first: the assertion is refused. Two
-    /// that name the same claim are one answer.
+    /// An issuer names callers by one claim in a tenant scope: strategies for
+    /// it configured with different claims refuse the assertion before any is
+    /// tried, even when only one of them holds the signing key, so the subject
+    /// never depends on which strategy verifies or whose keys can be fetched.
+    /// Two that name the same claim are one answer, and a tenant's own
+    /// strategies are a scope apart from the appliance-global ones.
     #[tokio::test]
     async fn strategies_for_one_issuer_that_name_different_claims_refuse_the_assertion() {
         use crate::jwt_bearer::test_utils::{ED25519_JWK_X, static_okp_strategy};
+        const OTHER_KEY: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
         let issuer = "https://idp.example";
-        let named = |id: &str, claim: Option<&str>| {
-            let mut strategy = static_okp_strategy(id, None, issuer, "k", ED25519_JWK_X);
+        let named = |id: &str, tenant: Option<&str>, key: &str, claim: Option<&str>| {
+            let mut strategy = static_okp_strategy(id, tenant, issuer, "k", key);
             strategy.principal_claim = claim.map(str::to_string);
             strategy
         };
 
-        let err = verify_signed_token_for(vec![named("old", None), named("new", Some("oid"))], issuer, None)
+        for old_key in [ED25519_JWK_X, OTHER_KEY] {
+            let err = verify_signed_token_for(
+                vec![named("old", None, old_key, None), named("new", None, ED25519_JWK_X, Some("oid"))],
+                issuer,
+                None,
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.error_code(), "invalid_grant");
-        assert!(
-            err.to_string()
-                .contains("different claims"),
-            "{err}"
-        );
+            assert_eq!(err.error_code(), "invalid_grant");
+            assert!(
+                err.to_string()
+                    .contains("different claims"),
+                "{err}"
+            );
+            assert!(
+                !err.to_string()
+                    .contains("old"),
+                "strategy ids stay in the server log: {err}"
+            );
+        }
 
-        let agreed = verify_signed_token_for(vec![named("one", Some("oid")), named("two", Some("oid"))], issuer, None)
-            .await
-            .unwrap();
+        let agreed = verify_signed_token_for(
+            vec![named("one", None, OTHER_KEY, Some("oid")), named("two", None, ED25519_JWK_X, Some("oid"))],
+            issuer,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(agreed.principal_claim, "oid");
+
+        let scoped = || {
+            vec![named("global", None, ED25519_JWK_X, None), named("own", Some("tenant-a"), ED25519_JWK_X, Some("oid"))]
+        };
+        assert_eq!(
+            verify_signed_token_for(scoped(), issuer, Some("tenant-a"))
+                .await
+                .unwrap()
+                .principal_claim,
+            "oid"
+        );
+        assert_eq!(
+            verify_signed_token_for(scoped(), issuer, None)
+                .await
+                .unwrap()
+                .principal_claim,
+            "sub"
+        );
     }
 
     /// A verifier whose strategies all name callers by `oid`.
