@@ -1545,8 +1545,9 @@ fn unbound_vendor_view_warnings(surface: &AgentSurface) -> Vec<String> {
                     .outbound_credentials
                     .is_empty()
                 && !view
-                    .source_auth()
-                    .is_some_and(|auth| {
+                    .source_auth_methods()
+                    .iter()
+                    .any(|auth| {
                         matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header)
                     })
                 && origin(&view.target.endpoint).is_some_and(|view_origin| bound.contains(&view_origin))
