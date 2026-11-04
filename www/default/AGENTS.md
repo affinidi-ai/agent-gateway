@@ -68,6 +68,24 @@ are the consumer; the convention is documented in
 | List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
 | Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
 
+## Login page
+
+`pages/LoginPage.tsx` signs users in with a passkey or SAML and registers new passkey users.
+
+- While `GET /api/v1/auth/mode` reports `setup_required: true` (no user exists yet), the page
+  opens in register mode and shows `SetupTokenField` (`pages/SetupTokenField.tsx`,
+  `login-setup-token`), a password input below the username. **Register Passkey** stays disabled
+  until it holds a token. The token is trimmed, sent with both registration requests
+  (`registerPasskey(username, terms, setupToken)`), kept only in component state, and cleared
+  with the field after a successful registration. A missing `setup_required` counts as `false`.
+- The field's help text says the token is in the `setup-token` file named in the gateway log.
+  Never show, prefill or store a token. The field sets `autoComplete="one-time-code"`, since
+  many browsers ignore `off` on a password field and offer to save its value, and
+  `maxLength={256}`, the longest token the gateway accepts.
+- The page renders its form with `{renderRightContent()}`, a render function, not a component
+  defined inside the page: that would be a new component type on every render, so it would
+  remount the form on each keystroke and move focus to the username field.
+
 ## CLI consent page
 
 `/cli-consent` (`pages/CliConsentPage/`) asks a signed-in user to approve a `fabric` CLI

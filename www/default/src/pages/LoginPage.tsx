@@ -11,6 +11,7 @@ import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
 import { loginNextTarget } from '../utils/loginNextTarget';
 import { RegistrationTerms } from './RegistrationTerms';
+import { SetupTokenField } from './SetupTokenField';
 import { useRegistrationTerms } from './useRegistrationTerms';
 
 interface LoginPageProps {
@@ -112,6 +113,8 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const [platformAuthAvailable, setPlatformAuthAvailable] = useState(false);
   const [authMode, setAuthMode] = useState<'passkey' | 'saml' | null>(null);
   const [initializing, setInitializing] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [setupToken, setSetupToken] = useState('');
   const registrationTerms = useRegistrationTerms(mode === 'register', setError);
 
   useEffect(() => {
@@ -141,6 +144,10 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
         if (data.mode === 'passkey') {
           setSupported(isWebAuthnSupported());
           isPlatformAuthenticatorAvailable().then(setPlatformAuthAvailable);
+          if (data.setup_required === true) {
+            setSetupRequired(true);
+            setMode('register');
+          }
         }
       } catch (err) {
         console.error('Failed to fetch auth mode:', err);
@@ -164,7 +171,13 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     setSuccess(null);
     setLoading(true);
     try {
-      await registerPasskey(username, registrationTerms.requirements);
+      await registerPasskey(
+        username,
+        registrationTerms.requirements,
+        setupRequired ? setupToken.trim() : undefined
+      );
+      setSetupRequired(false);
+      setSetupToken('');
       setSuccess('Passkey registered successfully! You can now log in.');
       setMode('login');
       setUsername('');
@@ -209,7 +222,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     }
   };
 
-  const RightContent = () => {
+  const renderRightContent = () => {
     if (authMode === null || initializing) {
       return (
         <div className="text-center py-5">
@@ -295,6 +308,10 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
             />
           </Form.Group>
 
+          {mode === 'register' && setupRequired && (
+            <SetupTokenField value={setupToken} onChange={setSetupToken} disabled={loading} />
+          )}
+
           {mode === 'register' && (
             <RegistrationTerms
               requirements={registrationTerms.requirements}
@@ -310,7 +327,8 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
               disabled={
                 loading ||
                 !username.trim() ||
-                (mode === 'register' && !registrationTerms.allAccepted)
+                (mode === 'register' && !registrationTerms.allAccepted) ||
+                (mode === 'register' && setupRequired && !setupToken.trim())
               }
               className={`d-flex align-items-center justify-content-center gap-2 ${styles.submitBtn} ${styles.submitBtnGradient}`}
               data-testid={mode === 'login' ? 'login-authenticate-button' : 'login-register-button'}
@@ -373,7 +391,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
               className={styles.formLogoWordmark}
             />
           </div>
-          <RightContent />
+          {renderRightContent()}
         </div>
         <footer className={styles.formFooterBottom}>
           <p className={styles.formFooterText}>

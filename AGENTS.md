@@ -101,6 +101,10 @@ Key or API Key Provider; see _Surface Builder_ in
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+While no user exists, the login page opens in register mode and asks for the setup token in a
+password field (`login-setup-token`) that it never stores; see _Login page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#login-page).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 

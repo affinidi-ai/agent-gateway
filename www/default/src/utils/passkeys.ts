@@ -87,21 +87,25 @@ function base64urlDecode(str: string): ArrayBuffer {
 }
 
 /**
- * Register a new passkey
+ * Register a new passkey. `setupToken` is sent on both registration requests when given; the
+ * gateway requires it while no user exists.
  */
 export async function registerPasskey(
   username: string,
-  acceptedTerms: TermsRequirement[] = []
+  acceptedTerms: TermsRequirement[] = [],
+  setupToken?: string
 ): Promise<{ success: true }> {
   if (!isWebAuthnSupported()) {
     throw new Error('WebAuthn is not supported in this browser');
   }
 
+  const setupTokenField = setupToken ? { setup_token: setupToken } : {};
+
   // Start registration
   const startResponse = await apiClient.fetch('/api/auth/register/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username }),
+    body: JSON.stringify({ username, ...setupTokenField }),
   });
 
   if (!startResponse.ok) {
@@ -147,6 +151,7 @@ export async function registerPasskey(
         version_id: term.version_id,
         accepted: true,
       })),
+      ...setupTokenField,
     }),
   });
 
