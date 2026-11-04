@@ -91,19 +91,13 @@ impl FileSystemApiKeyStore {
     /// agent directory that has none yet, loading (and, when encryption at rest
     /// is on, transparently migrating) its keys into memory: at startup every
     /// directory, later those another node sharing the storage created since. A
-    /// name that is not a valid storage id is no agent's and is skipped; an
-    /// agent whose keys cannot be loaded is logged and skipped. A root that
-    /// cannot be read is an error.
+    /// symlink to a directory counts as one; an entry whose type cannot be read is
+    /// skipped. A name that is not a valid storage id is no agent's and is
+    /// skipped; an agent whose keys cannot be loaded is logged and skipped. A root
+    /// that cannot be read is an error.
     async fn load_new_agents(&self) -> ApiKeyResult<()> {
         let mut entries = fs::read_dir(&self.storage_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
-            if !entry
-                .file_type()
-                .await?
-                .is_dir()
-            {
-                continue;
-            }
             let file_name = entry.file_name();
             let Some(agent_id) = file_name.to_str() else {
                 continue;
@@ -112,6 +106,9 @@ impl FileSystemApiKeyStore {
                 .stores
                 .contains_key(agent_id)
                 || crate::storage::validate_storage_id(agent_id).is_err()
+                || !fs::metadata(entry.path())
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
             {
                 continue;
             }
@@ -962,6 +959,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiKeyError::KeyNotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_agent_folder_is_loaded_and_a_dangling_link_is_skipped() {
+        let elsewhere = TempDir::new().unwrap();
+        let created = FileSystemApiKeyStore::new(
+            elsewhere
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .create("agent-linked", "client-1", None, "test-actor")
+        .await
+        .unwrap();
+        let root = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere
+                .path()
+                .join("agent-linked"),
+            root.path()
+                .join("agent-linked"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.path()
+                .join("no-such-folder"),
+            root.path()
+                .join("agent-dangling"),
+        )
+        .unwrap();
+
+        let store = FileSystemApiKeyStore::new(root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let validated = store
+            .validate("agent-linked", &created.secret)
+            .await
+            .unwrap()
+            .expect("a key in a symlinked agent folder validates");
+        assert_eq!(validated.key_id, created.key_id);
+        let listed = store
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, "agent-linked");
     }
 
     #[tokio::test]
