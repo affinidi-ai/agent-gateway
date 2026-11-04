@@ -1231,7 +1231,7 @@ async fn token_info_accepts_a_session_from_the_cookie() {
         .await;
     let (app, _directory) = token_info_app(new_store().await, sessions).await;
 
-    let cookie = format!("session_token={session_token}");
+    let cookie = format!("__Host-session_token={session_token}");
     let (status, body) = token_info(&app, None, &[("cookie", &cookie)]).await;
 
     assert_eq!(status, StatusCode::OK);

@@ -47,7 +47,7 @@ still accepts. Resource patterns limit which resource ids a token can reach, not
 holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
 `Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in
-the `Authorization` header or the `session_token` cookie.
+the `Authorization` header or the `__Host-session_token` cookie.
 
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
@@ -60,7 +60,7 @@ keys to `issuers.*`, so they are not valid access-token scopes.
 client can validate a bearer token and show who it is acting as. It takes no parameters and only reads
 the identity the session-auth middleware already resolved, so a caller can only inspect its own
 credential. It accepts a session token or an `agpat_` personal access token, sent as
-`Authorization: Bearer` or in the `session_token` cookie (the header wins when both are present). A
+`Authorization: Bearer` or in the `__Host-session_token` cookie (the header wins when both are present). A
 PAT's resource-scope headers (such as `x-external-account`) are not required or evaluated on this
 route. It returns `401` when the credential is missing, invalid or revoked, or its user is not
 approved, and `403` when:

@@ -747,7 +747,7 @@ mod tests {
     fn test_extract_session_token_prefers_authorization_header() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer bearer-token"));
-        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+        headers.insert(COOKIE, HeaderValue::from_static("__Host-session_token=cookie-token"));
         let params = HashMap::from([(String::from("token"), String::from("query-token"))]);
 
         let token = extract_session_token(&headers, &params).expect("token should be extracted");
@@ -770,12 +770,20 @@ mod tests {
     #[test]
     fn test_extract_session_token_uses_cookie_when_present() {
         let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+        headers.insert(COOKIE, HeaderValue::from_static("__Host-session_token=cookie-token"));
 
         let token = extract_session_token(&headers, &HashMap::new()).expect("token should be extracted");
 
         assert_eq!(token.token, "cookie-token");
         assert_eq!(token.source, SessionTokenSource::Cookie);
+    }
+
+    #[test]
+    fn test_extract_session_token_ignores_the_unprefixed_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+
+        assert!(extract_session_token(&headers, &HashMap::new()).is_none());
     }
 
     #[test]

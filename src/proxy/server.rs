@@ -85,6 +85,17 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
     cors_layer(cors_origins, false)
 }
 
+/// Removes every `Set-Cookie` from an Access Point's answer. The target shares
+/// the caller-facing host with the gateway's dashboard, so a cookie it sets
+/// would land on the dashboard's origin; and the caller's cookies are never
+/// forwarded to it, so a cookie it sets could never come back.
+async fn withhold_target_cookies(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .remove(axum::http::header::SET_COOKIE);
+    response
+}
+
 /// CORS for protected resource metadata: browser MCP clients on any origin
 /// read it with `GET` or `HEAD`, and other methods keep the `cors` allowlist.
 /// It is layered on the metadata routes only, and only on a listener where no
@@ -1014,6 +1025,7 @@ pub async fn run_port_server(
                         &format!("{}/{{{}}}", prefix, "*path"),
                         axum::routing::any(super::handler::multi_channel_proxy_handler),
                     )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
                     .layer(proxy_cors_layer(&network_config.cors))
                     .with_state(state.as_ref().clone());
 
@@ -1067,6 +1079,7 @@ pub async fn run_port_server(
         }
 
         let proxy_router = proxy_router
+            .layer(axum::middleware::map_response(withhold_target_cookies))
             .layer(axum::middleware::from_fn(crate::observability::trace_http_request))
             .layer(proxy_cors_layer(&network_config.cors))
             .with_state(state.as_ref().clone());
@@ -2130,6 +2143,45 @@ mod tests {
                 .headers()
                 .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
         );
+    }
+
+    #[tokio::test]
+    async fn an_access_point_answer_carries_no_cookie_the_target_set() {
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                axum::routing::any(|| async {
+                    (
+                        [
+                            (header::SET_COOKIE, "__Host-session_token=planted; Path=/; Secure"),
+                            (header::SET_COOKIE, "lb=sticky"),
+                            (header::CACHE_CONTROL, "no-store"),
+                        ],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .layer(axum::middleware::map_response(withhold_target_cookies));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agents/worker/rpc")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::SET_COOKIE)
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

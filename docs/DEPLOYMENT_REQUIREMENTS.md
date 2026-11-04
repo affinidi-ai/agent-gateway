@@ -114,6 +114,11 @@ flowchart LR
 | `8080` (HTTP) | The same, without TLS | Only a load balancer that terminates TLS |
 | `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth`, and failed attempts are not throttled (see below) |
 
+The dashboard's session cookie, `__Host-session_token`, is `Secure`, so a browser keeps it
+only over HTTPS or on `http://localhost`. Behind a load balancer that terminates TLS, port
+`8080` serves the dashboard as before. Opened over plain HTTP on any other host, the
+dashboard's single sign-on (SAML) login fails, because the browser drops the cookie it sets.
+
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:
 

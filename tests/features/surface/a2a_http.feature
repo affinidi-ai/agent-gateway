@@ -170,9 +170,11 @@ Feature: A2A HTTP surface forwarding and identity
 
   Scenario: Without a target credential the agent card fetch forwards caller headers as before
     When the caller fetches the agent card with extra headers
-      | cookie | session=caller |
+      | x-request-id | req-caller     |
+      | cookie       | session=caller |
     Then the response status is 200
-    And managed agent "bravo" received header "cookie" with value "session=caller"
+    And managed agent "bravo" received header "x-request-id" with value "req-caller"
+    And managed agent "bravo" did not receive header "cookie"
     And managed agent "bravo" did not receive header "x-target-api-key"
 
   Scenario: A2A agent card URL points to the gateway, not the Target

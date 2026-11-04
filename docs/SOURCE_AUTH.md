@@ -131,6 +131,12 @@ inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_h
 forwards its header only when it was the method selected for that request, so a request
 carrying several credentials forwards none.
 
+An Access Point never forwards its caller's `Cookie` to the managed agent, directly or over
+Fabric, and a gateway receiving a Fabric request drops a `Cookie` its peer sent. The cookies
+belong to the host the caller called, which serves the dashboard too, so its session cookie
+would otherwise reach the agent. For the same reason an Access Point's answer carries no
+`Set-Cookie` the agent sent, so the agent cannot set a cookie on the dashboard's host.
+
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,

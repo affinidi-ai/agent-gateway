@@ -1,0 +1,23 @@
+branch: fix/strip-access-point-cookies
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T11:15:42Z'
+      title: Keep caller cookies and target cookies off Access Points
+      description: >-
+        An Access Point no longer forwards its caller's Cookie header to the managed agent,
+        directly or over Fabric, and a gateway receiving a Fabric request drops a Cookie its peer
+        sent. Its answers no longer carry a Set-Cookie the agent sent. Access Points share their
+        host with the dashboard, so the dashboard session cookie reached the agent, and the agent
+        could set cookies on the dashboard's host.
+    - timestamp: '2026-11-04T11:15:42Z'
+      title: Harden the dashboard session cookie with Secure and the __Host- prefix
+      description: >-
+        The dashboard session cookie is now named __Host-session_token and is Secure, so a
+        browser sends it only over HTTPS or to localhost and no other host can set it. The old
+        session_token cookie is no longer read; a browser that holds only that cookie signs in
+        again. Single sign-on over plain HTTP on a host other than localhost needs HTTPS.
+  breaking: []
