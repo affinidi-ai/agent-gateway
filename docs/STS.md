@@ -106,7 +106,9 @@ In `handlers.rs`, `handle_token_exchange` runs: validate params → authenticate
 client (missing/bad creds → `invalid_client`, 401) → subject-token-type
 allowlist (`unauthorized_client`; a token whose JOSE `typ` is the ID-JAG media
 type counts as `id-jag` whatever type the client declares) → verify subject
-assertion + extract `sub`/`act` → resolve actor; a verified JWT subject or actor
+assertion + extract the subject (the value of the verifying strategy's
+`principal_claim`, `sub` by default, or `sub` for the gateway's own tokens and a VP) and `act` →
+resolve actor, named the same way; a verified JWT subject or actor
 the gateway signed itself (under its DID or the MCP issuer) is refused
 (`reject_self_issued`, `invalid_request`) unless, on `/oauth2/token`, it is one
 of the gateway's own access tokens (`typ: JWT`), so its ID-JAGs are consumed only

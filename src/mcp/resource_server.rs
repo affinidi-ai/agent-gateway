@@ -653,7 +653,7 @@ impl McpResourceServerConfig {
             .and_then(Value::as_str)
             != Some(profile.issuer.as_str())
             || profile
-                .validate_subject(claims, now)
+                .validate_subject(claims, crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM, now)
                 .is_err()
             || !claims
                 .get("aud")

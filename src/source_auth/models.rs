@@ -457,6 +457,15 @@ impl AuthenticatedIdentity {
         }
     }
 
+    /// The claim a JWT caller's verification strategy names it by; `None` for
+    /// any other mode.
+    pub fn jwt_principal_claim(&self) -> Option<&str> {
+        match self {
+            AuthenticatedIdentity::JwtBearer { principal_claim, .. } => Some(principal_claim),
+            _ => None,
+        }
+    }
+
     /// The caller's name as the credential states it: the value of the JWT
     /// strategy's principal claim (`sub` by default), the API key name, the
     /// DID, or the mTLS principal.

@@ -63,8 +63,13 @@ Point, identifies callers by the same claim.
   claim's name is part of the hash, so the same person through each is a different caller, with
   credentials of their own, and one person's value in one claim never stands for another
   person's value in the other. A surface save warns when its methods do this.
-- Token exchange ([STS](STS.md)) keeps reading `sub`, as RFC 8693 does: it passes the subject
-  token's `sub` on and does not key credentials by the identity hash.
+- Token exchange and `jwt-bearer` redemption ([STS](STS.md)) name a subject or actor token's
+  subject by the principal claim of the strategy that verified it too, so an exchanged token's
+  `sub` and `act.sub` carry that claim's value; on the MCP issuer, a subject from another issuer
+  is bound to the issuer and, when the claim is not `sub`, to the claim's name. A credential
+  provider's `consent_identity_strategy_id` matches the person who signs in to consent by its
+  strategy's claim in the same way. The gateway's own tokens, such as the MCP resource tokens and
+  ID-JAGs it issues, name their subject by `sub`.
 
 ### Several methods on one Access Point
 
