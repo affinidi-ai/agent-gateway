@@ -687,6 +687,13 @@ sends the trimmed value only when it is not blank, so a blank field means `sub`.
 strategy the field shows the stored claim, is disabled, and is left out of the update, since the
 gateway refuses a change to it.
 
+## Credentials audit tab
+
+`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
+the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
+the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
+other than `sub`.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
