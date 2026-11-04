@@ -30,6 +30,12 @@ pub use protocol_router::*;
 pub use rules_engine::*;
 pub use surface_manager::SurfaceTaskManager;
 
+/// Whether reading a request body failed because it passed the length limit
+/// it was read with.
+pub(crate) fn exceeds_length_limit(error: &axum::Error) -> bool {
+    std::error::Error::source(error).is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+}
+
 // ── Shared identity engine compilation ──────────────────────────────────────
 
 /// Compiled identity engines (rules engine + selector) for a channel or variant.

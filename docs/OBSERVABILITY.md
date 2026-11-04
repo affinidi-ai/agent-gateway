@@ -73,9 +73,12 @@ counter incremented once for each A2A or AP2 request that reaches
 [version negotiation](PROTOCOLS.md#version-negotiation), whether its `A2A-Version` negotiates or is
 refused. A request answered before that step is not counted: for example agent-card discovery, and
 refusals by source authentication, rate limiting, gateway or appliance-wide policy, or the AP2 gate.
-A request later refused by delegated payment, the egress guard or the request-body size limit
-(HTTP `413`) is counted. A request to a `fabric://` target is negotiated and counted on the sending
-gateway; the receiving gateway does not count it again.
+A request body over `[a2a] max_body_size` is refused with HTTP `413` as it is read, before version
+negotiation, and is not counted. A request later refused by delegated payment or the egress guard
+is counted, and so is one whose body grows past the size limit only once the gateway changes it
+(an AP2 transformation or injected metadata) and is then refused with `413`. A request to a
+`fabric://` target is negotiated and counted on the sending gateway; the receiving gateway does not
+count it again.
 
 | Label | Value |
 | --- | --- |
@@ -382,7 +385,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
     resolves its surface and variant when it opens, so one to a surface or variant that is not
     available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
-  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+  - `admission`: `body_too_large` (an Access Point or Transit Point request body over its limit,
+    MCP or not; the shared-host `/outbound` hop's own refusals, of a declared `Content-Length`
+    over `[a2a] max_body_size` and of a body above it for an MCP Transit Point with a larger
+    limit, are logged with the caller's address and not recorded),
+    `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
     `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol

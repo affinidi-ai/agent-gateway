@@ -76,6 +76,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Failed to read request body: {0}")]
     BodyReadFailed(String),
 
+    #[error("Request body too large (max: {0})")]
+    BodyTooLarge(usize),
+
     #[error("Request protocol '{detected}' does not match transit point protocol '{expected}'")]
     ProtocolMismatch { expected: String, detected: String },
 
@@ -289,6 +292,8 @@ impl OutboundPipelineError {
             Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
                 StatusCode::BAD_REQUEST
             }
+
+            Self::BodyTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
 
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
@@ -2294,12 +2299,28 @@ async fn step_extract_protocol_context_with_versions(
             req.into_body(),
             mcp_http
                 .as_ref()
-                .map_or(usize::MAX, |policy| policy.body_limit()),
+                .map_or(state.max_request_bytes, |policy| policy.body_limit()),
         )
         .await
         .map_err(|error| {
             if let Some(policy) = &mcp_http {
-                return OutboundPipelineError::McpValidation(policy.body_read_error(error));
+                let error = policy.body_read_error(error);
+                if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                    crate::audit::request_events::mcp_request_rejected(
+                        &crate::audit::request_events::RequestFacts {
+                            surface_id: &ctx.surface.surface_id,
+                            channel_name: &ctx.surface.name,
+                            trace_id: Some(&ctx.request_id),
+                            via_fabric: false,
+                        },
+                        &error,
+                    );
+                }
+                return OutboundPipelineError::McpValidation(error);
+            }
+            if crate::proxy::exceeds_length_limit(&error) {
+                record_body_too_large(ctx, state.max_request_bytes);
+                return OutboundPipelineError::BodyTooLarge(state.max_request_bytes);
             }
             OutboundPipelineError::BodyReadFailed(error.to_string())
         })?;
@@ -4896,6 +4917,32 @@ fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
     );
 }
 
+/// Logs and records, as a `request_rejected` at the `admission` stage, a
+/// request body over `max_bytes`.
+fn record_body_too_large(
+    ctx: &OutboundPipelineContext,
+    max_bytes: usize,
+) {
+    warn!(
+        request_id = %ctx.request_id,
+        transit_point = %ctx.virtual_channel.alias,
+        max = max_bytes,
+        "Request body too large"
+    );
+    crate::audit::request_events::request_rejected(
+        &crate::audit::request_events::RequestFacts {
+            surface_id: &ctx.surface.surface_id,
+            channel_name: &ctx.surface.name,
+            trace_id: Some(&ctx.request_id),
+            via_fabric: false,
+        },
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::BodyTooLarge,
+        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        None,
+    );
+}
+
 /// [`record_partner_consent_refusal`], and the refusal itself.
 fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
     record_partner_consent_refusal(ctx);
@@ -7256,6 +7303,7 @@ mod tests {
             gateway_base_url: None,
             task_monitor: None,
             max_response_bytes: crate::config::A2aConfig::default().max_body_size,
+            max_request_bytes: crate::config::A2aConfig::default().max_body_size,
             egress_allowlist: None,
             vc_alias_override: None,
         }
@@ -20856,5 +20904,304 @@ mod tests {
         }
 
         assert_eq!(recorded_connection_statuses(&metrics).await, [crate::metrics::ConnectionStatus::Failed]);
+    }
+
+    type Rejections =
+        Vec<(crate::audit::request_events::RejectionStage, crate::audit::request_events::RejectionReason, Option<u16>)>;
+
+    fn rejections_of(events: Vec<crate::delegation_vault::audit::DelegationAuditEvent>) -> Rejections {
+        events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    ..
+                } => Some((stage, reason, http_status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A listener state serving one open Transit Point `/outbound/a2a/partner`
+    /// of `protocol`, whose request cap is `max_request_bytes`.
+    fn open_transit_point_state(
+        protocol: &str,
+        mcp_http: Option<serde_json::Value>,
+        max_request_bytes: usize,
+    ) -> OutboundProxyState {
+        let mut point = json!({"alias": "partner", "protocol": protocol, "require_transit_token": false,
+            "allow_unauthenticated_callers": true, "target_endpoint": "http://127.0.0.1:1"});
+        if let Some(mcp_http) = mcp_http {
+            point["mcp_http"] = mcp_http;
+        }
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "body-surface", "name": "Body surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"points": [point]}
+        }))
+        .unwrap();
+        let mut state = test_outbound_state();
+        state.max_request_bytes = max_request_bytes;
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        state
+    }
+
+    /// The answer of the listener with `state` to `request`, and the
+    /// `request_rejected` records it wrote.
+    async fn serve_transit_point(
+        state: OutboundProxyState,
+        request: Request<axum::body::Body>,
+    ) -> (Response, Rejections) {
+        let (response, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        )))
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        (response, rejections_of(events))
+    }
+
+    /// The status, body and `request_rejected` records of a call to an open
+    /// Transit Point of `protocol` with `body`, on a listener whose request cap
+    /// is `max_request_bytes`.
+    async fn transit_point_body_outcome(
+        protocol: &str,
+        mcp_http: Option<serde_json::Value>,
+        max_request_bytes: usize,
+        body: axum::body::Body,
+    ) -> (StatusCode, String, Rejections) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/outbound/a2a/partner")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body)
+            .unwrap();
+        let (response, rejections) =
+            serve_transit_point(open_transit_point_state(protocol, mcp_http, max_request_bytes), request).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+    }
+
+    /// Through the shared-host hop, a chunked body over the cap still reaches
+    /// the Transit Point past its cap, whatever size its chunks, so the Transit
+    /// Point refuses it and records one `request_rejected` at admission, and
+    /// the caller gets 413.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_body_over_the_cap_sent_through_the_shared_host() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        const CAP: usize = 64 * 1024;
+
+        for chunk in [1024, 256 * 1024, 400 * 1024, 600 * 1024] {
+            let endless = axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+                Ok::<_, std::io::Error>(Bytes::from(vec![b' '; chunk]))
+            }));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/a2a/partner")
+                .header("content-type", "application/json")
+                .body(endless)
+                .unwrap();
+            let (status, body, rejections) =
+                through_the_shared_host(open_transit_point_state("a2a", None, CAP), CAP, request).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{chunk}: {body}");
+            assert!(body.contains(&format!("Request body too large (max: {CAP})")), "{chunk}: {body}");
+            assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))], "{chunk}");
+        }
+    }
+
+    /// Through the shared-host hop, a 2 MiB body to an MCP Transit Point with
+    /// the default `mcp_http` (1 MiB), declared or chunked, is refused by the
+    /// Transit Point with one `request_rejected` at admission. The caller gets
+    /// its JSON-RPC 413, or a 502 when the reset of the unread body overtakes
+    /// that answer at the hop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_transit_point_records_a_body_over_its_limit_sent_through_the_shared_host() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        const BODY: usize = 2 * 1024 * 1024;
+        let cap = crate::config::A2aConfig::default().max_body_size;
+
+        for declared in [true, false] {
+            let body = if declared {
+                axum::body::Body::from(vec![b' '; BODY])
+            } else {
+                axum::body::Body::from_stream(futures::stream::iter(
+                    (0..BODY / (64 * 1024)).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 64 * 1024]))),
+                ))
+            };
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/outbound/a2a/partner")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION);
+            if declared {
+                request = request.header("content-length", BODY);
+            }
+            let (status, body, rejections) =
+                through_the_shared_host(open_transit_point_state("mcp", None, cap), cap, request.body(body).unwrap())
+                    .await;
+
+            assert_eq!(
+                rejections,
+                [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))],
+                "declared: {declared}"
+            );
+            match status {
+                StatusCode::PAYLOAD_TOO_LARGE => {
+                    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["error"]["message"], "MCP request body exceeds the configured limit");
+                }
+                StatusCode::BAD_GATEWAY => {}
+                other => panic!("declared: {declared}: unexpected {other}: {body}"),
+            }
+        }
+    }
+
+    /// The status and body the shared-host hop, with a request cap of `cap`,
+    /// answers `request` with, and the `request_rejected` records of the one
+    /// request it forwards to a listener with `state`.
+    async fn through_the_shared_host(
+        state: OutboundProxyState,
+        cap: usize,
+        request: Request<axum::body::Body>,
+    ) -> (StatusCode, String, Rejections) {
+        let (recorded, mut records) = tokio::sync::mpsc::unbounded_channel();
+        let listener_app = axum::Router::new().fallback(move |request: Request<axum::body::Body>| {
+            let (state, recorded) = (state.clone(), recorded.clone());
+            async move {
+                let (response, rejections) = serve_transit_point(state, request).await;
+                let _ = recorded.send(rejections);
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, listener_app).await });
+        let hop = Arc::new(crate::proxy::server::SharedHostHop {
+            target,
+            client: crate::http_client::shared_host_hop(std::time::Duration::from_secs(30)).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes: cap,
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::proxy::server::forward_shared_host_hop(hop, request),
+        )
+        .await
+        .expect("the hop must answer instead of forwarding the whole body");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let rejections = tokio::time::timeout(std::time::Duration::from_secs(10), records.recv())
+            .await
+            .expect("the Transit Point must answer the forwarded request")
+            .unwrap();
+        assert!(records.try_recv().is_err(), "the hop forwarded more than one request");
+        (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+    }
+
+    fn jsonrpc_body_of(length: usize) -> axum::body::Body {
+        let envelope = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"pad": ""}}).to_string();
+        let padded = envelope.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(length - envelope.len())));
+        assert_eq!(padded.len(), length);
+        axum::body::Body::from(padded)
+    }
+
+    /// A Transit Point without `mcp_http` refuses a body over the listener's
+    /// request cap with 413 and one `request_rejected` at admission, and reads
+    /// a body of exactly the cap.
+    #[tokio::test]
+    async fn a_transit_point_refuses_a_body_over_the_request_cap_with_413() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, jsonrpc_body_of(1025)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large (max: 1024)"), "{body}");
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))]);
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, jsonrpc_body_of(1024)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !rejections
+                .iter()
+                .any(|(_, reason, _)| *reason == RejectionReason::BodyTooLarge),
+            "{rejections:?}"
+        );
+    }
+
+    /// A body the caller fails to send is still a 400, not a 413, and is not
+    /// recorded as too large.
+    #[tokio::test]
+    async fn a_transit_point_answers_a_failed_body_read_with_400() {
+        let failing = axum::body::Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]));
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, failing).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Failed to read request body"), "{body}");
+        assert!(rejections.is_empty(), "{rejections:?}");
+    }
+
+    /// An MCP Transit Point keeps its own `mcp_http.max_request_bytes` when it
+    /// is above the listener's request cap.
+    #[tokio::test]
+    async fn an_mcp_transit_point_keeps_its_own_request_limit() {
+        let tools_call = |length: usize| {
+            let envelope =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "pad": ""}})
+                    .to_string();
+            axum::body::Body::from(
+                envelope.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(length - envelope.len()))),
+            )
+        };
+        let larger = Some(json!({"max_request_bytes": 4096}));
+
+        let (status, body, rejections) =
+            transit_point_body_outcome("mcp", larger.clone(), 1024, tools_call(3000)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !rejections
+                .iter()
+                .any(|(_, reason, _)| *reason == crate::audit::request_events::RejectionReason::BodyTooLarge),
+            "{rejections:?}"
+        );
+
+        let (status, body, rejections) = transit_point_body_outcome("mcp", larger, 1024, tools_call(4097)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["message"], "MCP request body exceeds the configured limit");
+        assert_eq!(
+            rejections,
+            [(
+                crate::audit::request_events::RejectionStage::Admission,
+                crate::audit::request_events::RejectionReason::BodyTooLarge,
+                Some(413)
+            )]
+        );
     }
 }

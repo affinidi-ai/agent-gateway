@@ -68,6 +68,11 @@ async fn resolve_legacy_mcp_session(
 /// Longest upstream `Mcp-Session-Id` the gateway records client capabilities under.
 const MAX_UPSTREAM_SESSION_ID_LEN: usize = 1024;
 
+/// Largest DID Auth challenge or authenticate request body: a DID, an EdDSA or
+/// ES256 compact JWS whose `kid` repeats that DID, and an optional channel name
+/// take a few KiB even for a long `did:peer` or `did:webvh`.
+const DID_AUTH_MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// The upstream's `Mcp-Session-Id` from an `initialize` response: `Ok(None)`
 /// when it sent none, `Err` when it sent one the gateway can't use as a key
 /// (several values, or not visible ASCII as the MCP spec requires).
@@ -1740,9 +1745,15 @@ async fn proxy_handler_with_mcp_runtime(
 
             // Read the request body
             let (_parts, body) = req.into_parts();
-            let body_bytes = axum::body::to_bytes(body, usize::MAX)
+            let body_bytes = axum::body::to_bytes(body, DID_AUTH_MAX_BODY_BYTES)
                 .await
                 .map_err(|e| {
+                    if crate::proxy::exceeds_length_limit(&e) {
+                        return create_error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            &format!("Request body too large (max: {DID_AUTH_MAX_BODY_BYTES})"),
+                        );
+                    }
                     create_error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e))
                 })?;
 
@@ -2260,14 +2271,34 @@ async fn proxy_handler_with_mcp_runtime(
 
     // Extract body early for payment verification and fabric forwarding
     // Body is needed to check payment requirements based on request content
-    let mut body_bytes = axum::body::to_bytes(
+    let body_read = axum::body::to_bytes(
         req.into_body(),
         mcp_http
             .as_ref()
-            .map_or(usize::MAX, |policy| policy.body_limit()),
+            .map_or(state.config.a2a.max_body_size, |policy| policy.body_limit()),
     )
-    .await
-    .map_err(|e| {
+    .await;
+    if let Err(e) = &body_read
+        && mcp_http.is_none()
+        && crate::proxy::exceeds_length_limit(e)
+    {
+        warn!(channel = channel_name, max = state.config.a2a.max_body_size, "Request body too large");
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::BodyTooLarge,
+            413,
+            None,
+        );
+        connection_guard
+            .decrement()
+            .await;
+        return Err(create_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("Request body too large (max: {})", state.config.a2a.max_body_size),
+        ));
+    }
+    let mut body_bytes = body_read.map_err(|e| {
         error!(channel = channel_name, error = %e, "Failed to read request body");
         // Track error (connection guard will be dropped automatically)
         if let (Some(task_monitor), Some(task_id)) = (&state.task_monitor, &state.task_id) {
@@ -18204,6 +18235,108 @@ allow if {
         );
     }
 
+    /// An Access Point stops reading an endless body from a caller without a
+    /// credential once it passes `a2a.max_body_size`, answers 413 and records
+    /// one `request_rejected`; it reads a body of exactly the cap.
+    async fn access_point_caps_an_endless_body_as_it_reads_it(state: &crate::state::ProxyState) {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 64 * 1024;
+        const CHUNK: usize = 1024;
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
+        )
+        .await;
+        let surface = || -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "endless-body", "name": "Endless body",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": target.url()}
+            }))
+            .unwrap()
+        };
+        let mut capped_config = (*state.config).clone();
+        capped_config
+            .a2a
+            .max_body_size = CAP;
+        let capped_state = crate::state::ProxyState {
+            config: std::sync::Arc::new(capped_config),
+            ..state.clone()
+        };
+        let call = |body: axum::body::Body| {
+            let router = direct_router_state(&capped_state, surface());
+            async move {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/a2a/rpc")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap();
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        None,
+                    )))
+                    .await;
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let rejections = events
+                    .into_iter()
+                    .filter_map(|event| match event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason,
+                            http_status,
+                            ..
+                        } => Some((stage, reason, http_status)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+            }
+        };
+        let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = pulled.clone();
+        let endless = axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            counted.fetch_add(CHUNK, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b' '; CHUNK]))
+        }));
+
+        let (status, body, rejections) = tokio::time::timeout(std::time::Duration::from_secs(10), call(endless))
+            .await
+            .expect("the Access Point must answer instead of reading an endless body");
+
+        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains(&format!("Request body too large (max: {CAP})")), "{body}");
+        assert!(pulled.load(Ordering::SeqCst) <= CAP + CHUNK, "pulled {} bytes", pulled.load(Ordering::SeqCst));
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))]);
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        let envelope = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": ""}]
+        }}})
+        .to_string();
+        let exact = envelope.replacen(r#""text":"""#, &format!(r#""text":"{}""#, "x".repeat(CAP - envelope.len())), 1);
+        assert_eq!(exact.len(), CAP);
+        let (status, body, rejections) = call(axum::body::Body::from(exact)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(rejections.is_empty(), "{rejections:?}");
+    }
+
     /// Each refusal the Access Point answers itself is recorded as
     /// `request_rejected` with the status and JSON-RPC code the caller got.
     async fn access_point_records_request_refusals(state: &crate::state::ProxyState) {
@@ -19799,6 +19932,7 @@ allow if {
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
+        access_point_caps_an_endless_body_as_it_reads_it(&state).await;
         access_point_requests_each_carry_their_own_request_id(&state).await;
         streamed_response_records_carry_the_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();

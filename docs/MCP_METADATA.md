@@ -188,7 +188,7 @@ Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `allowed_origins` | `[]` | Additional exact serialized HTTP(S) origins, without paths, wildcards or credentials. |
-| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. |
+| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. On a Transit Point reached through the `/outbound/...` hop of an inbound listener that shares its host name, a body is also bounded by `[a2a] max_body_size`; see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). |
 | `max_header_bytes` | `16384` | Sum of header-name bytes, value bytes and four framing bytes per field. |
 | `max_accept_ranges` | `32` | Maximum nonempty parsed Accept media ranges across repeated fields. |
 | `max_response_bytes` | `1048576` | Maximum modern JSON response or normalized SSE event bytes. |
