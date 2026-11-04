@@ -127,16 +127,10 @@ pub async fn write_secret_file(
 }
 
 /// Create a secret file, in the form [`write_secret_file`] would write, only when
-/// neither form exists yet. The file is readable by its owner only. Returns
-/// `false`, leaving the existing file untouched, when the file already exists,
-/// including when another process sharing the directory creates it at the same
-/// moment: the content is written in full to a temporary file and then
-/// hard-linked into place, which fails rather than replacing a file, so exactly
-/// one creator wins and no reader sees a partly written file. The directory must
-/// therefore support hard links; one that does not fails the creation with an
-/// error saying so. Creators that disagree on encryption at rest can each create
-/// a different form at once; a creator that then finds the other form beside its
-/// own removes its own and fails, so no two keys stay in use.
+/// neither form exists yet, through [`create_owner_only_file`]. Creators that
+/// disagree on encryption at rest can each create a different form at once; a
+/// creator that then finds the other form beside its own removes its own and
+/// fails, so no two keys stay in use.
 pub async fn create_secret_file(
     path: &Path,
     contents: &str,
@@ -155,45 +149,80 @@ pub async fn create_secret_file(
         ),
         None => (path.to_path_buf(), enc_path, contents.to_string()),
     };
-    let mut staged = target
+    if !create_owner_only_file(&target, bytes.as_bytes()).await? {
+        return Ok(false);
+    }
+    settle_created_secret_file(&target, &other_form).await
+}
+
+/// Create `path` holding `bytes`, readable by its owner only, only when it does
+/// not exist yet, as plaintext whatever the encryption at rest setting. Returns
+/// `false`, leaving the existing file untouched, when the file already exists,
+/// including when another process sharing the directory creates it at the same
+/// moment: the content is written in full to a temporary file and then
+/// hard-linked into place, which fails rather than replacing a file, so exactly
+/// one creator wins and no reader sees a partly written file. The directory must
+/// therefore support hard links; one that does not fails the creation with an
+/// error saying so.
+pub(crate) async fn create_owner_only_file(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<bool> {
+    let mut staged = path
         .as_os_str()
         .to_os_string();
     staged.push(format!(".{}.new", uuid::Uuid::new_v4()));
     let staged = PathBuf::from(staged);
-    if let Err(error) = write_owner_only(&staged, bytes.as_bytes()).await {
+    if let Err(error) = write_owner_only(&staged, bytes).await {
         let _ = tokio::fs::remove_file(&staged).await;
-        return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
+        return Err(error).with_context(|| format!("Failed to write secret file {}", path.display()));
     }
-    let linked = tokio::fs::hard_link(&staged, &target).await;
+    let linked = link_if_absent(&staged, path).await;
     if let Err(error) = tokio::fs::remove_file(&staged).await {
         warn!("Failed to remove staged secret file {}: {}", staged.display(), error);
     }
-    match linked {
-        Ok(()) => settle_created_secret_file(&target, &other_form).await,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Failed to create secret file {} by hard-linking a complete copy into place; its directory must be on \
-                 a filesystem that supports hard links",
-                target.display()
-            )
-        }),
-    }
+    linked
 }
 
-/// Make a just-linked secret file durable, and give it up again when the other
-/// form of the same secret now exists beside it. Every creator checks after
-/// linking, so of two creators of different forms at least one sees the other.
+/// Make `source` also appear at `path`, only when `path` does not exist yet,
+/// through a hard link, which fails rather than replacing a file, so of the
+/// processes sharing the directory exactly one gives `path` its file. Returns
+/// `false`, leaving the existing file untouched, when `path` already exists. The
+/// directory must support hard links; one that does not fails with an error
+/// saying so.
+pub(crate) async fn link_if_absent(
+    source: &Path,
+    path: &Path,
+) -> Result<bool> {
+    match tokio::fs::hard_link(source, path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to create secret file {} by hard-linking a complete copy into place; its directory must \
+                     be on a filesystem that supports hard links",
+                    path.display()
+                )
+            });
+        }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        crate::storage::filesystem::sync_directory(parent)
+            .await
+            .with_context(|| format!("Failed to sync the directory of secret file {}", path.display()))?;
+    }
+    Ok(true)
+}
+
+/// Give up a just-created secret file again when the other form of the same
+/// secret now exists beside it. Every creator checks after creating, so of two
+/// creators of different forms at least one sees the other.
 async fn settle_created_secret_file(
     target: &Path,
     other_form: &Path,
 ) -> Result<bool> {
-    #[cfg(unix)]
-    if let Some(parent) = target.parent() {
-        crate::storage::filesystem::sync_directory(parent)
-            .await
-            .with_context(|| format!("Failed to sync the directory of secret file {}", target.display()))?;
-    }
     if !other_form.exists() {
         return Ok(true);
     }
@@ -537,6 +566,54 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("key.json")], "no staged file may be left behind");
+    }
+
+    #[tokio::test]
+    async fn owner_only_file_is_created_once_and_never_replaced() {
+        install_enabled_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup-token");
+
+        let created = create_owner_only_file(&path, b"first\n")
+            .await
+            .unwrap();
+        let recreated = create_owner_only_file(&path, b"second\n")
+            .await
+            .unwrap();
+
+        assert!(created);
+        assert!(!recreated);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\n", "plaintext even with encryption at rest");
+        assert!(!secret_enc_path(&path).exists());
+        #[cfg(unix)]
+        assert_eq!(file_mode(&path), 0o600);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("setup-token")], "no staged file may be left behind");
+    }
+
+    #[tokio::test]
+    async fn link_if_absent_links_a_file_into_a_free_path_and_never_replaces_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup-token");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&first, b"first\n").unwrap();
+        std::fs::write(&second, b"second\n").unwrap();
+
+        let linked = link_if_absent(&first, &path)
+            .await
+            .unwrap();
+        let relinked = link_if_absent(&second, &path)
+            .await
+            .unwrap();
+
+        assert!(linked);
+        assert!(!relinked);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second\n", "the source of a refused link is kept");
     }
 
     #[tokio::test]
