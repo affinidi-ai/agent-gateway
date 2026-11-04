@@ -1,0 +1,19 @@
+branch: fix/tenant-scope-legacy-vault
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T12:55:20Z'
+      title: Show a tenant's access token only its own tenant's delegation vault tokens
+      description: >-
+        GET /api/v1/delegation-vault and GET /api/v1/delegation-vault/{id} returned every tenant's
+        agent-keyed tokens, as metadata, to a tenant's access token. A vault token now belongs to
+        its credential provider's tenant: a tenant's access token lists only its own tenant's, and
+        reading another answers 404 like a missing token. Tokens of an appliance-wide, missing or
+        deleted provider are shown only to appliance-wide callers, since an appliance-wide provider
+        can hold any tenant's callers' tokens. An access token scoped by required headers alone, or
+        by a resource pattern without a tenant, reads none. Sessions and appliance-wide access
+        tokens still read every token.
+  breaking: []

@@ -2,20 +2,21 @@
 
 use super::{
     DelegationToken, DelegationTokenListItem, notifier::SharedVaultPopulationNotifier, oauth,
-    storage::DelegationVaultStorage,
+    read_scope::VaultReadScope, storage::DelegationVaultStorage,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
-use crate::auth_manager::pat::PatDelegationContext;
+use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::identity::VCIssuer;
 use crate::identity::ssi::vc_issuer::VcSigner;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
+use crate::tenancy::PatTenantContext;
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -54,14 +55,46 @@ pub struct DelegationVaultState {
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
+/// What the caller may read of the agent-keyed tokens and the delegation
+/// audit. While the credential providers cannot be read, a caller that needs
+/// them is refused with `refusal` and no detail.
+async fn read_scope(
+    state: &DelegationVaultState,
+    tenant: Option<&Extension<PatTenantContext>>,
+    resource_scope: Option<&Extension<PatResourceScope>>,
+    delegation: Option<&Extension<PatDelegationContext>>,
+    action: &'static str,
+    refusal: &'static str,
+) -> Result<VaultReadScope, Response> {
+    VaultReadScope::of(
+        Some(state.provider_store.as_ref()),
+        tenant.map(|Extension(tenant)| tenant),
+        resource_scope.map(|Extension(scope)| scope),
+        delegation.map(|Extension(delegation)| delegation),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            target: "credential_delegation",
+            action,
+            error = %error,
+            "Delegation vault read refused: the credential providers could not be read"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": refusal }))).into_response()
+    })
+}
+
 /// GET /api/v1/delegation-vault
 pub async fn list_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    tenant: Option<Extension<PatTenantContext>>,
+    resource_scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    // Fail closed: listing enumerates every user's/agent's grants, so it must be
-    // attributable to an authenticated actor — symmetric with the revokes.
+    // Fail closed: the list shows other users' and agents' grants, every one
+    // the caller's read scope covers, so it must be attributable to an
+    // authenticated actor, as the revokes are.
     if management_caller_context(caller.as_ref(), delegation.as_ref()).is_none() {
         warn!(
             target: "credential_delegation",
@@ -71,6 +104,19 @@ pub async fn list_tokens(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let reader = match read_scope(
+        &state,
+        tenant.as_ref(),
+        resource_scope.as_ref(),
+        delegation.as_ref(),
+        "list",
+        "Failed to list",
+    )
+    .await
+    {
+        Ok(reader) => reader,
+        Err(refused) => return refused,
+    };
 
     match state
         .vault_store
@@ -80,13 +126,14 @@ pub async fn list_tokens(
         Ok(tokens) => {
             let items: Vec<DelegationTokenListItem> = tokens
                 .iter()
+                .filter(|t| reader.reads(Some(&t.credential_provider_id)))
                 .map(|t| t.into())
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(items).unwrap())).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to list: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "list", error = %e, "Delegation token list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to list"}))).into_response()
         }
     }
 }
@@ -96,6 +143,8 @@ pub async fn get_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    tenant: Option<Extension<PatTenantContext>>,
+    resource_scope: Option<Extension<PatResourceScope>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a single-grant read must be attributable to an authenticated
@@ -110,23 +159,30 @@ pub async fn get_token(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let reader =
+        match read_scope(&state, tenant.as_ref(), resource_scope.as_ref(), delegation.as_ref(), "get", "Failed to get")
+            .await
+        {
+            Ok(reader) => reader,
+            Err(refused) => return refused,
+        };
 
     match state
         .vault_store
         .get(&id)
         .await
     {
-        Ok(Some(token)) => {
+        Ok(Some(token)) if reader.reads(Some(&token.credential_provider_id)) => {
             // Return metadata only — never expose access_token/refresh_token via API
             let item: DelegationTokenListItem = (&token).into();
             (StatusCode::OK, Json(serde_json::to_value(item).unwrap())).into_response()
         }
-        Ok(None) => {
+        Ok(_) => {
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to get: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "get", error = %e, "Delegation token read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to get"}))).into_response()
         }
     }
 }

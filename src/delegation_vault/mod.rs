@@ -18,6 +18,7 @@ pub mod jwt_assertion;
 pub mod modern_consent;
 pub mod notifier;
 pub mod oauth;
+pub mod read_scope;
 pub mod release;
 pub mod revocation;
 pub mod router;

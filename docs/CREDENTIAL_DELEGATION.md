@@ -1489,8 +1489,9 @@ Who may call it:
 
 - Starting and completing a connect, and the report, need `delegation_vault.connect`, and
   removal `delegation_vault.delete`; only administrators hold them by default. A token
-  provisioned for the connect API never needs `delegation_vault.view`, which also reads every
-  tenant's agent-keyed tokens.
+  provisioned for the connect API never needs `delegation_vault.view`, which also reads the
+  agent-keyed tokens: every tenant's for an appliance-wide caller, and only its own tenant's for
+  a tenant's token (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens)).
 - A tenant's access token reaches only its own tenant's surfaces and their connects and grants,
   and within its resource pattern, which names them as `delegation-vault:<surface id>` (for
   example `TENANT:${x-tenant}:(?:delegation-vault:.*|...)`); another tenant's surface answers
@@ -1716,6 +1717,11 @@ Nor can a provider move into a tenant that already has a provider with its `prov
 for its whole check and change, so no surface write binds the provider in between; a delete
 releases it before its grants are revoked.
 
+A move carries the provider's agent-keyed vault entries into the new tenant's view and out of
+the old one's, since an entry belongs to its provider's current tenant
+([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens)). An appliance-wide provider's
+entries can belong to any tenant's callers: revoke them before moving it into a tenant.
+
 ### Removing grants
 
 Grants by binding are removed one by one or by binding, and each removed grant is deleted, then
@@ -1828,13 +1834,16 @@ leave out all four.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens |
-| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry |
+| `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens; a tenant's access token lists only its own tenant's |
+| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
 | `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |
 | `GET /api/v1/delegation-audit` | The delegation audit log |
+
+A vault entry belongs to the tenant of its credential provider; see
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens).
 
 ### Removing grants keyed by the old identity hash
 
