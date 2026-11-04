@@ -388,7 +388,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   - `admission`: `body_too_large` (an Access Point or Transit Point request body over its limit,
     MCP or not; the shared-host `/outbound` hop's own refusals, of a declared `Content-Length`
     over `[a2a] max_body_size` and of a body above it for an MCP Transit Point with a larger
-    limit, are logged with the caller's address and not recorded),
+    limit, are logged with the caller's address and not recorded, and a DID Auth challenge or
+    authenticate body over its 64 KiB limit is refused before any record is built),
     `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),

@@ -3416,7 +3416,7 @@ mod tests {
         ]))
     }
 
-    /// The hop answers its own refusals as a JSON-RPC error with a null id
+    /// The hop answers its own refusals as a JSON-RPC error with no id
     /// when the request names an MCP protocol version, and as an A2A problem
     /// otherwise.
     #[tokio::test]
@@ -3448,7 +3448,7 @@ mod tests {
             assert_eq!(headers["content-type"], "application/json", "{case}");
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["jsonrpc"], "2.0", "{case}");
-            assert_eq!(body["id"], serde_json::Value::Null, "{case}");
+            assert!(body.get("id").is_none(), "{case}: {body}");
             assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{case}");
             assert_eq!(body["error"]["message"], message, "{case}");
         }
@@ -3629,8 +3629,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(pulled.load(Ordering::SeqCst), settled, "the hop kept pulling the refused body");
         assert!(
-            settled <= 2 * 1024 * 1024,
-            "pulled {settled} bytes, more than the socket and transport buffers between the hop and the listener hold"
+            settled <= limit / 2,
+            "pulled {settled} bytes of a body the listener refused; only socket and transport buffers, well under the {limit}-byte cap, should be read"
         );
     }
 

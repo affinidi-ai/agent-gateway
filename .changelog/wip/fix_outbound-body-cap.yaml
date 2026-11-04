@@ -9,14 +9,6 @@ changes:
         start with it and names the setting in the error; the minimum is 1 byte.
   fixed:
     - timestamp: '2026-11-03T18:00:00Z'
-      title: Answer MCP callers of the shared-host hop with a JSON-RPC error
-      description: >-
-        When the /outbound/... hop of an inbound listener sharing a host name with an outbound
-        listener refuses a request body itself, with 413 for one over a2a.max_body_size or 400
-        for one the caller failed to send, a request carrying an MCP-Protocol-Version header now
-        gets the JSON-RPC error with a null id that MCP endpoints answer with, instead of an A2A
-        problem.
-    - timestamp: '2026-11-03T18:00:00Z'
       title: Record an MCP Transit Point's refusal of an oversize body
       description: >-
         An MCP Transit Point answered a body over its mcp_http.max_request_bytes with 413 but
@@ -36,8 +28,9 @@ changes:
         refusal and stops it after the chunk that takes it 512 KiB past the limit, logs its own
         refusals with the caller's address, and refuses a body the caller fails to send with
         400, so the Transit Point refuses an unauthenticated caller after reading little of its
-        body. Access Points
-        cap the body at a2a.max_body_size as they read it, and the DID Auth challenge and
+        body. The hop's own 413 and 400 are a JSON-RPC error with no id for a request carrying an
+        MCP-Protocol-Version header, and an A2A problem otherwise. Access Points cap the body at
+        a2a.max_body_size as they read it, and the DID Auth challenge and
         authenticate endpoints at 64 KiB, so an unauthenticated caller can no longer make the
         gateway hold an unbounded body. An A2A or AP2 request refused this way is answered
         before version negotiation and is no longer counted in

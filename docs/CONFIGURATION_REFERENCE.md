@@ -237,7 +237,7 @@ the refusal; the hop stops it after the chunk that takes it 512 KiB past the lim
 an MCP Transit Point with a larger limit reaches. Those two hop refusals, the declared length
 and the MCP limit above `max_body_size`, are not recorded as `request_rejected`; the hop logs
 them with the caller's address. A body the caller fails to send is refused with `400`. The
-hop's own `413` and `400` are a JSON-RPC error with a `null` id and code `-32600` when the
+hop's own `413` and `400` are a JSON-RPC error with no `id` and code `-32600` when the
 request carries an `MCP-Protocol-Version` header, as an MCP endpoint answers, and an A2A
 problem (`application/problem+json`) otherwise. A refusal the outbound listener answers
 before it reads the whole body (a transit token `401` or `403`, a rate limit `429`, or an

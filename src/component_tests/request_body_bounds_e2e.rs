@@ -566,7 +566,7 @@ async fn an_mcp_transit_point_keeps_a_request_limit_above_the_appliance_cap() {
     .await;
     assert_eq!(status, 413, "{body}");
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(body["id"], serde_json::Value::Null);
+    assert!(body.get("id").is_none(), "{body}");
     assert_eq!(body["error"]["message"], "MCP request body exceeds the configured limit");
     assert_eq!(
         harness
