@@ -330,6 +330,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               </div>
               <input
                 id="principal_claim"
+                data-testid="jwt-strategy-editor-principal-claim-input"
                 name="principal_claim"
                 type="text"
                 className="form-control"

@@ -678,6 +678,15 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategy editor
+
+`/jwt-verification-strategies/new` and `/jwt-verification-strategies/:id`
+(`EditJwtVerificationStrategyPage.tsx`) have a **Caller identity claim** field
+(`jwt-strategy-editor-principal-claim-input`), the strategy's `principal_claim`. A new strategy
+sends the trimmed value only when it is not blank, so a blank field means `sub`. On an existing
+strategy the field shows the stored claim, is disabled, and is left out of the update, since the
+gateway refuses a change to it.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
