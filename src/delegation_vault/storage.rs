@@ -1709,7 +1709,9 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         let id = id.to_string();
         let recorded = self
             .try_mutate(move |store| async move {
-                if let Some(mut grant) = store.grants.get(&id).await? {
+                if let Some(mut grant) = store.grants.get(&id).await?
+                    && grant.use_is_due(Utc::now())
+                {
                     grant.last_used_at = Some(Utc::now());
                     store
                         .grants
@@ -1954,12 +1956,15 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     }
 
     async fn deferred_revocations(&self) -> Result<Vec<DeferredRevocation>> {
+        let ids =
+            ids_with_prefix(&self.deferred_revocations_directory, "", deferred_revocation::is_deferred_revocation_id)
+                .await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         self.require_encryption()?;
         let mut deferred = Vec::new();
-        for id in
-            ids_with_prefix(&self.deferred_revocations_directory, "", deferred_revocation::is_deferred_revocation_id)
-                .await?
-        {
+        for id in ids {
             match self
                 .deferred_revocations
                 .get(&id)
@@ -4133,6 +4138,33 @@ mod tests {
                 .unwrap()
                 .last_used_at
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn using_a_grant_again_within_the_interval_keeps_its_recorded_use() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let recent = Utc::now() - chrono::Duration::seconds(60);
+        let mut used = grant(&key(), "access");
+        used.last_used_at = Some(recent);
+        vault
+            .store_grant(used)
+            .await
+            .unwrap();
+        vault
+            .mark_grant_used(&key().record_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at,
+            Some(recent)
         );
     }
 

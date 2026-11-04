@@ -126,7 +126,9 @@ impl Sweeper {
                 if crate::server::mode::is_standby() {
                     continue;
                 }
-                let report = self.sweep(Utc::now()).await;
+                let report = self
+                    .sweep_while(Utc::now(), || !crate::server::mode::is_standby())
+                    .await;
                 tracing::info!(
                     target: "credential_delegation",
                     expired_connects = report.expired_connects,
@@ -144,9 +146,22 @@ impl Sweeper {
     }
 
     /// Sweep once, as of `now`.
+    #[cfg(test)]
     pub async fn sweep(
         &self,
         now: DateTime<Utc>,
+    ) -> SweepReport {
+        self.sweep_while(now, || true)
+            .await
+    }
+
+    /// Sweep once, as of `now`, stopping between bindings once `keep_going`
+    /// says no: a sweep waits for each binding's revocations, so it can
+    /// outlast the node being active.
+    pub async fn sweep_while(
+        &self,
+        now: DateTime<Utc>,
+        keep_going: impl Fn() -> bool,
     ) -> SweepReport {
         let mut report = SweepReport {
             expired_connects: self
@@ -204,6 +219,9 @@ impl Sweeper {
             }
         }
         for ids in bindings.into_values() {
+            if !keep_going() {
+                break;
+            }
             self.sweep_binding(ids, now, &mut providers, &mut report)
                 .await;
         }
@@ -312,7 +330,10 @@ impl Sweeper {
         if let Some(provider) = providers.get(id) {
             return Ok(provider.clone());
         }
-        let provider = self.providers.get(id).await?;
+        let provider = self
+            .providers
+            .get_checked(id)
+            .await?;
         providers.insert(id.to_string(), provider.clone());
         Ok(provider)
     }
@@ -349,7 +370,7 @@ impl Sweeper {
         let lock = crate::identity::handlers::surface_grants::lock_surface(&surface_id).await;
         let surface = match self
             .surfaces
-            .get(&surface_id)
+            .get_checked(&surface_id)
             .await
         {
             Ok(surface) => surface,
@@ -430,7 +451,7 @@ impl Sweeper {
             vault: Some(self.vault.clone()),
         };
         match super::revocation::delete_then_revoke(&self.vault, removed, revoker, lock, None).await {
-            Ok(_) => {
+            Ok(revocations) => {
                 for (_, removal) in removals {
                     match removal {
                         Removal::Unbound => report.unbound_grants += 1,
@@ -438,6 +459,11 @@ impl Sweeper {
                         Removal::Expired => report.expired_grants += 1,
                         Removal::Failing => report.failing_grants += 1,
                     }
+                }
+                // One binding's revocations at a time, so a sweep never has
+                // more vendor calls open than one revocation task allows.
+                if let Err(error) = revocations.await {
+                    tracing::warn!(target: "credential_delegation", error = %error, "A swept binding's revocations ended early");
                 }
             }
             Err(error) => {
@@ -733,6 +759,78 @@ mod tests {
             "the grant is kept"
         );
         assert!(server.requests().is_empty(), "and not revoked");
+    }
+
+    /// A surface whose file is stored but cannot be read is not a surface that
+    /// is gone: the sweep skips its binding, and removes and revokes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_skips_a_binding_whose_surface_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let mut sweeper = sweeper(&directory, &server, true).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        store(&sweeper, &key, "live", 3600).await;
+        let surfaces = directory
+            .path()
+            .join("surfaces");
+        for entry in std::fs::read_dir(&surfaces).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("surface.json")
+                })
+            {
+                std::fs::write(path, b"not a surface").unwrap();
+            }
+        }
+        sweeper.surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(surfaces)
+                .await
+                .unwrap(),
+        );
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+        assert_eq!(report.unbound_grants, 0);
+        assert_eq!(report.skipped_bindings, 1);
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the grant is kept"
+        );
+        assert!(server.requests().is_empty(), "and not revoked");
+    }
+
+    /// A sweep told to stop, as when the node is demoted, decides no further
+    /// binding: nothing is removed or revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_told_to_stop_decides_no_further_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, false).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor");
+        store(&sweeper, &key, "unbound", 3600).await;
+
+        let report = sweeper
+            .sweep_while(Utc::now(), || false)
+            .await;
+
+        assert_eq!(report.unbound_grants, 0);
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(server.requests().is_empty());
     }
 
     /// The sweep reads a binding's grants under its surface's lock, so a

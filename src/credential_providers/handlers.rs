@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::delegation_vault::oauth::TokenEgress;
+use crate::delegation_vault::storage::DeferredRevocation;
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
@@ -1161,12 +1162,40 @@ async fn remove_provider(
         saved: outcome,
         stored: Box::pin(provider_deleted(Arc::clone(&state.store), id.to_string())),
     };
-    let revocations = match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
-        Ok(revocations) => revocations,
-        Err(refused) => return (refused.into_response(), None),
+    let (revocations, kept) =
+        match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
+            Ok(removal) => removal,
+            Err(refused) => return (refused.into_response(), None),
+        };
+    // Spawned before the delete, so a delete dropped part way still decides
+    // them once the provider is gone, as the task deleting its grants does.
+    let (kept_deleted, revocations) = match state.vault.as_ref() {
+        Some(vault) if !kept.is_empty() => {
+            let (sender, outcome) = tokio::sync::oneshot::channel();
+            let revoker = provider_revoker(state, &existing, actor, vault);
+            let store = Arc::clone(&state.store);
+            let provider_id = id.to_string();
+            let task = crate::audit::producer::spawn_audited(async move {
+                let gone = match outcome.await {
+                    Ok(gone) => gone,
+                    Err(_) => provider_deleted(store, provider_id).await,
+                };
+                if let Some(revocations) = revocations {
+                    let _ = revocations.await;
+                }
+                if gone {
+                    crate::delegation_vault::revocation::decide_kept_of_deleted_provider(revoker, kept).await;
+                }
+            });
+            (Some(sender), Some(task))
+        }
+        _ => (None, revocations),
     };
     let result = state.store.delete(id).await;
     let _ = deleted.send(result.is_ok());
+    if let Some(kept_deleted) = kept_deleted {
+        let _ = kept_deleted.send(result.is_ok());
+    }
     drop(bindings);
     let response = match result {
         Ok(true) => {
@@ -1294,16 +1323,19 @@ async fn refuse_bound_provider(
 /// keeps the provider, as does a grant of this provider that cannot be read,
 /// for example because at-rest encryption is now off: it would otherwise be
 /// left unrevoked on disk. The refusal names that grant, which an operator
-/// can purge.
+/// can purge. Also returns the revocations the vault kept for the provider's
+/// earlier removals, read before these grants are deleted, for the delete to
+/// decide once the provider is gone; a vault that cannot read them keeps the
+/// provider too.
 async fn remove_provider_grants(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     bindings: Arc<tokio::sync::RwLockWriteGuard<'static, ()>>,
     outcome: crate::delegation_vault::revocation::ChangeOutcome,
-) -> Result<Option<tokio::task::JoinHandle<()>>, ProviderDeleteError> {
+) -> Result<(Option<tokio::task::JoinHandle<()>>, Vec<DeferredRevocation>), ProviderDeleteError> {
     if !provider.is_external_consent() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let Some(vault) = state.vault.as_ref() else {
         return Err(ProviderDeleteError::VaultUnavailable);
@@ -1327,23 +1359,42 @@ async fn remove_provider_grants(
             return Err(ProviderDeleteError::VaultUnavailable);
         }
     };
+    // Read before the grants below are deleted, which keep revocations of
+    // their own that the delete decides itself.
+    let kept = match crate::delegation_vault::revocation::kept_revocations_of(vault, &provider.id).await {
+        Ok(kept) => kept,
+        Err(error) => {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a provider's kept revocations");
+            return Err(ProviderDeleteError::VaultUnavailable);
+        }
+    };
     if grants.is_empty() {
-        return Ok(None);
+        return Ok((None, kept));
     }
-    let revoker = crate::delegation_vault::revocation::Revoker {
+    let revoker = provider_revoker(state, provider, actor, vault);
+    crate::delegation_vault::revocation::delete_then_revoke(vault, grants, revoker, bindings, Some(outcome))
+        .await
+        .map(|revocations| (Some(revocations), kept))
+        .map_err(|error| {
+            warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
+            ProviderDeleteError::VaultUnavailable
+        })
+}
+
+/// A revoker holding only `provider`, which revokes in `actor`'s name.
+fn provider_revoker(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
+    vault: &Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+) -> crate::delegation_vault::revocation::Revoker {
+    crate::delegation_vault::revocation::Revoker {
         providers: std::collections::HashMap::from([(provider.id.clone(), provider.clone())]),
         secrets: Some(Arc::clone(&state.secrets_store)),
         exact_allowlist: state.egress_allowlist.clone(),
         actor: actor.cloned(),
         vault: Some(Arc::clone(vault)),
-    };
-    crate::delegation_vault::revocation::delete_then_revoke(vault, grants, revoker, bindings, Some(outcome))
-        .await
-        .map(Some)
-        .map_err(|error| {
-            warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
-            ProviderDeleteError::VaultUnavailable
-        })
+    }
 }
 
 /// POST /api/v1/credential-providers/validate
@@ -3888,6 +3939,162 @@ mod external_provider_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A provider delete also decides the revocations the vault kept for the
+    /// provider's earlier removals while it still holds the provider, which a
+    /// later sweep could only forget unrevoked; another provider's are kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_provider_revokes_what_its_earlier_removals_deferred() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let vault = state.vault.clone().unwrap();
+        for (provider, token) in [("provider", "deferred"), ("other-provider", "other-deferred")] {
+            let key = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", provider);
+            let mut removed = crate::delegation_vault::grants::tests::grant(&key, token);
+            removed.id = key.record_id();
+            vault
+                .defer_revocation(removed)
+                .await
+                .unwrap();
+        }
+
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        assert_eq!(server.revoked_tokens(), ["deferred", "deferred-refresh"]);
+        let kept: Vec<_> = vault
+            .deferred_revocations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|kept| {
+                kept.grant
+                    .credential_provider_id
+            })
+            .collect();
+        assert_eq!(kept, ["other-provider"]);
+    }
+
+    /// A provider store whose delete removes the provider, says so, then never
+    /// answers, as a request dropped once the provider is gone.
+    struct DeleteThenHang(Arc<dyn CredentialProviderStorage>, Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl CredentialProviderStorage for DeleteThenHang {
+        async fn create(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.create(provider).await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0.get(id).await
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
+            self.0.list().await
+        }
+
+        async fn update(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.update(provider).await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<bool> {
+            self.0.delete(id).await?;
+            self.1.notify_one();
+            std::future::pending().await
+        }
+
+        async fn find_by_provider_id(
+            &self,
+            tenant_id: Option<&str>,
+            provider_id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0
+                .find_by_provider_id(tenant_id, provider_id)
+                .await
+        }
+    }
+
+    /// A provider delete dropped once the provider is gone still revokes what
+    /// the provider's earlier removals deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_delete_dropped_part_way_still_revokes_what_was_deferred() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let mut state = delete_state(&directory, &server).await;
+        let deleted = Arc::new(tokio::sync::Notify::new());
+        state.store = Arc::new(DeleteThenHang(Arc::clone(&state.store), Arc::clone(&deleted)));
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        let mut removed = crate::delegation_vault::grants::tests::grant(&key, "deferred");
+        removed.id = key.record_id();
+        state
+            .vault
+            .as_ref()
+            .unwrap()
+            .defer_revocation(removed)
+            .await
+            .unwrap();
+
+        let context = tenant("tenant-a");
+        tokio::select! {
+            _ = remove_provider(&state, "provider", &context, &None, None) => {
+                panic!("the delete never answers")
+            }
+            _ = deleted.notified() => {}
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server
+                .revoked_tokens()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(server.revoked_tokens(), ["deferred", "deferred-refresh"]);
+    }
+
+    /// A provider delete whose kept revocations cannot be read keeps the
+    /// provider, since once it is gone they could only be forgotten unrevoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_kept_revocations_cannot_be_read_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let kept = directory
+            .path()
+            .join("vault")
+            .join(crate::delegation_vault::storage::DEFERRED_REVOCATIONS_DIRECTORY);
+        let _ = std::fs::remove_dir_all(&kept);
+        std::fs::write(&kept, b"not a directory").unwrap();
+
+        let (status, body) = delete(&state, "provider").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

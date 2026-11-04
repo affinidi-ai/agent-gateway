@@ -346,9 +346,11 @@ impl ReleaseContext<'_> {
     /// The grant of `key` to retry a call with, after the vendor refused
     /// `rejected`, the grant it was sent, with a `Bearer` challenge: one
     /// another call refreshed or the person reconnected since, or one
-    /// refreshed now whatever its expiry. A grant that cannot be refreshed is
-    /// removed, and revoked at the vendor in the background, while it still
-    /// holds the token the vendor refused: someone must connect again. A
+    /// refreshed now whatever its expiry. A caller's grant that cannot be
+    /// refreshed is removed, and revoked at the vendor in the background,
+    /// while it still holds the token the vendor refused: someone must connect
+    /// again. An owner's is kept: any caller of the binding can send a request
+    /// the vendor refuses, so no such refusal ends the owner's grant. A
     /// refresh that fails for a reason a new connect would not fix keeps the
     /// grant, and so does one the authorization server keeps refusing, which
     /// asks for a new connect.
@@ -378,9 +380,10 @@ impl ReleaseContext<'_> {
         if matches!(*reason, "no_grant" | "invalid_grant" | "refresh_refused") {
             return outcome;
         }
-        if self
-            .remove(provider, key, rejected, "rejected_by_the_vendor")
-            .await
+        if subject == GrantSubject::Caller
+            && self
+                .remove(provider, key, rejected, "rejected_by_the_vendor")
+                .await
         {
             return outcome;
         }
