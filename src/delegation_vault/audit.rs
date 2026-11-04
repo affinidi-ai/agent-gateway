@@ -65,8 +65,9 @@ pub struct AuditCallerContext {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_identity_hash: Option<String>,
     /// The paired gateway that sent the request over Fabric, for a
-    /// `fabric_verified` or `fabric_asserted` caller: its issuer DID, else its
-    /// Remote gateway record id.
+    /// `fabric_verified` or `fabric_asserted` caller, and for the caller of a
+    /// delegated credential released on Fabric receive: its issuer DID, else
+    /// its Remote gateway record id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub peer_gateway: Option<String>,
     /// Raw caller email captured for administrator-only audit evidence.
@@ -1189,6 +1190,26 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
     }
 }
 
+/// Build the `AuditCallerContext` of a delegated credential released on Fabric
+/// receive: the caller the receiving surface's own `source_auth` or resource
+/// token verified on the request ([`build_caller_context`]), with the paired
+/// gateway that sent it as `peer_gateway`: its issuer DID, else its Remote
+/// gateway record id.
+pub fn fabric_receive_caller_context(
+    identity: &crate::source_auth::AuthenticatedIdentity,
+    peer_issuer_did: Option<&str>,
+    peer_gateway_id: &str,
+) -> AuditCallerContext {
+    AuditCallerContext {
+        peer_gateway: Some(
+            peer_issuer_did
+                .unwrap_or(peer_gateway_id)
+                .to_string(),
+        ),
+        ..build_caller_context(identity)
+    }
+}
+
 /// Build an `AuditCallerContext` from the caller context a transit token
 /// carries onto a Transit Point: the allowlisted `sub`, `email` and `name`
 /// claims captured for Workload Binding, with the inbound caller's DID as the
@@ -1779,6 +1800,36 @@ mod tests {
                 .is_none()
         );
         assert!(caller.name_redacted.is_none());
+    }
+
+    /// The caller of a credential released on Fabric receive is the one the
+    /// receiving surface verified, with the peer gateway that sent the request:
+    /// its issuer DID, else its record id. A direct caller names no peer.
+    #[test]
+    fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
+        };
+
+        let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
+        assert_eq!(
+            (received.auth_method.as_str(), received.iss.as_deref(), received.sub.as_deref()),
+            ("jwt_bearer", Some("https://issuer.example"), Some("alice"))
+        );
+        assert_eq!(
+            received
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(
+            fabric_receive_caller_context(&identity, None, "partner-record")
+                .peer_gateway
+                .as_deref(),
+            Some("partner-record")
+        );
+        assert_eq!(build_caller_context(&identity).peer_gateway, None);
     }
 
     #[test]

@@ -726,7 +726,8 @@ pub struct Target {
     /// ([`AgentSurface::fabric_caller_authentication_gap`]). A view that sets
     /// it keeps each person's grant under the surface, for legacy direct and
     /// Fabric callers alike. Off by default, when a per-user binding refuses
-    /// every Fabric request it applies to.
+    /// every Fabric request it applies to. It has no effect on a Target that
+    /// is not an HTTP or HTTPS URL ([`AgentSurface::target_is_http_url`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegated_credentials_for_fabric_callers: bool,
 }
@@ -1521,14 +1522,13 @@ pub struct TransitPoint {
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
     /// may set it.
-    /// The admin API refuses it on a surface whose caller authentication
-    /// cannot tell a partner's users apart
+    /// The admin API saves it with a `Warning` on a surface whose caller
+    /// authentication cannot tell a partner's users apart
     /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
     /// key, where every request from that partner, and every direct caller
-    /// with a key in the same secret, has the same key. A surface stored with
-    /// it otherwise releases nothing to partners: the receiving surface puts
-    /// no principal in the token, and the Transit Point checks its own view
-    /// again.
+    /// with a key in the same secret, has the same key. Such a surface releases
+    /// nothing to partners: the receiving surface puts no principal in the
+    /// token, and the Transit Point checks its own view again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegated_credentials_for_fabric_callers: bool,
 
@@ -2937,6 +2937,13 @@ const A2A_PROXY_ENDPOINT_PREFIX: &str = "a2a-proxy://";
 /// Requests through Transit Points run each Transit Point's own list instead.
 pub fn endpoint_runs_target_trust_checks(endpoint: &str) -> bool {
     endpoint.starts_with(A2A_PROXY_ENDPOINT_PREFIX) || endpoint.starts_with("fabric://")
+}
+
+/// Whether `endpoint` is an `http://` or `https://` URL exactly as written: a
+/// lower-case scheme with nothing before it. Fabric receive dials only such a
+/// URL through a client pinned to the address it vetted.
+pub fn endpoint_is_http_url(endpoint: &str) -> bool {
+    endpoint.starts_with("http://") || endpoint.starts_with("https://")
 }
 
 impl Target {

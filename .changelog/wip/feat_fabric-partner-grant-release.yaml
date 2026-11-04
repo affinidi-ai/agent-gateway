@@ -1,0 +1,40 @@
+branch: feat/fabric-partner-grant-release
+changes:
+  added:
+    - timestamp: '2026-11-04T17:15:00Z'
+      title: Let a Target release a person's grants to the partner requests sent for them
+      description: >-
+        A surface's Target can set delegated_credentials_for_fabric_callers, off by default and
+        overridable per variant, where a complete variant's Target override that omits it turns it
+        off. On a view whose HTTP or HTTPS Target sets it, and whose caller authentication tells a
+        partner's users apart (a JWT that names an audience, or a resource token), a legacy Fabric
+        request gets the per-user grant of the caller the receiving surface verified, as a direct
+        call does, instead of a 403 delegation_not_enabled_for_partners. Such a view keeps each
+        person's grant under the surface, on legacy direct calls too, so every agent acting for
+        that person shares one grant, and
+        nothing the partner sends, such as an agent, a DID or a transit token, selects a grant.
+        Two Agent Gateways cannot use the switch yet, as an Agent Gateway peer strips its caller's
+        token on legacy Fabric sends, and it must never be paired with a partner that presents a
+        static target_auth JWT, which maps every one of that partner's users to one grant.
+        The person connects by calling the surface directly; consent is never started through a
+        partner, and a caller with no grant is refused with 403
+        consent_not_available_for_partners. The switch is read on every request, and a node that
+        predates it refuses to load a surface that sets it, so turn it off everywhere before
+        moving back to such a release.
+  changed:
+    - timestamp: '2026-11-04T17:15:00Z'
+      title: Key a Fabric request's delegated credentials by the receiving surface
+      description: >-
+        Fabric receive kept its Target's delegated credentials, service tokens included, under
+        the Target's endpoint URL. It now keeps them under the receiving surface's id, the key a
+        person's directly connected grant has on a view that releases grants to partners. The
+        delegation audit events of a credential released on Fabric receive name that id as their
+        agent_did, and name the Target, the caller the receiving surface verified and, as
+        caller.peer_gateway, the paired gateway that sent the request. Service
+        tokens are fetched again once. Entries an earlier release stored under a Target's
+        endpoint URL, including grants people consented to through a partner, are never looked
+        up again; operators can revoke them from the vault.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

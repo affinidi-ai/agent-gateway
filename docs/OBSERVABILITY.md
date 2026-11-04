@@ -326,6 +326,17 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
+**Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
+delegated credential events name the agent half of the credential's vault key as `agent_did`.
+For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving
+surface's id (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
+record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp_tool_name`, with
+the caller the receiving surface verified as `caller` and the paired gateway that sent the
+request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
+`vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
+agent its presentation is for as `agent_did`.
+
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
@@ -405,8 +416,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
     ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
     and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
-    binding applies, which a partner's request never gets); the peer is answered `403` with that
-    reason (see
+    binding applies and the view that serves the request does not release its Target's grants
+    to partners) and `consent_not_available_for_partners` (the caller has no grant for a
+    per-user binding that applies); the peer is answered `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
