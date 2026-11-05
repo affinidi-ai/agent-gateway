@@ -522,7 +522,7 @@ with `outbound_credentials` ignores `transit_credentials`.
 A Transit Point sends its target at most one value of each credential header, by the same
 rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
 `Authorization` and `Cookie`, and without any header, every value of it, compared without
-regard to case, named like the Transit Point's `target_auth` header or like the
+regard to case or to `_` against `-`, named like the Transit Point's `target_auth` header or like the
 `custom_header` of any credential binding that can apply on it: every binding in the
 surface's `outbound_credentials`, `tools` bindings included, or else its own
 `transit_credentials`. Those headers are withheld whether or not the gateway adds a value to
