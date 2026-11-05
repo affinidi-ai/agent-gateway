@@ -703,6 +703,11 @@ refused request reaches the target. The credential's header is removed from an a
 request, so the target never receives the caller's key or token. A Transit Point that also
 requires a transit token needs both: `source_auth` first, then the token.
 
+A discovery read through a Transit Point, such as an agent card fetch, needs the caller's
+credential too. The gateway's own read of a `fabric://` target's agent card, for the Transit
+Point's Trust Checks or a policy with `require_agent_context`, goes straight over Fabric and
+not through the Transit Point, so `source_auth` and a Trust Check work together.
+
 A request that reaches a Transit Point through an inbound listener's `/outbound` route (see
 [Reachable from other hosts](#reachable-from-other-hosts)) carries no client
 certificate: that route never passes on the forwarded-client-cert header, because the

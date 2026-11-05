@@ -167,6 +167,25 @@ allow if {{
     )
 }
 
+/// Admits a request only when its target-leg Trust Checks ran and none
+/// reported any of `error_codes`.
+pub fn build_surface_deny_target_trust_check_errors_policy(error_codes: &[&str]) -> String {
+    let codes_literal = serde_json::to_string(error_codes).expect("error codes should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+denied_codes := {codes_literal}
+
+allow if {{
+    count(input.trust_check_results.target) > 0
+    count([r | r := input.trust_check_results.target[_]; r.error.code == denied_codes[_]]) == 0
+}}
+"#
+    )
+}
+
 pub fn build_transit_point_request_path_policy(allowed_path: &str) -> String {
     let allowed_path_literal = serde_json::to_string(allowed_path).expect("allowed path should serialize");
 
