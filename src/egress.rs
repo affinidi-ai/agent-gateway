@@ -428,6 +428,34 @@ pub(crate) fn vet_strict(
     validate_and_pin_inner(raw_url, EgressPolicy::Strict, exact_allowlist)
 }
 
+/// How long a save waits for [`strict_refuses`] to resolve a host.
+const SAVE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether the Strict policy refuses `raw_url` ([`vet_strict`]) when a JWT
+/// verification strategy or credential provider is saved: not an http(s) URL,
+/// or a host that resolves to a refused address. A host that does not resolve,
+/// or not within [`SAVE_RESOLVE_TIMEOUT`], is not refused, since every request
+/// vets it again. The resolve runs on the blocking pool.
+pub(crate) async fn strict_refuses(
+    raw_url: &str,
+    exact_allowlist: Option<&str>,
+) -> bool {
+    let raw = raw_url.to_string();
+    let allowlist = exact_allowlist.map(str::to_string);
+    let vetted = tokio::time::timeout(
+        SAVE_RESOLVE_TIMEOUT,
+        tokio::task::spawn_blocking(move || vet_strict(&raw, allowlist.as_deref())),
+    )
+    .await;
+    match vetted {
+        Ok(Ok(Err(error @ (EgressError::Blocked(_) | EgressError::Parse(_))))) => {
+            tracing::warn!(error = %error, "URL refused by the Strict egress policy");
+            true
+        }
+        _ => false,
+    }
+}
+
 /// [`vet_strict`] and a redirect-off client pinned to the vetted addresses
 /// that ignores proxies ([`pinned_direct_client`]), for a JWT verification
 /// strategy's JWKS fetch and a credential provider's token request.
@@ -709,6 +737,27 @@ mod tests {
                 Err(EgressError::Blocked(_))
             ),
             "metadata is never allow-listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_refuses_only_what_the_strict_policy_refuses() {
+        for raw in [
+            "https://10.0.0.1/token",
+            "https://127.0.0.1/token",
+            "https://[fd00::1]/token",
+            "https://169.254.169.254/token",
+            "not a url",
+            "ftp://1.2.3.4/token",
+        ] {
+            assert!(strict_refuses(raw, None).await, "a save must refuse {raw}");
+        }
+        for raw in ["https://1.2.3.4/token", "https://nonexistent.host.invalid/token"] {
+            assert!(!strict_refuses(raw, None).await, "a save must accept {raw}");
+        }
+        assert!(
+            !strict_refuses("http://127.0.0.1:9/token", Some("http://127.0.0.1:9")).await,
+            "an allow-listed fixture is accepted"
         );
     }
 

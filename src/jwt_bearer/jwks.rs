@@ -43,24 +43,20 @@ fn jwks_egress_allowlist() -> Option<String> {
     allowlist
 }
 
-/// Vet `jwks_uri` with the Strict egress policy: it must resolve to public
-/// addresses only, never cloud metadata, loopback, RFC 1918, link-local or
-/// IPv6 unique-local. A refusal is [`JwtBearerError::JwksUriBlocked`]; a host
-/// that does not resolve is [`JwtBearerError::JwksFetchFailed`]. The detail is
-/// logged, never returned.
+/// Vet `jwks_uri` with the Strict egress policy when a strategy is saved
+/// ([`crate::egress::strict_refuses`]): it must be an http(s) URL resolving to
+/// none of cloud metadata, loopback, RFC 1918, link-local or IPv6 unique-local.
+/// A refusal is [`JwtBearerError::JwksUriBlocked`]. A host that does not
+/// resolve, or not in time, passes, since every fetch vets it again.
 pub(crate) async fn vet_jwks_uri(jwks_uri: &str) -> JwtBearerResult<()> {
-    let raw = jwks_uri.to_string();
-    let allowlist = jwks_egress_allowlist();
-    let vetted = tokio::task::spawn_blocking(move || crate::egress::vet_strict(&raw, allowlist.as_deref()))
-        .await
-        .map_err(|e| JwtBearerError::JwksFetchFailed(format!("jwks_uri resolve task failed: {e}")))?;
-    vetted
-        .map(|_| ())
-        .map_err(egress_refusal)
+    if crate::egress::strict_refuses(jwks_uri, jwks_egress_allowlist().as_deref()).await {
+        return Err(JwtBearerError::JwksUriBlocked);
+    }
+    Ok(())
 }
 
 /// Build a per-fetch client for a JWKS URI, vetted with the Strict policy
-/// ([`vet_jwks_uri`]), pinned to the addresses the host resolved to so it
+/// ([`crate::egress::vet_strict`]), pinned to the addresses the host resolved to so it
 /// cannot rebind between validation and connect, with redirects refused and
 /// proxies ignored, since a proxy would resolve the host again. Built per
 /// fetch because JWKS fetches are transient and cached.
