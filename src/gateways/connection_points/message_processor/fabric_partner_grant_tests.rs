@@ -176,6 +176,7 @@ struct Receiver {
     _peer_issuers: tempfile::TempDir,
     _identities: tempfile::TempDir,
     idp: JwksFixture,
+    strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
     strategy: String,
     target: RecordingTarget,
     authorization_server: AuthorizationServer,
@@ -207,6 +208,16 @@ impl Receiver {
         change: impl FnOnce(&mut AgentSurface),
         trusted_issuers: Vec<String>,
     ) -> Self {
+        Self::start_configured(change, trusted_issuers, None).await
+    }
+
+    /// [`Self::start_trusting`], whose JWT verification strategy expects
+    /// `strategy_issuer` as `iss` instead of the identity provider's own.
+    async fn start_configured(
+        change: impl FnOnce(&mut AgentSurface),
+        trusted_issuers: Vec<String>,
+        strategy_issuer: Option<&str>,
+    ) -> Self {
         use crate::credential_providers::storage::FileSystemCredentialProviderStore;
         use crate::delegation_vault::storage::FileSystemDelegationVaultStore;
 
@@ -222,7 +233,8 @@ impl Receiver {
         let strategy = strategies
             .create(
                 serde_json::from_value(json!({
-                    "id": "partner-idp", "name": "Partner IdP", "expected_issuer": idp.issuer,
+                    "id": "partner-idp", "name": "Partner IdP",
+                    "expected_issuer": strategy_issuer.unwrap_or(&idp.issuer),
                     "jwks_source": { "type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", idp.issuer) },
                     "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
                 }))
@@ -303,7 +315,7 @@ impl Receiver {
             direct
                 .didauth_session_store
                 .clone(),
-            strategies,
+            strategies.clone(),
             Arc::new(crate::jwt_bearer::JwksClient::new()),
             Some(secrets.clone()),
             Arc::new(dashmap::DashMap::new()),
@@ -323,6 +335,7 @@ impl Receiver {
             _peer_issuers: peer_issuers,
             _identities: identities_dir,
             idp,
+            strategies,
             strategy,
             target,
             authorization_server,
@@ -1067,6 +1080,97 @@ async fn a_partner_credential_that_names_every_user_alike_never_releases_a_grant
     receiver
         .assert_released(&receiver.partner_request(receiver.as_user("alice")), "Bearer alice-access")
         .await;
+}
+
+/// A JWT verification strategy that names no issuer releases no grant to a
+/// partner, though the request check never reads the issuer: the strategy
+/// verifies only a token whose `iss` is empty, and a caller with an empty
+/// issuer has no identity hash, so the request is refused as one whose caller
+/// the surface did not verify. A grant kept under the hash an empty issuer
+/// would give stays unused. A strategy that cannot be read verifies no caller
+/// either: the request fails as a gateway fault, with no grant released.
+#[tokio::test]
+async fn a_strategy_that_names_no_issuer_releases_no_grant_to_a_partner() {
+    if ran_in_child("ATG_FABRIC_PARTNER_GRANT_NO_ISSUER_CHILD").await {
+        return;
+    }
+    let receiver = Receiver::start_configured(|_| {}, Vec::new(), Some("")).await;
+    let empty_issuer = crate::source_auth::models::caller_identity_hash("jwt_bearer", "", None, "alice").unwrap();
+    receiver
+        .store_grant(SURFACE_ID, &empty_issuer, PER_USER_PROVIDER, "empty-issuer-access", 3600)
+        .await;
+    receiver
+        .connected("alice")
+        .await;
+    let released = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, DelegationAuditAction::TokenInjected | DelegationAuditAction::TokenRefreshed)
+            })
+            .count()
+    };
+
+    let empty_iss =
+        sign_jwt(json!({ "iss": "", "sub": "alice", "aud": JWT_AUDIENCE, "exp": now_secs() + 300 }), &receiver.idp.kid);
+    let headers = json!({ "content-type": "application/json", "authorization": format!("Bearer {empty_iss}") });
+    let (response, events) = crate::audit::producer::capture(
+        receiver
+            .egress()
+            .scope(forward_response(&receiver.partner_request(headers))),
+    )
+    .await;
+    assert_eq!(released(&events), 0, "no grant is released: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. })),
+        "the token verified under the strategy: {events:?}"
+    );
+    assert_eq!(status_and_reason(&response), (json!(403), json!("partner_caller_not_verified")), "{response}");
+    assert_eq!(rejections(&events), [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
+
+    let (response, events) = crate::audit::producer::capture(
+        receiver
+            .egress()
+            .scope(forward_response(&receiver.partner_request(receiver.as_user("alice")))),
+    )
+    .await;
+    assert_eq!(released(&events), 0, "a token naming an issuer does not verify: {events:?}");
+    assert_eq!(status_and_reason(&response), (json!(403), json!("partner_caller_not_verified")), "{response}");
+    assert_eq!(rejections(&events), [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
+
+    receiver
+        .strategies
+        .delete(&receiver.strategy)
+        .await
+        .unwrap();
+    let (response, events) = crate::audit::producer::capture(
+        receiver
+            .egress()
+            .scope(forward_response(&receiver.partner_request(receiver.as_user("alice")))),
+    )
+    .await;
+    assert_eq!(released(&events), 0, "no grant is released: {events:?}");
+    let body: Value = serde_json::from_str(
+        response["body"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(
+        (&response["status"], &body["status"], &body["title"]),
+        (&json!(500), &json!(500), &json!("Internal Server Error")),
+        "a strategy that cannot be read fails the request as a gateway fault: {response}"
+    );
+
+    assert!(
+        receiver
+            .target
+            .received()
+            .is_empty(),
+        "the Target is never called"
+    );
 }
 
 /// A partner's request whose caller the surface did not verify gets no grant:
