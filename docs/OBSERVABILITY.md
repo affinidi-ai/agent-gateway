@@ -540,6 +540,15 @@ for which writes.
   as on policy change events, and the top level carries `surface_id` and `channel_name`. No
   record carries a secret id, header name, header format or value.
 
+**Secret force-delete events.** Raised by `DELETE /secrets/{id}?force=true` (group Auth); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-a-forced-secret-delete).
+
+- `secret_force_deleted`: a secret was deleted with force, with or without records still using
+  it. `secret_id` is the secret's id, `force` is `true`, and `referrers` lists each record that
+  used it as `{kind, id}` (`surface`, `credential_provider`, `a2a_proxy` or `sts_client`). `actor`
+  names the management caller as on policy change events. The record carries no secret value and
+  no record name, and sets no `surface_id`.
+
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no

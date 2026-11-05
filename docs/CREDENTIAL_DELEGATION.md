@@ -45,7 +45,7 @@ not fail on its next request.
 | --- | --- | --- |
 | `DELETE /api/v1/credential-providers/{id}` | A surface binds the provider or uses it for Target authentication; the answer is the `provider_in_use` one described in [Deleting a provider](#deleting-a-provider), not the body below | None: remove the references first |
 | `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
-| `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway and logs a warning with the secret id and the referrers' ids. It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
+| `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
 
 The other refusals answer a `409` body that keeps the `message` field current clients show:
 
@@ -75,6 +75,20 @@ that serves the admin API, which serialises them with an in-process lock: a save
 makes the delete answer `409` unless the delete adds `force=true`, and a save whose check found
 the secret before the delete removed it is refused with `400`, as a reference to a missing
 secret is.
+
+### Auditing a forced secret delete
+
+A `DELETE /api/v1/secrets/{id}?force=true` that deletes the secret records a
+`secret_force_deleted` event in the VP Audit Log, whether or not a record still used the
+secret: every forced delete is recorded, so a forced delete is never missing from the log. The
+record names the management caller as `actor`, the secret's `secret_id`, `force` (`true`) and
+`referrers`, each record that used it as `{kind, id}` with `kind` one of `surface`,
+`credential_provider`, `a2a_proxy` or `sts_client`, in kind and id order (an empty list when
+nothing used it). It carries the referrers of every kind, not only the kinds the caller may
+view, and never the secret's value or a referrer's name. A delete without `force`, a forced
+delete the gateway refuses (an integration endpoint that references the secret, a secret outside
+the token's scope, a failed lookup) and a delete outside a management request record nothing.
+See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the record.
 
 ### https token endpoints
 

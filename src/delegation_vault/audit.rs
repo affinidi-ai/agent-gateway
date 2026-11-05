@@ -412,6 +412,25 @@ pub struct TargetAuthChangeDetails {
     pub changed: Vec<TargetAuthField>,
 }
 
+/// A secret deleted with `force=true` through the management API. Names the secret by its id
+/// and each record that still used it by kind and id; never the secret's value or a record's
+/// name.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SecretForceDeleteDetails {
+    pub actor: Actor,
+    pub secret_id: String,
+    pub force: bool,
+    #[serde(default)]
+    pub referrers: Vec<SecretReferrerDetails>,
+}
+
+/// A record that used a secret when it was force-deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SecretReferrerDetails {
+    pub kind: String,
+    pub id: String,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -609,6 +628,8 @@ pub enum DelegationAuditAction {
     PolicyChangeRefused(Box<PolicyChangeDetails>),
     /// The Target Authentication of one leg of a surface was added, changed or removed.
     TargetAuthChanged(Box<TargetAuthChangeDetails>),
+    /// A secret was deleted with `force=true`, with or without records still using it.
+    SecretForceDeleted(Box<SecretForceDeleteDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +684,7 @@ impl DelegationAuditAction {
                 | Self::PolicyAttachmentChanged(_)
                 | Self::PolicyChangeRefused(_)
                 | Self::TargetAuthChanged(_)
+                | Self::SecretForceDeleted(_)
         )
     }
 }
@@ -1479,6 +1501,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
         DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
+        DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
     }
 }
 

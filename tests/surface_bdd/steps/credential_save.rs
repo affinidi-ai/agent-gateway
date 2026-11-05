@@ -22,12 +22,14 @@ pub(crate) async fn send(
         .unwrap_or_else(|error| panic!("{path} through admin API: {error}"))
 }
 
+pub(crate) const SECRET_VALUE: &str = "bdd-secret-value";
+
 async fn create_secret(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
 ) {
-    create_secret_with_value(world, secret_id, tenant, "bdd-secret-value").await;
+    create_secret_with_value(world, secret_id, tenant, SECRET_VALUE).await;
 }
 
 async fn create_secret_with_value(

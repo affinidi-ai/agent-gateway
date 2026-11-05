@@ -369,6 +369,9 @@ pub async fn delete_secret(
     drop(bindings);
     match deleted {
         Ok(_) => {
+            if query.force {
+                crate::audit::secret_force_deletes::secret_force_deleted(&secret.secret_id, &referrers);
+            }
             let trigger_secret = crate::integrations::secrets_integration_triggers::Secret {
                 id: secret.id.clone(),
                 name: secret.name.clone(),
@@ -1018,6 +1021,87 @@ mod tests {
             serde_json::json!([{"kind": "surface", "id": "billing-surface", "name": "Billing surface"}])
         );
         assert_eq!(body["hidden_references"], 1);
+    }
+
+    async fn delete_recorded(
+        store: Arc<dyn SecretsStore>,
+        references: crate::credential_providers::references::ReferenceStores,
+        force: bool,
+    ) -> (StatusCode, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
+        let ((status, _), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("u-1"),
+            delete_with(store, None, references, None, force),
+        ))
+        .await;
+        (status, records)
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_of_a_secret_in_use_is_recorded_with_its_actor_and_referrers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+
+        let (status, records) = delete_recorded(recording_store(None), references, true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].event.is_vp_audit());
+        assert_eq!(crate::delegation_vault::audit::action_category(&records[0].event), "secret_force_deleted");
+        let written = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(
+            written["event"]["secret_force_deleted"],
+            serde_json::json!({
+                "actor": {"kind": "user", "id": "u-1"},
+                "secret_id": "billing_api_key",
+                "force": true,
+                "referrers": [
+                    {"kind": "credential_provider", "id": "billing-provider"},
+                    {"kind": "surface", "id": "billing-surface"},
+                ],
+            })
+        );
+        let text = written.to_string();
+        for hidden in [PLAINTEXT, "Billing surface", "Billing API key"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_of_a_secret_nothing_uses_is_recorded_without_referrers() {
+        let (status, records) = delete_recorded(recording_store(None), Default::default(), true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let written = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(written["event"]["secret_force_deleted"]["force"], true);
+        assert_eq!(written["event"]["secret_force_deleted"]["referrers"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_force_and_a_refused_forced_delete_record_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+        let (status, records) = delete_recorded(recording_store(None), references.clone(), false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(records.is_empty(), "{records:?}");
+
+        let (status, records) = delete_recorded(recording_store(None), Default::default(), false).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(records.is_empty(), "{records:?}");
+
+        let ((status, _), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("u-1"),
+            delete_with(
+                recording_store(None),
+                Some(endpoint_referencing(dir.path(), "billing_api_key").await),
+                references,
+                None,
+                true,
+            ),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(records.is_empty(), "{records:?}");
     }
 
     #[tokio::test]

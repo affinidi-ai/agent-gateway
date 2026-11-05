@@ -91,7 +91,7 @@ impl ViewableKinds {
 }
 
 impl Referrer {
-    fn kind_label(&self) -> &'static str {
+    pub fn kind_label(&self) -> &'static str {
         match self.kind {
             ResourceKind::Surfaces => "surface",
             ResourceKind::CredentialProviders => "credential_provider",
