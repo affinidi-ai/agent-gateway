@@ -12,7 +12,7 @@ use axum::response::Response;
 use serde_json::Value as JsonValue;
 use tracing::{debug, error, info, warn};
 
-use super::{CallerAssertion, TargetAuthContext, TargetAuthError};
+use super::{CallerAssertion, TARGET_AUTH_FAILED, TargetAuthContext, TargetAuthError};
 use crate::a2a::create_error_response;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
@@ -621,7 +621,7 @@ impl TargetCardFetch<'_> {
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => Err(self.fail(
                         FetchFault::CredentialRejected(e),
-                        create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"),
+                        create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED),
                     )),
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(

@@ -875,6 +875,8 @@ pub(crate) fn a2a_proxy_target_caller(
     }
 }
 
+pub(crate) const TARGET_AUTH_FAILED: &str = "Target authentication failed";
+
 /// Why a target credential could not be resolved. Rendered to the caller only as a
 /// generic failure; the variant is logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -6943,7 +6945,7 @@ async fn proxy_handler_with_mcp_runtime(
                 "Refusing a request outside the Target base path: it would carry the Target credential"
             );
             record_target_base_refusal(&audit_facts, None, target_auth);
-            return Ok(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
+            return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         match resolve_target_credential(
@@ -6971,7 +6973,7 @@ async fn proxy_handler_with_mcp_runtime(
                 // Check fallback behavior
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
+                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -12911,7 +12913,7 @@ async fn handle_fabric_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
+            return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
         }
         match inject_target_auth_header(
             target_auth,
@@ -12943,7 +12945,7 @@ async fn handle_fabric_request(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
+                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -16370,7 +16372,7 @@ async fn handle_mcp_proxy_request(
             if let Some(target_auth) = state.surface.target_auth() {
                 record_target_base_refusal(&audit_facts, None, target_auth);
             }
-            Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
+            Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED))
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(

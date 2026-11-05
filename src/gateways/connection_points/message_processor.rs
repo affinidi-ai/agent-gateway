@@ -13,6 +13,7 @@ use crate::gateways::filesystem::GatewayStore;
 use crate::messages::MessageType;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
+use crate::proxy::handler::TARGET_AUTH_FAILED;
 use crate::proxy::protocol_router::join_endpoint_path;
 use crate::surfaces::AgentSurfaceStore;
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
@@ -8072,7 +8073,6 @@ fn fabric_mcp_tool_policy_error(
     mcp_forward_error_response(id, crate::mcp::error_codes::INTERNAL_ERROR, "Internal error: policy evaluation failed")
 }
 
-const TARGET_AUTH_FAILED: &str = "Target authentication failed";
 const TARGET_AUTH_CONFIGURATION_ERROR: &str = "Target authentication configuration error";
 
 /// The 502 a Fabric receive answers when the Target credential cannot be sent.
