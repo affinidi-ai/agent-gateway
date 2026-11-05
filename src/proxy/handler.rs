@@ -2058,17 +2058,24 @@ async fn proxy_handler_with_mcp_runtime(
     // Extract UCP operation type from request path and method (if this is a UCP channel).
     let mut ucp_operation = extract_ucp_operation(uri.path(), &method);
 
+    let logged_path = loggable::untrusted(&loggable::path(uri.path()));
     if let Some(ref op) = ucp_operation {
         channel_info!(
             config_id,
             "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={} ucp_op={}",
             trace_id,
             method,
-            uri.path(),
+            logged_path,
             op
         );
     } else {
-        channel_info!(config_id, "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={}", trace_id, method, uri.path());
+        channel_info!(
+            config_id,
+            "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={}",
+            trace_id,
+            method,
+            logged_path
+        );
     }
 
     // Track active connection for this task and create guard for cleanup
@@ -2094,8 +2101,6 @@ async fn proxy_handler_with_mcp_runtime(
         .unwrap_or(&addr_string)
         .to_string();
 
-    channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
-
     if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
         let response =
             match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone(), &trace_id).await {
@@ -2118,7 +2123,7 @@ async fn proxy_handler_with_mcp_runtime(
             .cloned();
 
         if let Some(cfg) = didauth_cfg {
-            channel_info!(config_id, "DID Auth request detected: {}", path);
+            channel_info!(config_id, "DID Auth request detected: {}", logged_path);
 
             // Read the request body
             let (_parts, body) = req.into_parts();
@@ -6657,7 +6662,7 @@ async fn proxy_handler_with_mcp_runtime(
         .map(|selection| selection.method)
     {
         Some(crate::source_auth::SourceAuthConfig::JwtBearer(config))
-            if config.forward_header && resource_authorization.is_none() =>
+            if config.forward_header && resource_authorization.is_none() && authenticated_identity.is_some() =>
         {
             Some(config.token_header.as_str())
         }
@@ -10125,26 +10130,21 @@ async fn multi_channel_proxy_handler_in_request_scope(
 ) -> Response {
     // Generate unique ID for this handler invocation to track duplicates
     let handler_invocation_id = uuid::Uuid::new_v4();
+    let path = req.uri().path().to_string();
+    let logged_path = loggable::untrusted(&loggable::path(&path));
     info!(
         "🔵 HANDLER ENTRY: invocation_id={} source={} method={} path={}",
         handler_invocation_id,
         addr,
         req.method(),
-        loggable::untrusted(&loggable::path(req.uri().path()))
+        logged_path
     );
 
-    // Extract path and query before consuming req
-    let path = req.uri().path().to_string();
+    // Extract the query before consuming req
     let query = req
         .uri()
         .query()
         .map(|q| q.to_string());
-
-    debug!(
-        "Multi-channel handler received request: method={} path={}",
-        req.method(),
-        loggable::untrusted(&loggable::path(&path))
-    );
 
     // Find the matching channel and parse any `$alias` suffix attached to its route.
     // URL grammar: `/route[$alias][/rest]`.
@@ -10175,8 +10175,11 @@ async fn multi_channel_proxy_handler_in_request_scope(
 
             crate::proxy::route_variant::parse_route_with_variant(&path, prefix).map(|m| {
                 debug!(
-                    "Route matched: surface='{}' route='{}' alias={:?} tail='{}'",
-                    ch.surface.name, normalized_route, m.alias, m.tail
+                    "Route matched: surface='{}' route='{}' alias={} tail={}",
+                    ch.surface.name,
+                    normalized_route,
+                    loggable::untrusted(m.alias.unwrap_or_default()),
+                    loggable::untrusted(&loggable::path(m.tail))
                 );
                 (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string())
             })
@@ -10190,13 +10193,9 @@ async fn multi_channel_proxy_handler_in_request_scope(
         None => (None, None, String::new()),
     };
 
-    if let Some(ref alias) = virtual_channel_alias {
-        debug!("Variant alias detected: alias='{}' tail='{}'", alias, stripped_tail);
-    }
-
     match channel_info {
         Some(ch) => {
-            info!("Matched channel '{}' with route '{}' for path '{}'", ch.surface.name, ch.surface.route(), path);
+            info!("Matched channel '{}' with route '{}' for path {}", ch.surface.name, ch.surface.route(), logged_path);
 
             // The URL's alias, else the default variant, else the base surface
             // (`variant_id` None) serves the request. A variant that can't be
@@ -10291,11 +10290,15 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 }
             };
             debug!(
-                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
-                path,
-                loggable::uri(&parsed_uri),
+                "Rewriting URI: original={} new={} (stripped route '{}' alias={})",
+                logged_path,
+                loggable::untrusted(&loggable::uri(&parsed_uri)),
                 ch.surface.route(),
-                virtual_channel_alias
+                loggable::untrusted(
+                    virtual_channel_alias
+                        .as_deref()
+                        .unwrap_or_default()
+                )
             );
             parts.uri = parsed_uri;
 
@@ -10359,7 +10362,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
             }
         }
         None => {
-            warn!("No surface route matches path {}", loggable::untrusted(&loggable::path(&path)));
+            warn!("No surface route matches path {}", logged_path);
             crate::audit::request_events::request_rejected(
                 &crate::audit::request_events::RequestFacts::unroutable(),
                 crate::audit::request_events::RejectionStage::Routing,
@@ -10595,7 +10598,12 @@ async fn handle_onboarding_request(
     mut connection_guard: ConnectionGuard,
     _req: Request,
 ) -> Result<Response, Response> {
-    info!(channel = channel_name, method = %method, path = %uri.path(), "Onboarding channel detected");
+    info!(
+        channel = channel_name,
+        method = %method,
+        path = %loggable::untrusted(&loggable::path(uri.path())),
+        "Onboarding channel detected"
+    );
 
     // Onboarding handler implementation would go here - this is a simplified version
     // The full implementation is quite long (lines 1438-1695 in original file)
@@ -23823,12 +23831,16 @@ allow if {
     async fn a_path_no_surface_serves_logs_one_bounded_line_naming_no_surface() {
         let surface = mcp_surface("tenant-only-surface", "http://127.0.0.1:9", None);
         let state = bare_proxy_state(surface.clone(), None);
+        let capability_id = uuid::Uuid::new_v4().to_string();
         let tail = "a".repeat(1000);
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
 
-        let response =
-            send_to_surface(&state, surface, legacy_mcp_request(&format!("/unknown/{tail}"), &serde_json::json!({})))
-                .await;
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(&format!("/onboard/{capability_id}/{tail}"), &serde_json::json!({})),
+        )
+        .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
         let text = logs.text();
@@ -23837,13 +23849,57 @@ allow if {
             .filter(|line| line.contains("No surface route matches path"))
             .collect();
         assert_eq!(misses.len(), 1, "{text}");
+        let shortened = crate::observability::loggable::secret(&capability_id);
         assert!(
-            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/unknown/{tail}"))),
+            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/onboard/{shortened}/{tail}"))),
             "{}",
             misses[0]
         );
         assert!(!text.contains(&tail), "a log holds the whole path: {text}");
+        assert!(!text.contains(&capability_id), "a log holds the capability id: {text}");
         assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_matched_routes_caller_path_is_logged_bounded_with_capability_ids_shortened() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "guarded", "name": "guarded",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/guarded", "protocol": "mcp",
+                "caller_authentication": {"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]}},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
+        let state = bare_proxy_state(surface.clone(), None);
+        let capability_id = uuid::Uuid::new_v4().to_string();
+        let shortened = crate::observability::loggable::secret(&capability_id);
+        let padding = "a".repeat(1000);
+
+        // Without source authentication the surface's handler refuses the
+        // request after logging its entry; an unknown alias is refused at routing.
+        for (route, status, reaches_surface_handler) in [
+            ("/guarded", axum::http::StatusCode::INTERNAL_SERVER_ERROR, true),
+            ("/guarded$canary", axum::http::StatusCode::NOT_FOUND, false),
+        ] {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let path = format!("{route}/onboard/{capability_id}/{padding}");
+
+            let response =
+                send_to_surface(&state, surface.clone(), legacy_mcp_request(&path, &serde_json::json!({}))).await;
+
+            assert_eq!(response.status(), status, "{route}");
+            let text = logs.text();
+            let matched = text
+                .lines()
+                .find(|line| line.contains("Matched channel 'guarded'"))
+                .unwrap_or_else(|| panic!("{route}: no match line: {text}"));
+            assert!(matched.contains(&format!("{route}/onboard/{shortened}/aaa")), "{matched}");
+            assert!(matched.contains("aaa\"..."), "{route}: the path is not cut: {matched}");
+            assert_eq!(text.contains("INNER HANDLER ENTRY"), reaches_surface_handler, "{route}: {text}");
+            assert!(!text.contains(&padding), "{route}: a log holds the whole path: {text}");
+            assert!(!text.contains(&capability_id), "{route}: a log holds the capability id: {text}");
+        }
     }
 
     #[tokio::test]

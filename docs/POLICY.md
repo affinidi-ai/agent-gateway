@@ -592,7 +592,16 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
   policy, and reads the card within the Transit Point's response bounds. A
-  blocked URL, a redirect or an oversized card yields no card.
+  blocked URL, a redirect or an oversized card yields no card. For a
+  `fabric://` target the card is read over Fabric instead, never through the
+  Transit Point's own listener, at the two well-known paths in turn: discovery
+  paths, which the remote gateway answers as public card reads, with its
+  surface's card and identity credential. Any other path is an ordinary
+  request through the remote Access Point, so `agent_card_path` is not used.
+  An oversized or non-JSON answer at one path is skipped for the next, and a
+  Fabric transport failure ends the read with no card. A Transit Point policy
+  with `require_agent_context` does not read a card the request's Trust Checks
+  already found unavailable.
 - The **managed agent Agent Card fetch** for display names
   (`src/identity/target_card_names.rs`) reads the card of an A2A or AP2
   surface's operator-configured HTTP(S) target through the same
