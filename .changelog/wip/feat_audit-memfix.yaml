@@ -6,8 +6,9 @@ changes:
       description: >-
         A new startup-only `[audit]` block sets `vp_audit_log_max_bytes` and `vp_audit_log_keep`,
         so an appliance that must keep more audit evidence on disk can raise them. They default
-        to the 8 MiB and 8 files the gateway already used, and a `vp_audit_log_keep` of 0 is read
-        as 1, so rotation never deletes the history outright.
+        to the 8 MiB and 8 files the gateway already used, and a `vp_audit_log_keep` of 0 keeps
+        every rotated file, so no audit record is deleted and the history grows until the disk
+        fills.
   changed:
     - timestamp: '2026-11-05T14:29:50Z'
       title: Keep a bounded VP Audit Log history on disk

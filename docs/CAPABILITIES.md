@@ -370,8 +370,8 @@ the gateway authorised, for whom, and under which policy.
 
 Entries are written as JSON Lines to a file that is rotated once it reaches its size cap,
 keeping a fixed number of rotated files beside it and deleting anything older, so the
-appliance's own copy of the audit history is bounded. The sizes are set by `[audit]` in
-`config.toml`; see
+appliance's own copy of the audit history is bounded by default; it can also be set to keep
+every rotated file. The sizes are set by `[audit]` in `config.toml`; see
 [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). Each policy decision
 records the exact policy version and content hash that decided. On calls through a Transit
 Point, policy decisions are also carried inside the signed workload-binding presentation,

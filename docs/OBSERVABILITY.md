@@ -424,15 +424,17 @@ agent its presentation is for as `agent_did`.
 `[audit] vp_audit_log_max_bytes` (8 MiB by default) it becomes `delegation-audit.jsonl.1`, every
 rotated file moves one position back, and `[audit] vp_audit_log_keep` of them are kept (8 by
 default, about 72 MiB in all). Anything older is deleted, so a long-running gateway keeps a
-bounded audit history on disk. A `vp_audit_log_keep` of `0` is read as `1`, so rotation always
-moves the live log aside and never deletes it outright; a `vp_audit_log_max_bytes` of `0`
-switches rotation off and lets the live file grow without limit. Both are startup-only; see
+bounded audit history on disk. A `vp_audit_log_keep` of `0` keeps every rotated file instead, so
+no audit record is deleted and the history grows with the appliance's request rate — give it the
+disk, because an audit log that fills the disk stops being written. A `vp_audit_log_max_bytes` of
+`0` switches rotation off and lets the live file grow without limit. Both are startup-only; see
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
 
-Rotation deletes the oldest records outright, and that loss is counted nowhere: the gateway's own
-copy of the audit history reaches back only as far as the retained files do at the appliance's
-request rate, and a flood of request events shortens it. Forward the records you must keep for
-longer to a Governance Audit integration, which keeps them wherever it delivers them.
+Where rotation does delete, it deletes the oldest records outright and that loss is counted
+nowhere: the gateway's own copy of the audit history reaches back only as far as the retained
+files do at the appliance's request rate, and a flood of request events shortens it. Forward the
+records you must keep for longer to a Governance Audit integration, which keeps them wherever it
+delivers them, or set `vp_audit_log_keep` to `0` to keep them all on the appliance.
 
 **Reads.** `/v1/audit` and `/v1/delegation-audit` read on a blocking thread, one read at a time,
 and each keeps only the newest 8 MiB of the records *it* returns. A read walks back from the live

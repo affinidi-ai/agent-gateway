@@ -590,7 +590,8 @@ impl Default for LoggingConfig {
 
 /// VP Audit Log file configuration (`[audit]`). The live log is rotated once it
 /// reaches `vp_audit_log_max_bytes`, and `vp_audit_log_keep` rotated files are
-/// kept beside it; anything older is deleted. Startup-only.
+/// kept beside it; anything older is deleted, unless `vp_audit_log_keep` is `0`,
+/// which keeps every rotated file. Startup-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditConfig {
     /// Bytes the live VP Audit Log may reach before it is rotated. `0` never
@@ -599,7 +600,8 @@ pub struct AuditConfig {
     pub vp_audit_log_max_bytes: u64,
 
     /// Rotated VP Audit Log files kept beside the live one, oldest deleted
-    /// first. Read as at least `1`, so rotation never deletes the history.
+    /// first. `0` keeps every rotated file, so no audit record is deleted and
+    /// the history grows until the disk fills.
     #[serde(default = "default_vp_audit_log_keep")]
     pub vp_audit_log_keep: usize,
 }
@@ -4783,10 +4785,11 @@ mod log_redaction_config_tests {
     }
 
     #[test]
-    fn an_audit_section_with_no_retained_files_still_keeps_one() {
+    fn an_audit_section_with_no_retained_count_keeps_every_rotated_file() {
         let audit: AuditConfig = toml::from_str("vp_audit_log_keep = 0").expect("parses");
 
-        assert_eq!(audit.rotation().kept(), 1, "rotation never deletes the history outright");
+        assert_eq!(audit.rotation().keep, 0, "rotation deletes no rotated file");
+        assert!(!audit.is_default());
     }
 }
 

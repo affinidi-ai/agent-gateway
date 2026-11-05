@@ -39,9 +39,9 @@ pub struct Rotation {
     /// Bytes the live log may reach before it is rotated. `0` never rotates.
     /// Default: 8 MiB.
     pub max_bytes: u64,
-    /// Rotated files kept beside the live log, oldest deleted first. Values
-    /// below `1` are read as `1`, so rotation never leaves the history empty.
-    /// Default: 8.
+    /// Rotated files kept beside the live log, oldest deleted first. `0` keeps
+    /// every rotated file, so no audit record is deleted and the history grows
+    /// with the appliance's request rate. Default: 8.
     pub keep: usize,
 }
 
@@ -70,12 +70,6 @@ impl Rotation {
             .get()
             .copied()
             .unwrap_or_default()
-    }
-
-    /// Rotated files actually kept: at least one, so a misconfigured `keep` of
-    /// `0` moves the live log aside instead of deleting the history.
-    pub fn kept(&self) -> usize {
-        self.keep.max(1)
     }
 }
 
@@ -191,20 +185,28 @@ pub fn read_window(
 }
 
 /// Rotates the live log: each rotated file moves one position back, the live
-/// log becomes `.1`, and everything past `keep` is deleted. A live log that is
-/// not there is left alone. `keep` is read as at least `1`, so rotation always
-/// moves the live log aside and never deletes it outright.
+/// log becomes `.1`, and everything past `keep` is deleted. A `keep` of `0`
+/// deletes nothing, so the whole history is kept. A live log that is not there
+/// is left alone, and the live log itself is never deleted.
 pub fn rotate(
     live: &Path,
     keep: usize,
 ) -> io::Result<()> {
-    let keep = keep.max(1);
-    let mut index = keep;
-    while rotated_path(live, index).exists() {
-        fs::remove_file(rotated_path(live, index))?;
-        index += 1;
-    }
-    for index in (1..keep).rev() {
+    let last_moved = if keep == 0 {
+        let mut index = 1;
+        while rotated_path(live, index).exists() {
+            index += 1;
+        }
+        index - 1
+    } else {
+        let mut index = keep;
+        while rotated_path(live, index).exists() {
+            fs::remove_file(rotated_path(live, index))?;
+            index += 1;
+        }
+        keep - 1
+    };
+    for index in (1..=last_moved).rev() {
         let from = rotated_path(live, index);
         if from.exists() {
             fs::rename(&from, rotated_path(live, index + 1))?;
@@ -337,25 +339,25 @@ mod tests {
     }
 
     #[test]
-    fn rotating_with_no_retained_count_still_moves_the_live_log_aside() {
+    fn rotating_with_no_retained_count_keeps_every_rotated_file() {
         let dir = TempDir::new().unwrap();
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
         fs::write(&path, "live\n").unwrap();
         fs::write(rotated_path(&path, 1), "first\n").unwrap();
+        fs::write(rotated_path(&path, 2), "second\n").unwrap();
 
         rotate(&path, 0).unwrap();
 
         assert!(!path.exists(), "the live log is moved aside, never deleted");
         assert_eq!(fs::read_to_string(rotated_path(&path, 1)).unwrap(), "live\n");
-        assert!(!rotated_path(&path, 2).exists(), "nothing is kept past the retained count");
-    }
-
-    #[test]
-    fn a_retained_count_below_one_is_read_as_one() {
-        assert_eq!(Rotation { max_bytes: 1, keep: 0 }.kept(), 1);
-        assert_eq!(Rotation::default().kept(), KEEP_ROTATED);
+        assert_eq!(fs::read_to_string(rotated_path(&path, 2)).unwrap(), "first\n");
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 3)).unwrap(),
+            "second\n",
+            "the oldest file is moved back instead of deleted"
+        );
     }
 
     #[test]
