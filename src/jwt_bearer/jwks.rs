@@ -281,8 +281,7 @@ impl JwksClient {
         &self,
         jwks_uri: &str,
     ) -> JwtBearerResult<CacheEntry> {
-        // Strategies saved before the write path refused private hosts are
-        // vetted here on every fetch.
+        // Vetted on every fetch: a stored strategy may predate the save check, and DNS answers change.
         let client = pinned_jwks_client(jwks_uri).await?;
 
         let response = client
@@ -628,11 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_jwks_rejects_loopback() {
-        // Loopback is blocked at the write path (create/update strategy).
-        // The runtime fetcher only blocks cloud metadata — allowing loopback
-        // keeps dev/test scenarios working and is safe because no loopback URI
-        // can be stored in the first place.
-        // This test verifies that a cloud-metadata IP (link-local range) is still blocked.
+        // The ECS task metadata address, in the link-local range the Strict policy refuses.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://169.254.170.2/v2/credentials/jwks.json")
@@ -646,10 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_jwks_rejects_localhost() {
-        // Loopback/localhost is blocked at the write path only.
-        // The runtime fetcher blocks cloud metadata; loopback is allowed so that
-        // stored strategies that pre-date the write-path guard still work in dev.
-        // This test verifies GCP metadata hostname is blocked at fetch time.
+        // The GCP metadata host name is refused before it is resolved.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://metadata.google.internal/.well-known/jwks.json")
@@ -676,8 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_jwks_rejects_ipv6_loopback() {
-        // IPv6 loopback is blocked at write-path; the fetcher blocks cloud metadata.
-        // This test verifies the IPv6 AWS metadata endpoint is blocked at fetch time.
+        // The IPv6 AWS metadata address, in the unique-local range the Strict policy refuses.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://[fd00:ec2::254]/jwks.json")
@@ -704,8 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_key_rejects_loopback_uri() {
-        // Loopback is blocked at write-path; the fetcher only blocks cloud metadata.
-        // This test verifies that a cloud-metadata URI is still rejected at get_key.
+        // A token check refuses a cloud metadata URI before any request.
         let client = JwksClient::new();
         let result = client
             .get_key("strat-loopback", "http://169.254.169.254/jwks.json", "kid-1")
@@ -760,6 +750,23 @@ mod tests {
             );
             assert!(matches!(vet_jwks_uri(uri).await, Err(JwtBearerError::JwksUriBlocked)), "save must refuse {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_jwks_fixture_is_no_longer_admitted() {
+        let (base, server) = start_jwks_server(rsa_jwks_body("key-1", DUMMY_N, DUMMY_E), None).await;
+        let uri = format!("{base}/.well-known/jwks.json");
+        assert!(
+            vet_jwks_uri(&uri)
+                .await
+                .is_ok(),
+            "a running fixture is admitted"
+        );
+        drop(server);
+        assert!(
+            matches!(vet_jwks_uri(&uri).await, Err(JwtBearerError::JwksUriBlocked)),
+            "a stopped fixture's loopback origin is refused like any other"
+        );
     }
 
     #[tokio::test]
