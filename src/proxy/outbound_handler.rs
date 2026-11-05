@@ -1797,6 +1797,15 @@ async fn step_resolve_agent_identity(
         Some(mi) => mi,
         None => return Ok(()),
     };
+    let managed_source = if per_tp_identity_configured {
+        crate::identity::filesystem::ManagedIdentitySource::transit_point(
+            ctx.virtual_channel
+                .alias
+                .clone(),
+        )
+    } else {
+        crate::identity::filesystem::ManagedIdentitySource::protected()
+    };
 
     // A transit point that inherits the surface-level identity (i.e. declares
     // no per-TP `managed_identity` of its own) only performs egress identity
@@ -1889,6 +1898,7 @@ async fn step_resolve_agent_identity(
         Ok(Some(crate::identity::credential_identity::CredentialIdentity::Derived {
             identity_fields,
             identity_hash,
+            credential_updated_at,
         })) => {
             let Some(ref vc_issuer) = state.vc_issuer else {
                 crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -1913,6 +1923,7 @@ async fn step_resolve_agent_identity(
                         .config_id()
                         .map(String::from),
                     ctx.surface.issuer_id.clone(),
+                    managed_source.with_credential_updated_at(credential_updated_at),
                 )
                 .await
                 .map_err(|e| {
@@ -2138,6 +2149,7 @@ async fn step_resolve_agent_identity(
                     .config_id()
                     .map(String::from),
                 ctx.surface.issuer_id.clone(),
+                managed_source,
             )
             .await
             .map_err(|e| {
@@ -2196,6 +2208,7 @@ async fn step_resolve_agent_identity(
                 .config_id()
                 .map(String::from),
             ctx.surface.issuer_id.clone(),
+            managed_source,
         )
         .await
         .map_err(|e| {

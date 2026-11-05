@@ -1,0 +1,66 @@
+branch: fix/display-identity-versioning
+changes:
+  added:
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Group a surface's managed agent identities into one Identities page entry
+      description: >-
+        A surface's managed agent gets a new DID when its x-identity claim values change or the
+        surface is pointed at a different certificate or API key. The Identities page now shows
+        every managed DID of a surface, from the agent's responses and from its requests through
+        any Transit Point, as one entry led by the most recently used DID with the usage summed
+        across them. The expanded row's Version History lists the earlier DIDs, each with its
+        Trust Score, Configure Policy and Copy link actions, and the credential rotations inside
+        them, newest first, with the fields each one changed. from_jwt_claim identities, one per
+        claim value, and external callers keep one row per DID. A link to an earlier DID opens
+        its entry and marks that version.
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Record certificate and API key rotations on managed agent identities
+      description: >-
+        Rotating a stored certificate or secret-store API key keeps the managed agent's DID, and
+        nothing recorded it. Each managed identity record now stores the slot that created it
+        (the protected slot or a Transit Point's own managed_identity), the credential's
+        updated_at, and a list of rotations with their time and, for a certificate, the
+        fingerprint, subject or issuer they replaced; the record's identity fields follow the
+        current certificate. Identities rows carry the optional slot and rotations fields, with
+        only the latest 20 rotations kept; the oldest kept one carries the earliest values of
+        the dropped ones, so the first version stays correct, and rotations_dropped makes the
+        page note "Earlier rotations not shown". An API key's value is not compared, so any edit of
+        the stored key's details is listed as "Credential updated". Rotations before this
+        release were not recorded; a certificate change found on the first use after it is
+        recorded once, without a time.
+  changed:
+    - timestamp: '2026-11-03T12:00:00Z'
+      title: Stop offering From API Key on the Managed Agent's response identity
+      description: >-
+        The Identity element on the Managed Agent to Access Point response leg no longer offers
+        From API Key in its Identity Extraction Type dropdown; the inbound and external identity
+        slots still do. Surfaces already using it keep resolving the Managed Agent's DID from the
+        bound API key.
+  fixed:
+    - timestamp: '2026-11-02T12:00:00Z'
+      title: Replace the Identities page version history button, which never appeared
+      description: >-
+        The button waited for a uuid field the backend never sends, and its modal read a
+        response shape the history endpoint does not return. The button and modal are removed;
+        an identity's versions are listed in its expanded row instead.
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Stop concurrent requests from losing identity usage counts
+      description: >-
+        Two requests that used the same identity at once could each read the record and save
+        it, so one request's usage count, channel usage or origin was lost. Within one gateway
+        process, usage, origin and rotation updates to one identity record, including those for
+        external callers, are now serialised per identity hash.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-05T12:00:00Z'
+      title: Present the current mTLS certificate to Fabric peers after a rotation
+      description: >-
+        The identity the gateway presents to Fabric peers kept the certificate fingerprint,
+        subject and issuer from when the identity was created, even after the stored
+        certificate was rotated. It now carries the current certificate's details under the
+        same DID, matching the certificate its request credentials already use. Fabric peers
+        whose policy pins the old fingerprint deny requests after a rotation until they update
+        the policy to the new fingerprint. Upgrade note: an identity whose certificate was
+        rotated before the upgrade presents the new fingerprint on its first request after
+        it; update peer policies that pin a fingerprint before upgrading.

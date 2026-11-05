@@ -3,15 +3,17 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import '@testing-library/jest-dom';
 import IdentitiesPage from '../IdentitiesPage';
 import { AppContext } from '../../context/AppContext';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
+import managedFixture from '../../__fixtures__/backend/identity-row-managed.json';
+import managedRotatedFixture from '../../__fixtures__/backend/identity-row-managed-rotated.json';
+import externalCallerFixture from '../../__fixtures__/backend/identity-row-external-caller.json';
 
 // Mock the API client
 jest.mock('../../api', () => ({
   apiClient: {
     getIdentityTrustScore: jest.fn(),
-    getIdentityVersionHistory: jest.fn(),
     createDidWebVhIdentity: jest.fn(),
     listDidWebVhIdentities: jest.fn().mockResolvedValue({ identities: [] }),
   },
@@ -294,38 +296,6 @@ describe('IdentitiesPage', () => {
     });
   });
 
-  it('opens version history modal when button clicked', async () => {
-    (apiClient.getIdentityVersionHistory as jest.Mock).mockResolvedValue([
-      {
-        version: 1,
-        timestamp: '2026-02-01T10:00:00Z',
-        operation: 'birth',
-        signer: 'did:web:example.com:admin',
-        hash: 'abc123',
-        changes: ['Initial creation'],
-      },
-    ]);
-
-    render(
-      <MemoryRouter>
-        <AppContext.Provider value={mockAppContext}>
-          <IdentitiesPage />
-        </AppContext.Provider>
-      </MemoryRouter>
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/did:webvh:zScid1:example\.com:agents:gpt4/i)).toBeInTheDocument();
-    });
-
-    const historyButtons = screen.getAllByTitle(/View version history/i);
-    fireEvent.click(historyButtons[0]);
-
-    await waitFor(() => {
-      expect(screen.getByText('Version History')).toBeInTheDocument();
-    });
-  });
-
   it('displays correct trust score color for high score', async () => {
     render(
       <MemoryRouter>
@@ -484,37 +454,6 @@ describe('IdentitiesPage', () => {
     });
   });
 
-  it('does not show history button for identity without uuid', async () => {
-    const identitiesWithoutUuid = [
-      {
-        ...mockIdentities[0],
-        uuid: undefined as any,
-      },
-    ];
-    const contextWithoutUuid = {
-      ...mockAppContext,
-      getCurrentStats: jest.fn(() => ({
-        identities: identitiesWithoutUuid,
-        channels: [] as any[],
-        gateways: [] as any[],
-        pipes: [] as any[],
-      })),
-    };
-
-    render(
-      <MemoryRouter>
-        <AppContext.Provider value={contextWithoutUuid}>
-          <IdentitiesPage />
-        </AppContext.Provider>
-      </MemoryRouter>
-    );
-
-    await waitFor(() => {
-      const historyButtons = screen.queryAllByTitle(/View version history/i);
-      expect(historyButtons.length).toBe(0);
-    });
-  });
-
   // === Identity Page Migration Display Tests ===
   // did:web identity must render without SCID and without trust score button.
   it('did_web_identity_rendered_without_scid_and_trust_score', async () => {
@@ -567,7 +506,6 @@ describe('IdentitiesPage', () => {
     });
 
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(0);
-    expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(0);
   });
 
   // did:webvh identity must render with SCID, version badge, and action buttons.
@@ -634,7 +572,6 @@ describe('IdentitiesPage', () => {
 
     expect(screen.getByText('v5')).toBeInTheDocument();
     expect(screen.queryAllByTitle(/View trust score/i).length).toBeGreaterThan(0);
-    expect(screen.queryAllByTitle(/View version history/i).length).toBeGreaterThan(0);
   });
 
   // mixed list of did:web and did:webvh must render correctly without cross-contamination.
@@ -712,7 +649,6 @@ describe('IdentitiesPage', () => {
     ).toBeInTheDocument();
 
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(1);
-    expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(1);
     expect(screen.getByText('v2')).toBeInTheDocument();
   });
 
@@ -791,6 +727,7 @@ describe('IdentitiesPage', () => {
       did: 'did:key:jwt-claim-a',
       identity_hash: 'hash-jwt-a',
       trust_score: 0.9,
+      agent_identity: { credential_type: 'jwt_claim', claim: 'sub', value: 'sub-a' },
       credential_principal: { kind: 'jwt_claim', id: 'sub-a', name: 'alice' },
     };
     const jwtClaimB = {
@@ -798,15 +735,37 @@ describe('IdentitiesPage', () => {
       did: 'did:key:jwt-claim-b',
       identity_hash: 'hash-jwt-b',
       trust_score: 0.4,
+      agent_identity: { credential_type: 'jwt_claim', claim: 'sub', value: 'sub-b' },
       credential_principal: { kind: 'jwt_claim', id: 'sub-b', name: 'bob' },
     };
 
-    it('renders one row per identity, including managed identities on one surface', async () => {
+    const payloadVersion = (did: string, model: string, createdAt: string, usedAt: string) => ({
+      ...managedFixture,
+      did,
+      identity_hash: `hash-${model}`,
+      created_at: createdAt,
+      last_used_at: usedAt,
+      usage_count: 2,
+      agent_identity: { 'agentIdentity.llmInfo.model': model },
+    });
+    const gpt4o = payloadVersion(
+      'did:webvh:zQmOld:gateway.example.com:surface:alpha',
+      'gpt-4o',
+      '2026-01-01T00:00:00Z',
+      '2026-01-03T00:00:00Z'
+    );
+    const gpt41 = payloadVersion(
+      'did:webvh:zQmNew:gateway.example.com:surface:alpha',
+      'gpt-4.1',
+      '2026-01-02T00:00:00Z',
+      '2026-01-04T00:00:00Z'
+    );
+
+    it('groups the managed identities of one surface under its most recently used DID', async () => {
       renderWithStats([managedOld, managedNew, callerNamed]);
 
-      const oldRow = await screen.findByTestId('identities-row-did:key:managed-old');
-      const newRow = screen.getByTestId('identities-row-did:key:managed-new');
-      expect(within(oldRow).getByTitle('did:key:managed-old')).toBeInTheDocument();
+      const newRow = await screen.findByTestId('identities-row-did:key:managed-new');
+      expect(screen.queryByTestId('identities-row-did:key:managed-old')).not.toBeInTheDocument();
       expect(within(newRow).getByTitle('did:key:managed-new')).toBeInTheDocument();
       expect(within(newRow).getByTestId('identities-origin-managed')).toHaveTextContent(
         'Managed Agent'
@@ -814,12 +773,269 @@ describe('IdentitiesPage', () => {
       expect(within(newRow).getByTestId('identities-credential-principal')).toHaveTextContent(
         'NITROGEN'
       );
-      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(3);
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
       expect(
         within(screen.getByTestId('identities-row-did:web:caller.example')).getByTestId(
           'identities-origin-external_caller'
         )
       ).toBeInTheDocument();
+    });
+
+    it('lists earlier DIDs as versions with what changed, and sums their usage', async () => {
+      renderWithStats([gpt4o, gpt41]);
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      expect(within(row).getByText('4')).toBeInTheDocument();
+      fireEvent.click(row);
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      const newest = screen.getByTestId('identities-version-2');
+      expect(newest).toHaveTextContent('Current');
+      expect(newest).not.toHaveTextContent('v2');
+      expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
+        'agentIdentity.llmInfo.model: gpt-4o → gpt-4.1'
+      );
+      expect(screen.getByTestId('identities-version-1-changes')).toHaveTextContent(
+        'agentIdentity.llmInfo.model: gpt-4o'
+      );
+      expect(screen.getByTestId('identities-version-1')).not.toHaveTextContent('Current');
+    });
+
+    it('lists a credential rotation inside the DID that kept it', async () => {
+      renderWithStats([managedRotatedFixture]);
+
+      const row = await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`);
+      fireEvent.click(row);
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-2')).toHaveTextContent('Credential rotated');
+      expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
+        'fingerprint_sha256: aa → bb'
+      );
+      expect(screen.getByTestId('identities-version-1-changes')).toHaveTextContent(
+        'fingerprint_sha256: aa'
+      );
+    });
+
+    it('lists an API key update as updated, not as a changed value', async () => {
+      const apiKeyRow = {
+        ...managedRotatedFixture,
+        agent_identity: { credential_type: 'api_key', api_key_id: 'key-1' },
+        rotations: [{ rotated_at: '2026-01-02T00:00:00Z' }],
+      };
+      renderWithStats([apiKeyRow]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${apiKeyRow.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      const update = screen.getByTestId('identities-version-2');
+      expect(update).toHaveTextContent('Credential updated');
+      expect(update).toHaveTextContent('The stored credential was updated');
+      expect(update).not.toHaveTextContent('Credential rotated');
+    });
+
+    it('says no rotations are recorded yet for a certificate identity, and nothing for a payload one', async () => {
+      renderWithStats([
+        { ...managedRotatedFixture, rotations: [] },
+        { ...managedFixture, surface_id: 'beta' },
+      ]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+      expect(screen.getByTestId('identities-version-history-empty')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId(`identities-row-${managedFixture.did}`));
+      expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
+    });
+
+    it('offers the actions of an earlier DID on its version, not on the current one', async () => {
+      renderWithStats([gpt4o, gpt41]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-1-policy-button')).toBeInTheDocument();
+      expect(screen.getByTestId('identities-version-1-copy-link-button')).toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-2-policy-button')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('identities-version-1-copy-link-button'));
+      expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1);
+    });
+
+    it('groups a surface’s response and Transit Point DIDs, but not an external caller', async () => {
+      const transitPoint = {
+        ...gpt41,
+        did: 'did:webvh:zQmTp:gateway.example.com:surface:alpha',
+        identity_hash: 'hash-tp',
+        last_used_at: '2026-01-05T00:00:00Z',
+        slot: { kind: 'transit_point', alias: 'tp-1' },
+      };
+      renderWithStats([gpt4o, transitPoint, callerNamed]);
+
+      expect(await screen.findByTestId(`identities-row-${transitPoint.did}`)).toBeInTheDocument();
+      expect(screen.queryByTestId(`identities-row-${gpt4o.did}`)).not.toBeInTheDocument();
+      expect(screen.getByTestId('identities-row-did:web:caller.example')).toBeInTheDocument();
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
+    });
+
+    it('notes earlier rotations only when the backend dropped some', async () => {
+      renderWithStats([{ ...managedRotatedFixture, rotations_dropped: true }]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-history-dropped')).toHaveTextContent(
+        'Earlier rotations not shown.'
+      );
+    });
+
+    it('does not note earlier rotations when none were dropped', async () => {
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.queryByTestId('identities-version-history-dropped')).not.toBeInTheDocument();
+    });
+
+    it('opens the surface entry and marks the version for a deep link to an earlier DID', async () => {
+      renderWithStats([gpt4o, gpt41], [], `/identities/${encodeURIComponent(gpt4o.did)}`);
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
+      expect(screen.getByTestId('identities-version-2')).not.toHaveAttribute('data-highlighted');
+    });
+
+    it('opens Version History for a link to an earlier DID when its entry is already open', async () => {
+      const GoTo: React.FC<{ to: string }> = ({ to }) => {
+        const navigate = useNavigate();
+        return <button type="button" data-testid="go-to" onClick={() => navigate(to)} />;
+      };
+      const stats = statsWith([gpt4o, gpt41]);
+      const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
+      render(
+        <MemoryRouter initialEntries={[`/identities/${encodeURIComponent(gpt41.did)}`]}>
+          <AppContext.Provider value={context}>
+            <GoTo to={`/identities/${encodeURIComponent(gpt4o.did)}`} />
+            <Routes>
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('go-to'));
+
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
+    });
+
+    it('waits for identities to load before opening a deep-linked earlier DID', async () => {
+      let stats: any = null;
+      const contextFor = () => ({ ...mockAppContext, getCurrentStats: jest.fn(() => stats) });
+      const page = (context: any) => (
+        <MemoryRouter initialEntries={[`/identities/${encodeURIComponent(gpt4o.did)}`]}>
+          <AppContext.Provider value={context}>
+            <Routes>
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+      const { rerender } = render(page(contextFor()));
+
+      stats = statsWith([gpt4o, gpt41]);
+      rerender(page(contextFor()));
+
+      const row = await screen.findByTestId(`identities-row-${gpt41.did}`);
+      await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+      expect(await screen.findByTestId('identities-version-1')).toHaveAttribute(
+        'data-highlighted',
+        'true'
+      );
+    });
+
+    describe('when another DID becomes the primary', () => {
+      const gpt5 = payloadVersion(
+        'did:webvh:zQmNewest:gateway.example.com:surface:alpha',
+        'gpt-5',
+        '2026-01-05T00:00:00Z',
+        '2026-01-06T00:00:00Z'
+      );
+
+      const renderLive = (identities: any[], path: string) => {
+        let stats = statsWith(identities);
+        const page = () => (
+          <MemoryRouter initialEntries={[path]}>
+            <AppContext.Provider
+              value={{ ...mockAppContext, getCurrentStats: jest.fn(() => stats) }}
+            >
+              <Routes>
+                <Route path="/identities" element={<IdentitiesPage />} />
+                <Route path="/identities/:did" element={<IdentitiesPage />} />
+              </Routes>
+            </AppContext.Provider>
+          </MemoryRouter>
+        );
+        const view = render(page());
+        return {
+          update: (next: any[]) => {
+            stats = statsWith(next);
+            view.rerender(page());
+          },
+        };
+      };
+
+      it('keeps an open entry open', async () => {
+        const { update } = renderLive([gpt4o, gpt41, callerNamed], '/identities');
+        fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+        // Open another row so the URL no longer links to this entry.
+        fireEvent.click(screen.getByTestId(`identities-row-${callerNamed.did}`));
+
+        update([gpt4o, gpt41, gpt5, callerNamed]);
+
+        expect(await screen.findByTestId(`identities-row-${gpt5.did}`)).toHaveAttribute(
+          'aria-expanded',
+          'true'
+        );
+        expect(screen.getByTestId('identities-version-history-toggle')).toBeInTheDocument();
+      });
+
+      it('does not reopen a section the user closed on a deep-linked entry', async () => {
+        const { update } = renderLive(
+          [gpt4o, gpt41],
+          `/identities/${encodeURIComponent(gpt4o.did)}`
+        );
+        expect(await screen.findByTestId('identities-version-history')).toBeInTheDocument();
+        fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+        expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+
+        update([gpt4o, gpt41, gpt5]);
+
+        expect(await screen.findByTestId(`identities-row-${gpt5.did}`)).toHaveAttribute(
+          'aria-expanded',
+          'true'
+        );
+        expect(screen.queryByTestId('identities-version-history')).not.toBeInTheDocument();
+      });
+    });
+
+    it('keeps an external caller row without versions', async () => {
+      renderWithStats([externalCallerFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${externalCallerFixture.did}`));
+      expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
     });
 
     it('gives each parallel managed identity on a surface its own actions', async () => {

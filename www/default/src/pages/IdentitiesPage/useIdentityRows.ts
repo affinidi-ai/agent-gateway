@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
+import { groupIdentityVersions, type IdentityVersion } from './identityVersions';
 import { matchesRecorderFilter, type RecorderFilter } from './recorderFilter';
 
 type SurfaceRef = Pick<
@@ -9,6 +10,8 @@ type SurfaceRef = Pick<
 
 const isUnnamed = (identity: Pick<Identity, 'display_name' | 'display_name_pending'>): boolean =>
   !identity.display_name && identity.display_name_pending !== true;
+
+const NO_VERSIONS: IdentityVersion[] = [];
 
 export interface SurfaceLink {
   id: string;
@@ -24,12 +27,23 @@ interface UseIdentityRowsOptions<T extends Identity> {
 }
 
 export interface IdentityRowsView<T extends Identity> {
+  /** One row per entry: the primary DID of a surface identity, or a lone identity. */
   filteredIdentities: T[];
+  /** Number of entries before filtering. */
+  entryCount: number;
   hasNamingMetadata: boolean;
   hasRecorderStatus: boolean;
   unnamedCount: number;
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
+  /** The versions of the entry whose primary DID is `did`, newest first. */
+  versionsFor: (did: string) => IdentityVersion[];
+  /** Whether the entry whose primary DID is `did` had older rotations dropped. */
+  rotationsDroppedFor: (did: string) => boolean;
+  /** The identity whose DID is `did`, for the actions on an earlier version. */
+  identityFor: (did: string) => T | undefined;
+  /** The primary DID of the entry holding `did`, or `did` itself when no entry holds it. */
+  primaryDidFor: (did: string) => string;
 }
 
 export function useIdentityRows<T extends Identity>({
@@ -78,39 +92,75 @@ export function useIdentityRows<T extends Identity>({
     [liveSurfaceNames]
   );
 
-  const unnamedCount = useMemo(() => identities.filter(isUnnamed).length, [identities]);
+  const entries = useMemo(() => groupIdentityVersions(identities), [identities]);
+
+  const { versionsByPrimary, droppedByPrimary, primaryByDid } = useMemo(() => {
+    const versions = new Map<string, IdentityVersion[]>();
+    const dropped = new Set<string>();
+    const primaries = new Map<string, string>();
+    entries.forEach(entry => {
+      versions.set(entry.primary.did, entry.versions);
+      if (entry.rotationsDropped) dropped.add(entry.primary.did);
+      entry.dids.forEach(did => primaries.set(did, entry.primary.did));
+    });
+    return { versionsByPrimary: versions, droppedByPrimary: dropped, primaryByDid: primaries };
+  }, [entries]);
+
+  const versionsFor = useCallback(
+    (did: string) => versionsByPrimary.get(did) ?? NO_VERSIONS,
+    [versionsByPrimary]
+  );
+
+  const rotationsDroppedFor = useCallback(
+    (did: string) => droppedByPrimary.has(did),
+    [droppedByPrimary]
+  );
+
+  const identitiesByDid = useMemo(
+    () => new Map(identities.map(identity => [identity.did, identity])),
+    [identities]
+  );
+
+  const identityFor = useCallback((did: string) => identitiesByDid.get(did), [identitiesByDid]);
+
+  const primaryDidFor = useCallback((did: string) => primaryByDid.get(did) ?? did, [primaryByDid]);
+
+  const unnamedCount = useMemo(
+    () => entries.filter(entry => isUnnamed(entry.primary)).length,
+    [entries]
+  );
 
   const filteredIdentities = useMemo(() => {
     const searchLower = searchTerm.trim().toLowerCase();
-    return identities.filter(identity => {
-      if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(identity)) return false;
-      if (hasRecorderStatus && !matchesRecorderFilter(identity, recorderFilter)) return false;
-      if (!searchLower) return true;
-      return [
-        identity.name,
-        identity.did,
-        identity.channel_name,
-        identity.identity_hash,
-        identity.display_name,
-        identity.surface_name,
-        identity.credential_principal?.name,
-      ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
-    });
-  }, [
-    identities,
-    searchTerm,
-    hasNamingMetadata,
-    showUnnamedOnly,
-    hasRecorderStatus,
-    recorderFilter,
-  ]);
+    return entries
+      .filter(({ primary, dids }) => {
+        if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(primary)) return false;
+        if (hasRecorderStatus && !matchesRecorderFilter(primary, recorderFilter)) return false;
+        if (!searchLower) return true;
+        return [
+          primary.name,
+          ...dids,
+          primary.channel_name,
+          primary.identity_hash,
+          primary.display_name,
+          primary.surface_name,
+          primary.credential_principal?.name,
+        ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
+      })
+      .map(entry => entry.primary);
+  }, [entries, searchTerm, hasNamingMetadata, showUnnamedOnly, hasRecorderStatus, recorderFilter]);
 
   return {
     filteredIdentities,
+    entryCount: entries.length,
     hasNamingMetadata,
     hasRecorderStatus,
     unnamedCount,
     liveSurfaceNames,
     surfaceLinkFor,
+    versionsFor,
+    rotationsDroppedFor,
+    identityFor,
+    primaryDidFor,
   };
 }

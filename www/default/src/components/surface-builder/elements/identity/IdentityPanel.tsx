@@ -48,11 +48,19 @@ const TYPE_OPTIONS: ExtractionTypeOption[] = [
   { value: 'from_mtls', label: 'From mTLS certificate', disabled: true },
 ];
 
-const typeOptionsForPlacement = (isTransitPointIdentity: boolean): ExtractionTypeOption[] =>
+const typeOptionsForPlacement = (
+  isTransitPointIdentity: boolean,
+  isProtectedIdentity: boolean
+): ExtractionTypeOption[] =>
   TYPE_OPTIONS.map(option => ({
     ...option,
     disabled:
-      option.disabled || (isTransitPointIdentity && option.value !== 'from_payload') || undefined,
+      option.disabled ||
+      (isTransitPointIdentity && option.value !== 'from_payload') ||
+      // MA → AP response leg: the key picker lists API keys issued to callers, and none of
+      // them identifies the Managed Agent.
+      (isProtectedIdentity && option.value === 'from_api_key') ||
+      undefined,
   }));
 
 const isSelectableExtractionType = (
@@ -193,7 +201,13 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const identityProtocol = parentTransitProtocol ?? protocol;
   const isA2aLikeProtocol = identityProtocol === 'a2a' || identityProtocol === 'ap2';
   const isTransitPointIdentity = parentTransitProtocol !== null;
-  const extractionTypeOptions = typeOptionsForPlacement(isTransitPointIdentity);
+  const isProtectedIdentity =
+    node.slotId === 'response:identity-protected' ||
+    (node.slotId === 'response:identity' && node.id === 'identity-protected');
+  const extractionTypeOptions = typeOptionsForPlacement(
+    isTransitPointIdentity,
+    isProtectedIdentity
+  );
   const isInboundA2aIdentity =
     node.slotId === 'request:identity-inbound' && (protocol === 'a2a' || protocol === 'ap2');
   const isTransitPointA2aIdentity =
@@ -250,7 +264,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
             </li>
             <li>
               <strong>From API Key</strong>: the caller authenticates with an API key you&apos;ve
-              issued.
+              issued. Not offered on the Managed Agent&apos;s response identity.
             </li>
             <li>
               <strong>From JWT Claims</strong>: the caller sends a signed token; read the identity

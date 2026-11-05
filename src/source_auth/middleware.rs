@@ -726,6 +726,10 @@ mod tests {
             is_local,
             verified: true,
             origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
+            rotations_dropped: false,
         }
     }
 

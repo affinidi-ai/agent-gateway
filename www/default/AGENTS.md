@@ -111,6 +111,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
+  Managed Agent response identity (`response:identity-protected`), since the key picker lists
+  API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
+  external slots still offer it. A protected
+  identity already set to From API Key keeps showing its key selector. Transit Point
+  identities offer only From Payload.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -835,16 +841,41 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 ## Identities page
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
-`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
-unnamed filter, recorder filter, and surface links in the `useIdentityRows` hook, and the row
-parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: grouping, search,
+unnamed filter, recorder filter, and surface links in the `useIdentityRows` hook, the
+grouping and change log in `identityVersions.ts`, and the row parts `IdentityNameCell`,
+`IdentityOriginBadge`, `IdentityRecorderChip`, and `IdentityVersionHistory`.
 
-- Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
-  Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
-  separate rows linked to the same surface. `/identities/<did>` expands that exact
-  identity.
-- Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
-  adds to the set rather than replacing it.
+- One row per surface Managed Agent: managed rows with the same `surface_id` are versions of
+  one entry (`groupIdentityVersions`), whatever their source
+  (`agent_identity.credential_type`) or `slot`, so the Managed Agent's response and Transit
+  Point DIDs share it. The row shows the most recently used DID, a summed usage count, and the
+  latest last use; its actions (Trust Score, Configure Policy, Copy link) belong to that DID.
+  `from_jwt_claim` DIDs (one per claim value), external callers and identities without a
+  surface keep one row per DID.
+- The expanded row's **Version History** section lists the entry's DIDs and the credential
+  rotations inside them as one timeline, newest first, numbered from the oldest. Each version
+  shows its time ("Time unknown" for a rotation found when tracking began), its DID, a
+  Current badge on the primary DID's latest version, and its field changes against the version
+  before it (a new DID against the previous DID, a rotation against its DID's earlier
+  fields); the first version lists its values. A rotation with field changes (a certificate)
+  is labelled "Credential rotated"; one without (an API key, whose update may only have
+  edited its details) is labelled "Credential updated". A version that introduces a DID other
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). When
+  the backend dropped older rotations (`rotations_dropped`), the list ends with "Earlier
+  rotations not shown." (`identities-version-history-dropped`). A certificate or API key
+  identity with no versions yet still shows the section, saying none are recorded. The rows'
+  `rotations` (the latest 20) come from the backend; see
+  `docs/SOURCE_AUTH.md#identity-versions`.
+- `/identities/<did>` expands the entry holding that DID once the dashboard identities have
+  loaded; an earlier DID also opens Version History and marks its versions, including when
+  the entry is already expanded.
+- Expansion state is a `Set` of primary DIDs. Rows expand and collapse independently, and a
+  deep link adds to the set rather than replacing it.
+- Identities page tests prefer the backend-generated rows in `src/__fixtures__/backend/` (a
+  managed row, a managed mTLS row with a rotation, and an external caller row) over
+  hand-written ones. Rust tests fail when the backend no longer sends that shape, and
+  `UPDATE_WEB_FIXTURES=1` regenerates them; do not hand-edit them.
 - The name cell shows the display name prominently, with the shortened DID in monospace
   beside it and a copy button for the full DID. Without a name, the shortened DID and
   copy button are the primary line, with no placeholder chip. While a caller name
@@ -882,19 +913,20 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
     recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
     reload.
 
-| Element                            | Test id                                                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Identity row                       | `identities-row-<did>`                                                                               |
-| Name, pending, conflict, verified  | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified` |
-| Copy DID                           | `identities-copy-did-button`                                                                         |
-| Origin badge                       | `identities-origin-<origin>`                                                                         |
-| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal`                                         |
-| Unnamed filter                     | `identities-unnamed-filter-button`                                                                   |
-| Recorder filter                    | `identities-recorder-filter`                                                                         |
-| Recorder chip                      | `identities-recorder-chip-<state>`                                                                   |
-| Recorder tooltip                   | `identities-recorder-tooltip`                                                                        |
-| Tooltip last attempt, reason       | `identities-recorder-last-attempt`, `identities-recorder-reason`                                     |
-| Tooltip registry entry             | `identities-recorder-entry-<registry id>`                                                            |
+| Element                                | Test id                                                                                                                                              |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity row (the entry's primary DID) | `identities-row-<did>`                                                                                                                               |
+| History toggle, version                | `identities-version-history-toggle`, `identities-version-<number>` (with `-changes`), `identities-version-history-empty`                             |
+| Name, pending, conflict, verified      | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                                                 |
+| Copy DID                               | `identities-copy-did-button`                                                                                                                         |
+| Origin badge                           | `identities-origin-<origin>`                                                                                                                         |
+| Surface link, credential principal     | `identities-surface-link`, `identities-credential-principal`                                                                                         |
+| Unnamed filter                         | `identities-unnamed-filter-button`                                                                                                                   |
+| Recorder filter                        | `identities-recorder-filter`                                                                                                                         |
+| Recorder chip                          | `identities-recorder-chip-<state>`                                                                                                                   |
+| Recorder tooltip                       | `identities-recorder-tooltip`                                                                                                                        |
+| Tooltip last attempt, reason           | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                                     |
+| Tooltip registry entry                 | `identities-recorder-entry-<registry id>`                                                                                                            |
 
 ## Remote gateway Issuer DIDs
 

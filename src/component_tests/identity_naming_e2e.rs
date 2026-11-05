@@ -198,6 +198,10 @@ fn legacy_managed_record(
         is_local: true,
         verified: true,
         origin: None,
+        slot: None,
+        credential_updated_at: None,
+        rotations: Vec::new(),
+        rotations_dropped: false,
     }
 }
 

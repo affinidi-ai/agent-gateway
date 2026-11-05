@@ -62,3 +62,24 @@ describe('useIdentityRows recorder status', () => {
     expect(dids(rows(plain, { recorderFilter: 'recorded' }))).toEqual(['did:x', 'did:y']);
   });
 });
+
+describe('useIdentityRows grouped versions', () => {
+  const version = (did: string, lastUsedAt: string): Identity => ({
+    ...identity(did),
+    origin: 'managed',
+    surface_id: 'surface-1',
+    last_used_at: lastUsedAt,
+  });
+  const older = version('did:older', '2026-01-02T00:00:00Z');
+  const primary = version('did:primary', '2026-01-03T00:00:00Z');
+
+  it('finds the entry by an earlier DID and returns its primary', () => {
+    expect(dids(rows([older, primary], { searchTerm: 'did:older' }))).toEqual(['did:primary']);
+  });
+
+  it('counts the grouped DIDs as one entry', () => {
+    const view = rows([older, primary]);
+    expect(view.entryCount).toBe(1);
+    expect(view.unnamedCount).toBe(1);
+  });
+});

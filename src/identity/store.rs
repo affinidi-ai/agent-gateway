@@ -75,6 +75,18 @@ pub trait IdentityStore: Send + Sync {
         Ok(None)
     }
 
+    /// Record where a managed identity comes from; see
+    /// [`filesystem::AgentIdentityRecord::apply_managed_source`]. Stores without provenance
+    /// tracking ignore it.
+    async fn apply_managed_source(
+        &self,
+        _identity_hash: &str,
+        _source: &filesystem::ManagedIdentitySource,
+        _identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.
     /// Returns `None` for in-memory or mock implementations.
     fn base_path(&self) -> Option<std::path::PathBuf> {

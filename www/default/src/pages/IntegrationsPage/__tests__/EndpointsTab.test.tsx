@@ -124,7 +124,9 @@ test('switching tabs keeps the tab in the URL', async () => {
   fireEvent.click(screen.getByRole('tab', { name: /endpoints/i }));
 
   expect(await row('Ops Slack')).toBeInTheDocument();
-  expect(screen.getByTestId('location')).toHaveTextContent('/integrations?tab=endpoints');
+  await waitFor(() =>
+    expect(screen.getByTestId('location')).toHaveTextContent('/integrations?tab=endpoints')
+  );
 });
 
 test('an unknown tab opens the integrations tab', async () => {
