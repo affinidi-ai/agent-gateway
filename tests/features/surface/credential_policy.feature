@@ -122,6 +122,7 @@ Feature: Credential policy on the request path
     And the token request metric counts no requests
     And managed agent "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_https is enforce"
+    And the gateway log has no warning containing "Target credential sent"
     And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and no OAuth error
 
   Scenario: A Target credential withheld from a plain http Target is left out when fallback is passthrough
@@ -150,6 +151,7 @@ Feature: Credential policy on the request path
     And the token request metric counts no requests
     And managed agent "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_source_auth is enforce"
+    And the gateway log has no warning containing "Target credential sent"
     And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and no OAuth error
 
   Scenario: A Target credential withheld for unchecked callers is left out when fallback is passthrough

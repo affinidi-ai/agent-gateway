@@ -810,6 +810,9 @@ a credential to a Target that is not https, or for callers nobody checks. Two `[
 | `target_https` | The leg's endpoint is not an `https://` URL with a host (`http://`, `fabric://`, `a2a-proxy://`, `proxy://`) | The credential is sent; a warning naming the surface id, and the Transit Point alias on a Transit Point leg, is logged once per leg and rule until the gateway restarts | The credential is withheld |
 | `target_source_auth` | The leg checks no caller: for the Target, the Access Point has no `caller_authentication` method and no `mcp_http.authorization`; for a Transit Point, it requires no transit token and sets neither `source_auth` nor `mcp_http.authorization` | As above | The credential is withheld |
 
+The warning is logged only when the credential is sent: a leg where another rule is `enforce` and
+withholds the credential logs none for a rule still in `warn`.
+
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
 withholds its credential; `target_https` does. A credential withheld under `enforce` is treated
 as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the

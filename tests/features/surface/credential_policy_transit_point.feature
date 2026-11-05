@@ -90,6 +90,7 @@ Feature: Credential policy on a Transit Point
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_https is enforce"
+    And the gateway log has no warning containing "Target credential sent"
     And the VP Audit Log records a Target credential of Transit Point "alpha" that was not sent, with outcome "rejected"
 
   Scenario: A Transit Point leaves out its Target credential for a plain http target endpoint when fallback is passthrough
@@ -121,6 +122,7 @@ Feature: Credential policy on a Transit Point
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_source_auth is enforce"
+    And the gateway log has no warning containing "Target credential sent"
     And the VP Audit Log records a Target credential of Transit Point "alpha" that was not sent, with outcome "rejected"
 
   Scenario: An Access Point with two source authentication methods does not check a Transit Point's callers

@@ -756,19 +756,20 @@ impl<'a> TargetAuthContext<'a> {
 }
 
 /// The first of the `broken` rules that is enforced, which withholds the Target credential.
-/// Each broken rule in `warn` is logged instead, once per leg: the surface's Target, or the
-/// Transit Point named `transit_point`.
+/// When none is, the credential is sent and each broken rule is logged, once per leg: the
+/// surface's Target, or the Transit Point named `transit_point`.
 fn withholding_rule(
     surface_id: &str,
     transit_point: Option<&str>,
     broken: Vec<crate::config::target_auth_rules::TargetCredentialRule>,
     mode: impl Fn(crate::config::target_auth_rules::TargetCredentialRule) -> crate::config::credential_policy::RuleMode,
 ) -> Option<crate::config::target_auth_rules::TargetCredentialRule> {
-    let mut withheld = None;
-    for rule in broken {
-        if mode(rule).is_enforced() {
-            withheld.get_or_insert(rule);
-        } else {
+    let withheld = broken
+        .iter()
+        .copied()
+        .find(|rule| mode(*rule).is_enforced());
+    if withheld.is_none() {
+        for rule in broken {
             warn_target_rule_once(surface_id, transit_point, rule);
         }
     }
@@ -17912,6 +17913,53 @@ pub(crate) mod target_auth_tests {
             assert!(once(&surface_id, Some("partner"), TargetCredentialRule::Https), "a Transit Point is its own leg");
             assert!(!once(&surface_id, Some("partner"), TargetCredentialRule::Https));
             assert!(once(&surface_id, Some("supplier"), TargetCredentialRule::Https));
+        }
+
+        #[test]
+        fn a_rule_in_warn_is_not_logged_when_another_rule_withholds_the_credential() {
+            let mode = |rule: TargetCredentialRule| match rule {
+                TargetCredentialRule::Https => RuleMode::Enforce,
+                TargetCredentialRule::SourceAuth => RuleMode::Warn,
+            };
+            let reversed = |rule: TargetCredentialRule| match rule {
+                TargetCredentialRule::Https => RuleMode::Warn,
+                TargetCredentialRule::SourceAuth => RuleMode::Enforce,
+            };
+            let once = super::super::warn_target_rule_once;
+            for transit_point in [None, Some("partner")] {
+                let surface_id = format!("withheld-{}", uuid::Uuid::new_v4());
+                let broken = || vec![TargetCredentialRule::Https, TargetCredentialRule::SourceAuth];
+                assert_eq!(
+                    super::super::withholding_rule(&surface_id, transit_point, broken(), mode),
+                    Some(TargetCredentialRule::Https)
+                );
+                assert!(
+                    once(&surface_id, transit_point, TargetCredentialRule::SourceAuth),
+                    "the warned rule was not logged, so its once-per-leg bit is unspent"
+                );
+
+                let surface_id = format!("withheld-{}", uuid::Uuid::new_v4());
+                assert_eq!(
+                    super::super::withholding_rule(&surface_id, transit_point, broken(), reversed),
+                    Some(TargetCredentialRule::SourceAuth)
+                );
+                assert!(once(&surface_id, transit_point, TargetCredentialRule::Https));
+            }
+        }
+
+        #[test]
+        fn every_rule_in_warn_is_logged_when_the_credential_is_sent() {
+            let surface_id = format!("sent-{}", uuid::Uuid::new_v4());
+            let withheld = super::super::withholding_rule(
+                &surface_id,
+                None,
+                vec![TargetCredentialRule::Https, TargetCredentialRule::SourceAuth],
+                |_| RuleMode::Warn,
+            );
+            assert_eq!(withheld, None);
+            let once = super::super::warn_target_rule_once;
+            assert!(!once(&surface_id, None, TargetCredentialRule::Https));
+            assert!(!once(&surface_id, None, TargetCredentialRule::SourceAuth));
         }
 
         #[tokio::test]
