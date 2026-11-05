@@ -224,8 +224,8 @@ with it, because that inbound listener passes `/outbound/...` requests on to it.
 URLs share a host name when their hosts match, ignoring case and port; an IPv6 address matches
 only the same address, however it is written (`[2001:db8::1]` and `[2001:DB8:0::1]` match,
 `[2001:db8::1]` and `[2001:db8::2]` do not). An external URL that does not parse, or has no
-host, shares a host name with none, and each load of the configuration names it in a `WARN`
-by its listener's `id` and its zero-based `external_url_index`. The inbound listener streams
+host, shares a host name with none, and startup names it once in a `WARN` by its listener's
+`id` and its zero-based `external_url_index`. The inbound listener streams
 the request and the response, so the outbound listener authenticates the caller before the
 body is read and an event stream arrives as it is sent. It sets no overall timeout, leaving
 the stream deadlines to the outbound listener, and keeps the request method. A Transit Point

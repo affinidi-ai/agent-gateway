@@ -8,7 +8,7 @@ changes:
       description: >-
         An external URL that does not parse, such as one with an out-of-range port, quietly
         stopped its listener sharing the outbound proxy with another listener of the same host.
-        Each load of the configuration now logs a warning naming the listener's id and the URL's
+        Startup now logs one warning for each such URL, naming the listener's id and the URL's
         position in its list, never the URL, so a credential in it stays out of the log.
   removed: []
   security:
