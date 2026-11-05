@@ -757,7 +757,8 @@ impl<'a> TargetAuthContext<'a> {
 
 /// The first of the `broken` rules that is enforced, which withholds the Target credential.
 /// When none is, the credential is sent and each broken rule is logged, once per leg: the
-/// surface's Target, or the Transit Point named `transit_point`.
+/// surface's Target, or the Transit Point named `transit_point`, under the surface variant the
+/// request resolved to.
 fn withholding_rule(
     surface_id: &str,
     transit_point: Option<&str>,
@@ -777,8 +778,9 @@ fn withholding_rule(
 }
 
 /// Logs that a leg sends its Target credential against `rule` in `warn`: the surface's Target,
-/// or the Transit Point named `transit_point`. The decision is made per request, so each leg
-/// and rule is logged once. Returns whether it logged.
+/// or the Transit Point named `transit_point`, under the surface variant the request resolved
+/// to. The decision is made per request, so each leg and rule is logged once. Returns whether
+/// it logged.
 fn warn_target_rule_once(
     surface_id: &str,
     transit_point: Option<&str>,
@@ -790,20 +792,22 @@ fn warn_target_rule_once(
         TargetCredentialRule::Https => 1,
         TargetCredentialRule::SourceAuth => 2,
     };
-    let leg = match transit_point {
-        None => std::borrow::Cow::Borrowed(surface_id),
-        Some(alias) => std::borrow::Cow::Owned(format!("{surface_id}\n{alias}")),
-    };
+    let variant = crate::observability::policy_audit::current_request_variant();
+    let leg = format!(
+        "{surface_id}\n{}\n{}",
+        variant
+            .as_deref()
+            .unwrap_or_default(),
+        transit_point.unwrap_or_default()
+    );
     if WARNED
-        .get(leg.as_ref())
+        .get(&leg)
         .is_some_and(|warned| *warned & bit != 0)
     {
         return false;
     }
     let first = {
-        let mut warned = WARNED
-            .entry(leg.into_owned())
-            .or_default();
+        let mut warned = WARNED.entry(leg).or_default();
         let first = *warned & bit == 0;
         *warned |= bit;
         first
@@ -818,6 +822,7 @@ fn warn_target_rule_once(
         };
         warn!(
             surface_id = %surface_id,
+            surface_variant = variant.as_deref(),
             transit_point = transit_point.unwrap_or_default(),
             rule = rule.key(),
             "Target credential sent {what}; it will be withheld once credential_policy.{rule} is enforce"
@@ -17913,6 +17918,26 @@ pub(crate) mod target_auth_tests {
             assert!(once(&surface_id, Some("partner"), TargetCredentialRule::Https), "a Transit Point is its own leg");
             assert!(!once(&surface_id, Some("partner"), TargetCredentialRule::Https));
             assert!(once(&surface_id, Some("supplier"), TargetCredentialRule::Https));
+        }
+
+        #[test]
+        fn a_rule_in_warn_is_logged_once_per_surface_variant() {
+            let surface_id = format!("warn-variant-{}", uuid::Uuid::new_v4());
+            let once = super::super::warn_target_rule_once;
+            let rule = TargetCredentialRule::Https;
+            let under = |variant: &str, transit_point: Option<&str>| {
+                crate::observability::policy_audit::with_request_variant(variant, || {
+                    once(&surface_id, transit_point, rule)
+                })
+            };
+            assert!(under("blue", None));
+            assert!(!under("blue", None));
+            assert!(under("green", None), "a variant is its own leg");
+            assert!(once(&surface_id, None, rule), "the base surface is its own leg");
+            assert!(!once(&surface_id, None, rule));
+            assert!(under("blue", Some("partner")));
+            assert!(!under("blue", Some("partner")));
+            assert!(under("green", Some("partner")));
         }
 
         #[test]

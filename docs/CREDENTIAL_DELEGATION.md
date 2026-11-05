@@ -807,7 +807,7 @@ a credential to a Target that is not https, or for callers nobody checks. Two `[
 
 | Rule | Broken when | `warn` (default) | `enforce` |
 | --- | --- | --- | --- |
-| `target_https` | The leg's endpoint is not an `https://` URL with a host (`http://`, `fabric://`, `a2a-proxy://`, `proxy://`) | The credential is sent; a warning naming the surface id, and the Transit Point alias on a Transit Point leg, is logged once per leg and rule until the gateway restarts | The credential is withheld |
+| `target_https` | The leg's endpoint is not an `https://` URL with a host (`http://`, `fabric://`, `a2a-proxy://`, `proxy://`) | The credential is sent; a warning naming the surface id, the surface variant the request resolved to, and the Transit Point alias on a Transit Point leg, is logged once per leg (the base surface, or a variant, each with its own Target and Transit Points) and rule until the gateway restarts | The credential is withheld |
 | `target_source_auth` | The leg checks no caller: for the Target, the Access Point has no `caller_authentication` method and no `mcp_http.authorization`; for a Transit Point, it requires no transit token and sets neither `source_auth` nor `mcp_http.authorization` | As above | The credential is withheld |
 
 The warning is logged only when the credential is sent: a leg where another rule is `enforce` and
