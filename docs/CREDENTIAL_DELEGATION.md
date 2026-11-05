@@ -280,7 +280,8 @@ receive, legacy or `2026-07-28`: its tool call's REST backend answers the token,
 caller gets that answer as a tool result with `isError` set. A Transit Point and the Fabric send
 leg do not: their refusals leave the token in place until it is renewed. The Target and a Transit
 Point that use the same provider and scopes on one surface share one cached token, so only the
-Target's own answers can drop it.
+Target's own answers can drop it. To keep a Transit Point's token unusable at the Target, give the
+Transit Point a provider whose `resource` names its own server.
 
 ### Logging token endpoint errors
 
