@@ -45,30 +45,13 @@ impl CardPreviewApi<'_> {
             }),
             PreviewCaller::ViewOnly => json!({"name": "card preview token", "scopes": ["surfaces.view"]}),
         };
-        let created = self
-            .operator
-            .send_recorded_json(reqwest::Method::POST, "/v1/access-tokens", Some(&request))
-            .await
-            .expect("creating the access token");
-        assert!(matches!(created.status, 200 | 201), "creating the access token: {}", created.body);
         let mut headers = header::HeaderMap::new();
-        let mut authorization = header::HeaderValue::from_str(&format!(
-            "Bearer {}",
-            created.body["token"]
-                .as_str()
-                .expect("the access token is returned once")
-        ))
-        .expect("a bearer header");
-        authorization.set_sensitive(true);
-        headers.insert(header::AUTHORIZATION, authorization);
         if let PreviewCaller::Tenant(tenant) = caller {
             headers.insert(TENANT_HEADER, header::HeaderValue::from_str(tenant).expect("a tenant header"));
         }
-        Client::builder()
-            .no_proxy()
-            .default_headers(headers)
-            .build()
-            .expect("an HTTP client")
+        self.operator
+            .personal_access_token_client(&request, headers)
+            .await
     }
 
     async fn send(

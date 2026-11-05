@@ -121,6 +121,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].payment_policy',
   'transit.points[*].networking',
   'transit.points[*].rate_limit',
+  'transit.points[*].per_caller_rate_limit',
   'transit.points[*].identity_injection',
   'transit.points[*].managed_identity',
   'transit.points[*].workload_binding',

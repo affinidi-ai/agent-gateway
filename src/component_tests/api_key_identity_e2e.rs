@@ -971,6 +971,22 @@ async fn start_with_stored_shared_key_surface(surface_id: &'static str) -> (Gate
             .identities
             .clone();
         seed_legacy_caller_record(&identities_dir, surface_id, LEGACY_SAVED_KEY_ID);
+        let api_keys = api_keys_dir(bootstrap);
+        block_on(async {
+            crate::api_keys::FileSystemApiKeyStore::new(&api_keys)
+                .await
+                .expect("create API key store")
+                .create_with_material(
+                    surface_id,
+                    LEGACY_SAVED_KEY_ID.to_string(),
+                    "atgs_legacy_saved_key".to_string(),
+                    "legacy",
+                    None,
+                    "component-test",
+                )
+                .await
+                .expect("seed the legacy key");
+        });
         let gateway: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
         let stored = json!({

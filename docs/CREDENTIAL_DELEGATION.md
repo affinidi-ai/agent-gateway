@@ -479,12 +479,14 @@ no valid transit token and the Transit Point's own `source_auth` verified the ca
 [identity hash](#the-callers-identity-hash), the value the Access Point computes for a caller
 it authenticated the same way. So:
 
-- an agent that calls the Transit Point with a JWT from the same issuer, for the same `sub`,
+- an agent that calls the Transit Point with a JWT from the same issuer, for the same value of
+  the same principal claim (`sub` by default),
   as a user who consented through the Access Point is given that user's grant; a JWT from
   another issuer, or the same name verified another way, is another caller;
 - an API-key caller is one identity: every request with a key from the same `api_key`
   secret, or with the same `api_key_provider` key, shares one set of grants;
-- a JWT without a `sub` names no caller and is given no grant.
+- a JWT without a non-empty string in its strategy's principal claim names no caller and is
+  given no grant.
 
 A caller verified by a resource access token (`mcp_http.authorization`) keys a grant only on
 a `2026-07-28` MCP request, and a `2026-07-28` MCP request keys a grant only that way. A
@@ -951,7 +953,7 @@ MCP request is refused with `-32022`: the vendor is reached over a
 session revision. A request that arrived over Fabric is refused `403` as one whose caller the
 gateway did not identify, before any payment is asked for or verified: the caller a peer gateway
 asserts never keys a grant. A public discovery read over Fabric is refused the same way, since
-it would carry the peer's headers, its caller's cookies among them, to the vendor, and no request
+it would carry the peer's headers to the vendor, and no request
 over Fabric can use the Target. Each such refusal is audited `request_rejected` at admission, as
 `consent_identity_required`. A surface whose binding breaks a rule above, as one edited by hand
 might, answers `connector_unavailable` before any payment is asked for or settled, and reads no
@@ -1098,8 +1100,8 @@ A Transit Point refuses such a request with `503`, and also refuses with `403` o
 no caller, because neither a transit token with a caller identity nor the Transit Point's
 `source_auth` identifies one. That includes every request to a Transit Point that serves callers it
 does not authenticate and every request to one that sets `require_transit_token: false` without
-`source_auth` (a valid transit token sent there names the caller to policy only, not to
-delegation), or for which neither its managed identity nor the transit token's caller DID gives
+`source_auth` (a valid transit token sent there names the caller to policy and to the per-caller rate limit
+only, not to delegation), or for which neither its managed identity nor the transit token's caller DID gives
 the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
@@ -1218,11 +1220,17 @@ certificate identity therefore shares one set of delegated tokens.
 ### The caller's identity hash
 
 `user_identity_hash` is the lowercase hex SHA-256 of the JSON array
-`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces):
+`[method, issuer, tenant, subject]`, written as RFC 8785 canonical JSON (no spaces). For a
+`jwt_bearer` caller whose verification strategy names a `principal_claim` other than `sub`, the
+claim's name is appended: `[method, issuer, tenant, subject, claim]`. One value in two claims, such
+as one person's `sub` and another person's `preferred_username` under two strategies for the same
+issuer, is therefore two callers. A strategy that names `sub`, or no claim, keeps the four-element
+form and every hash it gave before.
 
 | Source authentication | `method` | `issuer` | `subject` |
 | --- | --- | --- | --- |
-| `jwt_bearer`, and a resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
+| `jwt_bearer` | `jwt_bearer` | The token's `iss` | The value of the verification strategy's `principal_claim` in the token (`sub` unless the strategy names another claim: [Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)) |
+| A resource access token | `jwt_bearer` | The token's `iss` | The token's `sub` |
 | `api_key` | `api_key` | `""` | The `secret_id` |
 | `api_key_provider` | `api_key_provider` | The API Key Provider agent id | The key's id |
 | `did_auth` | `did_auth` | `""` | The DID |
@@ -1233,7 +1241,7 @@ by another method, issuer, API Key Provider agent or tenant is therefore another
 grants of its own. An mTLS caller is keyed by the subject and key of the CA the gateway trusted, not by the
 issuer name its certificate states, so renewing a CA with the same subject and key keeps its callers' identity
 hashes, and a CA with another key gives them new ones. With pinned trust, replacing a pinned
-certificate gives its caller a new hash. A JWT without a non-empty `sub`, or without an `iss`, names no caller: it has
+certificate gives its caller a new hash. A JWT without a non-empty string in its strategy's principal claim (`sub` by default), or without an `iss`, names no caller: it has
 no identity hash, so it is given no delegated credential: an Access Point answers `403`
 `identity-required`, and a Transit Point `403`.
 
@@ -1252,22 +1260,30 @@ A system that runs the connect for a caller, such as the page that hosts the per
 and the authorization server's redirect, passes the caller's identity hash as the `principal`
 of a connect and of a grant removal, and reads it from a grant report. It computes the hash
 itself from the ID token the person signed in with. Only the `jwt_bearer` form is meant to be
-computed outside the gateway: take the token's `iss` and `sub`, and the surface's `tenant_id`
-(or `null`).
+computed outside the gateway: take the token's `iss`, the surface's `tenant_id` (or `null`),
+and the value of the strategy's `principal_claim` (`sub` by default), followed by the claim's
+name when it is not `sub`. The ID token must carry that claim with the same value, and the same
+`iss`, as the tokens the agent's callers present. Microsoft Entra puts `oid` in an ID token only
+when the sign-in requests the `profile` scope, and its `iss` is the v2 issuer only from the v2.0
+endpoint, which must match the strategy's `expected_issuer`.
 
 The form is a compatibility surface. It is not changed without a documented migration, since
-a changed form orphans every stored grant. No pepper and no configuration setting is part of
-it: the same inputs always give the same hash, on every gateway. (The pepper derives the ids
+a changed form orphans every stored grant. No pepper is part of it, and the
+only setting that is, the strategy's `principal_claim`, is fixed when the strategy is created:
+the same inputs always give the same hash, on every gateway. (The pepper derives the ids
 grants are stored under, never the hash itself.) These values are held by
 tests, and a change to the form fails them:
 
-| `method` | `issuer` | `tenant` | `subject` | Identity hash |
-| --- | --- | --- | --- | --- |
-| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
-| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
-| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
-| `api_key` | `""` | `null` | `partner-key` | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
+| `method` | `issuer` | `tenant` | `subject` | `claim` | Identity hash |
+| --- | --- | --- | --- | --- | --- |
+| `jwt_bearer` | `https://login.example.com` | `null` | `alice` | none (`sub`) | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `alice` | none (`sub`) | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` |
+| `jwt_bearer` | `https://login.example.com` | `tenant-1` | `a"b\c` then `é` then a line feed | none (`sub`) | `37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353` |
+| `jwt_bearer` | `https://login.example.com` | `null` | `00000000-0000-0000-0000-0000000000aa` | `oid` | `37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f` |
+| `api_key` | `""` | `null` | `partner-key` | none | `67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db` |
 
+The fourth row is the hash of
+`["jwt_bearer","https://login.example.com",null,"00000000-0000-0000-0000-0000000000aa","oid"]`.
 The third row shows RFC 8785 escaping: the subject is written with `\"` for the quote, `\\` for the
 backslash, the character `é` as itself in UTF-8, and `\n` for the line feed.
 
@@ -1280,6 +1296,7 @@ written as base64url without padding (22 characters). It has the same compatibil
 | --- | --- |
 | `42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f` | `WXYw1wqFnUD93SdLiPtFyA` |
 | `88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738` | `YvFEO7T_9N80_y4j8sxMVA` |
+| `37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f` | `bjXra_R6O-9aJ7DUY5xpnA` |
 
 Delegated credentials stored by a release that keyed them by an earlier form of the identity
 hash are never looked up again, but their access and refresh tokens stay in the vault until

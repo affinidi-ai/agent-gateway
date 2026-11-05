@@ -4635,15 +4635,17 @@ async fn process_forward_request_in_request_scope(
         via_fabric: true,
     };
 
-    // A closed Access Point without source authentication is not ready: it
-    // refuses every request before source authentication, policy and the
-    // Target, as the direct path does.
-    if surface.refuses_every_request() {
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request before source authentication, policy and the Target, as the
+    // direct path does.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&surface).await {
         return axum_response_to_forward_result(crate::source_auth::errors::refuse_unavailable_access_point(
             &surface,
             &audit_facts,
             resolved_alias,
             refused_mcp_request_id(&surface, &body_bytes),
+            reason,
         ))
         .await;
     }
@@ -5775,6 +5777,9 @@ async fn process_forward_request_in_request_scope(
                 }
             if crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(key) {
                 channel_info!(config_id, "    Skipping caller-info header: {}", key);
+                continue;
+            }
+            if key_lower == "cookie" {
                 continue;
             }
             if target_auth_header.is_some_and(|credential| key.eq_ignore_ascii_case(credential)) {
@@ -11799,9 +11804,9 @@ mod tests {
         }
     }
 
-    /// The caller-info and DID identity headers a peer gateway sends, in any
-    /// case, never reach the agent behind the receiving surface; the peer's
-    /// other headers do.
+    /// The caller-info and DID identity headers and the caller's cookies a peer
+    /// gateway sends, in any case, never reach the agent behind the receiving
+    /// surface; the peer's other headers do.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11867,6 +11872,7 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "Cookie": "__Host-session_token=peer-dashboard-session",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11883,6 +11889,7 @@ mod tests {
             "x-gateway-did",
             "x-did-identity",
             "x-did-signed-identity",
+            "cookie",
         ] {
             assert!(
                 received[0]

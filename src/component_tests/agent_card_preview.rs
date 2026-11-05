@@ -104,7 +104,7 @@ impl AdminApi {
             let (status, body, _) = self
                 .send(
                     self.card(&self.client, surface_id)
-                        .header(reqwest::header::COOKIE, "session_token=management-cookie"),
+                        .header(reqwest::header::COOKIE, "__Host-session_token=management-cookie"),
                 )
                 .await;
             assert_eq!(status, 200, "{body}");

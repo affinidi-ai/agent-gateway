@@ -60,6 +60,9 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::Storage(msg) => SourceAuthError::Internal {
                 reason: format!("Storage error: {msg}"),
             },
+            JwtBearerError::InvalidPrincipalClaim(msg) => SourceAuthError::Internal {
+                reason: format!("Invalid principal claim: {msg}"),
+            },
         }
     }
 }
@@ -201,23 +204,56 @@ pub fn access_point_unavailable(
     }
 }
 
-/// Refuses a request to `surface`, whose Access Point is not ready
-/// ([`AgentSurface::refuses_every_request`]), on the direct path and over
-/// Fabric: logs why, records `request_rejected` with the reason
-/// `access_point_not_ready`, and answers with [`access_point_unavailable`].
+/// Why an Access Point is not ready: it is closed and authenticates no caller
+/// ([`AgentSurface::refuses_every_request`]), or it derives a DID from an API
+/// key it may not use ([`crate::identity::provider_key_gate`]).
 ///
 /// [`AgentSurface::refuses_every_request`]: crate::config::agent_surface::AgentSurface::refuses_every_request
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotReadyReason {
+    NoSourceAuthentication,
+    ProviderKeyTenant,
+    ApiKeyStoreUnavailable,
+}
+
+impl NotReadyReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSourceAuthentication => "no source authentication",
+            Self::ProviderKeyTenant => crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
+            Self::ApiKeyStoreUnavailable => crate::identity::provider_key_gate::API_KEY_STORE_UNAVAILABLE,
+        }
+    }
+
+    /// Why a request to `surface`, as served, is refused before source
+    /// authentication, on the direct path and over Fabric, if it is.
+    pub async fn of(surface: &crate::config::agent_surface::AgentSurface) -> Option<Self> {
+        if surface.refuses_every_request() {
+            return Some(Self::NoSourceAuthentication);
+        }
+        crate::identity::provider_key_gate::gate()
+            .refuses(surface)
+            .await
+    }
+}
+
+/// Refuses a request to `surface`, whose Access Point is not ready for
+/// `reason`, on the direct path and over Fabric: logs why, records
+/// `request_rejected` with the reason `access_point_not_ready`, and answers
+/// with [`access_point_unavailable`].
 pub fn refuse_unavailable_access_point(
     surface: &crate::config::agent_surface::AgentSurface,
     facts: &crate::audit::request_events::RequestFacts<'_>,
     variant_alias: Option<&str>,
     mcp_request_id: Option<serde_json::Value>,
+    reason: NotReadyReason,
 ) -> Response {
     crate::channel_warn!(
         surface.surface_id,
-        "Access Point is not ready (variant={:?}, via_fabric={}, reason=no source authentication) — refusing with 503",
+        "Access Point is not ready (variant={:?}, via_fabric={}, reason={}) — refusing with 503",
         variant_alias,
-        facts.via_fabric
+        facts.via_fabric,
+        reason.as_str()
     );
     let response = access_point_unavailable(&surface.access_point.protocol, mcp_request_id);
     let rpc_error_code = (surface.access_point.protocol == SurfaceProtocol::Mcp)

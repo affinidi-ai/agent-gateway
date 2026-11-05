@@ -31,6 +31,6 @@ pub use errors::ApiKeyResult;
 pub use filesystem::FileSystemApiKeyStore;
 pub use generator::KEY_ID_PREFIX;
 pub use store::ApiKeyValidator;
-#[cfg(test)]
-pub use types::ApiKeyIssuer;
 pub use types::{ApiKeyCreated, ApiKeyMeta, ApiKeyStatus};
+#[cfg(test)]
+pub use types::{ApiKeyIssuer, ApiKeyRecord};

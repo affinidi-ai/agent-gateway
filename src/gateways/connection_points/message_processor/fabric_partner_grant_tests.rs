@@ -390,6 +390,7 @@ impl Receiver {
         crate::source_auth::AuthenticatedIdentity::JwtBearer {
             subject: subject.to_string(),
             claims: json!({ "iss": self.idp.issuer, "sub": subject }),
+            principal_claim: "sub".to_string(),
         }
         .principal_hash(tenant)
         .unwrap()

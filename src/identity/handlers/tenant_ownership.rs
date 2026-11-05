@@ -22,7 +22,7 @@ use crate::tenancy::{
 };
 use crate::trust_registries::TrustRegistryStore;
 
-use super::surface_tenancy::collect_surface_reference_keys;
+use super::surface_tenancy::{collect_surface_reference_keys, provider_key_ids, provider_key_owners};
 use crate::config::credential_policy::RuleMode;
 
 #[derive(Debug)]
@@ -456,6 +456,7 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
         .agent_surface_store
         .as_ref()
     {
+        let mut key_owners = None;
         for mut surface in store
             .list_all()
             .await
@@ -483,6 +484,43 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                         custom_metadata: reference.custom_metadata,
                         ..edge
                     });
+                }
+            }
+            let ids = provider_key_ids(&surface).map_err(|error| {
+                OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
+            })?;
+            if ids.is_empty() {
+                continue;
+            }
+            if state.api_key_store.is_none() {
+                return Err(OwnershipApiError::Refused("API key store is not configured".into()));
+            }
+            if key_owners.is_none() {
+                key_owners = Some(
+                    provider_key_owners(state)
+                        .await
+                        .map_err(|error| {
+                            OwnershipApiError::Internal(format!("Failed to inspect API key owners: {:?}", error))
+                        })?,
+                );
+            }
+            let owners = key_owners
+                .as_ref()
+                .map(|owners| {
+                    ids.all()
+                        .filter_map(|key_id| owners.get(key_id))
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for owner in owners {
+                if let Some(edge) =
+                    ownership_reference(state, source.clone(), ResourceKind::ApiKeys, &owner, "surface identity", true)
+                        .await?
+                    && edge.target.exists
+                {
+                    references.push(edge);
                 }
             }
         }
@@ -948,8 +986,9 @@ async fn persist_tenant_id(
                 resource.tenant_id = tenant_id;
                 super::surface_tenancy::validate_surface_references(state, &resource, Some(&resource), None, None)
                     .await
-                    .map_err(|error| {
-                        OwnershipApiError::Internal(format!("Surface reference validation failed: {:?}", error))
+                    .map_err(|error| match error {
+                        super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),
+                        other => OwnershipApiError::Internal(format!("Surface reference validation failed: {other:?}")),
                     })?;
             }
             super::surface_tenancy::validate_external_consent_bindings(state, &resource)
