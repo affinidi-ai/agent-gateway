@@ -53,7 +53,7 @@ pub fn set_cache_refresh_interval_secs(secs: u64) {
     CACHE_REFRESH_INTERVAL_SECS.store(secs, Ordering::Relaxed);
 }
 
-fn cache_refresh_interval_secs() -> u64 {
+pub(crate) fn cache_refresh_interval_secs() -> u64 {
     CACHE_REFRESH_INTERVAL_SECS.load(Ordering::Relaxed)
 }
 

@@ -1,0 +1,106 @@
+branch: fix/tenant-check-provider-key-references
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Reload API keys when a Standby node becomes Active
+      description: >-
+        A Standby node promoted to Active kept the API keys it loaded at startup, so a key the
+        other node created, rotated or revoked meanwhile was refused, kept its old secret, or still
+        authenticated until a restart. On becoming Active the node now reconciles its API keys with
+        disk before it reloads its configuration.
+  removed: []
+  security:
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Tenant-check the API Key Provider keys a surface derives a DID from on save
+      description: >-
+        The gateway derives a DID from an API Key Provider key id (`atgk_`) without looking the
+        key up, and a surface save did not check whose key it named, so a surface could take the
+        DID of another tenant's key. A save now treats each key id named by a `from_api_key`
+        identity on the protected, external or a Transit Point slot, or by a target identity
+        injection of type `from_api_key`, on the base and in every variant, as a reference to the
+        key's owning surface. Another tenant's key, or a tenant's key on a surface with no
+        tenant, is refused with `400`.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Refuse requests to a stored surface that names an API key it may not use
+      description: >-
+        A surface stored before the save check, or changed on disk or by another node, went live
+        without it. At boot, on reload, on the cache refresh scan, on another node's write and on
+        the first request to an unchecked version, the gateway now checks its key ids and logs one
+        warning with the rule `provider_key_tenant`. Under `tenant_credential_isolation: enforce`
+        such a surface is not ready and answers `503` on direct inbound, Fabric receive and its
+        Transit Points. While the API key store cannot be read, a surface naming a key id that
+        has not been checked answers `503` in either mode; a store that failed to start needs a
+        restart. When a key-owning surface changes or is deleted, the surfaces naming its keys are
+        checked again on their next request. A legacy Caller Context API Key secret named like
+        such a key on an inbound From API Key view is checked the same way, and a new reference
+        to one is refused on save.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Fetch no agent card preview for a surface that names an API key it may not use
+      description: >-
+        The agent card preview derived and injected the surface's identity while building the
+        card, so it could present the DID of a key the surface may not use. A surface refused for
+        its API Key Provider keys now gets a `not_running` preview, and nothing is fetched or
+        kept.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Answer 409 to a reassignment that breaks a surface's API key references
+      description: >-
+        A tenant reassignment of a key-owning surface, or of a surface naming a key, that would
+        leave a surface naming another tenant's key, or make a tenant surface name the key of a
+        surface with no tenant, is now a conflict (`409`), also for a key a surface names as a
+        legacy Caller Context secret. A reassignment whose surface then fails any reference check
+        answers `409` instead of `500`, and so do a reassignment and an ownership impact read
+        made while a surface names an API key id and the API key store is not configured.
+  breaking:
+    - timestamp: '2026-11-03T18:00:00Z'
+      title: Answer 500 to a surface save naming an API key id without an API key store
+      description: >-
+        Without an API key store the gateway cannot tell whose key an `atgk_` id is, so saving a
+        surface that names one, including as a Caller Context API Key secret on a view whose
+        inbound Identity is From API Key, now answers `500` "API key store is not configured"
+        instead of saving it. Fix the API key store before saving such surfaces.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Refuse a new reference to an API key that does not exist
+      description: >-
+        A `from_api_key` identity or identity injection whose `atgk_` key id names no key, or a key
+        whose owning surface was deleted, is refused on save with `400`, where it used to be saved
+        with a DID derived from the id alone. A surface that already stored the reference keeps it,
+        so a GET then PUT still saves. Issue a new API key to add one.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Reserve the atgk_ prefix for API key ids and refuse it as a new secret id
+      description: >-
+        A secret named after an API key id shares that key's DID. `POST /v1/secrets/new` now
+        refuses a `secret_id` that starts with `atgk_` with `400`. Secrets already stored with such
+        an id keep loading and serving; replace them with a secret of another id to stop sharing a
+        key's DID.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Match a resource-scoped token's pattern against the API key ids a surface names
+      description: >-
+        Saving a surface with a resource-scoped access token now needs each API Key Provider key id
+        the surface names to match the token's pattern as `api-keys:<key id>`, also for a key the
+        stored surface already named. Widen the pattern of tokens that save such surfaces.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Refuse a tenant surface naming the API key of a surface with no tenant
+      description: >-
+        A tenant surface naming the key of a surface with no tenant is held to
+        `tenant_credential_isolation`, as an appliance-wide secret sent upstream is: a new
+        reference is refused on save, and one the stored surface already named is kept under
+        `warn` and refused under `enforce`.
+    - timestamp: '2026-11-03T17:00:00Z'
+      title: Answer 503 from stored surfaces naming an API key they may not use when enforced
+      description: >-
+        Under `tenant_credential_isolation: enforce`, a stored surface naming another tenant's API
+        Key Provider key, a tenant's key on a surface with no tenant, or the key of a surface with
+        no tenant now answers every request with `503`. If you run `enforce`, upgrade with
+        `warn` first, read the startup credential policy report for `provider_key_tenant` lines,
+        fix those surfaces, then restart with `enforce`. Such a surface still reports
+        `access_point_status: ready`; the gateway log line with `rule="provider_key_tenant"` says
+        why it answers `503`.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Answer 503 from surfaces naming an API key id while the key store is unavailable
+      description: >-
+        In either `tenant_credential_isolation` mode, a surface naming an `atgk_` id that has not
+        been checked answers `503` while the API key store cannot be read, where it used to serve.
+        A store that fails to start keeps such surfaces not ready until the gateway restarts with
+        a working store.

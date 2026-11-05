@@ -3405,3 +3405,144 @@ async fn fabric_multi_method_flow() {
     assert_eq!(discovery_jwt["status"], 200, "{discovery_jwt}");
     assert_eq!(reached(), 5);
 }
+
+#[test]
+fn fabric_receive_refuses_a_surface_naming_another_tenants_provider_key_when_enforced() {
+    run_in_own_process(provider_key_fabric_flow);
+}
+
+/// Over Fabric, a surface stored naming another tenant's API Key Provider key is not ready
+/// under `tenant_credential_isolation: enforce` and refuses with `503` before the Target; one
+/// naming its own tenant's key is served. The verdict is taken on the first request, as no
+/// apply ran for the surfaces.
+async fn provider_key_fabric_flow() {
+    use std::sync::Arc;
+
+    use crate::api_keys::store::ApiKeyStore as _;
+    use crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore;
+
+    crate::config::credential_policy::init_credential_policy(
+        crate::config::credential_policy::CredentialPolicyConfig {
+            tenant_credential_isolation: crate::config::credential_policy::RuleMode::Enforce,
+            ..Default::default()
+        },
+    );
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = Arc::new(
+        FileSystemAgentSurfaceStore::new(storage_path.clone())
+            .await
+            .unwrap(),
+    );
+    let api_keys = Arc::new(
+        crate::api_keys::FileSystemApiKeyStore::new(
+            &temp_dir
+                .path()
+                .join("api_keys")
+                .to_string_lossy(),
+        )
+        .await
+        .unwrap(),
+    );
+    let surface = |id: &str, tenant: &str, key_id: Option<&str>| {
+        let mut surface = json!({
+            "surface_id": id, "name": id, "tenant_id": tenant,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": "mcp"},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        });
+        if let Some(key_id) = key_id {
+            surface["identity_slots"] = json!({"external": {"type": "from_api_key", "api_key_id": key_id}});
+        }
+        serde_json::from_value::<AgentSurface>(surface).unwrap()
+    };
+    for stored in [
+        surface("owner-a", "tenant-a", None),
+        surface("owner-b", "tenant-b", None),
+        surface("names-cross", "tenant-a", Some("atgk_fabric_b")),
+        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
+    ] {
+        store
+            .save(&stored)
+            .await
+            .unwrap();
+    }
+    for (owner, key_id) in [("owner-a", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
+        api_keys
+            .create_with_material(owner, key_id.to_string(), format!("atgs_{key_id}"), "client", None, "test")
+            .await
+            .unwrap();
+    }
+    crate::identity::provider_key_gate::gate().set_sources(Some(api_keys), Some(store));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                temp_dir
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        ),
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str| {
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": format!("/{channel_id}"),
+                "headers": {"MCP-Protocol-Version": MCP_LEGACY_VERSION},
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move { receive(&message).await.0 }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    let refused = send("names-cross").await;
+    assert_eq!(refused["status"], 503, "{refused}");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            refused["body"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()["error"]["message"],
+        crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE
+    );
+    assert_eq!(reached(), 0, "a not-ready Access Point never reaches the Target");
+
+    let served = send("names-own").await;
+    assert_eq!(served["status"], 200, "{served}");
+    assert_eq!(reached(), 1);
+}

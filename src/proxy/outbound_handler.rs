@@ -1010,6 +1010,7 @@ async fn outbound_proxy_handler_in_request_scope(
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
     let mut ctx = OutboundPipelineContext::new(addr, req, &state, versions)?;
+    step_provider_key_gate(&mut ctx).await?;
     if let Some(refusal) = ctx
         .pending_variant_refusal
         .take()
@@ -1716,6 +1717,27 @@ fn caller_authentication_unavailable(
         "Transit Point caller authentication is unavailable"
     );
     transit_point_unavailable(ctx)
+}
+
+/// Refuses every request through a Transit Point of a surface that derives a
+/// DID from an API key it may not use, as its Access Point is refused.
+async fn step_provider_key_gate(ctx: &mut OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
+    let surface = ctx.surface.clone();
+    let Some(reason) = crate::identity::provider_key_gate::gate()
+        .refuses(&surface)
+        .await
+    else {
+        return Ok(());
+    };
+    warn!(
+        request_id = %ctx.request_id,
+        surface_id = %ctx.surface.surface_id,
+        transit_point = %ctx.virtual_channel.alias,
+        rule = crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
+        reason = reason.as_str(),
+        "Transit Point request refused: the surface is not ready"
+    );
+    Err(transit_point_unavailable(ctx))
 }
 
 /// Refuses a request the Transit Point cannot serve; on an MCP Transit Point
@@ -10355,6 +10377,54 @@ mod tests {
             .source_auth = None;
         let result = step_source_auth(&state, &mut ctx).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_naming_another_tenants_api_key_refuses_every_request_when_enforced() {
+        let _gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("owner-a", "atgk_transit_a"), ("owner-b", "atgk_transit_b")],
+        )
+        .await;
+        let naming = |key_id: &str| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            let mut surface = (*ctx.surface).clone();
+            surface.tenant_id = Some("tenant-a".into());
+            let mut point = ctx.virtual_channel.clone();
+            point.managed_identity =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": key_id})).unwrap());
+            surface.transit = Some(crate::config::agent_surface::TransitConfig {
+                points: vec![point],
+                outbound_listen_address: None,
+                shared: Default::default(),
+            });
+            ctx.surface = Arc::new(surface);
+            ctx
+        };
+
+        let mut cross = naming("atgk_transit_b");
+        let error = step_provider_key_gate(&mut cross)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                OutboundPipelineError::TransitPointUnavailable {
+                    mcp_request_id: Some(serde_json::Value::Null)
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut own = naming("atgk_transit_a");
+        assert!(
+            step_provider_key_gate(&mut own)
+                .await
+                .is_ok(),
+            "its own tenant's key is served"
+        );
     }
 
     #[tokio::test]
