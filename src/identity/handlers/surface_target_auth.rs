@@ -93,6 +93,15 @@ pub(super) fn target_rule_warnings(surface: &AgentSurface) -> Vec<String> {
         .collect()
 }
 
+/// Each `target_https` or `target_source_auth` breach of `surface`, on any leg of the base
+/// surface or of a variant as it resolves.
+pub(super) fn broken_target_rules(surface: &AgentSurface) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
+    Ok(breaches(surface)?
+        .into_iter()
+        .filter_map(|(.., policy_rule)| policy_rule)
+        .collect())
+}
+
 fn warning(
     rule: TargetCredentialRule,
     message: &str,

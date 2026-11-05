@@ -11,8 +11,7 @@ use super::surface_tenancy::{
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
-use crate::config::target_auth_rules::{TargetCredentialRule, broken_target_credential_rules, is_https_target};
-use crate::config::types::{TargetAuthConfig, TargetAuthMethod};
+use crate::config::target_auth_rules::TargetCredentialRule;
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
@@ -100,47 +99,6 @@ pub(crate) struct Findings {
     pub skipped: Vec<SkippedSurface>,
 }
 
-fn sends_credential(auth: Option<&TargetAuthConfig>) -> bool {
-    auth.is_some_and(|auth| {
-        matches!(auth.method, TargetAuthMethod::StaticSecret { .. } | TargetAuthMethod::CredentialProvider { .. })
-    })
-}
-
-/// The rules each leg of `surface` that sends a static secret or credential provider token
-/// breaks on a caller's request: the Target, checked by the Access Point, and each Transit
-/// Point, checked by itself. The backend credential of an A2A proxy Target is held to
-/// `target_source_auth` only, since it does not go over the `a2a-proxy://` endpoint. Every
-/// variant as it resolves is included; a surface with a variant that cannot be resolved is not
-/// checked.
-fn broken_target_rules(surface: &AgentSurface) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
-    let mut rules = Vec::new();
-    for view in super::surface_tenancy::resolved_views(surface)? {
-        if view.dispatches_to_a2a_proxy() {
-            rules.extend(broken_target_credential_rules(true, view.authenticates_callers(), false));
-        }
-        if sends_credential(view.target.auth.as_ref()) {
-            rules.extend(broken_target_credential_rules(
-                is_https_target(&view.target.endpoint),
-                view.authenticates_callers(),
-                false,
-            ));
-        }
-        for point in view
-            .transit
-            .iter()
-            .flat_map(|transit| transit.points.iter())
-            .filter(|point| sends_credential(point.target_auth.as_ref()))
-        {
-            rules.extend(broken_target_credential_rules(
-                is_https_target(&point.target_endpoint),
-                point.authenticates_callers(),
-                false,
-            ));
-        }
-    }
-    Ok(rules)
-}
-
 pub(crate) fn find_breaches(
     providers: &[CredentialProvider],
     surfaces: &[AgentSurface],
@@ -192,7 +150,7 @@ pub(crate) fn find_breaches(
             .map(|issues| (breaks, issues))
         });
         let verdict = verdict.and_then(|(breaks, issues)| {
-            broken_target_rules(surface).map(|target_rules| (breaks, issues, target_rules))
+            super::surface_target_auth::broken_target_rules(surface).map(|target_rules| (breaks, issues, target_rules))
         });
         match verdict {
             Ok((breaks, issues, target_rules)) => {
