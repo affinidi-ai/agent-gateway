@@ -5,7 +5,9 @@ Feature: Target credential scope on the direct path
   slash stays encoded. A caller header named like the Target credential header never
   reaches the Target, and a redirect from the Target is returned to the caller instead of
   being followed with the credential. A token the Access Point forwards for a caller it
-  verified goes beside the Target credential.
+  verified goes beside the Target credential. A stored Target credential whose header is one
+  the gateway may not set is never sent: the request is refused, or forwarded without it
+  when its fallback is passthrough.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -46,6 +48,24 @@ Feature: Target credential scope on the direct path
       | /smoke/..%2Fadmin       |
       | /smoke/..%5Cadmin       |
       | /smoke/%252e%252e/admin |
+
+  Scenario: A stored Target credential in a reserved header is not sent and the request is refused
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "X-Transit-Token"
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 502
+    And the response mentions "Target authentication failed"
+    And managed agent "bravo" was not called
+    And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and no OAuth error
+
+  Scenario: A stored Target credential in a reserved header is left out when fallback is passthrough
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "X-Transit-Token"
+    And the gateway's authentication to the managed agent falls back to "passthrough"
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 200
+    And managed agent "bravo" did not receive header "x-transit-token"
+    And the VP Audit Log records a Target credential that was not sent, with outcome "passthrough" and no OAuth error
 
   Scenario: A caller header named like the Target credential header is replaced by the Target credential
     When the caller sends a request to the surface with header "X-Target-Api-Key" set to "caller-chosen-value"

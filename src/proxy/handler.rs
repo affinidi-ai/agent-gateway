@@ -906,6 +906,8 @@ pub(crate) enum TargetAuthError {
     ProviderNeedsConsent,
     #[error("target credential withheld: credential_policy.{0} is enforce")]
     Withheld(crate::config::target_auth_rules::TargetCredentialRule),
+    #[error("target authentication header breaks a header rule and is never sent")]
+    InvalidHeader,
     #[error(transparent)]
     ServiceToken(#[from] crate::delegation_vault::service_token::ServiceTokenError),
 }
@@ -1076,6 +1078,17 @@ pub(crate) async fn resolve_target_credential(
             "Refusing to inject target credentials: the caller was not authenticated"
         );
         return Ok(None);
+    }
+    if let TargetAuthMethod::StaticSecret { header_name, header_format, .. }
+    | TargetAuthMethod::CredentialProvider { header_name, header_format, .. } = &target_auth.method
+        && crate::config::target_auth_rules::breaks_header_rules(header_name, header_format)
+    {
+        warn!(
+            channel = %channel_name,
+            header = ?header_name,
+            "Refusing to send a target credential whose header breaks a header rule"
+        );
+        return Err(TargetAuthError::InvalidHeader);
     }
     if !matches!(target_auth.method, TargetAuthMethod::CredentialLookup)
         && let Some(rule) = context.withholding_rule(caller)
@@ -18208,6 +18221,38 @@ pub(crate) mod target_auth_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_whose_header_breaks_a_header_rule_is_never_resolved() {
+        let fixture = Fixture::new(200).await;
+        for (header_name, header_format) in [
+            ("X-Transit-Token", "{value}"),
+            ("x_transit_token", "{value}"),
+            ("Host", "{value}"),
+            ("X Api", "{value}"),
+            ("", "{value}"),
+            ("x-key", "Bearer {value}\r\nX-Other: 1"),
+            ("x-key", "{value}\0"),
+            ("x-key", "Bearer"),
+            ("x-key", "{value}{value}"),
+        ] {
+            let secret: TargetAuthConfig = serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": "OWN_KEY", "header_name": header_name, "header_format": header_format
+            }}}))
+            .unwrap();
+            let provider: TargetAuthConfig = serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "header_name": header_name, "header_format": header_format
+            }}}))
+            .unwrap();
+            for auth in [secret, provider] {
+                let result =
+                    inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+                        .await;
+                assert_eq!(result, Err(TargetAuthError::InvalidHeader), "{header_name:?} {header_format:?}");
+            }
+        }
+        assert_eq!(fixture.requests(), 0, "no token is requested for a header the gateway will not send");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

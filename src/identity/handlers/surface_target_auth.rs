@@ -1,8 +1,9 @@
 //! Save-time rules for Target authentication: the header it sets, the format of its value,
-//! and the leg that sends it. The header and format rules always refuse a save; the
-//! `target_https` and `target_source_auth` rules refuse it only in `enforce`, and in `warn`
-//! the save goes through with a warning. A rule a stored leg already broke, with the same
-//! Target authentication and endpoint, does not block a save that keeps it.
+//! and the leg that sends it. The header and format rules refuse every save, a stored one
+//! included; the `target_https` and `target_source_auth` rules refuse it only in `enforce`, and
+//! in `warn` the save goes through with a warning. A `target_https` or `target_source_auth`
+//! breach a stored leg already had, with the same Target authentication and endpoint, does not
+//! block a save that keeps it.
 
 use tracing::warn;
 
@@ -40,10 +41,11 @@ struct Breach {
     rule: String,
 }
 
-/// Refuses the first rule a Target authentication of `surface` breaks that `stored` did not
-/// already break on the same leg with the same setting; a stored surface whose breaches cannot be
-/// listed, such as one with an unresolvable variant, keeps none. A new breach of a credential
-/// policy rule in `warn` is logged once nothing is refused, and saved.
+/// Refuses the first rule a Target authentication of `surface` breaks: any header rule, and a
+/// credential policy rule `stored` did not already break on the same leg with the same setting;
+/// a stored surface whose breaches cannot be listed, such as one with an unresolvable variant,
+/// keeps none. A new breach of a credential policy rule in `warn` is logged once nothing is
+/// refused, and saved.
 pub(super) fn validate_target_auth_rules(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -57,7 +59,7 @@ pub(super) fn validate_target_auth_rules(
         .collect();
     let mut warned = Vec::new();
     for (breach, message, policy_rule) in breaches(surface, https_proxies)? {
-        if kept.contains(&breach) {
+        if policy_rule.is_some() && kept.contains(&breach) {
             continue;
         }
         match policy_rule {
@@ -97,15 +99,23 @@ pub(super) fn target_rule_warnings(
         .collect()
 }
 
-/// Each `target_https` or `target_source_auth` breach of `surface`, on any leg of the base
-/// surface or of a variant as it resolves.
+/// A rule a Target authentication breaks: a credential policy rule, or a header rule, which
+/// refuses every save and keeps the credential from being sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrokenTargetRule {
+    Policy(TargetCredentialRule),
+    Header,
+}
+
+/// Each rule a Target authentication of `surface` breaks, on any leg of the base surface or of
+/// a variant as it resolves.
 pub(super) fn broken_target_rules(
     surface: &AgentSurface,
     https_proxies: &HttpsMcpProxies,
-) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
+) -> Result<Vec<BrokenTargetRule>, SurfaceApiError> {
     Ok(breaches(surface, https_proxies)?
         .into_iter()
-        .filter_map(|(.., policy_rule)| policy_rule)
+        .map(|(.., policy_rule)| policy_rule.map_or(BrokenTargetRule::Header, BrokenTargetRule::Policy))
         .collect())
 }
 
@@ -987,10 +997,46 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_header_rule_breach_is_refused_on_an_unchanged_save() {
+        let mut bound = surface(static_secret("X-Bound", "{value}"));
+        bound["outbound_credentials"] = json!([{
+            "credential_provider_id": "bound",
+            "inject_as": {"type": "custom_header", "name": "X-Bound", "format": "{value}"}
+        }]);
+        for (stored, refusal) in [
+            (
+                surface(static_secret("X-Transit-Token", "{value}")),
+                "target.auth.header_name must not be the reserved header X-Transit-Token",
+            ),
+            (surface(static_secret("X Api", "{value}")), "target.auth.header_name must be an HTTP header name"),
+            (
+                surface(static_secret("X-Api-Key", "Bearer {value}\r\nX-Other: 1")),
+                "target.auth.header_format must not contain CR, LF or NUL",
+            ),
+            (
+                surface(static_secret("X-Api-Key", "Bearer")),
+                "target.auth.header_format must contain {value} exactly once",
+            ),
+            (bound, "target.auth.header_name X-Bound is already sent by a credential binding"),
+            (
+                with_transit_point(
+                    surface(static_secret("X-Api-Key", "{value}")),
+                    json!({"target_auth": static_secret("X-Transit-Token", "{value}")}),
+                ),
+                "transit.points['partner'].target_auth.header_name must not be the reserved header X-Transit-Token",
+            ),
+        ] {
+            for mode in [RuleMode::Warn, RuleMode::Enforce] {
+                assert_eq!(check_in(mode, &stored, Some(&stored)), Err(refusal.to_string()), "{mode:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_stored_breach_is_kept_while_the_leg_keeps_its_setting_and_endpoint() {
         let mut stored = with_transit_point(
             surface(static_secret("X-Api-Key", "{value}")),
-            json!({"target_auth": static_secret("X-Partner-Key", "Bearer"), "require_transit_token": false,
+            json!({"target_auth": static_secret("X-Partner-Key", "{value}"), "require_transit_token": false,
                    "allow_unauthenticated_callers": true}),
         );
         stored["target"]["endpoint"] = json!("http://api.example.com/");
@@ -1017,7 +1063,9 @@ mod tests {
         redirected["transit"]["points"][0]["target_endpoint"] = json!("https://elsewhere.example.com/");
         assert_eq!(
             check(&redirected, Some(&stored)),
-            Err("transit.points['partner'].target_auth.header_format must contain {value} exactly once".to_string())
+            Err("transit.points['partner'].target_auth sends a credential, so it needs a Transit Point that \
+                 authenticates its callers"
+                .to_string())
         );
 
         let mut new_leg = stored.clone();

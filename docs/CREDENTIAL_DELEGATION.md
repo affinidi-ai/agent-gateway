@@ -805,22 +805,39 @@ reported, in this order:
 
 A caller credential the gateway consumes, read by any of the Access Point's methods, is removed
 before the Target credential is added, so only a forwarded JWT Bearer token collides with it.
-The rules apply to new and changed settings. A breach the stored surface already had on the
-same leg (the Target or Transit Point of the base surface or a variant, identified by `id`),
-with the same Target authentication and endpoint (for an A2A proxy Target, the same
-`a2a-proxy://` endpoint), does not block a save, so a stored surface that predates the rules
-still saves unchanged; editing that Target
-authentication or endpoint, or a change elsewhere that creates a new breach on the leg
-(removing source authentication, say), is checked as new: refused, or for the https and caller
-rules in `warn`, saved with a warning. Because the id names the leg, a save with two Transit
+The header and format rules (the first five rows) apply to every save, a stored setting
+included: a stored Target authentication with an invalid or reserved `header_name`, a header
+another credential on the leg sends, or a `header_format` without exactly one `{value}` or with
+CR, LF or NUL is refused on its next save, even unchanged, and the request path never sends it
+([below](#target-credential-rules-on-the-request-path)). Only the https and caller rules are
+kept for a stored surface: a `target_https` or `target_source_auth` breach the stored surface
+already had on the same leg (the Target or Transit Point of the base surface or a variant,
+identified by `id`), with the same Target authentication and endpoint (for an A2A proxy Target,
+the same `a2a-proxy://` endpoint), does not block a save, so a stored surface that predates
+those rules still saves unchanged; editing that Target authentication or endpoint, or a change
+elsewhere that creates a new breach on the leg (removing source authentication, say), is
+checked as new: refused, or in `warn`, saved with a warning. Because the id names the leg, a save with two Transit
 Points sharing an `id`, in the surface or in one variant's overrides, is refused with `400`
 `transit.points[<i>]: duplicate id '<id>'. Each transit point id must be unique within the
 surface.` (prefixed with `variants['<alias>'].` for a variant), so a
 new Transit Point cannot take over a stored one's exemption. The predicates live in
 [`config/target_auth_rules.rs`](../src/config/target_auth_rules.rs), and the request path uses
-the same ones.
+the same ones. The startup and reload credential policy report logs each stored surface that
+breaks a header or format rule, with rule `target_auth_header` and `enforced` true, beside its
+`target_https` and `target_source_auth` breaches.
 
 ### Target credential rules on the request path
+
+Before a `static_secret` or `credential_provider` credential is read or a token is requested,
+the request checks the header and format rules of the save: a `header_name` that is not an HTTP
+field name or is reserved, or a `header_format` without exactly one `{value}` or with CR, LF or
+NUL, is never sent, on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric
+receive, the agent card fetch and a Transit Point. It is treated as a credential that cannot be
+obtained: `fallback` `reject` answers 502 "Target authentication failed", `passthrough` forwards
+the request without it, as for a secret that cannot be read, and either way a
+`target_auth_failed` record names the outcome. The agent card preview reports it as
+`invalid_header`. The rule against a header another credential on the leg sends is checked at
+save only, since the leg's other credential headers are not known to the credential lookup.
 
 A stored surface that predates the rules, or one saved while the rule was `warn`, can still send
 a credential to a Target that is not https, or for callers nobody checks. Two `[credential_policy]` keys (see

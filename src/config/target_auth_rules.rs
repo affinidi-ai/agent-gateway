@@ -90,6 +90,17 @@ pub fn header_format_problem(format: &str) -> Option<HeaderFormatProblem> {
     }
 }
 
+/// Does a credential in header `name`, formatted as `format`, break a header rule the request
+/// path holds it to: a name that is no HTTP field name or is reserved, or a format refused by
+/// [`header_format_problem`]? A header another credential on the leg sends is refused at save
+/// only.
+pub fn breaks_header_rules(
+    name: &str,
+    format: &str,
+) -> bool {
+    !is_header_name(name) || reserved_header(name).is_some() || header_format_problem(format).is_some()
+}
+
 /// Is `endpoint` an https URL with a host? `fabric://`, `a2a-proxy://`, `proxy://` and
 /// `http://` Targets are not.
 pub fn is_https_target(endpoint: &str) -> bool {
@@ -174,6 +185,27 @@ pub fn broken_target_credential_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_breaks_the_header_rules_when_its_name_or_format_is_refused() {
+        for (name, format) in [("X-Api-Key", "{value}"), ("Authorization", "Bearer {value}"), ("x_api_key", "{value}")]
+        {
+            assert!(!breaks_header_rules(name, format), "{name} {format}");
+        }
+        for (name, format) in [
+            ("X-Transit-Token", "{value}"),
+            ("x_transit_token", "{value}"),
+            ("X Api", "{value}"),
+            ("", "{value}"),
+            ("X-Api-Key", "Bearer {value}\r"),
+            ("X-Api-Key", "{value}\n"),
+            ("X-Api-Key", "{value}\0"),
+            ("X-Api-Key", "Bearer"),
+            ("X-Api-Key", "{value}{value}"),
+        ] {
+            assert!(breaks_header_rules(name, format), "{name:?} {format:?}");
+        }
+    }
 
     #[test]
     fn a_credential_over_https_from_a_checked_leg_breaks_no_rule() {

@@ -121,8 +121,9 @@ could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3x
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
 `identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
-`token_unavailable`, `unsupported`, or `forbidden` (a `[credential_policy]` rule in `enforce`
-withholds the credential); `invalid_header`, `outside_target_base` and `header_conflict` are
+`token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
+withholds the credential), or `invalid_header` (a stored Target authentication whose header
+breaks a header rule, which is never sent); `outside_target_base` and `header_conflict` are
 never sent and keep the spellings the dashboard accepts.
 
 When a fetch fails, `after` is the last good card the preview built for the same running surface

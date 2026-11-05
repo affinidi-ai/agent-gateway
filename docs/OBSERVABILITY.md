@@ -446,7 +446,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
     `target_auth`) was not sent, because it could not be obtained (a secret or provider that
     cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`
-    withheld it, the request would have carried it outside the Target base path, or a Transit
+    withheld it, its stored `header_name` or `header_format` breaks a header rule (an invalid
+    or reserved header name, or a format without exactly one `{value}` or with CR, LF or NUL;
+    `outcome` follows the `fallback`), the request would have carried it outside the Target
+    base path, or a Transit
     Point's resolved credential cannot be sent as a header (the last two always `rejected`,
     whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
     Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card

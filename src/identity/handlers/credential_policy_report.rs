@@ -1,10 +1,12 @@
 //! Startup and reload report of the credential providers and surfaces that break a
-//! `[credential_policy]` rule. Log lines only: ids, tenants and rule names, never a secret value.
+//! `[credential_policy]` rule or a Target authentication header rule. Log lines only: ids,
+//! tenants and rule names, never a secret value.
 
 use std::collections::HashMap;
 
 use tracing::{info, warn};
 
+use super::surface_target_auth::BrokenTargetRule;
 use super::surface_tenancy::{
     ProviderKeyIssue, collect_surface_reference_keys, provider_key_owners, provider_key_verdict,
 };
@@ -24,6 +26,10 @@ const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
 const RULE_JWT_SUBJECT: &str = "jwt_subject";
 const RULE_TARGET_HTTPS: &str = TargetCredentialRule::Https.key();
 const RULE_TARGET_SOURCE_AUTH: &str = TargetCredentialRule::SourceAuth.key();
+/// The header rules a Target authentication meets at every save and on every request: a header
+/// name it may set, a header no other credential on the leg sends, and a value format with one
+/// `{value}` and no CR, LF or NUL. They have no `[credential_policy]` setting and always apply.
+const RULE_TARGET_AUTH_HEADER: &str = "target_auth_header";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -168,9 +174,13 @@ pub(crate) fn find_breaches(
                 if breaks {
                     rules.push(RULE_TENANT_CREDENTIAL_ISOLATION);
                 }
-                for rule in [TargetCredentialRule::Https, TargetCredentialRule::SourceAuth] {
+                for (rule, key) in [
+                    (BrokenTargetRule::Policy(TargetCredentialRule::Https), RULE_TARGET_HTTPS),
+                    (BrokenTargetRule::Policy(TargetCredentialRule::SourceAuth), RULE_TARGET_SOURCE_AUTH),
+                    (BrokenTargetRule::Header, RULE_TARGET_AUTH_HEADER),
+                ] {
                     if target_rules.contains(&rule) {
-                        rules.push(rule.key());
+                        rules.push(key);
                     }
                 }
             }
@@ -253,6 +263,7 @@ fn rule_mode(
     match rule {
         RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
         RULE_JWT_SUBJECT => RuleMode::Warn,
+        RULE_TARGET_AUTH_HEADER => RuleMode::Enforce,
         RULE_TARGET_HTTPS => policy.target_https,
         RULE_TARGET_SOURCE_AUTH => policy.target_source_auth,
         _ => policy.tenant_credential_isolation,
@@ -767,6 +778,39 @@ mod tests {
             }
         }
         assert!(surface_rules(&target_surface("http://upstream.internal", None, true)).is_empty());
+    }
+
+    #[test]
+    fn a_target_credential_whose_header_breaks_a_header_rule_is_reported_as_enforced() {
+        let reserved = TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "X-Transit-Token".to_string(),
+            header_format: "{value}".to_string(),
+        };
+        let surface = target_surface("https://upstream.example", Some(reserved), true);
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_AUTH_HEADER]);
+        assert!(rule_mode(RULE_TARGET_AUTH_HEADER, &CredentialPolicyConfig::default()).is_enforced());
+
+        let mut on_transit_point = target_surface("https://upstream.example", None, true);
+        let unformatted = TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "X-Api-Key".to_string(),
+            header_format: "Bearer".to_string(),
+        };
+        on_transit_point.transit =
+            Some(transit_config(vec![transit_point("https://tp.example", Some(unformatted), true)]));
+        assert_eq!(surface_rules(&on_transit_point), vec![RULE_TARGET_AUTH_HEADER]);
+
+        let both = target_surface(
+            "http://upstream.internal",
+            Some(TargetAuthMethod::StaticSecret {
+                secret_id: "S".to_string(),
+                header_name: "Host".to_string(),
+                header_format: "{value}{value}".to_string(),
+            }),
+            true,
+        );
+        assert_eq!(surface_rules(&both), vec![RULE_TARGET_HTTPS, RULE_TARGET_AUTH_HEADER]);
     }
 
     #[test]

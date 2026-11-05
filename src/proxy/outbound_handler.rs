@@ -21098,7 +21098,7 @@ mod tests {
                 let header_format = if fabric {
                     "Key {value}\u{e9}"
                 } else {
-                    "Key {value}\n"
+                    "Key {value}\u{7f}"
                 };
                 let mut ctx = credential_header_case(
                     &state,
