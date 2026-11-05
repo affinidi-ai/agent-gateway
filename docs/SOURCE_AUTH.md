@@ -959,6 +959,61 @@ Points sends, keeps a stored base block with empty `points` holding only its lif
 a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
 to 300 seconds.
 
+### Per-caller rate limit on a Transit Point
+
+A Transit Point's `rate_limit` is one bucket for the point, shared by every caller. Give the point
+a `per_caller_rate_limit` (`requests`, `window_secs` and an optional `burst`, as for `rate_limit`)
+to give each caller a bucket of their own, so one caller cannot spend the allowance of the others:
+
+```json
+{
+  "alias": "linear",
+  "rate_limit": { "requests": 600, "window_secs": 60 },
+  "per_caller_rate_limit": { "requests": 60, "window_secs": 60 }
+}
+```
+
+- **Who a caller is.** A request is counted against the transit caller, or else the transit
+  client: the identity hash of the caller its transit token names, or else of the client the
+  point's own `source_auth` verified. A token that names a caller wins when both are present;
+  one that names none counts the client. On a point with
+  `require_transit_token: false`, a token the request carries and that verifies names the caller
+  for this limit too, though it keys no delegated credentials. A request over Fabric counts as an
+  identified caller only where it does for delegated credentials.
+- **No identified caller.** Requests with no identified caller share one bucket of their own, so
+  a request cannot avoid the limit by naming no caller, and an identified caller is not held up
+  by them. Reads that carry no transit token, such as an agent card fetch, count against it too.
+- **Both limits apply.** A request is checked against its caller's bucket first, then the
+  surface's and the point's, so a caller who is over their limit does not use up the allowance of
+  the others. The stricter limit decides. A request the surface's or the point's limit refuses has
+  already spent one request of its caller's bucket.
+- **Refusals.** A refused request answers `429` with `Retry-After` in whole seconds, rounded up:
+  a JSON-RPC error with code `-32000` on an MCP Transit Point, and a plain `429` otherwise. The
+  answer names no caller. It is recorded as a `rate_limited` audit event with scope
+  `transit_point_caller`, the Transit Point's alias, the caller's identity hash and `retry_after_ms`.
+  A refusal by the bucket callers share at the bound below is recorded with scope
+  `transit_point_overflow` and no identity hash, since that caller spent no allowance of their own.
+- **Bounded memory.** At most 10,000 callers have a bucket at once, and a bucket that has fully
+  recovered is forgotten. While that many callers are all still limited, a caller who has a bucket
+  keeps it, and callers without one share one bucket until some recover. While the bound is
+  reached the gateway logs a warning naming the Transit Point, at most once a second.
+- **Surface variants.** A variant's Transit Point is limited by the per-caller limit of the
+  surface's Transit Point of the same alias, and shares its buckets. A variant point that sets
+  another per-caller limit, or one where the surface's point has none, is refused when the surface
+  is saved; a variant point may restate the surface's limit (an unset `burst` is the same as one
+  equal to `requests`) or leave it out. A request through a stored variant that is refused for
+  changing the limit spends nothing of its caller's allowance first.
+- **Counting.** Counting is per gateway node. With several replicas and no load-balancer affinity,
+  a caller can make about the replica count times `requests` per window, so divide the limit by
+  the replica count. Every bucket of a surface's Transit Points starts again when the surface is
+  saved, when a policy definition it references is saved, and when the node becomes Active.
+- **Limits that cannot be enforced.** A `requests` or `window_secs` of `0`, a `burst` of `0`,
+  more `requests` than the window can count (at most one per nanosecond), or a bucket that would
+  take longer than about 290 years to refill, is refused when the surface is saved, on the surface
+  and in a variant's own points. A stored limit like that, written to storage by hand for example,
+  makes the Transit Point refuse every request with `503` until a valid limit is saved, and is
+  logged as an error naming the Transit Point.
+
 ### Headers through a Transit Point
 
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,

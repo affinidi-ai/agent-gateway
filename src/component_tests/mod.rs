@@ -36,6 +36,7 @@ mod transit_caller_auth_e2e;
 mod transit_caller_policy_e2e;
 mod transit_point_headers_e2e;
 mod transit_point_lifecycle_e2e;
+mod transit_point_rate_limit_e2e;
 mod transit_source_auth_e2e;
 mod transit_token_e2e;
 mod trust_check_e2e;

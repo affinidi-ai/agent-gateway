@@ -156,7 +156,7 @@ answers, whichever path applies it:
 
 1. Retire the surface's outbound state: every route still holding it, on a new connection or
    one kept alive, refuses each request with `404`.
-2. Evict the surface's compiled policies, MCP tool gating, rate limiters and circuit breaker,
+2. Evict the surface's compiled policies, MCP tool gating, rate limiters (per-caller ones too) and circuit breaker,
    its variants' and its Transit Points' included.
 
 A surface without variants is removed in place: its Access Point leaves the running inbound

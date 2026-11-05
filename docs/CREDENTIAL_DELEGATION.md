@@ -1040,8 +1040,8 @@ A Transit Point refuses such a request with `503`, and also refuses with `403` o
 no caller, because neither a transit token with a caller identity nor the Transit Point's
 `source_auth` identifies one. That includes every request to a Transit Point that serves callers it
 does not authenticate and every request to one that sets `require_transit_token: false` without
-`source_auth` (a valid transit token sent there names the caller to policy only, not to
-delegation), or for which neither its managed identity nor the transit token's caller DID gives
+`source_auth` (a valid transit token sent there names the caller to policy and to the per-caller rate limit
+only, not to delegation), or for which neither its managed identity nor the transit token's caller DID gives
 the agent half of the vault key. It also refuses when its delegation
 stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-32603` for
 `503`, `-32001` for `403`) carrying the request's id, and any other Transit Point with an
