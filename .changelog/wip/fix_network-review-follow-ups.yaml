@@ -17,8 +17,8 @@ changes:
       description: >-
         A Transit Point dropped a caller's Forwarded, X-Real-IP and X-Forwarded headers but passed
         the other headers proxies and CDNs use to claim the client's address, host, path or scheme,
-        such as True-Client-IP, CF-Connecting-IP, X-Client-IP, X-Original-Host and X-Original-URL,
-        so a target that trusts the gateway as its proxy could still take the caller's claim. It
+        such as True-Client-IP, CF-Connecting-IP, X-Client-IP, WL-Proxy-Client-IP,
+        X-Envoy-External-Address, X-Original-Host and X-Original-URL, so a target that trusts the gateway as its proxy could still take the caller's claim. It
         now drops those too, in any letter case and with underscores for dashes, and the docs
         list every header.
     - timestamp: '2026-11-03T20:35:00Z'

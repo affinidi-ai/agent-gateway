@@ -2636,6 +2636,13 @@ const PROXY_FORWARDING_HEADERS: &[&str] = &[
     "x-azure-clientip",
     "x-proxyuser-ip",
     "x-original-forwarded-for",
+    "proxy-client-ip",
+    "wl-proxy-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "x-envoy-external-address",
+    "cloudfront-viewer-address",
     "x-original-host",
     "x-host",
     "x-original-url",
@@ -11362,6 +11369,14 @@ mod tests {
             "X-Rewrite-URL",
             "X-Scheme",
             "X-ARR-SSL",
+            "Proxy-Client-IP",
+            "WL-Proxy-Client-IP",
+            "wl_proxy_client_ip",
+            "X-Originating-IP",
+            "X-Remote-IP",
+            "X-Remote-Addr",
+            "X-Envoy-External-Address",
+            "CloudFront-Viewer-Address",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
@@ -11377,6 +11392,8 @@ mod tests {
             "client-ipaddress",
             "x-original-urls",
             "x-schemes",
+            "x-remote-address",
+            "x-envoy-external-addresses",
         ] {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
