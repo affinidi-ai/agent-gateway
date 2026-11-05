@@ -167,9 +167,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Public access on: "This Access Point is public. …", on every successful save.
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
+  The dashboard shows none of these after a save (`shownSaveWarnings` in
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
+  Access Point panel already show the Access Point's state, and turning Public access on is the
+  operator's own choice. Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
-  and one line per warning as a `warning` toast, the `Warning` headers first, then the
+  and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
   dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
   headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
   surface's page so the banner lists them.

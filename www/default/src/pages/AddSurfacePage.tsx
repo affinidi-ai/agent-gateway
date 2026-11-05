@@ -8,7 +8,10 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -473,9 +476,10 @@ const AddSurfacePage: React.FC = () => {
       showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, { headerWarnings });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
-      if (headerWarnings.length > 0 && created?.surface_id) {
+      const shown = shownSaveWarnings(headerWarnings);
+      if (shown.length > 0 && created?.surface_id) {
         navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
-          state: { saveWarnings: headerWarnings },
+          state: { saveWarnings: shown },
         });
       } else {
         navigate('/surfaces');

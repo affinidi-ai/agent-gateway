@@ -177,7 +177,6 @@ const NOT_READY_MESSAGE =
   'This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.';
 const LEGACY_OPEN_MESSAGE =
   'This Access Point is neither closed nor public, and it admits callers without credentials. Add source authentication, or set access_point.public to false to close it or to true to keep it open.';
-const SAVED_WITH_WARNINGS = 'Agent Surface "orders" saved, with warnings:';
 
 const API_KEY_AUTH = {
   methods: [
@@ -248,7 +247,7 @@ describe('SurfaceDetailPage save', () => {
     updateSurface = jest.spyOn(apiClient, 'updateSurface');
   });
 
-  it("shows the response's public warning once after Public access is turned on", async () => {
+  it("hides the response's public warning after Public access is turned on", async () => {
     await renderPage(
       stored({ public: false, caller_authentication: { ...API_KEY_AUTH, on_failure: 'reject' } }),
       [PUBLIC_MESSAGE]
@@ -259,17 +258,20 @@ describe('SurfaceDetailPage save', () => {
 
     expect(sent.access_point.public).toBe(true);
     expect(sent.access_point.caller_authentication).not.toHaveProperty('on_failure');
-    expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${PUBLIC_MESSAGE}`]);
+    expect(warningToasts()).toEqual([]);
+    expect(toast).toHaveBeenCalledWith('success', 'Agent Surface "orders" saved');
+    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
   });
 
-  it("saves a surface stored without public and no Caller Context, then shows the gateway's warning", async () => {
+  it('saves a surface stored without public and no Caller Context, showing no gateway warning', async () => {
     await renderPage(stored({}), [LEGACY_OPEN_MESSAGE]);
     expect(screen.getByTestId('legacy-access-point')).toHaveTextContent('true');
 
     const sent = await save();
 
     expect(sent.access_point).not.toHaveProperty('public');
-    expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${LEGACY_OPEN_MESSAGE}`]);
+    expect(warningToasts()).toEqual([]);
+    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
     expect(toast.mock.calls.some(c => c[0] === 'error')).toBe(false);
   });
 
@@ -288,13 +290,15 @@ describe('SurfaceDetailPage save', () => {
     );
   });
 
-  it('saves a closed surface with no Caller Context and shows the not-ready warning', async () => {
+  it('saves a closed surface with no Caller Context, showing no not-ready warning', async () => {
     await renderPage(stored({ public: false }), [NOT_READY_MESSAGE]);
 
     const sent = await save();
 
     expect(sent.access_point.public).toBe(false);
-    expect(warningToasts()).toEqual([`${SAVED_WITH_WARNINGS}\n${NOT_READY_MESSAGE}`]);
+    expect(warningToasts()).toEqual([]);
+    expect(toast).toHaveBeenCalledWith('success', 'Agent Surface "orders" saved');
+    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
     expect(toast.mock.calls.some(c => c[0] === 'error')).toBe(false);
   });
 
