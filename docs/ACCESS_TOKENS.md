@@ -264,9 +264,14 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 Runtime stores, listeners, policy compilation, hot reload, and the data-plane protocols
 are unpartitioned. Tenancy constrains management records, not the running data plane.
 
-Every PAT-accessible management route is feature-gated, so the bound user's role and the
-PAT's feature scopes both apply. A scoped PAT may create or update tokens only with a
-non-empty subset of its own scopes.
+A feature-gated management route checks both the bound user's role and the PAT's feature
+scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
+owner's role, and routes open to any signed-in caller, such as the caller's own profile and
+settings, need no feature. The routes on the caller's own notifications need a session sign-in, not
+a PAT: with a PAT, the notification list is empty, the unread count is `0`, and reading, creating,
+updating or deleting a notification answers `401` (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)). A scoped PAT may create or
+update tokens only with a non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
 paths: only an audited allowlist of handler-enforced actions may proceed. The surface

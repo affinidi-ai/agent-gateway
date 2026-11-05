@@ -751,6 +751,7 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 
     let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        principal_claim: "sub".to_string(),
         subject: "alice".to_string(),
         claims: json!({ "iss": "https://idp.example", "sub": "alice", "email": "alice@example.com",
             "name": "Alice", "phone": "+15550100" }),
@@ -973,7 +974,8 @@ async fn a_partner_request_gets_no_per_user_credential_on_fabric_receive() {
 /// A service-level binding, such as an API key provider, keys no caller's
 /// grant, so it reaches a partner's request without the opt-in, as long as the
 /// receiving surface verified a caller of the request; without one the request
-/// is refused with `403` before the Target is called.
+/// is refused with `403` before the Target is called, even when the peer names
+/// a caller in the identity extension.
 #[tokio::test]
 async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in() {
     if ran_in_child("ATG_FABRIC_RECEIVE_SERVICE_CREDENTIAL_CHILD").await {
@@ -985,29 +987,27 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
     delegating.outbound_credentials = vec![binding(SERVICE_PROVIDER)];
     let _receiver = receiver(root.path(), &delegating).await;
     install_delegation_stores(root.path(), &target.url, &[]).await;
-    let send = |key: &str| {
-        forward_request(root.path(), json!({ "content-type": "application/json", "x-api-key": key }), a2a_body())
+    let send = |key: &str, body: Value| {
+        forward_request(root.path(), json!({ "content-type": "application/json", "x-api-key": key }), body)
     };
 
-    let response = forward_response(&send(CALLER_KEY)).await;
-    assert_eq!(response["status"], 200, "{response}");
-    assert_eq!(
-        header_values(
-            &target
-                .received()
-                .pop()
-                .unwrap(),
-            "x-service-key"
-        ),
-        [SERVICE_KEY]
-    );
+    for (case, request) in
+        [("no caller named", a2a_body()), ("peer names a caller", naming(json!({ "agentId": "alice" })))]
+    {
+        let before = target.received().len();
+        let response = forward_response(&send(CALLER_KEY, request.clone())).await;
+        assert_eq!(response["status"], 200, "{case}: {response}");
+        let received = target.received();
+        assert_eq!(received.len(), before + 1, "{case}: the Target is called once");
+        assert_eq!(header_values(&received[before], "x-service-key"), [SERVICE_KEY], "{case}");
 
-    let reached = target.received().len();
-    let (response, body, rejected) = refused(&send("not-the-key")).await;
-    assert_eq!(response["status"], 403, "{response}");
-    assert_eq!(body["reason"], "partner_caller_not_verified", "{body}");
-    assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
-    assert_eq!(target.received().len(), reached, "the Target is not called");
+        let reached = received.len();
+        let (response, body, rejected) = refused(&send("not-the-key", request)).await;
+        assert_eq!(response["status"], 403, "{case}: {response}");
+        assert_eq!(body["reason"], "partner_caller_not_verified", "{case}: {body}");
+        assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)], "{case}");
+        assert_eq!(target.received().len(), reached, "{case}: the Target is not called");
+    }
 }
 
 /// Each receive-side refusal of delegated credentials answers `403`: an MCP
@@ -1199,6 +1199,7 @@ async fn a_jwt_the_receiving_surface_verified_is_the_fabric_tokens_principal_wit
         .validate(header_values(&received, "x-transit-token")[0], 300)
         .unwrap();
     let verified = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        principal_claim: "sub".to_string(),
         subject: "user-123".to_string(),
         claims,
     };

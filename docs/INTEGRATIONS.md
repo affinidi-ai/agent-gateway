@@ -627,13 +627,18 @@ logged.
 Separate from integrations, the gateway keeps notifications for dashboard users, shown in
 the top bar.
 
-| Route | Purpose |
-| --- | --- |
-| `GET`, `POST /v1/notifications` | List and create |
-| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one |
-| `GET /v1/notifications/unread/count` | The badge count |
-| `POST /v1/notifications/send-welcome` | Send the welcome message |
-| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template |
+| Route | Purpose | Permission |
+| --- | --- | --- |
+| `GET`, `POST /v1/notifications` | List and create | Session |
+| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one | Session |
+| `GET /v1/notifications/unread/count` | The badge count | Session |
+| `POST /v1/notifications/send-welcome` | Send the welcome message | `users.approve` |
+| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template | `users.approve` |
+
+The session routes act on the caller's own notifications. The welcome routes need
+`users.approve`, which the built-in defaults grant to `administrator` only, and refuse every
+request with `403` when no auth backend is configured; `send-welcome` sends to the user named in
+the request. See [`RBAC.md`](RBAC.md#maintenance-and-welcome-routes).
 
 Welcome messages for administrators and users start from the templates
 [`admin_welcome.json`](../src/integrations/admin_welcome.json) and

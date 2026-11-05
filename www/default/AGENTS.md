@@ -679,6 +679,23 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategy editor
+
+`/jwt-verification-strategies/new` and `/jwt-verification-strategies/:id`
+(`EditJwtVerificationStrategyPage.tsx`) have a **Caller identity claim** field
+(`jwt-strategy-editor-principal-claim-input`), the strategy's `principal_claim`. A new strategy
+sends the trimmed value only when it is not blank, so a blank field means `sub`. On an existing
+strategy the field shows the stored claim, is disabled, and is left out of the update, since the
+gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
+same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
+
+## Credentials audit tab
+
+`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
+the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
+the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
+other than `sub`.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
@@ -911,7 +928,7 @@ peer's Fabric exposure through `PUT /gateways/{id}/exposed-surfaces`.
 
 ## Feature flags
 
-Settings → **System** → **Feature Flags** is a table of the shared `FeatureFlagRow`
+Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFlagRow`
 (`SettingsPage/SystemTab.tsx`).
 
 - A new flag is one row plus an optional field on `FeatureFlags` in `types.ts`.
@@ -929,10 +946,20 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 
 ## Restore from backup
 
-Settings → **System** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
+Settings → **Admin** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
 `.agbak` and legacy `.tgwbak` files. The legacy support is stated on the page
 (`data-testid="restore-legacy-format-note"`), and the wrong-file toast names both extensions.
 The hidden file input is `data-testid="restore-file-input"`.
+
+## Maintenance actions
+
+The Dashboard's Gateway Configuration card shows the metrics **Delete** button
+(`dashboard-metrics-delete-button`) only when `hasPermission('settings.edit')`, the permission
+`POST /v1/metrics/truncate` needs; the **Logs** button is shown to everyone. Settings → **Admin**
+(`SettingsPage/SystemTab.tsx`), shown with `settings.view`, holds **Truncate Old Metrics Now**
+(`settings-admin-truncate-metrics-button`) and **Truncate Old Logs**
+(`settings-admin-truncate-logs-button`), whose routes also need `settings.edit`. The backend
+check is authoritative; see [`docs/RBAC.md`](../../docs/RBAC.md#maintenance-and-welcome-routes).
 
 ## Schema capture and A2A versions
 

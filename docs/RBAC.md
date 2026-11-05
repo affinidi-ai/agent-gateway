@@ -98,6 +98,23 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
+## Maintenance and welcome routes
+
+`POST /v1/logs/truncate` removes the rotated `agent-gateway*.log*` files and keeps the current
+`agent-gateway.log`; `POST /v1/metrics/truncate` drops stored metrics older than the retention
+period. Both need `settings.edit`. Without an auth backend neither route is registered.
+
+`GET` and `PUT /v1/notifications/user-welcome-template` read and change the notification a user
+receives when their account is approved, and `POST /v1/notifications/send-welcome` sends a
+notification with the given title and text to the user named in the request. All three need
+`users.approve` and, without an auth backend, refuse every request with `403`.
+
+The built-in defaults grant `settings.edit` and `users.approve` to `administrator` only. A personal
+access token with feature scopes needs the permission among its scopes; one created without scopes
+follows its owner's role. The other `/v1/notifications` routes act on the caller's own
+notifications and need only a session (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)).
+
 ## Dashboard log lines
 
 Log lines from the gateway log file need `logs.view`, checked against the caller's role and, for a

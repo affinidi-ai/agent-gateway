@@ -60,6 +60,9 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::Storage(msg) => SourceAuthError::Internal {
                 reason: format!("Storage error: {msg}"),
             },
+            JwtBearerError::InvalidPrincipalClaim(msg) => SourceAuthError::Internal {
+                reason: format!("Invalid principal claim: {msg}"),
+            },
         }
     }
 }

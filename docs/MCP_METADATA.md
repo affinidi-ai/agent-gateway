@@ -188,7 +188,7 @@ Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `allowed_origins` | `[]` | Additional exact serialized HTTP(S) origins, without paths, wildcards or credentials. |
-| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. |
+| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. On a Transit Point reached through the `/outbound/...` hop of an inbound listener that shares its host name, a body is also bounded by `[a2a] max_body_size`; see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). |
 | `max_header_bytes` | `16384` | Sum of header-name bytes, value bytes and four framing bytes per field. |
 | `max_accept_ranges` | `32` | Maximum nonempty parsed Accept media ranges across repeated fields. |
 | `max_response_bytes` | `1048576` | Maximum modern JSON response or normalized SSE event bytes. |
@@ -1089,7 +1089,9 @@ OAuth callback. When the continuation runtime, STS profile and existing
 source-auth verification stores are
 configured, `/mcp-consent/connect/{provider-id}` and
 `/mcp-consent/callback/{provider-id}` are registered. The provider references an
-existing JWT verification strategy through `consent_identity_strategy_id`.
+existing JWT verification strategy through `consent_identity_strategy_id`; its
+`principal_claim` names the person who signs in to consent, as it names callers
+on a surface.
 Create/update enforce provider type, HTTPS issuer/resource, tenant-compatible
 references and PAT resource scope; the reference participates in ownership
 impact and reassignment. Connect and callback reject changed surface, provider
@@ -1301,7 +1303,10 @@ profile policy inputs additionally expose `input.sts.resource` and
 time spent in asynchronous policy preparation.
 
 Profile subjects derived from external assertions are namespaced by the
-verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`.
+verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`,
+where the subject is the value of the verifying strategy's `principal_claim`
+(`sub` by default). A strategy that names another claim binds its name too,
+`SHA-256(JCS([iss,subject,claim]))`, so one value in two claims is two subjects.
 Two trusted issuers using the same `sub` therefore cannot share a resource or
 delegation identity. Already-local profile subjects remain stable through
 ID-JAG redemption. Existing DID-issued endpoints keep their original subject

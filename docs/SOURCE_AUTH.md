@@ -28,6 +28,83 @@ Configured on the Access Point as `caller_authentication.methods`, and on a Tran
 | DID Auth | `did_auth` | A DID Auth session token |
 | mTLS | `mtls` | A TLS client certificate |
 
+### Which claim names a JWT caller
+
+A JWT verification strategy names the claim that identifies a caller with `principal_claim`
+(default `sub`; the API field may be left out). The claim's value is the caller's subject in the
+[identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash), and a claim other than `sub`
+adds its name to the hash, so it decides which
+delegated credentials a caller uses, `input.source_auth.subject`, and the caller key of
+per-caller limits. Every method that points at the strategy, on an Access Point or a Transit
+Point, identifies callers by the same claim.
+
+- Choose a claim that is unique to one person and that the identity provider never lets them
+  change. Microsoft Entra's `sub` is different for each application, so a caller's `sub` in one
+  application differs from their `sub` in another; use `oid`, which is the same across a
+  tenant's applications. The issuer is part of the hash too, so set `expected_issuer` to the v2
+  issuer, `https://login.microsoftonline.com/{tenant-id}/v2.0`, and have the agent's API issue
+  v2 access tokens (`requestedAccessTokenVersion: 2` in its app registration manifest). A v1
+  access token carries `https://sts.windows.net/{tenant-id}/` instead, so the same `oid` would
+  be another caller, and the strategy refuses the token. The issuer names one Entra tenant, and
+  a user's `oid` differs in each tenant too, so an agent API that serves several tenants needs
+  one strategy per tenant, each its own method. A claim a person can edit, such as an email
+  address they control, lets them take another person's name.
+- The value must be a non-empty string. A token without the claim, or with a value that is
+  empty or not a string, is valid but names no caller: an Access Point answers `403`
+  `identity-required` to a request that needs one, and no delegated credential is given. A
+  policy still sees the request as authenticated, with `input.source_auth.subject` set to the
+  placeholder `<none>`, and every such caller shares the per-caller limit key `jwt:<none>`, as a
+  token without `sub` does under the default.
+- The claim name is printable ASCII with no spaces, up to 128 characters. It names a top-level
+  claim, matched case-sensitively: `Sub` is not `sub`, and `a.b` is a claim named `a.b`, not a
+  path into `a`. Claims that name the token, its issuer, audience, client, tenant, session or
+  lifetime are refused, since none names a person: `iss`, `aud`, `exp`, `iat`, `nbf`, `jti`,
+  `azp`, `client_id`, `tid`, `idp`, `scope`, `scp`, `nonce`, `sid`, `act`, `cnf`, `typ`, `ver`,
+  `auth_time`, `amr` and `acr`. Naming `sub` is the default, and is not stored.
+- A strategy whose stored `principal_claim` is one the API refuses, such as one written to
+  `_storage/` by hand, names no caller: the gateway logs a warning for it at startup, a surface
+  save that uses it answers with a `Warning` header, and JWT source authentication through it
+  answers `500`.
+- `principal_claim` is fixed when the strategy is created. Changing it would change every
+  caller's identity hash and orphan the credentials stored under the old ones, so an update that
+  names a different claim is refused with `400`, and an update that leaves it out keeps it. To
+  use another claim:
+  1. Create a new strategy for the issuer that names the claim.
+  2. Point every surface method, and every credential provider whose
+     `consent_identity_strategy_id` names the old strategy, at the new one.
+  3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
+     would answer its consents with not found.
+  4. Have callers connect again, since their identity hashes have changed.
+
+  From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens
+  with `invalid_grant`, and with them the MCP OAuth path and its consents, so run those steps
+  back to back.
+- A release older than `principal_claim` ignores the field from the moment it loads the
+  strategy: while it runs, the strategy names callers by `sub`, so every caller has another
+  identity hash and the grants stored under the claim's hashes are not found. It also removes
+  the field from storage the next time it saves the strategy. The API cannot restore it, since
+  an update naming the claim is refused as a change: after upgrading again, edit
+  `principal_claim` back into the strategy's record under `_storage/jwt_verification_strategies/`
+  and restart the gateway (or see [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md) for when
+  a reload picks the edit up). Downgrade only with strategies that leave the claim unset.
+- Two strategies for the same issuer that name different claims never share a caller: the
+  claim's name is part of the hash, so the same person through each is a different caller, with
+  credentials of their own, and one person's value in one claim never stands for another
+  person's value in the other. A surface save warns when its Access Point, on the surface or in
+  a variant, or a Transit Point accepts the issuer through both.
+- For token exchange an issuer names callers by one claim in a tenant scope: a tenant's own
+  strategies, or the appliance-global ones for a tenant with none. While two strategies of the
+  scope name the issuer's callers by different claims, STS refuses that issuer's tokens, for
+  every surface in the scope, even one that uses only one of them. Creating or updating such a
+  strategy answers with a `Warning` header.
+- Token exchange and `jwt-bearer` redemption ([STS](STS.md)) name a subject or actor token's
+  subject by the principal claim of the strategy that verified it too, so an exchanged token's
+  `sub` and `act.sub` carry that claim's value; on the MCP issuer, a subject from another issuer
+  is bound to the issuer and, when the claim is not `sub`, to the claim's name. A credential
+  provider's `consent_identity_strategy_id` matches the person who signs in to consent by its
+  strategy's claim in the same way. The gateway's own tokens, such as the MCP resource tokens and
+  ID-JAGs it issues, name their subject by `sub`.
+
 ### Several methods on one Access Point
 
 `methods` is a list, so one surface can accept callers with different credentials, for
@@ -281,7 +358,8 @@ An XFCC header from any other source is not trusted.
 ### DID Auth
 
 A two-step ceremony: `POST /authenticate/challenge` issues a challenge, and
-`POST /authenticate` accepts a JWS over it.
+`POST /authenticate` accepts a JWS over it. Either request body may hold at most 64 KiB; a
+larger one is refused with HTTP `413` before it is parsed.
 
 ```mermaid
 sequenceDiagram
@@ -593,7 +671,7 @@ limit or resolves a credential:
 | Method | On a Transit Point |
 | --- | --- |
 | `api_key`, `api_key_provider` | Read from an HTTP header only |
-| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer and subject, so a caller verified through another strategy that names the same `expected_issuer`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 
@@ -630,7 +708,7 @@ is:
 
 | Method | Principal | So |
 | --- | --- | --- |
-| `jwt_bearer` | The token's `sub` | One caller per issuer and subject. A token without a `sub` names no caller: it has no identity hash, so no delegated credentials |
+| `jwt_bearer` | The value of the strategy's [`principal_claim`](#which-claim-names-a-jwt-caller) (`sub` by default) | One caller per issuer, subject and principal claim. A token without a non-empty string in that claim names no caller: it has no identity hash, so no delegated credentials |
 | `api_key` | The `secret_id` | Every key in the secret is the same caller; give each caller a secret of its own to tell them apart |
 | `api_key_provider` | The key's id | One caller per issued key |
 | `mtls` | The principal the `identity_binding` derives | One caller per trusted CA (its subject and key, or the pinned certificate) and bound principal |

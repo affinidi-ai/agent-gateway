@@ -1295,6 +1295,7 @@ mod tests {
                 issuer: "https://gateway.example/oauth2/mcp".into(),
             };
             let caller = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
             };
@@ -1656,6 +1657,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -1850,6 +1852,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -1962,6 +1965,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2042,6 +2046,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2152,6 +2157,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2539,6 +2545,7 @@ mod tests {
                 issuer: "https://gateway.example/oauth2/mcp".into(),
             };
             let caller = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
             };

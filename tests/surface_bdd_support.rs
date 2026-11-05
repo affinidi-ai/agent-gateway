@@ -136,6 +136,54 @@ fn write_config_writes_the_access_point_a2a_settings() {
     assert_eq!(surface_json["access_point"]["a2a"], a2a);
 }
 
+fn written_log_directory(surface_config: &SurfaceConfigBuilder) -> (TempDir, Option<String>) {
+    let temp_dir = TempDir::new().unwrap();
+    config::single_surface_writer::write_single_surface_config(
+        temp_dir.path(),
+        32030,
+        "http://127.0.0.1:9",
+        surface_config,
+        None,
+    );
+    let config: toml::Table = std::fs::read_to_string(
+        temp_dir
+            .path()
+            .join("config.toml"),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    let log_directory = config["logging"]
+        .get("log_directory")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    (temp_dir, log_directory)
+}
+
+#[test]
+fn write_config_sets_no_log_directory_by_default() {
+    let (_temp_dir, log_directory) = written_log_directory(&SurfaceConfigBuilder::default());
+
+    assert_eq!(log_directory, None);
+}
+
+#[test]
+fn write_config_points_the_log_directory_into_storage_when_asked() {
+    let surface_config = SurfaceConfigBuilder {
+        writes_log_directory: true,
+        ..SurfaceConfigBuilder::default()
+    };
+
+    let (temp_dir, log_directory) = written_log_directory(&surface_config);
+
+    let expected = temp_dir
+        .path()
+        .join("_storage/logs")
+        .display()
+        .to_string();
+    assert_eq!(log_directory, Some(expected));
+}
+
 #[test]
 fn write_config_seeds_api_key_provider_source_auth_fixture() {
     let temp_dir = TempDir::new().unwrap();

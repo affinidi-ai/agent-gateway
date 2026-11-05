@@ -5974,9 +5974,8 @@ async fn process_forward_request_in_request_scope(
                     &base_url,
                     true, // via_fabric = true (G2G path)
                     None, // audit context not yet available in G2G path
-                    // The caller identity here is asserted by the peer gateway, not
-                    // verified against the consenting issuer, so it can never unlock
-                    // a modern consent record.
+                    // A Fabric request establishes no consent principal, so it never
+                    // unlocks a modern consent record.
                     None,
                 )
                 .await;

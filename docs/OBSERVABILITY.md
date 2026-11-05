@@ -73,9 +73,12 @@ counter incremented once for each A2A or AP2 request that reaches
 [version negotiation](PROTOCOLS.md#version-negotiation), whether its `A2A-Version` negotiates or is
 refused. A request answered before that step is not counted: for example agent-card discovery, and
 refusals by source authentication, rate limiting, gateway or appliance-wide policy, or the AP2 gate.
-A request later refused by delegated payment, the egress guard or the request-body size limit
-(HTTP `413`) is counted. A request to a `fabric://` target is negotiated and counted on the sending
-gateway; the receiving gateway does not count it again.
+A request body over `[a2a] max_body_size` is refused with HTTP `413` as it is read, before version
+negotiation, and is not counted. A request later refused by delegated payment or the egress guard
+is counted, and so is one whose body grows past the size limit only once the gateway changes it
+(an AP2 transformation or injected metadata) and is then refused with `413`. A request to a
+`fabric://` target is negotiated and counted on the sending gateway; the receiving gateway does not
+count it again.
 
 | Label | Value |
 | --- | --- |
@@ -390,7 +393,12 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
     resolves its surface and variant when it opens, so one to a surface or variant that is not
     available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
-  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+  - `admission`: `body_too_large` (an Access Point or Transit Point request body over its limit,
+    MCP or not; the shared-host `/outbound` hop's own refusals, of a declared `Content-Length`
+    over `[a2a] max_body_size` and of a body above it for an MCP Transit Point with a larger
+    limit, are logged with the caller's address and not recorded, and a DID Auth challenge or
+    authenticate body over its 64 KiB limit is refused before any record is built),
+    `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
     `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol
@@ -664,10 +672,15 @@ default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCI
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
 `AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
 `/v1/audit` row shape. The principal variables come from the record's `caller` context:
-`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (JWT
-`sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
-carries), and all four are empty when the request had no caller context (no source auth, or a
-Transit Point whose token carries no caller). The policy variables describe the policy that made
+`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (for a
+JWT the value of its verification strategy's `principal_claim`, `sub` by default; the API key
+name, DID, mTLS principal, or on a Transit Point the caller the transit token carries), and all
+four are empty when the request had no caller context (no source auth, or a
+Transit Point whose token carries no caller). For a JWT caller that the Access Point's own
+source authentication verified through a strategy naming a claim other than `sub`, the `caller`
+context keeps the token's own `sub` in `sub`, so it matches the identity provider's logs, and
+adds the claim's value as `principal`. A Transit Point record takes its caller from the transit
+token, which carries no `principal`. The policy variables describe the policy that made
 a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
 for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
 policy") and are empty for other records; see

@@ -1738,6 +1738,7 @@ async fn seed_strategy(
     use crate::jwt_bearer::JwtVerificationStrategyStorage;
     strategies
         .create(crate::jwt_bearer::models::JwtVerificationStrategy {
+            principal_claim: None,
             id: String::new(),
             tenant_id: tenant_id.map(str::to_string),
             name: "Seeded strategy".to_string(),

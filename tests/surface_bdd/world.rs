@@ -147,6 +147,8 @@ pub struct SurfaceWorld {
     pub transit_token: Option<String>,
     /// A surface the operator is about to save through the admin API.
     pub surface_draft: Option<serde_json::Value>,
+    /// A client presenting the personal access token an operator minted in the scenario.
+    pub personal_access_token_client: Option<reqwest::Client>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -213,6 +215,7 @@ impl SurfaceWorld {
             oauth_callback_query: None,
             transit_token: None,
             surface_draft: None,
+            personal_access_token_client: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

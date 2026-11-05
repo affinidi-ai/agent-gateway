@@ -580,6 +580,9 @@ fn write_single_surface_config_inner(
     } else if surface_config.keeps_gateway_log {
         log_warnings(base_dir);
     }
+    if surface_config.writes_log_directory {
+        set_log_directory(base_dir);
+    }
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.
@@ -596,6 +599,16 @@ fn log_warnings(base_dir: &Path) {
     let config = std::fs::read_to_string(&path).unwrap();
     assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
     std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
+}
+
+/// Points the gateway's log directory at `_storage/logs`.
+fn set_log_directory(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("[logging]\n"), "the gateway config must have a logging table");
+    let log_directory = base_dir.join("_storage/logs");
+    let setting = format!("[logging]\nlog_directory = \"{}\"\n", log_directory.display());
+    std::fs::write(&path, config.replacen("[logging]\n", &setting, 1)).unwrap();
 }
 
 /// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when

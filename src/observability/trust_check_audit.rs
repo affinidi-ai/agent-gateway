@@ -407,6 +407,7 @@ mod tests {
     #[tokio::test]
     async fn the_audit_record_carries_the_surface_and_the_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
         };

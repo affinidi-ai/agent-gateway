@@ -1658,6 +1658,7 @@ async fn fabric_consent_flow() {
             kind: crate::mcp::request_validation::McpMessageKind::Request,
         };
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://receiver.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
         };
