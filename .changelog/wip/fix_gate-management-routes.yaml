@@ -1,0 +1,35 @@
+branch: fix/gate-management-routes
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-04T12:30:00Z'
+      title: Show the Dashboard metrics Delete button only to users with settings.edit
+      description: >-
+        The Dashboard's Gateway Configuration card showed the metrics Delete button to every
+        user, although truncating stored metrics needs `settings.edit`. The button now appears
+        only for users who hold `settings.edit`, so others no longer see an action the gateway
+        refuses.
+  removed: []
+  security:
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Require settings.edit to remove rotated logs or truncate stored metrics
+      description: >-
+        `POST /v1/logs/truncate` and `POST /v1/metrics/truncate` answered any signed-in user and
+        any personal access token, so any caller could delete the rotated `agent-gateway*.log*`
+        files or drop stored metrics past the retention period. Both routes now need
+        `settings.edit`, which the built-in defaults grant to administrators only, and a personal
+        access token with feature scopes needs `settings.edit` among them. A caller without it
+        gets `403` and nothing is removed. Without an auth backend the routes are not registered.
+    - timestamp: '2026-11-04T12:00:00Z'
+      title: Require users.approve to read or change the welcome template or send one
+      description: >-
+        `GET` and `PUT /v1/notifications/user-welcome-template` and
+        `POST /v1/notifications/send-welcome` answered any signed-in user and any personal access
+        token, so any caller could rewrite the message newly approved users receive or place a
+        notification with any title and text in any user's inbox. The three routes now need
+        `users.approve`, which the built-in defaults grant to administrators only, and a personal
+        access token with feature scopes needs `users.approve` among them. Without an auth
+        backend they refuse every request with `403`. The other notification routes still act on
+        the caller's own notifications with a session only.
+  breaking: []
