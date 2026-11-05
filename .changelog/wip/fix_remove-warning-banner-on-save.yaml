@@ -1,0 +1,19 @@
+branch: fix/remove-warning-banner-on-save
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed:
+    - timestamp: '2026-11-05T09:00:00Z'
+      title: Stop showing the gateway's save warnings in a banner or toast
+      description: >-
+        Saving or creating a surface in the dashboard showed each Warning header from the
+        gateway twice: in the "The last save drew a warning" banner and in a toast. Both are
+        removed, so the save toast says only that the surface was saved or created, plus any
+        issue the dashboard finds itself. The public Access Point warning is dropped outright,
+        since turning Public access on is the operator's own choice. A warning that names a
+        Transit Point still shows in that Transit Point's panel, and the canvas and Access Point
+        panel still show whether the Access Point is ready. API clients still receive every
+        Warning header.
+  security: []
+  breaking: []
