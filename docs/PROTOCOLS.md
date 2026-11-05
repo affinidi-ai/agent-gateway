@@ -826,7 +826,7 @@ nor any other host. A surface without `target.auth`, or a
 Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
 each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
 below a non-root `base_url` path, one that makes an ambiguous segment above (for example
-`../admin`, sent as `..%2Fadmin`), with or without the credential.
+`../admin`, sent as `..%2Fadmin`), with or without the credential. The refusal is an HTTP `400` with JSON-RPC error `-32602` and the message "Invalid tool arguments", answered before any request is sent; it writes no VP Audit Log record.
 
 The forward clients do not follow redirects: a Target's 3xx is returned to the caller with its
 `Location`, so the credential never follows it to another URL. This holds for the pinned direct

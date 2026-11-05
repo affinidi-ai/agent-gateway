@@ -536,6 +536,8 @@ for which writes.
   as on policy change events, and the top level carries `surface_id` and `channel_name`. No
   record carries a secret id, header name, header format or value.
 
+A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
