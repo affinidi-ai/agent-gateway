@@ -1,0 +1,34 @@
+# CodeQL Configuration File for GitHub's Managed CodeQL
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning
+
+# Paths to include and exclude from analysis
+paths:
+  # Include source code and tests
+  include:
+    - src
+    - tests
+
+  # Exclude unnecessary directories to speed up analysis
+  exclude:
+    # Rust build artifacts
+    - target
+    
+    # Build and test directories
+    - ui-tests
+    - .cargo
+    
+    # Dependencies and generated code
+    - node_modules
+    - dist
+    - build
+    - .venv
+    - venv
+    
+    # Configuration and documentation
+    - '**/*.md'
+    - config
+
+# Use focused query set instead of all available queries
+# This significantly speeds up analysis while maintaining security coverage
+queries:
+  - uses: security-and-quality
