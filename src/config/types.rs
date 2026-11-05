@@ -588,6 +588,55 @@ impl Default for LoggingConfig {
     }
 }
 
+/// VP Audit Log file configuration (`[audit]`). The live log is rotated once it
+/// reaches `vp_audit_log_max_bytes`, and `vp_audit_log_keep` rotated files are
+/// kept beside it; anything older is deleted. Startup-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Bytes the live VP Audit Log may reach before it is rotated. `0` never
+    /// rotates, so the live log grows without limit.
+    #[serde(default = "default_vp_audit_log_max_bytes")]
+    pub vp_audit_log_max_bytes: u64,
+
+    /// Rotated VP Audit Log files kept beside the live one, oldest deleted
+    /// first. Read as at least `1`, so rotation never deletes the history.
+    #[serde(default = "default_vp_audit_log_keep")]
+    pub vp_audit_log_keep: usize,
+}
+
+fn default_vp_audit_log_max_bytes() -> u64 {
+    crate::audit::log_files::LIVE_MAX_BYTES
+}
+
+fn default_vp_audit_log_keep() -> usize {
+    crate::audit::log_files::KEEP_ROTATED
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            vp_audit_log_max_bytes: default_vp_audit_log_max_bytes(),
+            vp_audit_log_keep: default_vp_audit_log_keep(),
+        }
+    }
+}
+
+impl AuditConfig {
+    /// Whether this is the default, so a generated `config.toml` carries no
+    /// `[audit]` section until an operator sets one.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// How the VP Audit Log is rotated with these settings.
+    pub fn rotation(&self) -> crate::audit::log_files::Rotation {
+        crate::audit::log_files::Rotation {
+            max_bytes: self.vp_audit_log_max_bytes,
+            keep: self.vp_audit_log_keep,
+        }
+    }
+}
+
 /// Extension inspection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionInspectionConfig {
@@ -3190,6 +3239,11 @@ pub struct BootstrapConfig {
     /// the file's.
     #[serde(skip)]
     pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
+
+    /// VP Audit Log rotation (`[audit]`). Omitted from a generated
+    /// `config.toml` while it holds the defaults.
+    #[serde(default, skip_serializing_if = "AuditConfig::is_default")]
+    pub audit: AuditConfig,
 }
 
 /// DID document cache configuration
@@ -4707,6 +4761,32 @@ mod log_redaction_config_tests {
         let read_back: LoggingConfig =
             serde_json::from_str(&serde_json::to_string(&logging).expect("serializes")).expect("parses");
         assert!(!read_back.redaction.enabled);
+    }
+
+    #[test]
+    fn an_audit_section_sets_the_vp_audit_log_rotation() {
+        let audit: AuditConfig =
+            toml::from_str("vp_audit_log_max_bytes = 1048576\nvp_audit_log_keep = 2").expect("parses");
+
+        assert_eq!(audit.rotation().max_bytes, 1_048_576);
+        assert_eq!(audit.rotation().keep, 2);
+        assert!(!audit.is_default());
+    }
+
+    #[test]
+    fn a_missing_audit_section_keeps_the_built_in_rotation() {
+        let audit: AuditConfig = toml::from_str("").expect("parses");
+
+        assert_eq!(audit, AuditConfig::default());
+        assert_eq!(audit.rotation(), crate::audit::log_files::Rotation::default());
+        assert!(audit.is_default(), "a generated config.toml carries no [audit] section");
+    }
+
+    #[test]
+    fn an_audit_section_with_no_retained_files_still_keeps_one() {
+        let audit: AuditConfig = toml::from_str("vp_audit_log_keep = 0").expect("parses");
+
+        assert_eq!(audit.rotation().kept(), 1, "rotation never deletes the history outright");
     }
 }
 

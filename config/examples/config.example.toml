@@ -232,6 +232,15 @@ json = false    # Set to true for JSON-formatted logs
 log_directory = "../_storage/logs"  # Directory to write log files (logs to stdout only if not set)
 # Log redaction is set in gateway.json `logging.redaction`, not here. It is on by default.
 
+# VP Audit Log file rotation (optional; the defaults are shown).
+# The live log is rotated once it reaches vp_audit_log_max_bytes, and
+# vp_audit_log_keep rotated files are kept beside it. Records older than those
+# files are deleted and counted nowhere, so forward anything that must outlive
+# them to a Governance Audit integration. Startup only.
+# [audit]
+# vp_audit_log_max_bytes = 8388608  # 8 MiB; 0 switches rotation off
+# vp_audit_log_keep = 8             # rotated files kept; 0 is read as 1
+
 # Extension Inspection Configuration (optional)
 [extension_inspection]
 # Enable inspection of A2A extensions

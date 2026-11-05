@@ -420,15 +420,37 @@ request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
 agent its presentation is for as `agent_did`.
 
-**File size and reads.** The VP Audit Log is rotated: once the live file reaches 8 MiB it
-becomes `delegation-audit.jsonl.1`, every rotated file moves one position back, and the 8 most
-recent are kept (about 72 MiB in all). Anything older is deleted, so a long-running gateway
-keeps a bounded audit history on disk. `/v1/audit` and `/v1/delegation-audit` read only the
-newest 8 MiB of that history, back through the rotated files, on a blocking thread and one read
-at a time: a read costs the same however large the history has grown, and concurrent readers
-wait for each other instead of each holding a copy. When the history holds more than that
-window the response sets `truncated: true`, and `total`, `total_pages` and `category_counts`
-then describe the window rather than the whole history.
+**File size.** The VP Audit Log is rotated: once the live file reaches
+`[audit] vp_audit_log_max_bytes` (8 MiB by default) it becomes `delegation-audit.jsonl.1`, every
+rotated file moves one position back, and `[audit] vp_audit_log_keep` of them are kept (8 by
+default, about 72 MiB in all). Anything older is deleted, so a long-running gateway keeps a
+bounded audit history on disk. A `vp_audit_log_keep` of `0` is read as `1`, so rotation always
+moves the live log aside and never deletes it outright; a `vp_audit_log_max_bytes` of `0`
+switches rotation off and lets the live file grow without limit. Both are startup-only; see
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
+
+Rotation deletes the oldest records outright, and that loss is counted nowhere: the gateway's own
+copy of the audit history reaches back only as far as the retained files do at the appliance's
+request rate, and a flood of request events shortens it. Forward the records you must keep for
+longer to a Governance Audit integration, which keeps them wherever it delivers them.
+
+**Reads.** `/v1/audit` and `/v1/delegation-audit` read on a blocking thread, one read at a time,
+and each keeps only the newest 8 MiB of the records *it* returns. A read walks back from the live
+file through the rotated ones and spends that window on the records its endpoint keeps, so
+`/v1/delegation-audit`, which drops the VP-audit categories, keeps looking past them instead of
+filling its window with records it would discard. A read therefore costs the same however large
+the history has grown: one history file and one window are in memory at a time, and concurrent
+readers wait for each other instead of each holding a copy. The permit belongs to the read rather
+than to the request that asked for it, so a request cancelled mid-read still bars the next read
+until its window is out of memory. When the history holds more records than the window fits, the
+response sets `truncated: true`, and `total`, `total_pages` and `category_counts` then describe
+the window rather than the whole history.
+
+Two limits bound the walk. One history file is read from its end for at most 16 MiB, so raising
+`vp_audit_log_max_bytes` above that leaves only each file's newest 16 MiB readable. And because
+`/v1/audit` keeps every record it meets, its window is normally filled by the live file and the
+newest rotated one: the older rotated files are kept for off-box inspection and for the
+restart de-duplication described under _Delivery_ below, not for the API to page back into.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
@@ -674,7 +696,9 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   event set mixes audit and other events gets each event as its own message, never values of
   one inside the other.
 
-**Delivery.** No record is lost by the gateway except in the counted cases below.
+**Delivery.** No record is lost on its way to a sink except in the counted cases below. What a
+sink does with a record afterwards is the sink's own: the VP Audit Log deletes its oldest
+records as it rotates, and that is not counted here (see _File size_ above).
 
 - *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
   It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),

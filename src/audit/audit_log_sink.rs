@@ -494,6 +494,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_size_cap_of_zero_never_rotates_the_live_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let sink = AuditLogSink::open(&path, 16, Rotation { max_bytes: 0, keep: 2 }).unwrap();
+        let (first, second) = (entry(1), entry(2));
+
+        sink.deliver(&first)
+            .await
+            .unwrap();
+        sink.deliver(&second)
+            .await
+            .unwrap();
+        sink.commit().await.unwrap();
+
+        assert_eq!(ids(&path), vec![first.record.event_id, second.record.event_id]);
+        assert!(!rotated(&path, 1).exists(), "nothing was rotated away");
+    }
+
+    #[tokio::test]
     async fn a_record_rotated_out_of_the_live_log_is_not_written_again() {
         let dir = TempDir::new().unwrap();
         let path = dir

@@ -1,17 +1,32 @@
 branch: feat/audit-memfix
 changes:
-  added: []
-  changed: []
+  added:
+    - timestamp: '2026-11-05T14:29:50Z'
+      title: Let config.toml set the VP Audit Log's rotation size and retained files
+      description: >-
+        A new startup-only `[audit]` block sets `vp_audit_log_max_bytes` and `vp_audit_log_keep`,
+        so an appliance that must keep more audit evidence on disk can raise them. They default
+        to the 8 MiB and 8 files the gateway already used, and a `vp_audit_log_keep` of 0 is read
+        as 1, so rotation never deletes the history outright.
+  changed:
+    - timestamp: '2026-11-05T14:29:50Z'
+      title: Keep a bounded VP Audit Log history on disk
+      description: >-
+        The VP Audit Log kept every record it had ever written. It is now rotated at 8 MiB with
+        the 8 most recent files kept, and records older than those files are deleted, so the
+        gateway's own copy of the audit history is bounded by the appliance's request rate.
+        Forward the records you must keep for longer to a Governance Audit integration.
   fixed:
     - timestamp: '2026-11-05T14:29:50Z'
       title: ⭐ Keep the Audit page from running the gateway out of memory
       description: >-
         Opening the Audit page read and parsed the whole VP Audit Log on every request, so the
         gateway could be killed for using too much memory once the log had grown. A read now
-        takes only the newest 8 MiB of the log, back through its rotated files, on a blocking
-        thread and one read at a time, and the response says when the history held more than
-        that window. The log itself is now rotated at 8 MiB with the 8 most recent files kept,
-        so it no longer grows without limit.
+        keeps only the newest 8 MiB of the records it returns, walking back through the rotated
+        files, on a blocking thread and one read at a time, and the response says when the
+        history held more than that window. Each view spends its window on the records it keeps,
+        so the Credential Delegation Audit Log still finds its records behind a flood of request
+        events.
   removed: []
   security: []
   breaking: []

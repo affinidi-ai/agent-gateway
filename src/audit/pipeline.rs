@@ -126,7 +126,7 @@ pub fn start_with(
     let journal_dir = audit_dir.join("journal");
     let writer = JournalWriter::open(&journal_dir, SEGMENT_MAX_BYTES)?;
     let cursors = Arc::new(CursorStore::open(&journal_dir)?);
-    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS, Rotation::default())?;
+    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS, Rotation::configured())?;
     let factory = ProductionSinks {
         audit_log: audit_log.clone(),
         publish: Arc::new(publish_audit_delivery),

@@ -949,11 +949,15 @@ fn enrich_policy_decisions_from_signed_vps(events: &mut [DelegationAuditEvent]) 
 }
 
 /// Sets up the audit pipeline with the VP Audit Log at
-/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, and
-/// starts it unless the node is in Standby: only the Active node writes the
-/// journal (see [`set_audit_pipeline_mode`]). Call once at startup from the
-/// orchestrator.
-pub async fn init_audit_logger(log_directory: Option<&str>) {
+/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, rotated
+/// as `audit` says, and starts it unless the node is in Standby: only the
+/// Active node writes the journal (see [`set_audit_pipeline_mode`]). Call once
+/// at startup from the orchestrator.
+pub async fn init_audit_logger(
+    log_directory: Option<&str>,
+    audit: &crate::config::AuditConfig,
+) {
+    log_files::Rotation::configure(audit.rotation());
     let dir = log_directory
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("_storage/audit"));
@@ -1658,20 +1662,24 @@ impl OwnedAuditLogFilter {
     }
 }
 
-/// How many reads parse the audit log at once. Each one holds a window of the
-/// log, and the records parsed from it, in memory, so concurrent readers — a
-/// second dashboard tab, or a filter changed while a page is still loading —
-/// wait for each other instead of multiplying that cost.
+/// How many reads parse the audit log at once. Each one holds a history file,
+/// and a window of the records parsed from it, in memory, so concurrent
+/// readers — a second dashboard tab, or a filter changed while a page is still
+/// loading — wait for each other instead of multiplying that cost. The permit
+/// belongs to the blocking read, not to the request that asked for it: a
+/// request cancelled mid-read (a disconnect, a reload) leaves the read running,
+/// and it must still bar the next one until its window is out of memory.
 static AUDIT_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Read the audit log with pagination (newest first). Every [`AuditLogFilter`]
 /// is applied **before** pagination and the category tally so `total`,
 /// `total_pages`, and `category_counts` stay consistent with the returned page.
 ///
-/// Only the newest [`log_files::READ_WINDOW_BYTES`] of the log are read, back
-/// through the rotated files, so a read costs the same whatever the log has
-/// grown to. [`AuditLogPage::truncated`] says the history held more than that
-/// window, in which case the counts describe the window.
+/// A read keeps only the newest [`log_files::READ_WINDOW_BYTES`] of the records
+/// the view asks for, walking back through the rotated files, so it costs the
+/// same whatever the history has grown to. [`AuditLogPage::truncated`] says the
+/// history held more than that window, in which case the counts describe the
+/// window.
 pub async fn read_audit_log(
     page: usize,
     page_size: usize,
@@ -1683,16 +1691,24 @@ pub async fn read_audit_log(
         .clone();
     let filter = OwnedAuditLogFilter::from(opts);
 
-    let _permit = AUDIT_READS.acquire().await?;
+    let permit = AUDIT_READS.acquire().await?;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         read_audit_window(&path, page, page_size, &filter, log_files::READ_WINDOW_BYTES)
     })
     .await?
 }
 
-/// Parse the newest `window_bytes` of the audit log into a page. Runs on a
-/// blocking thread: the window is read, parsed and filtered off the async
+/// Parse the newest records of the audit history into a page. Runs on a
+/// blocking thread: the history is read, parsed and filtered off the async
 /// runtime, so audit reads never hold up proxy traffic.
+///
+/// Walks back from the live log through the rotated files and keeps the records
+/// the view wants until they reach `window_bytes`, so a view whose records are
+/// rare in the history — the Credential Delegation Audit Log beside a flood of
+/// request events — fills its window instead of being crowded out by the records
+/// it discards. One history file's tail and `window_bytes` of kept records are
+/// in memory at a time, however long the history is.
 fn read_audit_window(
     path: &Path,
     page: usize,
@@ -1700,27 +1716,45 @@ fn read_audit_window(
     filter: &OwnedAuditLogFilter,
     window_bytes: u64,
 ) -> anyhow::Result<AuditLogPage> {
-    let window = log_files::read_window(path, window_bytes)?;
-
-    // Parse the window most-recent first. Text filtering happens after VP-backed
+    // Parse the history most-recent first. Text filtering happens after VP-backed
     // policy evidence enrichment so full-hash searches can match hydrated
     // PolicyDecision rows even when the original JSONL row predated the fields.
-    let mut events: Vec<DelegationAuditEvent> = window
-        .text
-        .lines()
-        .rev()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
+    let mut events: Vec<DelegationAuditEvent> = Vec::new();
+    let mut kept_bytes: u64 = 0;
+    let mut truncated = false;
+    'history: for file in log_files::history(path) {
+        let tail = log_files::read_tail(&file, log_files::FILE_READ_BYTES)?;
+        for line in tail.text.lines().rev() {
+            if kept_bytes >= window_bytes {
+                truncated = true;
+                break 'history;
             }
-            serde_json::from_str::<DelegationAuditEvent>(line).ok()
-        })
-        .collect();
+            let record = line.trim();
+            if record.is_empty() {
+                continue;
+            }
+            // A line cut by the window, or left half-written by a crash, is
+            // dropped rather than surfaced as a record.
+            let Ok(event) = serde_json::from_str::<DelegationAuditEvent>(record) else {
+                continue;
+            };
+            // Records this view discards cost no budget, so a view whose records
+            // are rare keeps looking instead of filling its window with them.
+            if filter.exclude_vp_audit && event.event.is_vp_audit() {
+                continue;
+            }
+            kept_bytes += line.len() as u64 + 1;
+            events.push(event);
+        }
+        if tail.truncated {
+            truncated = true;
+            break 'history;
+        }
+    }
 
     enrich_policy_decisions_from_signed_vps(&mut events);
 
-    Ok(page_of(events, page, page_size, filter.borrowed(), window.truncated))
+    Ok(page_of(events, page, page_size, filter.borrowed(), truncated))
 }
 
 /// Filter, tally and paginate parsed events, newest first.
@@ -2015,6 +2049,75 @@ mod tests {
     fn audit_line(provider: &str) -> String {
         let event = audit_event(DelegationAuditAction::TokenInjected, None, None, Some(provider), None);
         format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    /// A record the Credential Delegation Audit Log discards: it belongs to the
+    /// VP Audit Log, and one per request is the bulk of a busy history.
+    fn vp_audit_line() -> String {
+        let event = audit_event(
+            DelegationAuditAction::TraceTerminated {
+                own_trace_id: "own".to_string(),
+                downstream_trace_id: "down".to_string(),
+                flow: "fabric".to_string(),
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    fn delegation_only() -> OwnedAuditLogFilter {
+        OwnedAuditLogFilter {
+            exclude_vp_audit: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_read_spends_its_window_only_on_the_records_the_view_keeps() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let wanted = audit_line("delegated");
+        let noise: String = (0..20)
+            .map(|_| vp_audit_line())
+            .collect();
+        std::fs::write(&path, format!("{wanted}{noise}")).unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &delegation_only(), wanted.len() as u64).unwrap();
+
+        assert_eq!(page.total, 1, "the record behind the discarded ones is still found");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("delegated")
+        );
+        assert!(!page.truncated, "the whole history was walked");
+    }
+
+    #[test]
+    fn a_read_walks_back_into_the_rotated_files_for_the_records_it_wants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let wanted = audit_line("rotated-out");
+        std::fs::write(&path, vp_audit_line()).unwrap();
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), &wanted).unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &delegation_only(), wanted.len() as u64).unwrap();
+
+        assert_eq!(page.total, 1, "the live log held nothing this view keeps");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("rotated-out")
+        );
     }
 
     #[test]

@@ -11,24 +11,36 @@
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Bytes the live log may reach before it is rotated.
+/// Bytes the live log may reach before it is rotated. The default of
+/// `[audit] vp_audit_log_max_bytes`.
 pub const LIVE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Rotated files kept beside the live log. The oldest is deleted on rotation.
+/// The default of `[audit] vp_audit_log_keep`.
 pub const KEEP_ROTATED: usize = 8;
 
-/// Most bytes one read takes from the end of the audit history. A read holds
-/// this much of the log, and the records parsed from it, in memory.
+/// Most bytes of kept records one read takes from the end of the audit history.
+/// A read holds this much of the log's lines, and the records parsed from them,
+/// in memory; finding them costs at most a walk back through the whole history.
 pub const READ_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Most bytes one read takes from a single history file. Twice
+/// [`LIVE_MAX_BYTES`], so a file written under the default rotation is always
+/// read whole; a file left larger by a raised [`Rotation::max_bytes`] is read
+/// from its end only, which keeps a read's memory bounded however the rotation
+/// is configured.
+pub const FILE_READ_BYTES: u64 = 2 * LIVE_MAX_BYTES;
+
 /// How the live log is rotated.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rotation {
     /// Bytes the live log may reach before it is rotated. `0` never rotates.
     /// Default: 8 MiB.
     pub max_bytes: u64,
-    /// Rotated files kept beside the live log, oldest deleted first.
+    /// Rotated files kept beside the live log, oldest deleted first. Values
+    /// below `1` are read as `1`, so rotation never leaves the history empty.
     /// Default: 8.
     pub keep: usize,
 }
@@ -39,6 +51,31 @@ impl Default for Rotation {
             max_bytes: LIVE_MAX_BYTES,
             keep: KEEP_ROTATED,
         }
+    }
+}
+
+/// Set once at start-up from `[audit]` in `config.toml`.
+static CONFIGURED: OnceLock<Rotation> = OnceLock::new();
+
+impl Rotation {
+    /// Sets the rotation the gateway's own pipeline runs with. The first call
+    /// wins, so a second start-up in one process does not change it.
+    pub fn configure(rotation: Rotation) {
+        let _ = CONFIGURED.set(rotation);
+    }
+
+    /// The configured rotation, or the defaults while none has been set.
+    pub fn configured() -> Self {
+        CONFIGURED
+            .get()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Rotated files actually kept: at least one, so a misconfigured `keep` of
+    /// `0` moves the live log aside instead of deleting the history.
+    pub fn kept(&self) -> usize {
+        self.keep.max(1)
     }
 }
 
@@ -155,21 +192,17 @@ pub fn read_window(
 
 /// Rotates the live log: each rotated file moves one position back, the live
 /// log becomes `.1`, and everything past `keep` is deleted. A live log that is
-/// not there is left alone. With `keep` of `0` the live log is deleted instead.
+/// not there is left alone. `keep` is read as at least `1`, so rotation always
+/// moves the live log aside and never deletes it outright.
 pub fn rotate(
     live: &Path,
     keep: usize,
 ) -> io::Result<()> {
-    let mut index = keep.max(1);
+    let keep = keep.max(1);
+    let mut index = keep;
     while rotated_path(live, index).exists() {
         fs::remove_file(rotated_path(live, index))?;
         index += 1;
-    }
-    if keep == 0 {
-        return match fs::remove_file(live) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        };
     }
     for index in (1..keep).rev() {
         let from = rotated_path(live, index);
@@ -301,6 +334,28 @@ mod tests {
         assert_eq!(fs::read_to_string(rotated_path(&path, 1)).unwrap(), "live\n");
         assert!(!rotated_path(&path, 2).exists());
         assert!(!rotated_path(&path, 3).exists());
+    }
+
+    #[test]
+    fn rotating_with_no_retained_count_still_moves_the_live_log_aside() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        fs::write(&path, "live\n").unwrap();
+        fs::write(rotated_path(&path, 1), "first\n").unwrap();
+
+        rotate(&path, 0).unwrap();
+
+        assert!(!path.exists(), "the live log is moved aside, never deleted");
+        assert_eq!(fs::read_to_string(rotated_path(&path, 1)).unwrap(), "live\n");
+        assert!(!rotated_path(&path, 2).exists(), "nothing is kept past the retained count");
+    }
+
+    #[test]
+    fn a_retained_count_below_one_is_read_as_one() {
+        assert_eq!(Rotation { max_bytes: 1, keep: 0 }.kept(), 1);
+        assert_eq!(Rotation::default().kept(), KEEP_ROTATED);
     }
 
     #[test]

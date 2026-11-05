@@ -2033,6 +2033,7 @@ pub async fn run_axum_proxy(
                 .logging
                 .log_directory
                 .as_deref(),
+            &bootstrap_config.audit,
         )
         .await;
 

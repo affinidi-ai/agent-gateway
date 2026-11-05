@@ -368,7 +368,11 @@ the gateway authorised, for whom, and under which policy.
 | Consent granted | A user completes consent and a token is stored |
 | Payments | A delegated agent-pay payment is taken, challenged, held for review, or refused |
 
-Entries are written as JSON Lines to a file that rotates daily. Each policy decision
+Entries are written as JSON Lines to a file that is rotated once it reaches its size cap,
+keeping a fixed number of rotated files beside it and deleting anything older, so the
+appliance's own copy of the audit history is bounded. The sizes are set by `[audit]` in
+`config.toml`; see
+[Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). Each policy decision
 records the exact policy version and content hash that decided. On calls through a Transit
 Point, policy decisions are also carried inside the signed workload-binding presentation,
 so the receiving side can check them against the gateway's own key. Auditing is off until
