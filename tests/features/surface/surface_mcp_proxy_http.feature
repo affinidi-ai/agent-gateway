@@ -163,7 +163,7 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And REST API "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
-  Scenario: A credentialed tool call under the MCP proxy base path carries the target credential
+  Scenario: A credentialed tool call under the MCP proxy base path carries the Target credential
     Given the MCP proxy's base URL has the base path "/api/"
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
@@ -219,7 +219,7 @@ Feature: Routing through a proxy:// MCP target
     And REST API "bravo" received exactly 1 requests
     And REST API "bravo" received "GET /weather/Paris"
 
-  Scenario: An MCP proxy tool call carries the target credential while https Targets only warn
+  Scenario: An MCP proxy tool call carries the Target credential while https Targets only warn
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway only warns on the credential rule "target_https"
@@ -238,7 +238,7 @@ Feature: Routing through a proxy:// MCP target
     And the response mentions "Target authentication"
     And REST API "bravo" was not called
 
-  Scenario: An MCP proxy tool call goes out without the target credential when https Targets are enforced and fallback is passthrough
+  Scenario: An MCP proxy tool call goes out without the Target credential when https Targets are enforced and fallback is passthrough
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway's authentication to the managed agent falls back to "passthrough"
@@ -248,7 +248,7 @@ Feature: Routing through a proxy:// MCP target
     And REST API "bravo" received "GET /weather/Paris"
     And REST API "bravo" did not receive header "x-target-api-key"
 
-  Scenario: Editing an MCP proxy target credential is saved with a warning while https Targets only warn
+  Scenario: Editing an MCP proxy Target credential is saved with a warning while https Targets only warn
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway only warns on the credential rule "target_https"
@@ -256,7 +256,7 @@ Feature: Routing through a proxy:// MCP target
     Then the admin API response status is 200
     And the admin API response carries a Warning header containing "target.auth sends a credential, so its Target must be an https URL; it will be refused once credential_policy.target_https is enforce"
 
-  Scenario: Editing an MCP proxy target credential is refused when https Targets are enforced
+  Scenario: Editing an MCP proxy Target credential is refused when https Targets are enforced
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway enforces the credential rule "target_https"
