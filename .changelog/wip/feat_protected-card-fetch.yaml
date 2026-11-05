@@ -21,14 +21,14 @@ changes:
     - timestamp: '2026-11-02T11:45:42Z'
       title: Fetch agent cards over Fabric with the direct path's header and failure rules
       description: >-
-        On a Fabric route, the receiving gateway sends the Target credential only on a GET or
-        HEAD whose normalised path is exactly an agent card path or the configured card
-        location, with the direct path's header, body and failure rules. That fetch is a new GET
-        with no body that keeps only Accept, Accept-Language and User-Agent from the peer, and
-        carries no delegated credential, transit token or trace id. Its answer reaches the peer
-        with only the headers that describe the card, and a refusal with only its status. Unlike
-        the direct path, it fetches the exact normalised path the peer sent rather than
-        agent-card.json for a legacy agent.json request, and a GET at the configured card
+        On a Fabric route with Target authentication, the receiving gateway's agent card fetch,
+        a GET of exactly /.well-known/agent-card.json or the configured card location, now
+        follows the direct path's header, body and failure rules. It is a new GET with no body
+        that carries the Target credential and keeps only Accept, Accept-Language and User-Agent
+        from the peer, with no delegated credential, transit token or trace id. Its answer
+        reaches the peer with only the headers that describe the card, and a refusal with only
+        its status. Any other public read, a HEAD of the card path or the legacy agent.json
+        included, is forwarded as sent without the credential. A GET at the configured card
         location is the card fetch for any caller, including one who failed source
         authentication on a surface that forwards failed callers to policy. The card read for
         policy input now presents the Target credential and is cached per surface and Target

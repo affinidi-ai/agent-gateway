@@ -663,18 +663,16 @@ impl CallerAssertion {
         }
     }
 
-    /// A request received over Fabric. Only a `GET` of exactly the default card location or the
-    /// surface's own one is the sending gateway's card fetch; any other request, a `HEAD` or
-    /// another discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
+    /// A request received over Fabric. The sending gateway's card fetch
+    /// ([`is_fabric_card_fetch`]) is the gateway's own; any other request, a `HEAD` or another
+    /// discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
     pub(crate) fn for_fabric_received_request(
         surface: &crate::config::agent_surface::AgentSurface,
         method: &str,
         path: &str,
         source_auth_failed: bool,
     ) -> Self {
-        if method.eq_ignore_ascii_case("GET")
-            && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
-        {
+        if is_fabric_card_fetch(surface, method, path) {
             Self::GatewayOriginated
         } else {
             Self::for_forwarded_request(method, path, source_auth_failed)
@@ -14762,6 +14760,19 @@ async fn evaluate_mcp_tool_policies(
 
 const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
+/// Whether a request received over Fabric is the sending gateway's own agent card fetch: a `GET`
+/// whose path is exactly `/.well-known/agent-card.json` or the surface's configured card
+/// location, the paths a sending gateway's card fetch asks for. Another method, a query, another
+/// spelling of the path, or the legacy `/.well-known/agent.json` is not.
+pub(crate) fn is_fabric_card_fetch(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    path: &str,
+) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
+}
+
 fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentSurface) -> String {
     if surface.override_agent_card_location()
         && let Some(custom_path) = surface.agent_card_location_path()
@@ -16688,6 +16699,71 @@ mod caller_assertion_tests {
         ] {
             assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
         }
+    }
+
+    fn surface_with_card_location(card_location: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        let mut value = serde_json::json!({
+            "surface_id": "card", "name": "card",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/card", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example/base"}
+        });
+        if let Some(location) = card_location {
+            value["access_point"]["agent_card_path"] = serde_json::json!(location);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn only_an_exact_card_get_over_fabric_is_the_sending_gateways_card_fetch() {
+        let default = surface_with_card_location(None);
+        let configured = surface_with_card_location(Some("cards/me"));
+        for (surface, method, path) in [
+            (&default, "GET", "/.well-known/agent-card.json"),
+            (&default, "get", "/.well-known/agent-card.json"),
+            (&configured, "GET", "/cards/me"),
+            (&configured, "GET", "/.well-known/agent-card.json"),
+        ] {
+            assert!(super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_eq!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, true),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}: the fetch is the gateway's own, whatever the caller"
+            );
+        }
+        for (surface, method, path) in [
+            (&default, "HEAD", "/.well-known/agent-card.json"),
+            (&default, "POST", "/.well-known/agent-card.json"),
+            (&default, "GET", "/.well-known/agent.json"),
+            (&default, "GET", "/.well-known/agent-card.json?view=full"),
+            (&default, "GET", "/x/../.well-known/agent-card.json"),
+            (&default, "GET", "/x/%2e%2e/.well-known/agent-card.json"),
+            (&default, "GET", "/%2Ewell-known/agent-card.json"),
+            (&default, "GET", "/.well-known/Agent-Card.json"),
+            (&default, "GET", "/.well-known/agent-card.json/"),
+            (&default, "GET", "/discovery"),
+            (&default, "GET", "/.well-known/ucp"),
+            (&default, "GET", "/cards/me"),
+            (&configured, "HEAD", "/cards/me"),
+            (&configured, "GET", "/cards/me/"),
+            (&configured, "GET", "/cards/ME"),
+        ] {
+            assert!(!super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_ne!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, false),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "HEAD", "/.well-known/agent-card.json", false),
+            CallerAssertion::Unauthenticated,
+            "a HEAD of the card path is a caller's discovery read"
+        );
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "GET", "/cards/me", true),
+            CallerAssertion::Unauthenticated,
+            "a path that is no card location keeps the failed caller's rule"
+        );
     }
 }
 

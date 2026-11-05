@@ -1564,9 +1564,9 @@ fn peer_request(
 }
 
 /// A peer's agent card fetch reaches a protected Target as the gateway's own
-/// request, as on the direct path: a bodiless `GET` of the normalised card path
-/// with the Target credential and only the peer's `Accept`, `Accept-Language`
-/// and `User-Agent`.
+/// request, as on the direct path: a bodiless `GET` of the card path with the
+/// Target credential and only the peer's `Accept`, `Accept-Language` and
+/// `User-Agent`.
 #[tokio::test]
 async fn an_agent_card_fetch_over_fabric_is_a_credentialed_get_of_the_exact_card_path() {
     if ran_in_child("ATG_FABRIC_CREDENTIALED_CARD_CHILD").await {
@@ -1577,33 +1577,27 @@ async fn an_agent_card_fetch_over_fabric_is_a_credentialed_get_of_the_exact_card
     let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", None)).await;
     store_target_key(&root.path().join("secrets")).await;
 
-    for (method, path, card_path) in [
-        ("GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json"),
-        ("HEAD", "/.well-known/agent.json", "/.well-known/agent.json"),
-        ("GET", "/x/%2e%2e/.well-known/agent-card.json?view=full", "/.well-known/agent-card.json"),
-    ] {
-        let response = forward_response(&peer_request(root.path(), method, path)).await;
-        assert_eq!(response["status"], 200, "{method} {path}: {response}");
-        let request = target
-            .received()
-            .pop()
-            .unwrap();
-        assert_eq!(request.method, axum::http::Method::GET, "{method} {path}");
-        assert_eq!(request.path, card_path, "{method} {path}");
-        assert!(request.body.is_empty(), "{method} {path}: the peer's body was forwarded");
-        assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY], "{method} {path}");
-        assert_eq!(header_values(&request.headers, "accept"), ["application/json"], "{method} {path}");
-        assert_eq!(header_values(&request.headers, "accept-language"), ["en-GB"], "{method} {path}");
-        assert_eq!(header_values(&request.headers, "user-agent"), ["peer-agent"], "{method} {path}");
-        for withheld in ["authorization", "cookie", "x-custom", "content-type"] {
-            assert!(
-                request
-                    .headers
-                    .get(withheld)
-                    .is_none(),
-                "{method} {path}: {withheld} was forwarded"
-            );
-        }
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.method, axum::http::Method::GET);
+    assert_eq!(request.path, "/.well-known/agent-card.json");
+    assert!(request.body.is_empty(), "the peer's body was forwarded");
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+    assert_eq!(header_values(&request.headers, "accept"), ["application/json"]);
+    assert_eq!(header_values(&request.headers, "accept-language"), ["en-GB"]);
+    assert_eq!(header_values(&request.headers, "user-agent"), ["peer-agent"]);
+    for withheld in ["authorization", "cookie", "x-custom", "content-type"] {
+        assert!(
+            request
+                .headers
+                .get(withheld)
+                .is_none(),
+            "{withheld} was forwarded"
+        );
     }
 }
 
@@ -1686,9 +1680,10 @@ async fn a_card_fetch_at_a_configured_location_carries_no_transit_token() {
     );
 }
 
-/// Other public paths, including a dot-segment spelling of one, skip caller
-/// authentication and so reach the Target without its credential; a request
-/// from an authenticated caller still carries it.
+/// Other public reads skip caller authentication and so reach the Target without
+/// its credential, as they were sent: another discovery path, a `HEAD` of the
+/// card path, the legacy `agent.json`, and a card path spelled with a query or
+/// dot segments. A request from an authenticated caller still carries it.
 #[tokio::test]
 async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_without_its_credential() {
     if ran_in_child("ATG_FABRIC_PUBLIC_PATH_CHILD").await {
@@ -1699,19 +1694,29 @@ async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_withou
     let _receiver = receiver(root.path(), &protected_surface(&target.url, "target-key", None)).await;
     store_target_key(&root.path().join("secrets")).await;
 
-    for path in ["/discovery", "/.well-known/ucp", "/x/%2e%2e/discovery", "/agent/agent-card.json"] {
-        let response = forward_response(&peer_request(root.path(), "GET", path)).await;
-        assert_eq!(response["status"], 401, "{path}: {response}");
+    for (method, path) in [
+        ("GET", "/discovery"),
+        ("GET", "/.well-known/ucp"),
+        ("GET", "/x/%2e%2e/discovery"),
+        ("GET", "/agent/agent-card.json"),
+        ("HEAD", "/.well-known/agent-card.json"),
+        ("GET", "/.well-known/agent.json"),
+        ("GET", "/.well-known/agent-card.json?view=full"),
+        ("GET", "/x/../.well-known/agent-card.json"),
+    ] {
+        let response = forward_response(&peer_request(root.path(), method, path)).await;
+        assert_eq!(response["status"], 401, "{method} {path}: {response}");
         let request = target
             .received()
             .pop()
             .unwrap();
+        assert_eq!(request.method.as_str(), method, "{method} {path}");
         assert!(
             request
                 .headers
                 .get(TARGET_KEY_HEADER)
                 .is_none(),
-            "{path}: the Target credential was sent"
+            "{method} {path}: the Target credential was sent"
         );
     }
 

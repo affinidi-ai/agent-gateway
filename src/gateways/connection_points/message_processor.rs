@@ -5814,21 +5814,16 @@ async fn process_charged_forward_request(
     }
 
     // A card fetch on a surface with Target authentication is the gateway's own
-    // request, as on the direct path: a bodiless GET of the normalised card path
-    // that keeps only content-negotiation headers from the peer, and carries no
-    // caller's delegated credential or transit token.
-    let card_fetch_path = surface
-        .target_auth()
-        .and_then(|_| crate::proxy::paths::credentialed_agent_card_path(method, path, surface.agent_card_location_path()));
-    let credentialed_card_fetch = card_fetch_path.is_some();
+    // request, as on the direct path: a bodiless GET of the card path that keeps
+    // only content-negotiation headers from the peer, and carries no caller's
+    // delegated credential or transit token.
+    let credentialed_card_fetch =
+        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
     if credentialed_card_fetch {
         body_bytes = Default::default();
         outbound_creds.clear();
         modern_delegation = None;
     }
-    let forward_path = card_fetch_path
-        .as_deref()
-        .unwrap_or(path);
 
     // An agent card request at a configured card location goes to that path on the
     // Target's origin, dropping any sub-path of the Target endpoint.
@@ -5837,7 +5832,7 @@ async fn process_charged_forward_request(
         channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
         url
     } else {
-        join_endpoint_path(surface.target_endpoint(), forward_path)
+        join_endpoint_path(surface.target_endpoint(), path)
     };
 
     channel_info!(
@@ -5879,7 +5874,6 @@ async fn process_charged_forward_request(
 
     // Build the request
     let http_method = match method.to_uppercase().as_str() {
-        _ if credentialed_card_fetch => reqwest::Method::GET,
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
         "PUT" => reqwest::Method::PUT,
@@ -5994,16 +5988,12 @@ async fn process_charged_forward_request(
             }
         };
 
-        let caller = if credentialed_card_fetch {
-            crate::proxy::handler::CallerAssertion::GatewayOriginated
-        } else {
-            crate::proxy::handler::CallerAssertion::for_fabric_received_request(
-                &surface,
-                method,
-                path,
-                source_auth_failed,
-            )
-        };
+        let caller = crate::proxy::handler::CallerAssertion::for_fabric_received_request(
+            &surface,
+            method,
+            path,
+            source_auth_failed,
+        );
         let providers = get_credential_provider_store();
         let vault = get_delegation_vault_store();
         let mcp_proxy_base_url = match GLOBAL_MCP_PROXY_STORE.get() {

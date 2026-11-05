@@ -461,16 +461,14 @@ calls, but it moves the default paths of the surface's Transit Points, which fol
 ### Agent card fetch over Fabric
 
 The receiving gateway fetches the local Target's agent card with the
-[direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` or
-`HEAD` whose path is exactly
-`/.well-known/agent-card.json`, `/.well-known/agent.json` or the surface's configured card location
-is a card fetch, matched after percent-encoded unreserved characters are decoded and dot segments
-removed, ignoring the query and keeping case
-([`credentialed_agent_card_path`](../src/proxy/paths.rs)). On a surface with `target.auth`, that
-fetch is the gateway's own request: a `GET` with no body, sent to the normalised card path (or the
-configured location on the Target's origin), carrying `target.auth` and only the peer's `Accept`,
-`Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers and body are
-dropped, and the fetch carries no caller's material: no delegated credential from
+[direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` whose
+path is exactly `/.well-known/agent-card.json` or the surface's configured card location, the paths
+a sending gateway's card fetch asks for, is a card fetch
+([`is_fabric_card_fetch`](../src/proxy/handler.rs)). On a surface with `target.auth`, that fetch is
+the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
+the configured location on the Target's origin), carrying `target.auth` and only the peer's
+`Accept`, `Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers
+and body are dropped, and the fetch carries no caller's material: no delegated credential from
 `outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
 configured card location, and no `X-Gateway-Trace-Id`.
 
@@ -481,16 +479,19 @@ agent card response. The client does not follow redirects. A non-2xx answer, a 3
 reaches the peer as its status with the body "Upstream error: <status>", as on the direct path, so
 nothing the Target says about the credential reaches the peer.
 
-Every other public path, such as `/discovery`, `/.well-known/ucp` or `/x/%2e%2e/discovery`, skips
-caller authentication and is forwarded without the credential. A credential that cannot be resolved
-under `target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as
-the direct path and the MCP proxy path.
+Every other public read skips caller authentication and is forwarded as the peer sent it, without
+the credential: another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the
+card path, the legacy `/.well-known/agent.json`, and a card path with a query, dot segments,
+percent-escapes or another case. A credential that cannot be resolved under
+`target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as the
+direct path and the MCP proxy path.
 
 Two things differ from the direct path:
 
-- The direct path fetches `/.well-known/agent-card.json`, or the configured card location, even
-  for a request to the legacy `/.well-known/agent.json`. Over Fabric the fetch goes to the exact
-  normalised path the peer sent.
+- The direct path answers a request of any method to `/.well-known/agent-card.json` or the legacy
+  `/.well-known/agent.json` with its card fetch. Over Fabric only a `GET` of
+  `/.well-known/agent-card.json` or the configured card location is the card fetch; any other read
+  of a card path is forwarded as sent, without `target.auth`.
 - Over Fabric a `GET` at the configured card location is the card fetch for any caller: the
   gateway sends it as its own request with `target.auth` and returns the card. That includes a
   caller who failed source authentication on a surface that forwards failed callers to policy.
