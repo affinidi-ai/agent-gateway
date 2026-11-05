@@ -71,6 +71,14 @@ Feature: A2A surface HTTP transport contract
     Then the response status is 200
     And the response includes header "x-target-trace" with value "trace-abc"
 
+  Scenario: Target cookies are not relayed to the caller
+    Given managed agent "bravo" responds with header "x-target-trace" set to "trace-abc"
+    And managed agent "bravo" responds with header "set-cookie" set to "agent_sid=planted; Path=/"
+    When the caller sends a request to the surface
+    Then the response status is 200
+    And the response includes header "x-target-trace" with value "trace-abc"
+    And the response does not include header "set-cookie"
+
   Scenario: Target connection failure returns a gateway-side error, not a target error
     Given managed agent "bravo" is unreachable
     When the caller sends a request to the surface

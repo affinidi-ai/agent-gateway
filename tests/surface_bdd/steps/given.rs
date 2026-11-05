@@ -891,6 +891,46 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} admits {int} request(s) per minute from each caller")]
+fn transit_point_admits_requests_per_minute_from_each_caller(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    requests: u32,
+) {
+    transit_point_config_mut(world, &transit_point).per_caller_rate_limit_per_minute = Some(requests);
+}
+
+#[given(expr = "caller {string} has reached the per-caller limit of Transit Point {string}")]
+async fn caller_has_reached_the_per_caller_limit_of_transit_point(
+    world: &mut SurfaceWorld,
+    caller: String,
+    transit_point: String,
+) {
+    let admitted = transit_point_config_mut(world, &transit_point)
+        .per_caller_rate_limit_per_minute
+        .unwrap_or_else(|| panic!("Transit Point '{transit_point}' must limit each caller before one can reach it"));
+    let agent = world
+        .actors
+        .targets()
+        .values()
+        .find(|target| target.kind == TargetActorKind::ManagedAgent)
+        .map(|target| target.key.clone())
+        .expect("the surface must have a managed agent to call the Transit Point");
+    for request in 1..=admitted {
+        crate::steps::when::ask_for_tools_through_transit_point_with_its_token(world, &agent, &transit_point).await;
+        let response = world
+            .caller_response
+            .as_ref()
+            .expect("the admitted request has a response");
+        assert!(
+            (200..300).contains(&response.status),
+            "expected admitted request {request} of {admitted} from caller '{caller}' to succeed, got status {} with body {}",
+            response.status,
+            response.body
+        );
+    }
+}
+
 #[given(expr = "the appliance lets transit tokens live up to {int} seconds")]
 fn appliance_lets_transit_tokens_live_up_to(
     world: &mut SurfaceWorld,
@@ -954,8 +994,6 @@ fn transit_point_has_a_policy_allowing_only_a_caller(
     transit_point: String,
     caller: String,
 ) {
-    use sha2::Digest as _;
-
     let rego = format!(
         r#"package surface.policy
 
@@ -963,10 +1001,10 @@ default allow := false
 
 allow if {{
     input.transit.caller.verified
-    input.transit.caller.user_identity_hash == "{:x}"
+    input.transit.caller.user_identity_hash == "{}"
 }}
 "#,
-        sha2::Sha256::digest(caller.as_bytes())
+        caller_identity_hash(&caller)
     );
     transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
         format!("bdd-transit-caller-{}", uuid::Uuid::new_v4()),
@@ -1143,14 +1181,19 @@ async fn managed_agent_holds_a_transit_token_living(
     ));
 }
 
+/// The identity hash a transit token carries for `caller` in these scenarios.
+pub(crate) fn caller_identity_hash(caller: &str) -> String {
+    use sha2::Digest as _;
+
+    format!("{:x}", sha2::Sha256::digest(caller.as_bytes()))
+}
+
 #[given(expr = "managed agent {string} holds a transit token naming caller {string}")]
 async fn managed_agent_holds_a_transit_token_naming_a_caller(
     world: &mut SurfaceWorld,
     agent_name: String,
     caller: String,
 ) {
-    use sha2::Digest as _;
-
     managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
     let token = world
         .transit_token
@@ -1161,7 +1204,7 @@ async fn managed_agent_holds_a_transit_token_naming_a_caller(
         &token,
         serde_json::json!({
             "sub": format!("did:web:{caller}.example"),
-            "user_identity_hash": format!("{:x}", sha2::Sha256::digest(caller.as_bytes())),
+            "user_identity_hash": caller_identity_hash(&caller),
         }),
     ));
 }

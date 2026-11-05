@@ -1588,13 +1588,11 @@ async fn proxy_handler_with_mcp_runtime(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    // A closed Access Point without source authentication is not ready: it
-    // refuses every request, discovery reads included, before source
-    // authentication, policy and the Target.
-    if state
-        .surface
-        .refuses_every_request()
-    {
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request, discovery reads included, before source authentication, policy
+    // and the Target.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&state.surface).await {
         return Ok(refuse_not_ready_access_point(
             &state.surface,
             &state.network_config,
@@ -1603,6 +1601,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .active_variant_alias
                 .as_deref(),
             req,
+            reason,
         )
         .await);
     }
@@ -6706,10 +6705,18 @@ async fn proxy_handler_with_mcp_runtime(
                 .zip(
                     authenticated_identity
                         .as_ref()
-                        .and_then(crate::source_auth::AuthenticatedIdentity::jwt_claims),
+                        .and_then(|identity| {
+                            identity
+                                .jwt_claims()
+                                .zip(identity.jwt_principal_claim())
+                        }),
                 )
-                .and_then(|(profile, claims)| {
-                    crate::delegation_vault::modern_consent::identity::principal_for_claims(profile, claims)
+                .and_then(|(profile, (claims, principal_claim))| {
+                    crate::delegation_vault::modern_consent::identity::principal_for_claims(
+                        profile,
+                        claims,
+                        principal_claim,
+                    )
                 });
 
             let delegation_audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
@@ -9589,6 +9596,7 @@ async fn refuse_not_ready_access_point(
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     variant_alias: Option<&str>,
     req: Request,
+    reason: crate::source_auth::errors::NotReadyReason,
 ) -> Response {
     let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
     crate::source_auth::errors::refuse_unavailable_access_point(
@@ -9596,6 +9604,7 @@ async fn refuse_not_ready_access_point(
         &routing_facts(surface),
         variant_alias,
         mcp_request_id,
+        reason,
     )
 }
 
@@ -19310,6 +19319,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::SseSessions,
                         retry_after_ms: None,
+                        ..
                     }
                 )),
             "the refused SSE session is audited: {audit:?}"
@@ -20567,6 +20577,7 @@ allow if {
             kind: crate::mcp::request_validation::McpMessageKind::Request,
         };
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
         };
@@ -21535,6 +21546,19 @@ allow if {
     }
 
     #[test]
+    fn an_access_point_never_forwards_the_callers_cookies() {
+        assert!(!forwards_ap_caller_header("Cookie", &[], None, None, None));
+        assert!(!should_forward_ap_request_header_with_mapping("cookie", &[], None, Some("cookie")));
+        let mut caller = HeaderMap::new();
+        caller.insert("cookie", HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
+        caller.insert("x-trace", HeaderValue::from_static("t-1"));
+        let (buffered, stream) = access_point_fabric_headers(&caller, &[], None);
+        assert!(!buffered.contains_key("COOKIE"));
+        assert!(!stream.contains_key("cookie"));
+        assert_eq!(buffered["X-TRACE"], "t-1");
+    }
+
+    #[test]
     fn a_caller_header_named_like_the_target_auth_header_is_never_forwarded() {
         assert!(!forwards_ap_caller_header("X-Vendor-Key", &[], None, None, Some("x-vendor-key")));
         assert!(forwards_ap_caller_header("X-Vendor-Key", &[], None, None, None));
@@ -21731,6 +21755,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::FabricCapacity,
                         retry_after_ms: Some(5000),
+                        ..
                     }
                 )),
             "the full Fabric stream cap is audited: {audit:?}"
@@ -22077,6 +22102,7 @@ allow if {
             let (issuer, _dir) = test_vc_issuer().await;
             let state = state_with(inbound_from_api_key("pak-wrong-auth"), Some(issuer));
             let jwt = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
             };
@@ -23138,6 +23164,7 @@ mod fabric_extended_card_tests {
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
         });
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
         };

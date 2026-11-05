@@ -47,7 +47,7 @@ still accepts. Resource patterns limit which resource ids a token can reach, not
 holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
 `Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in
-the `Authorization` header or the `session_token` cookie.
+the `Authorization` header or the `__Host-session_token` cookie.
 
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
@@ -60,7 +60,7 @@ keys to `issuers.*`, so they are not valid access-token scopes.
 client can validate a bearer token and show who it is acting as. It takes no parameters and only reads
 the identity the session-auth middleware already resolved, so a caller can only inspect its own
 credential. It accepts a session token or an `agpat_` personal access token, sent as
-`Authorization: Bearer` or in the `session_token` cookie (the header wins when both are present). A
+`Authorization: Bearer` or in the `__Host-session_token` cookie (the header wins when both are present). A
 PAT's resource-scope headers (such as `x-external-account`) are not required or evaluated on this
 route. It returns `401` when the credential is missing, invalid or revoked, or its user is not
 approved, and `403` when:
@@ -97,6 +97,23 @@ The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers re
 both routers deny every request instead of serving unauthenticated. The built-in defaults grant
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
+
+## Maintenance and welcome routes
+
+`POST /v1/logs/truncate` removes the rotated `agent-gateway*.log*` files and keeps the current
+`agent-gateway.log`; `POST /v1/metrics/truncate` drops stored metrics older than the retention
+period. Both need `settings.edit`. Without an auth backend neither route is registered.
+
+`GET` and `PUT /v1/notifications/user-welcome-template` read and change the notification a user
+receives when their account is approved, and `POST /v1/notifications/send-welcome` sends a
+notification with the given title and text to the user named in the request. All three need
+`users.approve` and, without an auth backend, refuse every request with `403`.
+
+The built-in defaults grant `settings.edit` and `users.approve` to `administrator` only. A personal
+access token with feature scopes needs the permission among its scopes; one created without scopes
+follows its owner's role. The other `/v1/notifications` routes act on the caller's own
+notifications and need only a session (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)).
 
 ## Dashboard log lines
 

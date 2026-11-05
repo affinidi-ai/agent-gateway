@@ -104,6 +104,11 @@ on neither. The same names set in a variant's `overrides.transit.shared` behave 
 
 See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token) for which requests carry a transit token.
 
+A Transit Point's rate limits are surface fields, not configuration files: `rate_limit` is one
+bucket for the point, and `per_caller_rate_limit` gives each caller the point identifies a bucket
+of their own. Both are counted on each gateway node. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
+
 ## Secret references
 
 Any field documented as accepting a loader reference resolves through
@@ -483,6 +488,18 @@ reaches over Fabric:
 A manual edit is picked up as described in
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). See
 [`FABRIC.md`](FABRIC.md#peer-exposure).
+
+## JWT verification strategy records
+
+JWT verification strategies live in `_storage/jwt_verification_strategies/`, not in a
+configuration file, and are managed through `/v1/jwt-verification-strategies`. Besides the
+issuer and the keys, one field decides who a caller is:
+
+| Field | Values | Behaviour |
+| --- | --- | --- |
+| `principal_claim` | A top-level claim name, case-sensitive, printable ASCII without spaces, up to 128 characters | The claim whose value names a JWT caller, in the identity hash, STS subjects and consent. Absent means `sub`, and naming `sub` is stored as absent. Fixed when the strategy is created: an update naming another claim gets `400`. A claim that names a token, client, tenant, session or lifetime, such as `iss`, `aud` or `tid`, is refused, and a record edited by hand to name one names no caller. A release older than the field names callers by `sub` while it runs and removes the field when it saves the strategy; restore it by editing the record. |
+
+See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller).
 
 ## Related
 

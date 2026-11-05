@@ -86,9 +86,14 @@ pub struct McpIssuerProfile {
 }
 
 impl McpIssuerProfile {
+    /// The MCP subject for a verified assertion whose `principal_claim` names
+    /// its subject: the gateway's own subject as it is, and any other issuer's
+    /// hashed with that issuer, and with the claim's name when it is not `sub`,
+    /// so one value in two claims is two subjects.
     pub fn bound_subject(
         &self,
         claims: &serde_json::Value,
+        principal_claim: &str,
     ) -> Result<String, StsError> {
         use sha2::{Digest, Sha256};
 
@@ -98,15 +103,19 @@ impl McpIssuerProfile {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| StsError::InvalidGrant("Missing subject issuer".into()))?;
         let subject = claims
-            .get("sub")
+            .get(principal_claim)
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| StsError::InvalidGrant("Missing subject".into()))?;
         if issuer == self.issuer {
             return Ok(subject.to_string());
         }
-        let identity = serde_json_canonicalizer::to_vec(&(issuer, subject))
-            .map_err(|_| StsError::ServerError("Subject binding failed".into()))?;
+        let identity = if principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM {
+            serde_json_canonicalizer::to_vec(&(issuer, subject))
+        } else {
+            serde_json_canonicalizer::to_vec(&(issuer, subject, principal_claim))
+        }
+        .map_err(|_| StsError::ServerError("Subject binding failed".into()))?;
         Ok(format!("urn:affinidi:mcp:subject:{}", hex::encode(Sha256::digest(identity))))
     }
 
@@ -199,9 +208,10 @@ impl McpIssuerProfile {
     pub fn validate_subject(
         &self,
         claims: &serde_json::Value,
+        principal_claim: &str,
         now: u64,
     ) -> Result<u64, StsError> {
-        for field in ["iss", "sub"] {
+        for field in ["iss", principal_claim] {
             if claims
                 .get(field)
                 .and_then(serde_json::Value::as_str)
@@ -301,22 +311,58 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let first = profile
-            .bound_subject(&json!({"iss": "https://one.example", "sub": "user"}))
+            .bound_subject(&json!({"iss": "https://one.example", "sub": "user"}), "sub")
             .unwrap();
         let second = profile
-            .bound_subject(&json!({"iss": "https://two.example", "sub": "user"}))
+            .bound_subject(&json!({"iss": "https://two.example", "sub": "user"}), "sub")
             .unwrap();
         assert_ne!(first, second);
         assert_eq!(
             profile
-                .bound_subject(&json!({"iss": profile.issuer, "sub": first}))
+                .bound_subject(&json!({"iss": profile.issuer, "sub": first}), "sub")
                 .unwrap(),
             first
         );
         assert!(
             profile
-                .bound_subject(&json!({"sub": "user"}))
+                .bound_subject(&json!({"sub": "user"}), "sub")
                 .is_err()
+        );
+    }
+
+    /// A subject named by another claim is bound with the claim's name, so
+    /// one value in two claims is two subjects, and a token without the claim
+    /// has none.
+    #[test]
+    fn a_subject_named_by_another_claim_is_bound_with_its_name() {
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let claims = json!({"iss": "https://one.example", "sub": "user", "oid": "user"});
+        let by_sub = profile
+            .bound_subject(&claims, "sub")
+            .unwrap();
+        let by_oid = profile
+            .bound_subject(&claims, "oid")
+            .unwrap();
+        assert_ne!(by_sub, by_oid);
+        assert_eq!(
+            by_oid,
+            profile
+                .bound_subject(&json!({"iss": "https://one.example", "sub": "other-app", "oid": "user"}), "oid")
+                .unwrap(),
+            "the same oid through another application is the same subject"
+        );
+        assert!(
+            profile
+                .bound_subject(&json!({"iss": "https://one.example", "sub": "user"}), "oid")
+                .is_err()
+        );
+        assert!(
+            profile
+                .validate_subject(&json!({"iss": "https://one.example", "sub": "user", "exp": u64::MAX}), "oid", 0)
+                .is_err(),
+            "a subject token without the strategy's claim is refused"
         );
     }
 

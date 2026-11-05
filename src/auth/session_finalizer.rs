@@ -179,7 +179,7 @@ mod tests {
                 .session_token
                 .is_empty()
         );
-        assert!(cookie.contains("session_token="));
+        assert!(cookie.starts_with(&format!("{}=", session_cookie::SESSION_COOKIE_NAME)));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=420"));

@@ -1378,6 +1378,7 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
 struct GatewayServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     startup_log: StartupLog,
+    provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -1459,17 +1460,20 @@ fn spawn_gateway_server(
     let credential_policy = bootstrap
         .credential_policy
         .clone();
+    let provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate = Box::leak(Box::default());
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _log = thread_log.capture_on_this_thread();
             crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+            crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024)
                 .on_thread_start(move || {
-                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone())
+                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+                    crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
                 })
                 .build()
                 .expect("build gateway harness runtime");
@@ -1491,6 +1495,7 @@ fn spawn_gateway_server(
     GatewayServer {
         shutdown: Some(shutdown_tx),
         startup_log,
+        provider_key_gate,
         _thread: thread,
     }
 }
@@ -1786,6 +1791,12 @@ impl GatewayHarness {
         self._gw_server
             .startup_log
             .text()
+    }
+
+    /// The provider key gate this gateway keeps its verdicts in.
+    pub fn provider_key_gate(&self) -> &'static crate::identity::provider_key_gate::ProviderKeyGate {
+        self._gw_server
+            .provider_key_gate
     }
 }
 

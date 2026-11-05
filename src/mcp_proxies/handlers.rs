@@ -2131,10 +2131,12 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut forwarded = ReqwestHeaderMap::new();
     for (key, value) in headers.iter() {
         let name = key.as_str().to_lowercase();
-        // Skip hop-by-hop, content-length, host, and accept headers
+        // Skip hop-by-hop, content-length, host and accept headers, and the
+        // caller's cookies, which belong to the host it called (the dashboard's).
         if matches!(
             name.as_str(),
-            "connection"
+            "cookie"
+                | "connection"
                 | "keep-alive"
                 | "proxy-authenticate"
                 | "proxy-authorization"
@@ -3831,6 +3833,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_rest_backend_never_receives_the_callers_cookies() {
+        let mut caller = axum::http::HeaderMap::new();
+        caller.insert("cookie", axum::http::HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
+        caller.insert("x-api-key", axum::http::HeaderValue::from_static("backend-key"));
+        caller.insert("authorization", axum::http::HeaderValue::from_static("Bearer backend-token"));
+
+        let forwarded = super::extract_forwardable_headers(&caller);
+
+        assert!(!forwarded.contains_key("cookie"));
+        assert_eq!(forwarded["x-api-key"], "backend-key");
+        assert_eq!(forwarded["authorization"], "Bearer backend-token");
+    }
+
     #[tokio::test]
     async fn owned_modern_dispatch_surface_uses_target_headers_and_surface_limits() {
         use serde_json::json;
@@ -3886,6 +3902,7 @@ mod tests {
             client
                 .post(format!("proxy://{}", proxy.id))
                 .header("authorization", "Bearer target-test-credential")
+                .header("cookie", "__Host-session_token=dashboard-session")
                 .header("mcp-session-id", "never-forward")
                 .header("last-event-id", "never-forward")
                 .header("mcp-param-unknown", "never-send-to-rest")
@@ -3911,7 +3928,7 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer target-test-credential")
         );
-        for name in ["mcp-session-id", "last-event-id", "mcp-param-unknown"] {
+        for name in ["cookie", "mcp-session-id", "last-event-id", "mcp-param-unknown"] {
             assert!(
                 !received
                     .headers
@@ -3925,6 +3942,96 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.id, Some(json!("owned")));
+    }
+
+    /// A tool whose operation takes a cookie sends the REST API that cookie
+    /// alone, even when the caller sent its own `Cookie`.
+    #[tokio::test]
+    async fn a_cookie_argument_reaches_the_rest_backend_beside_a_caller_cookie() {
+        use serde_json::json;
+
+        let target =
+            crate::component_tests::helpers::MockServer::start_with_response(json!({"value": "kept"}).to_string())
+                .await;
+        let proxy = McpProxy::new(
+            "Cookie tool".into(),
+            String::new(),
+            target.url(),
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/echo": {"get": {
+                        "operationId": "echo",
+                        "parameters": [{"name": "sid", "in": "cookie", "required": true, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "OK"}}
+                    }}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/cookie-tool".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "cookie-tools", "name": "Cookie tools",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        let manager = super::McpServerManager::new();
+        manager
+            .create_server(&proxy)
+            .await
+            .unwrap();
+        let name = manager
+            .get_server(&proxy.id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .get_tool_names()
+            .pop()
+            .unwrap();
+        let mut request = owned_modern_request("tools/list");
+        request.method = "tools/call".to_string();
+        request
+            .params
+            .as_mut()
+            .unwrap()["name"] = json!(name);
+        request
+            .params
+            .as_mut()
+            .unwrap()["arguments"] = json!({"cookie_sid": "from-argument"});
+        let client = reqwest::Client::new();
+        let caller = client
+            .post(format!("proxy://{}", proxy.id))
+            .header("cookie", "__Host-session_token=dashboard-session")
+            .body("{}")
+            .build()
+            .unwrap();
+
+        let response = super::handle_modern_surface_request(
+            &proxy,
+            &surface,
+            &request,
+            caller,
+            &client,
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["result"]["resultType"], "complete", "{response}");
+        let received = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            received
+                .headers
+                .get("cookie")
+                .map(String::as_str),
+            Some("sid=from-argument")
+        );
     }
 
     #[tokio::test]
