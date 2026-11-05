@@ -835,10 +835,18 @@ A legacy MCP proxy `tools/call` that carries the Target credential, direct or ov
 sent by the gateway's REST client (the one the 2026-07-28 path uses) instead of `rmcp-openapi`'s
 client, which follows redirects. It resolves the tool against the proxy's `base_url` with a
 trailing `/` added when missing, as `rmcp-openapi` does (`/api/v4` reaches `/api/v4/pets/1`), and
-returns the same tool result. A 3xx fails the call with
-"Tool execution failed: REST tool redirects are not permitted", and the redirect target receives
-nothing. That client also applies the `mcp_http` size limits, encodes each path parameter as one
-segment, and checks the response against the tool's output schema. It reaches the same backends
+returns the same tool result (`content` and `isError`; a legacy tool result carries no
+`structuredContent`) for a JSON response, a failure status included, except as listed here. A 3xx
+fails the call with "Tool execution failed: REST tool redirects are not permitted", and the
+redirect target receives nothing. That client also applies the `mcp_http` size limits, encodes
+each path parameter as one segment, and refuses a `base_url` with user info. It checks a 2xx
+response against the tool's output schema, so a response the schema does not admit is a tool
+error, "REST response does not match the tool output schema", where `rmcp-openapi`'s client
+returns it as a success. The result text of a response that is not JSON leaves out the response
+headers and the request body, a response body other than an image that is not UTF-8 text fails
+the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
+rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). It reaches the same backends
 as `rmcp-openapi`'s client: the proxy's `base_url` is vetted when the proxy is saved and not again
 per call, while the 2026-07-28 path pins each call to the vetted address. A tool call without the
 credential still runs on `rmcp-openapi`'s client and is unchanged.
