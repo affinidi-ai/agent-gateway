@@ -14,6 +14,7 @@ pub(crate) mod fabric_stream;
 pub mod handler;
 pub mod outbound_handler;
 pub mod paths;
+pub mod port_listener;
 pub mod protocol_router;
 pub mod response_policy;
 pub mod route_variant;

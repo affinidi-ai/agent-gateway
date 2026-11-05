@@ -1088,7 +1088,6 @@ pub async fn run_axum_proxy(
 
     // Group channels by port and spawn ONE listener task per port
     // Multiple channels can share the same port if they have different routes
-    let mut channel_handles = HashMap::new();
     let mut task_ids_map = HashMap::new();
 
     // Get configured ports from network config
@@ -3724,9 +3723,8 @@ pub async fn run_axum_proxy(
             .set_didwebvh_stores(didwebvh_identity_store_shared.clone(), didwebvh_log_storage_shared.clone())
             .await;
 
-        // NOW spawn port listeners with Identity API router
-        let mut port_listener_handles = HashMap::new();
-        let mut state_receivers = Vec::new();
+        // NOW serve port listeners with Identity API router
+        let mut port_listener_states = HashMap::new();
 
         // Surfaces are translated to channels lazily inside the inbound
         // per-port loop below, but the *outbound* bucketing was computed
@@ -3905,18 +3903,16 @@ pub async fn run_axum_proxy(
                 let outbound_states = channel_manager
                     .outbound_channel_states
                     .clone();
-                let direct_client_auth_clone = direct_client_auth.clone();
                 let listener_mgr_slot_for_outbound = listener_manager_slot.clone();
                 let outbound_source_auth_middleware = Some(source_auth_middleware.clone());
 
                 info!("Starting outbound port listener on port {} for {} channel(s)", port, outbound_channels.len());
 
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = crate::proxy::server::run_outbound_port_server(
-                        bind_address,
+                let served = async {
+                    let router = crate::proxy::server::build_outbound_port_router(
                         port,
                         outbound_channels,
-                        config_clone,
+                        config_clone.clone(),
                         network_config_clone,
                         metrics_clone,
                         secrets_store_clone,
@@ -3925,20 +3921,20 @@ pub async fn run_axum_proxy(
                         trust_registry_clone,
                         vc_issuer_clone,
                         task_monitor_clone,
-                        use_tls,
                         outbound_states,
-                        direct_client_auth_clone,
                         listener_mgr_slot_for_outbound,
                         outbound_source_auth_middleware,
-                        None,
                     )
-                    .await
-                    {
-                        error!("Outbound port listener error for port {}: {}", port, e);
-                    }
-                });
-
-                port_listener_handles.insert(port, handle.abort_handle());
+                    .await?;
+                    let address = crate::proxy::server::listener_socket_address(&bind_address, port)?;
+                    channel_manager
+                        .serve_port(port, vec![address], use_tls, router, &config_clone)
+                        .await
+                }
+                .await;
+                if let Err(e) = served {
+                    error!("Outbound port listener error for port {}: {}", port, e);
+                }
                 continue;
             }
 
@@ -3992,14 +3988,12 @@ pub async fn run_axum_proxy(
                 }
             }
 
-            let port_task_id = format!("port-{}-{}", port, uuid::Uuid::new_v4());
             let tls_acceptor = tls_acceptor.clone();
             let client = client.clone();
             let config_clone = Arc::clone(&config);
             let bootstrap_config_clone = Arc::clone(&bootstrap_config);
             let metrics = metrics_store.clone();
             let task_mon = task_monitor.clone();
-            let task_id_clone = port_task_id.clone();
             let ws_state_clone = ws_state.clone();
             let vc_issuer_clone = vc_issuer.clone();
             let channels_clone = channels.clone();
@@ -4008,9 +4002,6 @@ pub async fn run_axum_proxy(
             let mcp_proxy_store_clone = mcp_proxy_store.clone();
             let a2a_proxy_store_clone = a2a_proxy_store.clone();
             let mcp_server_manager_clone = Some(mcp_server_manager.clone());
-
-            // Create a oneshot channel to receive the state from the spawned task
-            let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
 
             // Determine if this port should get the Identity API router
             let identity_router_for_port = if Some(port) == identity_api_http_port {
@@ -4059,7 +4050,6 @@ pub async fn run_axum_proxy(
 
             // Clone source_auth_middleware for this port
             let source_auth_middleware_for_port = Some(source_auth_middleware.clone());
-            let direct_client_auth_for_port = direct_client_auth.clone();
             let resolved_surface_cache_for_port = resolved_surface_cache.clone();
 
             // Determine if this port should use TLS based on network config
@@ -4089,28 +4079,25 @@ pub async fn run_axum_proxy(
                 );
             }
 
-            let handle = tokio::spawn(async move {
-                if let Err(e) = crate::proxy::server::run_port_server(
+            let served = async {
+                let (router, state) = crate::proxy::server::build_port_router(
                     port,
                     channels_clone,
                     tls_acceptor,
                     client,
-                    config_clone,
+                    config_clone.clone(),
                     bootstrap_config_clone,
                     metrics,
                     task_mon.clone(),
-                    Some(task_id_clone.clone()),
                     Some(ws_state_clone),
                     vc_issuer_clone,
                     listener_mgr_slot,
-                    Some(state_sender),
                     identity_router_for_port,
                     onboarding_router_for_port,
                     did_router_for_port,
                     secrets_router_for_port,
                     secrets_store_for_port,
                     network_config_clone,
-                    use_tls,
                     policy_mgr_clone,
                     gateway_policy_mgr_clone,
                     mcp_proxy_store_clone,
@@ -4120,73 +4107,51 @@ pub async fn run_axum_proxy(
                     notification_store_for_port,
                     didauth_session_store_clone,
                     source_auth_middleware_for_port,
-                    direct_client_auth_for_port,
                     resolved_surface_cache_for_port,
                     #[cfg(feature = "didwebvh")]
                     didwebvh_identity_store_for_port,
                     #[cfg(feature = "didwebvh")]
                     didwebvh_log_storage_for_port,
                 )
-                .await
-                {
-                    error!("Port listener error for port {}: {}", port, e);
+                .await?;
+                let served = match crate::proxy::server::inbound_bind_addresses(&network_config, port) {
+                    Ok(addresses) => {
+                        channel_manager
+                            .serve_port(port, addresses, use_tls, router, &config_clone)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if served.is_err() {
+                    crate::proxy::server::unregister_port_tasks(&state, task_mon.as_deref()).await;
+                } else {
+                    port_listener_states.insert(port, state);
+                    info!("Captured state for port {} listener", port);
                 }
-            });
+                served
+            }
+            .await;
+            if let Err(e) = served {
+                error!("Port listener error for port {}: {}", port, e);
+            }
 
-            // Store the abort handle for this port listener
-            port_listener_handles.insert(port, handle.abort_handle());
-
-            // Store the receiver to wait for states later
-            state_receivers.push((port, state_receiver));
-
-            // Store the handle for each channel in this port listener
             for surface in &channels {
                 let config_id = surface
                     .config_id()
                     .unwrap_or(surface.name.as_str())
                     .to_string();
                 let channel_task_id = format!("task-{}-{}", config_id, uuid::Uuid::new_v4());
-                channel_handles.insert(config_id.clone(), handle.abort_handle());
                 task_ids_map.insert(config_id, channel_task_id);
             }
         }
 
-        // Wait for all states to be sent back (with a timeout per state)
-        let mut port_listener_states = HashMap::new();
-        for (port, state_receiver) in state_receivers {
-            if let Ok(state) = tokio::time::timeout(tokio::time::Duration::from_secs(5), state_receiver).await {
-                if let Ok(state) = state {
-                    port_listener_states.insert(port, state);
-                    info!("Captured state for port {} listener", port);
-                } else {
-                    warn!("Port listener {} failed to send state", port);
-                }
-            } else {
-                warn!("Timeout waiting for port listener {} state", port);
-            }
-        }
-
-        // Store port listener handles and states in the manager
-        {
-            let mut handles = channel_manager
-                .port_listener_handles
-                .write()
-                .await;
-            *handles = port_listener_handles;
-        }
+        // Store port listener states in the manager
         {
             let mut states = channel_manager
                 .port_listener_states
                 .write()
                 .await;
             *states = port_listener_states;
-        }
-        {
-            let mut handles = channel_manager
-                .channel_handles
-                .write()
-                .await;
-            *handles = channel_handles;
         }
         {
             let mut task_ids = channel_manager

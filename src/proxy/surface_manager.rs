@@ -41,8 +41,9 @@ fn extract_port_from_address(addr: &str) -> Option<u16> {
 /// Shared state for managing channel tasks and configuration reloading
 #[derive(Clone)]
 pub struct SurfaceTaskManager {
-    /// Handles to running port listener tasks (mapped by port - should NOT be restarted)
-    pub(crate) port_listener_handles: Arc<RwLock<HashMap<u16, AbortHandle>>>,
+    /// Bound port listeners by port. A reload swaps the router each one serves
+    /// and binds a port again only when its addresses or TLS setting change.
+    pub(crate) bound_ports: Arc<RwLock<HashMap<u16, crate::proxy::port_listener::BoundPort>>>,
     /// MultiSurfaceProxyState for each port listener (for dynamic channel updates)
     pub(crate) port_listener_states: Arc<RwLock<HashMap<u16, Arc<crate::state::MultiSurfaceProxyState>>>>,
     /// Live-updatable outbound channel states keyed by config_id
@@ -108,10 +109,10 @@ pub struct SurfaceTaskManager {
     #[cfg(feature = "didwebvh")]
     didwebvh_log_storage: Arc<RwLock<Option<Arc<dyn crate::storage::DidLogStorage>>>>,
     /// Serializes listener reloads. Both the full reload (`reload_channels`) and the
-    /// single-channel reload (`reload_single_channel_with_fallback`) rebind ports and
-    /// mutate the shared listener maps, so a promotion re-derive and a concurrent
-    /// surface-store change must not run them at once (a port-bind race yields a hard
-    /// bind failure). Shared across all clones via `Arc`.
+    /// single-channel reload (`reload_single_channel_with_fallback`) swap port routers,
+    /// may bind a port, and mutate the shared listener maps, so a promotion re-derive
+    /// and a concurrent surface-store change must not run them at once (an older
+    /// router could replace a newer one). Shared across all clones via `Arc`.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -127,7 +128,7 @@ impl SurfaceTaskManager {
         didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     ) -> Self {
         Self {
-            port_listener_handles: Arc::new(RwLock::new(HashMap::new())),
+            bound_ports: Arc::new(RwLock::new(HashMap::new())),
             port_listener_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_channel_states: Arc::new(std::sync::RwLock::new(HashMap::new())),
             channel_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -339,7 +340,47 @@ impl SurfaceTaskManager {
         info!("✓ DID:webvh stores set in SurfaceTaskManager");
     }
 
-    /// Update configuration and restart channel tasks
+    /// Serve `router` on `port`. A listener already bound there on
+    /// `addresses` with the same TLS setting keeps its socket and serves
+    /// `router` from its next request on, so a surface change never refuses a
+    /// connection; otherwise the port is bound now, replacing a listener bound
+    /// differently.
+    pub(crate) async fn serve_port(
+        &self,
+        port: u16,
+        addresses: Vec<std::net::SocketAddr>,
+        use_tls: bool,
+        router: axum::Router,
+        config: &GatewayConfig,
+    ) -> anyhow::Result<()> {
+        use crate::proxy::port_listener::{BoundPort, PortBinding, listener_tls_config};
+
+        let direct_client_auth = self
+            .direct_client_auth
+            .read()
+            .await
+            .clone();
+        let tls_config = use_tls
+            .then(|| listener_tls_config(port, config, direct_client_auth.as_ref()))
+            .flatten();
+        let binding = PortBinding { addresses, tls: use_tls };
+        let mut ports = self.bound_ports.write().await;
+        if let Some(bound) = ports.get(&port)
+            && bound.serves(&binding)
+        {
+            bound.swap(router, tls_config);
+            return Ok(());
+        }
+        if ports.remove(&port).is_some() {
+            info!("Binding port {} again: its addresses or TLS setting changed", port);
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        let bound = BoundPort::bind(port, binding, router, tls_config, direct_client_auth.is_some()).await?;
+        ports.insert(port, bound);
+        Ok(())
+    }
+
+    /// Update configuration and swap the routers of the port listeners
     /// Returns (channels_count, is_fallback, warning_message)
     pub async fn reload_channels(
         &self,
@@ -350,7 +391,7 @@ impl SurfaceTaskManager {
         task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
     ) -> anyhow::Result<(usize, bool, Option<String>)> {
         // Serialize against any concurrent single-channel or full reload so two reloads
-        // never rebind the same port at once (F1).
+        // never swap or bind the same port at once.
         let _reload_guard = self.reload_lock.lock().await;
         info!("Reloading channel configuration...");
 
@@ -374,37 +415,10 @@ impl SurfaceTaskManager {
             task_ids_map.clear();
         }
 
-        // Step 1b: Abort the previous port listeners so their TCP sockets
-        // are released before we rebind below. Without this the new
-        // listeners hit "Address already in use (os error 48)" because
-        // the old tasks are still owning 8080/8081/8443.
-        {
-            let mut port_handles = self
-                .port_listener_handles
-                .write()
-                .await;
-            info!("Stopping {} existing port listener task(s)", port_handles.len());
-            for (port, handle) in port_handles.drain() {
-                info!("Aborting port listener on port {}", port);
-                handle.abort();
-            }
-        }
-        {
-            let mut port_states = self
-                .port_listener_states
-                .write()
-                .await;
-            port_states.clear();
-        }
-
-        // Step 2: Drop stale TaskInfo entries proactively. Aborting a
-        // port listener cancels the `axum_server::serve(...).await`
-        // point, so the post-await cleanup in `run_port_server` that
-        // would normally call `unregister_task` never executes. Without
-        // this clear, every reload accumulates duplicate AP rows
-        // (their task_ids embed a fresh UUID, so re-registration does
-        // not overwrite). Then sleep briefly so the OS releases the
-        // listening sockets before we rebind them below.
+        // Step 2: Drop every TaskInfo entry before the routers are rebuilt.
+        // Building a port router registers a task per channel and Transit
+        // Point, and their task_ids embed a fresh UUID, so without this clear
+        // every reload would accumulate duplicate rows.
         if let Some(ref monitor) = task_monitor {
             let cleared = monitor
                 .clear_all_tasks()
@@ -413,7 +427,6 @@ impl SurfaceTaskManager {
                 info!("Cleared {} stale task(s) from monitor before reload", cleared);
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Step 2: Update configuration
         {
@@ -542,11 +555,9 @@ impl SurfaceTaskManager {
 
         info!("Grouped {} channels across {} configured ports", channels_count, channels_by_port.len());
 
-        // Store handles and states for port listeners
-        let mut new_port_handles = HashMap::new();
         let mut new_port_states = HashMap::new();
 
-        // Spawn ONE listener task per configured port that handles routing to all channels on that port
+        // Serve ONE router per configured port that handles routing to all channels on that port
         // Iterate over ALL configured ports, not just those with channels
 
         // Get stored routers for merging into port listeners
@@ -616,28 +627,13 @@ impl SurfaceTaskManager {
             .await
             .clone();
 
-        for port in configured_ports {
+        for &port in &configured_ports {
             // Get channels for this port (may be empty)
             let channels = channels_by_port
                 .get(&port)
                 .cloned()
                 .unwrap_or_default();
-            let port_task_id = format!("port-{}-{}", port, uuid::Uuid::new_v4());
-            let tls_acceptor = tls_acceptor.clone();
-            let client = client.clone();
-            let config = new_config.clone();
-            let bootstrap_config_clone = self.bootstrap_config.clone();
-            let metrics = metrics_store.clone();
-            let task_mon = task_monitor.clone();
-            let task_id_clone = port_task_id.clone();
-            let ws_state_clone = self.ws_state.clone();
-            let vc_issuer_clone = self.vc_issuer.clone();
-            let channels_clone = channels.clone(); // Clone for the async block
-            let listener_mgr_clone = self.listener_manager.clone();
             let network_config_clone = Arc::new(network_config.clone());
-
-            // Create a oneshot channel to receive the state from the spawned task
-            let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
 
             // Determine if this port should use TLS based on network config
             let listener_info = network_config
@@ -657,7 +653,7 @@ impl SurfaceTaskManager {
             if listener_type == "outbound" {
                 // ── Outbound listener ────────────────────────────────────────
                 // Use the dedicated outbound_channels_by_port map (built from outbound_listen_address).
-                // A port without Transit Points is bound anyway, as at startup, so it keeps
+                // A port without Transit Points is served anyway, as at startup, so it keeps
                 // answering `/alive`.
                 let outbound_channels = outbound_channels_by_port
                     .get(&port)
@@ -668,22 +664,8 @@ impl SurfaceTaskManager {
                     .map(|l| l.bind_address.clone())
                     .unwrap_or_else(|| "127.0.0.1".to_string());
 
-                let secrets_store_clone = secrets_store.clone();
-                let policy_manager_clone = policy_manager.clone();
-                let gateway_policy_manager_clone = self
+                let gateway_policy_manager = self
                     .gateway_policy_manager
-                    .read()
-                    .await
-                    .clone();
-                let trust_registry_clone =
-                    crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager();
-                let metrics_clone = metrics_store.clone();
-
-                let outbound_states = self
-                    .outbound_channel_states
-                    .clone();
-                let direct_client_auth_clone = self
-                    .direct_client_auth
                     .read()
                     .await
                     .clone();
@@ -693,39 +675,33 @@ impl SurfaceTaskManager {
                     .await
                     .clone();
 
-                let (states_registered, states_registered_rx) = tokio::sync::oneshot::channel();
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = super::server::run_outbound_port_server(
-                        bind_address,
+                let served = async {
+                    let router = super::server::build_outbound_port_router(
                         port,
                         outbound_channels,
-                        config,
+                        new_config.clone(),
                         network_config_clone,
-                        metrics_clone,
-                        secrets_store_clone,
-                        policy_manager_clone,
-                        gateway_policy_manager_clone,
-                        trust_registry_clone,
-                        vc_issuer_clone,
-                        task_mon,
-                        use_tls,
-                        outbound_states,
-                        direct_client_auth_clone,
-                        listener_mgr_clone,
+                        metrics_store.clone(),
+                        secrets_store.clone(),
+                        policy_manager.clone(),
+                        gateway_policy_manager,
+                        crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
+                        self.vc_issuer.clone(),
+                        task_monitor.clone(),
+                        self.outbound_channel_states
+                            .clone(),
+                        self.listener_manager.clone(),
                         source_auth_middleware,
-                        Some(states_registered),
                     )
-                    .await
-                    {
-                        error!("Outbound port listener error for port {}: {}", port, e);
-                    }
-                });
-                // A surface removal after this reload returns must find the
-                // states the listener registers, or it retires nothing and the
-                // listener later serves the removed surface.
-                let _ = states_registered_rx.await;
-
-                new_port_handles.insert(port, handle.abort_handle());
+                    .await?;
+                    let address = super::server::listener_socket_address(&bind_address, port)?;
+                    self.serve_port(port, vec![address], use_tls, router, &new_config)
+                        .await
+                }
+                .await;
+                if let Err(e) = served {
+                    error!("Outbound port listener error for port {}: {}", port, e);
+                }
                 continue;
             }
 
@@ -762,124 +738,102 @@ impl SurfaceTaskManager {
                 vault_http_router.clone()
             };
 
-            let mcp_proxy_store_clone = mcp_proxy_store.clone();
-            let a2a_proxy_store_clone = a2a_proxy_store.clone();
-            let mcp_server_manager_clone = mcp_server_manager.clone();
-            let secrets_store_clone = secrets_store.clone();
-            let policy_manager_clone = policy_manager.clone();
-            let gateway_policy_manager_clone = self
+            let gateway_policy_manager = self
                 .gateway_policy_manager
                 .read()
                 .await
                 .clone();
-            let settings_store_clone = self.settings_store.clone();
-            let notification_store_clone = self
+            let notification_store = self
                 .notification_store
                 .read()
                 .await
                 .clone();
-            let didauth_session_store_clone = self
-                .didauth_session_store
-                .clone();
-            let source_auth_middleware_clone = self
+            let source_auth_middleware = self
                 .source_auth_middleware
                 .read()
                 .await
                 .clone();
-            let direct_client_auth_clone = self
-                .direct_client_auth
-                .read()
-                .await
-                .clone();
-            let resolved_surface_cache_clone = self
+            let resolved_surface_cache = self
                 .resolved_surface_cache
                 .read()
                 .await
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::surfaces::ResolvedSurfaceCache::new()));
             #[cfg(feature = "didwebvh")]
-            let didwebvh_identity_store_clone = self
+            let didwebvh_identity_store = self
                 .didwebvh_identity_store
                 .read()
                 .await
                 .clone();
             #[cfg(feature = "didwebvh")]
-            let didwebvh_log_storage_clone = self
+            let didwebvh_log_storage = self
                 .didwebvh_log_storage
                 .read()
                 .await
                 .clone();
 
-            let handle = tokio::spawn(async move {
-                if let Err(e) = super::server::run_port_server(
+            let served = async {
+                let (router, state) = super::server::build_port_router(
                     port,
-                    channels_clone,
-                    tls_acceptor,
-                    client,
-                    config,
-                    bootstrap_config_clone,
-                    metrics,
-                    task_mon.clone(),
-                    Some(task_id_clone.clone()),
-                    ws_state_clone,
-                    vc_issuer_clone,
-                    listener_mgr_clone,
-                    Some(state_sender),
-                    identity_router,     // Pass Identity API router
-                    onboarding_router,   // Pass Onboarding router
-                    did_router,          // Pass DID router
-                    vault_router,        // Pass Vault router
-                    secrets_store_clone, // Pass secrets store
+                    channels,
+                    tls_acceptor.clone(),
+                    client.clone(),
+                    new_config.clone(),
+                    self.bootstrap_config.clone(),
+                    metrics_store.clone(),
+                    task_monitor.clone(),
+                    self.ws_state.clone(),
+                    self.vc_issuer.clone(),
+                    self.listener_manager.clone(),
+                    identity_router,
+                    onboarding_router,
+                    did_router,
+                    vault_router,
+                    secrets_store.clone(),
                     network_config_clone,
-                    use_tls,
-                    policy_manager_clone,         // Pass policy manager
-                    gateway_policy_manager_clone, // Pass gateway policy manager
-                    mcp_proxy_store_clone,        // Pass MCP proxy store
-                    a2a_proxy_store_clone,        // Pass A2A proxy store
-                    mcp_server_manager_clone,     // Pass MCP server manager
-                    settings_store_clone,         // Pass settings store
-                    notification_store_clone,     // Pass notification store
-                    didauth_session_store_clone,  // Pass DID Auth session store
-                    source_auth_middleware_clone, // Pass unified source auth middleware
-                    direct_client_auth_clone,     // Pass direct-TLS client auth
-                    resolved_surface_cache_clone, // Phase D — pre-resolved surface snapshots
+                    policy_manager.clone(),
+                    gateway_policy_manager,
+                    mcp_proxy_store.clone(),
+                    a2a_proxy_store.clone(),
+                    mcp_server_manager.clone(),
+                    self.settings_store.clone(),
+                    notification_store,
+                    self.didauth_session_store
+                        .clone(),
+                    source_auth_middleware,
+                    resolved_surface_cache,
                     #[cfg(feature = "didwebvh")]
-                    didwebvh_identity_store_clone,
+                    didwebvh_identity_store,
                     #[cfg(feature = "didwebvh")]
-                    didwebvh_log_storage_clone,
+                    didwebvh_log_storage,
                 )
-                .await
-                {
-                    error!("Port listener error for port {}: {}", port, e);
-                }
-            });
-
-            // Store the abort handle for this port listener
-            new_port_handles.insert(port, handle.abort_handle());
-
-            // Wait for the state to be sent back (with a timeout)
-            if let Ok(state) = tokio::time::timeout(tokio::time::Duration::from_secs(5), state_receiver).await {
-                if let Ok(state) = state {
-                    new_port_states.insert(port, state);
+                .await?;
+                let served = match super::server::inbound_bind_addresses(&network_config, port) {
+                    Ok(addresses) => {
+                        self.serve_port(port, addresses, use_tls, router, &new_config)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if served.is_err() {
+                    super::server::unregister_port_tasks(&state, task_monitor.as_deref()).await;
                 } else {
-                    warn!("Port listener {} failed to send state", port);
+                    new_port_states.insert(port, state);
                 }
-            } else {
-                warn!("Timeout waiting for port listener {} state", port);
+                served
             }
-
-            // Note: Individual channel task IDs are managed by the port listener itself
-            // We don't create or track them here - the port listener registers them with the task monitor
+            .await;
+            if let Err(e) = served {
+                error!("Port listener error for port {}: {}", port, e);
+            }
         }
 
-        // Step 5: Store new handles and port listener states
-        {
-            let mut port_handles = self
-                .port_listener_handles
-                .write()
-                .await;
-            *port_handles = new_port_handles;
-        }
+        // Step 5: Stop the listeners of ports no longer configured and store
+        // the new port listener states
+        self.bound_ports
+            .write()
+            .await
+            .retain(|port, _| configured_ports.contains(port));
         {
             let mut port_states = self
                 .port_listener_states
@@ -1448,7 +1402,7 @@ impl SurfaceTaskManager {
             crate::proxy::server::retire_outbound_channel_state(state);
         }
         if surface_has_outbound || previous_surface_has_outbound {
-            self.restart_outbound_listener_for_channel(&new_surface, previous_surface.as_ref(), metrics_store)
+            self.rebuild_outbound_routes_for_channel(&new_surface, previous_surface.as_ref(), metrics_store)
                 .await?;
         }
 
@@ -1568,17 +1522,17 @@ impl SurfaceTaskManager {
         Ok(true)
     }
 
-    /// Restart the outbound port listener that serves a given channel.
+    /// Rebuild the router of the outbound port listener that serves a given channel.
     ///
     /// The outbound Axum router bakes virtual-channel aliases into its route
-    /// table at startup.  When virtual channels are added, removed, or renamed
-    /// the listener must be rebuilt so the new routes take effect.
+    /// table.  When virtual channels are added, removed, or renamed the router
+    /// must be rebuilt so the new routes take effect.
     ///
     /// This method:
     /// 1. Resolves the outbound port from `outbound_listen_address`.
     /// 2. Collects every outbound-enabled channel on that port.
-    /// 3. Aborts the old listener and spawns a replacement.
-    async fn restart_outbound_listener_for_channel(
+    /// 3. Builds the port's router and swaps it into the bound listener.
+    async fn rebuild_outbound_routes_for_channel(
         &self,
         channel: &crate::config::agent_surface::AgentSurface,
         previous_channel: Option<&crate::config::agent_surface::AgentSurface>,
@@ -1690,97 +1644,56 @@ impl SurfaceTaskManager {
                 .unwrap_or(false);
             let outbound_channel_count = outbound_channels.len();
 
-            {
-                let mut port_handles = self
-                    .port_listener_handles
-                    .write()
-                    .await;
-                if let Some(handle) = port_handles.remove(&outbound_port) {
-                    info!(port = outbound_port, "Aborting outbound port listener to rebuild routes");
-                    handle.abort();
-                }
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-            let secrets_store_clone = self
-                .secrets_store
-                .read()
-                .await
-                .clone();
-            let policy_manager_clone = self
-                .policy_manager
-                .read()
-                .await
-                .clone();
-            let gateway_policy_manager_clone = self
+            let gateway_policy_manager = self
                 .gateway_policy_manager
                 .read()
                 .await
                 .clone();
-            let trust_registry_clone =
-                crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager();
-            let outbound_states = self
-                .outbound_channel_states
-                .clone();
-            let vc_issuer_clone = self.vc_issuer.clone();
-            let network_config_clone = Arc::new(network_config.clone());
-            let config_clone = config_clone.clone();
-            let direct_client_auth_clone = self
-                .direct_client_auth
-                .read()
-                .await
-                .clone();
-            let metrics_store = metrics_store.clone();
-            let listener_mgr_clone = self.listener_manager.clone();
             let source_auth_middleware = self
                 .source_auth_middleware
                 .read()
                 .await
                 .clone();
-
-            let (states_registered, states_registered_rx) = tokio::sync::oneshot::channel();
-            let handle = tokio::spawn(async move {
-                if let Err(e) = super::server::run_outbound_port_server(
-                    bind_address,
+            let served = async {
+                let router = super::server::build_outbound_port_router(
                     outbound_port,
                     outbound_channels,
-                    config_clone,
-                    network_config_clone,
-                    metrics_store,
-                    secrets_store_clone,
-                    policy_manager_clone,
-                    gateway_policy_manager_clone,
-                    trust_registry_clone,
-                    vc_issuer_clone,
+                    config_clone.clone(),
+                    Arc::new(network_config.clone()),
+                    metrics_store.clone(),
+                    self.secrets_store
+                        .read()
+                        .await
+                        .clone(),
+                    self.policy_manager
+                        .read()
+                        .await
+                        .clone(),
+                    gateway_policy_manager,
+                    crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
+                    self.vc_issuer.clone(),
                     None, // task_monitor
-                    use_tls,
-                    outbound_states,
-                    direct_client_auth_clone,
-                    listener_mgr_clone,
+                    self.outbound_channel_states
+                        .clone(),
+                    self.listener_manager.clone(),
                     source_auth_middleware,
-                    Some(states_registered),
                 )
-                .await
-                {
-                    error!("Outbound port listener error for port {}: {}", outbound_port, e);
-                }
-            });
-            let _ = states_registered_rx.await;
-
-            {
-                let mut port_handles = self
-                    .port_listener_handles
-                    .write()
-                    .await;
-                port_handles.insert(outbound_port, handle.abort_handle());
+                .await?;
+                let address = super::server::listener_socket_address(&bind_address, outbound_port)?;
+                self.serve_port(outbound_port, vec![address], use_tls, router, &config_clone)
+                    .await
+            }
+            .await;
+            if let Err(e) = served {
+                error!("Outbound port listener error for port {}: {}", outbound_port, e);
+                continue;
             }
 
             info!(
                 surface = %channel.name,
                 port = outbound_port,
                 outbound_channel_count,
-                "Restarted outbound port listener with updated routes"
+                "Rebuilt outbound port listener routes"
             );
         }
 
@@ -2029,5 +1942,134 @@ mod tests {
             Err(crate::config::agent_surface_variants::VariantResolveError::UnknownAlias("prod".to_string())),
             "storing the resolved surface would refuse every $prod request"
         );
+    }
+
+    fn manager(directory: &std::path::Path) -> super::SurfaceTaskManager {
+        let config: crate::config::GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
+        }))
+        .unwrap();
+        super::SurfaceTaskManager::new(
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(bootstrap),
+            std::sync::Arc::new(crate::storage::ConfigCache::new(directory)),
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::storage::SettingsStore::new(directory)),
+            std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        )
+    }
+
+    fn answering(path: &'static str) -> axum::Router {
+        axum::Router::new().route(path, axum::routing::get(|| async { "ok" }))
+    }
+
+    fn free_loopback_address() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    async fn status(
+        address: std::net::SocketAddr,
+        path: &str,
+    ) -> Option<u16> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap()
+            .get(format!("http://{address}{path}"))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status().as_u16())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serving_a_new_router_on_a_bound_port_refuses_no_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let config = manager.get_config().await;
+        let address = free_loopback_address();
+        manager
+            .serve_port(address.port(), vec![address], false, answering("/before"), &config)
+            .await
+            .unwrap();
+        assert_eq!(status(address, "/before").await, Some(200));
+
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prober = tokio::spawn({
+            let (refused, probing) = (refused.clone(), probing.clone());
+            async move {
+                let mut probes = 0;
+                while probing.load(std::sync::atomic::Ordering::Relaxed) {
+                    if tokio::net::TcpStream::connect(address)
+                        .await
+                        .is_err()
+                    {
+                        refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    probes += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                probes
+            }
+        });
+        for _ in 0..20 {
+            manager
+                .serve_port(address.port(), vec![address], false, answering("/after"), &config)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        probing.store(false, std::sync::atomic::Ordering::Relaxed);
+        let probes = prober.await.unwrap();
+
+        assert!(probes > 0);
+        assert_eq!(refused.load(std::sync::atomic::Ordering::Relaxed), 0, "of {probes} connections");
+        assert_eq!(status(address, "/after").await, Some(200));
+        assert_eq!(status(address, "/before").await, Some(404));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_whose_binding_changes_is_bound_again_and_not_served_without_its_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let config = manager.get_config().await;
+        let address = free_loopback_address();
+        manager
+            .serve_port(address.port(), vec![address], false, answering("/plain"), &config)
+            .await
+            .unwrap();
+        assert_eq!(status(address, "/plain").await, Some(200));
+
+        let error = manager
+            .serve_port(address.port(), vec![address], true, answering("/tls"), &config)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), format!("Port {} speaks TLS but has no TLS configuration", address.port()));
+        assert!(
+            manager
+                .bound_ports
+                .read()
+                .await
+                .is_empty(),
+            "the listener bound for plain HTTP stops"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(status(address, "/plain").await, None, "the port is no longer served");
     }
 }

@@ -1,0 +1,18 @@
+branch: fix/surface-reload-without-rebind
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T15:46:35Z'
+      title: Keep listeners bound while surface changes are applied
+      description: >-
+        Saving an inactive surface, a surface with variants or Transit Points, or deleting a
+        surface with variants reloaded the whole configuration by stopping every port listener,
+        the management API's included, and binding it again, so connections were refused for up
+        to half a second on every such save, and anyone allowed to edit surfaces could keep the
+        gateway refusing connections for every tenant. A reload now builds new routes and swaps
+        them into the listeners already bound, which stay up, and binds a port again only when
+        its addresses or TLS setting change in gateway.json.
+  breaking: []
