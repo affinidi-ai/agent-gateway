@@ -291,7 +291,10 @@ pub trait StorageBackend<T: StorableEntity>: Send + Sync {
     ) -> Result<Option<T>>;
 
     /// Get an entity by ID, as [`Self::get`], except that a record stored on
-    /// disk that could not be read is an error, never `None`.
+    /// disk that could not be read is an error, never `None`. The default is
+    /// [`Self::get`], right for a backend whose `get` already fails on such a
+    /// record (uncached) or that keeps no files (in memory); a backend that
+    /// leaves unreadable records out of a cache overrides it.
     async fn get_checked(
         &self,
         id: &str,

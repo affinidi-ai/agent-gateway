@@ -22,14 +22,17 @@ changes:
       description: >-
         The sweep took a surface or credential provider whose file is stored but could not be read,
         for example one that fails to decrypt, for one that was deleted, and removed and revoked its
-        grants. It now skips that binding until the next sweep, as the documentation says.
+        grants. It now skips that binding until the next sweep, as the documentation says. The
+        revocations kept for an unreadable provider wait too, and those of every other provider
+        are still decided.
     - timestamp: '2026-11-04T16:45:03Z'
       title: Revoke a deleted provider's kept revocations before the provider is gone
       description: >-
         Deleting a credential provider revoked its stored grants but left the revocations kept for
         its earlier removals, pending or deferred to the daily sweep, which the sweep then forgot
         unrevoked once the provider was gone. The delete now decides them while it still holds the
-        provider, and answers 503 and keeps the provider when the vault cannot list them.
+        provider, and answers 503 and keeps the provider, naming the cause, while any revocation the
+        vault kept cannot be read.
     - timestamp: '2026-11-04T16:45:03Z'
       title: Record an Access Point grant's use at most hourly, off the request path
       description: >-
