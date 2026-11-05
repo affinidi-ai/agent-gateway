@@ -130,15 +130,21 @@ The credential headers of every method are stripped before a request is forwarde
 inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
 forwards its header only when it was the method selected for that request and its token
 verified, so a request carrying several credentials forwards none, and a token that failed
-verification never reaches the Target, even when policy lets the request through.
+verification never reaches the Target, even when policy lets the request through. A public
+discovery read verifies no caller, so it forwards no token either. A Target that checks tokens
+itself therefore gets no token the method's strategy rejects, such as one from another issuer
+or for another audience: make the strategy and `audiences` accept the tokens it needs, or give
+it its credential through target authentication instead.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
 each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
 list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called. A request that carries the
-method's token header more than once fails, whatever the values.
+metadata, where `aud` must name the resource of the route called. A request whose token header
+carries more than one value in the method's `token_scheme` fails, whatever the values, on an
+Access Point, a Transit Point and over Fabric. A value in another scheme, such as an MPP
+`Payment` credential beside the `Bearer` token, does not count.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
