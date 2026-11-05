@@ -450,7 +450,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     Point's resolved credential cannot be sent as a header (the last two always `rejected`,
     whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
     Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
-    fetch and its preview. The record carries `provider_id` for a credential provider and a
+    fetch and its preview. The record carries the request's trace id, except on the gateway's
+    own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
+    fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
+    trace id. The record carries `provider_id` for a credential provider and a
     `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
     on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
     `transit_point` names the Transit Point by alias when the credential was a Transit Point's

@@ -1351,6 +1351,7 @@ pub async fn handle_agent_card(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ProxyState>,
     headers: HeaderMap,
+    trace_id: &str,
 ) -> Result<Response, Response> {
     let channel_name = state.surface.name.clone();
 
@@ -1467,9 +1468,10 @@ pub async fn handle_agent_card(
         }
     }
 
-    let card = agent_card::build_public_card(&state, &headers, &source_addr, agent_card::CardMode::Serve)
-        .await
-        .map_err(|failure| failure.response)?;
+    let card =
+        agent_card::build_public_card(&state, &headers, &source_addr, agent_card::CardMode::Serve, Some(trace_id))
+            .await
+            .map_err(|failure| failure.response)?;
 
     // Negotiate the agent-card media type: A2A 1.0.1 prefers
     // `application/a2a+json`, but it is only served to callers that signalled 1.0
@@ -2095,9 +2097,10 @@ async fn proxy_handler_with_mcp_runtime(
     channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
 
     if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
-        let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
-            Ok(response) | Err(response) => response,
-        };
+        let response =
+            match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone(), &trace_id).await {
+                Ok(response) | Err(response) => response,
+            };
         connection_guard
             .decrement()
             .await;

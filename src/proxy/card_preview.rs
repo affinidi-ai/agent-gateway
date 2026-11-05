@@ -622,9 +622,10 @@ async fn fetch_preview(
     let fetched_at = Utc::now();
     let mut headers = HeaderMap::new();
     headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-    let built = tokio::time::timeout(deadline, build_public_card(state, &headers, PREVIEW_SOURCE, CardMode::Preview))
-        .await
-        .ok();
+    let built =
+        tokio::time::timeout(deadline, build_public_card(state, &headers, PREVIEW_SOURCE, CardMode::Preview, None))
+            .await
+            .ok();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut auth = CardAuthReport::for_surface(surface);

@@ -136,12 +136,14 @@ pub(crate) fn card_target_url(surface: &crate::config::agent_surface::AgentSurfa
 /// Build the public agent card of the state's surface: fetch or generate it,
 /// resolve its identity, rewrite its endpoints to the Access Point and add the
 /// gateway's identity credential and did:webvh identity. A served card also
-/// writes the Trust Recorder and records the connection.
+/// writes the Trust Recorder and records the connection. `trace_id` is the trace of
+/// the request that asked for the card, `None` when the gateway builds it unprompted.
 pub(crate) async fn build_public_card(
     state: &ProxyState,
     headers: &HeaderMap,
     source_addr: &str,
     mode: CardMode,
+    trace_id: Option<&str>,
 ) -> Result<BuiltCard, CardFailure> {
     let channel_name = state.surface.name.as_str();
     let prepared = super::prepare_a2a_proxy_agent_card(state, channel_name)
@@ -156,6 +158,7 @@ pub(crate) async fn build_public_card(
                 state,
                 source_addr,
                 mode,
+                trace_id,
                 credential_sent: AtomicBool::new(false),
             };
             let fetched = fetch
@@ -490,6 +493,7 @@ struct TargetCardFetch<'a> {
     state: &'a ProxyState,
     source_addr: &'a str,
     mode: CardMode,
+    trace_id: Option<&'a str>,
     credential_sent: AtomicBool,
 }
 
@@ -611,7 +615,7 @@ impl TargetCardFetch<'_> {
                     &crate::audit::request_events::RequestFacts {
                         surface_id: &state.surface.surface_id,
                         channel_name,
-                        trace_id: None,
+                        trace_id: self.trace_id,
                         via_fabric: false,
                     },
                     None,
@@ -676,7 +680,7 @@ impl TargetCardFetch<'_> {
             &crate::audit::request_events::RequestFacts {
                 surface_id: &state.surface.surface_id,
                 channel_name,
-                trace_id: None,
+                trace_id: self.trace_id,
                 via_fabric: false,
             },
         )
@@ -978,7 +982,9 @@ mod tests {
     }
 
     use super::*;
+    use crate::audit::request_events::RejectionReason;
     use crate::component_tests::helpers::{MockServer, RecordingTarget};
+    use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
     use serde_json::json;
 
     fn surface(target: JsonValue) -> crate::config::agent_surface::AgentSurface {
@@ -1009,7 +1015,15 @@ mod tests {
         state: &ProxyState,
         mode: CardMode,
     ) -> Result<BuiltCard, CardFailure> {
-        build_public_card(state, &HeaderMap::new(), "203.0.113.7", mode).await
+        build_traced(state, mode, None).await
+    }
+
+    async fn build_traced(
+        state: &ProxyState,
+        mode: CardMode,
+        trace_id: Option<&str>,
+    ) -> Result<BuiltCard, CardFailure> {
+        build_public_card(state, &HeaderMap::new(), "203.0.113.7", mode, trace_id).await
     }
 
     /// The connections recorded once the spawned writes have landed, after
@@ -1161,6 +1175,43 @@ mod tests {
                 .unwrap_err();
             assert_eq!(failure.fault, FetchFault::CredentialRejected(TargetAuthError::StoreUnavailable), "{mode:?}");
             assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
+        }
+    }
+
+    fn target_auth_trace_ids(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        ..
+                    }
+                )
+            })
+            .map(|event| event.trace_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_the_trace_of_the_request_that_asked_for_the_card() {
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let state = state(
+            json!({"endpoint": "http://127.0.0.1:9", "auth": {"method": {"static_secret": {
+                "secret_id": "missing", "header_name": "x-key"
+            }}}}),
+            &metrics,
+        )
+        .await;
+
+        for (trace_id, expected) in [(Some("trace-from-request"), Some("trace-from-request".to_string())), (None, None)]
+        {
+            let (failure, events) =
+                crate::audit::producer::capture(build_traced(&state, CardMode::Serve, trace_id)).await;
+
+            assert!(failure.is_err());
+            assert_eq!(target_auth_trace_ids(&events), vec![expected], "{trace_id:?}");
         }
     }
 
