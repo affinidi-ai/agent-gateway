@@ -341,6 +341,73 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
     );
 }
 
+/// With `forward_header`, the caller's token reaches the target only when it
+/// verified; an expired token, one from another issuer, or a second token
+/// beside a valid one is still forwarded with no policy denying it, but
+/// without any token.
+#[tokio::test(flavor = "multi_thread")]
+async fn forward_header_passes_on_only_a_verified_token() {
+    let fixture = JwksFixture::start().await;
+
+    let h = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(&fixture, temp_dir, gw_config);
+        if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt)) = gw_config.surfaces[0]
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .and_then(|caller| caller.methods.first_mut())
+        {
+            jwt.forward_header = true;
+        }
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+    let sign = |issuer: &str, exp: u64| {
+        sign_jwt(json!({"iss": issuer, "sub": "user-e2e", "aud": "any", "exp": exp, "iat": now_secs()}), &fixture.kid)
+    };
+
+    let valid = sign(&fixture.issuer, now_secs() + 300);
+    let expired = sign(&fixture.issuer, now_secs() - 3600);
+    for (case, tokens, forwarded) in [
+        ("valid", vec![valid.clone()], true),
+        ("expired", vec![expired.clone()], false),
+        ("another issuer", vec![sign("https://other-issuer.example", now_secs() + 300)], false),
+        ("valid then expired", vec![valid, expired], false),
+    ] {
+        let resp = tokens
+            .iter()
+            .fold(client.post(&h.gateway_url), |request, token| {
+                request.header("authorization", format!("Bearer {token}"))
+            })
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_response(resp).await;
+        assert_forwarded_request(&h.mock, body);
+        let received = h
+            .mock
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("mock did not receive a request");
+        assert_eq!(
+            received
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            forwarded
+                .then(|| format!("Bearer {}", tokens[0]))
+                .as_deref(),
+            "{case}"
+        );
+    }
+}
+
 /// The managed agent learns who is calling only from the caller-info and DID
 /// identity headers the gateway sets: a caller's own copies, in any case, are
 /// dropped, so the agent gets the gateway's one value of each it sets and none

@@ -2721,15 +2721,51 @@ pub(crate) fn should_forward_outbound_request_header(
     true
 }
 
-/// Whether `name` is a header a proxy sets to tell the next hop who connected to
-/// it, for which host and over what: `Forwarded`, `X-Real-IP` and every
-/// `X-Forwarded-*` header, also spelled with `_` for `-`, which CGI-style servers
-/// read as the same header.
+/// The proxy and CDN headers, other than `X-Forwarded-*`, that claim the client's
+/// address, the host or path it asked for or the scheme it used.
+const PROXY_FORWARDING_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-real-ip",
+    "true-client-ip",
+    "client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "cf-connecting-ip",
+    "cf-connecting-ipv6",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "x-arr-clientip",
+    "x-azure-clientip",
+    "x-proxyuser-ip",
+    "x-original-forwarded-for",
+    "proxy-client-ip",
+    "wl-proxy-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "x-envoy-external-address",
+    "cloudfront-viewer-address",
+    "x-original-host",
+    "x-host",
+    "x-original-url",
+    "x-original-uri",
+    "x-rewrite-url",
+    "x-scheme",
+    "x-url-scheme",
+    "x-arr-ssl",
+    "front-end-https",
+];
+
+/// Whether `name` is a header a proxy or CDN sets to tell the next hop who
+/// connected to it, for which host and path and over what: [`PROXY_FORWARDING_HEADERS`]
+/// and every `X-Forwarded-*` header, also spelled with `_` for `-`, which
+/// CGI-style servers read as the same header.
 fn is_proxy_forwarding_header(name: &str) -> bool {
     const X_FORWARDED: &str = "x-forwarded-";
     let name = name.replace('_', "-");
-    name.eq_ignore_ascii_case("forwarded")
-        || name.eq_ignore_ascii_case("x-real-ip")
+    PROXY_FORWARDING_HEADERS
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
         || name
             .get(..X_FORWARDED.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(X_FORWARDED))
@@ -11769,11 +11805,56 @@ mod tests {
             "X-Forwarded_For",
             "x_forwarded_host",
             "X-Real_IP",
+            "True-Client-IP",
+            "true_client_ip",
+            "Client-IP",
+            "X-Client-IP",
+            "X-Cluster-Client-IP",
+            "CF-Connecting-IP",
+            "CF-Connecting-IPv6",
+            "Fastly-Client-IP",
+            "X-Original-Forwarded-For",
+            "X-Original-Host",
+            "x_original_host",
+            "X-Host",
+            "X-Url-Scheme",
+            "Front-End-Https",
+            "Fly-Client-IP",
+            "X-ARR-ClientIP",
+            "X-Azure-ClientIP",
+            "X-ProxyUser-Ip",
+            "X-Original-URL",
+            "x_original_url",
+            "X-Original-URI",
+            "X-Rewrite-URL",
+            "X-Scheme",
+            "X-ARR-SSL",
+            "Proxy-Client-IP",
+            "WL-Proxy-Client-IP",
+            "wl_proxy_client_ip",
+            "X-Originating-IP",
+            "X-Remote-IP",
+            "X-Remote-Addr",
+            "X-Envoy-External-Address",
+            "CloudFront-Viewer-Address",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in ["x-forwarded", "x-forwardedfor", "forwarded-for", "x-real-ip-note", "x-vendor-forwarded-for"]
-        {
+        for forwarded in [
+            "x-forwarded",
+            "x-forwardedfor",
+            "forwarded-for",
+            "x-real-ip-note",
+            "x-vendor-forwarded-for",
+            "x-client-ip-hint",
+            "x-hostname",
+            "x-original-hosts",
+            "client-ipaddress",
+            "x-original-urls",
+            "x-schemes",
+            "x-remote-address",
+            "x-envoy-external-addresses",
+        ] {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
     }
@@ -20327,6 +20408,7 @@ mod tests {
             ("x-forwarded-for", "203.0.113.9"),
             ("x_forwarded_host", "agent.example"),
             ("forwarded", "for=203.0.113.9"),
+            ("true-client-ip", "203.0.113.9"),
         ] {
             ctx.original_headers
                 .insert(name, HeaderValue::from_static(value));
@@ -20655,7 +20737,7 @@ mod tests {
             let sent = received.last().unwrap();
             assert_eq!(header_values(sent, "authorization"), authorization, "{alias}: {sent:?}");
             assert_eq!(header_values(sent, "x-vendor-key"), vendor_key, "{alias}: {sent:?}");
-            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded"] {
+            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded", "true-client-ip"] {
                 assert!(header_values(sent, withheld).is_empty(), "{alias} sent {withheld}: {sent:?}");
             }
         }

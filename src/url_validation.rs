@@ -697,6 +697,8 @@ mod tests {
         must_block("http://[2002:7f00:1::]/");
         must_block("http://[64:ff9b::7f00:1]/");
         must_block("http://[64:ff9b:1::a9fe:a9fe]/latest/meta-data/");
+        must_block("http://[2002::]/");
+        must_block("http://[64:ff9b::]/");
         forwarding_must_block("http://[2002:a9fe:a9fe::1]/latest/meta-data/");
         forwarding_must_block("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/");
     }
@@ -1094,6 +1096,8 @@ mod tests {
     fn resolved_6to4_and_nat64_addresses_are_classified_by_their_ipv4() {
         let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
         assert!(is_blocked_resolved_ip(ip("64:ff9b::7f00:1")));
+        assert!(is_blocked_resolved_ip(ip("2002::")));
+        assert!(is_blocked_resolved_ip(ip("64:ff9b::")));
         assert!(!is_blocked_resolved_ip(ip("2002:a00:1::1")));
         assert!(is_blocked_resolved_webhook_ip(ip("2002:a00:1::1")));
         assert!(is_blocked_resolved_webhook_ip(ip("64:ff9b::c0a8:101")));

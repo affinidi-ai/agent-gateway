@@ -635,6 +635,7 @@ pub async fn run_axum_proxy(
             listener.external_urls.len()
         );
     }
+    crate::config::network::warn_about_unparsed_external_urls(&network_config.listeners);
 
     // Initialize settings store and load settings from disk
     info!(

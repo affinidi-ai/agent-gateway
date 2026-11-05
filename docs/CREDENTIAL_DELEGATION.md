@@ -1124,6 +1124,8 @@ enabled, its key seals the state; otherwise a key derived from `AG_IDENTITY_HASH
 does, so gateways that share the pepper can open each other's states. The callback refuses
 a `state` this gateway did not seal, an expired one, and one whose nonce was already used
 ([`encode_oauth_state`, `decode_oauth_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
+It also refuses a `state` that names another provider than its path, without using it up, and
+records and completes the consent under the provider the `state` names.
 Used nonces are remembered in the gateway process for 15 minutes, longer than a state
 lives, so a restart or a different gateway instance does not know about them. A state is
 used up only when its credential is stored, so a callback that fails before then, for
