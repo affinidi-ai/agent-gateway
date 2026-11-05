@@ -41,19 +41,19 @@ struct Breach {
 }
 
 /// Refuses the first rule a Target authentication of `surface` breaks that `stored` did not
-/// already break on the same leg with the same setting. A new breach of a credential policy
-/// rule in `warn` is logged once nothing is refused, and saved.
+/// already break on the same leg with the same setting; a stored surface whose breaches cannot be
+/// listed, such as one with an unresolvable variant, keeps none. A new breach of a credential
+/// policy rule in `warn` is logged once nothing is refused, and saved.
 pub(super) fn validate_target_auth_rules(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
-    let kept = match stored {
-        Some(stored) => breaches(stored)?
-            .into_iter()
-            .map(|(breach, ..)| breach)
-            .collect(),
-        None => Vec::new(),
-    };
+    let kept: Vec<Breach> = stored
+        .and_then(|stored| breaches(stored).ok())
+        .into_iter()
+        .flatten()
+        .map(|(breach, ..)| breach)
+        .collect();
     let mut warned = Vec::new();
     for (breach, message, policy_rule) in breaches(surface)? {
         if kept.contains(&breach) {
@@ -839,6 +839,30 @@ mod tests {
                 "transit.points['partner'].target_auth sends a credential, so its target endpoint must be an https URL"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn a_save_that_repairs_an_unresolvable_stored_variant_is_held_to_the_rules_in_full() {
+        let variants = |first: &str, second: &str| {
+            json!([
+                {"id": "a", "alias": first, "name": "A", "enabled": false},
+                {"id": "b", "alias": second, "name": "B", "enabled": true}
+            ])
+        };
+        let mut stored = surface(static_secret("X-Api-Key", "{value}"));
+        stored["variants"] = variants("same", "same");
+        let unresolvable: AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+        assert!(breaches(&unresolvable).is_err());
+
+        let mut repaired = surface(static_secret("X-Api-Key", "{value}"));
+        repaired["variants"] = variants("first", "second");
+        assert_eq!(check(&repaired, Some(&stored)), Ok(()));
+
+        repaired["target"]["endpoint"] = json!("http://api.example.com/");
+        assert_eq!(
+            check(&repaired, Some(&stored)),
+            Err("target.auth sends a credential, so its Target must be an https URL".to_string())
         );
     }
 

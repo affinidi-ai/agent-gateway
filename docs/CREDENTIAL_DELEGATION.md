@@ -767,7 +767,9 @@ rule is `enforce`; in `warn` (the default) the save succeeds, the gateway logs a
 the surface, the rule and the `details` below, and the response carries the same text in a
 `Warning: 299` header, as on every save while the breach remains. A save that keeps a breach
 the stored surface already had, while its rule is `enforce`, answers with a `Warning` header too,
-saying the credential is withheld. The `details` field names the setting:
+saying the credential is withheld. A stored surface whose breaches cannot be listed, such as
+one with a variant that cannot be resolved, keeps none: a save that repairs it is held to every
+rule. The `details` field names the setting:
 `target.auth`, `transit.points['<alias>'].target_auth`, `target` for an A2A proxy Target, or
 any of them prefixed with `variants['<alias>'].`. Header names are compared without regard to
 case or to `_` against `-`, as the request path compares them. The first refused breach is
