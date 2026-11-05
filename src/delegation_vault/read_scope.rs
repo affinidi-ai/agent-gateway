@@ -3,9 +3,45 @@
 
 use std::collections::HashSet;
 
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+
 use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::tenancy::PatTenantContext;
+
+/// The management caller of a read, as the session and access-token
+/// middleware describe it in the request extensions. A handler takes it
+/// whole, so none can decide a [`VaultReadScope`] from part of the caller.
+pub struct VaultReader {
+    tenant: Option<PatTenantContext>,
+    resource_scope: Option<PatResourceScope>,
+    delegation: Option<PatDelegationContext>,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for VaultReader {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            tenant: parts
+                .extensions
+                .get()
+                .cloned(),
+            resource_scope: parts
+                .extensions
+                .get()
+                .cloned(),
+            delegation: parts
+                .extensions
+                .get()
+                .cloned(),
+        })
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum VaultReadScope {
@@ -21,15 +57,17 @@ pub enum VaultReadScope {
 }
 
 impl VaultReadScope {
-    /// The scope of the caller the request extensions describe. Only a
-    /// tenant's token reads `providers`, once; a failed read is an error,
-    /// never a wider scope.
+    /// The scope of `reader`. Only a tenant's token reads `providers`, once; a
+    /// failed read is an error, never a wider scope.
     pub async fn of(
         providers: Option<&dyn CredentialProviderStorage>,
-        tenant: Option<&PatTenantContext>,
-        resource_scope: Option<&PatResourceScope>,
-        delegation: Option<&PatDelegationContext>,
+        reader: &VaultReader,
     ) -> anyhow::Result<Self> {
+        let VaultReader {
+            tenant,
+            resource_scope,
+            delegation,
+        } = reader;
         if let Some(tenant) = tenant {
             let Some(providers) = providers else {
                 return Ok(Self::Tenant(HashSet::new()));
@@ -43,7 +81,11 @@ impl VaultReadScope {
                 .collect();
             return Ok(Self::Tenant(owned));
         }
-        if resource_scope.is_some() || delegation.is_some_and(|delegation| delegation.resource_scoped) {
+        if resource_scope.is_some()
+            || delegation
+                .as_ref()
+                .is_some_and(|delegation| delegation.resource_scoped)
+        {
             return Ok(Self::Nothing);
         }
         Ok(Self::Appliance)
@@ -229,15 +271,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// The caller a request with these extensions describes.
+    pub(crate) fn reader(
+        tenant: Option<PatTenantContext>,
+        resource_scope: Option<PatResourceScope>,
+        delegation: Option<PatDelegationContext>,
+    ) -> VaultReader {
+        VaultReader {
+            tenant,
+            resource_scope,
+            delegation,
+        }
+    }
+
     async fn tenant_scope(
         providers: &InMemoryProviders,
         tenant_id: &str,
     ) -> anyhow::Result<VaultReadScope> {
         VaultReadScope::of(
             Some(providers),
-            Some(&tenant(tenant_id)),
-            Some(&pattern(tenant_id)),
-            Some(&delegation(true)),
+            &reader(Some(tenant(tenant_id)), Some(pattern(tenant_id)), Some(delegation(true))),
         )
         .await
     }
@@ -272,10 +325,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_tenant_token_reads_no_record_without_a_provider_store() {
-        let scope =
-            VaultReadScope::of(None, Some(&tenant("tenant-a")), Some(&pattern("tenant-a")), Some(&delegation(true)))
-                .await
-                .unwrap();
+        let scope = VaultReadScope::of(
+            None,
+            &reader(Some(tenant("tenant-a")), Some(pattern("tenant-a")), Some(delegation(true))),
+        )
+        .await
+        .unwrap();
         assert_eq!(scope, VaultReadScope::Tenant(HashSet::new()));
         assert!(!scope.reads(Some("cp-a")));
     }
@@ -284,7 +339,7 @@ pub(crate) mod tests {
     async fn an_appliance_wide_caller_reads_every_record_without_reading_the_provider_store() {
         let unreadable = InMemoryProviders::unreadable();
         for delegation in [None, Some(delegation(false))] {
-            let scope = VaultReadScope::of(Some(&unreadable), None, None, delegation.as_ref())
+            let scope = VaultReadScope::of(Some(&unreadable), &reader(None, None, delegation))
                 .await
                 .unwrap();
             assert_eq!(scope, VaultReadScope::Appliance);
@@ -296,9 +351,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_token_scoped_by_required_headers_alone_reads_no_record() {
-        let scope = VaultReadScope::of(Some(&InMemoryProviders::unreadable()), None, None, Some(&delegation(true)))
-            .await
-            .unwrap();
+        let scope =
+            VaultReadScope::of(Some(&InMemoryProviders::unreadable()), &reader(None, None, Some(delegation(true))))
+                .await
+                .unwrap();
         assert_eq!(scope, VaultReadScope::Nothing);
         for credential_provider_id in [Some("cp-a"), Some("cp-global"), None] {
             assert!(!scope.reads(credential_provider_id), "{credential_provider_id:?}");
@@ -309,7 +365,7 @@ pub(crate) mod tests {
     async fn a_resource_scope_without_a_tenant_reads_no_record() {
         let unreadable = InMemoryProviders::unreadable();
         for delegation in [None, Some(delegation(true))] {
-            let scope = VaultReadScope::of(Some(&unreadable), None, Some(&pattern("tenant-a")), delegation.as_ref())
+            let scope = VaultReadScope::of(Some(&unreadable), &reader(None, Some(pattern("tenant-a")), delegation))
                 .await
                 .unwrap();
             assert_eq!(scope, VaultReadScope::Nothing);

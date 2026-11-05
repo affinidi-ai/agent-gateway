@@ -1,15 +1,13 @@
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::credential_providers::storage::CredentialProviderStorage;
-use crate::delegation_vault::read_scope::VaultReadScope;
+use crate::delegation_vault::read_scope::{VaultReadScope, VaultReader};
 use crate::identity::state::IdentityApiState;
-use crate::tenancy::PatTenantContext;
 
 #[derive(Debug, Deserialize)]
 pub struct AuditLogQuery {
@@ -46,9 +44,7 @@ pub struct AuditLogResponse {
 
 pub async fn get_audit_log(
     State(state): State<IdentityApiState>,
-    tenant: Option<Extension<PatTenantContext>>,
-    resource_scope: Option<Extension<PatResourceScope>>,
-    delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<AuditLogResponse>, (StatusCode, String)> {
     Ok(Json(
@@ -56,29 +52,19 @@ pub async fn get_audit_log(
             state
                 .credential_provider_store
                 .as_deref(),
-            tenant
-                .as_ref()
-                .map(|Extension(tenant)| tenant),
-            resource_scope
-                .as_ref()
-                .map(|Extension(scope)| scope),
-            delegation
-                .as_ref()
-                .map(|Extension(delegation)| delegation),
+            &reader,
             query,
         )
         .await,
     ))
 }
 
-/// The page of the VP Audit Log the caller may read: a tenant's access token
+/// The page of the VP Audit Log `reader` may read: a tenant's access token
 /// reads only the records of its own tenant's credential providers. While the
 /// credential providers cannot be read, such a caller gets an empty page.
 async fn audit_log_page(
     providers: Option<&dyn CredentialProviderStorage>,
-    tenant: Option<&PatTenantContext>,
-    resource_scope: Option<&PatResourceScope>,
-    delegation: Option<&PatDelegationContext>,
+    reader: &VaultReader,
     query: AuditLogQuery,
 ) -> AuditLogResponse {
     let limit = query.limit.clamp(1, 500);
@@ -92,8 +78,8 @@ async fn audit_log_page(
         category_counts: std::collections::BTreeMap::new(),
     };
 
-    let reader = match VaultReadScope::of(providers, tenant, resource_scope, delegation).await {
-        Ok(reader) => reader,
+    let scope = match VaultReadScope::of(providers, reader).await {
+        Ok(scope) => scope,
         Err(e) => {
             tracing::warn!(error = %e, "Audit log read refused: the credential providers could not be read");
             return empty();
@@ -111,7 +97,7 @@ async fn audit_log_page(
             decision: query.decision.as_deref(),
             exclude_vp_audit: false,
         },
-        &reader,
+        &scope,
     )
     .await;
 
@@ -134,8 +120,12 @@ async fn audit_log_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_manager::pat::PatDelegationContext;
     use crate::delegation_vault::audit::reading_audit_log_from;
-    use crate::delegation_vault::read_scope::tests::{InMemoryProviders, audit_log_of_two_tenants, delegation, tenant};
+    use crate::delegation_vault::read_scope::tests::{
+        InMemoryProviders, audit_log_of_two_tenants, delegation, reader, tenant,
+    };
+    use crate::tenancy::PatTenantContext;
 
     async fn read(
         providers: &InMemoryProviders,
@@ -145,7 +135,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let log = audit_log_of_two_tenants(directory.path()).await;
         let query = serde_json::from_value(serde_json::json!({})).unwrap();
-        reading_audit_log_from(log, audit_log_page(Some(providers), tenant, None, delegation, query)).await
+        let caller = reader(tenant.cloned(), None, delegation.cloned());
+        reading_audit_log_from(log, audit_log_page(Some(providers), &caller, query)).await
     }
 
     fn provider_ids(response: &AuditLogResponse) -> Vec<Option<&str>> {

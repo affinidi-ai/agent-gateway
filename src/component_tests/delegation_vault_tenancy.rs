@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::routing::get;
 use axum::{Router, middleware};
 use chrono::Utc;
 use tower::ServiceExt;
@@ -18,6 +20,7 @@ use crate::delegation_vault::DelegationToken;
 use crate::delegation_vault::audit::reading_audit_log_from;
 use crate::delegation_vault::handlers::DelegationVaultState;
 use crate::delegation_vault::read_scope::tests::{audit_log_of_two_tenants, provider};
+use crate::delegation_vault::read_scope::{VaultReadScope, VaultReader};
 use crate::delegation_vault::router::create_delegation_vault_router;
 use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
 
@@ -29,6 +32,8 @@ const TENANT_HEADER: &str = "x-external-account";
 /// `cp-global`, and a vault token of each, `t-a`, `t-b` and `t-global`.
 struct Vault {
     app: Router,
+    auth: AuthGuardState,
+    providers: Arc<dyn CredentialProviderStorage>,
     tokens: Arc<FsAccessTokenStore>,
     vault: Arc<dyn DelegationVaultStorage>,
     admin_session: String,
@@ -60,6 +65,7 @@ async fn vault() -> Vault {
             .await
             .unwrap();
     }
+    let providers: Arc<dyn CredentialProviderStorage> = Arc::new(providers);
     let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
         FileSystemDelegationVaultStore::new(path("vault"))
             .await
@@ -80,7 +86,7 @@ async fn vault() -> Vault {
     .unwrap();
     let state = DelegationVaultState {
         vault_store: vault.clone(),
-        provider_store: Arc::new(providers),
+        provider_store: providers.clone(),
         secrets_store: Arc::new(secrets),
         gateway_base_url: "https://gw.example".to_string(),
         agent_surface_store: None,
@@ -142,13 +148,46 @@ async fn vault() -> Vault {
     let auth = AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
         .with_pat_authenticator(Some(tokens.clone()));
     let app = create_delegation_vault_router(state, Some(RbacGuard::new(users, rbac)))
-        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+        .layer(middleware::from_fn_with_state(auth.clone(), require_session_auth));
     Vault {
         app,
+        auth,
+        providers,
         tokens,
         vault,
         admin_session,
         directory,
+    }
+}
+
+impl Vault {
+    /// The read scope a vault route takes from a request with `bearer`
+    /// behind the same middleware.
+    async fn read_scope(
+        &self,
+        bearer: &str,
+        tenant_id: Option<&str>,
+    ) -> VaultReadScope {
+        let seen = Arc::new(Mutex::new(None));
+        let probe = {
+            let (providers, seen) = (self.providers.clone(), seen.clone());
+            move |reader: VaultReader| async move {
+                let scope = VaultReadScope::of(Some(providers.as_ref()), &reader)
+                    .await
+                    .unwrap();
+                *seen.lock().unwrap() = Some(scope);
+                StatusCode::NO_CONTENT
+            }
+        };
+        let app = Router::new()
+            .route("/api/v1/delegation-vault", get(probe))
+            .layer(middleware::from_fn_with_state(self.auth.clone(), require_session_auth));
+        let (status, body) = send(&app, "GET", "/api/v1/delegation-vault", bearer, tenant_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        seen.lock()
+            .unwrap()
+            .take()
+            .expect("the probe saw the request")
     }
 }
 
@@ -287,6 +326,39 @@ async fn an_appliance_wide_access_token_reads_every_vault_token() {
         assert_eq!(status, StatusCode::OK, "{global}");
         assert_eq!(global["credential_provider_id"], "cp-global");
     }
+}
+
+#[tokio::test]
+async fn a_vault_reader_takes_the_whole_caller_from_the_request() {
+    let fixture = vault().await;
+    let appliance_wide = access_token(&fixture.tokens, None, Vec::new()).await;
+    let tenant = tenant_access_token(&fixture.tokens, "tenant-a").await;
+    let header_only = access_token(&fixture.tokens, None, tenant_header("tenant-a")).await;
+
+    assert_eq!(
+        fixture
+            .read_scope(&fixture.admin_session, None)
+            .await,
+        VaultReadScope::Appliance
+    );
+    assert_eq!(
+        fixture
+            .read_scope(&appliance_wide, None)
+            .await,
+        VaultReadScope::Appliance
+    );
+    assert_eq!(
+        fixture
+            .read_scope(&tenant, Some("tenant-a"))
+            .await,
+        VaultReadScope::Tenant(HashSet::from(["cp-a".to_string()]))
+    );
+    assert_eq!(
+        fixture
+            .read_scope(&header_only, Some("tenant-a"))
+            .await,
+        VaultReadScope::Nothing
+    );
 }
 
 #[tokio::test]
