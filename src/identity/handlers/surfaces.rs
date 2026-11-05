@@ -1136,7 +1136,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 /// each that opts Fabric callers in to delegated credentials without a
 /// managed identity ([`fabric_delegation_identity_warnings`]), each that
 /// does so where the surface cannot tell a partner's users apart
-/// ([`fabric_caller_delegation_warnings`]), and each with external consent
+/// ([`fabric_caller_delegation_warnings`]), each view whose Target does so
+/// there, or on a Target the switch has no effect on
+/// ([`target_fabric_caller_delegation_warnings`]), and each with external consent
 /// that a variant keeps under its own settings
 /// ([`inherited_external_point_warnings`]), as the Access Point Target's
 /// binding with external consent ([`inherited_target_binding_warnings`]),
@@ -1165,6 +1167,7 @@ async fn save_warnings(
         .chain(fabric_hop_limit_warnings(surface))
         .chain(fabric_delegation_identity_warnings(surface))
         .chain(fabric_caller_delegation_warnings(surface, &issuers))
+        .chain(target_fabric_caller_delegation_warnings(surface, &issuers))
         .chain(inherited_external_point_warnings(surface))
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
@@ -1641,13 +1644,47 @@ fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
     warnings
 }
 
+/// Why `view`'s caller authentication cannot tell apart the users a paired
+/// gateway sends requests for over Fabric
+/// ([`AgentSurface::fabric_caller_authentication_gap`]), or names a JWT
+/// verification strategy that, in `issuers`, names no issuer; `None` when it
+/// can tell them apart.
+fn fabric_caller_gap(
+    view: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Option<String> {
+    view.fabric_caller_authentication_gap()
+        .map(str::to_string)
+        .or_else(|| {
+            let (access_point, _) = jwt_bearer_methods(view, None);
+            access_point
+                .iter()
+                .map(|config| {
+                    config
+                        .jwt_verification_strategy_id
+                        .as_str()
+                })
+                .find(|strategy| {
+                    issuers
+                        .get(*strategy)
+                        .is_none_or(|naming| {
+                            naming
+                                .issuer
+                                .trim()
+                                .is_empty()
+                        })
+                })
+                .map(|strategy| {
+                    format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read")
+                })
+        })
+}
+
 /// Each Transit Point, on the surface or in an enabled variant, that sets
 /// `delegated_credentials_for_fabric_callers` where the view's caller
-/// authentication cannot tell a partner's users apart
-/// ([`AgentSurface::fabric_caller_authentication_gap`]), or names a JWT
-/// verification strategy that, in `issuers`, names no issuer. The receiving
-/// surface then puts no principal in a partner's transit token, so the
-/// Transit Point releases no delegated credential to Fabric callers.
+/// authentication cannot tell a partner's users apart ([`fabric_caller_gap`]).
+/// The receiving surface then puts no principal in a partner's transit token,
+/// so the Transit Point releases no delegated credential to Fabric callers.
 fn fabric_caller_delegation_warnings(
     surface: &AgentSurface,
     issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
@@ -1661,33 +1698,7 @@ fn fabric_caller_delegation_warnings(
         else {
             continue;
         };
-        let gap = view
-            .fabric_caller_authentication_gap()
-            .map(str::to_string)
-            .or_else(|| {
-                let (access_point, _) = jwt_bearer_methods(&view, None);
-                access_point
-                    .iter()
-                    .map(|config| {
-                        config
-                            .jwt_verification_strategy_id
-                            .as_str()
-                    })
-                    .find(|strategy| {
-                        issuers
-                            .get(*strategy)
-                            .is_none_or(|naming| {
-                                naming
-                                    .issuer
-                                    .trim()
-                                    .is_empty()
-                            })
-                    })
-                    .map(|strategy| {
-                        format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read")
-                    })
-            });
-        if let Some(gap) = gap {
+        if let Some(gap) = fabric_caller_gap(&view, issuers) {
             let label = variant.map_or_else(String::new, |alias| format!("variant '{alias}': "));
             warnings.push(format!(
                 "{label}Transit Point '{}' sets delegated_credentials_for_fabric_callers, but the surface's caller \
@@ -1698,6 +1709,46 @@ fn fabric_caller_delegation_warnings(
         }
     }
     warnings
+}
+
+/// Each view, the surface or an enabled variant, whose Target sets
+/// `delegated_credentials_for_fabric_callers` where the switch has no effect:
+/// on a Target that is not an HTTP or HTTPS URL
+/// ([`AgentSurface::target_is_http_url`]), to which Fabric receive sends no
+/// delegated credential, or where the view's caller authentication cannot
+/// tell a partner's users apart ([`fabric_caller_gap`]), when Fabric receive
+/// releases none of that view's per-user grants to partners. These are the
+/// conditions [`AgentSurface::releases_target_grants_to_fabric_callers`]
+/// checks on every request, with the strategy's issuer besides. The save is
+/// not refused, as for a Transit Point.
+fn target_fabric_caller_delegation_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    surface_views(surface)
+        .into_iter()
+        .filter(|(_, view)| {
+            view.target
+                .delegated_credentials_for_fabric_callers
+        })
+        .filter_map(|(variant, view)| {
+            let label = variant.map_or_else(String::new, |alias| format!("variant '{alias}': "));
+            if !view.target_is_http_url() {
+                return Some(format!(
+                    "{label}the Target sets delegated_credentials_for_fabric_callers, but its endpoint is not an \
+                     http:// or https:// URL, so Fabric receive sends it no delegated credential and the switch has \
+                     no effect there"
+                ));
+            }
+            fabric_caller_gap(&view, issuers).map(|gap| {
+                format!(
+                    "{label}the Target sets delegated_credentials_for_fabric_callers, but the surface's caller \
+                     authentication cannot tell a partner's users apart, and {gap}, so Fabric callers get none of \
+                     its per-user delegated credentials"
+                )
+            })
+        })
+        .collect()
 }
 
 /// Each Transit Point with `consent_mode: external` that an enabled variant
@@ -6777,6 +6828,163 @@ mod validation_tests {
         );
     }
 
+    /// A Target that releases per-user grants to Fabric callers is warned of
+    /// for each view, the surface or an enabled variant, whose caller
+    /// authentication cannot tell a partner's users apart, by the rule a
+    /// Transit Point's switch follows, or whose Target is not an HTTP URL; not
+    /// where callers are told apart, or where the view's Target does not set
+    /// the switch.
+    #[test]
+    fn target_warnings_name_each_view_where_the_switch_releases_nothing() {
+        let issuers = std::collections::HashMap::from([
+            ("idp".to_string(), naming("https://idp.example", "sub")),
+            ("blank".to_string(), naming("", "sub")),
+        ]);
+        let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
+        let mtls = serde_json::json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["cert"] },
+            "identity_binding": { "type": "fingerprint" } });
+        let releasing = |methods: serde_json::Value, releases: bool| {
+            let mut surface = with_caller_authentication(
+                surface_with_transit_points(serde_json::json!([]), serde_json::json!([])),
+                methods,
+            );
+            surface
+                .target
+                .delegated_credentials_for_fabric_callers = releases;
+            surface
+        };
+        let warning = "the Target sets delegated_credentials_for_fabric_callers, but the surface's caller \
+                       authentication cannot tell a partner's users apart, and";
+
+        let mut resource_tokens = releasing(serde_json::json!([mtls.clone()]), true);
+        resource_tokens.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({ "authorization": { "resource": "https://gw.example/mcp" } }))
+                .unwrap(),
+        );
+        for (case, quiet) in [
+            ("a JWT naming an audience", releasing(serde_json::json!([per_user_jwt()]), true)),
+            (
+                "a JWT naming an audience beside mTLS",
+                releasing(serde_json::json!([mtls.clone(), per_user_jwt()]), true),
+            ),
+            ("a resource token beside mTLS", resource_tokens),
+            ("the switch off beside an API key", releasing(serde_json::json!([caller_key()]), false)),
+        ] {
+            assert_eq!(target_fabric_caller_delegation_warnings(&quiet, &issuers), Vec::<String>::new(), "{case}");
+        }
+
+        for (case, methods, reason) in [
+            ("no caller authentication", serde_json::json!([]), "it verifies no caller"),
+            ("mTLS only", serde_json::json!([mtls.clone()]), "it verifies no caller"),
+            ("an API key", serde_json::json!([caller_key()]), "every key in its secret as one caller"),
+            (
+                "an API key beside a JWT",
+                serde_json::json!([per_user_jwt(), caller_key()]),
+                "every key in its secret as one caller",
+            ),
+            (
+                "an API Key Provider key",
+                serde_json::json!([{ "type": "api_key_provider", "agent_id": "keys",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" } }]),
+                "names the client that holds it",
+            ),
+            (
+                "a DID Auth session",
+                serde_json::json!([{ "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session" } }]),
+                "names the DID that signed in",
+            ),
+            ("a JWT naming no audience", serde_json::json!([jwt("idp", serde_json::json!([]))]), "names no audience"),
+            (
+                "a JWT naming no strategy",
+                serde_json::json!([jwt("", serde_json::json!(["api://agent"]))]),
+                "names no JWT verification strategy",
+            ),
+            (
+                "a JWT whose strategy cannot be read",
+                serde_json::json!([jwt("missing", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'missing' names no issuer",
+            ),
+            (
+                "a JWT whose strategy names no issuer",
+                serde_json::json!([jwt("blank", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'blank' names no issuer",
+            ),
+        ] {
+            let warnings = target_fabric_caller_delegation_warnings(&releasing(methods, true), &issuers);
+            assert_eq!(warnings.len(), 2, "{case}: the surface and its variant: {warnings:?}");
+            assert!(warnings[0].starts_with(warning), "{case}: {warnings:?}");
+            assert!(warnings[1].starts_with(&format!("variant 'candidate': {warning}")), "{case}: {warnings:?}");
+            for warning in &warnings {
+                assert!(warning.contains(reason), "{case}: {warning}");
+                assert!(warning_header(warning).is_some(), "{case}: {warning}");
+            }
+        }
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&releasing(serde_json::json!([caller_key()]), true), &issuers)[0],
+            "the Target sets delegated_credentials_for_fabric_callers, but the surface's caller authentication \
+             cannot tell a partner's users apart, and an api_key method names every key in its secret as one caller, \
+             the partner's and direct callers' alike, so Fabric callers get none of its per-user delegated credentials"
+        );
+
+        let mut variant_key = releasing(serde_json::json!([per_user_jwt()]), true);
+        variant_key.variants[0]
+            .overrides
+            .access_point = Some(
+            serde_json::from_value(serde_json::json!({ "caller_authentication": { "methods": [caller_key()] } }))
+                .unwrap(),
+        );
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&variant_key, &issuers)
+                .iter()
+                .map(|found| found.starts_with(&format!("variant 'candidate': {warning}")))
+                .collect::<Vec<_>>(),
+            [true],
+            "only the variant that verifies an API key"
+        );
+
+        let mut variant_off = releasing(serde_json::json!([caller_key()]), true);
+        variant_off.variants[0]
+            .overrides
+            .target = Some(
+            serde_json::from_value(serde_json::json!({ "delegated_credentials_for_fabric_callers": false })).unwrap(),
+        );
+        let warnings = target_fabric_caller_delegation_warnings(&variant_off, &issuers);
+        assert_eq!(warnings.len(), 1, "a variant that turns the switch off is not warned of: {warnings:?}");
+        assert!(warnings[0].starts_with(warning), "{warnings:?}");
+
+        variant_key.variants[0].enabled = false;
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&variant_key, &issuers),
+            Vec::<String>::new(),
+            "a disabled variant serves nothing"
+        );
+
+        for endpoint in [
+            "proxy://tools",
+            "a2a-proxy://worker",
+            "fabric://peer/surface",
+            "ws://agent.internal/socket",
+            "agent.internal:8080",
+            "HTTPS://agent.internal",
+            " https://agent.internal",
+        ] {
+            for methods in [serde_json::json!([per_user_jwt()]), serde_json::json!([caller_key()])] {
+                let mut not_http = releasing(methods, true);
+                not_http.target.endpoint = endpoint.to_string();
+                assert!(!not_http.target_is_http_url(), "{endpoint}");
+                assert_eq!(
+                    target_fabric_caller_delegation_warnings(&not_http, &issuers),
+                    ["", "variant 'candidate': "].map(|label| format!(
+                        "{label}the Target sets delegated_credentials_for_fabric_callers, but its endpoint is not an \
+                         http:// or https:// URL, so Fabric receive sends it no delegated credential and the switch \
+                         has no effect there"
+                    )),
+                    "{endpoint}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_transit_point_that_cannot_authenticate_its_callers_is_refused_on_the_surface_and_in_a_variant() {
         let valid = serde_json::json!([{ "alias": "partner", "target_endpoint": "https://partner.example" }]);
@@ -7609,6 +7817,7 @@ mod validation_tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,

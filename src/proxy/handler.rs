@@ -7125,12 +7125,9 @@ async fn proxy_handler_with_mcp_runtime(
                 .as_ref()
                 .and_then(crate::surface_context::McpContext::called_tool_name);
 
-            // Use the agent DID from request-path identity extraction.
-            // Fall back to channel_id as the workload identity when no
-            // managed identity is configured.
-            let agent_did_for_vault = request_agent_did
-                .as_deref()
-                .unwrap_or(config_id);
+            let agent_did_for_vault = state
+                .surface
+                .target_grant_agent_did(request_agent_did.as_deref());
 
             // Only a verified JWT establishes who consented; every other source
             // auth mode leaves this None and so cannot unlock a consent record.

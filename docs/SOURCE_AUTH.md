@@ -853,10 +853,16 @@ caller as `verification: fabric_peer`, verified only with a `fabric.principal_ha
 even when a presentation carried it, so policy sees it as the peer's (`fabric.caller_did`),
 never as the caller's `did`. Static `target_auth`
 credentials are added as for any caller. Delegated per-user credentials are released for it
-only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, which the
-admin API accepts only on a surface whose caller authentication tells a partner's users apart,
-and only for the caller in `fabric.principal_hash` (see
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true` on a surface
+whose caller authentication tells a partner's users apart (a save elsewhere answers with a
+`Warning`, and the Transit Point releases nothing there), and only for the caller in
+`fabric.principal_hash` (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)). The
+receiving surface's own Target follows the same rule with its own switch,
+`target.delegated_credentials_for_fabric_callers`: it is sent the grant of the caller the surface
+verified on the request, kept under the surface, only on a view whose HTTP or HTTPS Target sets
+it beside caller authentication that tells a partner's users apart (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 A Transit Point's audit records name a caller in `fabric.principal_hash` with
 `auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a
 caller verified by an API key, and the allowlisted `sub`, `email` and `name` the receiving

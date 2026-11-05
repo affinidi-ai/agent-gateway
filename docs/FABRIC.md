@@ -476,8 +476,8 @@ The setting applies to one route only. Another `fabric://` Target or Transit Poi
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
 `outbound_credentials` uses only its own `transit_credentials`, never another Transit Point's. A
 Target variant can override the setting, a variant's `transit.points` override sets it for that
-variant's Transit Points, and a variant with `complete: true` that omits the Target override turns
-it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
+variant's Transit Points, and a complete (`complete: true`) variant's Target override that omits
+it turns it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
 credential.
 
 When the setting keeps bindings from a peer, the sending gateway logs `Delegated credentials
@@ -492,16 +492,27 @@ credentials over Fabric** switch on the Managed Agent or Transit Point panel, sh
 The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
 whose `params.name` it lists, read after admission has refused batches and ambiguous keys. It keys
-the grant only by the caller its own source authentication verified on the request: a pseudonym,
-DID or presentation the peer's request names never selects stored credentials. That caller is
-usually the partner's own `target_auth` credential, which names all of the partner's users alike,
-so a per-user grant never reaches a legacy Fabric request; a partner's calls use one only through
-a Transit Point that opts in. Service-level credentials reach a request whose caller the surface
-verified. The receiving gateway never starts consent for a legacy Fabric request. Each refusal is
-a `403` with a fixed reason (`delegation_not_enabled_for_partners` or
-`partner_caller_not_verified`), answered before the Target is called and recorded as a
-`request_rejected`; an agent card fetch is never refused for a binding
-(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+the grant only by the receiving surface and the caller its own source authentication verified on
+the request: a pseudonym, DID, presentation or transit token the peer's request carries never
+selects stored credentials. A per-user grant reaches a legacy Fabric request only when the view
+that serves it sets `target.delegated_credentials_for_fabric_callers: true` (off by default) on an
+HTTP or HTTPS Target and its caller authentication tells a partner's users apart, such as a JWT
+that names an audience: the partner then forwards each person's own token, and the person's
+grant, made by connecting to the surface directly with a legacy request, is sent to the Target.
+The switch has no effect on a Target that is not an `http://` or `https://` URL exactly as
+written, with a lower-case scheme and nothing before it. A grant made
+through a `2026-07-28` MCP request is kept under the agent DID that request names and never
+reaches a partner's request. A variant can override the switch, and a complete variant's Target
+override that omits it turns it off. A partner's own `target_auth` credential names all of the
+partner's users alike: never pair the switch with a partner that presents a static `target_auth`
+JWT, which maps every one of its users to one grant. An Agent Gateway peer strips its caller's own
+token from a legacy Fabric send and presents only its `target_auth`, so two Agent Gateways cannot
+use the switch yet. Service-level credentials reach a request whose caller the surface
+verified, without the switch. The receiving gateway never starts consent for a legacy Fabric
+request. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
+`partner_caller_not_verified` or `consent_not_available_for_partners`), answered before the
+Target is called and recorded as a `request_rejected`; an agent card fetch is never refused for a
+binding (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 A receiving surface whose Target is bound by external consent (`consent_mode: external`) refuses
 every request with `403`, public discovery reads included, before any payment is asked for or
 verified: the caller the peer asserts never keys a grant by binding, and a discovery read would
@@ -514,9 +525,10 @@ matter. In a mixed-version fleet, a receiving node that predates them still keys
 grants by the caller the peer's request names, releases per-user grants to partners without the
 switch, and answers a missing grant with an authorization URL the partner sees. Such a node stays
 exposed until it is upgraded, so upgrade every node that receives Fabric requests before relying
-on these rules. A node that predates the surface's switch refuses to load a surface that sets it,
-on the surface or in a variant, rather than serve it without these rules, and a `PUT` through
-such a node saves the surface without it, which turns it off.
+on these rules. A node that predates the Target's switch refuses to load a surface that sets it,
+on the Target or in a variant, rather than serve it without these rules, and a save through such
+a node that leaves the switch out, as that node's dashboard does, turns it off. Before moving a
+node back to such a release, turn the switch off on every surface and variant.
 
 When the agent behind the receiving surface then calls one of its own Transit Points with the
 transit token it got for the peer's request, that Transit Point releases a delegated per-user
