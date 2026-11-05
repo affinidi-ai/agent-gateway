@@ -203,6 +203,59 @@ async fn surface_saves_that_reload_the_gateway_refuse_no_connection() {
     assert_eq!(call(&h, "/aliased$beta").await, 404, "the deleted surface's alias route stops answering");
 }
 
+/// A port removed from `gateway.json` stops answering after a reload, while
+/// the ports still configured stay bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_removed_from_the_network_configuration_stops_after_a_reload() {
+    let mut admin = None;
+    let mut network_path = None;
+    let h = GatewayHarness::start_with_outbound(|_, _, bootstrap| {
+        admin = Some(configure_admin_api(bootstrap));
+        network_path = Some(std::path::PathBuf::from(&bootstrap.config_files.gateway));
+    })
+    .await;
+    let admin = admin.unwrap();
+    let network_path = network_path.unwrap();
+    let outbound = (
+        "127.0.0.1",
+        port_of(
+            h.outbound_url
+                .as_deref()
+                .unwrap(),
+        ),
+    );
+    assert!(
+        tokio::net::TcpStream::connect(outbound)
+            .await
+            .is_ok(),
+        "the outbound port is served"
+    );
+
+    let mut network: Value = serde_json::from_slice(&std::fs::read(&network_path).unwrap()).unwrap();
+    network["listeners"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|listener| listener["listener_type"] != "outbound");
+    std::fs::write(&network_path, serde_json::to_vec(&network).unwrap()).unwrap();
+    let (status, reloaded) = send(admin.post(format!("{}/api/v1/config/reload", h.gateway_base))).await;
+    assert_eq!(status, 200, "{reloaded}");
+
+    let mut refused = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(outbound)
+            .await
+            .is_err()
+        {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused, "the removed outbound port stops answering");
+    let (status, _) = send(admin.get(format!("{}/api/v1/alive", h.gateway_base))).await;
+    assert_eq!(status, 200, "the inbound port stays bound");
+}
+
 /// A port whose router a reload cannot rebuild, because one of its surfaces
 /// names a default variant it does not have, keeps serving its previous
 /// router, and a surface created on that port afterwards is still served.
@@ -254,6 +307,13 @@ async fn a_surface_created_on_a_port_whose_router_could_not_be_rebuilt_is_served
     std::fs::write(&stored_path, serde_json::to_vec(&stored).unwrap()).unwrap();
     let (status, reloaded) = send(admin.post(format!("{}/api/v1/config/reload", h.gateway_base))).await;
     assert_eq!(status, 200, "{reloaded}");
+    let warning = reloaded["warning"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        warning.contains(&format!("port {}: CONFIGURATION ERROR", port_of(&h.gateway_base))),
+        "the reload reports the port that keeps its previous routes: {reloaded}"
+    );
     assert_eq!(call(&h, "/kept").await, 200, "the port keeps serving its previous router");
 
     let (status, added) = send(create("added")).await;

@@ -114,6 +114,10 @@ impl BoundPort {
         self.binding == *binding && !self.handle.is_finished()
     }
 
+    pub fn speaks_tls(&self) -> bool {
+        self.binding.tls
+    }
+
     /// Serve `router` from the next request on, and `tls_config`, when given,
     /// from the next TLS handshake on, without unbinding the port.
     pub fn swap(
@@ -339,6 +343,46 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         (Arc::new(server), tokio_rustls::TlsConnector::from(Arc::new(client)))
+    }
+
+    /// Whether a new TLS connection to `address` completes its handshake
+    /// with a client trusting only the certificate `connector` trusts.
+    async fn handshakes(
+        address: SocketAddr,
+        connector: &tokio_rustls::TlsConnector,
+    ) -> bool {
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .unwrap();
+        connector
+            .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_swapped_tls_configuration_serves_its_certificate_from_the_next_handshake() {
+        let (first, trusts_first) = localhost_tls();
+        let (rotated, trusts_rotated) = localhost_tls();
+        let binding = free_loopback_binding(true);
+        let address = binding.addresses[0];
+        let bound = BoundPort::bind(address.port(), binding, router_answering("/"), Some(first), false)
+            .await
+            .unwrap();
+        assert!(handshakes(address, &trusts_first).await);
+        assert!(!handshakes(address, &trusts_rotated).await);
+
+        bound.swap(router_answering("/"), Some(rotated));
+
+        assert!(handshakes(address, &trusts_rotated).await, "the rotated certificate is served");
+        assert!(!handshakes(address, &trusts_first).await, "the previous certificate is no longer served");
+
+        bound.swap(router_answering("/"), None);
+
+        assert!(
+            handshakes(address, &trusts_rotated).await,
+            "a swap without a TLS configuration keeps the certificate served"
+        );
     }
 
     #[tokio::test]

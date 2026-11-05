@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -38,6 +37,14 @@ fn extract_port_from_address(addr: &str) -> Option<u16> {
     }
 }
 
+/// A port a reload could not serve a rebuilt router on.
+pub(crate) struct PortFailure {
+    pub(crate) error: anyhow::Error,
+    /// The state of the previous router, which the listener still bound on
+    /// the port keeps serving.
+    pub(crate) kept: Option<Arc<crate::state::MultiSurfaceProxyState>>,
+}
+
 /// Shared state for managing channel tasks and configuration reloading
 #[derive(Clone)]
 pub struct SurfaceTaskManager {
@@ -49,8 +56,6 @@ pub struct SurfaceTaskManager {
     /// Live-updatable outbound channel states keyed by config_id
     pub(crate) outbound_channel_states:
         Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::RwLock<crate::state::OutboundSurfaceState>>>>>,
-    /// Handles to running channel tasks mapped by channel name (DEPRECATED - channels don't have separate tasks anymore)
-    pub(crate) channel_handles: Arc<RwLock<HashMap<String, AbortHandle>>>,
     /// Task IDs mapped by channel name (for unregistering from TaskMonitor)
     pub(crate) task_ids: Arc<RwLock<HashMap<String, String>>>,
     /// Configuration for channels
@@ -131,7 +136,6 @@ impl SurfaceTaskManager {
             bound_ports: Arc::new(RwLock::new(HashMap::new())),
             port_listener_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_channel_states: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            channel_handles: Arc::new(RwLock::new(HashMap::new())),
             task_ids: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             bootstrap_config,
@@ -365,11 +369,21 @@ impl SurfaceTaskManager {
             .flatten();
         let binding = PortBinding { addresses, tls: use_tls };
         let mut ports = self.bound_ports.write().await;
-        if let Some(bound) = ports.get(&port)
-            && bound.serves(&binding)
-        {
-            bound.swap(router, tls_config);
-            return Ok(());
+        if let Some(bound) = ports.get(&port) {
+            if bound.serves(&binding) {
+                debug!(
+                    port,
+                    tls_config_applied = tls_config.is_some(),
+                    "Swapped the router of the listener on port {port}"
+                );
+                bound.swap(router, tls_config);
+                return Ok(());
+            }
+            if use_tls && tls_config.is_none() && bound.speaks_tls() {
+                anyhow::bail!(
+                    "Port {port} keeps its TLS listener: binding it on its new addresses needs a TLS configuration that could not be loaded"
+                );
+            }
         }
         if ports.remove(&port).is_some() {
             info!("Binding port {} again: its addresses or TLS setting changed", port);
@@ -378,6 +392,118 @@ impl SurfaceTaskManager {
         let bound = BoundPort::bind(port, binding, router, tls_config, direct_client_auth.is_some()).await?;
         ports.insert(port, bound);
         Ok(())
+    }
+
+    /// Serve a rebuilt inbound router on `port`, on its configured inbound
+    /// addresses, and return the state single-surface reloads update from now
+    /// on. On failure the task rows registered for `surfaces`, the port's
+    /// surfaces, are removed; when the port's previous listener is still bound
+    /// it keeps serving its previous router, whose state is returned in the
+    /// failure and whose rows are restored from `previous_rows`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn serve_inbound_port(
+        &self,
+        port: u16,
+        surfaces: &[crate::config::agent_surface::AgentSurface],
+        built: anyhow::Result<(axum::Router, Arc<crate::state::MultiSurfaceProxyState>)>,
+        network_config: &crate::config::NetworkConfig,
+        use_tls: bool,
+        config: &GatewayConfig,
+        task_monitor: Option<&crate::observability::TaskMonitor>,
+        previous_rows: &[crate::observability::TaskInfo],
+    ) -> Result<Arc<crate::state::MultiSurfaceProxyState>, PortFailure> {
+        let served = match built {
+            Ok((router, state)) => match super::server::inbound_bind_addresses(network_config, port) {
+                Ok(addresses) => self
+                    .serve_port(port, addresses, use_tls, router, config)
+                    .await
+                    .map(|()| state),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        let error = match served {
+            Ok(state) => return Ok(state),
+            Err(error) => error,
+        };
+        error!("Port listener error for port {}: {}", port, error);
+        if let Some(monitor) = task_monitor {
+            for config_id in surfaces
+                .iter()
+                .filter_map(|surface| surface.config_id())
+            {
+                monitor
+                    .unregister_all_tasks_for_config_id(config_id)
+                    .await;
+            }
+        }
+        let still_bound = self
+            .bound_ports
+            .read()
+            .await
+            .contains_key(&port);
+        let kept = if still_bound {
+            self.port_listener_states
+                .read()
+                .await
+                .get(&port)
+                .cloned()
+        } else {
+            None
+        };
+        if let (Some(monitor), Some(kept)) = (task_monitor, kept.as_ref()) {
+            let kept_config_ids: std::collections::HashSet<String> = kept
+                .channels
+                .read()
+                .await
+                .iter()
+                .filter_map(|channel| {
+                    channel
+                        .surface
+                        .config_id()
+                        .map(str::to_string)
+                })
+                .collect();
+            for row in previous_rows {
+                if row
+                    .config_id
+                    .as_ref()
+                    .is_some_and(|config_id| kept_config_ids.contains(config_id))
+                {
+                    monitor
+                        .register_task(row.clone())
+                        .await;
+                }
+            }
+        }
+        Err(PortFailure { error, kept })
+    }
+
+    /// Serve a rebuilt outbound router on `port`, on `bind_address`. The error
+    /// is logged and returned; a listener still bound on the port keeps
+    /// serving its previous router.
+    pub(crate) async fn serve_outbound_port(
+        &self,
+        port: u16,
+        bind_address: &str,
+        built: anyhow::Result<axum::Router>,
+        use_tls: bool,
+        config: &GatewayConfig,
+    ) -> anyhow::Result<()> {
+        let served = match built {
+            Ok(router) => match super::server::listener_socket_address(bind_address, port) {
+                Ok(address) => {
+                    self.serve_port(port, vec![address], use_tls, router, config)
+                        .await
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &served {
+            error!("Outbound port listener error for port {}: {}", port, e);
+        }
+        served
     }
 
     /// Update configuration and swap the routers of the port listeners
@@ -395,30 +521,21 @@ impl SurfaceTaskManager {
         let _reload_guard = self.reload_lock.lock().await;
         info!("Reloading channel configuration...");
 
-        // Step 1: Abort all existing port listener tasks
-        {
-            let mut handles = self
-                .channel_handles
-                .write()
-                .await;
-            let mut task_ids_map = self.task_ids.write().await;
-            info!("Stopping {} existing per-channel listener tasks", handles.len());
-
-            // Abort all per-channel handles (legacy; usually empty in the
-            // port-listener model).
-            for (channel_name, handle) in handles.drain() {
-                info!("Aborting per-channel listener: {}", channel_name);
-                handle.abort();
-            }
-
-            // Clear task IDs map
-            task_ids_map.clear();
-        }
+        // Step 1: Clear the task IDs map
+        self.task_ids
+            .write()
+            .await
+            .clear();
 
         // Step 2: Drop every TaskInfo entry before the routers are rebuilt.
         // Building a port router registers a task per channel and Transit
         // Point, and their task_ids embed a fresh UUID, so without this clear
-        // every reload would accumulate duplicate rows.
+        // every reload would accumulate duplicate rows. The rows are kept
+        // aside for a port that keeps serving its previous router.
+        let previous_rows = match task_monitor {
+            Some(ref monitor) => monitor.get_all_tasks().await,
+            None => Vec::new(),
+        };
         if let Some(ref monitor) = task_monitor {
             let cleared = monitor
                 .clear_all_tasks()
@@ -556,6 +673,7 @@ impl SurfaceTaskManager {
         info!("Grouped {} channels across {} configured ports", channels_count, channels_by_port.len());
 
         let mut new_port_states = HashMap::new();
+        let mut failed_ports = Vec::new();
 
         // Serve ONE router per configured port that handles routing to all channels on that port
         // Iterate over ALL configured ports, not just those with channels
@@ -675,32 +793,29 @@ impl SurfaceTaskManager {
                     .await
                     .clone();
 
-                let served = async {
-                    let router = super::server::build_outbound_port_router(
-                        port,
-                        outbound_channels,
-                        new_config.clone(),
-                        network_config_clone,
-                        metrics_store.clone(),
-                        secrets_store.clone(),
-                        policy_manager.clone(),
-                        gateway_policy_manager,
-                        crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
-                        self.vc_issuer.clone(),
-                        task_monitor.clone(),
-                        self.outbound_channel_states
-                            .clone(),
-                        self.listener_manager.clone(),
-                        source_auth_middleware,
-                    )
-                    .await?;
-                    let address = super::server::listener_socket_address(&bind_address, port)?;
-                    self.serve_port(port, vec![address], use_tls, router, &new_config)
-                        .await
-                }
+                let built = super::server::build_outbound_port_router(
+                    port,
+                    outbound_channels,
+                    new_config.clone(),
+                    network_config_clone,
+                    metrics_store.clone(),
+                    secrets_store.clone(),
+                    policy_manager.clone(),
+                    gateway_policy_manager,
+                    crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
+                    self.vc_issuer.clone(),
+                    task_monitor.clone(),
+                    self.outbound_channel_states
+                        .clone(),
+                    self.listener_manager.clone(),
+                    source_auth_middleware,
+                )
                 .await;
-                if let Err(e) = served {
-                    error!("Outbound port listener error for port {}: {}", port, e);
+                if let Err(e) = self
+                    .serve_outbound_port(port, &bind_address, built, use_tls, &new_config)
+                    .await
+                {
+                    failed_ports.push(format!("port {port}: {e}"));
                 }
                 continue;
             }
@@ -772,74 +887,62 @@ impl SurfaceTaskManager {
                 .await
                 .clone();
 
-            let served = async {
-                let (router, state) = super::server::build_port_router(
+            let built = super::server::build_port_router(
+                port,
+                channels.clone(),
+                tls_acceptor.clone(),
+                client.clone(),
+                new_config.clone(),
+                self.bootstrap_config.clone(),
+                metrics_store.clone(),
+                task_monitor.clone(),
+                self.ws_state.clone(),
+                self.vc_issuer.clone(),
+                self.listener_manager.clone(),
+                identity_router,
+                onboarding_router,
+                did_router,
+                vault_router,
+                secrets_store.clone(),
+                network_config_clone,
+                policy_manager.clone(),
+                gateway_policy_manager,
+                mcp_proxy_store.clone(),
+                a2a_proxy_store.clone(),
+                mcp_server_manager.clone(),
+                self.settings_store.clone(),
+                notification_store,
+                self.didauth_session_store
+                    .clone(),
+                source_auth_middleware,
+                resolved_surface_cache,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_identity_store,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_log_storage,
+            )
+            .await;
+            match self
+                .serve_inbound_port(
                     port,
-                    channels,
-                    tls_acceptor.clone(),
-                    client.clone(),
-                    new_config.clone(),
-                    self.bootstrap_config.clone(),
-                    metrics_store.clone(),
-                    task_monitor.clone(),
-                    self.ws_state.clone(),
-                    self.vc_issuer.clone(),
-                    self.listener_manager.clone(),
-                    identity_router,
-                    onboarding_router,
-                    did_router,
-                    vault_router,
-                    secrets_store.clone(),
-                    network_config_clone,
-                    policy_manager.clone(),
-                    gateway_policy_manager,
-                    mcp_proxy_store.clone(),
-                    a2a_proxy_store.clone(),
-                    mcp_server_manager.clone(),
-                    self.settings_store.clone(),
-                    notification_store,
-                    self.didauth_session_store
-                        .clone(),
-                    source_auth_middleware,
-                    resolved_surface_cache,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_identity_store,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_log_storage,
+                    &channels,
+                    built,
+                    &network_config,
+                    use_tls,
+                    &new_config,
+                    task_monitor.as_deref(),
+                    &previous_rows,
                 )
-                .await?;
-                let served = match super::server::inbound_bind_addresses(&network_config, port) {
-                    Ok(addresses) => {
-                        self.serve_port(port, addresses, use_tls, router, &new_config)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                };
-                if served.is_err() {
-                    super::server::unregister_port_tasks(&state, task_monitor.as_deref()).await;
-                } else {
+                .await
+            {
+                Ok(state) => {
                     new_port_states.insert(port, state);
                 }
-                served
-            }
-            .await;
-            if let Err(e) = served {
-                error!("Port listener error for port {}: {}", port, e);
-                // A listener still bound on the port serves its previous router,
-                // so its previous state stays the one single-surface reloads update.
-                if self
-                    .bound_ports
-                    .read()
-                    .await
-                    .contains_key(&port)
-                    && let Some(previous) = self
-                        .port_listener_states
-                        .read()
-                        .await
-                        .get(&port)
-                        .cloned()
-                {
-                    new_port_states.insert(port, previous);
+                Err(failure) => {
+                    if let Some(kept) = failure.kept {
+                        new_port_states.insert(port, kept);
+                    }
+                    failed_ports.push(format!("port {port}: {}", failure.error));
                 }
             }
         }
@@ -858,19 +961,20 @@ impl SurfaceTaskManager {
             *port_states = new_port_states;
         }
 
-        // Clear channel handles and task IDs since they're now managed by port listeners
-        {
-            let mut handles = self
-                .channel_handles
-                .write()
-                .await;
-            handles.clear();
-        }
-        {
-            let mut task_ids_map = self.task_ids.write().await;
-            task_ids_map.clear();
-        }
+        // Clear task IDs since they're now managed by port listeners
+        self.task_ids
+            .write()
+            .await
+            .clear();
 
+        if !failed_ports.is_empty() {
+            let warning = format!(
+                "These ports could not be given their rebuilt routes and keep serving their previous ones: {}",
+                failed_ports.join("; ")
+            );
+            warn!("{warning}");
+            return Ok((channels_count, false, Some(warning)));
+        }
         info!("Successfully reloaded {} channels", channels_count);
         Ok((channels_count, false, None))
     }
@@ -913,7 +1017,14 @@ impl SurfaceTaskManager {
                             .reload_channels(new_config, tls_acceptor, client, metrics_store, task_monitor)
                             .await
                         {
-                            Ok((channels_count, _, _)) => Ok((channels_count, true, Some(warning))),
+                            Ok((channels_count, _, port_warning)) => Ok((
+                                channels_count,
+                                true,
+                                Some(match port_warning {
+                                    Some(port_warning) => format!("{warning}. {port_warning}"),
+                                    None => warning,
+                                }),
+                            )),
                             Err(e) => {
                                 error!("Failed to reload even with cached configuration: {}", e);
                                 Err(e)
@@ -1670,38 +1781,35 @@ impl SurfaceTaskManager {
                 .read()
                 .await
                 .clone();
-            let served = async {
-                let router = super::server::build_outbound_port_router(
-                    outbound_port,
-                    outbound_channels,
-                    config_clone.clone(),
-                    Arc::new(network_config.clone()),
-                    metrics_store.clone(),
-                    self.secrets_store
-                        .read()
-                        .await
-                        .clone(),
-                    self.policy_manager
-                        .read()
-                        .await
-                        .clone(),
-                    gateway_policy_manager,
-                    crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
-                    self.vc_issuer.clone(),
-                    None, // task_monitor
-                    self.outbound_channel_states
-                        .clone(),
-                    self.listener_manager.clone(),
-                    source_auth_middleware,
-                )
-                .await?;
-                let address = super::server::listener_socket_address(&bind_address, outbound_port)?;
-                self.serve_port(outbound_port, vec![address], use_tls, router, &config_clone)
+            let built = super::server::build_outbound_port_router(
+                outbound_port,
+                outbound_channels,
+                config_clone.clone(),
+                Arc::new(network_config.clone()),
+                metrics_store.clone(),
+                self.secrets_store
+                    .read()
                     .await
-            }
+                    .clone(),
+                self.policy_manager
+                    .read()
+                    .await
+                    .clone(),
+                gateway_policy_manager,
+                crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
+                self.vc_issuer.clone(),
+                None, // task_monitor
+                self.outbound_channel_states
+                    .clone(),
+                self.listener_manager.clone(),
+                source_auth_middleware,
+            )
             .await;
-            if let Err(e) = served {
-                error!("Outbound port listener error for port {}: {}", outbound_port, e);
+            if self
+                .serve_outbound_port(outbound_port, &bind_address, built, use_tls, &config_clone)
+                .await
+                .is_err()
+            {
                 continue;
             }
 
@@ -1716,59 +1824,33 @@ impl SurfaceTaskManager {
         Ok(())
     }
 
-    /// Stop a channel by name (used when renaming channels)
+    /// Remove a channel's task rows by name. Returns whether any were removed.
     pub async fn stop_channel_by_name(
         &self,
         channel_name: &str,
         task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
     ) -> bool {
-        let mut handles = self
-            .channel_handles
+        if let Some(task_id) = self
+            .task_ids
             .write()
-            .await;
-        let mut task_ids_map = self.task_ids.write().await;
-        if let Some(handle) = handles.remove(channel_name) {
-            info!("Stopping channel task: {}", channel_name);
-            // Unregister from task monitor if available - unregister ALL tasks for this channel
-            if let Some(ref monitor) = task_monitor {
-                // First remove the current task ID from our map
-                if let Some(task_id) = task_ids_map.remove(channel_name) {
-                    info!("Removing current task_id {} for channel {} from task_ids map", task_id, channel_name);
-                }
-
-                // Then unregister ALL tasks for this channel (including any stale ones from previous reloads)
-                let unregistered_count = monitor
-                    .unregister_all_tasks_for_channel(channel_name)
-                    .await;
-                if unregistered_count > 0 {
-                    info!("✅ Unregistered {} task(s) for channel '{}' from monitor", unregistered_count, channel_name);
-                } else {
-                    warn!("⚠️ No tasks found in monitor for channel '{}'", channel_name);
-                }
-            } else {
-                warn!("⚠️ No task monitor available to unregister tasks for channel '{}'", channel_name);
-            }
-            handle.abort();
-            info!("✅ Channel '{}' task handle aborted", channel_name);
-            true
-        } else {
-            warn!("⚠️ Channel '{}' not found in channel_handles - may not be running", channel_name);
-
-            // Even if the handle isn't found, still try to clean up any stale task monitor entries
-            if let Some(ref monitor) = task_monitor {
-                let unregistered_count = monitor
-                    .unregister_all_tasks_for_channel(channel_name)
-                    .await;
-                if unregistered_count > 0 {
-                    info!(
-                        "✅ Cleaned up {} stale task(s) for channel '{}' from monitor",
-                        unregistered_count, channel_name
-                    );
-                }
-            }
-
-            false
+            .await
+            .remove(channel_name)
+        {
+            info!("Removing current task_id {} for channel {} from task_ids map", task_id, channel_name);
         }
+        let Some(monitor) = task_monitor else {
+            warn!("⚠️ No task monitor available to unregister tasks for channel '{}'", channel_name);
+            return false;
+        };
+        let unregistered_count = monitor
+            .unregister_all_tasks_for_channel(channel_name)
+            .await;
+        if unregistered_count == 0 {
+            warn!("⚠️ No tasks found in monitor for channel '{}'", channel_name);
+            return false;
+        }
+        info!("✅ Unregistered {} task(s) for channel '{}' from monitor", unregistered_count, channel_name);
+        true
     }
 
     /// Stop a channel by its config_id (identifier-based, not name-based)
@@ -2087,5 +2169,236 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(status(address, "/plain").await, None, "the port is no longer served");
+    }
+
+    fn network_without_listeners() -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [],
+            "routes": {}
+        }))
+        .unwrap()
+    }
+
+    fn row(
+        task_id: &str,
+        config_id: &str,
+        transit_point: Option<&str>,
+    ) -> crate::observability::TaskInfo {
+        let now = chrono::Utc::now();
+        crate::observability::TaskInfo {
+            task_id: task_id.to_string(),
+            config_id: Some(config_id.to_string()),
+            channel_name: config_id.to_string(),
+            transit_point: transit_point.map(str::to_string),
+            listen_address: "http://localhost:8080".to_string(),
+            target_endpoint: "http://127.0.0.1:9".to_string(),
+            started_at: now,
+            status: crate::observability::TaskStatus::Running,
+            total_connections: 7,
+            active_connections: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_activity: None,
+            error_count: 0,
+            recent_bytes_sent: 0,
+            recent_bytes_received: 0,
+            recent_window_start: now,
+        }
+    }
+
+    fn surface(surface_id: &str) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "http://localhost:8080", "route": format!("/{surface_id}"), "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap()
+    }
+
+    async fn task_ids(monitor: &crate::observability::TaskMonitor) -> Vec<String> {
+        let mut ids: Vec<String> = monitor
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The rows a failed router registered, Transit Point rows included, are
+    /// removed; a port whose previous listener is still bound keeps its
+    /// previous state and gets its previous rows back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_that_keeps_its_previous_router_keeps_its_previous_state_and_task_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let config = manager.get_config().await;
+        let network = network_without_listeners();
+        let monitor = crate::observability::TaskMonitor::new(None);
+        let address = free_loopback_address();
+        manager
+            .serve_port(address.port(), vec![address], false, answering("/kept"), &config)
+            .await
+            .unwrap();
+        let kept = std::sync::Arc::new(crate::proxy::handler::variant_routing_tests::router(surface("kept")));
+        manager
+            .port_listener_states
+            .write()
+            .await
+            .insert(address.port(), kept.clone());
+        let kept_task_id = kept.channels.read().await[0]
+            .task_id
+            .clone();
+        let previous_rows = vec![
+            row(&kept_task_id, "kept", None),
+            row("task-kept-tp-partner", "kept", Some("partner")),
+            row("task-gone-1", "gone", None),
+        ];
+        for half_built in [row("task-added-1", "added", None), row("task-added-tp-partner", "added", Some("partner"))] {
+            monitor
+                .register_task(half_built)
+                .await;
+        }
+
+        let failure = manager
+            .serve_inbound_port(
+                address.port(),
+                &[surface("added")],
+                Err(anyhow::anyhow!("the router could not be built")),
+                &network,
+                false,
+                &config,
+                Some(&monitor),
+                &previous_rows,
+            )
+            .await
+            .err()
+            .expect("the router could not be built");
+
+        assert_eq!(failure.error.to_string(), "the router could not be built");
+        assert!(
+            failure
+                .kept
+                .is_some_and(|state| std::sync::Arc::ptr_eq(&state, &kept))
+        );
+        let mut expected = vec![kept_task_id, "task-kept-tp-partner".to_string()];
+        expected.sort();
+        assert_eq!(task_ids(&monitor).await, expected);
+        assert_eq!(
+            monitor
+                .get_task("task-kept-tp-partner")
+                .await
+                .map(|task| task.total_connections),
+            Some(7),
+            "a restored row keeps its counters"
+        );
+        assert_eq!(status(address, "/kept").await, Some(200), "the previous router is still served");
+    }
+
+    /// A port with no listener bound keeps no state, and the rows its failed
+    /// router registered, Transit Point rows included, are removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_left_without_a_listener_keeps_no_state_or_task_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let config = manager.get_config().await;
+        let network = network_without_listeners();
+        let monitor = crate::observability::TaskMonitor::new(None);
+        for half_built in [row("task-added-1", "added", None), row("task-added-tp-partner", "added", Some("partner"))] {
+            monitor
+                .register_task(half_built)
+                .await;
+        }
+
+        let failure = manager
+            .serve_inbound_port(
+                9,
+                &[surface("added")],
+                Err(anyhow::anyhow!("the router could not be built")),
+                &network,
+                false,
+                &config,
+                Some(&monitor),
+                &[row("task-kept-1", "kept", None)],
+            )
+            .await
+            .err()
+            .expect("the router could not be built");
+
+        assert!(failure.kept.is_none());
+        assert!(
+            task_ids(&monitor)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A self-signed `localhost` certificate written to `directory`, with a
+    /// TLS client that trusts it.
+    fn localhost_certificate(directory: &std::path::Path) -> tokio_rustls::TlsConnector {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(directory.join("cert.pem"), certificate.pem()).unwrap();
+        std::fs::write(directory.join("key.pem"), key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(certificate.der().clone())
+            .unwrap();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tls_port_keeps_its_listener_when_its_new_addresses_need_a_certificate_that_cannot_be_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let connector = localhost_certificate(directory.path());
+        let mut config = (*manager.get_config().await).clone();
+        config.tls.cert_path = directory
+            .path()
+            .join("cert.pem");
+        config.tls.key_path = directory
+            .path()
+            .join("key.pem");
+        let address = free_loopback_address();
+        manager
+            .serve_port(address.port(), vec![address], true, answering("/"), &config)
+            .await
+            .unwrap();
+        config.tls.cert_path = directory
+            .path()
+            .join("missing.pem");
+        let moved = std::net::SocketAddr::from(([0, 0, 0, 0], address.port()));
+
+        let error = manager
+            .serve_port(address.port(), vec![moved], true, answering("/"), &config)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Port {} keeps its TLS listener: binding it on its new addresses needs a TLS configuration that could not be loaded",
+                address.port()
+            )
+        );
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the TLS listener stays bound");
+        connector
+            .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .expect("the TLS listener still completes a handshake");
     }
 }

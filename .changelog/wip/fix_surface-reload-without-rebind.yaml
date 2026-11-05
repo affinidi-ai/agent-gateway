@@ -14,5 +14,7 @@ changes:
         to half a second on every such save, and anyone allowed to edit surfaces could keep the
         gateway refusing connections for every tenant. A reload now builds new routes and swaps
         them into the listeners already bound, which stay up, and binds a port again only when
-        its addresses or TLS setting change in gateway.json.
+        its addresses or TLS setting change in gateway.json. A port whose routes a reload
+        cannot rebuild keeps serving its previous ones, and POST /v1/config/reload names it in
+        its warning.
   breaking: []

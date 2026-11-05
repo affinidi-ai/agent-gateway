@@ -252,10 +252,8 @@ impl TaskMonitor {
     }
 
     /// Remove every registered task and its metrics history. Used by the
-    /// full-reload path to guarantee no stale entries survive when port
-    /// listeners are aborted (the post-`.await` cleanup in
-    /// `run_port_server` is skipped when an `AbortHandle` cancels the
-    /// serve future, so reload must clean up explicitly).
+    /// full-reload path before it rebuilds the port routers, which register
+    /// every task again, so no stale entry survives the reload.
     pub async fn clear_all_tasks(&self) -> usize {
         let mut tasks = self.tasks.write().await;
         let mut metrics = self
@@ -269,22 +267,6 @@ impl TaskMonitor {
             debug!("Cleared {} task(s) from monitor", n);
         }
         n
-    }
-
-    /// Unregister a task (when it stops)
-    pub async fn unregister_task(
-        &self,
-        task_id: &str,
-    ) {
-        let mut tasks = self.tasks.write().await;
-        tasks.remove(task_id);
-
-        // Clean up metrics history
-        let mut metrics = self
-            .metrics_history
-            .write()
-            .await;
-        metrics.remove(task_id);
     }
 
     /// Unregister all tasks for a given channel name (useful when disabling/deleting channels)

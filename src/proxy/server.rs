@@ -229,7 +229,7 @@ fn extract_hostname(url: &str) -> Option<String> {
 /// the inbound listener on `inbound_port`. Returns `None` when no overlap exists
 /// (i.e. inbound and outbound have fully separate domains).
 ///
-/// Used by `run_port_server` to decide whether to register the `/outbound/*`
+/// Used by `build_port_router` to decide whether to register the `/outbound/*`
 /// reverse-proxy on the inbound port.
 pub(crate) fn find_shared_outbound_listener(
     network_config: &crate::config::NetworkConfig,
@@ -1539,27 +1539,6 @@ pub async fn build_port_router(
     Ok((app, state))
 }
 
-/// Unregister the task of every channel a port router registered, for a router
-/// no listener serves because its port could not be bound.
-pub(crate) async fn unregister_port_tasks(
-    state: &MultiSurfaceProxyState,
-    task_monitor: Option<&crate::observability::TaskMonitor>,
-) {
-    let Some(monitor) = task_monitor else {
-        return;
-    };
-    for channel_info in state
-        .channels
-        .read()
-        .await
-        .iter()
-    {
-        monitor
-            .unregister_task(&channel_info.task_id)
-            .await;
-    }
-}
-
 /// Get the shared outbound channel state for `config_id`.
 ///
 /// Existing listeners keep a clone of this shared state, so reloads must update
@@ -2223,7 +2202,7 @@ mod tests {
         use tower::ServiceExt;
 
         // Mirrors the `/alive` route registered on the outbound/channel listener
-        // in `run_outbound_port_server` (used by ECS/ALB health checks on the
+        // in `build_outbound_port_router` (used by ECS/ALB health checks on the
         // channel port, e.g. 5000).
         let app = Router::new().route("/alive", axum::routing::get(crate::identity::handlers::alive_check));
 

@@ -1102,7 +1102,7 @@ pub async fn run_axum_proxy(
     // Group active channels by the port they'll use.
     // Surfaces are kept as `AgentSurface` end-to-end so that `variants` and
     // `default_variant_id` survive into the runtime listener; the legacy
-    // `ChannelMapping` shape is derived inside `run_port_server` only where
+    // `ChannelMapping` shape is derived inside `build_port_router` only where
     // pre-variant fields are needed.
     let mut channels_by_port: HashMap<u16, Vec<crate::config::agent_surface::AgentSurface>> = HashMap::new();
     for surface in config.surfaces.iter() {
@@ -3870,7 +3870,7 @@ pub async fn run_axum_proxy(
                     // Bind anyway (no early `continue`): the listener still comes up
                     // and serves the `/alive` liveness route so ECS/ALB target-group
                     // health checks on this port pass even with zero outbound
-                    // channels. `run_outbound_port_server` handles an empty channel
+                    // channels. `build_outbound_port_router` handles an empty channel
                     // list — it simply registers no proxy routes.
                     info!(
                         "Outbound listener on port {} has no enabled outbound channels — binding for /alive health checks only",
@@ -3908,33 +3908,26 @@ pub async fn run_axum_proxy(
 
                 info!("Starting outbound port listener on port {} for {} channel(s)", port, outbound_channels.len());
 
-                let served = async {
-                    let router = crate::proxy::server::build_outbound_port_router(
-                        port,
-                        outbound_channels,
-                        config_clone.clone(),
-                        network_config_clone,
-                        metrics_clone,
-                        secrets_store_clone,
-                        policy_mgr_clone,
-                        gateway_policy_mgr_clone,
-                        trust_registry_clone,
-                        vc_issuer_clone,
-                        task_monitor_clone,
-                        outbound_states,
-                        listener_mgr_slot_for_outbound,
-                        outbound_source_auth_middleware,
-                    )
-                    .await?;
-                    let address = crate::proxy::server::listener_socket_address(&bind_address, port)?;
-                    channel_manager
-                        .serve_port(port, vec![address], use_tls, router, &config_clone)
-                        .await
-                }
+                let built = crate::proxy::server::build_outbound_port_router(
+                    port,
+                    outbound_channels,
+                    config_clone.clone(),
+                    network_config_clone,
+                    metrics_clone,
+                    secrets_store_clone,
+                    policy_mgr_clone,
+                    gateway_policy_mgr_clone,
+                    trust_registry_clone,
+                    vc_issuer_clone,
+                    task_monitor_clone,
+                    outbound_states,
+                    listener_mgr_slot_for_outbound,
+                    outbound_source_auth_middleware,
+                )
                 .await;
-                if let Err(e) = served {
-                    error!("Outbound port listener error for port {}: {}", port, e);
-                }
+                let _ = channel_manager
+                    .serve_outbound_port(port, &bind_address, built, use_tls, &config_clone)
+                    .await;
                 continue;
             }
 
@@ -4079,60 +4072,55 @@ pub async fn run_axum_proxy(
                 );
             }
 
-            let served = async {
-                let (router, state) = crate::proxy::server::build_port_router(
-                    port,
-                    channels_clone,
-                    tls_acceptor,
-                    client,
-                    config_clone.clone(),
-                    bootstrap_config_clone,
-                    metrics,
-                    task_mon.clone(),
-                    Some(ws_state_clone),
-                    vc_issuer_clone,
-                    listener_mgr_slot,
-                    identity_router_for_port,
-                    onboarding_router_for_port,
-                    did_router_for_port,
-                    secrets_router_for_port,
-                    secrets_store_for_port,
-                    network_config_clone,
-                    policy_mgr_clone,
-                    gateway_policy_mgr_clone,
-                    mcp_proxy_store_clone,
-                    a2a_proxy_store_clone,
-                    mcp_server_manager_clone,
-                    settings_store_for_port,
-                    notification_store_for_port,
-                    didauth_session_store_clone,
-                    source_auth_middleware_for_port,
-                    resolved_surface_cache_for_port,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_identity_store_for_port,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_log_storage_for_port,
-                )
-                .await?;
-                let served = match crate::proxy::server::inbound_bind_addresses(&network_config, port) {
-                    Ok(addresses) => {
-                        channel_manager
-                            .serve_port(port, addresses, use_tls, router, &config_clone)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                };
-                if served.is_err() {
-                    crate::proxy::server::unregister_port_tasks(&state, task_mon.as_deref()).await;
-                } else {
-                    port_listener_states.insert(port, state);
-                    info!("Captured state for port {} listener", port);
-                }
-                served
-            }
+            let built = crate::proxy::server::build_port_router(
+                port,
+                channels_clone,
+                tls_acceptor,
+                client,
+                config_clone.clone(),
+                bootstrap_config_clone,
+                metrics,
+                task_mon.clone(),
+                Some(ws_state_clone),
+                vc_issuer_clone,
+                listener_mgr_slot,
+                identity_router_for_port,
+                onboarding_router_for_port,
+                did_router_for_port,
+                secrets_router_for_port,
+                secrets_store_for_port,
+                network_config_clone,
+                policy_mgr_clone,
+                gateway_policy_mgr_clone,
+                mcp_proxy_store_clone,
+                a2a_proxy_store_clone,
+                mcp_server_manager_clone,
+                settings_store_for_port,
+                notification_store_for_port,
+                didauth_session_store_clone,
+                source_auth_middleware_for_port,
+                resolved_surface_cache_for_port,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_identity_store_for_port,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_log_storage_for_port,
+            )
             .await;
-            if let Err(e) = served {
-                error!("Port listener error for port {}: {}", port, e);
+            if let Ok(state) = channel_manager
+                .serve_inbound_port(
+                    port,
+                    &channels,
+                    built,
+                    &network_config,
+                    use_tls,
+                    &config_clone,
+                    task_mon.as_deref(),
+                    &[],
+                )
+                .await
+            {
+                port_listener_states.insert(port, state);
+                info!("Captured state for port {} listener", port);
             }
 
             for surface in &channels {
