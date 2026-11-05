@@ -601,11 +601,15 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   answer read up to 256 KiB), including a `jwks_uri` found through
   authorization server discovery. Creating or updating a strategy whose
   `jwks_uri` resolves to a non-public address is refused with `400`, and a
-  strategy stored before that check is refused on every fetch. `POST
+  stored strategy whose `jwks_uri` resolves to one is refused on every fetch. `POST
   /api/v1/jwt-verification-strategies/validate-jwks-uri` needs
   `jwt_verification_strategies.edit` and answers one of two fixed errors
   (the URI is refused, or it could not be fetched or is not a JWKS); the
-  detail is only logged. The fetch ignores any HTTP proxy. Under
+  detail is only logged, so the probe reveals no reachability. A name that
+  resolves to a refused address is still told apart from one that does not
+  resolve, on this probe, on the credential provider probe and on save, so a
+  user with the edit permission can learn which internal names exist. The
+  fetch ignores any HTTP proxy. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` admits listed loopback
   fixtures, never cloud metadata.
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **x402

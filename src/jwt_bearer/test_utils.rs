@@ -56,12 +56,19 @@ pub fn static_okp_strategy(
     }
 }
 
-/// RAII guard that aborts the spawned server task when dropped.
-pub struct TestServer(pub tokio::task::JoinHandle<()>);
+/// RAII guard that aborts the spawned server task when dropped, and removes its
+/// origin from the JWKS fixtures the client admits.
+pub struct TestServer {
+    handle: tokio::task::JoinHandle<()>,
+    origin: String,
+}
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.0.abort();
+        self.handle.abort();
+        if let Ok(mut origins) = JWKS_FIXTURE_ORIGINS.lock() {
+            origins.retain(|origin| origin != &self.origin);
+        }
     }
 }
 
@@ -110,11 +117,11 @@ pub async fn start_jwks_server(
         .lock()
         .unwrap()
         .push(origin.clone());
-    (origin, TestServer(handle))
+    (origin.clone(), TestServer { handle, origin })
 }
 
-/// The origins of the loopback JWKS servers [`start_jwks_server`] started, which
-/// the JWKS client admits although the Strict egress policy refuses loopback.
+/// The origins of the running loopback JWKS servers [`start_jwks_server`] started,
+/// which the JWKS client admits although the Strict egress policy refuses loopback.
 static JWKS_FIXTURE_ORIGINS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 pub fn jwks_fixture_origins() -> Vec<String> {
