@@ -21538,6 +21538,19 @@ allow if {
     }
 
     #[test]
+    fn an_access_point_never_forwards_the_callers_cookies() {
+        assert!(!forwards_ap_caller_header("Cookie", &[], None, None, None));
+        assert!(!should_forward_ap_request_header_with_mapping("cookie", &[], None, Some("cookie")));
+        let mut caller = HeaderMap::new();
+        caller.insert("cookie", HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
+        caller.insert("x-trace", HeaderValue::from_static("t-1"));
+        let (buffered, stream) = access_point_fabric_headers(&caller, &[], None);
+        assert!(!buffered.contains_key("COOKIE"));
+        assert!(!stream.contains_key("cookie"));
+        assert_eq!(buffered["X-TRACE"], "t-1");
+    }
+
+    #[test]
     fn a_caller_header_named_like_the_target_auth_header_is_never_forwarded() {
         assert!(!forwards_ap_caller_header("X-Vendor-Key", &[], None, None, Some("x-vendor-key")));
         assert!(forwards_ap_caller_header("X-Vendor-Key", &[], None, None, None));

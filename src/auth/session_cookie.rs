@@ -1,7 +1,7 @@
 use cookie::time::Duration;
 use cookie::{Cookie, SameSite};
 
-pub(crate) const SESSION_COOKIE_NAME: &str = "session_token";
+pub(crate) const SESSION_COOKIE_NAME: &str = "__Host-session_token";
 
 pub(crate) fn build_session_cookie(
     session_token: &str,
@@ -9,6 +9,7 @@ pub(crate) fn build_session_cookie(
 ) -> String {
     Cookie::build((SESSION_COOKIE_NAME, session_token))
         .path("/")
+        .secure(true)
         .http_only(true)
         .same_site(SameSite::Strict)
         .max_age(Duration::seconds(max_age.min(i64::MAX as u64) as i64))
@@ -20,6 +21,7 @@ pub(crate) fn build_session_cookie(
 pub(crate) fn clear_session_cookie() -> String {
     let mut cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")
+        .secure(true)
         .http_only(true)
         .same_site(SameSite::Strict)
         .build();
@@ -42,8 +44,11 @@ mod tests {
         let parsed = Cookie::parse_encoded(cookie).expect("session cookie should parse");
 
         assert_eq!(parsed.name(), SESSION_COOKIE_NAME);
+        assert_eq!(parsed.name(), "__Host-session_token");
         assert_eq!(parsed.value(), "abc 123?;");
         assert_eq!(parsed.path(), Some("/"));
+        assert_eq!(parsed.secure(), Some(true));
+        assert_eq!(parsed.domain(), None);
         assert_eq!(parsed.http_only(), Some(true));
         assert_eq!(parsed.same_site(), Some(SameSite::Strict));
         assert_eq!(parsed.max_age(), Some(Duration::seconds(1200)));
@@ -58,6 +63,7 @@ mod tests {
         assert_eq!(parsed.name(), SESSION_COOKIE_NAME);
         assert_eq!(parsed.value(), "");
         assert_eq!(parsed.path(), Some("/"));
+        assert_eq!(parsed.secure(), Some(true));
         assert_eq!(parsed.http_only(), Some(true));
         assert_eq!(parsed.same_site(), Some(cookie::SameSite::Strict));
         assert_eq!(parsed.max_age(), Some(Duration::ZERO));

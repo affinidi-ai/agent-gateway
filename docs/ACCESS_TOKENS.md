@@ -343,6 +343,12 @@ replica, an exchange that reaches a different instance than the consent gets `in
 session stickiness does not help, because the exchange request carries no browser cookie.
 Limits and the full flow are in [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway).
 
+CLI browser login needs the dashboard over HTTPS or on `http://localhost`. The authorize page
+is opened as a navigation, so it sees only the `Secure` `__Host-session_token` cookie, which a
+browser drops over plain HTTP on any other host; there the browser moves between sign-in and
+the authorize page until the authorize throttle answers `429`, and the CLI gets no code. See
+[`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md).
+
 The `fabric` CLI lives in its own repository, so this is the contract it must follow:
 
 | Step | Request | Response |
