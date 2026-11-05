@@ -82,6 +82,11 @@ The Surface Builder's **Send delegated credentials over Fabric** switch is per r
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Managed Agent panel's **Release per-user grants to Fabric callers** switch writes
+`target.delegated_credentials_for_fabric_callers`, off by default, and is shown only for an HTTP
+or HTTPS Target on a surface with credential bindings, with a warning while on; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
 Transit Point element's **Who can call this Transit Point** section sets the transit token, a
@@ -89,6 +94,10 @@ Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the A
 `allow_unauthenticated_callers`, and shows the exposure `Warning` headers a save answers with.
 See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A Transit Point's Rate Limit panel has a **Per caller** section that writes
+`transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
@@ -103,6 +112,14 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
+see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
+
+The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
+claim other than `sub`; see _Credentials audit tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, and target authentication on a Managed Agent or Transit
@@ -149,6 +166,9 @@ access" under the Access Point URL with a **Configure Authentication** action. S
 surface, a not-ready one, or a surface without `public` and without a Caller Context, warns
 after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
+_Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 

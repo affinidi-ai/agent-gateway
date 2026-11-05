@@ -106,7 +106,12 @@ In `handlers.rs`, `handle_token_exchange` runs: validate params → authenticate
 client (missing/bad creds → `invalid_client`, 401) → subject-token-type
 allowlist (`unauthorized_client`; a token whose JOSE `typ` is the ID-JAG media
 type counts as `id-jag` whatever type the client declares) → verify subject
-assertion + extract `sub`/`act` → resolve actor; a verified JWT subject or actor
+assertion + extract the subject (the value of the verifying strategy's
+`principal_claim`, `sub` by default, or `sub` for the gateway's own tokens and a VP; an issuer
+names callers by one claim in a tenant scope, so when the strategies for the issuer that the
+client's tenant may use, its own or else the appliance-global ones, name different claims, the
+assertion is refused with `invalid_grant` before any is tried) and `act` →
+resolve actor, named the same way; a verified JWT subject or actor
 the gateway signed itself (under its DID or the MCP issuer) is refused
 (`reject_self_issued`, `invalid_request`) unless, on `/oauth2/token`, it is one
 of the gateway's own access tokens (`typ: JWT`), so its ID-JAGs are consumed only
@@ -250,7 +255,9 @@ Per-connection controls:
   be created before the surface it will target exists. Appliance-global
   connections are administrator-created and unrestricted. Ownership reads the
   network configuration loaded at startup, so restart after changing listener
-  `external_urls`.
+  `external_urls`. Every grant runs this ownership check: token exchange,
+  ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
+  empty or lists the resource.
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.

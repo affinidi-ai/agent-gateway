@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::jwt_bearer::models::JwtVerificationStrategy;
@@ -90,14 +90,12 @@ impl FileSystemJwtVerificationStrategyStore {
             .await
             .context("Failed to open JWT verification strategy storage")?;
         let store = Self { storage };
-        info!(
-            "Initialised FileSystemJwtVerificationStrategyStore with {} strategy/strategies",
-            store
-                .storage
-                .list_all()
-                .await?
-                .len()
-        );
+        let strategies = store
+            .storage
+            .list_all()
+            .await?;
+        info!("Initialised FileSystemJwtVerificationStrategyStore with {} strategy/strategies", strategies.len());
+        warn_of_unusable_principal_claims(&strategies);
         Ok(store)
     }
 
@@ -110,7 +108,28 @@ impl FileSystemJwtVerificationStrategyStore {
         info!("Reloading JWT verification strategy store from disk");
         self.storage
             .refresh_from_disk()
-            .await
+            .await?;
+        warn_of_unusable_principal_claims(
+            &self
+                .storage
+                .list_all()
+                .await?,
+        );
+        Ok(())
+    }
+}
+
+/// Logs each strategy whose stored `principal_claim` the API would refuse,
+/// such as one written to storage by hand: it names no caller, so its callers
+/// see only `500`s.
+fn warn_of_unusable_principal_claims(strategies: &[JwtVerificationStrategy]) {
+    for strategy in strategies {
+        if let Err(error) = strategy.principal_claim_name() {
+            warn!(
+                strategy_id = %strategy.id,
+                "JWT verification strategy names no caller: {error}; create a strategy that names another claim"
+            );
+        }
     }
 }
 
@@ -218,6 +237,7 @@ mod tests {
 
     fn sample_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {
+            principal_claim: None,
             id: String::new(), // populated by create()
             tenant_id: None,
             name: "Test IdP".to_string(),
@@ -254,6 +274,32 @@ mod tests {
             .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "Test IdP");
+    }
+
+    #[tokio::test]
+    async fn a_principal_claim_stored_without_the_api_is_checked_when_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let mut written = sample_strategy();
+        written.principal_claim = Some("iss".to_string());
+        let id = FileSystemJwtVerificationStrategyStore::new(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .create(written)
+            .await
+            .unwrap()
+            .id;
+
+        let reloaded = FileSystemJwtVerificationStrategyStore::new(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("the strategy loads");
+        assert!(matches!(
+            reloaded.principal_claim_name(),
+            Err(crate::jwt_bearer::errors::JwtBearerError::InvalidPrincipalClaim(_))
+        ));
     }
 
     #[tokio::test]

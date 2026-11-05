@@ -12,7 +12,10 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -121,7 +124,8 @@ const SurfaceDetailPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // `Warning` headers of the last save, shown on the Transit Points they name.
+  // `Warning` headers of the last save but the Access Point's, shown in the
+  // banner and on the Transit Points they name.
   // A create that drew warnings sends them here in the route state. They are
   // kept with the surface they are about, since this page stays mounted when
   // the route moves to another surface.
@@ -1288,7 +1292,7 @@ const SurfaceDetailPage: React.FC = () => {
           headerWarnings = received;
         },
       });
-      setSavedWarnings({ surfaceId, warnings: headerWarnings });
+      setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(headerWarnings) });
       setSurface(updated);
       setSaveCount(count => count + 1);
       setJsonOverride(null);

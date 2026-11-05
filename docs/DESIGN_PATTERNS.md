@@ -40,12 +40,15 @@ non-empty snapshot. Callers depend on the trait rather than backend-specific beh
 callback. A task upgrades the weak reference immediately before use. Do not retain a strong manager
 reference inside a task owned by that manager, because it would prevent shutdown cleanup.
 
-## One-shot state publication
+## Swappable routers behind bound listeners
 
-`SurfaceTaskManager::reload_channels` creates a Tokio `oneshot` for each inbound port listener and
-passes its sender to `run_port_server`. The child publishes its `Arc<MultiSurfaceProxyState>` once;
-the manager stores the received state for later single-surface updates. Use this pattern when a
-spawned owner must publish one initialized value, rather than introducing a shared mutable slot.
+A port listener binds its socket once and serves a
+[`SwappableRouter`](../src/proxy/port_listener.rs), which hands each request to the router current
+when it arrives. `build_port_router` and `build_outbound_port_router` only build a router (the
+inbound one with its `Arc<MultiSurfaceProxyState>`), and `SurfaceTaskManager::serve_port` swaps it
+into the listener already bound on the port, binding the port again only when its addresses or TLS
+setting change. Never change a listener's routes by stopping and binding it again: a reload must
+not refuse connections.
 
 ## Batched metrics persistence
 

@@ -1,0 +1,43 @@
+branch: fix/strip-access-point-cookies
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-04T11:15:42Z'
+      title: Keep caller cookies and target cookies off Access Points
+      description: >-
+        An Access Point no longer forwards its caller's Cookie header to the managed agent,
+        directly or over Fabric, and a gateway receiving a Fabric request drops a Cookie its peer
+        sent. Its answers no longer carry a Set-Cookie the agent sent. Access Points share their
+        host with the dashboard, so the dashboard session cookie reached the agent, and the agent
+        could set cookies on the dashboard's host.
+    - timestamp: '2026-11-04T15:30:00Z'
+      title: Keep the caller's cookies away from an MCP Proxy's REST API
+      description: >-
+        An MCP Proxy no longer forwards its caller's Cookie header to the REST API it calls.
+        MCP Proxy routes share their host with the dashboard, so the dashboard session cookie
+        reached the REST API, and a tool that takes a cookie argument failed whenever the caller
+        also sent a Cookie. A REST API that needs a cookie still gets it from the tool argument
+        its OpenAPI specification declares.
+    - timestamp: '2026-11-04T11:15:42Z'
+      title: Harden the dashboard session cookie with Secure and the __Host- prefix
+      description: >-
+        The dashboard session cookie is now named __Host-session_token and is Secure, so a
+        browser sends it only over HTTPS or to localhost and no other host can set it. The old
+        session_token cookie is no longer read; an open dashboard receives the new cookie on its
+        next request, and a browser with no open dashboard signs in once. After a rollback to a
+        release that reads only session_token, browsers sign in once again.
+  breaking:
+    - timestamp: '2026-11-05T09:00:00Z'
+      title: Stop passing cookies through Access Points and MCP Proxies
+      description: >-
+        An agent behind an Access Point no longer receives its caller's cookies or sets cookies
+        on its callers, so cookie-based session affinity or agent-held cookie sessions stop
+        working; use a header for affinity instead. An MCP Proxy's REST API no longer receives
+        the caller's cookies, and a JWT bearer method with forward_header on a header named
+        Cookie forwards nothing. Scripts that send Cookie session_token to the management API get
+        401; send Authorization Bearer or the __Host-session_token cookie. The dashboard, and
+        CLI browser login, now need HTTPS or http://localhost: over plain HTTP on any other host
+        the live-update notice keeps returning and CLI login never completes.

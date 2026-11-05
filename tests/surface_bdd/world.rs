@@ -144,6 +144,8 @@ pub struct SurfaceWorld {
     pub transit_token: Option<String>,
     /// The ids of the credential providers the operator created, by `provider_id` slug.
     pub credential_provider_ids: HashMap<String, String>,
+    /// A client presenting the personal access token an operator minted in the scenario.
+    pub personal_access_token_client: Option<reqwest::Client>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -209,6 +211,7 @@ impl SurfaceWorld {
             oauth_callback_query: None,
             transit_token: None,
             credential_provider_ids: HashMap::new(),
+            personal_access_token_client: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

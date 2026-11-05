@@ -415,6 +415,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_callback_whose_path_names_another_provider_than_its_state_is_refused() {
+        let state = crate::delegation_vault::OAuthState {
+            agent_did: "did:web:agent.example".to_string(),
+            user_identity_hash: "sha256:user".to_string(),
+            surface_id: "surface".to_string(),
+            credential_provider_id: "deleted-provider".to_string(),
+            provider_id: "github".to_string(),
+            nonce: uuid::Uuid::new_v4().to_string(),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            code_verifier: None,
+        };
+        let encoded = crate::delegation_vault::oauth::encode_oauth_state(&state).unwrap();
+        let response = create_delegation_vault_oauth_router(state_with(Vec::new()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/identity/oauth/callback/gitlab?code=code&state={encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("does not match its provider"), "{body}");
+        assert!(
+            crate::delegation_vault::oauth::claim_oauth_state(&state).await,
+            "the refused callback left the state unused"
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_error_on_the_callback_logs_only_the_oauth_error_code() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
@@ -451,6 +484,45 @@ mod tests {
             logs.text()
         );
         assert!(!logs.text().contains("quote"), "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_callbacks_provider_id_is_logged_escaped_and_bounded() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let app = create_delegation_vault_oauth_router(state_with(Vec::new()));
+        let padding = "a".repeat(400);
+        for query in ["error=access_denied", "code=c&state=not-a-state"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/identity/oauth/callback/github%0D%0AINFO%20forged{padding}?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let text = logs.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("provider_id="))
+            .collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains(r#"provider_id="github\r\nINFO forgedaaa"#)),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("INFO forged")),
+            "{text}"
+        );
+        assert!(!text.contains(&padding), "{text}");
     }
 
     // ── a non-admin principal is denied on every management route ──

@@ -3615,7 +3615,7 @@ async fn forward_client_for(
     target_url: &str,
     timeout: std::time::Duration,
 ) -> Result<reqwest::Client, ForwardClientError> {
-    if !(target_url.starts_with("http://") || target_url.starts_with("https://")) {
+    if !crate::config::agent_surface::endpoint_is_http_url(target_url) {
         return Ok(GLOBAL_HTTP_CLIENT
             .get()
             .cloned()
@@ -3962,8 +3962,10 @@ async fn fabric_per_user_binding_applies(
 pub(super) enum FabricDelegationRefusal {
     /// The receiving surface verified no caller to key a grant by.
     CallerNotVerified,
-    /// A per-user binding applies, and the surface does not release per-user
-    /// grants to partners (`delegated_credentials_for_fabric_callers`).
+    /// A per-user binding applies, and the served view does not release its
+    /// Target's per-user grants to partners: its Target does not set
+    /// `delegated_credentials_for_fabric_callers` or is not an HTTP or HTTPS
+    /// URL, or its caller authentication cannot tell a partner's users apart.
     NotEnabledForPartners,
     /// The caller has no grant yet, and consent is never started through a
     /// partner, who would see the authorization URL.
@@ -4633,15 +4635,17 @@ async fn process_forward_request_in_request_scope(
         via_fabric: true,
     };
 
-    // A closed Access Point without source authentication is not ready: it
-    // refuses every request before source authentication, policy and the
-    // Target, as the direct path does.
-    if surface.refuses_every_request() {
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request before source authentication, policy and the Target, as the
+    // direct path does.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&surface).await {
         return axum_response_to_forward_result(crate::source_auth::errors::refuse_unavailable_access_point(
             &surface,
             &audit_facts,
             resolved_alias,
             refused_mcp_request_id(&surface, &body_bytes),
+            reason,
         ))
         .await;
     }
@@ -5775,6 +5779,9 @@ async fn process_forward_request_in_request_scope(
                 channel_info!(config_id, "    Skipping caller-info header: {}", key);
                 continue;
             }
+            if key_lower == "cookie" {
+                continue;
+            }
             if target_auth_header.is_some_and(|credential| key.eq_ignore_ascii_case(credential)) {
                 continue;
             }
@@ -5914,7 +5921,8 @@ async fn process_forward_request_in_request_scope(
         let called_tool = crate::mcp::tool_analyzer::called_tool_name(&body_bytes);
         let refusal = if !fabric_delegation_applies(&outbound_creds, called_tool.as_deref()) {
             None
-        } else if fabric_per_user_binding_applies(
+        } else if !surface.releases_target_grants_to_fabric_callers()
+            && fabric_per_user_binding_applies(
                 &outbound_creds,
                 called_tool.as_deref(),
                 get_credential_provider_store().as_ref(),
@@ -5961,11 +5969,36 @@ async fn process_forward_request_in_request_scope(
                 &user_hash[..8.min(user_hash.len())]
             );
 
+            let delegation_audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
+                caller: authenticated_identity
+                    .as_ref()
+                    .map(|identity| {
+                        crate::delegation_vault::audit::fabric_receive_caller_context(
+                            identity,
+                            sender
+                                .issuer_did
+                                .as_deref(),
+                            &sender.id,
+                        )
+                    }),
+                channel_name: Some(surface.name.clone()),
+                target_endpoint: Some(
+                    surface
+                        .target_endpoint()
+                        .to_string(),
+                ),
+                protocol: Some(format!("{:?}", surface.channel_protocol()).to_lowercase()),
+                mcp_tool_name: called_tool.clone(),
+                agent_identity_did: None,
+                vp_jwt: None,
+                // No session, so a partner's request never drives an elicitation.
+                mcp_session_id: None,
+            };
             let delegation_results =
                 crate::proxy::credential_delegation::resolve_delegation_credentials(
                     &outbound_creds,
                     user_hash,
-                    surface.target_endpoint(),
+                    surface.target_grant_agent_did(None),
                     config_id,
                     crate::tenancy::SurfaceTenancy::configured(
                         surface
@@ -5981,7 +6014,7 @@ async fn process_forward_request_in_request_scope(
                     &secrets_store,
                     &base_url,
                     true, // via_fabric = true (G2G path)
-                    None, // audit context not yet available in G2G path
+                    Some(&delegation_audit_ctx),
                     // A Fabric request establishes no consent principal, so it never
                     // unlocks a modern consent record.
                     None,
@@ -9866,6 +9899,9 @@ mod variant_routing_tests;
 mod target_grant_tests;
 
 #[cfg(test)]
+mod fabric_partner_grant_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
@@ -11768,9 +11804,9 @@ mod tests {
         }
     }
 
-    /// The caller-info and DID identity headers a peer gateway sends, in any
-    /// case, never reach the agent behind the receiving surface; the peer's
-    /// other headers do.
+    /// The caller-info and DID identity headers and the caller's cookies a peer
+    /// gateway sends, in any case, never reach the agent behind the receiving
+    /// surface; the peer's other headers do.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11836,6 +11872,7 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "Cookie": "__Host-session_token=peer-dashboard-session",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11852,6 +11889,7 @@ mod tests {
             "x-gateway-did",
             "x-did-identity",
             "x-did-signed-identity",
+            "cookie",
         ] {
             assert!(
                 received[0]

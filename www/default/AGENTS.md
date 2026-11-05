@@ -111,6 +111,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Release per-user grants to Fabric callers** is the Managed Agent panel's
+  `managed-agent/PartnerGrantReleaseSection.tsx`, under a **Fabric Callers** label. It writes
+  `target.delegated_credentials_for_fabric_callers` and appears only when the Target is an HTTP
+  or HTTPS URL and the surface has a Credential Delegation row; a save drops the field for any
+  other Target. It defaults to off, its explanation sits behind `FieldHelp`, and while on an
+  always-visible warning says a paired gateway that sends a person's own token gets that
+  person's grant. A variant carries it in `overrides.target`. Test ids:
+  `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -166,9 +174,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Public access on: "This Access Point is public. …", on every successful save.
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
+  The dashboard shows none of these after a save (`shownSaveWarnings` in
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
+  Access Point panel already show the Access Point's state, and turning Public access on is the
+  operator's own choice. Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
-  and one line per warning as a `warning` toast, the `Warning` headers first, then the
+  and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
   dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
   headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
   surface's page so the banner lists them.
@@ -280,6 +292,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   leaves it in place. The default variant's note says it also answers on the surface's route
   with the resource as written.
 
+- A Transit Point's Rate Limit panel (`rate-limit/RateLimitPanel.tsx`) adds a **Per caller
+  (optional)** section (`per-caller-rate-limit`) below the shared limit, with its explanation
+  behind `field-help-rate-limit-per-caller`. It writes `transit.points[].per_caller_rate_limit`
+  beside `rate_limit` (`rate-limit/wire.ts`), and either can be set alone. The inbound Rate Limit
+  panel does not show it. Inputs: `rate-limit-caller-requests-input`,
+  `rate-limit-caller-window-secs-input` and `rate-limit-caller-burst-input`; like the gateway,
+  `validate` refuses a per-caller requests, window or burst below 1. A per-caller limit set
+  through the API is kept by a dashboard save, and a limit removed through the API is not
+  restored: a Transit Point's rate-limit node takes its limits only from the stored surface,
+  never from the canvas blob. On a named variant the per-caller inputs are read-only, with the
+  hint `rate-limit-caller-base-only`, and show the base point's limit (`resolveVariant`);
+  `computeOverridesFromPayload` leaves `per_caller_rate_limit` out of a variant's points, since
+  the gateway enforces the base point's.
 - A Transit Point's **Inject outbound credential** binding (`_shared/TransitCredentialBindingSection.tsx`)
   keeps what its controls do not set: `elicit_timeout_secs`, `elicit_fallback` and an external
   consent binding's `subject` round-trip through the form, and the consent select
@@ -678,6 +703,23 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategy editor
+
+`/jwt-verification-strategies/new` and `/jwt-verification-strategies/:id`
+(`EditJwtVerificationStrategyPage.tsx`) have a **Caller identity claim** field
+(`jwt-strategy-editor-principal-claim-input`), the strategy's `principal_claim`. A new strategy
+sends the trimmed value only when it is not blank, so a blank field means `sub`. On an existing
+strategy the field shows the stored claim, is disabled, and is left out of the update, since the
+gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
+same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
+
+## Credentials audit tab
+
+`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
+the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
+the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
+other than `sub`.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
@@ -910,7 +952,7 @@ peer's Fabric exposure through `PUT /gateways/{id}/exposed-surfaces`.
 
 ## Feature flags
 
-Settings → **System** → **Feature Flags** is a table of the shared `FeatureFlagRow`
+Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFlagRow`
 (`SettingsPage/SystemTab.tsx`).
 
 - A new flag is one row plus an optional field on `FeatureFlags` in `types.ts`.
@@ -928,10 +970,20 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 
 ## Restore from backup
 
-Settings → **System** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
+Settings → **Admin** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
 `.agbak` and legacy `.tgwbak` files. The legacy support is stated on the page
 (`data-testid="restore-legacy-format-note"`), and the wrong-file toast names both extensions.
 The hidden file input is `data-testid="restore-file-input"`.
+
+## Maintenance actions
+
+The Dashboard's Gateway Configuration card shows the metrics **Delete** button
+(`dashboard-metrics-delete-button`) only when `hasPermission('settings.edit')`, the permission
+`POST /v1/metrics/truncate` needs; the **Logs** button is shown to everyone. Settings → **Admin**
+(`SettingsPage/SystemTab.tsx`), shown with `settings.view`, holds **Truncate Old Metrics Now**
+(`settings-admin-truncate-metrics-button`) and **Truncate Old Logs**
+(`settings-admin-truncate-logs-button`), whose routes also need `settings.edit`. The backend
+check is authoritative; see [`docs/RBAC.md`](../../docs/RBAC.md#maintenance-and-welcome-routes).
 
 ## Schema capture and A2A versions
 

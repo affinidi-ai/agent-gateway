@@ -6,6 +6,7 @@ import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
 import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import { providerTargetAuthFromApi, providerTargetAuthToApi } from '../_shared/providerTargetAuth';
+import { isHttpTarget } from './PartnerGrantReleaseSection';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -233,6 +234,9 @@ export const managedAgentDefinition: NodeDefinition = {
     if (typeof c.endpoint === 'string' && c.endpoint.startsWith('fabric://')) {
       if (c.fabric_target_name) tgt.fabric_target_name = c.fabric_target_name;
       if (c.fabric_delegated_credentials === true) tgt.fabric_delegated_credentials = true;
+    }
+    if (isHttpTarget(c.endpoint) && c.delegated_credentials_for_fabric_callers === true) {
+      tgt.delegated_credentials_for_fabric_callers = true;
     }
     if (c.mpp_auto_pay) {
       tgt.mpp_auto_pay = true;

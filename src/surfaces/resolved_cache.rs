@@ -318,6 +318,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,

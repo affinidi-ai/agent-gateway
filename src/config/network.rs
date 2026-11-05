@@ -527,6 +527,27 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warns about each listener external URL with no host that parses, through
+/// which no listener shares `/outbound`, naming it by its listener and
+/// position, never its value, which may hold a credential. Listeners change
+/// only on a restart, so startup calls this once.
+pub(crate) fn warn_about_unparsed_external_urls(listeners: &[Listener]) {
+    for l in listeners {
+        for (index, _) in l
+            .external_urls
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| !Url::parse(url).is_ok_and(|url| url.has_host()))
+        {
+            tracing::warn!(
+                listener = %l.id,
+                external_url_index = index,
+                "Listener external URL has no host that parses, so no listener shares /outbound through it"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod listener_validation_tests {
     use super::*;
@@ -553,6 +574,35 @@ mod listener_validation_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate listener bind address 0.0.0.0:8080"), "got: {err}");
+    }
+
+    #[test]
+    fn an_external_url_without_a_host_is_named_by_its_position_not_its_value() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut outbound = listener("outbound-http", "0.0.0.0", 9000);
+        outbound.external_urls = vec![
+            "https://shared.example.com".into(),
+            "https://secret-user:secret-pass@shared.example.com:99999".into(),
+            "no-scheme".into(),
+        ];
+
+        warn_about_unparsed_external_urls(&[listener("inbound-http", "0.0.0.0", 8080), outbound]);
+
+        let text = logs.text();
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Listener external URL has no host that parses"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{text}");
+        assert!(
+            warnings
+                .iter()
+                .all(|line| line.contains("outbound-http")),
+            "{text}"
+        );
+        assert!(warnings[0].contains("external_url_index=1"), "{}", warnings[0]);
+        assert!(warnings[1].contains("external_url_index=2"), "{}", warnings[1]);
+        assert!(!text.contains("secret-pass"), "a log holds the URL: {text}");
     }
 
     #[test]

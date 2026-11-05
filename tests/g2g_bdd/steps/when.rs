@@ -74,6 +74,19 @@ pub(crate) async fn send_a2a_request_through_transit_point(
 }
 
 #[when(
+    regex = r#"^managed agent "([^"]+)" sends an A2A message/send request through Transit Point "([^"]+)" with header "([^"]+)" set to "([^"]+)"$"#
+)]
+pub async fn managed_agent_sends_a2a_request_through_transit_point_with_header(
+    world: &mut G2gWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    send_a2a_request_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)]).await;
+}
+
+#[when(
     regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request through Transit Point \"([^\"]+)\" with header \"([^\"]+)\" set to \"([^\"]+)\" and header \"([^\"]+)\" set to \"([^\"]+)\"$"#
 )]
 pub async fn managed_agent_sends_a2a_request_through_transit_point_with_two_headers(

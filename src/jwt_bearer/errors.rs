@@ -40,6 +40,10 @@ pub enum JwtBearerError {
     /// A storage I/O error occurred.
     #[error("Storage error: {0}")]
     Storage(String),
+
+    /// The strategy's stored `principal_claim` is not one that can name a caller.
+    #[error("Invalid principal claim on strategy: {0}")]
+    InvalidPrincipalClaim(String),
 }
 
 impl From<anyhow::Error> for JwtBearerError {

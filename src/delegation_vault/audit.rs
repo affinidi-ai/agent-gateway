@@ -92,6 +92,11 @@ pub struct AuditCallerContext {
     /// `sub` claim (JWT subject)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
+    /// The value of the JWT verification strategy's principal claim, when the
+    /// strategy names a claim other than `sub`: the subject the caller is
+    /// identified by. `sub` then holds the token's own `sub`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub principal: Option<String>,
     /// Management-API personal access token id, when the caller authenticated
     /// with a PAT rather than a console session. Attributes a management action
     /// (e.g. a delegation-vault revoke) to the exact token used.
@@ -103,8 +108,9 @@ pub struct AuditCallerContext {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_identity_hash: Option<String>,
     /// The paired gateway that sent the request over Fabric, for a
-    /// `fabric_verified` or `fabric_asserted` caller: its issuer DID, else its
-    /// Remote gateway record id.
+    /// `fabric_verified` or `fabric_asserted` caller, and for the caller of a
+    /// delegated credential released on Fabric receive: its issuer DID, else
+    /// its Remote gateway record id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub peer_gateway: Option<String>,
     /// Raw caller email captured for administrator-only audit evidence.
@@ -536,6 +542,9 @@ pub enum DelegationAuditAction {
         scope: RateLimitScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        /// The Transit Point whose per-caller limit refused the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
     },
     RequestRejected {
         stage: RejectionStage,
@@ -1121,7 +1130,27 @@ pub fn vp_fingerprint(vp_jwt: &str) -> String {
 /// Build an `AuditCallerContext` from a source-auth identity
 pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity) -> AuditCallerContext {
     match identity {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims } => {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject,
+            principal_claim,
+            claims,
+        } => {
+            let named_by_sub = principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM;
+            let (sub, principal) = if named_by_sub {
+                (Some(subject.clone()), None)
+            } else {
+                let carried = claims
+                    .get(principal_claim.as_str())
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty() && *value == subject.as_str());
+                (
+                    claims
+                        .get("sub")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    carried.map(String::from),
+                )
+            };
             let iss = claims
                 .get("iss")
                 .and_then(|v| v.as_str())
@@ -1152,7 +1181,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
                 auth_method: "jwt_bearer".to_string(),
                 iss,
                 aud,
-                sub: Some(subject.clone()),
+                sub,
+                principal,
                 token_id: None,
                 email: email.map(String::from),
                 name: name.map(String::from),
@@ -1167,6 +1197,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             }
         }
         crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, .. } => AuditCallerContext {
+            principal: None,
             auth_method: "api_key".to_string(),
             iss: None,
             aud: None,
@@ -1184,6 +1215,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             peer_gateway: None,
         },
         crate::source_auth::AuthenticatedIdentity::DidAuth { did } => AuditCallerContext {
+            principal: None,
             auth_method: "did_auth".to_string(),
             iss: None,
             aud: None,
@@ -1208,6 +1240,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             source,
             ..
         } => AuditCallerContext {
+            principal: None,
             auth_method: "mtls".to_string(),
             iss: Some(issuer_dn.clone()),
             aud: None,
@@ -1227,6 +1260,26 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             user_identity_hash: None,
             peer_gateway: None,
         },
+    }
+}
+
+/// Build the `AuditCallerContext` of a delegated credential released on Fabric
+/// receive: the caller the receiving surface's own `source_auth` or resource
+/// token verified on the request ([`build_caller_context`]), with the paired
+/// gateway that sent it as `peer_gateway`: its issuer DID, else its Remote
+/// gateway record id.
+pub fn fabric_receive_caller_context(
+    identity: &crate::source_auth::AuthenticatedIdentity,
+    peer_issuer_did: Option<&str>,
+    peer_gateway_id: &str,
+) -> AuditCallerContext {
+    AuditCallerContext {
+        peer_gateway: Some(
+            peer_issuer_did
+                .unwrap_or(peer_gateway_id)
+                .to_string(),
+        ),
+        ..build_caller_context(identity)
     }
 }
 
@@ -1261,6 +1314,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
             .clone()
             .unwrap_or_else(|| fabric.peer_gateway_id.clone());
         return Some(AuditCallerContext {
+            principal: None,
             auth_method: if verified {
                 "fabric_verified"
             } else {
@@ -1298,6 +1352,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
         return None;
     }
     Some(AuditCallerContext {
+        principal: None,
         auth_method: "transit_token".to_string(),
         iss: None,
         aud: None,
@@ -1340,6 +1395,7 @@ pub fn binding_caller_context(binding: &crate::surface_context::IdentityBindingC
         return None;
     }
     Some(AuditCallerContext {
+        principal: None,
         auth_method: "workload_binding".to_string(),
         iss: Some(binding.gateway_did.clone()),
         aud: None,
@@ -1376,6 +1432,7 @@ pub fn management_caller_context(
         "session"
     };
     Some(AuditCallerContext {
+        principal: None,
         auth_method: auth_method.to_string(),
         iss: None,
         aud: None,
@@ -1801,6 +1858,7 @@ mod tests {
     #[test]
     fn caller_context_preserves_raw_jwt_identity_evidence() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({
                 "iss": "https://issuer.example",
@@ -1822,6 +1880,67 @@ mod tests {
                 .is_none()
         );
         assert!(caller.name_redacted.is_none());
+        assert!(caller.principal.is_none(), "a caller named by sub has no separate principal");
+    }
+
+    /// A strategy that names callers by another claim keeps the token's own
+    /// `sub` in the record, so it matches the identity provider's logs, and
+    /// adds the claim's value as the principal.
+    #[test]
+    fn caller_context_keeps_the_tokens_sub_beside_another_principal_claim() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "person-1".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub", "oid": "person-1" }),
+        };
+        let caller = build_caller_context(&identity);
+        assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
+        assert_eq!(caller.principal.as_deref(), Some("person-1"));
+        let without_sub = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "person-1".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
+        };
+        assert_eq!(build_caller_context(&without_sub).sub, None);
+        let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "<none>".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
+        };
+        let caller = build_caller_context(&without_oid);
+        assert_eq!(caller.principal, None, "a token without the claim has no principal, not the placeholder");
+        assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
+    }
+
+    /// The caller of a credential released on Fabric receive is the one the
+    /// receiving surface verified, with the peer gateway that sent the request:
+    /// its issuer DID, else its record id. A direct caller names no peer.
+    #[test]
+    fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
+            principal_claim: "sub".to_string(),
+        };
+
+        let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
+        assert_eq!(
+            (received.auth_method.as_str(), received.iss.as_deref(), received.sub.as_deref()),
+            ("jwt_bearer", Some("https://issuer.example"), Some("alice"))
+        );
+        assert_eq!(
+            received
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(
+            fabric_receive_caller_context(&identity, None, "partner-record")
+                .peer_gateway
+                .as_deref(),
+            Some("partner-record")
+        );
+        assert_eq!(build_caller_context(&identity).peer_gateway, None);
     }
 
     #[test]
@@ -2182,6 +2301,7 @@ mod tests {
                 DelegationAuditAction::RateLimited {
                     scope: RateLimitScope::SseSessions,
                     retry_after_ms: Some(1500),
+                    transit_point: None,
                 },
                 "rate_limited",
             ),
@@ -2498,6 +2618,7 @@ mod tests {
     #[tokio::test]
     async fn audit_policy_decision_records_the_authenticated_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
         };
@@ -2750,6 +2871,7 @@ mod tests {
     #[test]
     fn a_vp_injection_record_has_the_full_field_set() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
         };
@@ -2780,6 +2902,7 @@ mod tests {
     #[tokio::test]
     async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
         };
