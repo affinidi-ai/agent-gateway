@@ -32,6 +32,24 @@ Feature: Credential policy rules when saving Target authentication
     Then the admin API response status is 400
     And the admin API error response mentions "target.auth sends a credential, so its Target must be an https URL"
 
+  Scenario Outline: A header rule is enforced while the Target credential rules only warn
+    Given the gateway only warns on the credential rule "target_https"
+    And the gateway only warns on the credential rule "target_source_auth"
+    And the operator can use the admin API and no surface is configured for route "/example"
+    And the appliance holds the secret "target-key"
+    And a surface draft for route "/refused" whose Target receives secret "target-key" in header "<header>"
+    And the draft's Access Point checks callers by the API key in secret "target-key"
+    And the draft's Target is "http://127.0.0.1:9/"
+    And the draft's Target authentication formats its value as "<format>"
+    When the operator creates the surface from the draft
+    Then the admin API response status is 400
+    And the admin API error response mentions "<message>"
+
+    Examples:
+      | header       | format  | message                                                      |
+      | Host         | {value} | target.auth.header_name must not be the reserved header Host |
+      | X-Target-Key | Bearer  | target.auth.header_format must contain {value} exactly once |
+
   Scenario: A Target credential on a closed Access Point without a Caller Context is saved not ready with a warning in warn mode
     Given the gateway keeps its log of warnings
     And the operator can use the admin API and no surface is configured for route "/example"
