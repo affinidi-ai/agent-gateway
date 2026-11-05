@@ -15,9 +15,6 @@ an error. This page says which layer to put them in.
 | Dashboard | [`ui-tests/`](../../ui-tests/) | The dashboard in a real browser | A running gateway and Playwright |
 | Legacy component (frozen) | [`src/component_tests/`](../../src/component_tests/) | Flows written before the Behaviour layer existed; takes no additions | Nothing |
 
-Around 300 source files carry inline test modules, there are 64 feature files, 11 Playwright
-specs, and 44 frozen component-test files.
-
 ```mermaid
 flowchart LR
     U["Unit<br/>one function"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
