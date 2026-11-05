@@ -214,6 +214,12 @@ pipeline: the node admits traffic after one start attempt and, if that start is 
 integrations cannot be listed, or the other node still holds the journal), keeps trying in the
 background.
 
+Also on becoming Active, before it reloads its configuration, a node reconciles with disk its
+policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
+created, rotated or revoked while this node was Standby therefore authenticate, or stop
+authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
+held.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
@@ -263,7 +269,12 @@ that means a tenant surface sending an appliance-wide secret or credential provi
 out without it or is refused, as `target.auth.fallback` says (see
 [Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A
 reference to another tenant's is refused in both modes (see
-[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
+[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). A
+stored surface that derives a DID from another tenant's API Key Provider key, or from the key of
+a surface with no tenant, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
+those surfaces, then restart with `"enforce"`. An
 unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not

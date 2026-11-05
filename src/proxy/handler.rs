@@ -1944,13 +1944,11 @@ async fn proxy_handler_with_mcp_runtime(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    // A closed Access Point without source authentication is not ready: it
-    // refuses every request, discovery reads included, before source
-    // authentication, policy and the Target.
-    if state
-        .surface
-        .refuses_every_request()
-    {
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request, discovery reads included, before source authentication, policy
+    // and the Target.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&state.surface).await {
         return Ok(refuse_not_ready_access_point(
             &state.surface,
             &state.network_config,
@@ -1959,6 +1957,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .active_variant_alias
                 .as_deref(),
             req,
+            reason,
         )
         .await);
     }
@@ -9991,6 +9990,7 @@ async fn refuse_not_ready_access_point(
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     variant_alias: Option<&str>,
     req: Request,
+    reason: crate::source_auth::errors::NotReadyReason,
 ) -> Response {
     let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
     crate::source_auth::errors::refuse_unavailable_access_point(
@@ -9998,6 +9998,7 @@ async fn refuse_not_ready_access_point(
         &routing_facts(surface),
         variant_alias,
         mcp_request_id,
+        reason,
     )
 }
 

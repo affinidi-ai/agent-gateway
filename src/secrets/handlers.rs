@@ -93,6 +93,19 @@ pub async fn create_secret(
     scope: Option<Extension<PatResourceScope>>,
     Json(mut request): Json<CreateSecretRequest>,
 ) -> impl IntoResponse {
+    if request
+        .secret_id
+        .starts_with(crate::api_keys::KEY_ID_PREFIX)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": format!(
+                "secret_id cannot start with {}, which is reserved for API key ids",
+                crate::api_keys::KEY_ID_PREFIX
+            ) })),
+        )
+            .into_response();
+    }
     request.tenant_id = match tenant_for_create(request.tenant_id.take(), pat.is_some(), tenant_context(&context)) {
         Ok(tenant_id) => tenant_id,
         Err(message) => {
@@ -566,7 +579,9 @@ mod tests {
             &self,
             _request: CreateSecretRequest,
         ) -> Result<Secret> {
-            unreachable!()
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.secret.clone())
         }
         async fn get(
             &self,
@@ -1069,5 +1084,106 @@ mod tests {
                 0
             );
         }
+    }
+
+    async fn create_with_id(
+        store: Arc<dyn SecretsStore>,
+        secret_id: &str,
+    ) -> (StatusCode, String) {
+        let response = create_secret(
+            State(store),
+            Extension(None),
+            None,
+            None,
+            None,
+            Json(CreateSecretRequest {
+                tenant_id: None,
+                name: "Key".to_string(),
+                secret_id: secret_id.to_string(),
+                description: None,
+                value: PLAINTEXT.to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        status_and_body(response).await
+    }
+
+    #[tokio::test]
+    async fn a_secret_id_with_the_api_key_id_prefix_is_refused_on_create() {
+        let recording = recording_store(None);
+        let (status, body) = create_with_id(recording.clone(), "atgk_0123456789abcdef").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["message"],
+            "secret_id cannot start with atgk_, which is reserved for API key ids"
+        );
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_id_without_the_api_key_id_prefix_is_created() {
+        let recording = recording_store(None);
+        let (status, body) = create_with_id(recording.clone(), "billing_api_key").await;
+
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["secret_id"], "billing_api_key");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_secret_with_the_api_key_id_prefix_is_still_read_and_updated() {
+        let mut stored = recording_store(None);
+        Arc::get_mut(&mut stored)
+            .unwrap()
+            .secret
+            .secret_id = "atgk_legacy".to_string();
+        let store: Arc<dyn SecretsStore> = stored.clone();
+
+        let read = get_secret(State(store.clone()), Path("internal-1".to_string()), None, None)
+            .await
+            .into_response();
+        let (status, body) = status_and_body(read).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["secret_id"], "atgk_legacy");
+
+        let updated = update_secret(
+            State(store),
+            Extension(None),
+            Extension(None),
+            Path("internal-1".to_string()),
+            None,
+            None,
+            Json(UpdateSecretRequest {
+                name: None,
+                description: None,
+                value: Some("rotated".to_string()),
+                update_value: Some(true),
+                secret_type: None,
+                tags: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(
+            stored
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

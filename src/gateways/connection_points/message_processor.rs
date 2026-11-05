@@ -4633,15 +4633,17 @@ async fn process_forward_request_in_request_scope(
         via_fabric: true,
     };
 
-    // A closed Access Point without source authentication is not ready: it
-    // refuses every request before source authentication, policy and the
-    // Target, as the direct path does.
-    if surface.refuses_every_request() {
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request before source authentication, policy and the Target, as the
+    // direct path does.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&surface).await {
         return axum_response_to_forward_result(crate::source_auth::errors::refuse_unavailable_access_point(
             &surface,
             &audit_facts,
             resolved_alias,
             refused_mcp_request_id(&surface, &body_bytes),
+            reason,
         ))
         .await;
     }

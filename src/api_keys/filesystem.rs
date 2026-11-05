@@ -70,7 +70,7 @@ impl FileSystemApiKeyStore {
 
         // Build per-agent stores and load existing keys into memory
         store
-            .load_existing_agents()
+            .load_new_agents()
             .await?;
 
         info!("Initialized FileSystemApiKeyStore at: {}", store.storage_dir.display());
@@ -88,24 +88,33 @@ impl FileSystemApiKeyStore {
     }
 
     /// Scan the storage root and build a per-agent generic store for every
-    /// existing agent directory, loading (and, when encryption at rest is on,
-    /// transparently migrating) each agent's keys into memory.
-    async fn load_existing_agents(&self) -> ApiKeyResult<()> {
-        let mut entries = match fs::read_dir(&self.storage_dir).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-
+    /// agent directory that has none yet, loading (and, when encryption at rest
+    /// is on, transparently migrating) its keys into memory: at startup every
+    /// directory, later those another node sharing the storage created since. A
+    /// symlink to a directory counts as one; an entry whose type cannot be read is
+    /// skipped. A name that is not a valid storage id is no agent's and is
+    /// skipped; an agent whose keys cannot be loaded is logged and skipped. A root
+    /// that cannot be read is an error.
+    async fn load_new_agents(&self) -> ApiKeyResult<()> {
+        let mut entries = fs::read_dir(&self.storage_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_dir()
-                && let Some(agent_id) = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                && let Err(e) = self
-                    .agent_store(agent_id)
+            let file_name = entry.file_name();
+            let Some(agent_id) = file_name.to_str() else {
+                continue;
+            };
+            if self
+                .stores
+                .contains_key(agent_id)
+                || crate::storage::validate_storage_id(agent_id).is_err()
+                || !fs::metadata(entry.path())
                     .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                continue;
+            }
+            if let Err(e) = self
+                .agent_store(agent_id)
+                .await
             {
                 warn!("Failed to load keys for agent {}: {}", agent_id, e);
             }
@@ -155,9 +164,19 @@ impl FileSystemApiKeyStore {
             .into();
         self.stores
             .insert(agent_id.to_string(), store.clone());
+        self.index_agent(agent_id, store.as_ref())
+            .await?;
 
-        // Build the secret-hash lookup for this agent from disk. Legacy records
-        // without a `secret_hash` are skipped and therefore never validate.
+        Ok(store)
+    }
+
+    /// Build, or rebuild, the secret-hash lookup of one agent from its store's records.
+    /// Legacy records without a `secret_hash` are skipped and therefore never validate.
+    async fn index_agent(
+        &self,
+        agent_id: &str,
+        store: &dyn StorageBackend<ApiKeyRecord>,
+    ) -> ApiKeyResult<()> {
         let index = DashMap::new();
         for record in store.list_all().await? {
             if let Some(ref hash) = record.secret_hash {
@@ -166,8 +185,43 @@ impl FileSystemApiKeyStore {
         }
         self.hash_index
             .insert(agent_id.to_string(), index);
+        Ok(())
+    }
 
-        Ok(store)
+    /// Reconcile every agent's keys with disk, as another node sharing the storage wrote
+    /// them: load agent folders created since, re-read each loaded agent's records, so a key
+    /// created, rotated or revoked elsewhere takes effect, rebuild its secret-hash lookup, and
+    /// drop an agent whose folder is gone. An agent that cannot be refreshed keeps what it
+    /// held and is logged.
+    pub async fn refresh_from_disk(&self) -> ApiKeyResult<()> {
+        self.load_new_agents().await?;
+        let agents: Vec<(String, Arc<dyn StorageBackend<ApiKeyRecord>>)> = self
+            .stores
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (agent_id, store) in agents {
+            if !fs::try_exists(self.agent_dir(&agent_id)).await? {
+                self.stores.remove(&agent_id);
+                self.hash_index
+                    .remove(&agent_id);
+                continue;
+            }
+            let refreshed = match store
+                .refresh_from_disk()
+                .await
+            {
+                Ok(()) => {
+                    self.index_agent(&agent_id, store.as_ref())
+                        .await
+                }
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = refreshed {
+                warn!("Failed to refresh keys for agent {}: {}", agent_id, error);
+            }
+        }
+        Ok(())
     }
 
     /// Insert or replace this record's `secret_hash -> key_id` entry.
@@ -510,7 +564,12 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         Ok(())
     }
 
+    async fn refresh_from_disk(&self) -> ApiKeyResult<()> {
+        FileSystemApiKeyStore::refresh_from_disk(self).await
+    }
+
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        self.load_new_agents().await?;
         let stores: Vec<_> = self
             .stores
             .iter()
@@ -602,6 +661,139 @@ mod tests {
         .await
         .unwrap();
         (store, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn list_all_sees_keys_another_store_on_the_same_directory_created_for_a_new_agent() {
+        let (first, temp_dir) = create_test_store().await;
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            second
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let created = first
+            .create("agent-later", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        std::fs::create_dir(
+            temp_dir
+                .path()
+                .join(".not-an-agent"),
+        )
+        .unwrap();
+
+        let seen = second
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].key_id, created.key_id);
+        assert_eq!(seen[0].agent_id, "agent-later");
+    }
+
+    #[tokio::test]
+    async fn refresh_from_disk_takes_in_keys_another_store_created_rotated_or_revoked() {
+        let (first, temp_dir) = create_test_store().await;
+        let rotated = first
+            .create("agent-x", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let revoked = first
+            .create("agent-x", "client-2", None, "test-actor")
+            .await
+            .unwrap();
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let created = first
+            .create("agent-x", "client-3", None, "test-actor")
+            .await
+            .unwrap();
+        let rotation = first
+            .rotate("agent-x", &rotated.key_id, "test-actor")
+            .await
+            .unwrap();
+        first
+            .revoke("agent-x", &revoked.key_id, "test-actor")
+            .await
+            .unwrap();
+        let validates = |secret: String| {
+            let second = &second;
+            async move {
+                second
+                    .validate("agent-x", &secret)
+                    .await
+                    .unwrap()
+                    .map(|meta| meta.key_id)
+            }
+        };
+        assert_eq!(validates(created.secret.clone()).await, None, "not seen before the refresh");
+
+        ApiKeyStore::refresh_from_disk(&second)
+            .await
+            .unwrap();
+
+        let listed: Vec<String> = second
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.key_id)
+            .collect();
+        assert!(listed.contains(&created.key_id), "{listed:?}");
+        assert_eq!(validates(created.secret.clone()).await, Some(created.key_id.clone()));
+        assert_eq!(validates(rotation.secret.clone()).await, Some(rotated.key_id.clone()));
+        assert_eq!(validates(rotated.secret.clone()).await, None, "the rotated-out secret no longer validates");
+        assert_eq!(validates(revoked.secret.clone()).await, None, "a revoked key no longer validates");
+
+        std::fs::remove_dir_all(
+            temp_dir
+                .path()
+                .join("agent-x"),
+        )
+        .unwrap();
+        ApiKeyStore::refresh_from_disk(&second)
+            .await
+            .unwrap();
+        assert!(
+            second
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a deleted agent folder is dropped"
+        );
+        assert_eq!(validates(created.secret.clone()).await, None);
+    }
+
+    #[tokio::test]
+    async fn list_all_fails_when_the_storage_root_cannot_be_read() {
+        let (store, temp_dir) = create_test_store().await;
+        std::fs::remove_dir_all(temp_dir.path()).unwrap();
+
+        assert!(
+            store
+                .list_all()
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -767,6 +959,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiKeyError::KeyNotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_agent_folder_is_loaded_and_a_dangling_link_is_skipped() {
+        let elsewhere = TempDir::new().unwrap();
+        let created = FileSystemApiKeyStore::new(
+            elsewhere
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .create("agent-linked", "client-1", None, "test-actor")
+        .await
+        .unwrap();
+        let root = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere
+                .path()
+                .join("agent-linked"),
+            root.path()
+                .join("agent-linked"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.path()
+                .join("no-such-folder"),
+            root.path()
+                .join("agent-dangling"),
+        )
+        .unwrap();
+
+        let store = FileSystemApiKeyStore::new(root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let validated = store
+            .validate("agent-linked", &created.secret)
+            .await
+            .unwrap()
+            .expect("a key in a symlinked agent folder validates");
+        assert_eq!(validated.key_id, created.key_id);
+        let listed = store
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, "agent-linked");
     }
 
     #[tokio::test]

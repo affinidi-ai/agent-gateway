@@ -1318,6 +1318,42 @@ pub async fn run_axum_proxy(
             }
         }
 
+        let api_keys_storage_path = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .map(|p| p.join("api_keys"))
+        .unwrap_or_else(|| std::path::PathBuf::from("_storage/api_keys"));
+        let api_keys_storage_path_str = api_keys_storage_path
+            .to_string_lossy()
+            .to_string();
+        let api_key_store = match crate::api_keys::FileSystemApiKeyStore::new(&api_keys_storage_path_str).await {
+            Ok(store) => {
+                info!("API Keys store initialized at {}", api_keys_storage_path_str);
+                let store_arc = std::sync::Arc::new(store);
+                {
+                    use crate::api_keys::store::ApiKeyStore as _;
+                    let s = store_arc.clone();
+                    crate::config::register_counter("secrets.apikeys", move || {
+                        let s = s.clone();
+                        async move {
+                            s.list_all()
+                                .await
+                                .map(|v| v.len())
+                                .unwrap_or(0)
+                        }
+                    });
+                }
+                Some(store_arc)
+            }
+            Err(e) => {
+                warn!("Failed to initialize API Keys store at {}: {}", api_keys_storage_path_str, e);
+                None
+            }
+        };
+
         // Create identity API state
         let identity_state = crate::identity::IdentityApiState {
             vc_issuer: vc_issuer_for_api.clone(),
@@ -1359,6 +1395,9 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             delegation_vault_store: None,
             sts_client_store: None,
+            api_key_store: api_key_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::api_keys::store::ApiKeyStore>),
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
@@ -1373,6 +1412,31 @@ pub async fn run_axum_proxy(
             #[cfg(feature = "didwebvh")]
             didwebvh_base_url: None,
         };
+
+        let provider_key_gate = crate::identity::provider_key_gate::gate();
+        provider_key_gate.set_sources(
+            identity_state
+                .api_key_store
+                .clone(),
+            agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+        );
+        if let Some(ref surface_store) = agent_surface_store {
+            match surface_store.list_all().await {
+                Ok(surfaces) => {
+                    for surface in surfaces
+                        .iter()
+                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                    {
+                        provider_key_gate
+                            .admit(surface)
+                            .await;
+                    }
+                }
+                Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
+            }
+        }
 
         // Once changes of channels are detected (FS updated by another node) -> propagate changes to this node
         let pending_surface_events: PendingSurfaceEvents = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -3113,17 +3177,6 @@ pub async fn run_axum_proxy(
 
         // Build the unified source authentication middleware
         // First create the api_key_validator since source_auth_middleware depends on it
-        let api_keys_storage_path = std::path::PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .secrets,
-        )
-        .parent()
-        .map(|p| p.join("api_keys"))
-        .unwrap_or_else(|| std::path::PathBuf::from("_storage/api_keys"));
-        let api_keys_storage_path_str = api_keys_storage_path
-            .to_string_lossy()
-            .to_string();
         // Build the RBAC guard threaded through vault sub-routers that require
         // feature-level permissions. Durable audit evidence is not registered
         // when the guard is unavailable.
@@ -3137,42 +3190,23 @@ pub async fn run_axum_proxy(
             })
             .map(|storage| crate::auth_manager::middleware::RbacGuard::new(storage, rbac_config.clone()));
 
-        let (api_keys_router, api_key_validator) =
-            match crate::api_keys::FileSystemApiKeyStore::new(&api_keys_storage_path_str).await {
-                Ok(store) => {
-                    info!("API Keys store initialized at {}", api_keys_storage_path_str);
-                    let store_arc = std::sync::Arc::new(store);
-                    {
-                        use crate::api_keys::store::ApiKeyStore as _;
-                        let s = store_arc.clone();
-                        crate::config::register_counter("secrets.apikeys", move || {
-                            let s = s.clone();
-                            async move {
-                                s.list_all()
-                                    .await
-                                    .map(|v| v.len())
-                                    .unwrap_or(0)
-                            }
-                        });
-                    }
-                    let router = agent_surface_store
-                        .clone()
-                        .map(|surface_store| {
-                            let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = surface_store;
-                            crate::api_keys::router::create_api_keys_router(
-                                store_arc.clone(),
-                                surface_store,
-                                vault_rbac_guard.clone(),
-                            )
-                        });
-                    let validator: std::sync::Arc<dyn crate::api_keys::ApiKeyValidator> = store_arc;
-                    (router, Some(validator))
-                }
-                Err(e) => {
-                    warn!("Failed to initialize API Keys store at {}: {}", api_keys_storage_path_str, e);
-                    (None, None)
-                }
-            };
+        let (api_keys_router, api_key_validator) = match api_key_store {
+            Some(store_arc) => {
+                let router = agent_surface_store
+                    .clone()
+                    .map(|surface_store| {
+                        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = surface_store;
+                        crate::api_keys::router::create_api_keys_router(
+                            store_arc.clone(),
+                            surface_store,
+                            vault_rbac_guard.clone(),
+                        )
+                    });
+                let validator: std::sync::Arc<dyn crate::api_keys::ApiKeyValidator> = store_arc;
+                (router, Some(validator))
+            }
+            None => (None, None),
+        };
 
         let access_tokens_storage_path = std::path::PathBuf::from(
             &bootstrap_config
@@ -4438,6 +4472,15 @@ async fn rederive_planes_on_activation(
             .await
     {
         warn!("Gateway store refresh on activation failed: {e}");
+    }
+    if let Some(store) = identity_state
+        .api_key_store
+        .as_ref()
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("API key store refresh on activation failed: {e}");
     }
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.

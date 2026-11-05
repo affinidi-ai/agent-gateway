@@ -296,6 +296,13 @@ endpoint URL.
 | `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
+A surface that derives a DID from an API Key Provider key it may not use, or whose key or
+owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
+`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
+`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+is `true` when the surface is refused at runtime; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
 provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a
@@ -414,8 +421,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
-    `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    `access_point_not_ready` (a closed Access Point without source authentication, logged with
+    `reason=no source authentication`, or a surface that derives a DID from an API key it may
+    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
+    over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
     external consent refused before anything is sent `target_path_refused` (`400`, a path the
     grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
