@@ -8,7 +8,7 @@ use axum::{
     },
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, COOKIE, ORIGIN},
+        header::{AUTHORIZATION, ORIGIN},
     },
     response::{IntoResponse, Response},
 };
@@ -373,27 +373,10 @@ fn extract_session_token(
         }
     }
 
-    if let Some(cookie_header) = headers.get(COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        for cookie in cookie_str.split(';') {
-            let parts: Vec<&str> = cookie
-                .trim()
-                .splitn(2, '=')
-                .collect();
-            if parts.len() == 2 && parts[0] == crate::auth::session_cookie::SESSION_COOKIE_NAME {
-                let token = parts[1].trim();
-                if !token.is_empty() {
-                    return Some(SessionToken {
-                        token: token.to_string(),
-                        source: SessionTokenSource::Cookie,
-                    });
-                }
-            }
-        }
-    }
-
-    None
+    crate::auth::session_cookie::session_cookie_value(headers).map(|token| SessionToken {
+        token: token.to_string(),
+        source: SessionTokenSource::Cookie,
+    })
 }
 
 fn build_allowed_websocket_origins(network_config: &crate::config::NetworkConfig) -> HashSet<String> {
