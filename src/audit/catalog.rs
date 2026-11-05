@@ -155,7 +155,8 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "rate_limited",
         "Rate Limited",
-        "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
+        "A request was refused because a surface rate limit, a Transit Point's per-caller rate limit, SSE session cap \
+         or Fabric stream capacity was reached",
         Requests,
     ),
     event(

@@ -221,7 +221,19 @@ impl SourceAuthMiddleware {
         headers: &HeaderMap,
         channel_name: &str,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
-        // 1. Extract bearer token from the configured header / scheme
+        // 1. Extract bearer token from the configured header / scheme. A value in
+        // another scheme, such as an MPP `Payment` credential, is not a token.
+        if headers
+            .get_all(config.token_header.as_str())
+            .iter()
+            .filter(|value| in_token_scheme(value.as_bytes(), &config.token_scheme))
+            .count()
+            > 1
+        {
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "More than one bearer token".to_string(),
+            });
+        }
         let header_value = headers
             .get(config.token_header.as_str())
             .and_then(|v| v.to_str().ok());
@@ -243,16 +255,21 @@ impl SourceAuthMiddleware {
                 ))
             })?;
 
+        let principal_claim = jwt_strategy
+            .principal_claim_name()
+            .map_err(SourceAuthError::from)?
+            .to_string();
+
         // 3. Verify
         let claims = self
             .jwt_verifier
             .validate(token, &jwt_strategy, &config.audiences)
             .await
             .map_err(SourceAuthError::from)?;
-
         let subject = claims
-            .get("sub")
+            .get(principal_claim.as_str())
             .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
             .unwrap_or("<none>")
             .to_string();
 
@@ -262,7 +279,11 @@ impl SourceAuthMiddleware {
             "JWT Bearer source authentication succeeded"
         );
 
-        Ok(AuthenticatedIdentity::JwtBearer { subject, claims })
+        Ok(AuthenticatedIdentity::JwtBearer {
+            subject,
+            principal_claim,
+            claims,
+        })
     }
 
     // ── API Key (SecretsStore) ─────────────────────────────────────────────
@@ -656,6 +677,19 @@ fn extract_credential(
         // helper does not perform.
         CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
     }
+}
+
+/// Whether a token header value is in `scheme`, compared ignoring case as HTTP
+/// authentication schemes are. With no scheme, every value is a token.
+fn in_token_scheme(
+    value: &[u8],
+    scheme: &str,
+) -> bool {
+    scheme.is_empty()
+        || value
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(scheme.as_bytes()))
 }
 
 fn constant_time_compare(
@@ -1605,12 +1639,23 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         String, // strategy_id
         crate::jwt_bearer::test_utils::TestServer,
     ) {
+        jwt_test_setup_naming(None).await
+    }
+
+    async fn jwt_test_setup_naming(
+        principal_claim: Option<&str>
+    ) -> (
+        SourceAuthMiddleware,
+        String, // strategy_id
+        crate::jwt_bearer::test_utils::TestServer,
+    ) {
         let kid = "source-auth-test-key";
         let (base, server) = start_jwks_server(ed25519_jwks_body(kid, ED25519_JWK_X), Some(3600)).await;
 
         let strategy_store = Arc::new(InMemoryStrategyStore::new());
         let strategy = strategy_store
             .create(JwtVerificationStrategy {
+                principal_claim: principal_claim.map(str::to_string),
                 id: String::new(),
                 tenant_id: None,
                 name: "Test EdDSA IdP".to_string(),
@@ -1661,7 +1706,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await;
         let identity = result.expect("should succeed");
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+            AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
                 assert_eq!(subject, "user-1");
                 assert_eq!(
                     claims
@@ -1682,6 +1727,109 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             }
             other => panic!("expected JwtBearer identity, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_strategy_that_names_a_principal_claim_identifies_the_caller_by_it() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("oid")).await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+        let token_with = |claims: serde_json::Value| {
+            let mut base = json!({
+                "iss": "https://issuer.example.com",
+                "sub": "pairwise-sub",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(
+                    claims
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            make_token(base, kid)
+        };
+
+        let with_oid = token_with(json!({ "oid": "00000000-0000-0000-0000-0000000000aa" }));
+        let identity = mw
+            .authenticate(&config, &bearer(&with_oid), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect("a token with the claim authenticates");
+        match &identity {
+            AuthenticatedIdentity::JwtBearer { subject, principal_claim, .. } => {
+                assert_eq!(subject, "00000000-0000-0000-0000-0000000000aa");
+                assert_eq!(principal_claim, "oid");
+            }
+            _ => panic!("expected a JwtBearer identity"),
+        }
+        assert_eq!(
+            identity
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            crate::source_auth::models::jwt_caller_identity_hash(
+                "https://issuer.example.com",
+                Some("tenant-1"),
+                "00000000-0000-0000-0000-0000000000aa",
+                "oid"
+            )
+            .as_deref()
+        );
+
+        let without_oid = token_with(json!({}));
+        let identity = mw
+            .authenticate(&config, &bearer(&without_oid), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect("the token is valid; it just names no caller");
+        assert_eq!(identity.principal_hash(None), None, "a token without the claim names no caller");
+
+        let empty = token_with(json!({ "oid": "" }));
+        let identity = mw
+            .authenticate(&config, &bearer(&empty), "test-channel", SessionView::base("surface"), None)
+            .await
+            .unwrap();
+        assert_eq!(identity.principal(), "<none>", "an empty claim reaches policy as the placeholder");
+        assert_eq!(identity.principal_key(), "jwt:<none>");
+
+        let numeric = token_with(json!({ "oid": 7 }));
+        let identity = mw
+            .authenticate(&config, &bearer(&numeric), "test-channel", SessionView::base("surface"), None)
+            .await
+            .unwrap();
+        assert_eq!(identity.principal_hash(None), None, "a claim that is not a string names no caller");
+    }
+
+    #[tokio::test]
+    async fn a_strategy_stored_with_a_claim_the_api_refuses_authenticates_nobody() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("iss")).await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let error = mw
+            .authenticate(&config, &bearer(&token), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect_err("a strategy naming iss identifies nobody");
+        assert!(matches!(error, SourceAuthError::Internal { .. }), "{error}");
+        assert!(!error.is_caller_attributable(), "the strategy, not the caller, is at fault");
     }
 
     #[tokio::test]
@@ -1780,6 +1928,47 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_value_in_the_token_scheme_fails_and_one_in_another_scheme_does_not() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+
+        for (case, second, verifies) in [
+            ("a second Bearer value", format!("Bearer {token}"), false),
+            ("a lower-case bearer value", "bearer other".to_string(), false),
+            ("a Payment value", "Payment credential".to_string(), true),
+        ] {
+            let mut headers = bearer(&token);
+            headers.append(axum::http::header::AUTHORIZATION, HeaderValue::from_str(&second).unwrap());
+            let result = mw
+                .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                .await;
+            if verifies {
+                assert!(
+                    matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+                    "{case}"
+                );
+            } else {
+                assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{case}");
+            }
+        }
     }
 
     #[tokio::test]

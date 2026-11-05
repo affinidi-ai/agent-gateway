@@ -109,16 +109,7 @@ class SessionManager {
   }
 
   getSessionToken(): string | null {
-    // Try sessionStorage first
-    let token = sessionStorage.getItem('session_token');
-    if (token) return token;
-
-    token = this.getCookie('session_token');
-    if (token) {
-      // Restore to sessionStorage for future calls
-      sessionStorage.setItem('session_token', token);
-    }
-    return token;
+    return sessionStorage.getItem('session_token');
   }
 
   getAuthHeaders(): Record<string, string> {
@@ -146,7 +137,6 @@ class SessionManager {
     }
 
     sessionStorage.removeItem('session_token');
-    document.cookie = 'session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
   }
 
   expireSession(): void {

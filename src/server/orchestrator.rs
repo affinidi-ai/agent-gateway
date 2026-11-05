@@ -679,6 +679,7 @@ pub async fn run_axum_proxy(
             listener.external_urls.len()
         );
     }
+    crate::config::network::warn_about_unparsed_external_urls(&network_config.listeners);
 
     // Initialize settings store and load settings from disk
     info!(
@@ -1164,7 +1165,6 @@ pub async fn run_axum_proxy(
 
     // Group channels by port and spawn ONE listener task per port
     // Multiple channels can share the same port if they have different routes
-    let mut channel_handles = HashMap::new();
     let mut task_ids_map = HashMap::new();
 
     // Get configured ports from network config
@@ -1179,7 +1179,7 @@ pub async fn run_axum_proxy(
     // Group active channels by the port they'll use.
     // Surfaces are kept as `AgentSurface` end-to-end so that `variants` and
     // `default_variant_id` survive into the runtime listener; the legacy
-    // `ChannelMapping` shape is derived inside `run_port_server` only where
+    // `ChannelMapping` shape is derived inside `build_port_router` only where
     // pre-variant fields are needed.
     let mut channels_by_port: HashMap<u16, Vec<crate::config::agent_surface::AgentSurface>> = HashMap::new();
     for surface in config.surfaces.iter() {
@@ -1400,6 +1400,42 @@ pub async fn run_axum_proxy(
             }
         }
 
+        let api_keys_storage_path = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .map(|p| p.join("api_keys"))
+        .unwrap_or_else(|| std::path::PathBuf::from("_storage/api_keys"));
+        let api_keys_storage_path_str = api_keys_storage_path
+            .to_string_lossy()
+            .to_string();
+        let api_key_store = match crate::api_keys::FileSystemApiKeyStore::new(&api_keys_storage_path_str).await {
+            Ok(store) => {
+                info!("API Keys store initialized at {}", api_keys_storage_path_str);
+                let store_arc = std::sync::Arc::new(store);
+                {
+                    use crate::api_keys::store::ApiKeyStore as _;
+                    let s = store_arc.clone();
+                    crate::config::register_counter("secrets.apikeys", move || {
+                        let s = s.clone();
+                        async move {
+                            s.list_all()
+                                .await
+                                .map(|v| v.len())
+                                .unwrap_or(0)
+                        }
+                    });
+                }
+                Some(store_arc)
+            }
+            Err(e) => {
+                warn!("Failed to initialize API Keys store at {}: {}", api_keys_storage_path_str, e);
+                None
+            }
+        };
+
         // Create identity API state
         let identity_state = crate::identity::IdentityApiState {
             vc_issuer: vc_issuer_for_api.clone(),
@@ -1441,6 +1477,9 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             delegation_vault_store: None,
             sts_client_store: None,
+            api_key_store: api_key_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::api_keys::store::ApiKeyStore>),
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
@@ -1455,6 +1494,31 @@ pub async fn run_axum_proxy(
             #[cfg(feature = "didwebvh")]
             didwebvh_base_url: None,
         };
+
+        let provider_key_gate = crate::identity::provider_key_gate::gate();
+        provider_key_gate.set_sources(
+            identity_state
+                .api_key_store
+                .clone(),
+            agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+        );
+        if let Some(ref surface_store) = agent_surface_store {
+            match surface_store.list_all().await {
+                Ok(surfaces) => {
+                    for surface in surfaces
+                        .iter()
+                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                    {
+                        provider_key_gate
+                            .admit(surface)
+                            .await;
+                    }
+                }
+                Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
+            }
+        }
 
         // Once changes of channels are detected (FS updated by another node) -> propagate changes to this node
         let pending_surface_events: PendingSurfaceEvents = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -3224,17 +3288,6 @@ pub async fn run_axum_proxy(
 
         // Build the unified source authentication middleware
         // First create the api_key_validator since source_auth_middleware depends on it
-        let api_keys_storage_path = std::path::PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .secrets,
-        )
-        .parent()
-        .map(|p| p.join("api_keys"))
-        .unwrap_or_else(|| std::path::PathBuf::from("_storage/api_keys"));
-        let api_keys_storage_path_str = api_keys_storage_path
-            .to_string_lossy()
-            .to_string();
         // Build the RBAC guard threaded through vault sub-routers that require
         // feature-level permissions. Durable audit evidence is not registered
         // when the guard is unavailable.
@@ -3248,42 +3301,23 @@ pub async fn run_axum_proxy(
             })
             .map(|storage| crate::auth_manager::middleware::RbacGuard::new(storage, rbac_config.clone()));
 
-        let (api_keys_router, api_key_validator) =
-            match crate::api_keys::FileSystemApiKeyStore::new(&api_keys_storage_path_str).await {
-                Ok(store) => {
-                    info!("API Keys store initialized at {}", api_keys_storage_path_str);
-                    let store_arc = std::sync::Arc::new(store);
-                    {
-                        use crate::api_keys::store::ApiKeyStore as _;
-                        let s = store_arc.clone();
-                        crate::config::register_counter("secrets.apikeys", move || {
-                            let s = s.clone();
-                            async move {
-                                s.list_all()
-                                    .await
-                                    .map(|v| v.len())
-                                    .unwrap_or(0)
-                            }
-                        });
-                    }
-                    let router = agent_surface_store
-                        .clone()
-                        .map(|surface_store| {
-                            let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = surface_store;
-                            crate::api_keys::router::create_api_keys_router(
-                                store_arc.clone(),
-                                surface_store,
-                                vault_rbac_guard.clone(),
-                            )
-                        });
-                    let validator: std::sync::Arc<dyn crate::api_keys::ApiKeyValidator> = store_arc;
-                    (router, Some(validator))
-                }
-                Err(e) => {
-                    warn!("Failed to initialize API Keys store at {}: {}", api_keys_storage_path_str, e);
-                    (None, None)
-                }
-            };
+        let (api_keys_router, api_key_validator) = match api_key_store {
+            Some(store_arc) => {
+                let router = agent_surface_store
+                    .clone()
+                    .map(|surface_store| {
+                        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = surface_store;
+                        crate::api_keys::router::create_api_keys_router(
+                            store_arc.clone(),
+                            surface_store,
+                            vault_rbac_guard.clone(),
+                        )
+                    });
+                let validator: std::sync::Arc<dyn crate::api_keys::ApiKeyValidator> = store_arc;
+                (router, Some(validator))
+            }
+            None => (None, None),
+        };
 
         let access_tokens_storage_path = std::path::PathBuf::from(
             &bootstrap_config
@@ -3841,9 +3875,8 @@ pub async fn run_axum_proxy(
             .set_didwebvh_stores(didwebvh_identity_store_shared.clone(), didwebvh_log_storage_shared.clone())
             .await;
 
-        // NOW spawn port listeners with Identity API router
-        let mut port_listener_handles = HashMap::new();
-        let mut state_receivers = Vec::new();
+        // NOW serve port listeners with Identity API router
+        let mut port_listener_states = HashMap::new();
 
         // Surfaces are translated to channels lazily inside the inbound
         // per-port loop below, but the *outbound* bucketing was computed
@@ -3961,7 +3994,7 @@ pub async fn run_axum_proxy(
                     // Bind anyway (no early `continue`): the listener still comes up
                     // and serves the `/alive` liveness route so ECS/ALB target-group
                     // health checks on this port pass even with zero outbound
-                    // channels. `run_outbound_port_server` handles an empty channel
+                    // channels. `build_outbound_port_router` handles an empty channel
                     // list — it simply registers no proxy routes.
                     info!(
                         "Outbound listener on port {} has no enabled outbound channels — binding for /alive health checks only",
@@ -3994,40 +4027,31 @@ pub async fn run_axum_proxy(
                 let outbound_states = channel_manager
                     .outbound_channel_states
                     .clone();
-                let direct_client_auth_clone = direct_client_auth.clone();
                 let listener_mgr_slot_for_outbound = listener_manager_slot.clone();
                 let outbound_source_auth_middleware = Some(source_auth_middleware.clone());
 
                 info!("Starting outbound port listener on port {} for {} channel(s)", port, outbound_channels.len());
 
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = crate::proxy::server::run_outbound_port_server(
-                        bind_address,
-                        port,
-                        outbound_channels,
-                        config_clone,
-                        network_config_clone,
-                        metrics_clone,
-                        secrets_store_clone,
-                        policy_mgr_clone,
-                        gateway_policy_mgr_clone,
-                        trust_registry_clone,
-                        vc_issuer_clone,
-                        task_monitor_clone,
-                        use_tls,
-                        outbound_states,
-                        direct_client_auth_clone,
-                        listener_mgr_slot_for_outbound,
-                        outbound_source_auth_middleware,
-                        None,
-                    )
-                    .await
-                    {
-                        error!("Outbound port listener error for port {}: {}", port, e);
-                    }
-                });
-
-                port_listener_handles.insert(port, handle.abort_handle());
+                let built = crate::proxy::server::build_outbound_port_router(
+                    port,
+                    outbound_channels,
+                    config_clone.clone(),
+                    network_config_clone,
+                    metrics_clone,
+                    secrets_store_clone,
+                    policy_mgr_clone,
+                    gateway_policy_mgr_clone,
+                    trust_registry_clone,
+                    vc_issuer_clone,
+                    task_monitor_clone,
+                    outbound_states,
+                    listener_mgr_slot_for_outbound,
+                    outbound_source_auth_middleware,
+                )
+                .await;
+                let _ = channel_manager
+                    .serve_outbound_port(port, &bind_address, built, use_tls, &config_clone)
+                    .await;
                 continue;
             }
 
@@ -4081,14 +4105,12 @@ pub async fn run_axum_proxy(
                 }
             }
 
-            let port_task_id = format!("port-{}-{}", port, uuid::Uuid::new_v4());
             let tls_acceptor = tls_acceptor.clone();
             let client = client.clone();
             let config_clone = Arc::clone(&config);
             let bootstrap_config_clone = Arc::clone(&bootstrap_config);
             let metrics = metrics_store.clone();
             let task_mon = task_monitor.clone();
-            let task_id_clone = port_task_id.clone();
             let ws_state_clone = ws_state.clone();
             let vc_issuer_clone = vc_issuer.clone();
             let channels_clone = channels.clone();
@@ -4097,9 +4119,6 @@ pub async fn run_axum_proxy(
             let mcp_proxy_store_clone = mcp_proxy_store.clone();
             let a2a_proxy_store_clone = a2a_proxy_store.clone();
             let mcp_server_manager_clone = Some(mcp_server_manager.clone());
-
-            // Create a oneshot channel to receive the state from the spawned task
-            let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
 
             // Determine if this port should get the Identity API router
             let identity_router_for_port = if Some(port) == identity_api_http_port {
@@ -4148,7 +4167,6 @@ pub async fn run_axum_proxy(
 
             // Clone source_auth_middleware for this port
             let source_auth_middleware_for_port = Some(source_auth_middleware.clone());
-            let direct_client_auth_for_port = direct_client_auth.clone();
             let resolved_surface_cache_for_port = resolved_surface_cache.clone();
 
             // Determine if this port should use TLS based on network config
@@ -4178,104 +4196,74 @@ pub async fn run_axum_proxy(
                 );
             }
 
-            let handle = tokio::spawn(async move {
-                if let Err(e) = crate::proxy::server::run_port_server(
+            let built = crate::proxy::server::build_port_router(
+                port,
+                channels_clone,
+                tls_acceptor,
+                client,
+                config_clone.clone(),
+                bootstrap_config_clone,
+                metrics,
+                task_mon.clone(),
+                Some(ws_state_clone),
+                vc_issuer_clone,
+                listener_mgr_slot,
+                identity_router_for_port,
+                onboarding_router_for_port,
+                did_router_for_port,
+                secrets_router_for_port,
+                secrets_store_for_port,
+                network_config_clone,
+                policy_mgr_clone,
+                gateway_policy_mgr_clone,
+                mcp_proxy_store_clone,
+                a2a_proxy_store_clone,
+                mcp_server_manager_clone,
+                settings_store_for_port,
+                notification_store_for_port,
+                didauth_session_store_clone,
+                source_auth_middleware_for_port,
+                resolved_surface_cache_for_port,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_identity_store_for_port,
+                #[cfg(feature = "didwebvh")]
+                didwebvh_log_storage_for_port,
+            )
+            .await;
+            if let Ok(state) = channel_manager
+                .serve_inbound_port(
                     port,
-                    channels_clone,
-                    tls_acceptor,
-                    client,
-                    config_clone,
-                    bootstrap_config_clone,
-                    metrics,
-                    task_mon.clone(),
-                    Some(task_id_clone.clone()),
-                    Some(ws_state_clone),
-                    vc_issuer_clone,
-                    listener_mgr_slot,
-                    Some(state_sender),
-                    identity_router_for_port,
-                    onboarding_router_for_port,
-                    did_router_for_port,
-                    secrets_router_for_port,
-                    secrets_store_for_port,
-                    network_config_clone,
+                    &channels,
+                    built,
+                    &network_config,
                     use_tls,
-                    policy_mgr_clone,
-                    gateway_policy_mgr_clone,
-                    mcp_proxy_store_clone,
-                    a2a_proxy_store_clone,
-                    mcp_server_manager_clone,
-                    settings_store_for_port,
-                    notification_store_for_port,
-                    didauth_session_store_clone,
-                    source_auth_middleware_for_port,
-                    direct_client_auth_for_port,
-                    resolved_surface_cache_for_port,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_identity_store_for_port,
-                    #[cfg(feature = "didwebvh")]
-                    didwebvh_log_storage_for_port,
+                    &config_clone,
+                    task_mon.as_deref(),
+                    &[],
                 )
                 .await
-                {
-                    error!("Port listener error for port {}: {}", port, e);
-                }
-            });
+            {
+                port_listener_states.insert(port, state);
+                info!("Captured state for port {} listener", port);
+            }
 
-            // Store the abort handle for this port listener
-            port_listener_handles.insert(port, handle.abort_handle());
-
-            // Store the receiver to wait for states later
-            state_receivers.push((port, state_receiver));
-
-            // Store the handle for each channel in this port listener
             for surface in &channels {
                 let config_id = surface
                     .config_id()
                     .unwrap_or(surface.name.as_str())
                     .to_string();
                 let channel_task_id = format!("task-{}-{}", config_id, uuid::Uuid::new_v4());
-                channel_handles.insert(config_id.clone(), handle.abort_handle());
                 task_ids_map.insert(config_id, channel_task_id);
             }
         }
 
-        // Wait for all states to be sent back (with a timeout per state)
-        let mut port_listener_states = HashMap::new();
-        for (port, state_receiver) in state_receivers {
-            if let Ok(state) = tokio::time::timeout(tokio::time::Duration::from_secs(5), state_receiver).await {
-                if let Ok(state) = state {
-                    port_listener_states.insert(port, state);
-                    info!("Captured state for port {} listener", port);
-                } else {
-                    warn!("Port listener {} failed to send state", port);
-                }
-            } else {
-                warn!("Timeout waiting for port listener {} state", port);
-            }
-        }
-
-        // Store port listener handles and states in the manager
-        {
-            let mut handles = channel_manager
-                .port_listener_handles
-                .write()
-                .await;
-            *handles = port_listener_handles;
-        }
+        // Store port listener states in the manager
         {
             let mut states = channel_manager
                 .port_listener_states
                 .write()
                 .await;
             *states = port_listener_states;
-        }
-        {
-            let mut handles = channel_manager
-                .channel_handles
-                .write()
-                .await;
-            *handles = channel_handles;
         }
         {
             let mut task_ids = channel_manager
@@ -4542,6 +4530,15 @@ async fn rederive_planes_on_activation(
             .await
     {
         warn!("Gateway store refresh on activation failed: {e}");
+    }
+    if let Some(store) = identity_state
+        .api_key_store
+        .as_ref()
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("API key store refresh on activation failed: {e}");
     }
     crate::payments_ledger::reload_global().await;
 

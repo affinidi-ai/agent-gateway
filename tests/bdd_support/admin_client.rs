@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -224,6 +224,31 @@ impl AdminApiClient {
             .send_request(method, &url, body)
             .await?;
         recorded_response(response).await
+    }
+
+    /// Mints a personal access token as this operator from `request` and returns a client that
+    /// presents it as its bearer credential, sending `headers` on every request.
+    pub async fn personal_access_token_client(
+        &self,
+        request: &Value,
+        mut headers: header::HeaderMap,
+    ) -> Client {
+        let created = self
+            .send_recorded_json(Method::POST, "/v1/access-tokens", Some(request))
+            .await
+            .expect("creating the access token");
+        assert!(matches!(created.status, 200 | 201), "creating the access token: {}", created.body);
+        let token = created.body["token"]
+            .as_str()
+            .expect("the access token is returned once");
+        let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}")).expect("a bearer header");
+        authorization.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, authorization);
+        Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .expect("an HTTP client")
     }
 
     pub async fn create_surface_recorded(

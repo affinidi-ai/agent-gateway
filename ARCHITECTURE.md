@@ -41,7 +41,7 @@ There is no external datastore.
 | --- | --- |
 | Runtime | A DashMap cache is authoritative. [`src/state/`](src/state/) holds the per-surface runtime state. |
 | Disk | JSON files under `_storage/`, written immediately on change. [`src/storage/`](src/storage/) holds the store traits and the filesystem implementation. |
-| Reload | Surfaces are hot-reloadable. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
+| Reload | Surfaces are hot-reloadable. A reload swaps the router each port listener serves and keeps the listener bound, so it refuses no connection. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
 
 Encryption at rest is optional and lives in [`src/encryption/`](src/encryption/). See
 [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) for reload mechanics and
@@ -141,7 +141,7 @@ logic.
 | --- | --- | --- |
 | Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
-| Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
+| Rate limiting | Per-surface request limits; a Transit Point's shared and per-caller limits are checked on the outbound path | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | MCP wire validation | Rejecting malformed or non-active MCP revisions | [`src/mcp/`](src/mcp/) |
 | Agent context | Trust-registry context from the original body, as `input.agent` for every policy and Trust Check template | [`src/surface_context/`](src/surface_context/) |

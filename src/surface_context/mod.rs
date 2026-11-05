@@ -638,7 +638,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
     fn from(identity: &crate::source_auth::AuthenticatedIdentity) -> Self {
         use crate::source_auth::AuthenticatedIdentity;
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => SourceAuthContext::JwtBearer {
+            AuthenticatedIdentity::JwtBearer { subject, claims, .. } => SourceAuthContext::JwtBearer {
                 subject: subject.clone(),
                 claims: claims.clone(),
             },

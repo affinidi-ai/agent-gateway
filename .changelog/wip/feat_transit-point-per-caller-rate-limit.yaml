@@ -1,0 +1,25 @@
+branch: feat/transit-point-per-caller-rate-limit
+changes:
+  added:
+    - timestamp: '2026-11-04T13:59:00Z'
+      title: Limit each caller's requests on a Transit Point
+      description: >-
+        A Transit Point can set per_caller_rate_limit (requests, window_secs and an optional burst)
+        to give each caller it identifies a rate limit of their own, so one caller cannot use up the
+        allowance of the others. The caller is the one its transit token names, an optional token
+        included, or else the client its source_auth verified. Requests with no identified caller
+        share one bucket, the number of buckets is bounded (a caller who has a bucket keeps it), and
+        the limit applies beside the point's rate_limit. A surface variant's Transit Point is
+        limited by the surface's per-caller limit and a variant that sets another is refused on
+        save. A limit that cannot be enforced is refused on save, and one stored anyway makes the
+        Transit Point answer 503. A refused request answers 429 with Retry-After, as a JSON-RPC
+        error on an MCP Transit Point, and is recorded as a rate_limited audit event with scope
+        transit_point_caller, the Transit Point and the caller's identity hash, or with scope
+        transit_point_overflow and no caller when the shared overflow bucket refused it. The
+        Surface Builder's Rate Limit panel on a Transit Point has the setting, read-only on a
+        named variant.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

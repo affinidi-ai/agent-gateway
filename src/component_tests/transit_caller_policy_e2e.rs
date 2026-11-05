@@ -42,10 +42,11 @@ fn write_policy_definition(
 fn write_jwt_strategy(
     temp_dir: &std::path::Path,
     fixture: &JwksFixture,
+    principal_claim: Option<&str>,
 ) {
     let dir = temp_dir.join("jwt_verification_strategies");
     std::fs::create_dir_all(&dir).expect("create strategy dir");
-    let strategy = json!({
+    let mut strategy = json!({
         "id": STRATEGY_ID,
         "name": "Transit caller strategy",
         "expected_issuer": fixture.issuer,
@@ -53,12 +54,18 @@ fn write_jwt_strategy(
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:00Z"
     });
+    if let Some(claim) = principal_claim {
+        strategy["principal_claim"] = json!(claim);
+    }
     std::fs::write(dir.join(format!("{STRATEGY_ID}.json")), serde_json::to_string_pretty(&strategy).unwrap())
         .expect("write strategy");
 }
 
-fn surface(require_transit_token: bool) -> crate::config::agent_surface::AgentSurface {
-    serde_json::from_value(json!({
+fn surface(
+    require_transit_token: bool,
+    extra: serde_json::Value,
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = json!({
         "surface_id": "transit-caller-policy",
         "name": "transit-caller-policy",
         "access_point": {
@@ -81,20 +88,37 @@ fn surface(require_transit_token: bool) -> crate::config::agent_surface::AgentSu
                 "policy": { "policy_definition_id": POLICY_ID }
             }]
         }
-    }))
-    .expect("transit caller policy surface")
+    });
+    for (key, value) in extra
+        .as_object()
+        .expect("surface fields")
+    {
+        surface[key] = value.clone();
+    }
+    serde_json::from_value(surface).expect("transit caller policy surface")
 }
 
 async fn start_gateway(
     rego: impl FnOnce(&str) -> String,
     require_transit_token: bool,
 ) -> (GatewayHarness, JwksFixture) {
+    start_gateway_with(rego, require_transit_token, None, json!({})).await
+}
+
+/// A gateway whose strategy names callers by `principal_claim`, with `extra`
+/// fields on its surface.
+async fn start_gateway_with(
+    rego: impl FnOnce(&str) -> String,
+    require_transit_token: bool,
+    principal_claim: Option<&str>,
+    extra: serde_json::Value,
+) -> (GatewayHarness, JwksFixture) {
     let fixture = JwksFixture::start().await;
     let rego = rego(&fixture.issuer);
     let h = GatewayHarness::start_with_outbound_mock(MockServer::start().await, |temp_dir, gw_config, _| {
-        write_jwt_strategy(temp_dir, &fixture);
+        write_jwt_strategy(temp_dir, &fixture, principal_claim);
         write_policy_definition(temp_dir, &rego);
-        gw_config.surfaces = vec![surface(require_transit_token)];
+        gw_config.surfaces = vec![surface(require_transit_token, extra)];
     })
     .await;
     (h, fixture)
@@ -114,22 +138,47 @@ async fn transit_token_for(
     fixture: &JwksFixture,
     subject: &str,
 ) -> String {
-    let jwt = sign_jwt(
-        json!({
-            "iss": fixture.issuer, "sub": subject, "aud": "any",
-            "exp": now_secs() + 300, "iat": now_secs(),
-        }),
-        &fixture.kid,
-    );
-    let response = client()
+    transit_token_with(h, fixture, json!({ "sub": subject })).await
+}
+
+/// A caller's JWT from `fixture`'s issuer, carrying `claims` too.
+fn caller_jwt(
+    fixture: &JwksFixture,
+    claims: serde_json::Value,
+) -> String {
+    let mut token = json!({ "iss": fixture.issuer, "aud": "any", "exp": now_secs() + 300, "iat": now_secs() });
+    for (key, value) in claims
+        .as_object()
+        .expect("claims")
+    {
+        token[key] = value.clone();
+    }
+    sign_jwt(token, &fixture.kid)
+}
+
+async fn call_access_point(
+    h: &GatewayHarness,
+    jwt: &str,
+) -> reqwest::Response {
+    client()
         .post(format!("{}/smoke/rpc", h.gateway_base))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {jwt}"))
         .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
         .send()
         .await
-        .unwrap();
-    assert_eq!(response.status(), 200, "the Access Point must admit {subject}");
+        .unwrap()
+}
+
+/// The transit token the Access Point hands the managed agent for a caller
+/// whose JWT carries `claims`.
+async fn transit_token_with(
+    h: &GatewayHarness,
+    fixture: &JwksFixture,
+    claims: serde_json::Value,
+) -> String {
+    let response = call_access_point(h, &caller_jwt(fixture, claims.clone())).await;
+    assert_eq!(response.status(), 200, "the Access Point must admit {claims}");
     h.mock
         .last_request_rx
         .borrow()
@@ -280,4 +329,75 @@ allow if {
     let before = requests_seen(&h);
     assert_eq!(call_transit_point(&h, None).await, 200);
     assert_eq!(requests_seen(&h), before + 1, "the anonymous call is admitted by the policy that names it");
+}
+
+/// A strategy that names callers by `oid` gives the transit token the `oid`
+/// caller's hash, with the claim's name in it: the same person through two
+/// applications, whose `sub` differs, is one caller, and a token without
+/// `oid` names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strategy_naming_oid_gives_the_transit_token_the_oid_callers_hash() {
+    let rego = |issuer: &str| {
+        let hash =
+            format!("{:x}", Sha256::digest(format!(r#"["jwt_bearer","{issuer}",null,"person-1","oid"]"#).as_bytes()));
+        format!(
+            r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "{hash}"
+}}
+"#
+        )
+    };
+    let (h, fixture) = start_gateway_with(rego, true, Some("oid"), json!({})).await;
+
+    for sub in ["sub-in-the-agents-app", "sub-in-the-sign-in-app"] {
+        let token = transit_token_with(&h, &fixture, json!({ "sub": sub, "oid": "person-1" })).await;
+        assert_eq!(call_transit_point(&h, Some(&token)).await, 200, "{sub}");
+    }
+    let named_by_sub = transit_token_with(&h, &fixture, json!({ "sub": "person-1" })).await;
+    let before = requests_seen(&h);
+    assert_eq!(
+        call_transit_point(&h, Some(&named_by_sub)).await,
+        403,
+        "a token without oid names no caller, even when its sub is the oid value"
+    );
+    assert_eq!(requests_seen(&h), before);
+}
+
+/// An Access Point that gives delegated credentials refuses a caller whose
+/// token lacks the strategy's claim, or carries a value that is empty or not a
+/// string, as it refuses a token without `sub` today.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_access_point_refuses_delegation_to_a_token_without_the_strategys_claim() {
+    let delegated = json!({ "outbound_credentials": [{ "credential_provider_id": "provider", "scopes": ["read"] }] });
+    let (h, fixture) = start_gateway_with(
+        |_| "package surface.policy\n\ndefault allow := true\n".to_string(),
+        true,
+        Some("oid"),
+        delegated,
+    )
+    .await;
+
+    for claims in [
+        json!({ "sub": "alice" }),
+        json!({ "sub": "alice", "oid": "" }),
+        json!({ "sub": "alice", "oid": 7 }),
+        json!({ "sub": "alice", "oid": { "value": "person-1" } }),
+    ] {
+        let response = call_access_point(&h, &caller_jwt(&fixture, claims.clone())).await;
+        assert_eq!(response.status(), 403, "{claims}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "https://affinidi.com/atg/errors/identity-required", "{claims}");
+    }
+    let named = call_access_point(&h, &caller_jwt(&fixture, json!({ "sub": "alice", "oid": "person-1" }))).await;
+    assert_eq!(named.status(), 503, "a token with the claim is a caller, and goes on to delegation");
+    let body: serde_json::Value = named.json().await.unwrap();
+    assert_eq!(
+        body["type"], "https://affinidi.com/atg/errors/delegated-credentials-unavailable",
+        "past the caller check, this harness has no vault to give a credential from: {body}"
+    );
 }

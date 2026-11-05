@@ -2,6 +2,7 @@ import * as Cap from '../capabilities';
 import { registry } from '../registry';
 import { networkingConfigToWire } from '../networking/definition';
 import { rateLimitConfigToWire } from '../rate-limit/definition';
+import { perCallerRateLimitConfigToWire } from '../rate-limit/wire';
 import type { NodeDefinition, Protocol } from '../types';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
@@ -333,6 +334,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'rate-limit' && n.parentId === tp.id
                 );
                 const rateLimit = rateLimitConfigToWire(rateLimitNode?.config);
+                const perCallerRateLimit = perCallerRateLimitConfigToWire(rateLimitNode?.config);
                 // Per-TP managed identity (MA→TP request slot): the identity
                 // element parents to this TP and the TP factory owns the
                 // `managed_identity` slice. The identity element's own
@@ -509,6 +511,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     : {}),
                   ...(networking ? { networking } : {}),
                   ...(rateLimit ? { rate_limit: rateLimit } : {}),
+                  ...(perCallerRateLimit ? { per_caller_rate_limit: perCallerRateLimit } : {}),
                   ...(managedIdentity ? { managed_identity: managedIdentity } : {}),
                   ...(workloadBinding ? { workload_binding: workloadBinding } : {}),
                   ...(mcpToolGating ? { mcp_tool_gating: mcpToolGating } : {}),

@@ -189,6 +189,31 @@ function pickFields<T extends string>(
  * resolver is happy with full replacement because `Some(v)` simply wins
  * over base.
  */
+/**
+ * A variant's Transit Point without `per_caller_rate_limit`: the gateway
+ * limits it by the base surface's point of the same alias and refuses a
+ * variant point that sets another limit, so a variant never stores one.
+ */
+function withoutPerCallerRateLimit(point: any): any {
+  if (!point || typeof point !== 'object') return point;
+  const { per_caller_rate_limit: _enforcedFromBase, ...rest } = point;
+  return rest;
+}
+
+/**
+ * A variant's Transit Points showing the per-caller rate limit the gateway
+ * enforces on them: that of the base surface's point of the same alias.
+ */
+function withBasePerCallerRateLimits(points: any[], basePoints: unknown): any[] {
+  const base = Array.isArray(basePoints) ? basePoints : [];
+  return points.map(point => {
+    if (!point || typeof point !== 'object') return point;
+    const limit = base.find((b: any) => b?.alias === point.alias)?.per_caller_rate_limit;
+    const rest = withoutPerCallerRateLimit(point);
+    return limit ? { ...rest, per_caller_rate_limit: limit } : rest;
+  });
+}
+
 export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
   const out: SurfaceOverrides = { complete: true };
   const ap = pickFields(payload?.access_point, ACCESS_POINT_FIELDS);
@@ -203,7 +228,9 @@ export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
     // this an empty array drops out of the override and the backend
     // resolver inherits base's TPs, causing deleted TPs to
     // "resurrect" on save / reload.
-    transitOverride.points = Array.isArray(transit.points) ? transit.points : [];
+    transitOverride.points = (Array.isArray(transit.points) ? transit.points : []).map(
+      withoutPerCallerRateLimit
+    );
     const shared = pickFields(transit.shared, SHARED_TRANSIT_FIELDS);
     if (shared) transitOverride.shared = shared;
     out.transit = transitOverride;
@@ -279,7 +306,7 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
         const baseTransit = (out.transit ?? {}) as Record<string, unknown>;
         out.transit = {
           outbound_listen_address: baseTransit.outbound_listen_address,
-          points: overrides.transit.points ?? [],
+          points: withBasePerCallerRateLimits(overrides.transit.points ?? [], baseTransit.points),
           shared: overrides.transit.shared ?? {},
         };
       }
@@ -309,7 +336,7 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
         out.transit && typeof out.transit === 'object' ? out.transit : { points: [], shared: {} };
       const merged = { ...baseTransit };
       if (overrides.transit.points) {
-        merged.points = overrides.transit.points;
+        merged.points = withBasePerCallerRateLimits(overrides.transit.points, baseTransit.points);
       }
       if (overrides.transit.shared) {
         merged.shared = { ...(merged.shared ?? {}), ...overrides.transit.shared };

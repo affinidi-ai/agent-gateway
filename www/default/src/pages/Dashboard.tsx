@@ -18,6 +18,7 @@ import {
   BarElement,
 } from 'chart.js';
 import { useApp } from '../context/AppContext';
+import { usePermissions } from '../context/PermissionsContext';
 import StatCard from '../components/StatCard';
 import ChartCard from '../components/ChartCard';
 import IdentityDetailsModal from '../components/IdentityDetailsModal';
@@ -100,6 +101,7 @@ ChartJS.register(
 
 const Dashboard: React.FC = () => {
   const { state, actions, getCurrentStats } = useApp();
+  const { hasPermission } = usePermissions();
   const navigate = useNavigate();
   const [showDidModal, setShowDidModal] = useState(false);
   const [didDocument, setDidDocument] = useState<any>(null);
@@ -1099,16 +1101,18 @@ const Dashboard: React.FC = () => {
                 <i className="fas fa-cog"></i> Gateway Configuration
               </h6>
               <div className="d-flex align-items-center gap-2">
-                <DeleteButton
-                  onDelete={async () => {
-                    await actions.truncateMetrics();
-                  }}
-                  data-testid="dashboard-metrics-delete-button"
-                  title="Clear all stored metrics data"
-                  variant="danger"
-                >
-                  Delete
-                </DeleteButton>
+                {hasPermission('settings.edit') && (
+                  <DeleteButton
+                    onDelete={async () => {
+                      await actions.truncateMetrics();
+                    }}
+                    data-testid="dashboard-metrics-delete-button"
+                    title="Clear all stored metrics data"
+                    variant="danger"
+                  >
+                    Delete
+                  </DeleteButton>
+                )}
                 <button
                   className="btn btn-sm btn-outline-primary"
                   data-testid="dashboard-logs-button"

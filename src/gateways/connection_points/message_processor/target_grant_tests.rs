@@ -66,7 +66,7 @@ fn fabric_receive_refuses_a_discovery_read_of_a_bound_target() {
             message.message_body["path"] = json!(path);
             message.message_body["body"] = json!(null);
             message.message_body["headers"] =
-                json!({"cookie": "session_token=dashboard-session", "accept": "application/json"});
+                json!({"cookie": "__Host-session_token=dashboard-session", "accept": "application/json"});
             let (status, events) = receiver
                 .receive(&message)
                 .await;

@@ -677,7 +677,7 @@ const CREATE_PAGES: LayoutPage[] = [
     {
         id: 'jwt-strategy-new',
         route: '/jwt-verification-strategies/new',
-        testIds: ['page-jwt-strategy-editor'],
+        testIds: ['page-jwt-strategy-editor', 'jwt-strategy-editor-principal-claim-input'],
         actions: [
             'jwt-strategy-editor-back-button',
             'jwt-strategy-editor-check-jwks-button',

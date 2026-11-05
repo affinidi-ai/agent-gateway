@@ -364,6 +364,13 @@ endpoint URL.
 | `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
+A surface that derives a DID from an API Key Provider key it may not use, or whose key or
+owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
+`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
+`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+is `true` when the surface is refused at runtime; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
 provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a
@@ -394,7 +401,8 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
+at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
@@ -408,9 +416,16 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the request's trace id, and the TCP peer as `client_ip`, since the outbound listener does not
   resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
-  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
-  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
+  rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target), `transit_point_caller` (a Transit Point's
+  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)) or
+  `transit_point_overflow` (the bucket that per-caller limit's callers share while it holds as
+  many buckets as it may). `retry_after_ms`
+  is the wait the caller is given, when there is one; the surface and per-caller limits also send
+  it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
+  (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
+  a request with no identified caller. A `transit_point_overflow` record names the Transit Point
+  and no caller.
 - `request_rejected`: the gateway refused the request before or while forwarding it.
   `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
   the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP
@@ -466,8 +481,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
-    `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    `access_point_not_ready` (a closed Access Point without source authentication, logged with
+    `reason=no source authentication`, or a surface that derives a DID from an API key it may
+    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
+    over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
     external consent refused before anything is sent `target_path_refused` (`400`, a path the
     grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
@@ -717,10 +735,15 @@ default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCI
 `AUDIT_VP_JWT` is empty and `AUDIT_RECORD` has no `vp_jwt` for it, so integrations get only
 `AUDIT_VP_FINGERPRINT`; the full credential stays in the local VP Audit Log as dispute evidence
 (see [Payment credentials](#payment-credentials-in-the-audit-trail)). The principal variables come from the record's `caller` context:
-`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (JWT
-`sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
-carries), and all four are empty when the request had no caller context (no source auth, or a
-Transit Point whose token carries no caller). The policy variables describe the policy that made
+`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (for a
+JWT the value of its verification strategy's `principal_claim`, `sub` by default; the API key
+name, DID, mTLS principal, or on a Transit Point the caller the transit token carries), and all
+four are empty when the request had no caller context (no source auth, or a
+Transit Point whose token carries no caller). For a JWT caller that the Access Point's own
+source authentication verified through a strategy naming a claim other than `sub`, the `caller`
+context keeps the token's own `sub` in `sub`, so it matches the identity provider's logs, and
+adds the claim's value as `principal`. A Transit Point record takes its caller from the transit
+token, which carries no `principal`. The policy variables describe the policy that made
 a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
 for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
 policy") and are empty for other records; see

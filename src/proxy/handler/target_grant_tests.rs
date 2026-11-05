@@ -749,7 +749,7 @@ async fn a_discovery_read_carries_no_grant() {
             .method("GET")
             .uri(path)
             .header("x-api-key", KEY)
-            .header("cookie", "session_token=dashboard-session")
+            .header("cookie", "__Host-session_token=dashboard-session")
             .header("authorization", "Bearer the-callers-own-token")
             .header("proxy-authorization", "Basic cHJveHk6c2VjcmV0")
             .header("x-caller-did", "did:example:spoofed")
@@ -813,7 +813,7 @@ async fn the_target_gets_nothing_of_the_callers_but_its_request() {
     let call = || {
         let (mut parts, body) = mcp_call(Some(KEY)).into_parts();
         for (name, value) in [
-            ("cookie", "session_token=dashboard-session; lb=sticky"),
+            ("cookie", "__Host-session_token=dashboard-session; lb=sticky"),
             ("proxy-authorization", "Basic cHJveHk6c2VjcmV0"),
             ("x-caller-did", "did:example:spoofed"),
             ("x-caller-identity-source", "spoofed"),

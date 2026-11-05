@@ -20,7 +20,8 @@ use crate::bdd_support::mediator::Mediator as _;
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
-    build_surface_identity_binding_issuer_policy, build_transit_point_partner_policy,
+    build_surface_deny_target_trust_check_errors_policy, build_surface_identity_binding_issuer_policy,
+    build_transit_point_partner_policy,
 };
 use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
 
@@ -438,6 +439,84 @@ pub async fn transit_point_requires_a_transit_token(
     transit_point: String,
 ) {
     transit_point_spec_mut(world, &transit_point).require_transit_token = true;
+}
+
+#[given(expr = "Transit Point {string} authenticates its callers with API key {string}")]
+pub async fn transit_point_authenticates_callers_with_api_key(
+    world: &mut G2gWorld,
+    transit_point: String,
+    valid_key: String,
+) {
+    let link = world
+        .transit_point_link(&transit_point)
+        .clone();
+    transit_point_spec_mut(world, &transit_point).source_auth = Some(SourceAuthSpec::ApiKey {
+        header_name: "x-api-key".to_string(),
+        secret_id: format!("{}-{transit_point}-caller-key", link.from_surface),
+        valid_key,
+    });
+}
+
+/// `error_codes` is a comma-separated list.
+#[given(expr = "surface {string} denies a target Trust Check reporting any of error codes {string}")]
+pub async fn surface_denies_target_trust_check_errors(
+    world: &mut G2gWorld,
+    surface_name: String,
+    error_codes: String,
+) {
+    let codes = error_codes
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    surface_spec_mut(world, &surface_name).transit_policy_rego =
+        Some(build_surface_deny_target_trust_check_errors_policy(&codes));
+}
+
+/// Starts the fabric, since the Trust Check names a trust registry stored
+/// through the admin API. The registry never connects, so only the stages
+/// before its query run. The partner's managed agent then forgets the requests
+/// it has served, so a later agent card fetch is the Trust Check's own.
+#[given(expr = "Transit Point {string} has a target-leg Trust Check")]
+pub async fn transit_point_has_a_target_trust_check(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    world.start().await;
+    let link = world
+        .transit_point_link(&transit_point)
+        .clone();
+    let harness = world.harness();
+    let admin = &harness.gw(link.from_gw).admin;
+    let registry_name = format!("{}-{transit_point}-registry", link.from_surface);
+    let created = admin
+        .create_trust_registry(&registry_name, "Unconnected registry", "http://127.0.0.1:1/unreachable")
+        .await;
+    let registry_id = admin
+        .list_trust_registries()
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"))
+        .into_iter()
+        .find(|registry| registry.name == registry_name)
+        .unwrap_or_else(|| panic!("trust registry '{registry_name}' was not stored: {created:?}"))
+        .id;
+    harness
+        .update_transit_point(link.from_gw, &link.from_surface, &transit_point, |surface, index| {
+            surface["trust_check_split"] = serde_json::json!(true);
+            surface["transit"]["points"][index]["trust_check_list"] = serde_json::json!([{
+                "id": format!("{transit_point}-recognition"),
+                "trust_registry_id": registry_id,
+                "query_type": "recognition",
+                "query": { "authority_id": "did:example:authority", "entity_id": "{{ target.did }}" }
+            }]);
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    harness
+        .gw(link.to_gw)
+        .mock(&link.to_surface)
+        .unwrap_or_else(|| panic!("no managed agent backing surface '{}' on gateway {}", link.to_surface, link.to_gw))
+        .clear_requests()
+        .await;
 }
 
 /// How long a fresh pairing may take to record the peer's issuer DID.

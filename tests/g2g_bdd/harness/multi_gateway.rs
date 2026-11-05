@@ -721,20 +721,36 @@ impl MultiGatewayHarness {
         transit_point_alias: &str,
         policy_definition_id: &str,
     ) -> Result<()> {
+        self.update_transit_point(gw_index, surface_id, transit_point_alias, |surface, index| {
+            surface["transit"]["points"][index]["policy"] =
+                serde_json::json!({ "policy_definition_id": policy_definition_id });
+        })
+        .await
+    }
+
+    /// Saves surface `surface_id` on gateway `gw_index` through the admin API
+    /// after `edit` changes it, given the index of its Transit Point
+    /// `transit_point_alias`.
+    pub async fn update_transit_point(
+        &self,
+        gw_index: usize,
+        surface_id: &str,
+        transit_point_alias: &str,
+        edit: impl FnOnce(&mut serde_json::Value, usize),
+    ) -> Result<()> {
         let gateway = self.gw(gw_index);
         let mut surface = gateway
             .admin
             .get_surface(surface_id)
             .await
             .with_context(|| format!("fetch surface {surface_id} on gateway {gw_index}"))?;
-        let point = surface
-            .get_mut("transit")
-            .and_then(|transit| transit.get_mut("points"))
-            .and_then(serde_json::Value::as_array_mut)
+        let index = surface
+            .pointer("/transit/points")
+            .and_then(serde_json::Value::as_array)
             .and_then(|points| {
                 points
-                    .iter_mut()
-                    .find(|point| {
+                    .iter()
+                    .position(|point| {
                         point
                             .get("alias")
                             .and_then(serde_json::Value::as_str)
@@ -744,16 +760,13 @@ impl MultiGatewayHarness {
             .with_context(|| {
                 format!("surface {surface_id} on gateway {gw_index} has no Transit Point '{transit_point_alias}'")
             })?;
-        point["policy"] = serde_json::json!({ "policy_definition_id": policy_definition_id });
+        edit(&mut surface, index);
         gateway
             .admin
             .update_surface(surface_id, &surface)
             .await
             .with_context(|| {
-                format!(
-                    "attach a policy to Transit Point {transit_point_alias} of surface {surface_id} on gateway \
-                     {gw_index}"
-                )
+                format!("update Transit Point {transit_point_alias} of surface {surface_id} on gateway {gw_index}")
             })?;
         tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
         Ok(())

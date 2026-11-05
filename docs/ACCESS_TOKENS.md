@@ -186,7 +186,8 @@ another tenant's alike. Deleting a secret does not check the surfaces that name 
 stored before the deletion keeps the reference until its next save. Secret ids are one namespace
 across tenants, so
 `POST /v1/secrets/new` with an id that any tenant already uses answers that the secret already
-exists. An appliance-wide reference the stored surface or provider already held is kept in the
+exists. The `atgk_` prefix is reserved for API key ids: a new `secret_id` that starts with it is
+refused with `400` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). An appliance-wide reference the stored surface or provider already held is kept in the
 default `warn` mode (on a provider, only in the same field and while the provider's type and
 destination are unchanged; on a surface, only while every destination that sends it already
 sent it: the endpoint of each Target and Transit Point, and the caller for response custom
@@ -257,9 +258,14 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 Runtime stores, listeners, policy compilation, hot reload, and the data-plane protocols
 are unpartitioned. Tenancy constrains management records, not the running data plane.
 
-Every PAT-accessible management route is feature-gated, so the bound user's role and the
-PAT's feature scopes both apply. A scoped PAT may create or update tokens only with a
-non-empty subset of its own scopes.
+A feature-gated management route checks both the bound user's role and the PAT's feature
+scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
+owner's role, and routes open to any signed-in caller, such as the caller's own profile and
+settings, need no feature. The routes on the caller's own notifications need a session sign-in, not
+a PAT: with a PAT, the notification list is empty, the unread count is `0`, and reading, creating,
+updating or deleting a notification answers `401` (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)). A scoped PAT may create or
+update tokens only with a non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
 paths: only an audited allowlist of handler-enforced actions may proceed. The surface
@@ -272,8 +278,10 @@ impact reads filter the root and every graph edge by tenant/scope, and
 resource-scoped PATs cannot reassign ownership. Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and the secrets, JWT verification strategies, API-key
-parents and certificates its `source_auth` names, and every Trust Recorder entry,
-on the surface and in every variant. MCP tool discovery
+parents and certificates its `source_auth` names, every Trust Recorder entry, and the
+owning surface of each API Key Provider key a `from_api_key` identity or identity injection
+derives a DID from, on the surface and in every variant, matched against the token's pattern as
+`api-keys:<key id>`; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys). MCP tool discovery
 requires MCP Proxy edit plus Secret view authority, validates raw endpoints with
 `validate_resolved_url`, dials through a per-request Strict-pinned,
 redirect-disabled client (`egress::pinned_strict_client`), independently
@@ -289,7 +297,10 @@ Ownership changes are administrator-only: `GET
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
 reference would become incompatible, including a tenant surface or credential provider that
 would end up sending an appliance-wide secret or credential provider upstream (an existing
-one is only refused when `tenant_credential_isolation` is `enforce`). The self Gateway and built-in Surface
+one is only refused when `tenant_credential_isolation` is `enforce`). While a surface names an
+API Key Provider key id and no API key store is configured, both the impact read and the
+reassignment answer `409` "API key store is not configured"; see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys). The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
 child API keys and Connection Points move with their parent. A credential provider that any
 surface binds, of any tenant, cannot move to another tenant (`409`); remove the bindings first
@@ -331,6 +342,12 @@ in memory for two minutes, so CLI login works with one gateway instance. With mo
 replica, an exchange that reaches a different instance than the consent gets `invalid_grant`;
 session stickiness does not help, because the exchange request carries no browser cookie.
 Limits and the full flow are in [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway).
+
+CLI browser login needs the dashboard over HTTPS or on `http://localhost`. The authorize page
+is opened as a navigation, so it sees only the `Secure` `__Host-session_token` cookie, which a
+browser drops over plain HTTP on any other host; there the browser moves between sign-in and
+the authorize page until the authorize throttle answers `429`, and the CLI gets no code. See
+[`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md).
 
 The `fabric` CLI lives in its own repository, so this is the contract it must follow:
 

@@ -762,6 +762,38 @@ pub async fn the_relay_was_refused_after_calls(
     assert_eq!(world.response_status, Some(status), "body={:?}", world.response_body);
 }
 
+#[then(expr = "managed agent {string} served its agent card")]
+pub async fn managed_agent_served_its_agent_card(
+    world: &mut G2gWorld,
+    target_name: String,
+) {
+    let (_, _, mock) = mock_for(world, &target_name);
+    let requests = mock.requests().await;
+    assert!(
+        requests
+            .iter()
+            .any(is_discovery_request),
+        "managed agent '{target_name}' received no agent card fetch: {requests:?}; caller_status={:?}; caller_body={:?}",
+        world.response_status,
+        world.response_body
+    );
+}
+
+#[then(expr = "managed agent {string} received one forwarded message")]
+pub async fn actor_received_one_forwarded_message(
+    world: &mut G2gWorld,
+    target_name: String,
+) {
+    let messages = forwarded_messages_for(world, &target_name).await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "target collaborator '{target_name}' should receive one forwarded message (discovery card fetches excluded): {messages:?}; caller_status={:?}; caller_body={:?}",
+        world.response_status,
+        world.response_body
+    );
+}
+
 #[then(regex = r#"^managed agent "([^"]+)" did not receive a forwarded message$"#)]
 pub async fn actor_did_not_receive_forwarded_message(
     world: &mut G2gWorld,

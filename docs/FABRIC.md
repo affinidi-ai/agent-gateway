@@ -645,6 +645,9 @@ through a Transit Point of a gateway with no transit token issuer, which reads n
 discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
 the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
+or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
+not through the Transit Point, with a count of 1 and a trace id of its own.
 The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
 the agent sending the token it was given each time; two agents that call each other's Access
 Points are not bounded by it, nor are agents that keep calling through any of the resets above.

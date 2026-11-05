@@ -530,7 +530,8 @@ impl PreviewMemory {
     }
 
     /// The preview of the running `state`, fetched for `caller` within the fetch
-    /// limits. Past either limit, a read answers with the last preview of the same
+    /// limits. A surface deriving a DID from an API key it may not use gets no
+    /// preview and no fetch. Past either limit, a read answers with the last preview of the same
     /// running surface, marked `cached`; a refresh, or a read without one, is
     /// [`RateLimited`]. Every fetch is audited.
     pub(crate) async fn preview(
@@ -543,6 +544,13 @@ impl PreviewMemory {
             .surface
             .surface_id
             .as_str();
+        if crate::identity::provider_key_gate::gate()
+            .refuses(&state.surface)
+            .await
+            .is_some()
+        {
+            return Ok(AgentCardPreview::unsupported(surface_id, UnsupportedReason::NotRunning));
+        }
         let digest = surface_digest(&state.surface);
         if let Err(limited) = self.admit(caller.user_id, surface_id) {
             if request == PreviewRequest::Refresh {
@@ -1155,6 +1163,64 @@ mod tests {
                 && !received
                     .headers
                     .contains_key("cookie")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_naming_another_tenants_api_key_gets_no_preview_and_no_fetch() {
+        let _gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("owner-a", "atgk_preview_a"), ("owner-b", "atgk_preview_b")],
+        )
+        .await;
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let naming = |surface_id: &str, key_id: &str| {
+            let mut surface = surface_with(surface_id, json!({"endpoint": target.url()}));
+            surface.tenant_id = Some("tenant-a".into());
+            surface
+                .identity_slots
+                .external =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": key_id})).unwrap());
+            surface
+        };
+        let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
+
+        let refused = memory
+            .preview(&running(naming("cross", "atgk_preview_b")).await, &caller("u-gate"), PreviewRequest::Read)
+            .await
+            .unwrap();
+        assert_eq!(refused, AgentCardPreview::unsupported("cross", UnsupportedReason::NotRunning));
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "a not-ready surface is never fetched"
+        );
+        assert!(
+            memory
+                .previews
+                .get("cross")
+                .await
+                .is_none()
+                && memory
+                    .good_cards
+                    .get("cross")
+                    .await
+                    .is_none(),
+            "nothing is kept"
+        );
+
+        let shown = memory
+            .preview(&running(naming("own", "atgk_preview_a")).await, &caller("u-gate"), PreviewRequest::Read)
+            .await
+            .unwrap();
+        assert_eq!(fetch_of(&shown), (CardFetchStatus::Ok, None, None));
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            1
         );
     }
 

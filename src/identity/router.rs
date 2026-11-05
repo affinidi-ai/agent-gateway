@@ -253,14 +253,11 @@ pub fn create_identity_api_router(
         // NOTE: storage backup/restore/export and agents-api sign-jwt are admin-only
         // and are registered on the RBAC-gated `auth_manager_router` below, not here.
         // Metrics routes
-        .route("/v1/metrics/truncate", post(handlers::truncate_metrics))
         .route("/v1/metrics/prometheus", get(handlers::prometheus_metrics))
         .route("/v1/metrics/otlp-status", get(handlers::get_otlp_status))
         // NOTE: the metrics configuration routes write the OTLP exporter destination and its
         // secret-store-resolved auth header, and the log download returns the whole log
         // directory, so all four are RBAC-gated on `rbac_identity_router` below.
-        // Logs routes
-        .route("/v1/logs/truncate", post(handlers::truncate_old_logs))
         // NOTE: the VP Audit Log (/v1/audit) can include caller context and VP
         // JWTs, so it is RBAC-gated behind administrator-only `audit.view` on
         // the `rbac_identity_router` below, not registered here.
@@ -633,10 +630,18 @@ pub fn create_identity_api_router(
                     Feature::SettingsEdit,
                 )),
             )
+            .route(
+                "/v1/metrics/truncate",
+                post(handlers::truncate_metrics).layer(require_feature(s.clone(), r.clone(), Feature::SettingsEdit)),
+            )
             // Server logs routinely carry tokens, request detail and PII.
             .route(
                 "/v1/logs/download",
                 get(handlers::download_logs).layer(require_feature(s.clone(), r.clone(), Feature::AuditView)),
+            )
+            .route(
+                "/v1/logs/truncate",
+                post(handlers::truncate_old_logs).layer(require_feature(s.clone(), r.clone(), Feature::SettingsEdit)),
             )
             // H1 / H16 — surface mutations (H16 collapses into H1 because the
             // channel-policy update is reached via the surface PUT/DELETE)
@@ -2118,69 +2123,86 @@ pub fn create_identity_api_router(
 
     // Create notification routes if store is provided
     let notification_router = if let Some(store) = notification_store {
-        let router =
-            Router::new()
-                .route(
-                    "/v1/notifications",
-                    get(crate::integrations::handlers::list_notifications::<
+        use crate::auth_manager::middleware::{RbacGuard, maybe_gate};
+        use crate::rbac::Feature;
+        let notification_guard = passkey_storage_for_manager
+            .as_ref()
+            .map(|auth_storage| RbacGuard::new(auth_storage.clone(), rbac_config.clone()));
+        let guard = notification_guard.as_ref();
+        let router = Router::new()
+            .route(
+                "/v1/notifications",
+                get(crate::integrations::handlers::list_notifications::<
+                    crate::integrations::FileSystemNotificationStore,
+                >),
+            )
+            .route(
+                "/v1/notifications",
+                post(
+                    crate::integrations::handlers::create_notification::<
                         crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications",
-                    post(
-                        crate::integrations::handlers::create_notification::<
-                            crate::integrations::FileSystemNotificationStore,
-                        >,
-                    ),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    get(crate::integrations::handlers::get_notification::<
+                    >,
+                ),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                get(
+                    crate::integrations::handlers::get_notification::<crate::integrations::FileSystemNotificationStore>,
+                ),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                put(crate::integrations::handlers::update_notification::<
+                    crate::integrations::FileSystemNotificationStore,
+                >),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                delete(
+                    crate::integrations::handlers::delete_notification::<
                         crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    put(crate::integrations::handlers::update_notification::<
-                        crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    delete(
-                        crate::integrations::handlers::delete_notification::<
-                            crate::integrations::FileSystemNotificationStore,
-                        >,
-                    ),
-                )
-                .route(
-                    "/v1/notifications/unread/count",
-                    get(crate::integrations::handlers::get_unread_count::<
-                        crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/user-welcome-template",
+                    >,
+                ),
+            )
+            .route(
+                "/v1/notifications/unread/count",
+                get(
+                    crate::integrations::handlers::get_unread_count::<crate::integrations::FileSystemNotificationStore>,
+                ),
+            )
+            .route(
+                "/v1/notifications/user-welcome-template",
+                maybe_gate(
+                    guard,
                     get(crate::integrations::handlers::get_user_welcome_template::<
                         crate::integrations::FileSystemNotificationStore,
                     >),
-                )
-                .route(
-                    "/v1/notifications/user-welcome-template",
+                    Feature::UsersApprove,
+                ),
+            )
+            .route(
+                "/v1/notifications/user-welcome-template",
+                maybe_gate(
+                    guard,
                     put(crate::integrations::handlers::set_user_welcome_template::<
                         crate::integrations::FileSystemNotificationStore,
                     >),
-                )
-                .route(
-                    "/v1/notifications/send-welcome",
+                    Feature::UsersApprove,
+                ),
+            )
+            .route(
+                "/v1/notifications/send-welcome",
+                maybe_gate(
+                    guard,
                     post(
                         crate::integrations::handlers::send_user_welcome::<
                             crate::integrations::FileSystemNotificationStore,
                         >,
                     ),
-                )
-                .layer(Extension(store));
+                    Feature::UsersApprove,
+                ),
+            )
+            .layer(Extension(store));
 
         // Add session manager if available (works for both Passkey and SAML modes)
         if let Some(sess_mgr) = &session_manager_for_manager {

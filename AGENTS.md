@@ -121,6 +121,10 @@ Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the A
 See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+A Transit Point's Rate Limit panel has a **Per caller** section that writes
+`transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
@@ -134,6 +138,14 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
+see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
+
+The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
+claim other than `sub`; see _Credentials audit tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, and target authentication on a Managed Agent or Transit
@@ -184,6 +196,9 @@ access" under the Access Point URL with a **Configure Authentication** action. S
 surface, a not-ready one, or a surface without `public` and without a Caller Context, warns
 after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
+_Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 

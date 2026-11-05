@@ -112,13 +112,16 @@ fn normalize_audience(aud: &Value) -> Vec<String> {
 /// Structurally validate an inbound ID-JAG's claims (signature verification is
 /// performed separately by the JWT verifier).
 ///
-/// Enforces: `iss`/`sub`/`client_id` present and non-empty; `aud` contains
+/// Enforces: `iss`, `client_id` and the subject (the value of `principal_claim`,
+/// the claim the verification strategy that accepted the ID-JAG names its
+/// subjects by) present and non-empty; `aud` contains
 /// `expected_audience` (this gateway as the resource AS); `exp` present and in
 /// the future relative to `now`; `nbf`, when present, not in the future; and a
 /// non-empty `jti` (required for single-use enforcement). On any failure
 /// returns `invalid_grant`.
 pub fn validate_id_jag(
     claims: &Value,
+    principal_claim: &str,
     expected_audience: &str,
     now: u64,
 ) -> Result<IdJagClaims, StsError> {
@@ -130,10 +133,10 @@ pub fn validate_id_jag(
         .to_string();
 
     let subject = claims
-        .get("sub")
+        .get(principal_claim)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| StsError::InvalidGrant("ID-JAG missing sub".to_string()))?
+        .ok_or_else(|| StsError::InvalidGrant("ID-JAG names no subject".to_string()))?
         .to_string();
 
     let aud = claims
@@ -260,7 +263,7 @@ mod tests {
             act: Some(act.clone()),
         });
         assert_eq!(claims["act"], act);
-        let parsed = validate_id_jag(&claims, "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
         assert_eq!(parsed.act, Some(act));
     }
 
@@ -275,7 +278,7 @@ mod tests {
             "jti": "grant-1",
             "exp": 2_000
         });
-        let parsed = validate_id_jag(&claims, "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
         assert_eq!(parsed.issuer, "https://idp.example");
         assert_eq!(parsed.subject, "user-123");
         assert_eq!(parsed.audience, vec!["https://gw.example".to_string()]);
@@ -296,21 +299,21 @@ mod tests {
             "jti": "grant-2",
             "exp": 2_000
         });
-        let parsed = validate_id_jag(&claims, "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
         assert_eq!(parsed.audience.len(), 2);
     }
 
     #[test]
     fn validate_id_jag_rejects_wrong_audience() {
         let claims = json!({ "iss": "i", "sub": "u", "aud": "https://elsewhere.example", "exp": 2_000 });
-        let err = validate_id_jag(&claims, "https://gw.example", 1_000).unwrap_err();
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
     }
 
     #[test]
     fn validate_id_jag_rejects_expired() {
         let claims = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "exp": 500 });
-        let err = validate_id_jag(&claims, "https://gw.example", 1_000).unwrap_err();
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
         assert!(
             err.description()
@@ -321,8 +324,32 @@ mod tests {
     #[test]
     fn validate_id_jag_rejects_future_nbf() {
         let claims = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "exp": 5_000, "nbf": 4_000 });
-        let err = validate_id_jag(&claims, "https://gw.example", 1_000).unwrap_err();
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
+    }
+
+    /// The ID-JAG's subject is the value of the claim the accepting strategy
+    /// names, and an ID-JAG without it, or with it empty, names no subject.
+    #[test]
+    fn validate_id_jag_reads_the_subject_from_the_strategys_claim() {
+        let base = json!({ "iss": "i", "sub": "pairwise", "oid": "person-1", "aud": "https://gw.example",
+            "client_id": "agent0", "jti": "g", "exp": 5_000 });
+        let parsed = validate_id_jag(&base, "oid", "https://gw.example", 1_000).expect("valid");
+        assert_eq!(parsed.subject, "person-1");
+        for oid in [None, Some(json!("")), Some(json!(7))] {
+            let mut claims = base.clone();
+            match oid {
+                Some(value) => claims["oid"] = value,
+                None => {
+                    claims
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("oid");
+                }
+            }
+            let err = validate_id_jag(&claims, "oid", "https://gw.example", 1_000).unwrap_err();
+            assert_eq!(err.error_code(), "invalid_grant", "{claims}");
+        }
     }
 
     #[test]
@@ -333,7 +360,7 @@ mod tests {
             c.as_object_mut()
                 .unwrap()
                 .remove(missing);
-            let err = validate_id_jag(&c, "https://gw.example", 1_000).unwrap_err();
+            let err = validate_id_jag(&c, "sub", "https://gw.example", 1_000).unwrap_err();
             assert_eq!(err.error_code(), "invalid_grant", "missing {missing} must be invalid_grant");
         }
     }

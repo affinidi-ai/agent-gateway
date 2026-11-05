@@ -79,6 +79,8 @@ pub struct SurfaceConfigBuilder {
     pub token_request_timeout_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
+    /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
+    pub writes_log_directory: bool,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -137,6 +139,7 @@ impl Default for SurfaceConfigBuilder {
             enforced_credential_rules: Vec::new(),
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
+            writes_log_directory: false,
         }
     }
 }
@@ -256,6 +259,9 @@ pub struct SurfaceTransitPointConfig {
     /// The Transit Point authenticates its target with the surface's
     /// `target_auth_provider`.
     pub target_auth_provider: bool,
+    /// Requests per minute the Transit Point admits from each caller
+    /// (`per_caller_rate_limit`).
+    pub per_caller_rate_limit_per_minute: Option<u32>,
 }
 
 impl SurfaceTransitPointConfig {
@@ -275,6 +281,7 @@ impl SurfaceTransitPointConfig {
             allow_unauthenticated_callers: true,
             delegated_credentials: false,
             target_auth_provider: false,
+            per_caller_rate_limit_per_minute: None,
         }
     }
 }
