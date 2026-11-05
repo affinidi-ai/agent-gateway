@@ -2,7 +2,6 @@ import React, { useEffect, useState, useCallback, useRef, useReducer, useMemo } 
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
-import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -12,7 +11,10 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  withoutPublicAccessWarning,
+} from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -1285,7 +1287,7 @@ const SurfaceDetailPage: React.FC = () => {
       let headerWarnings: string[] = [];
       const updated = await apiClient.updateSurface(surfaceId, payload, {
         onWarnings: received => {
-          headerWarnings = received;
+          headerWarnings = withoutPublicAccessWarning(received);
         },
       });
       setSavedWarnings({ surfaceId, warnings: headerWarnings });
@@ -1379,7 +1381,7 @@ const SurfaceDetailPage: React.FC = () => {
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving.
-      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated);
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1668,16 +1670,11 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || (saveWarnings && saveWarnings.length > 0) ? (
-            <>
-              {error && (
-                <div className="alert alert-danger surface-page-alert mb-2" role="alert">
-                  <i className="fas fa-exclamation-circle me-2" />
-                  {error}
-                </div>
-              )}
-              <SaveWarningsBanner warnings={saveWarnings} />
-            </>
+          error ? (
+            <div className="alert alert-danger surface-page-alert mb-2" role="alert">
+              <i className="fas fa-exclamation-circle me-2" />
+              {error}
+            </div>
           ) : null
         }
         meta={{

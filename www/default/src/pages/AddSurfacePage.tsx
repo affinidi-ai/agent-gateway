@@ -8,7 +8,10 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  withoutPublicAccessWarning,
+} from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -464,15 +467,15 @@ const AddSurfacePage: React.FC = () => {
       let headerWarnings: string[] = [];
       const created = await apiClient.createSurface(payload, {
         onWarnings: warnings => {
-          headerWarnings = warnings;
+          headerWarnings = withoutPublicAccessWarning(warnings);
         },
       });
       justCreatedRef.current = true;
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload);
       // Warnings from the gateway go with the operator to the new surface's
-      // page, which lists them, since the toast goes after a few seconds.
+      // page, where the Transit Point a warning names shows it in its panel.
       if (headerWarnings.length > 0 && created?.surface_id) {
         navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
           state: { saveWarnings: headerWarnings },
