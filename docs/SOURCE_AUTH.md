@@ -1044,7 +1044,8 @@ decides, as for a failed key.
 ### `from_jwt_claim`
 
 Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived.
+verified before the DID is derived. On a direct Access Point, a missing or invalid bearer token
+is refused with `401` before the target is called.
 
 | Field | Default | Effect |
 | --- | --- | --- |

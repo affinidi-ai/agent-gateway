@@ -1547,6 +1547,83 @@ async fn inbound_from_jwt_claim_missing_oid_rejected() {
     assert_eq!(body["code"], "identity_validation_failed", "problem.code mismatch: {body}");
 }
 
+/// Inbound A2A with `identity_slots.inbound = from_jwt_claim` and no caller JWT:
+/// the gateway must answer 401 and never call the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_jwt_claim_missing_jwt_returns_401_without_upstream_call() {
+    use helpers::jwt::{JwksFixture, setup_jwt_claim_inbound_identity};
+
+    let fixture = JwksFixture::start().await;
+
+    let agent_response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "kind": "message", "messageId": "msg-001", "role": "agent", "parts": [] }
+    });
+    let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
+
+    let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, _| {
+        setup_jwt_claim_inbound_identity(&fixture, temp_dir, gw_config);
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .json(&a2a_request())
+        .send()
+        .await
+        .expect("inbound request failed");
+
+    assert_eq!(resp.status(), 401, "missing caller JWT must be refused with 401, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unauthenticated request must not reach target"
+    );
+}
+
+/// Inbound A2A with `identity_slots.inbound = from_jwt_claim` and a malformed
+/// bearer token: the gateway must answer 401 and never call the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_jwt_claim_invalid_jwt_returns_401_without_upstream_call() {
+    use helpers::jwt::{JwksFixture, setup_jwt_claim_inbound_identity};
+
+    let fixture = JwksFixture::start().await;
+
+    let agent_response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "kind": "message", "messageId": "msg-001", "role": "agent", "parts": [] }
+    });
+    let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
+
+    let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, _| {
+        setup_jwt_claim_inbound_identity(&fixture, temp_dir, gw_config);
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer not-a-jwt")
+        .json(&a2a_request())
+        .send()
+        .await
+        .expect("inbound request failed");
+
+    assert_eq!(resp.status(), 401, "invalid caller JWT must be refused with 401, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "invalid-token request must not reach target"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_proxy_entra_identity_matches_header_metadata_did() {
     let agent_response = json!({

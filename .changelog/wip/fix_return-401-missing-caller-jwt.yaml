@@ -1,0 +1,14 @@
+branch: fix/return-401-missing-caller-jwt
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-05T08:10:06Z'
+      title: Return 401 when the caller JWT is missing on direct from_jwt_claim surfaces
+      description: >-
+        A direct Access Point whose inbound identity is from_jwt_claim answered 500 when a caller
+        sent no bearer token or an invalid one. It now answers 401 with the caller authentication
+        error and never calls the target.
+  removed: []
+  security: []
+  breaking: []

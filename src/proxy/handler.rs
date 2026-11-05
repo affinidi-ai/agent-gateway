@@ -1829,6 +1829,10 @@ async fn proxy_handler_with_mcp_runtime(
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
+    let mut caller_auth_error: Option<(
+        crate::source_auth::SourceAuthConfig,
+        crate::source_auth::errors::SourceAuthError,
+    )> = None;
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
         channel_name: &channel_name,
@@ -2087,6 +2091,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .to_string(),
                         reason: e.to_string(),
                     });
+                    caller_auth_error = Some((resolved_auth_config, e));
                     None
                 }
                 // Server-side failure (config not found, internal) — keep
@@ -4984,6 +4989,23 @@ async fn proxy_handler_with_mcp_runtime(
                     .elapsed()
                     .as_secs_f64(),
             );
+            if let Some((auth_config, error)) = caller_auth_error.as_ref()
+                && state
+                    .surface
+                    .has_source_auth()
+            {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    auth_config,
+                    error,
+                ));
+            }
             connection_guard
                 .decrement()
                 .await;

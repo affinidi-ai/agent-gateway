@@ -257,7 +257,7 @@ A closed Access Point (`access_point.public: false`, which the admin API sets on
 it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
 refuse a missing or invalid credential with `401` before policy, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
-does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
+does not refuse a request whose credential is missing or invalid, except on a direct Access Point whose inbound identity is `from_jwt_claim`, which refuses it with `401` because no caller identity can be derived. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
 the method selected for the request (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
