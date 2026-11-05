@@ -26,4 +26,12 @@ changes:
         provider are shown only to appliance-wide callers. An access token scoped by required
         headers alone, or by a resource pattern without a tenant, reads none. Dashboard sessions
         and appliance-wide access tokens still read the whole log.
+    - timestamp: '2026-11-05T15:38:38Z'
+      title: Keep store error detail out of delegation vault and audit error answers
+      description: >-
+        The delegation vault's list, read and revoke routes, its revoke of a user's tokens and
+        GET /api/v1/delegation-audit answered a failed store read or revoke with the store's error
+        text, which can quote storage file paths. They now answer a fixed body, such as
+        {"error":"Failed to revoke"}, and log the detail instead. The revokes log it escaped,
+        since it can quote the id the caller sent.
   breaking: []

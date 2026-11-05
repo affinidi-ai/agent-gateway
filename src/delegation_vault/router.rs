@@ -105,13 +105,15 @@ mod tests {
 
     /// Minimal in-memory delegation vault backing the handler under test.
     /// Only the reads/deletes exercised by the management routes are real.
-    /// An `unreadable` vault fails every read with [`VAULT_READ_FAILURE`].
+    /// An `unreadable` vault fails every read and delete with
+    /// [`VAULT_READ_FAILURE`].
     struct InMemoryVault {
         tokens: Mutex<Vec<DelegationToken>>,
         unreadable: bool,
     }
 
-    /// The detail of a failed read of an `unreadable` [`InMemoryVault`].
+    /// The detail of a failed read or delete of an `unreadable`
+    /// [`InMemoryVault`].
     const VAULT_READ_FAILURE: &str = "vault entry /srv/gateway/_storage/delegation_vault/t1.json unreadable";
 
     #[async_trait::async_trait]
@@ -167,6 +169,9 @@ mod tests {
             &self,
             id: &str,
         ) -> anyhow::Result<bool> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             let mut guard = self.tokens.lock().unwrap();
             let before = guard.len();
             guard.retain(|t| t.id != id);
@@ -177,6 +182,9 @@ mod tests {
             &self,
             user_identity_hash: &str,
         ) -> anyhow::Result<usize> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             let mut guard = self.tokens.lock().unwrap();
             let before = guard.len();
             guard.retain(|t| t.user_identity_hash != user_identity_hash);
@@ -915,6 +923,43 @@ mod tests {
             let (status, body) = response_of(app.clone(), "GET", uri).await;
             assert_eq!((status, body.as_str()), (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), refusal), "{uri}");
         }
+    }
+
+    /// A failed revoke answers `500` with a fixed body. The error's detail,
+    /// which can quote the caller's id, goes to the log only, escaped.
+    #[tokio::test]
+    async fn a_failed_revoke_answers_without_its_detail() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let state = DelegationVaultState {
+            vault_store: Arc::new(InMemoryVault {
+                tokens: Mutex::new(vec![seed_token("t1")]),
+                unreadable: true,
+            }),
+            ..state_with(Vec::new())
+        };
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        for uri in ["/api/v1/delegation-vault/t1", "/api/v1/delegation-vault/by-user/sha256:user-1"] {
+            let (status, body) = response_of(app.clone(), "DELETE", uri).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to revoke"}"#),
+                "{uri}"
+            );
+        }
+        let text = logs.text();
+        let failures: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("revoke failed"))
+            .collect();
+        assert_eq!(failures.len(), 2, "{text}");
+        assert!(
+            failures
+                .iter()
+                .all(|line| line.contains(&format!("error={VAULT_READ_FAILURE:?}"))),
+            "{text}"
+        );
     }
 
     // ── A tenant's token reads only its own tenant's agent-keyed tokens ──

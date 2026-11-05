@@ -222,8 +222,14 @@ pub async fn revoke_token(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                id = %loggable::untrusted(&id),
+                action = "revoke",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation token revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
@@ -279,8 +285,14 @@ pub async fn revoke_user_tokens(
             (StatusCode::OK, Json(serde_json::json!({"revoked": count}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                user_hash = %loggable::untrusted(&user_hash),
+                action = "revoke_all",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation mass-revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
