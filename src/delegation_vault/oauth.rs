@@ -849,19 +849,19 @@ impl TokenEgress {
         Ok(())
     }
 
-    /// Whether the Strict egress policy refuses `endpoint`: not an http(s) URL, or a host
-    /// that resolves to a non-public address. A host that does not resolve now is not
-    /// refused here; every token request vets it again.
+    /// Whether the Strict egress policy refuses `endpoint` when a provider is saved
+    /// ([`crate::egress::strict_refuses`]). A host that does not resolve, or not in time,
+    /// is not refused here; every token request vets it again.
     pub(crate) async fn refuses_token_endpoint(
         &self,
         endpoint: &str,
     ) -> bool {
-        let raw = endpoint.to_string();
-        let allowlist = self.exact_allowlist.clone();
-        matches!(
-            tokio::task::spawn_blocking(move || crate::egress::vet_strict(&raw, allowlist.as_deref())).await,
-            Ok(Err(crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_)))
+        crate::egress::strict_refuses(
+            endpoint,
+            self.exact_allowlist
+                .as_deref(),
         )
+        .await
     }
 
     /// A redirect-off client that ignores proxies, pinned to the addresses `endpoint`
@@ -880,7 +880,9 @@ impl TokenEgress {
         .await
         .context("Provider token request failed")?
         .map_err(|error| match error {
-            crate::egress::EgressError::Blocked(_) => anyhow::Error::new(TokenEndpointRefused),
+            crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_) => {
+                anyhow::Error::new(TokenEndpointRefused)
+            }
             _ => anyhow!("Provider token request failed"),
         })?;
         Ok((client, target.url))

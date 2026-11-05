@@ -2317,6 +2317,75 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_that_is_not_public_is_refused_on_create_and_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (index, endpoint) in [
+            "https://10.0.0.1/token",
+            "https://172.16.0.1/token",
+            "https://192.168.1.1/token",
+            "https://169.254.1.1/token",
+            "https://[fd00::1]/token",
+            "https://[::ffff:10.0.0.1]/token",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for body in [client_credentials("oauth2_client_credentials"), jwt_bearer("p")] {
+                let (status, response) =
+                    create(&state, with_token_endpoint(body.clone(), &format!("private-{index}"), endpoint)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
+                assert_eq!(response["error"], "token_endpoint must resolve to public addresses only", "{endpoint}");
+            }
+        }
+        let (status, response) = create(
+            &state,
+            with_token_endpoint(client_credentials("oauth2_client_credentials"), "loopback", "https://127.0.0.1/token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "loopback is refused too: {response}");
+        assert!(
+            state
+                .store
+                .list()
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is stored"
+        );
+
+        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "a public address is saved: {created}");
+        let (status, key) = create(
+            &state,
+            json!({"name": "Key", "provider_id": "key", "provider_type": "api_key",
+                   "api_key_secret_ref": "CLIENT_SECRET", "token_endpoint": "https://10.0.0.1/token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "an API key provider sends nothing to a token endpoint: {key}");
+
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://192.168.1.1/token"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "token_endpoint must resolve to public addresses only");
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .token_endpoint
+                .as_deref(),
+            Some("https://192.0.2.1/token"),
+            "the stored endpoint is kept"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_to_an_http_token_endpoint_is_refused_and_a_stored_one_is_kept_in_warn_mode() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;

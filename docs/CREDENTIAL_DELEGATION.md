@@ -96,7 +96,9 @@ Every type except `api_key` sends its client secret, assertion or code to the to
 so the endpoint must be an https URL. An http endpoint meets the rule only when the bootstrap
 `[credential_policy] insecure_token_endpoints` lists it exactly (compared as parsed URLs, so
 another port or path does not match), or, under `AG_TEST_MODE=true`, when
-`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `credential_policy.token_endpoint_https`
+`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `insecure_token_endpoints` relaxes only the
+scheme: an endpoint it names must still resolve to public addresses
+([Service tokens](#service-tokens)). `credential_policy.token_endpoint_https`
 sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
 
 | | `warn` (default) | `enforce` |
