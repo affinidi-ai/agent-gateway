@@ -1950,10 +1950,10 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             ..Default::default()
         });
 
-        for (second, verifies) in [
-            (format!("Bearer {token}"), false),
-            ("bearer other".to_string(), false),
-            ("Payment credential".to_string(), true),
+        for (case, second, verifies) in [
+            ("a second Bearer value", format!("Bearer {token}"), false),
+            ("a lower-case bearer value", "bearer other".to_string(), false),
+            ("a Payment value", "Payment credential".to_string(), true),
         ] {
             let mut headers = bearer(&token);
             headers.append(axum::http::header::AUTHORIZATION, HeaderValue::from_str(&second).unwrap());
@@ -1963,10 +1963,10 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             if verifies {
                 assert!(
                     matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
-                    "{second}: {result:?}"
+                    "{case}"
                 );
             } else {
-                assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{second}: {result:?}");
+                assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{case}");
             }
         }
     }
