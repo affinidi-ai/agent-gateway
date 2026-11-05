@@ -10,8 +10,8 @@ changes:
         Saving or creating a surface in the dashboard showed each Warning header from the
         gateway twice: in the "The last save drew a warning" banner and in a toast. Both are
         removed, so the save toast says only that the surface was saved or created, plus any
-        issue the dashboard finds itself. The public Access Point warning is dropped outright,
-        since turning Public access on is the operator's own choice. A warning that names a
+        issue the dashboard finds itself. Turning Public access on is the operator's own choice,
+        so a save no longer warns about it. A warning that names a
         Transit Point still shows in that Transit Point's panel, and the canvas and Access Point
         panel still show whether the Access Point is ready. API clients still receive every
         Warning header.

@@ -10,11 +10,7 @@ import AccessPointPanel, {
 } from '../access-point/AccessPointPanel';
 import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 import { nodesFromSurface } from '../../nodesFromSurface';
-import {
-  PUBLIC_ACCESS_WARNING,
-  showSurfaceSaveToast,
-  withoutPublicAccessWarning,
-} from '../saveWarnings';
+import { showSurfaceSaveToast } from '../saveWarnings';
 import { withCallerAccessSettled } from '../access-point/publicAccess';
 import { showToast } from '../../../../utils/toaster';
 import type { AgentSurface } from '../../../../api';
@@ -32,10 +28,6 @@ jest.mock('../../../../utils/toaster', () => ({
 }));
 
 const toast = showToast as jest.Mock;
-
-const PUBLIC_MESSAGE =
-  'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
-const GATEWAY_MESSAGE = 'This Access Point is not ready for external access.';
 
 function makeCtx(nodes: any[]): PayloadContext {
   return {
@@ -289,17 +281,5 @@ describe('showSurfaceSaveToast', () => {
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith('success', 'Saved');
-  });
-});
-
-describe('withoutPublicAccessWarning', () => {
-  it('drops the public Access Point warning and keeps the others, in order', () => {
-    expect(
-      withoutPublicAccessWarning(['from the gateway', PUBLIC_MESSAGE, GATEWAY_MESSAGE])
-    ).toEqual(['from the gateway', GATEWAY_MESSAGE]);
-  });
-
-  it('matches the gateway message', () => {
-    expect(PUBLIC_ACCESS_WARNING).toBe(PUBLIC_MESSAGE);
   });
 });

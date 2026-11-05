@@ -8,10 +8,7 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
-import {
-  showSurfaceSaveToast,
-  withoutPublicAccessWarning,
-} from '../components/surface-builder/elements/saveWarnings';
+import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -467,7 +464,7 @@ const AddSurfacePage: React.FC = () => {
       let headerWarnings: string[] = [];
       const created = await apiClient.createSurface(payload, {
         onWarnings: warnings => {
-          headerWarnings = withoutPublicAccessWarning(warnings);
+          headerWarnings = warnings;
         },
       });
       justCreatedRef.current = true;

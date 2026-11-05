@@ -168,7 +168,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     public, and it admits callers without credentials. …".
   The dashboard shows none of these after a save: the canvas notice and the Access Point panel
   already show the Access Point's state, and turning Public access on is the operator's own
-  choice. The pages drop the public message (`withoutPublicAccessWarning`) as it arrives.
+  choice.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
   and one line per warning as a `warning` toast for the dashboard's own non-blocking issues

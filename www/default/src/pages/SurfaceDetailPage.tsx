@@ -11,10 +11,7 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
-import {
-  showSurfaceSaveToast,
-  withoutPublicAccessWarning,
-} from '../components/surface-builder/elements/saveWarnings';
+import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -1287,7 +1284,7 @@ const SurfaceDetailPage: React.FC = () => {
       let headerWarnings: string[] = [];
       const updated = await apiClient.updateSurface(surfaceId, payload, {
         onWarnings: received => {
-          headerWarnings = withoutPublicAccessWarning(received);
+          headerWarnings = received;
         },
       });
       setSavedWarnings({ surfaceId, warnings: headerWarnings });
