@@ -66,7 +66,7 @@ sequenceDiagram
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
 | Redirects | The client is pinned to the vetted target address with redirects disabled, so the credential cannot follow a 3xx to another host. A 3xx answers 502 "Upstream redirected". |
 | Blocked by egress policy | 403 |
-| Without `target.auth` | The fetch forwards caller headers and follows redirects as before. |
+| Without `target.auth` | The fetch forwards caller headers except `Cookie`, and follows redirects as before. |
 | `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
 
 The card fetched with `target.auth` is served to unauthenticated callers as is, so a

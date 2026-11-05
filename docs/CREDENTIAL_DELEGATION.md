@@ -1060,7 +1060,7 @@ MCP request is refused with `-32022`: the vendor is reached over a
 session revision. A request that arrived over Fabric is refused `403` as one whose caller the
 gateway did not identify, before any payment is asked for or verified: the caller a peer gateway
 asserts never keys a grant. A public discovery read over Fabric is refused the same way, since
-it would carry the peer's headers, its caller's cookies among them, to the vendor, and no request
+it would carry the peer's headers to the vendor, and no request
 over Fabric can use the Target. Each such refusal is audited `request_rejected` at admission, as
 `consent_identity_required`. A surface whose binding breaks a rule above, as one edited by hand
 might, answers `connector_unavailable` before any payment is asked for or settled, and reads no

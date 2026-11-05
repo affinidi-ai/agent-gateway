@@ -8155,7 +8155,9 @@ fn gateway_owned_receive_header(
     credential_headers: &[&str],
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
 ) -> Option<&'static str> {
-    if source_cred_headers
+    if key.eq_ignore_ascii_case("cookie") {
+        Some("cookie")
+    } else if source_cred_headers
         .iter()
         .any(|cred| key.eq_ignore_ascii_case(cred))
     {
@@ -11864,9 +11866,9 @@ mod tests {
         }
     }
 
-    /// The caller-info and DID identity headers a peer gateway sends, in any
-    /// case, never reach the agent behind the receiving surface; the peer's
-    /// other headers do.
+    /// The caller-info and DID identity headers and the caller's cookies a peer
+    /// gateway sends, in any case, never reach the agent behind the receiving
+    /// surface; the peer's other headers do.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11932,6 +11934,7 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "Cookie": "__Host-session_token=peer-dashboard-session",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11948,6 +11951,7 @@ mod tests {
             "x-gateway-did",
             "x-did-identity",
             "x-did-signed-identity",
+            "cookie",
         ] {
             assert!(
                 received[0]
