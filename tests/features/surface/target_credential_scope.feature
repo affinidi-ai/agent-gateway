@@ -4,7 +4,8 @@ Feature: Target credential scope on the direct path
   or as an ambiguous segment, is refused before anything reaches the Target. An encoded
   slash stays encoded. A caller header named like the Target credential header never
   reaches the Target, and a redirect from the Target is returned to the caller instead of
-  being followed with the credential.
+  being followed with the credential. A token the Access Point forwards for a caller it
+  verified goes beside the Target credential.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -95,3 +96,22 @@ Feature: Target credential scope on the direct path
     And the response header "location" points at path "/elsewhere" of managed agent "bravo"
     And managed agent "bravo" received exactly 1 request
     And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: A JWT Bearer caller's forwarded token goes beside the Target credential when Target source authentication is enforced
+    Given the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface's Access Point forwards the token of a caller its JWT Bearer method verifies to managed agent "bravo"
+    And the gateway enforces the credential rule "target_source_auth"
+    When the caller sends a request to the surface with a valid token
+    Then the response status is 200
+    And managed agent "bravo" received the caller's "authorization" header unchanged
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: An API key caller gets the Target credential and no forwarded credential when Target source authentication is enforced
+    Given the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface's Access Point forwards the token of a caller its JWT Bearer method verifies to managed agent "bravo"
+    And the gateway enforces the credential rule "target_source_auth"
+    When the caller sends a request to the surface with a valid API key
+    Then the response status is 200
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+    And managed agent "bravo" did not receive header "authorization"
+    And managed agent "bravo" did not receive header "x-api-key"

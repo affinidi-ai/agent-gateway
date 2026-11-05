@@ -11,7 +11,7 @@ use crate::steps::when::{
     build_request_body, ensure_admin_session, ensure_gateway_running, record_mock_observation,
     record_replacement_mock_observation, send_mcp_request_through_transit_point, send_request_and_record,
 };
-use crate::world::{RecordedResponse, SurfaceTargetAuthConfig, SurfaceWorld};
+use crate::world::{RecordedResponse, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceWorld};
 
 fn before_the_gateway_starts(
     world: &SurfaceWorld,
@@ -143,6 +143,34 @@ fn access_point_checks_no_caller(world: &mut SurfaceWorld) {
     world
         .surface_config
         .source_auth = None;
+}
+
+#[given(
+    expr = "the surface's Access Point forwards the token of a caller its JWT Bearer method verifies to managed agent {string}"
+)]
+fn access_point_forwards_verified_jwt_bearer_token(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&name, TargetActorKind::ManagedAgent);
+    before_the_gateway_starts(world, "forwarding the caller's JWT Bearer token");
+    let surface = &mut world.surface_config;
+    let jwt_bearer = surface
+        .source_auth
+        .iter_mut()
+        .chain(
+            surface
+                .additional_source_auth
+                .iter_mut(),
+        )
+        .find_map(|auth| match auth {
+            SurfaceSourceAuthConfig::JwtBearer(config) => Some(config),
+            SurfaceSourceAuthConfig::ApiKey(_) | SurfaceSourceAuthConfig::ApiKeyProvider(_) => None,
+        })
+        .expect("the surface must accept JWT Bearer source authentication first");
+    jwt_bearer.forward_header = true;
 }
 
 #[given(expr = "Transit Point {string} is an Open Transit Point")]

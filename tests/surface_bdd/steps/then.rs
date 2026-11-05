@@ -2684,6 +2684,21 @@ fn named_managed_agent_received_header(
     assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &expected_value);
 }
 
+#[then(expr = "managed agent {string} received the caller's {string} header unchanged")]
+fn named_managed_agent_received_callers_header_unchanged(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    header_name: String,
+) {
+    let sent = world
+        .sent_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&header_name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("the caller sent no '{header_name}' header"));
+    assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &sent);
+}
+
 #[then(expr = "external agent {string} received header {string} with value {string}")]
 fn named_external_agent_received_header(
     world: &mut SurfaceWorld,

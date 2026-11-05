@@ -2237,6 +2237,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
             audiences: Vec::new(),
+            forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
             header_name: "X-API-Key".to_string(),

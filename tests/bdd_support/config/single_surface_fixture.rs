@@ -341,6 +341,7 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    pub forward_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -598,6 +599,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),

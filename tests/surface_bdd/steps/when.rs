@@ -716,6 +716,7 @@ async fn send_json_request_to_path_and_record(
     let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path_and_query);
 
     world.sent_body = Some(body.clone());
+    world.sent_headers = headers.clone();
 
     let client = reqwest::Client::new();
     let response = post_json(&client, &url, &body, &headers)
