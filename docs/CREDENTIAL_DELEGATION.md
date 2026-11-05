@@ -742,7 +742,7 @@ receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or 
 configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
 credential. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
-`passthrough` forwards without the credential, and the cause is logged only. A `401` from the
+`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
 above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
@@ -1192,7 +1192,7 @@ appliance-wide Direct Line secret answers `409`, whether the proxy moves into a 
 secret becomes appliance-wide.
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
-`fallback`), and the cause is logged only. A refused legacy binding records
+`fallback`), and a `target_auth_failed` record in the VP Audit Log names the cause. A refused legacy binding records
 `provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
 or grant is requested, and answers as in
 [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved). On a modern MCP

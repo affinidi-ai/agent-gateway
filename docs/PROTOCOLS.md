@@ -64,7 +64,7 @@ sequenceDiagram
 
 | Aspect | Behaviour |
 | --- | --- |
-| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is logged only. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
+| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
 | Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
