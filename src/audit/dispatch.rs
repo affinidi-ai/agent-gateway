@@ -870,7 +870,7 @@ mod tests {
     }
 
     async fn wait_until(condition: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
             assert!(Instant::now() < deadline, "condition not met in time");
             tokio::time::sleep(Duration::from_millis(2)).await;

@@ -29,15 +29,6 @@ changes:
         release were not recorded; a certificate change found on the first use after it is
         recorded once, without a time.
   changed:
-    - timestamp: '2026-11-05T12:00:00Z'
-      title: Present the current mTLS certificate to Fabric peers after a rotation
-      description: >-
-        The identity the gateway presents to Fabric peers kept the certificate fingerprint,
-        subject and issuer from when the identity was created, even after the stored
-        certificate was rotated. It now carries the current certificate's details under the
-        same DID, matching the certificate its request credentials already use. Fabric peers
-        whose policy pins the old fingerprint deny requests after a rotation until they update
-        the policy to the new fingerprint.
     - timestamp: '2026-11-03T12:00:00Z'
       title: Stop offering From API Key on the Managed Agent's response identity
       description: >-
@@ -61,4 +52,15 @@ changes:
         external callers, are now serialised per identity hash.
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-05T12:00:00Z'
+      title: Present the current mTLS certificate to Fabric peers after a rotation
+      description: >-
+        The identity the gateway presents to Fabric peers kept the certificate fingerprint,
+        subject and issuer from when the identity was created, even after the stored
+        certificate was rotated. It now carries the current certificate's details under the
+        same DID, matching the certificate its request credentials already use. Fabric peers
+        whose policy pins the old fingerprint deny requests after a rotation until they update
+        the policy to the new fingerprint. Upgrade note: an identity whose certificate was
+        rotated before the upgrade presents the new fingerprint on its first request after
+        it; update peer policies that pin a fingerprint before upgrading.

@@ -122,12 +122,14 @@ async fn outbound_through_transit_point_inheriting_surface_identity_records_prot
 /// An inbound request on a protected `from_mtls` slot stores the certificate's `updated_at`
 /// as the record's baseline.
 ///
-/// Ignored in the shared test run: the request path reads the certificate store from a
-/// process-wide global (`proxy::server::get_certificates_store`) that the first gateway to boot
-/// sets, so any earlier harness leaves it pointing at a deleted temp dir. Run it on its own.
+/// Runs in its own process: the request path reads the certificate store from a process-wide
+/// global (`proxy::server::get_certificates_store`) that the first gateway to boot sets, so any
+/// earlier harness would leave it pointing at a deleted temp dir.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs its own process: the proxy's certificate store is a process-wide global"]
 async fn inbound_protected_from_mtls_records_the_certificate_updated_at() {
+    if !crate::a2a::version::run_isolated_from_other_tests() {
+        return;
+    }
     let key_pair = rcgen::KeyPair::generate().expect("client key pair");
     let mut params = rcgen::CertificateParams::default();
     params.distinguished_name = rcgen::DistinguishedName::new();
