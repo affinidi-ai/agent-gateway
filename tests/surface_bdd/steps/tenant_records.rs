@@ -224,6 +224,14 @@ async fn tenant_reads_vault_token(
     read_as_tenant(world, &tenant, &format!("/v1/delegation-vault/{}", vault_token_id(&provider))).await;
 }
 
+#[when(expr = "a token of tenant {string} reads a vault token that does not exist")]
+async fn tenant_reads_missing_vault_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    read_as_tenant(world, &tenant, "/v1/delegation-vault/no-such-token").await;
+}
+
 #[when("the operator lists the delegation vault")]
 async fn operator_lists_delegation_vault(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
@@ -348,17 +356,8 @@ fn vault_read_shows_the_token_of(
     );
 }
 
-#[then(expr = "the answer is the one a token of tenant {string} gets for a missing vault token")]
-async fn answer_is_the_one_for_a_missing_vault_token(
-    world: &mut SurfaceWorld,
-    tenant: String,
-) {
-    let foreign = world
-        .admin_response
-        .take()
-        .expect("the gateway must have answered a read");
-    read_as_tenant(world, &tenant, "/v1/delegation-vault/no-such-token").await;
-    let missing = answer(world);
-    assert_eq!(missing.status, 404, "{}", missing.body);
-    assert_eq!((foreign.status, &foreign.body), (missing.status, &missing.body));
+#[then("the vault read answers that the vault token is not found")]
+fn vault_read_answers_not_found(world: &mut SurfaceWorld) {
+    let answer = answer(world);
+    assert_eq!((answer.status, &answer.body), (404, &json!({"error": "Delegation token not found"})));
 }

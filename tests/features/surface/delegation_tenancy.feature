@@ -47,7 +47,12 @@ Feature: Tenant reads of delegation vault tokens and audit records
   Scenario: Another tenant's vault token answers like a missing one
     When a token of tenant "tenant-a" reads the vault token of credential provider "calendar-b"
     Then the admin API response status is 404
-    And the answer is the one a token of tenant "tenant-a" gets for a missing vault token
+    And the vault read answers that the vault token is not found
+
+  Scenario: A missing vault token answers that it is not found
+    When a token of tenant "tenant-a" reads a vault token that does not exist
+    Then the admin API response status is 404
+    And the vault read answers that the vault token is not found
 
   Scenario: An administrator lists every tenant's vault tokens
     When the operator lists the delegation vault
