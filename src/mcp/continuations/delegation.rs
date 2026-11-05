@@ -46,7 +46,12 @@ pub fn make_binding(
 }
 
 fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, ContinuationError> {
-    let AuthenticatedIdentity::JwtBearer { subject, claims } = identity else {
+    let AuthenticatedIdentity::JwtBearer {
+        subject,
+        principal_claim,
+        claims,
+    } = identity
+    else {
         return Err(ContinuationError::BindingMismatch);
     };
     let issuer = claims
@@ -56,7 +61,7 @@ fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, Contin
         .ok_or(ContinuationError::BindingMismatch)?;
     if subject.is_empty()
         || claims
-            .get("sub")
+            .get(principal_claim.as_str())
             .and_then(Value::as_str)
             != Some(subject)
     {
@@ -155,6 +160,7 @@ mod tests {
             "id": "provider", "name": "Provider", "provider_id": "provider", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap();
         let identity = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/oauth2/mcp", "sub": "user", "scope": "write read", "act": {"sub": "client"}, "exp": 100}),
         };

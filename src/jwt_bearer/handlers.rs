@@ -15,7 +15,7 @@ use crate::auth_manager::middleware::pat_scope_allows;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::jwt_bearer::{
     JwtVerificationStrategyStorage,
-    models::{JwksSource, JwtVerificationStrategy},
+    models::{JwksSource, JwtVerificationStrategy, normalize_principal_claim},
 };
 use crate::rbac::{Feature, RbacConfig};
 use crate::tenancy::{
@@ -49,6 +49,49 @@ pub struct JwtVerificationStrategyRequest {
     pub name: String,
     pub expected_issuer: String,
     pub jwks_source: JwksSource,
+    #[serde(default)]
+    pub principal_claim: Option<String>,
+}
+
+/// A `Warning` header for each other strategy of `saved`'s tenant scope that
+/// names callers of the same issuer by a different claim. An issuer names
+/// callers by one claim in a tenant, so token exchange and `jwt-bearer`
+/// redemption refuse that issuer's tokens until one of them is deleted.
+async fn mixed_claim_warnings(
+    store: &dyn JwtVerificationStrategyStorage,
+    saved: &JwtVerificationStrategy,
+) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    let Ok(claim) = saved.principal_claim_name() else {
+        return headers;
+    };
+    let Ok(strategies) = store.list().await else {
+        return headers;
+    };
+    for other in strategies
+        .iter()
+        .filter(|other| {
+            other.id != saved.id && other.tenant_id == saved.tenant_id && other.expected_issuer == saved.expected_issuer
+        })
+    {
+        let Ok(other_claim) = other.principal_claim_name() else {
+            continue;
+        };
+        if other_claim == claim {
+            continue;
+        }
+        let warning = format!(
+            "JWT verification strategy '{}' names callers of issuer '{}' by '{other_claim}', and this one by \
+             '{claim}': an issuer names callers by one claim in a tenant, so token exchange and jwt-bearer \
+             redemption refuse its tokens until one of the two is deleted",
+            other.id, saved.expected_issuer
+        );
+        warn!(strategy_id = %saved.id, other_strategy_id = %other.id, "{warning}");
+        if let Some(value) = crate::identity::handlers::surfaces::warning_header(&warning) {
+            headers.append(axum::http::header::WARNING, value);
+        }
+    }
+    headers
 }
 
 /// Error response body.
@@ -137,6 +180,14 @@ pub async fn create_strategy(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
     }
 
+    let principal_claim = match normalize_principal_claim(
+        body.principal_claim
+            .as_deref(),
+    ) {
+        Ok(claim) => claim,
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
+
     body.tenant_id = match tenant_for_create(body.tenant_id.take(), pat.is_some(), tenant_context(&context)) {
         Ok(tenant_id) => tenant_id,
         Err(message) => return (StatusCode::FORBIDDEN, ErrorBody::json(message)).into_response(),
@@ -158,6 +209,7 @@ pub async fn create_strategy(
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
+        principal_claim,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -165,7 +217,8 @@ pub async fn create_strategy(
     match store.create(strategy).await {
         Ok(created) => {
             info!(id = %created.id, name = %created.name, "JWT verification strategy created");
-            (StatusCode::CREATED, Json(created)).into_response()
+            let warnings = mixed_claim_warnings(store.as_ref(), &created).await;
+            (StatusCode::CREATED, warnings, Json(created)).into_response()
         }
         Err(e) => {
             error!("Failed to create JWT verification strategy: {}", e);
@@ -319,12 +372,42 @@ pub async fn update_strategy(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
     }
 
+    // A stored claim the API would refuse is kept as it is: it names no caller
+    // when used, and no request can name it, so it can only be replaced by a new
+    // strategy.
+    let stored_claim = existing
+        .normalized_principal_claim()
+        .unwrap_or_else(|_| {
+            existing
+                .principal_claim
+                .clone()
+        });
+    if let Some(requested) = body
+        .principal_claim
+        .as_deref()
+    {
+        let requested = match normalize_principal_claim(Some(requested)) {
+            Ok(claim) => claim,
+            Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+        };
+        if requested != stored_claim {
+            return (
+                StatusCode::BAD_REQUEST,
+                ErrorBody::json(
+                    "principal_claim cannot be changed after creation: create a new strategy and point the surface at it",
+                ),
+            )
+                .into_response();
+        }
+    }
+
     let updated = JwtVerificationStrategy {
         id: existing.id.clone(),
         tenant_id: existing.tenant_id,
         name: body.name,
         expected_issuer: body.expected_issuer,
         jwks_source: body.jwks_source,
+        principal_claim: stored_claim,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -332,7 +415,8 @@ pub async fn update_strategy(
     match store.update(updated).await {
         Ok(strategy) => {
             info!(id = %strategy.id, name = %strategy.name, "JWT verification strategy updated");
-            (StatusCode::OK, Json(strategy)).into_response()
+            let warnings = mixed_claim_warnings(store.as_ref(), &strategy).await;
+            (StatusCode::OK, warnings, Json(strategy)).into_response()
         }
         Err(e) => {
             error!("Failed to update JWT verification strategy {}: {}", id, e);
@@ -864,6 +948,277 @@ mod tests {
         );
     }
 
+    async fn send_strategy(
+        router: &Router,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response_body(response).await)
+    }
+
+    fn strategy_body(principal_claim: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "name": "Entra callers",
+            "expected_issuer": "https://login.example.com/tenant/v2.0",
+            "jwks_source": { "type": "remote", "jwks_uri": "https://login.example.com/tenant/keys" }
+        });
+        if let Some(claim) = principal_claim {
+            body["principal_claim"] = serde_json::json!(claim);
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn a_strategy_stores_the_principal_claim_it_is_created_with() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+
+        let (status, created) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("oid"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["principal_claim"], "oid");
+
+        let (_, read) = send_strategy(
+            &router,
+            "GET",
+            &format!(
+                "/v1/jwt-verification-strategies/{}",
+                created["id"]
+                    .as_str()
+                    .unwrap()
+            ),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(read["principal_claim"], "oid");
+
+        let (status, default) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(None)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            default
+                .get("principal_claim")
+                .is_none(),
+            "the default claim is not stored: {default}"
+        );
+
+        let (status, named_default) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("sub"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            named_default
+                .get("principal_claim")
+                .is_none(),
+            "naming sub is the default: {named_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_principal_claim_that_does_not_name_a_caller_is_refused() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        for claim in ["", "two words", "iss", "aud", "exp", "jti", "tid", "azp", "client_id", &"x".repeat(129)] {
+            let (status, body) =
+                send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some(claim))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{claim:?}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_principal_claim_cannot_be_changed_after_creation() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let (_, created) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(Some("oid"))).await;
+        let path = format!(
+            "/v1/jwt-verification-strategies/{}",
+            created["id"]
+                .as_str()
+                .unwrap()
+        );
+
+        for other in [Some("email"), Some("sub")] {
+            let (status, body) = send_strategy(&router, "PUT", &path, strategy_body(other)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{other:?}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot be changed"),
+                "{body}"
+            );
+        }
+
+        let (status, same) = send_strategy(&router, "PUT", &path, strategy_body(Some("oid"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(same["principal_claim"], "oid");
+
+        let (status, omitted) = send_strategy(&router, "PUT", &path, strategy_body(None)).await;
+        assert_eq!(status, StatusCode::OK, "an update that does not mention the claim keeps it");
+        assert_eq!(omitted["principal_claim"], "oid");
+
+        let (_, default) = send_strategy(&router, "POST", "/v1/jwt-verification-strategies", strategy_body(None)).await;
+        let default_path = format!(
+            "/v1/jwt-verification-strategies/{}",
+            default["id"]
+                .as_str()
+                .unwrap()
+        );
+        let (status, named_default) = send_strategy(&router, "PUT", &default_path, strategy_body(Some("sub"))).await;
+        assert_eq!(status, StatusCode::OK, "naming sub on a default strategy is no change: {named_default}");
+        assert!(
+            named_default
+                .get("principal_claim")
+                .is_none()
+        );
+    }
+
+    /// A strategy that names callers of an issuer by a claim another strategy
+    /// of its tenant scope does not is saved with a warning, since STS then
+    /// refuses that issuer's tokens; one that agrees is not warned of.
+    #[tokio::test]
+    async fn a_second_claim_for_one_issuer_is_saved_with_a_warning() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let create = |claim: Option<&str>| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jwt-verification-strategies")
+                .header("content-type", "application/json")
+                .body(Body::from(strategy_body(claim).to_string()))
+                .unwrap()
+        };
+        let warnings = |response: &axum::response::Response| -> Vec<String> {
+            response
+                .headers()
+                .get_all(axum::http::header::WARNING)
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        let by_sub = router
+            .clone()
+            .oneshot(create(None))
+            .await
+            .unwrap();
+        assert_eq!(by_sub.status(), StatusCode::CREATED);
+        assert!(warnings(&by_sub).is_empty());
+        let by_sub_id = response_body(by_sub).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let by_oid = router
+            .clone()
+            .oneshot(create(Some("oid")))
+            .await
+            .unwrap();
+        assert_eq!(by_oid.status(), StatusCode::CREATED);
+        let found = warnings(&by_oid);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("299 - "), "{found:?}");
+        assert!(found[0].contains(&by_sub_id) && found[0].contains("one claim in a tenant"), "{found:?}");
+
+        let second_oid = router
+            .clone()
+            .oneshot(create(Some("oid")))
+            .await
+            .unwrap();
+        let found = warnings(&second_oid);
+        assert_eq!(found.len(), 1, "only the strategy naming sub disagrees: {found:?}");
+        assert!(found[0].contains(&by_sub_id), "{found:?}");
+    }
+
+    /// A strategy written to storage by hand skips the API's checks: naming
+    /// `sub` there is still the default, and a claim the API would refuse can
+    /// be kept but not changed.
+    #[tokio::test]
+    async fn an_update_compares_with_the_stored_claim_in_its_api_form() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        for (id, stored) in [("named-sub", "sub"), ("named-iss", "iss")] {
+            let mut strategy = seeded_strategy(None);
+            strategy.id = id.to_string();
+            strategy.principal_claim = Some(stored.to_string());
+            store
+                .inner
+                .insert(id.to_string(), strategy);
+        }
+
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-sub", strategy_body(Some("sub")))
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("principal_claim")
+                .is_none(),
+            "the stored sub is saved in its API form: {body}"
+        );
+
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-iss", strategy_body(Some("oid")))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) =
+            send_strategy(&router, "PUT", "/v1/jwt-verification-strategies/named-iss", strategy_body(None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["principal_claim"], "iss", "it is kept, and names no caller when used");
+    }
+
     #[tokio::test]
     async fn test_update_returns_404_for_missing_strategy() {
         let store = Arc::new(MemStore::default());
@@ -1105,6 +1460,7 @@ mod tests {
 
     fn seeded_strategy(tenant_id: Option<&str>) -> JwtVerificationStrategy {
         JwtVerificationStrategy {
+            principal_claim: None,
             id: "strategy-a".to_string(),
             tenant_id: tenant_id.map(str::to_string),
             name: "Operator strategy".to_string(),

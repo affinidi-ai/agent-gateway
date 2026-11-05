@@ -13400,6 +13400,7 @@ mod tests {
         surface.outbound_credentials =
             vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
         let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
         };
@@ -13489,6 +13490,7 @@ mod tests {
         .principal_hash(None)
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
         };
@@ -13636,6 +13638,7 @@ mod tests {
             .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
         });
@@ -13669,6 +13672,7 @@ mod tests {
     fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
         let mut ctx = test_pipeline_context();
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
         });
@@ -13693,6 +13697,7 @@ mod tests {
         assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "<none>".to_string(),
             claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
         });
@@ -13709,6 +13714,7 @@ mod tests {
         authenticate_by_resource_token(
             &mut ctx,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
             },
@@ -14137,6 +14143,7 @@ mod tests {
         authenticate_by_resource_token(
             &mut resource_caller,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "sub": "alice", "tid": "tenant-1" }),
             },
@@ -16079,6 +16086,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: subject.to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": subject }),
         };
@@ -18209,6 +18217,30 @@ mod tests {
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/connect-required");
         assert!(vendor.requests().is_empty());
 
+        let oid_caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "00000000-0000-0000-0000-0000000000aa".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
+                "oid": "00000000-0000-0000-0000-0000000000aa" }),
+        }
+        .principal_hash(None)
+        .unwrap();
+        let mut ctx = external_grant_context(&mcp, VENDOR_HOP, Some(&oid_caller));
+        let response = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err()
+            .into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["error"]["data"]["hint"], "bjXra_R6O-9aJ7DUY5xpnA",
+            "an oid caller's hint is the contract's, from the hash with the claim's name"
+        );
+
         let owner = fixture_surface(&vendor, "owner", "mcp");
         store_grant(
             &state,
@@ -18963,6 +18995,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()
                 .unwrap_or("<none>")
@@ -19066,6 +19099,87 @@ mod tests {
         );
     }
 
+    /// A strategy that names a principal claim keys a caller's grants by that
+    /// claim: the same person reached through two applications whose `sub`
+    /// differs finds one grant, and a grant is not found by another claim's
+    /// value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_grants_are_found_by_the_principal_claim_the_strategy_names() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let named_by = |principal_claim: &str, sub: &str| {
+            let claims = json!({ "iss": "https://idp.example", "sub": sub, "oid": "person-1" });
+            AuthenticatedIdentity::JwtBearer {
+                subject: claims[principal_claim]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                principal_claim: principal_claim.to_string(),
+                claims,
+            }
+        };
+        let by_oid = named_by("oid", "sub-in-the-first-app");
+        state
+            .delegation_vault_store
+            .clone()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "person-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": by_oid.principal_hash(None).unwrap(),
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": "person-access", "refresh_token": "person-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity: AuthenticatedIdentity| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(by_oid)).await, "person-access");
+        assert_eq!(
+            injected_credential(&state, context(named_by("oid", "sub-in-the-second-app"))).await,
+            "person-access",
+            "the same oid from another application is the same caller"
+        );
+        for other in [named_by("sub", "sub-in-the-first-app"), named_by("sub", "sub-in-the-second-app")] {
+            assert!(
+                step_inject_credentials(&state, &mut context(other))
+                    .await
+                    .is_err(),
+                "a caller named by `sub` is not the caller named by `oid`"
+            );
+        }
+        let without_oid = AuthenticatedIdentity::JwtBearer {
+            subject: "<none>".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
+        };
+        assert!(
+            step_inject_credentials(&state, &mut context(without_oid))
+                .await
+                .is_err(),
+            "a token without the strategy's claim names no caller, so the Transit Point gives no credential"
+        );
+    }
+
     /// The `credential_delegation` lines that refuse a Transit Point call for
     /// want of a caller or an agent to key its delegated credentials by, or
     /// because it arrived over Fabric (with the Transit Point opted out, or
@@ -19091,6 +19205,7 @@ mod tests {
         };
         let mut no_agent = no_caller();
         no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
         });
@@ -20322,6 +20437,7 @@ mod tests {
         .principal_hash(Some("tenant-a"))
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
         };

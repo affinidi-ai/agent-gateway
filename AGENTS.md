@@ -104,6 +104,14 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
+see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
+
+The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
+claim other than `sub`; see _Credentials audit tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
+
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, and target authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and

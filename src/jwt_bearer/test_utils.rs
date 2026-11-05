@@ -33,6 +33,7 @@ pub fn static_okp_strategy(
 ) -> crate::jwt_bearer::models::JwtVerificationStrategy {
     use crate::jwt_bearer::{jwks::Jwk, models::JwksSource};
     crate::jwt_bearer::models::JwtVerificationStrategy {
+        principal_claim: None,
         id: id.to_string(),
         tenant_id: tenant_id.map(str::to_string),
         name: id.to_string(),
