@@ -324,6 +324,8 @@ fn named_group<'haystack>(
 }
 
 /// The (method, path) pairs `router` serves, with `ANY` for a path that takes every method.
+/// Fails the calling test when a registered path has an endpoint [`ROUTE_ENDPOINT`] cannot
+/// read, so a path is never left out of the walk unnoticed.
 fn registered_routes(router: &Router) -> BTreeSet<(String, String)> {
     let debug = format!("{router:?}");
     let (path_router, _) = debug
@@ -334,8 +336,11 @@ fn registered_routes(router: &Router) -> BTreeSet<(String, String)> {
         .map(|capture| (named_group(&capture, "id"), named_group(&capture, "path")))
         .collect();
     let mut routes = BTreeSet::new();
+    let mut read_ids = BTreeSet::new();
     for capture in ROUTE_ENDPOINT.captures_iter(path_router) {
-        let path = path_of[named_group(&capture, "id")].to_string();
+        let id = named_group(&capture, "id");
+        read_ids.insert(id);
+        let path = path_of[id].to_string();
         let Some(fallback) = capture.name("fallback") else {
             routes.insert((ANY_METHOD.to_string(), path));
             continue;
@@ -349,6 +354,12 @@ fn registered_routes(router: &Router) -> BTreeSet<(String, String)> {
             }
         }
     }
+    let unread: BTreeSet<&str> = path_of
+        .iter()
+        .filter(|(id, _)| !read_ids.contains(*id))
+        .map(|(_, path)| *path)
+        .collect();
+    assert!(unread.is_empty(), "registered paths whose endpoint the walk cannot read: {unread:?}");
     routes
 }
 
