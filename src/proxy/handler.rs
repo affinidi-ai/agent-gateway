@@ -922,10 +922,10 @@ pub(crate) fn record_target_auth_failure(
     record_target_auth_outcome(facts, transit_point, target_auth, outcome, error.oauth_error());
 }
 
-/// Records in the VP Audit Log that a request that would carry the Target credential of
-/// `target_auth` outside the Target's base path was refused. Nothing is forwarded, whatever the
-/// `fallback`.
-pub(crate) fn record_target_base_refusal(
+/// Records in the VP Audit Log that a request was refused over the Target credential of
+/// `target_auth` whatever its `fallback`: it would have carried the credential outside the
+/// Target's base path, or the credential cannot be sent as a header. Nothing is forwarded.
+pub(crate) fn record_target_auth_refusal(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     transit_point: Option<&str>,
     target_auth: &crate::config::TargetAuthConfig,
@@ -6944,7 +6944,7 @@ async fn proxy_handler_with_mcp_runtime(
                 channel = channel_name,
                 "Refusing a request outside the Target base path: it would carry the Target credential"
             );
-            record_target_base_refusal(&audit_facts, None, target_auth);
+            record_target_auth_refusal(&audit_facts, None, target_auth);
             return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
@@ -12909,7 +12909,7 @@ async fn handle_fabric_request(
                 channel = channel_name,
                 "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
             );
-            record_target_base_refusal(&fabric_send_facts, None, target_auth);
+            record_target_auth_refusal(&fabric_send_facts, None, target_auth);
             connection_guard
                 .decrement()
                 .await;
@@ -16370,7 +16370,7 @@ async fn handle_mcp_proxy_request(
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
             if let Some(target_auth) = state.surface.target_auth() {
-                record_target_base_refusal(&audit_facts, None, target_auth);
+                record_target_auth_refusal(&audit_facts, None, target_auth);
             }
             Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED))
         }

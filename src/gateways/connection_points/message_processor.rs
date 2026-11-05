@@ -5796,7 +5796,7 @@ async fn process_forward_request_in_request_scope(
             surface.agent_card_location_path(),
         ) {
             channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
-            crate::proxy::handler::record_target_base_refusal(&audit_facts, None, target_auth);
+            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
             return target_auth_failed_result(TARGET_AUTH_FAILED);
         }
         // Build a secrets store from the storage path passed via message context
@@ -8819,7 +8819,7 @@ async fn handle_mcp_proxy_forward(
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
             if let Some(target_auth) = surface.target_auth() {
-                crate::proxy::handler::record_target_base_refusal(&audit_facts, None, target_auth);
+                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
             }
             target_auth_failed_result(TARGET_AUTH_FAILED)
         }

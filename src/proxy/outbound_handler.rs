@@ -2815,10 +2815,19 @@ async fn transit_target_auth_header(
     )
     .await
     {
-        Ok(Some((name, value))) => Ok(Some((
-            axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| target_auth_unavailable(ctx))?,
-            axum::http::HeaderValue::from_str(&value).map_err(|_| target_auth_unavailable(ctx))?,
-        ))),
+        Ok(Some((name, value))) => {
+            match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(&value)) {
+                (Ok(name), Ok(value)) => Ok(Some((name, value))),
+                _ => {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                    Err(target_auth_unavailable(ctx))
+                }
+            }
+        }
         Ok(None) => Ok(None),
         Err(error) => {
             warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
@@ -5786,6 +5795,26 @@ async fn fabric_forward_headers(
                 })
             {
                 warn!(request_id = %ctx.request_id, header = %key, "Target authentication header is not a string Fabric can carry - refusing the request");
+                if let Some(target_auth) = ctx
+                    .virtual_channel
+                    .target_auth
+                    .as_ref()
+                    .filter(|target_auth| {
+                        target_auth
+                            .method
+                            .header_name()
+                            .is_some_and(|name| {
+                                key.as_str()
+                                    .eq_ignore_ascii_case(name)
+                            })
+                    })
+                {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                }
                 return Err(target_auth_unavailable(ctx));
             }
             continue;
@@ -5848,7 +5877,7 @@ async fn step_forward_request_fabric(
         && !crate::proxy::paths::appended_path_stays_below_base(&path)
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
-        crate::proxy::handler::record_target_base_refusal(
+        crate::proxy::handler::record_target_auth_refusal(
             &transit_audit_facts(ctx),
             Some(&ctx.virtual_channel.alias),
             target_auth,
@@ -6022,7 +6051,7 @@ async fn step_forward_request_http(
             .target_auth
             .as_ref()
         {
-            crate::proxy::handler::record_target_base_refusal(
+            crate::proxy::handler::record_target_auth_refusal(
                 &transit_audit_facts(ctx),
                 Some(&ctx.virtual_channel.alias),
                 target_auth,
@@ -20619,6 +20648,107 @@ mod tests {
                 })
                 .collect();
             assert_eq!(records, vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_credential_that_cannot_be_sent_as_a_header_is_recorded_as_rejected_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let records = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| -> Vec<_> {
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for fabric in [false, true] {
+            for fallback in ["reject", "passthrough"] {
+                let header_format = if fabric {
+                    "Key {value}\u{e9}"
+                } else {
+                    "Key {value}\n"
+                };
+                let mut ctx = credential_header_case(
+                    &state,
+                    Some("X-Vendor-Key"),
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/message/send",
+                )
+                .await;
+                if fabric {
+                    ctx.virtual_channel
+                        .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+                }
+                ctx.virtual_channel
+                    .target_auth = Some(
+                    serde_json::from_value(json!({
+                        "method": {"static_secret": {
+                            "secret_id": "target-key", "header_name": "X-Vendor-Key", "header_format": header_format}},
+                        "fallback": fallback
+                    }))
+                    .unwrap(),
+                );
+                let alias = ctx
+                    .virtual_channel
+                    .alias
+                    .clone();
+                let (refused, events) = crate::audit::producer::capture(async {
+                    if fabric {
+                        fabric_forward_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    } else {
+                        transit_request_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    }
+                })
+                .await;
+                assert!(refused, "{fallback} fabric={fabric}");
+                assert_eq!(
+                    records(&events),
+                    vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))],
+                    "{fallback} fabric={fabric}"
+                );
+            }
+
+            let mut ctx = credential_header_case(
+                &state,
+                Some("X-Vendor-Key"),
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/message/send",
+            )
+            .await;
+            if fabric {
+                ctx.virtual_channel
+                    .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            }
+            let (sent, events) = crate::audit::producer::capture(async {
+                if fabric {
+                    fabric_forward_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                } else {
+                    transit_request_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            assert!(sent, "fabric={fabric}");
+            assert_eq!(records(&events), vec![], "a credential that can be sent writes no record, fabric={fabric}");
         }
     }
 
