@@ -69,6 +69,19 @@ Feature: Target credential scope on the direct path
     Then the response status is 200
     And managed agent "bravo" did not receive header "x-target-api-key"
 
+  Scenario Outline: The agent card fetch drops a caller header named like a delegated credential header
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "passthrough"
+    And the surface requires delegated credentials from OAuth provider "maps"
+    And the surface injects delegated credentials from OAuth provider "maps" as header "x-vendor-token"
+    When the caller fetches the agent card with header "<header>" set to "caller-chosen-value"
+    Then the response status is 200
+    And managed agent "bravo" did not receive header "<header>"
+
+    Examples:
+      | header         |
+      | X-Vendor-Token |
+      | X_Vendor_Token |
+
   Scenario: A caller header with another name reaches the Target
     When the caller sends a request to the surface with header "X-Caller-Note" set to "caller-chosen-value"
     Then the response status is 200

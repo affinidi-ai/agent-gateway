@@ -101,13 +101,6 @@ fn upstream_mcp_session_id(headers: &HeaderMap) -> Result<Option<String>, &'stat
 
 /// Returns `true` if the header should be forwarded upstream, additionally
 /// stripping every source-auth credential header.
-fn should_forward_header(
-    name: &str,
-    source_auth_headers: &[&str],
-) -> bool {
-    should_forward_ap_request_header_with_mapping(name, source_auth_headers, None, None)
-}
-
 fn should_forward_ap_request_header_with_mapping(
     name: &str,
     source_auth_headers: &[&str],

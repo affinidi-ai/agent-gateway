@@ -704,17 +704,20 @@ impl TargetCardFetch<'_> {
             .surface
             .source_credential_headers();
         let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
-        let target_auth_header = super::target_auth_header_name(state.surface.target_auth());
+        let credential_headers = super::target_credential_header_names(&state.surface);
         for (key, value) in headers.iter() {
             let forward = match credential {
                 Some(_) => super::is_forwarded_on_credentialed_card_fetch(key.as_str()),
                 None if bound_target => {
                     crate::proxy::target_grant::forwards_caller_header(key.as_str(), &source_cred_headers, None)
                 }
-                None => {
-                    !super::is_credential_header(key.as_str(), target_auth_header.as_slice())
-                        && super::should_forward_header(key.as_str(), &source_cred_headers)
-                }
+                None => super::forwards_ap_caller_header(
+                    key.as_str(),
+                    &source_cred_headers,
+                    None,
+                    None,
+                    &credential_headers,
+                ),
             };
             if forward {
                 req = req.header(key.as_str(), value.as_bytes());
@@ -875,18 +878,17 @@ fn record_agent_card_gateway_fault(
 }
 
 /// The caller's headers a card fetch over Fabric carries: those the Access Point forwards,
-/// except one named like the Target credential header, with the first Fabric crossing.
+/// except one named like a Target or delegated credential header, with the first Fabric crossing.
 fn fabric_card_fetch_headers(
     surface: &crate::config::agent_surface::AgentSurface,
     headers: &HeaderMap,
 ) -> HashMap<String, String> {
     let source_cred_headers = surface.source_credential_headers();
-    let target_auth_header = super::target_auth_header_name(surface.target_auth());
+    let credential_headers = super::target_credential_header_names(surface);
     let mut forwarded_headers = headers
         .iter()
         .filter(|(key, _)| {
-            !super::is_credential_header(key.as_str(), target_auth_header.as_slice())
-                && super::should_forward_header(key.as_str(), &source_cred_headers)
+            super::forwards_ap_caller_header(key.as_str(), &source_cred_headers, None, None, &credential_headers)
         })
         .filter_map(|(key, value)| {
             value
@@ -929,6 +931,50 @@ mod tests {
                 .map(String::as_str),
             Some("application/json")
         );
+    }
+
+    #[test]
+    fn a_card_fetch_over_fabric_drops_a_caller_header_named_like_a_delegated_credential_header() {
+        let rows = [
+            (
+                serde_json::json!({"type": "custom_header", "name": "X-Vendor-Token", "format": "{value}"}),
+                "x-vendor-token",
+            ),
+            (
+                serde_json::json!({"type": "custom_header", "name": "X-Vendor-Token", "format": "{value}"}),
+                "x_vendor_token",
+            ),
+            (serde_json::json!({"type": "bearer_header"}), "authorization"),
+        ];
+        for (inject_as, caller_header) in rows {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+                "surface_id": "fabric-card", "name": "Fabric card",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": "fabric://peer/remote"},
+                "outbound_credentials": [{"credential_provider_id": "maps", "required_for": "all",
+                    "consent_mode": "on_demand", "inject_as": inject_as}]
+            }))
+            .unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in [(caller_header, "caller"), ("accept", "application/json")] {
+                headers.insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
+            }
+
+            let forwarded = super::fabric_card_fetch_headers(&surface, &headers);
+
+            assert!(
+                !forwarded
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(caller_header)),
+                "{caller_header}: {forwarded:?}"
+            );
+            assert_eq!(
+                forwarded
+                    .get("accept")
+                    .map(String::as_str),
+                Some("application/json")
+            );
+        }
     }
 
     use super::*;
