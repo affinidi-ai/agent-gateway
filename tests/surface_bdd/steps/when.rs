@@ -400,6 +400,15 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
+    // A credentialed MCP proxy tool call vets its REST backend like any stored
+    // backend, which refuses loopback unless the egress allow-list names it.
+    if world
+        .surface_config
+        .mcp_proxy_target
+        .is_some()
+    {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+    }
     // The A2A proxy dial refuses loopback targets unless the gateway's
     // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
     if world

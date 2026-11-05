@@ -1758,13 +1758,14 @@ fn tool_call_failure(error: &rmcp_openapi::ToolCallError) -> String {
     }
 }
 
-/// The egress allow-list for an owned MCP Proxy's REST backend: the BDD
-/// allow-list in production, and the proxy's own loopback fixture in unit
-/// tests, whose refusal without it is covered by `modern_rest` and `egress`.
+/// The egress allow-list for an MCP Proxy's REST backend: the BDD allow-list in
+/// production, and in unit tests the proxy's own fixture when its host is a
+/// loopback IP literal, so a host name that resolves to loopback is still refused.
 fn rest_egress_allowlist(proxy: &McpProxy) -> Option<String> {
     if cfg!(test) {
         return Url::parse(&proxy.base_url)
             .ok()
+            .filter(|url| matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))))
             .map(|url| {
                 url.origin()
                     .ascii_serialization()
@@ -2584,11 +2585,12 @@ fn tool_call_leaves_base(
 
 /// What a credentialed legacy tool call sends through the gateway's REST client, worked out once
 /// per call rather than per retry: the [`legacy_base_directory`] of the proxy's `base_url`, the tool with its
-/// output schema, and the request content type.
+/// output schema, the request content type, and the egress allow-list its backend is vetted with.
 struct StoredToolCall {
     directory: Url,
     metadata: rmcp_openapi::ToolMetadata,
     content_type: String,
+    egress_allowlist: Option<String>,
 }
 
 impl StoredToolCall {
@@ -2609,6 +2611,7 @@ impl StoredToolCall {
             directory,
             metadata,
             content_type,
+            egress_allowlist: rest_egress_allowlist(proxy),
         })
     }
 }
@@ -2617,7 +2620,7 @@ impl StoredToolCall {
 /// sent by the gateway's REST client, which never follows a redirect, since the
 /// `rmcp_openapi` client follows redirects and would carry the credential to the
 /// redirect target. That client resolves the tool against the [`legacy_base_directory`]
-/// of the base URL and reaches the same backends as `rmcp_openapi` does, and builds the
+/// of the base URL, vets and pins each call as a 2026-07-28 tool call is, and builds the
 /// same `CallToolResult`. It drops `sent_token`, the issued service token behind that
 /// credential, when the backend refuses it as invalid.
 async fn call_legacy_tool(
@@ -2633,13 +2636,16 @@ async fn call_legacy_tool(
             .await
             .map_err(|error| tool_call_failure(&error));
     };
-    super::modern_rest::call_stored_backend(
+    super::modern_rest::call(
         stored.directory.as_str(),
         &stored.metadata,
         arguments,
         credential_headers,
         limits,
         &stored.content_type,
+        stored
+            .egress_allowlist
+            .as_deref(),
         sent_token,
     )
     .await
@@ -3288,6 +3294,35 @@ mod tests {
             *received.lock().unwrap(),
             vec![("/base/items/1".to_string(), Some("gateway-value".to_string())), ("/open".to_string(), None)]
         );
+    }
+
+    /// A tool call that carries the Target credential is vetted and pinned at call time: a
+    /// backend host that resolves to a refused address, as a rebinding host would, gets no
+    /// request and no credential. Without the credential the call still reaches it.
+    #[tokio::test]
+    async fn a_credentialed_tool_call_is_refused_when_its_backend_resolves_to_a_refused_address() {
+        let (mut proxy, received) = recording_items_proxy("/base/").await;
+        proxy.base_url = proxy
+            .base_url
+            .replacen("127.0.0.1", "localhost", 1);
+
+        assert_eq!(
+            call_get_item(&proxy, "1", true)
+                .await
+                .expect_err("a backend resolving to loopback is refused"),
+            super::McpProxyCallError::Failed("Tool execution failed: REST tool target is not permitted".to_string())
+        );
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        call_get_item(&proxy, "1", false)
+            .await
+            .expect("an uncredentialed call is forwarded");
+        assert_eq!(*received.lock().unwrap(), vec![("/base/items/1".to_string(), None)]);
     }
 
     /// A path parameter value counts as leaving the base when it names another path parameter's

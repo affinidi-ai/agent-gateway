@@ -488,8 +488,9 @@ disabled** — so a host cannot rebind to an internal/metadata IP between vettin
 and connect, and an upstream 3xx is returned to the caller rather than followed.
 A2A-proxy and legacy MCP `proxy://` targets are **not** DNS-resolved/pinned here
 (vetted at dial time / MCP-proxy create time). A modern (`2026-07-28`) owned MCP
-Proxy `tools/call` dials its REST backend through a pinned, redirect-free client
-too, under the stricter save-time policy (see _Other pinned egress sinks_). A
+Proxy `tools/call`, and a legacy one that carries the Target credential, dials its
+REST backend through a pinned, redirect-free client too, under the stricter
+save-time policy (see _Other pinned egress sinks_). A
 blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
@@ -543,9 +544,13 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - `egress::pinned_configured_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, allows RFC 1918) pins the
   modern owned **MCP Proxy `tools/call`** to its REST backend
-  (`src/mcp_proxies/modern_rest.rs`). It applies at call time the same policy
-  `validate_resolved_url` applies to `base_url` when the proxy is saved, so a
-  backend host that rebinds to loopback afterwards is refused. Under
+  (`src/mcp_proxies/modern_rest.rs`), and a legacy MCP Proxy `tools/call` that
+  carries the Target credential, direct or over Fabric, the same way. It applies
+  at call time the same policy `validate_resolved_url` applies to `base_url`
+  when the proxy is saved, so a backend host that rebinds to loopback afterwards
+  is refused before any request, and the credential is never sent to it. A
+  legacy call without the credential still runs on `rmcp-openapi`'s client and
+  is not pinned. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
@@ -736,22 +741,22 @@ documented here so operators can assess exposure.
   resolver that honours `HostPolicy` or pins the checked address, injected through
   the SDK. See [Agent name resolution](#agent-name-resolution).
 
-- **The legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
+- **The uncredentialed legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);
   discovery through it reads tool names from the loaded OpenAPI spec and does not
-  dial, but a `tools/call` dials `base_url` through rmcp-openapi's own internally
-  built HTTP client, or, when it carries the Target credential, through the
-  gateway's REST client (`modern_rest::call_stored_backend`, which follows no
-  redirects and applies the `mcp_http` limits). Either client re-resolves at
-  connect (`base_url` is management-gated and checked on create/update with
+  dial, but a `tools/call` without the Target credential dials `base_url` through
+  rmcp-openapi's own internally built HTTP client, which re-resolves at connect
+  (`base_url` is management-gated and checked on create/update with
   `validate_resolved_url`, which blocks cloud metadata, loopback and unspecified
-  addresses but not RFC 1918). Neither client is pinned, so this path retains a
-  DNS-rebinding window between validation and connect. Modern `tools/call` uses the gateway's own pinned
-  client instead (`egress::pinned_configured_client`, see _Other pinned egress
-  sinks_), which applies the save-time policy at call time: a host that rebinds
-  to loopback, an unspecified address or cloud metadata after validation is
-  refused. It does not refuse a rebind to an RFC 1918 address, because that
-  policy allows RFC 1918.
+  addresses but not RFC 1918), so that call retains a DNS-rebinding window between
+  validation and connect. A legacy `tools/call` that carries the Target credential,
+  and every modern `tools/call`, uses the gateway's own REST client
+  (`modern_rest::call`) pinned with `egress::pinned_configured_client` (see _Other
+  pinned egress sinks_), which applies the save-time policy at call time: a host
+  that rebinds to loopback, an unspecified address or cloud metadata after
+  validation is refused before the request, so the credential never reaches it.
+  It does not refuse a rebind to an RFC 1918 address, because that policy allows
+  RFC 1918.
 - **The process-wide Legacy-SSE session cache** (keyed by `base_url`) can reuse a
   non-discovery session's client for a discovery GET. The POST origin-lock closes
   the metadata vector regardless, but the reused GET leg is not pinned.

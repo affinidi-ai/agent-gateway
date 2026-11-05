@@ -847,10 +847,12 @@ returns it as a success. The result text of a response that is not JSON leaves o
 headers and the request body, a response body other than an image that is not UTF-8 text fails
 the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
 tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
-rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). It reaches the same backends
-as `rmcp-openapi`'s client: the proxy's `base_url` is vetted when the proxy is saved and not again
-per call, while the 2026-07-28 path pins each call to the vetted address. A tool call without the
-credential still runs on `rmcp-openapi`'s client and is unchanged.
+rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
+vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud
+metadata refused, private ranges allowed) and pins the connection to the vetted address, so a host
+that later resolves to a refused address fails the call with "Tool execution failed: REST tool
+target is not permitted" before any request, and the credential is not sent. A tool call without
+the credential still runs on `rmcp-openapi`'s client and is unchanged.
 
 ## Upstream Response Bounds
 

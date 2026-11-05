@@ -600,16 +600,6 @@ async fn add_body(
     Ok(request)
 }
 
-/// How a REST tool call reaches its backend.
-enum RestEgress<'a> {
-    /// Vet the URL with the configured-backend egress policy and pin the client to
-    /// the address it resolves to; the BDD allow-list can admit a loopback fixture.
-    Pinned(Option<&'a str>),
-    /// Reach the stored base URL the way the legacy MCP proxy client does: the URL
-    /// was vetted when the proxy was saved and is not vetted again per call.
-    Stored,
-}
-
 pub(super) async fn call(
     base_url: &str,
     metadata: &ToolMetadata,
@@ -618,59 +608,6 @@ pub(super) async fn call(
     limits: &McpHttpConfig,
     content_type: &str,
     egress_allowlist: Option<&str>,
-    sent_token: Option<&SentServiceToken<'_>>,
-) -> Result<CallToolResult, RestError> {
-    call_with(
-        base_url,
-        metadata,
-        arguments,
-        target_headers,
-        limits,
-        content_type,
-        RestEgress::Pinned(egress_allowlist),
-        sent_token,
-    )
-    .await
-}
-
-/// The pooled client for stored MCP proxy backends: redirects off, each request
-/// carrying its own timeout.
-fn stored_backend_client() -> Result<reqwest::Client, RestError> {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client.clone());
-    }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| RestError::Unavailable)?;
-    Ok(CLIENT
-        .get_or_init(|| client)
-        .clone())
-}
-
-/// [`call`] for a legacy MCP proxy tool call: the backends it reaches are those the
-/// legacy `rmcp_openapi` client reaches, and redirects stay off.
-pub(super) async fn call_stored_backend(
-    base_url: &str,
-    metadata: &ToolMetadata,
-    arguments: &Value,
-    target_headers: &HeaderMap,
-    limits: &McpHttpConfig,
-    content_type: &str,
-    sent_token: Option<&SentServiceToken<'_>>,
-) -> Result<CallToolResult, RestError> {
-    call_with(base_url, metadata, arguments, target_headers, limits, content_type, RestEgress::Stored, sent_token).await
-}
-
-async fn call_with(
-    base_url: &str,
-    metadata: &ToolMetadata,
-    arguments: &Value,
-    target_headers: &HeaderMap,
-    limits: &McpHttpConfig,
-    content_type: &str,
-    egress: RestEgress<'_>,
     sent_token: Option<&SentServiceToken<'_>>,
 ) -> Result<CallToolResult, RestError> {
     if serde_json::to_vec(arguments)
@@ -717,26 +654,19 @@ async fn call_with(
             )
             .max(1),
         );
-    // A pinned call resolves the target once, vets it with the save-time policy
-    // and pins the client to that address, so DNS cannot rebind it to loopback
-    // between the save-time check and this call. Redirects stay off either way.
-    let client = match egress {
-        RestEgress::Pinned(egress_allowlist) => {
-            let raw_url = url.to_string();
-            let egress_allowlist = egress_allowlist.map(str::to_string);
-            tokio::task::spawn_blocking(move || {
-                crate::egress::pinned_configured_client(
-                    &raw_url,
-                    Duration::from_secs(timeout),
-                    egress_allowlist.as_deref(),
-                )
-            })
-            .await
-            .map_err(|_| RestError::Unavailable)?
-            .map_err(|_| RestError::Target)?
-            .0
-        }
-        RestEgress::Stored => stored_backend_client()?,
+    // Resolve the target once, vet it with the save-time policy and pin the client
+    // to that address, so DNS cannot rebind it to loopback between the save-time
+    // check and this call. Redirects stay off.
+    let client = {
+        let raw_url = url.to_string();
+        let egress_allowlist = egress_allowlist.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            crate::egress::pinned_configured_client(&raw_url, Duration::from_secs(timeout), egress_allowlist.as_deref())
+        })
+        .await
+        .map_err(|_| RestError::Unavailable)?
+        .map_err(|_| RestError::Target)?
+        .0
     };
     let headers = request_headers(&parameters, target_headers)?;
     if headers
