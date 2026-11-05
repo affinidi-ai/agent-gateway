@@ -588,12 +588,16 @@ neither lists them nor acts on them.
   `limits.json`, and peers toward `connections.gateways`; both count toward the `connections`
   total. Connecting and turning a peer into a payment gateway are refused with `403` at the limit.
 - At startup every peer that an `agent_pay` policy of a surface it may serve names (a surface of
-  the peer's tenant, or any surface for an appliance-wide peer) becomes a payment gateway, so
-  surfaces that already charge keep charging. It leaves a peer that a surface routes to over
-  `fabric://` (which `payment-role` also refuses), or whose exposure is not already `none` (so it
-  never cuts a peer off from local surfaces), a peer and logs a warning naming it; those surfaces keep charging through it but cannot be saved until the routes are
-  pointed elsewhere, its exposure is `none` and it is turned into a payment gateway. A migrated
-  gateway answers `404` on `/v1/gateways/*`, and there is no way back to a peer.
+  the peer's tenant, or any surface for an appliance-wide peer) becomes a payment gateway with
+  exposure `none`, as `payment-role` makes one, so surfaces that already charge keep charging and
+  agent-pay no longer reaches local surfaces. A migrated gateway answers `404` on
+  `/v1/gateways/*`, and there is no way back to a peer.
+- The migration leaves a peer that a surface routes to over `fabric://` a peer, since
+  `payment-role` refuses it too, and logs a warning naming it. The surfaces charging through it
+  answer every chargeable request with `503 payment_unavailable` until it is a payment gateway.
+  Startup turns `agent_pay_delegation` on (unless an operator set it) so that it can be: point
+  those `fabric://` routes at another gateway, then use it as a payment gateway (Connections ›
+  Gateways › **Use as payment gateway**, or `POST /v1/gateways/{id}/payment-role`).
 
 ### Taking the payment
 

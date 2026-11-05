@@ -309,7 +309,14 @@ fn register_resource_limit_counters(
 /// Keeps the agent-pay UI visible on an appliance that already has a payment
 /// gateway, so an upgrade never hides one that is taking payments. An operator's
 /// explicit setting, on or off, is kept.
-async fn enable_agent_pay_ui_in_use(store: &crate::gateways::FileSystemGatewayStore) {
+/// Turns `agent_pay_delegation` on, unless an operator set it, when a payment
+/// gateway exists or `peer_awaits_payment_role`: a peer that `agent_pay`
+/// policies name but the migration left a peer, which only the flag-gated
+/// payment-role action can fix.
+async fn enable_agent_pay_ui_in_use(
+    store: &crate::gateways::FileSystemGatewayStore,
+    peer_awaits_payment_role: bool,
+) {
     use crate::gateways::GatewayStore;
 
     let has_payment_gateway = match store.list_all().await {
@@ -324,14 +331,14 @@ async fn enable_agent_pay_ui_in_use(store: &crate::gateways::FileSystemGatewaySt
     let Some(settings) = crate::storage::settings_store::global_settings_store() else {
         return;
     };
-    if !has_payment_gateway {
+    if !has_payment_gateway && !peer_awaits_payment_role {
         return;
     }
     match settings
         .enable_flag_if_unset(crate::gateways::agent_pay_flag::FLAG_AGENT_PAY)
         .await
     {
-        Ok(true) => info!("Turned on agent_pay_delegation: this appliance already has a payment gateway"),
+        Ok(true) => info!("Turned on agent_pay_delegation: this appliance already takes payments through agent-pay"),
         Ok(false) => {}
         Err(e) => warn!("Failed to turn on agent_pay_delegation: {}", e),
     }
@@ -1641,15 +1648,25 @@ pub async fn run_axum_proxy(
                         },
                         None => Vec::new(),
                     };
-                    match store
+                    let migration = match store
                         .migrate_payment_roles(&surfaces)
                         .await
                     {
-                        Ok(0) => {}
-                        Ok(n) => info!("Migrated {n} gateway(s) that take payments to payment gateways"),
-                        Err(e) => warn!("Failed to migrate payment gateways: {}", e),
-                    }
-                    enable_agent_pay_ui_in_use(&store).await;
+                        Ok(migration) => {
+                            if migration.migrated > 0 {
+                                info!(
+                                    "Migrated {} gateway(s) that take payments to payment gateways",
+                                    migration.migrated
+                                );
+                            }
+                            migration
+                        }
+                        Err(e) => {
+                            warn!("Failed to migrate payment gateways: {}", e);
+                            Default::default()
+                        }
+                    };
+                    enable_agent_pay_ui_in_use(&store, migration.skipped > 0).await;
                     info!("Gateway store initialized");
                     Some(Arc::new(store))
                 }

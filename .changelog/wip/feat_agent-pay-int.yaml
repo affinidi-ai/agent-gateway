@@ -304,12 +304,14 @@ changes:
     - timestamp: '2026-11-04T00:00:00Z'
       title: Turn the peers agent_pay policies name into payment gateways at startup
       description: >-
-        At startup each peer that an `agent_pay` policy of a surface it may serve names, whose
-        exposure is already `none` and that no surface routes to over `fabric://`, becomes a
-        payment gateway: it answers `404` on `/v1/gateways/*` and is managed under
-        `/v1/payment-gateways/*` with `payment_gateways.*`, and it cannot be turned back into a
-        peer. Any other such peer is left a peer with a warning naming it, and its surfaces cannot
-        be saved until it is made a payment gateway.
+        At startup each peer that an `agent_pay` policy of a surface it may serve names becomes a
+        payment gateway with exposure `none`, as Use as payment gateway makes one, so it no longer
+        reaches local surfaces: it answers `404` on `/v1/gateways/*`, is managed under
+        `/v1/payment-gateways/*` with `payment_gateways.*`, and cannot be turned back into a peer.
+        A peer that a surface routes to over `fabric://` is left a peer with a warning, and the
+        surfaces charging through it answer `503 payment_unavailable` until it is made a payment
+        gateway; startup turns `agent_pay_delegation` on so that it can be, once those routes point
+        elsewhere.
     - timestamp: '2026-10-20T00:00:00Z'
       title: Replace input.payment.verified with the chargeable-request context
       description: >-

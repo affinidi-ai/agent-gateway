@@ -683,6 +683,27 @@ async fn an_unreachable_agent_pay_fails_closed_and_opens_the_breaker() {
     assert_eq!(forwarded(&harness), 0);
 }
 
+/// A peer the startup migration leaves a peer, because a surface routes to it
+/// over `fabric://`, is not a payment gateway, so the surfaces charging through
+/// it answer `503 payment_unavailable` until it is made one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_charging_through_a_peer_that_is_not_a_payment_gateway_answers_503() {
+    let gate = taking_gate().not_a_payment_gateway();
+    install_test_transport("e2e-skipped-peer", gate.clone());
+    let harness = start("e2e-skipped-peer").await;
+
+    let (status, _, body) =
+        post(&harness, &tool_call("paid_report", json!({})), &[("PAYMENT-SIGNATURE", "peer-proof")]).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["data"]["error"], "payment_unavailable", "{body}");
+    assert_eq!(gate.calls(), 0, "a peer is never asked to charge");
+    assert_eq!(forwarded(&harness), 0);
+
+    let (status, _, body) = post(&harness, &tool_call("free_tool", json!({})), &[]).await;
+    assert_eq!(status, 200, "a free call still goes through: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_local_payment_surface_answers_503() {
     let mut surface = helpers::build_minimal_mcp_surface();

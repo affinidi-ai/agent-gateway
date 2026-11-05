@@ -409,11 +409,10 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   description={
                     <>
                       Shows the agent-pay UI: the <code>Payment Gateways</code> tab under{' '}
-                      <code>Connections</code>, the <code>Payments</code> page, the{' '}
-                      <code>Payment</code> element and payment templates in the surface builder, and{' '}
-                      <code>Use as payment gateway</code>. While off, no payment gateway can be
-                      added; surfaces that already take payments keep their Payment element and keep
-                      working.
+                      <code>Connections</code>, the <code>Payment</code> element and payment
+                      templates in the surface builder, and <code>Use as payment gateway</code>.
+                      While off, no payment gateway can be added; surfaces that already take
+                      payments keep their Payment element and keep working.
                     </>
                   }
                   onChangeMessages={{

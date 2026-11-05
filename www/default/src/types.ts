@@ -771,8 +771,8 @@ export interface FeatureFlags {
    *  reachable directly even when hidden. */
   metrics?: boolean;
   /** Show the agent-pay UI: Connections › Payment Gateways and its pages, the
-   *  Payments page, the Payment element in the surface builder palette, payment templates and Use as
-   *  payment gateway. Default off (treated as `false` when undefined). A surface
+   *  Payment element in the surface builder palette, payment templates and Use as
+   *  payment gateway; the Payments page needs only `payments.view`. Default off (treated as `false` when undefined). A surface
    *  that already has a Payment element keeps it, editable, either way; the
    *  gateway also refuses to add a payment gateway while it is off. */
   agent_pay_delegation?: boolean;
