@@ -1955,7 +1955,15 @@ mod jwt_provider_tests {
                 .await
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while futures::FutureExt::now_or_never(crate::identity::handlers::surface_grants::hold_provider_bindings())
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retype queues for the exclusive bindings lock");
         assert!(!retype.is_finished(), "the retype waits for the surface write that holds the lock");
         drop(writing);
         let (status, response) = retype.await.unwrap();
