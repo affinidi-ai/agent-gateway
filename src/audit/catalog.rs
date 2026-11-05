@@ -192,6 +192,18 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A change to a policy, or to where a policy applies, was refused",
         Policies,
     ),
+    event(
+        "target_auth_changed",
+        "Target Authentication Changed",
+        "The credential a surface sends to its Target or a Transit Point was added, changed or removed",
+        Auth,
+    ),
+    event(
+        "secret_force_deleted",
+        "Secret Force-Deleted",
+        "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
+        Auth,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -270,6 +282,8 @@ mod tests {
         assert_eq!(group_of("trace_terminated"), Some(AuditEventGroup::Trace));
         assert_eq!(group_of("payment"), Some(AuditEventGroup::Payments));
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("target_auth_changed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("secret_force_deleted"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
         for request in ["request_rejected", "rate_limited"] {

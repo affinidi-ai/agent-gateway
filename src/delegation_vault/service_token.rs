@@ -8,7 +8,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
-use super::{DelegationToken, OAuthTokenResponse, VaultLookupResult, oauth, storage::DelegationVaultStorage};
+use super::storage::{DelegationVaultStorage, access_token_fingerprint};
+use super::{DelegationToken, OAuthTokenResponse, VaultLookupResult, oauth};
 use crate::config::credential_policy::RuleMode;
 use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
 use crate::mcp::continuations::delegation::provider_digest;
@@ -45,6 +46,14 @@ pub struct IssuedToken {
     /// Whether the provider's token endpoint breaks the https rule and is let through only
     /// because the rule is in warn mode.
     pub insecure_endpoint: bool,
+    /// The key whose lock guards this token's renewal.
+    slot: GrantSlotKey,
+    /// When the provider issued this token value. A renewal keeps the vault row and its id, so
+    /// this, not the row's `created_at`, dates the value.
+    issued_at: DateTime<Utc>,
+    /// SHA-256 of the token value, so [`invalidate`] drops the row only while it still holds
+    /// the token that was sent.
+    fingerprint: [u8; 32],
 }
 
 /// How an issued token was obtained.
@@ -80,14 +89,146 @@ impl ServiceToken {
         insecure_endpoint: bool,
     ) -> Self {
         Self {
-            value: zeroize::Zeroizing::new(token.access_token),
             issued: Some(IssuedToken {
+                fingerprint: access_token_fingerprint(&token.access_token),
+                issued_at: token.consent_granted_at,
+                slot: (token.agent_did, token.user_identity_hash, token.credential_provider_id),
                 id: token.id,
                 freshness,
                 insecure_endpoint,
             }),
+            value: zeroize::Zeroizing::new(token.access_token),
         }
     }
+}
+
+/// A token younger than this many seconds is never dropped after a Target refuses it. A
+/// Target that refuses a token just issued refuses every token, and dropping each one would
+/// send the provider a token request per call.
+pub const MIN_INVALIDATION_AGE_SECS: i64 = 30;
+
+/// What [`invalidate`] did with a refused token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invalidation {
+    /// The vault row held the refused token and was deleted.
+    Dropped,
+    /// The token is younger than [`MIN_INVALIDATION_AGE_SECS`] and was kept.
+    TooRecent,
+    /// The row is gone, holds another token, or is being renewed right now: nothing to drop.
+    Replaced,
+}
+
+/// Forgets an issued token its Target refused, so the next request for its key asks the
+/// provider for a new token. The vault row is deleted only while it still holds the token that
+/// was sent, no renewal of it is running, and the token is at least
+/// [`MIN_INVALIDATION_AGE_SECS`] old at `now`. The deletion is no revocation: pending consents
+/// and open subscriptions are kept. The key's retry backoff is kept, so a failing token
+/// endpoint is still held back. Nothing is retried here.
+pub async fn invalidate(
+    vault: &dyn DelegationVaultStorage,
+    issued: &IssuedToken,
+    now: DateTime<Utc>,
+) -> Result<Invalidation, ServiceTokenError> {
+    if now - issued.issued_at < chrono::Duration::seconds(MIN_INVALIDATION_AGE_SECS) {
+        return Ok(Invalidation::TooRecent);
+    }
+    let Ok(_renewal) = grant_slot(&issued.slot.0, &issued.slot.1, &issued.slot.2).try_lock_owned() else {
+        return Ok(Invalidation::Replaced);
+    };
+    let dropped = vault
+        .delete_token_holding(&issued.id, &issued.fingerprint)
+        .await
+        .map_err(|_| ServiceTokenError::StoreUnavailable)?;
+    Ok(if dropped {
+        Invalidation::Dropped
+    } else {
+        Invalidation::Replaced
+    })
+}
+
+/// Whether a Target's answer refuses the token it was sent as invalid: a 401 with a Bearer
+/// challenge in a `WWW-Authenticate` header whose `error` is `invalid_token` (RFC 6750
+/// section 3.1), quoted or not. A 401 without it, or a 403, says nothing about the token.
+pub fn refuses_token_as_invalid<'a>(
+    status: u16,
+    challenges: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    status == 401
+        && challenges
+            .into_iter()
+            .any(|header| bearer_error(header).as_deref() == Some("invalid_token"))
+}
+
+/// The `error` auth-param of the Bearer challenge in one `WWW-Authenticate` value, which may
+/// hold several challenges (RFC 9110 section 11.6.1).
+fn bearer_error(header: &str) -> Option<String> {
+    let mut in_bearer = false;
+    for element in split_outside_quotes(header) {
+        let element = element.trim();
+        let (first, rest) = element
+            .split_once(|c: char| c.is_ascii_whitespace())
+            .map_or((element, ""), |(first, rest)| (first, rest.trim_start()));
+        let param = if first.contains('=') || rest.starts_with('=') {
+            Some(element)
+        } else if first.is_empty() {
+            None
+        } else {
+            in_bearer = first.eq_ignore_ascii_case("bearer");
+            (!rest.is_empty()).then_some(rest)
+        };
+        let Some((name, value)) = param.and_then(|param| param.split_once('=')) else {
+            continue;
+        };
+        if in_bearer
+            && name
+                .trim()
+                .eq_ignore_ascii_case("error")
+        {
+            return Some(unquote(value.trim()));
+        }
+    }
+    None
+}
+
+/// `value` split at each comma outside a quoted string.
+fn split_outside_quotes(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// A token, or a quoted string with its quotes and backslash escapes removed.
+fn unquote(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped || c != '\\' {
+            unquoted.push(c);
+            escaped = false;
+        } else {
+            escaped = true;
+        }
+    }
+    unquoted
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -98,6 +239,9 @@ pub enum ServiceTokenError {
     SecretUnavailable,
     #[error("credential provider token request failed")]
     TokenRequestFailed,
+    /// The token endpoint answered with an OAuth error, whose `error` code this keeps.
+    #[error("credential provider token request rejected: {0}")]
+    TokenRequestRejected(oauth::OAuthErrorCode),
     #[error("credential provider token endpoint refused by egress policy")]
     TokenEndpointRefused,
     #[error("credential provider token endpoint is not https")]
@@ -118,7 +262,15 @@ impl ServiceTokenError {
     /// failures (a missing secret, an unusable signing key or provider setting, a refused
     /// endpoint, a store error) never do either.
     fn backs_off(self) -> bool {
-        matches!(self, Self::TokenRequestFailed | Self::ScopeMismatch)
+        matches!(self, Self::TokenRequestFailed | Self::TokenRequestRejected(_) | Self::ScopeMismatch)
+    }
+
+    /// The token endpoint's OAuth `error` code, when it answered with one.
+    pub fn oauth_error(&self) -> Option<oauth::OAuthErrorCode> {
+        match self {
+            Self::TokenRequestRejected(code) => Some(*code),
+            _ => None,
+        }
     }
 }
 
@@ -315,6 +467,8 @@ async fn token_grant(
             .is_some()
         {
             ServiceTokenError::ProviderMisconfigured
+        } else if let Some(rejected) = error.downcast_ref::<oauth::TokenRequestRejected>() {
+            ServiceTokenError::TokenRequestRejected(rejected.code)
         } else if let Some(error) = error.downcast_ref::<oauth::ProviderSecretError>() {
             match error {
                 oauth::ProviderSecretError::NotFound | oauth::ProviderSecretError::OutsideTenant => {
@@ -1198,6 +1352,284 @@ mod tests {
             ("renewed".into(), Freshness::Fresh)
         );
         assert_eq!(fixture.requests().len(), 2);
+    }
+
+    #[test]
+    fn a_401_bearer_challenge_with_invalid_token_refuses_the_token() {
+        for challenge in [
+            r#"Bearer error="invalid_token""#,
+            "Bearer error=invalid_token",
+            r#"Bearer realm="api", error="invalid_token", error_description="The token expired""#,
+            r#"bearer ERROR = "invalid_token""#,
+            r#"Basic realm="a, b", Bearer error="invalid_token""#,
+            r#"Bearer realm="api, error=\"x\"", error="invalid_token""#,
+            r#"Bearer error="invalid_\token""#,
+        ] {
+            assert!(refuses_token_as_invalid(401, [challenge]), "{challenge}");
+        }
+        assert!(refuses_token_as_invalid(401, ["Basic realm=\"a\"", "Bearer error=\"invalid_token\""]));
+    }
+
+    #[test]
+    fn any_other_answer_says_nothing_about_the_token() {
+        for challenge in [
+            r#"Bearer error="insufficient_scope""#,
+            r#"Bearer realm="api""#,
+            "Bearer",
+            r#"Basic error="invalid_token""#,
+            r#"Bearer error_description="error=\"invalid_token\"""#,
+            r#"Bearer realm="error=invalid_token""#,
+            r#"Bearer error="invalid_token_extra""#,
+            r#"DPoP error="invalid_token", Bearer realm="api""#,
+            "",
+        ] {
+            assert!(!refuses_token_as_invalid(401, [challenge]), "{challenge}");
+        }
+        assert!(!refuses_token_as_invalid(401, std::iter::empty::<&str>()));
+        for status in [200, 400, 403, 407, 500] {
+            assert!(!refuses_token_as_invalid(status, [r#"Bearer error="invalid_token""#]), "{status}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_token_is_dropped_only_once_it_is_old_enough() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let mut token = fixture
+            .acquire(&provider, &[], Utc::now())
+            .await
+            .unwrap();
+        let refused = token.issued.take().unwrap();
+        let issued_at = fixture
+            .only_stored()
+            .await
+            .consent_granted_at;
+        let staged = stage_a_consent(&fixture.vault).await;
+        let epoch = fixture
+            .vault
+            .access_revision()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            invalidate(&fixture.vault, &refused, seconds(issued_at, MIN_INVALIDATION_AGE_SECS - 1))
+                .await
+                .unwrap(),
+            Invalidation::TooRecent
+        );
+        assert_eq!(fixture.stored().await.len(), 1, "a token issued less than 30 seconds ago is kept");
+
+        assert_eq!(
+            invalidate(&fixture.vault, &refused, seconds(issued_at, MIN_INVALIDATION_AGE_SECS))
+                .await
+                .unwrap(),
+            Invalidation::Dropped
+        );
+        assert!(
+            fixture
+                .stored()
+                .await
+                .is_empty(),
+            "the refused token's vault row is deleted"
+        );
+        assert_eq!(
+            fixture
+                .vault
+                .access_revision()
+                .await
+                .unwrap(),
+            epoch,
+            "the revocation epoch, which open subscriptions watch, is unchanged"
+        );
+        assert!(
+            fixture
+                .vault
+                .staged_consent(staged, [7; 32], Utc::now().timestamp() as u64)
+                .await
+                .unwrap()
+                .is_some(),
+            "a staged consent survives the drop"
+        );
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], Utc::now())
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        assert_eq!(fixture.requests().len(), 2);
+    }
+
+    /// Stages a consent for another identity, returning its id; it is read back with the
+    /// binding digest `[7; 32]`.
+    async fn stage_a_consent(vault: &FileSystemDelegationVaultStore) -> uuid::Uuid {
+        let now = Utc::now().timestamp() as u64;
+        let mut credential = crate::delegation_vault::tests::make_token(Some(3600), false);
+        credential.agent_did = "did:example:user-agent".into();
+        let id = uuid::Uuid::new_v4();
+        vault
+            .stage_consent(
+                crate::delegation_vault::storage::StagedConsent {
+                    id: id.to_string(),
+                    binding_digest: [7; 32],
+                    issued_at: now,
+                    expires_at: now + 300,
+                    snapshot: vault
+                        .consent_snapshot(
+                            &credential.agent_did,
+                            &credential.user_identity_hash,
+                            &credential.credential_provider_id,
+                        )
+                        .await
+                        .unwrap(),
+                    credential,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_token_is_kept_while_its_renewal_holds_the_key() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        let mut sent = fixture
+            .acquire(&provider, &[], seconds(created, 60))
+            .await
+            .unwrap();
+        let sent = sent.issued.take().unwrap();
+        let (_, slot) = fixture
+            .grant_slot(&provider, &[])
+            .await;
+
+        let renewing = slot.lock().await;
+        assert_eq!(
+            invalidate(&fixture.vault, &sent, seconds(created, 120))
+                .await
+                .unwrap(),
+            Invalidation::Replaced
+        );
+        assert_eq!(fixture.only_stored().await.id, sent.id, "the row under renewal is kept");
+
+        drop(renewing);
+        assert_eq!(
+            invalidate(&fixture.vault, &sent, seconds(created, 120))
+                .await
+                .unwrap(),
+            Invalidation::Dropped
+        );
+        assert!(
+            fixture
+                .stored()
+                .await
+                .is_empty()
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_of_a_token_already_replaced_does_nothing() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        let mut sent = fixture
+            .acquire(&provider, &[], seconds(created, 60))
+            .await
+            .unwrap();
+        let sent = sent.issued.take().unwrap();
+
+        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], seconds(created, 3300))
+                    .await
+            ),
+            ("renewed".into(), Freshness::Fresh)
+        );
+        assert_eq!(fixture.only_stored().await.id, sent.id, "a renewal keeps the vault row");
+        assert_eq!(
+            invalidate(&fixture.vault, &sent, seconds(created, 3400))
+                .await
+                .unwrap(),
+            Invalidation::Replaced
+        );
+        assert_eq!(
+            fixture
+                .only_stored()
+                .await
+                .access_token,
+            "renewed",
+            "a late refusal of the old token leaves the renewed one"
+        );
+
+        fixture
+            .vault
+            .delete(&sent.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            invalidate(&fixture.vault, &sent, seconds(created, 3400))
+                .await
+                .unwrap(),
+            Invalidation::Replaced,
+            "a row that is gone is not dropped again"
+        );
+        assert_eq!(fixture.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_refused_token_keeps_the_retry_backoff_of_its_key() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(client_credentials())
+            .await;
+        let created = cache_a_token(&fixture, &provider).await;
+        fixture.fail(true);
+        let renew_at = seconds(created, 3300);
+        let mut stale = fixture
+            .acquire(&provider, &[], renew_at)
+            .await
+            .unwrap();
+        let stale = stale.issued.take().unwrap();
+        assert_eq!(stale.freshness, Freshness::Stale);
+        assert_eq!(fixture.requests().len(), 2);
+
+        assert_eq!(
+            invalidate(&fixture.vault, &stale, after(renew_at, 100))
+                .await
+                .unwrap(),
+            Invalidation::Dropped
+        );
+        fixture.fail(false);
+        assert_eq!(
+            fixture
+                .acquire(&provider, &[], after(renew_at, 500))
+                .await
+                .err(),
+            Some(ServiceTokenError::TokenRequestFailed),
+            "the failed renewal's backoff still holds the next request back"
+        );
+        assert_eq!(fixture.requests().len(), 2);
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &[], after(renew_at, 5_000))
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        assert_eq!(fixture.requests().len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

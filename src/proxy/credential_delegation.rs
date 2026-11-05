@@ -579,6 +579,7 @@ pub async fn resolve_delegation_credentials(
                             id,
                             freshness,
                             insecure_endpoint,
+                            ..
                         }) => Ok((id, freshness, insecure_endpoint, token)),
                         // Unreachable: acquire issues a vault token for each of these OAuth types.
                         None => Err(ServiceTokenError::Unsupported),

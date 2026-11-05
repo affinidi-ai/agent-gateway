@@ -18,7 +18,9 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
     .await;
     let admin = admin.unwrap();
     let api = format!("{}/api/v1", h.gateway_base);
-    for (secret_id, value) in [("target-client-id", "client"), ("target-client-secret", "secret")] {
+    for (secret_id, value) in
+        [("target-client-id", "client"), ("target-client-secret", "secret"), ("caller-key", "caller")]
+    {
         let created = admin
             .post(format!("{api}/secrets/new"))
             .json(&json!({"name": secret_id, "secret_id": secret_id, "value": value}))
@@ -68,8 +70,14 @@ async fn a_surface_save_accepts_only_a_target_auth_method_the_gateway_can_use() 
     let surface = |method: serde_json::Value| {
         json!({
             "name": "target-auth-provider",
-            "access_point": { "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a" },
-            "target": { "endpoint": h.mock.url(), "auth": { "method": method } }
+            "access_point": {
+                "listen_address": h.gateway_base, "route": "/smoke", "protocol": "a2a",
+                "caller_authentication": {"methods": [{
+                    "type": "api_key", "secret_id": "caller-key",
+                    "extraction": {"source": "http_header", "field": "X-Caller-Key"}
+                }]}
+            },
+            "target": { "endpoint": "https://127.0.0.1:9/", "auth": { "method": method } }
         })
     };
 

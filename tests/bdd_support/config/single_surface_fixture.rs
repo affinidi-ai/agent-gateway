@@ -40,6 +40,8 @@ pub struct SurfaceConfigBuilder {
     pub alternate_variant_target_policy: Option<VariantTargetPolicyFixture>,
     pub custom_response_headers: HashMap<String, String>,
     pub override_target_url: Option<String>,
+    /// The path the Target endpoint, or the MCP proxy base URL, adds to the target's address.
+    pub target_base_path: Option<String>,
     pub mcp_proxy_target: Option<McpProxyTargetFixture>,
     pub a2a_proxy_target: Option<A2aProxyTargetFixture>,
     pub custom_metadata: Option<SurfaceCustomMetadataConfig>,
@@ -64,6 +66,9 @@ pub struct SurfaceConfigBuilder {
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
     pub protected_resource: Option<ProtectedResourceFixture>,
+    /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
+    /// https origin a Transit Point's `mcp_http.authorization` resource must use.
+    pub outbound_public_origin: bool,
     pub a2a_settings: Option<serde_json::Value>,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
@@ -111,9 +116,11 @@ impl Default for SurfaceConfigBuilder {
             alternate_variant_target_policy: None,
             custom_response_headers: HashMap::new(),
             override_target_url: None,
+            target_base_path: None,
             mcp_proxy_target: None,
             a2a_proxy_target: None,
             protected_resource: None,
+            outbound_public_origin: false,
             custom_metadata: None,
             credential_delegation: None,
             oauth_provider_base_url: None,
@@ -214,6 +221,8 @@ pub struct McpProxyTargetFixture {
     pub proxy_id: String,
     pub openapi_spec: Option<String>,
     pub disabled: bool,
+    /// The proxy's `base_url` names the REST API with `https://` instead of `http://`.
+    pub https_base_url: bool,
 }
 
 impl McpProxyTargetFixture {
@@ -222,6 +231,7 @@ impl McpProxyTargetFixture {
             proxy_id: proxy_id.into(),
             openapi_spec: None,
             disabled: false,
+            https_base_url: false,
         }
     }
 
@@ -259,6 +269,13 @@ pub struct SurfaceTransitPointConfig {
     /// The Transit Point authenticates its target with the surface's
     /// `target_auth_provider`.
     pub target_auth_provider: bool,
+    /// The `fallback` of the Transit Point's `target_auth`.
+    pub target_auth_fallback: String,
+    /// The Transit Point authenticates its target with a static secret that the gateway does
+    /// not hold instead.
+    pub target_auth_secret: Option<SurfaceTargetAuthConfig>,
+    /// The path the Transit Point's target endpoint adds to its destination's address.
+    pub target_base_path: Option<String>,
     /// Requests per minute the Transit Point admits from each caller
     /// (`per_caller_rate_limit`).
     pub per_caller_rate_limit_per_minute: Option<u32>,
@@ -281,6 +298,9 @@ impl SurfaceTransitPointConfig {
             allow_unauthenticated_callers: true,
             delegated_credentials: false,
             target_auth_provider: false,
+            target_auth_fallback: "reject".to_string(),
+            target_auth_secret: None,
+            target_base_path: None,
             per_caller_rate_limit_per_minute: None,
         }
     }
@@ -324,6 +344,7 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    pub forward_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -581,6 +602,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),

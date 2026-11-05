@@ -137,6 +137,7 @@ pub async fn create_a2a_proxy<S: A2aProxyStore>(
         return Err((StatusCode::FORBIDDEN, "A2A Proxy is outside this token's permitted scope".into()));
     }
     proxy.agent_identity = request.agent_identity;
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
     validate_backend_secret(secrets_store.as_ref(), proxy.tenant_id.as_deref(), &proxy.backend, None, &context, &scope)
         .await?;
     proxy
@@ -195,6 +196,7 @@ pub async fn update_a2a_proxy<S: A2aProxyStore>(
     }
     proxy.updated_at = chrono::Utc::now();
 
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
     validate_backend_secret(
         secrets_store.as_ref(),
         proxy.tenant_id.as_deref(),
@@ -312,20 +314,20 @@ mod tests {
         store: &Arc<FileSystemA2aProxyStore>,
         secret_id: &str,
     ) -> Result<Json<A2aProxy>, (StatusCode, String)> {
+        create_for_tenant_a_with(store, direct_line_secrets(), secret_id).await
+    }
+
+    async fn create_for_tenant_a_with(
+        store: &Arc<FileSystemA2aProxyStore>,
+        secrets: Option<Arc<dyn SecretsStore>>,
+        secret_id: &str,
+    ) -> Result<Json<A2aProxy>, (StatusCode, String)> {
         let request: CreateA2aProxyRequest = serde_json::from_value(serde_json::json!({
             "name": "worker",
             "backend": {"kind": "copilot_direct_line", "secret_id": secret_id, "base_url": "https://203.0.113.7/v3/directline"}
         }))
         .expect("request");
-        create_a2a_proxy(
-            Extension(store.clone()),
-            Extension(direct_line_secrets()),
-            None,
-            tenant_a(),
-            None,
-            Json(request),
-        )
-        .await
+        create_a2a_proxy(Extension(store.clone()), Extension(secrets), None, tenant_a(), None, Json(request)).await
     }
 
     async fn stored_tenant_a_proxy(
@@ -406,6 +408,94 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saving_a_proxy_waits_for_a_secret_delete_in_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemA2aProxyStore::new(dir.path().to_path_buf())
+                .await
+                .expect("store"),
+        );
+        let id = stored_tenant_a_proxy(&store, "tenant-a-direct-line").await;
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let store = store.clone();
+            async move { create_for_tenant_a(&store, "tenant-a-direct-line").await }
+        });
+        let updating = tokio::spawn({
+            let store = store.clone();
+            async move { update_for_tenant_a(&store, &id, serde_json::json!({"description": "after"})).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "a create waits for the secret delete that holds the lock");
+        assert!(!updating.is_finished(), "an update waits for the secret delete that holds the lock");
+        drop(deleting);
+        let Json(created) = creating
+            .await
+            .unwrap()
+            .expect("and is saved once it ends");
+        assert_eq!(created.tenant_id.as_deref(), Some("tenant-a"));
+        let Json(updated) = updating
+            .await
+            .unwrap()
+            .expect("and is saved once it ends");
+        assert_eq!(updated.description, "after");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_proxy_naming_a_secret_deleted_while_it_waited_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemA2aProxyStore::new(dir.path().join("proxies"))
+                .await
+                .expect("store"),
+        );
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                dir.path()
+                    .join("secrets")
+                    .to_str()
+                    .expect("path"),
+            )
+            .await
+            .expect("secrets store"),
+        );
+        let secret = secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-a".into()),
+                name: "tenant-a-direct-line".into(),
+                secret_id: "tenant-a-direct-line".into(),
+                description: None,
+                value: "tenant-a".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .expect("secret");
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let store = store.clone();
+            let secrets = secrets.clone();
+            async move { create_for_tenant_a_with(&store, Some(secrets), "tenant-a-direct-line").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        secrets
+            .delete(&secret.id)
+            .await
+            .expect("delete");
+        drop(deleting);
+
+        refused(creating.await.unwrap());
+        assert!(
+            store
+                .list_all()
+                .await
+                .expect("list")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

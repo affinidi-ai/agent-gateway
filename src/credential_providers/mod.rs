@@ -15,6 +15,7 @@
 
 pub mod external;
 pub mod handlers;
+pub mod references;
 pub mod router;
 pub mod scope_comparison;
 pub mod storage;
