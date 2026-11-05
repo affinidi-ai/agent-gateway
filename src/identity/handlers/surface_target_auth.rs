@@ -9,8 +9,8 @@ use tracing::warn;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{RuleMode, credential_policy};
 use crate::config::target_auth_rules::{
-    HeaderFormatProblem, TargetCredentialRule, broken_target_credential_rules, header_format_problem, is_header_name,
-    is_https_target, reserved_header, same_header_name,
+    HeaderFormatProblem, HttpsMcpProxies, TargetCredentialRule, broken_target_credential_rules, header_format_problem,
+    is_header_name, is_https_target, reserved_header, same_header_name,
 };
 use crate::config::{TargetAuthConfig, TargetAuthMethod};
 
@@ -47,15 +47,16 @@ struct Breach {
 pub(super) fn validate_target_auth_rules(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
+    https_proxies: &HttpsMcpProxies,
 ) -> Result<(), SurfaceApiError> {
     let kept: Vec<Breach> = stored
-        .and_then(|stored| breaches(stored).ok())
+        .and_then(|stored| breaches(stored, https_proxies).ok())
         .into_iter()
         .flatten()
         .map(|(breach, ..)| breach)
         .collect();
     let mut warned = Vec::new();
-    for (breach, message, policy_rule) in breaches(surface)? {
+    for (breach, message, policy_rule) in breaches(surface, https_proxies)? {
         if kept.contains(&breach) {
             continue;
         }
@@ -78,8 +79,11 @@ pub(super) fn validate_target_auth_rules(
 /// Each `target_https` or `target_source_auth` breach of a saved `surface`, worded for the save
 /// response's `Warning` header: in `warn` the credential is still sent; in `enforce`, which
 /// lets a save keep only a breach the stored surface already had, it is withheld.
-pub(super) fn target_rule_warnings(surface: &AgentSurface) -> Vec<String> {
-    breaches(surface)
+pub(super) fn target_rule_warnings(
+    surface: &AgentSurface,
+    https_proxies: &HttpsMcpProxies,
+) -> Vec<String> {
+    breaches(surface, https_proxies)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(_, message, policy_rule)| {
@@ -95,11 +99,34 @@ pub(super) fn target_rule_warnings(surface: &AgentSurface) -> Vec<String> {
 
 /// Each `target_https` or `target_source_auth` breach of `surface`, on any leg of the base
 /// surface or of a variant as it resolves.
-pub(super) fn broken_target_rules(surface: &AgentSurface) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
-    Ok(breaches(surface)?
+pub(super) fn broken_target_rules(
+    surface: &AgentSurface,
+    https_proxies: &HttpsMcpProxies,
+) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
+    Ok(breaches(surface, https_proxies)?
         .into_iter()
         .filter_map(|(.., policy_rule)| policy_rule)
         .collect())
+}
+
+/// The MCP proxies with an https `base_url`, which the `proxy://` Targets that name them meet
+/// `target_https` through. Proxies that cannot be listed meet it through none.
+pub(super) async fn https_mcp_proxies(state: &crate::identity::state::IdentityApiState) -> HttpsMcpProxies {
+    use crate::mcp_proxies::McpProxyStore;
+    let Some(store) = state.mcp_proxy_store.as_ref() else {
+        return HttpsMcpProxies::default();
+    };
+    match store.list_all().await {
+        Ok(proxies) => HttpsMcpProxies::from_base_urls(
+            proxies
+                .iter()
+                .map(|proxy| (proxy.id.as_str(), proxy.base_url.as_str())),
+        ),
+        Err(error) => {
+            warn!(%error, "Could not list MCP proxies; no proxy:// Target meets target_https");
+            HttpsMcpProxies::default()
+        }
+    }
 }
 
 fn warning(
@@ -121,7 +148,10 @@ fn rule_mode(rule: TargetCredentialRule) -> RuleMode {
 /// rule it belongs to, if any.
 type Found = (Breach, String, Option<TargetCredentialRule>);
 
-fn breaches(surface: &AgentSurface) -> Result<Vec<Found>, SurfaceApiError> {
+fn breaches(
+    surface: &AgentSurface,
+    https_proxies: &HttpsMcpProxies,
+) -> Result<Vec<Found>, SurfaceApiError> {
     let variants = std::iter::once(None).chain(
         surface
             .variants
@@ -134,7 +164,7 @@ fn breaches(surface: &AgentSurface) -> Result<Vec<Found>, SurfaceApiError> {
         found.extend(a2a_proxy_breach(&view, variant));
         for leg in legs(&view, variant) {
             let authentication = serde_json::to_value(leg.authentication).unwrap_or_default();
-            for (rule, policy_rule) in broken_rules(&leg) {
+            for (rule, policy_rule) in broken_rules(&leg, https_proxies) {
                 let message = format!("{}{rule}", leg.field);
                 found.push((
                     Breach {
@@ -272,7 +302,10 @@ fn legs<'a>(
 
 /// Each rule `leg` breaks, worded to follow the leg's field name, with the credential policy
 /// rule it belongs to, if any.
-fn broken_rules(leg: &Leg<'_>) -> Vec<(String, Option<TargetCredentialRule>)> {
+fn broken_rules(
+    leg: &Leg<'_>,
+    https_proxies: &HttpsMcpProxies,
+) -> Vec<(String, Option<TargetCredentialRule>)> {
     let (header_name, header_format) = match &leg.authentication.method {
         TargetAuthMethod::StaticSecret { header_name, header_format, .. }
         | TargetAuthMethod::CredentialProvider { header_name, header_format, .. } => {
@@ -301,9 +334,18 @@ fn broken_rules(leg: &Leg<'_>) -> Vec<(String, Option<TargetCredentialRule>)> {
         }
         None => {}
     }
-    if !is_https_target(leg.endpoint) {
+    let over_https = match leg.transit_point_id {
+        Some(_) => is_https_target(leg.endpoint),
+        None => https_proxies.sends_over_https(leg.endpoint),
+    };
+    if !over_https {
         let destination = if leg.transit_point_id.is_some() {
             "target endpoint"
+        } else if leg
+            .endpoint
+            .starts_with("proxy://")
+        {
+            "MCP proxy's base_url"
         } else {
             "Target"
         };
@@ -446,7 +488,7 @@ mod tests {
         let surface: AgentSurface = serde_json::from_value(http_and_unchecked()).unwrap();
         let validate = |https, source_auth| {
             crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(policy(https, source_auth), || {
-                validate_target_auth_rules(&surface, None).map_err(|error| match error {
+                validate_target_auth_rules(&surface, None, &HttpsMcpProxies::default()).map_err(|error| match error {
                     SurfaceApiError::BadRequest(message) => message,
                     other => panic!("unexpected error {other:?}"),
                 })
@@ -468,7 +510,7 @@ mod tests {
         let surface: AgentSurface = serde_json::from_value(http_and_unchecked()).unwrap();
         let warnings = |https, source_auth| {
             crate::config::credential_policy::TEST_CREDENTIAL_POLICY
-                .sync_scope(policy(https, source_auth), || target_rule_warnings(&surface))
+                .sync_scope(policy(https, source_auth), || target_rule_warnings(&surface, &HttpsMcpProxies::default()))
         };
         assert_eq!(
             warnings(RuleMode::Warn, RuleMode::Warn),
@@ -498,8 +540,54 @@ mod tests {
         let header_breach: AgentSurface = serde_json::from_value(header_breach).unwrap();
         assert!(
             crate::config::credential_policy::TEST_CREDENTIAL_POLICY
-                .sync_scope(policy(RuleMode::Warn, RuleMode::Warn), || target_rule_warnings(&header_breach))
+                .sync_scope(policy(RuleMode::Warn, RuleMode::Warn), || target_rule_warnings(
+                    &header_breach,
+                    &HttpsMcpProxies::default()
+                ))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_proxy_target_meets_target_https_only_through_an_https_mcp_proxy_base_url() {
+        let mut body = surface(static_secret("X-Api-Key", "{value}"));
+        body["access_point"]["protocol"] = json!("mcp");
+        body["target"]["endpoint"] = json!("proxy://weather");
+        let target: AgentSurface = serde_json::from_value(body).unwrap();
+        let proxies = |base_url| HttpsMcpProxies::from_base_urls([("weather", base_url)]);
+        let validate = |mode, proxies: &HttpsMcpProxies| {
+            crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(policy(mode, RuleMode::Enforce), || {
+                (
+                    validate_target_auth_rules(&target, None, proxies).map_err(|error| match error {
+                        SurfaceApiError::BadRequest(message) => message,
+                        other => panic!("unexpected error {other:?}"),
+                    }),
+                    target_rule_warnings(&target, proxies),
+                )
+            })
+        };
+        let breach = "target.auth sends a credential, so its MCP proxy's base_url must be an https URL";
+
+        assert_eq!(validate(RuleMode::Enforce, &proxies("https://rest.example.com/api")), (Ok(()), Vec::new()));
+        for refused in [proxies("http://rest.example.com"), HttpsMcpProxies::default()] {
+            assert_eq!(validate(RuleMode::Enforce, &refused).0, Err(breach.to_string()));
+        }
+        assert_eq!(
+            validate(RuleMode::Warn, &proxies("http://rest.example.com")),
+            (Ok(()), vec![format!("{breach}; it will be refused once credential_policy.target_https is enforce")])
+        );
+
+        let point = with_transit_point(
+            surface(static_secret("X-Api-Key", "{value}")),
+            json!({"target_endpoint": "proxy://weather", "target_auth": static_secret("X-Partner-Key", "{value}")}),
+        );
+        assert_eq!(
+            check_with(&point, &proxies("https://rest.example.com/api")),
+            Err(
+                "transit.points['partner'].target_auth sends a credential, so its target endpoint must be an https URL"
+                    .to_string()
+            ),
+            "a Transit Point does not reach an MCP proxy"
         );
     }
 
@@ -515,6 +603,23 @@ mod tests {
         check_in(RuleMode::Enforce, body, stored)
     }
 
+    /// [`validate_target_auth_rules`] in `enforce` with the MCP proxies `https_proxies`.
+    fn check_with(
+        body: &Value,
+        https_proxies: &HttpsMcpProxies,
+    ) -> Result<(), String> {
+        let surface: AgentSurface = serde_json::from_value(body.clone()).unwrap();
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(
+            policy(RuleMode::Enforce, RuleMode::Enforce),
+            || {
+                validate_target_auth_rules(&surface, None, https_proxies).map_err(|error| match error {
+                    SurfaceApiError::BadRequest(message) => message,
+                    other => panic!("unexpected error {other:?}"),
+                })
+            },
+        )
+    }
+
     fn check_in(
         mode: RuleMode,
         body: &Value,
@@ -524,9 +629,11 @@ mod tests {
         let surface: AgentSurface = serde_json::from_value(body.clone()).unwrap();
         let stored: Option<AgentSurface> = stored.map(|stored| serde_json::from_value(stored.clone()).unwrap());
         crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(policy, || {
-            validate_target_auth_rules(&surface, stored.as_ref()).map_err(|error| match error {
-                SurfaceApiError::BadRequest(message) => message,
-                other => panic!("unexpected error {other:?}"),
+            validate_target_auth_rules(&surface, stored.as_ref(), &HttpsMcpProxies::default()).map_err(|error| {
+                match error {
+                    SurfaceApiError::BadRequest(message) => message,
+                    other => panic!("unexpected error {other:?}"),
+                }
             })
         })
     }
@@ -668,7 +775,7 @@ mod tests {
     ) -> Vec<String> {
         let surface: AgentSurface = serde_json::from_value(body.clone()).unwrap();
         crate::config::credential_policy::TEST_CREDENTIAL_POLICY
-            .sync_scope(policy(mode, mode), || target_rule_warnings(&surface))
+            .sync_scope(policy(mode, mode), || target_rule_warnings(&surface, &HttpsMcpProxies::default()))
     }
 
     #[test]
@@ -853,7 +960,7 @@ mod tests {
         let mut stored = surface(static_secret("X-Api-Key", "{value}"));
         stored["variants"] = variants("same", "same");
         let unresolvable: AgentSurface = serde_json::from_value(stored.clone()).unwrap();
-        assert!(breaches(&unresolvable).is_err());
+        assert!(breaches(&unresolvable, &HttpsMcpProxies::default()).is_err());
 
         let mut repaired = surface(static_secret("X-Api-Key", "{value}"));
         repaired["variants"] = variants("first", "second");
@@ -948,8 +1055,10 @@ mod tests {
         assert_eq!(check(&body, Some(&body)), Ok(()), "an unchanged stored breach saves");
         let kept: AgentSurface = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(
-            crate::config::credential_policy::TEST_CREDENTIAL_POLICY
-                .sync_scope(policy(RuleMode::Enforce, RuleMode::Enforce), || target_rule_warnings(&kept)),
+            crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(
+                policy(RuleMode::Enforce, RuleMode::Enforce),
+                || target_rule_warnings(&kept, &HttpsMcpProxies::default())
+            ),
             vec![format!(
                 "{A2A_PROXY_UNCHECKED}; the credential is withheld while credential_policy.target_source_auth is enforce"
             )],
@@ -1005,7 +1114,10 @@ mod tests {
         let checked: AgentSurface = serde_json::from_value(checked_body).unwrap();
         let under = |https, source_auth, surface: &AgentSurface| {
             crate::config::credential_policy::TEST_CREDENTIAL_POLICY.sync_scope(policy(https, source_auth), || {
-                (validate_target_auth_rules(surface, None).is_ok(), target_rule_warnings(surface))
+                (
+                    validate_target_auth_rules(surface, None, &HttpsMcpProxies::default()).is_ok(),
+                    target_rule_warnings(surface, &HttpsMcpProxies::default()),
+                )
             })
         };
         assert_eq!(under(RuleMode::Enforce, RuleMode::Enforce, &checked), (true, Vec::<String>::new()));

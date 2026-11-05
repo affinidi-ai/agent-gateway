@@ -11,7 +11,7 @@ use super::surface_tenancy::{
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
-use crate::config::target_auth_rules::TargetCredentialRule;
+use crate::config::target_auth_rules::{HttpsMcpProxies, TargetCredentialRule};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
@@ -105,6 +105,7 @@ pub(crate) fn find_breaches(
     secret_tenants: &HashMap<&str, Option<&str>>,
     key_owners: Option<&HashMap<String, Vec<String>>>,
     egress: &TokenEgress,
+    https_proxies: &HttpsMcpProxies,
 ) -> Findings {
     let surface_tenants: HashMap<&str, Option<&str>> = surfaces
         .iter()
@@ -150,7 +151,8 @@ pub(crate) fn find_breaches(
             .map(|issues| (breaks, issues))
         });
         let verdict = verdict.and_then(|(breaks, issues)| {
-            super::surface_target_auth::broken_target_rules(surface).map(|target_rules| (breaks, issues, target_rules))
+            super::surface_target_auth::broken_target_rules(surface, https_proxies)
+                .map(|target_rules| (breaks, issues, target_rules))
         });
         match verdict {
             Ok((breaks, issues, target_rules)) => {
@@ -235,8 +237,12 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
     let key_owners = provider_key_owners(state)
         .await
         .ok();
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
 
-    log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, key_owners.as_ref(), &egress), policy);
+    log_findings(
+        &find_breaches(&providers, &surfaces, &secret_tenants, key_owners.as_ref(), &egress, &https_proxies),
+        policy,
+    );
 }
 
 /// The mode a rule runs in; `jwt_subject` has no setting and only warns.
@@ -362,7 +368,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        find_breaches(providers, &[], &secret_tenants, None, &egress(policy))
+        find_breaches(providers, &[], &secret_tenants, None, &egress(policy), &HttpsMcpProxies::default())
             .breaches
             .into_iter()
             .map(|breach| (breach.id, breach.rule))
@@ -495,6 +501,7 @@ mod tests {
                     &secret_tenants,
                     None,
                     &egress(CredentialPolicyConfig::default()),
+                    &HttpsMcpProxies::default(),
                 )
                 .breaches
                 .iter()
@@ -510,6 +517,7 @@ mod tests {
             &secret_tenants,
             None,
             &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
         )
         .breaches
         .into_iter()
@@ -541,7 +549,14 @@ mod tests {
             ..Default::default()
         };
         let surfaces = [surface_that_cannot_be_inspected("broken"), healthy];
-        let findings = find_breaches(&[], &surfaces, &secret_tenants, None, &egress(CredentialPolicyConfig::default()));
+        let findings = find_breaches(
+            &[],
+            &surfaces,
+            &secret_tenants,
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        );
         assert_eq!(findings.breaches, vec![]);
         assert_eq!(findings.skipped.len(), 1);
         assert_eq!(findings.skipped[0].id, "broken");
@@ -626,10 +641,17 @@ mod tests {
                 serde_json::from_value(serde_json::json!({"payload": {"key": format!("$SECRET:{secret_id}")}}))
                     .unwrap(),
             );
-            find_breaches(&[], &[surface], &secret_tenants, None, &egress(CredentialPolicyConfig::default()))
-                .breaches
-                .iter()
-                .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
+            find_breaches(
+                &[],
+                &[surface],
+                &secret_tenants,
+                None,
+                &egress(CredentialPolicyConfig::default()),
+                &HttpsMcpProxies::default(),
+            )
+            .breaches
+            .iter()
+            .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
         };
 
         assert!(reported(Some("t1"), "S_WIDE"));
@@ -697,6 +719,7 @@ mod tests {
             &HashMap::new(),
             None,
             &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
         )
         .breaches
         .into_iter()
@@ -828,12 +851,40 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_target_is_reported_for_target_https_unless_its_mcp_proxy_base_url_is_https() {
+        let surface = target_surface("proxy://weather", Some(static_secret()), true);
+        let rules = |base_url: &str| {
+            find_breaches(
+                &[],
+                std::slice::from_ref(&surface),
+                &HashMap::new(),
+                None,
+                &egress(CredentialPolicyConfig::default()),
+                &HttpsMcpProxies::from_base_urls([("weather", base_url)]),
+            )
+            .breaches
+            .into_iter()
+            .map(|breach| breach.rule)
+            .collect::<Vec<_>>()
+        };
+        assert!(rules("https://rest.example.com/api").is_empty());
+        assert_eq!(rules("http://rest.example.com"), vec![RULE_TARGET_HTTPS]);
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_HTTPS], "a missing MCP proxy");
+    }
+
+    #[test]
     fn a_surface_that_cannot_be_inspected_is_not_reported_for_the_target_rules_of_its_other_views() {
         let mut surface = surface_that_cannot_be_inspected("broken");
         surface.target = target_surface("http://upstream.example", Some(static_secret()), false).target;
         let healthy = target_surface("http://upstream.example", Some(static_secret()), true);
-        let findings =
-            find_breaches(&[], &[surface, healthy], &HashMap::new(), None, &egress(CredentialPolicyConfig::default()));
+        let findings = find_breaches(
+            &[],
+            &[surface, healthy],
+            &HashMap::new(),
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        );
         assert_eq!(
             findings
                 .breaches
@@ -915,7 +966,7 @@ mod tests {
             tenant_credential_isolation: isolation,
             ..Default::default()
         };
-        find_breaches(&[], &surfaces, &HashMap::new(), owners, &egress(policy))
+        find_breaches(&[], &surfaces, &HashMap::new(), owners, &egress(policy), &HttpsMcpProxies::default())
             .provider_keys
             .into_iter()
             .map(|finding| (finding.surface_id, finding.issue.kind.as_str(), finding.issue.kind.is_breach()))
@@ -1034,6 +1085,7 @@ mod tests {
                 .collect(),
             Some(&owners),
             &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
         );
         log_findings(&findings, &CredentialPolicyConfig::default());
         let text = logs.text();

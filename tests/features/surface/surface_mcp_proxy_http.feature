@@ -2,9 +2,9 @@ Feature: Routing through a proxy:// MCP target
   An MCP surface whose target endpoint is proxy://{id} answers MCP requests
   through the named MCP proxy. The proxy advertises its dashboard-configured
   name on initialize and translates tool invocations into REST calls against
-  its configured backend. A proxy:// target is not an https URL, so its Target
-  credential is held to the target_https credential rule on save and on every tool
-  call.
+  its configured backend. A Target credential on a proxy:// target goes to the
+  MCP proxy's base URL, so that URL is held to the target_https credential rule on
+  save and on every tool call.
 
   Background:
     Given REST API "bravo" exposes a Weather OpenAPI
@@ -254,7 +254,7 @@ Feature: Routing through a proxy:// MCP target
     And the gateway only warns on the credential rule "target_https"
     When the operator saves the surface with its Target authentication formatting the value as "Token {value}"
     Then the admin API response status is 200
-    And the admin API response carries a Warning header containing "target.auth sends a credential, so its Target must be an https URL; it will be refused once credential_policy.target_https is enforce"
+    And the admin API response carries a Warning header containing "target.auth sends a credential, so its MCP proxy's base_url must be an https URL; it will be refused once credential_policy.target_https is enforce"
 
   Scenario: Editing an MCP proxy Target credential is refused when https Targets are enforced
     Given the surface requires "API Key" source authentication
@@ -262,4 +262,13 @@ Feature: Routing through a proxy:// MCP target
     And the gateway enforces the credential rule "target_https"
     When the operator saves the surface with its Target authentication formatting the value as "Token {value}"
     Then the admin API response status is 400
-    And the admin API error response mentions "target.auth sends a credential, so its Target must be an https URL"
+    And the admin API error response mentions "target.auth sends a credential, so its MCP proxy's base_url must be an https URL"
+
+  Scenario: Editing an MCP proxy Target credential is saved when https Targets are enforced and the MCP proxy's base URL is https
+    Given the MCP proxy's base URL is an https URL
+    And the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And the gateway enforces the credential rule "target_https"
+    When the operator saves the surface with its Target authentication formatting the value as "Token {value}"
+    Then the admin API response status is 200
+    And the admin API response carries no Warning header containing "must be an https URL"

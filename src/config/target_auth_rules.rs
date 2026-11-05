@@ -96,6 +96,36 @@ pub fn is_https_target(endpoint: &str) -> bool {
     url::Url::parse(endpoint.trim()).is_ok_and(|url| url.scheme() == "https" && url.host().is_some())
 }
 
+/// The MCP proxies whose `base_url` is an https URL, by id. A credential sent to a `proxy://`
+/// Target goes to its MCP proxy's `base_url`, so `target_https` judges that URL.
+#[derive(Debug, Default)]
+pub struct HttpsMcpProxies(std::collections::HashSet<String>);
+
+impl HttpsMcpProxies {
+    /// The proxies among `(id, base_url)` pairs whose `base_url` is an https URL.
+    pub fn from_base_urls<'a>(proxies: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self(
+            proxies
+                .into_iter()
+                .filter(|(_, base_url)| is_https_target(base_url))
+                .map(|(id, _)| id.to_string())
+                .collect(),
+        )
+    }
+
+    /// Does a credential sent to `endpoint` go over https: an https URL, or a `proxy://` Target
+    /// whose MCP proxy is listed? A `proxy://` Target naming no listed proxy does not.
+    pub fn sends_over_https(
+        &self,
+        endpoint: &str,
+    ) -> bool {
+        is_https_target(endpoint)
+            || endpoint
+                .strip_prefix("proxy://")
+                .is_some_and(|proxy_id| self.0.contains(proxy_id))
+    }
+}
+
 /// A rule the request path holds a Target credential to, named by its `[credential_policy]` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetCredentialRule {
@@ -291,6 +321,20 @@ mod tests {
             "",
         ] {
             assert!(!is_https_target(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn a_proxy_target_sends_over_https_only_when_its_mcp_proxy_base_url_is_https() {
+        let proxies = HttpsMcpProxies::from_base_urls([
+            ("secure", "https://rest.example.com/api"),
+            ("plain", "http://rest.example.com"),
+        ]);
+        assert!(proxies.sends_over_https("proxy://secure"));
+        assert!(proxies.sends_over_https("https://api.example.com/"));
+        for endpoint in ["proxy://plain", "proxy://missing", "proxy://", "http://api.example.com", "a2a-proxy://secure"]
+        {
+            assert!(!proxies.sends_over_https(endpoint), "{endpoint}");
         }
     }
 

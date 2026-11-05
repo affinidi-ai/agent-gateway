@@ -5826,12 +5826,17 @@ async fn process_forward_request_in_request_scope(
         );
         let providers = get_credential_provider_store();
         let vault = get_delegation_vault_store();
+        let mcp_proxy_base_url = match GLOBAL_MCP_PROXY_STORE.get() {
+            Some(store) => store.target_base_url(surface.target_endpoint()).await,
+            None => None,
+        };
         let context = crate::proxy::handler::TargetAuthContext::of_surface(
             &surface,
             secrets_store.as_ref(),
             providers.as_ref(),
             vault.as_ref(),
-        );
+        )
+        .for_mcp_proxy(mcp_proxy_base_url.as_deref());
         match crate::proxy::handler::resolve_target_credential(target_auth, &context, &surface.name, caller)
         .await
         {
@@ -8637,7 +8642,8 @@ async fn handle_mcp_proxy_forward(
             secrets_store.as_ref(),
             providers.as_ref(),
             vault.as_ref(),
-        );
+        )
+        .for_mcp_proxy(Some(&proxy.base_url));
         match crate::proxy::handler::resolve_target_credential(
             target_auth,
             &context,

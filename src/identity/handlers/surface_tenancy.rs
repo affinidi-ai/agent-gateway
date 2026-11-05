@@ -70,7 +70,8 @@ pub async fn validate_surface_references(
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
     validate_target_auth_methods(state, surface).await?;
-    super::surface_target_auth::validate_target_auth_rules(surface, stored)
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
+    super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
 
 pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =

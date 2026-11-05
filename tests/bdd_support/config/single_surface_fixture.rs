@@ -221,6 +221,8 @@ pub struct McpProxyTargetFixture {
     pub proxy_id: String,
     pub openapi_spec: Option<String>,
     pub disabled: bool,
+    /// The proxy's `base_url` names the REST API with `https://` instead of `http://`.
+    pub https_base_url: bool,
 }
 
 impl McpProxyTargetFixture {
@@ -229,6 +231,7 @@ impl McpProxyTargetFixture {
             proxy_id: proxy_id.into(),
             openapi_spec: None,
             disabled: false,
+            https_base_url: false,
         }
     }
 

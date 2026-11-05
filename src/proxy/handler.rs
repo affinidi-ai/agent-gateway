@@ -738,6 +738,19 @@ impl<'a> TargetAuthContext<'a> {
         }
     }
 
+    /// The same leg to an MCP proxy Target: the credential goes to the proxy's `base_url`, so
+    /// `target_https` judges that URL. Without one the `proxy://` endpoint stays, which is
+    /// not https.
+    pub(crate) fn for_mcp_proxy(
+        self,
+        base_url: Option<&'a str>,
+    ) -> Self {
+        Self {
+            endpoint: base_url.unwrap_or(self.endpoint),
+            ..self
+        }
+    }
+
     fn rule_mode(
         &self,
         rule: crate::config::target_auth_rules::TargetCredentialRule,
@@ -6958,9 +6971,17 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
+        let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
+            Some(store) => {
+                store
+                    .target_base_url(&state.surface.target.endpoint)
+                    .await
+            }
+            None => None,
+        };
         match resolve_target_credential(
             target_auth,
-            &TargetAuthContext::of_proxy(&state),
+            &TargetAuthContext::of_proxy(&state).for_mcp_proxy(mcp_proxy_base_url.as_deref()),
             &channel_name,
             caller_assertion,
         )
@@ -16081,7 +16102,7 @@ async fn handle_mcp_proxy_request(
     let target_credential = if let Some(target_auth) = state.surface.target_auth() {
         match resolve_target_credential(
             target_auth,
-            &TargetAuthContext::of_proxy(state),
+            &TargetAuthContext::of_proxy(state).for_mcp_proxy(Some(&proxy.base_url)),
             channel_name,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
@@ -17940,6 +17961,26 @@ pub(crate) mod target_auth_tests {
                     "{methods}"
                 );
             }
+        }
+
+        #[test]
+        fn an_mcp_proxy_target_is_held_to_target_https_by_its_proxy_base_url() {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "s", "name": "s",
+                "access_point": {"listen_address": "127.0.0.1:8080", "route": "/s", "protocol": "mcp",
+                    "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "caller-key",
+                        "extraction": {"source": "http_header", "field": "X-Caller"}}]}},
+                "target": {"endpoint": "proxy://weather"}
+            }))
+            .unwrap();
+            let withheld = |base_url: Option<&str>| {
+                let mut context = TargetAuthContext::of_surface(&surface, None, None, None).for_mcp_proxy(base_url);
+                context.target_https = crate::config::credential_policy::RuleMode::Enforce;
+                context.withholding_rule(CallerAssertion::Authenticated)
+            };
+            assert_eq!(withheld(Some("https://rest.example.com/api")), None);
+            assert_eq!(withheld(Some("http://rest.example.com/api")), Some(TargetCredentialRule::Https));
+            assert_eq!(withheld(None), Some(TargetCredentialRule::Https), "an MCP proxy that could not be loaded");
         }
 
         #[test]

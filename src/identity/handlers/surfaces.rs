@@ -1148,6 +1148,7 @@ async fn save_warnings(
     surface: &AgentSurface,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1167,7 +1168,7 @@ async fn save_warnings(
         .chain(inherited_external_point_warnings(surface))
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
-        .chain(super::surface_target_auth::target_rule_warnings(surface))
+        .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);

@@ -531,7 +531,11 @@ fn write_single_surface_config_inner(
     );
 
     if let Some(proxy) = &surface_config.mcp_proxy_target {
-        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, target_url_under_base_path(mock_url, surface_config));
+        let mut base_url = target_url_under_base_path(mock_url, surface_config);
+        if proxy.https_base_url {
+            base_url = base_url.replacen("http://", "https://", 1);
+        }
+        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, base_url);
         if let Some(spec) = &proxy.openapi_spec {
             fixture = fixture.with_openapi_spec(spec.clone());
         }

@@ -315,8 +315,8 @@ An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject
 signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
 for this rule.
 A surface breaks `target_https` when its Target, or one of its Transit Points, sends a static secret
-or credential provider token to an endpoint that is not `https` (`http://`, `fabric://`, `a2a-proxy://`
-and `proxy://` count as not https). It breaks `target_source_auth` when its Target sends a
+or credential provider token to an endpoint that is not `https` (`http://`, `fabric://` and
+`a2a-proxy://` count as not https; a `proxy://` Target counts as its MCP proxy's `base_url`). It breaks `target_source_auth` when its Target sends a
 credential, or is an `a2a-proxy://` Target of an A2A or AP2 surface (its A2A proxy sends its
 Direct Line credential), and its Access Point has neither a source authentication method nor
 `mcp_http.authorization`, or a Transit Point sends one and requires no transit token and sets

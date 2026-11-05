@@ -242,6 +242,17 @@ fn mcp_proxy_base_url_has_base_path(
         .target_base_path = Some(path);
 }
 
+#[given("the MCP proxy's base URL is an https URL")]
+fn mcp_proxy_base_url_is_https(world: &mut SurfaceWorld) {
+    before_the_gateway_starts(world, "the MCP proxy base URL");
+    world
+        .surface_config
+        .mcp_proxy_target
+        .as_mut()
+        .expect("background must register an MCP proxy target before its base URL is set")
+        .https_base_url = true;
+}
+
 #[given(expr = "the target endpoint of Transit Point {string} has the base path {string}")]
 fn transit_point_target_endpoint_has_base_path(
     world: &mut SurfaceWorld,
