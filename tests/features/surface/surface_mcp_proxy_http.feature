@@ -163,6 +163,35 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And REST API "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
+  Scenario: A legacy MCP proxy tool call answers the same tool result with and without the Target credential
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
+    Then the response status is 200
+    And the MCP tool result matches REST API "bravo" response
+    And REST API "bravo" answered the same MCP tool result with and without the Target credential
+
+  Scenario: A legacy MCP proxy tool call answers the same failed tool result with and without the Target credential
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" is failing with status 503
+    When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
+    Then the response status is 200
+    And the MCP tool result is marked as an error
+    And the MCP tool result matches REST API "bravo" response
+    And REST API "bravo" answered the same MCP tool result with and without the Target credential
+
+  Scenario: Only a legacy MCP proxy tool call with the Target credential checks the REST response against the tool's output schema
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" answers a weather report whose temperature is "warm"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
+    Then the response status is 200
+    And the MCP tool result without the Target credential matches REST API "bravo" response
+    And the MCP tool result is marked as an error
+    And the response mentions "REST response does not match the tool output schema"
+    And REST API "bravo" received exactly 2 requests
+
   Scenario: A credentialed tool call under the MCP proxy base path carries the Target credential
     Given the MCP proxy's base URL has the base path "/api/"
     And the surface requires "API Key" source authentication

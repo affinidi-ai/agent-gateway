@@ -2199,6 +2199,36 @@ fn managed_agent_is_failing_with_status(
     world.set_primary_target_response(response);
 }
 
+#[given(expr = "REST API {string} answers a weather report whose temperature is {string}")]
+fn rest_api_answers_weather_report_with_temperature(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    temperature: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        serde_json::json!({"city": "Paris", "temperature": temperature, "conditions": "Sunny"}),
+    );
+}
+
+#[given(expr = "REST API {string} is failing with status {int}")]
+fn rest_api_is_failing_with_status(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    status: u16,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    let mut response = MockResponse::json(serde_json::json!({ "error": format!("mock REST API status {status}") }));
+    response.status = status;
+    set_target_response_for_actor(world, &rest_api_name, response);
+}
+
 #[given(expr = "managed agent {string} responds with header {string} set to {string}")]
 fn managed_agent_responds_with_header(
     world: &mut SurfaceWorld,

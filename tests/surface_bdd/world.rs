@@ -127,6 +127,9 @@ pub struct SurfaceWorld {
     pub captured_mcp_identity_schema: Option<serde_json::Value>,
     pub sse_endpoint_path: Option<String>,
     pub sse_responses: Vec<serde_json::Value>,
+    /// The JSON-RPC response to an MCP tool call sent without the Target credential, kept for
+    /// comparison with the same call sent with it.
+    pub mcp_tool_response_without_target_credential: Option<serde_json::Value>,
     /// Collaborators a step said are reached over plain http; the gateway start checks the
     /// URL it writes for each.
     pub plain_http_collaborators: Vec<String>,
@@ -206,6 +209,7 @@ impl SurfaceWorld {
             captured_mcp_identity_schema: None,
             sse_endpoint_path: None,
             sse_responses: Vec::new(),
+            mcp_tool_response_without_target_credential: None,
             plain_http_collaborators: Vec::new(),
             mcp_stream: None,
             mcp_stream_buffer: String::new(),

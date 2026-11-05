@@ -3081,6 +3081,22 @@ async fn mcp_tool_call_with_city_argument_and_valid_api_key(
     send_json_request_and_record(world, body, vec![header]).await;
 }
 
+#[when(expr = "the caller invokes the MCP tool {string} for city {string} once without and once with a valid API key")]
+async fn mcp_tool_call_with_city_argument_without_then_with_valid_api_key(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+) {
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_json_request_and_record(world, body.clone(), vec![]).await;
+    world.mcp_tool_response_without_target_credential = world
+        .caller_response
+        .as_ref()
+        .map(|response| response.body.clone());
+    let header = build_valid_api_key_source_auth_header(world);
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} over Legacy SSE")]
 async fn mcp_tool_call_with_city_argument_over_legacy_sse(
     world: &mut SurfaceWorld,

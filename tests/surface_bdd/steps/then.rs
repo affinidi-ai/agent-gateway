@@ -2917,7 +2917,34 @@ fn mcp_tool_result_matches_rest_api_response(
     let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
         .configured_response
         .body;
-    let body = get_response_body_value(world);
+    assert_mcp_tool_result_carries_rest_api_body(get_response_body_value(world), expected, &actor_name);
+}
+
+#[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
+fn mcp_tool_result_without_target_credential_matches_rest_api_response(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let body = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result without the Target credential. Body: {body}"
+    );
+    assert_mcp_tool_result_carries_rest_api_body(body, expected, &actor_name);
+}
+
+fn assert_mcp_tool_result_carries_rest_api_body(
+    body: &serde_json::Value,
+    expected: &serde_json::Value,
+    actor_name: &str,
+) {
     let text = body
         .pointer("/result/content/0/text")
         .and_then(|value| value.as_str())
@@ -2931,6 +2958,64 @@ fn mcp_tool_result_matches_rest_api_response(
         actual, expected,
         "MCP tool result body differs from REST API '{}' response.\nExpected: {}\nActual: {}",
         actor_name, expected, actual
+    );
+}
+
+#[then(expr = "the MCP tool result is marked as an error")]
+fn mcp_tool_result_is_marked_as_an_error(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(true)),
+        "expected an MCP tool result with isError true. Body: {body}"
+    );
+}
+
+#[then(expr = "REST API {string} answered the same MCP tool result with and without the Target credential")]
+fn rest_api_answered_same_tool_result_with_and_without_target_credential(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let header_name = &world
+        .surface_config
+        .target_auth
+        .as_ref()
+        .expect("the scenario must configure a Target credential")
+        .header_name;
+    let context = format!("REST API '{}'", actor_name);
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi),
+        &context,
+    );
+    let [without, with] = requests else {
+        panic!("expected {context} to receive two requests, got {}: {requests:?}", requests.len());
+    };
+    assert_collaborator_header_absent(&without.headers, header_name, &format!("{context}, first request"));
+    assert!(
+        with.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(header_name)),
+        "expected the second request to {context} to carry the Target credential header '{header_name}'"
+    );
+    assert_eq!(
+        (&without.method, &without.path_and_query),
+        (&with.method, &with.path_and_query),
+        "both tool calls must reach the same {context} resource"
+    );
+    let without = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    let with = get_response_body_value(world);
+    assert!(
+        without
+            .get("result")
+            .is_some(),
+        "the call without the Target credential must answer a tool result. Body: {without}"
+    );
+    assert_eq!(
+        without, with,
+        "the MCP tool result differs with the Target credential.\nWithout: {without}\nWith: {with}"
     );
 }
 
