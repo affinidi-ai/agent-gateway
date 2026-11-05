@@ -360,6 +360,26 @@ pub async fn oauth_callback(
         }
     };
 
+    if oauth_state.provider_id != provider_id {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %logged_provider_id,
+            state_provider_id = %oauth_state.provider_id,
+            "OAuth callback path names another provider than its state"
+        );
+        return Html(
+            r#"<!DOCTYPE html>
+<html><head><title>Authorization Failed</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h2>Authorization Failed</h2>
+<p>This authorization link does not match its provider.</p>
+<p>Please try again from the original application.</p>
+</body></html>"#
+                .to_string(),
+        )
+        .into_response();
+    }
+
     // Load the credential provider
     let provider = match state
         .provider_store
@@ -565,7 +585,7 @@ pub async fn oauth_callback(
                     super::audit::DelegationAuditAction::ConsentGranted,
                     Some(&oauth_state.agent_did),
                     Some(&oauth_state.user_identity_hash),
-                    Some(&provider_id),
+                    Some(&oauth_state.provider_id),
                     Some(&oauth_state.surface_id),
                 );
                 evt.scopes = Some(granted_scopes.clone());
@@ -669,7 +689,7 @@ pub async fn oauth_callback(
             // be populated by the MCP elicitation flow.
             if let Some(notifier) = &state.vault_population_notifier {
                 notifier
-                    .notify(&oauth_state.agent_did, &oauth_state.user_identity_hash, &provider_id)
+                    .notify(&oauth_state.agent_did, &oauth_state.user_identity_hash, &oauth_state.provider_id)
                     .await;
             }
         }

@@ -412,6 +412,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_callback_whose_path_names_another_provider_than_its_state_is_refused() {
+        let state = crate::delegation_vault::OAuthState {
+            agent_did: "did:web:agent.example".to_string(),
+            user_identity_hash: "sha256:user".to_string(),
+            surface_id: "surface".to_string(),
+            credential_provider_id: "deleted-provider".to_string(),
+            provider_id: "github".to_string(),
+            nonce: uuid::Uuid::new_v4().to_string(),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            code_verifier: None,
+        };
+        let encoded = crate::delegation_vault::oauth::encode_oauth_state(&state).unwrap();
+        let response = create_delegation_vault_oauth_router(state_with(Vec::new()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/identity/oauth/callback/gitlab?code=code&state={encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("does not match its provider"), "{body}");
+        assert!(
+            crate::delegation_vault::oauth::claim_oauth_state(&state).await,
+            "the refused callback left the state unused"
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_error_on_the_callback_logs_only_the_oauth_error_code() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let app = create_delegation_vault_oauth_router(state_with(Vec::new()));

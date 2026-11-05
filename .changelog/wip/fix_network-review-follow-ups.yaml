@@ -37,6 +37,14 @@ changes:
         The OAuth consent callback, which needs no authentication, logged the provider id from its
         path as-is on every line, so a caller could put a line break in it and forge log lines. It
         is now escaped and cut to 256 characters.
+    - timestamp: '2026-11-05T09:15:00Z'
+      title: Refuse an OAuth consent callback whose path names another provider
+      description: >-
+        The OAuth consent callback took the provider id from its path for its audit event and to
+        wake the tool calls waiting on the consent, though the state it carries names the
+        provider. A valid code and state replayed to another provider's callback path stored the
+        right token but recorded the wrong provider and woke no waiting call. Such a callback is
+        now refused before the code exchange, without using up its state.
     - timestamp: '2026-11-04T09:00:00Z'
       title: Forward a caller's JWT to the Target only after it verified
       description: >-
