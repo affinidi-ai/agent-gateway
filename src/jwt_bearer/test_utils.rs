@@ -105,7 +105,23 @@ pub async fn start_jwks_server(
             .unwrap();
     });
 
-    (format!("http://{}", addr), TestServer(handle))
+    let origin = format!("http://{}", addr);
+    JWKS_FIXTURE_ORIGINS
+        .lock()
+        .unwrap()
+        .push(origin.clone());
+    (origin, TestServer(handle))
+}
+
+/// The origins of the loopback JWKS servers [`start_jwks_server`] started, which
+/// the JWKS client admits although the Strict egress policy refuses loopback.
+static JWKS_FIXTURE_ORIGINS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn jwks_fixture_origins() -> Vec<String> {
+    JWKS_FIXTURE_ORIGINS
+        .lock()
+        .unwrap()
+        .clone()
 }
 
 /// Build a minimal JWKS JSON body with a single RSA key.

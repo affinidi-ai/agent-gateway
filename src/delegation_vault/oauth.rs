@@ -849,8 +849,24 @@ impl TokenEgress {
         Ok(())
     }
 
-    /// A redirect-off client pinned to the addresses `endpoint` resolved to when it was
-    /// vetted, and the URL to post to. A blocked address is [`TokenEndpointRefused`].
+    /// Whether the Strict egress policy refuses `endpoint`: not an http(s) URL, or a host
+    /// that resolves to a non-public address. A host that does not resolve now is not
+    /// refused here; every token request vets it again.
+    pub(crate) async fn refuses_token_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> bool {
+        let raw = endpoint.to_string();
+        let allowlist = self.exact_allowlist.clone();
+        matches!(
+            tokio::task::spawn_blocking(move || crate::egress::vet_strict(&raw, allowlist.as_deref())).await,
+            Ok(Err(crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_)))
+        )
+    }
+
+    /// A redirect-off client that ignores proxies, pinned to the addresses `endpoint`
+    /// resolved to when the Strict policy vetted it, and the URL to post to. A blocked
+    /// address is [`TokenEndpointRefused`].
     pub(crate) async fn pinned_client(
         &self,
         endpoint: &str,
@@ -859,7 +875,7 @@ impl TokenEgress {
         let timeout = self.timeout;
         let allowlist = self.exact_allowlist.clone();
         let (client, target) = tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
+            crate::egress::pinned_strict_direct_client(&raw, timeout, allowlist.as_deref())
         })
         .await
         .context("Provider token request failed")?

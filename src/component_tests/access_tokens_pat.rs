@@ -1673,9 +1673,9 @@ async fn jwt_strategy_update_lets_a_pat_with_the_edit_scope_change_a_strategy() 
 }
 
 #[tokio::test]
-async fn jwks_uri_validation_refuses_a_pat_without_the_view_scope() {
+async fn jwks_uri_validation_refuses_a_pat_without_the_edit_scope() {
     let fixture = jwt_strategies_app().await;
-    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["surfaces.view"]).await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
 
     assert_eq!(
         json_request(
@@ -1691,9 +1691,9 @@ async fn jwks_uri_validation_refuses_a_pat_without_the_view_scope() {
 }
 
 #[tokio::test]
-async fn jwks_uri_validation_lets_a_pat_with_the_view_scope_reach_the_probe() {
+async fn jwks_uri_validation_lets_a_pat_with_the_edit_scope_reach_the_probe() {
     let fixture = jwt_strategies_app().await;
-    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.edit"]).await;
 
     assert_eq!(
         json_request(

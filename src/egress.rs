@@ -264,7 +264,8 @@ fn pinned_client(
 }
 
 /// [`pinned_client`] for a vendor call of external consent, which carries a
-/// client's credentials or a person's token: it ignores any proxy the
+/// client's credentials or a person's token, and for a JWT verification
+/// strategy's JWKS fetch and a credential provider's token request: it ignores any proxy the
 /// environment or the system names and connects directly, since a proxy would
 /// resolve the host again and connect to an address nobody vetted, voiding the
 /// pin. [`warn_when_vendor_clients_ignore_a_proxy`] says so at startup.
@@ -288,10 +289,11 @@ pub(crate) const PROXY_VARIABLES: [&str; 6] =
 /// Warn, once at startup, when the environment names a proxy: the vendor
 /// clients of external consent (the providers' own issuer metadata, the code
 /// exchange, token refresh, token revocation, and requests that carry a grant
-/// by binding) ignore it and connect directly, so the host needs direct egress
-/// to those vendors. Every other egress, inbound and MCP authorization server
-/// discovery included, uses the proxy as before. Returns the variables found
-/// set.
+/// by binding), the JWKS fetches of JWT verification strategies and the token
+/// requests of credential providers ignore it and connect directly, so the host
+/// needs direct egress to those vendors and identity providers. Every other
+/// egress, inbound and MCP authorization server discovery included, uses the
+/// proxy as before. Returns the variables found set.
 pub(crate) fn warn_when_vendor_clients_ignore_a_proxy(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
     let set: Vec<&'static str> = PROXY_VARIABLES
         .into_iter()
@@ -302,10 +304,11 @@ pub(crate) fn warn_when_vendor_clients_ignore_a_proxy(lookup: impl Fn(&str) -> O
             target: "credential_delegation",
             variables = ?set,
             "A proxy is set, but the vendor clients of external consent (the providers' own issuer metadata, the \
-             code exchange, token refresh, token revocation, and requests that carry a grant by binding) ignore it \
-             and connect directly, since a proxy would resolve each vendor's host again and void the pin to its \
-             vetted addresses; allow direct egress to those vendors. Inbound and MCP authorization server \
-             discovery, like all other egress, use the proxy"
+             code exchange, token refresh, token revocation, and requests that carry a grant by binding), the JWKS \
+             fetches of JWT verification strategies and the token requests of credential providers ignore it and \
+             connect directly, since a proxy would resolve each host again and void the pin to its vetted \
+             addresses; allow direct egress to those vendors and identity providers. Inbound and MCP \
+             authorization server discovery, like all other egress, use the proxy"
         );
     }
     set
@@ -410,6 +413,34 @@ pub(crate) async fn pinned_vendor_client(
     }
     let target = resolve_pin_blocking(raw_url.to_string(), EgressPolicy::Strict, exact_allowlist).await?;
     pinned_direct_client(&target, timeout)
+}
+
+/// Vet `raw_url` with the Strict policy and pin it to the addresses it
+/// resolved to. `exact_allowlist` is the BDD allow-list
+/// ([`bdd_egress_allowlist`] on the production path), which can admit a
+/// loopback fixture but never cloud metadata.
+///
+/// Resolves DNS (blocking OS resolver); call from a blocking context.
+pub(crate) fn vet_strict(
+    raw_url: &str,
+    exact_allowlist: Option<&str>,
+) -> Result<PinnedTarget, EgressError> {
+    validate_and_pin_inner(raw_url, EgressPolicy::Strict, exact_allowlist)
+}
+
+/// [`vet_strict`] and a redirect-off client pinned to the vetted addresses
+/// that ignores proxies ([`pinned_direct_client`]), for a JWT verification
+/// strategy's JWKS fetch and a credential provider's token request.
+///
+/// Resolves DNS (blocking OS resolver); call from a blocking context.
+pub(crate) fn pinned_strict_direct_client(
+    raw_url: &str,
+    timeout: Duration,
+    exact_allowlist: Option<&str>,
+) -> Result<(Client, PinnedTarget), EgressError> {
+    let target = vet_strict(raw_url, exact_allowlist)?;
+    let client = pinned_direct_client(&target, timeout)?;
+    Ok((client, target))
 }
 
 fn allowlisted(
@@ -641,6 +672,47 @@ mod tests {
     }
 
     #[test]
+    fn strict_direct_client_refuses_private_ranges_and_admits_only_an_allow_listed_fixture() {
+        let timeout = Duration::from_secs(1);
+        for raw in [
+            "http://10.0.0.1/jwks.json",
+            "http://172.16.0.1/jwks.json",
+            "http://192.168.1.1/jwks.json",
+            "http://127.0.0.1:9/jwks.json",
+            "http://[::1]/jwks.json",
+            "http://169.254.1.1/jwks.json",
+            "http://[fd00::1]/jwks.json",
+            "http://[::ffff:10.0.0.1]/jwks.json",
+        ] {
+            assert!(
+                matches!(pinned_strict_direct_client(raw, timeout, None), Err(EgressError::Blocked(_))),
+                "strict direct must refuse {raw}"
+            );
+        }
+        let (_, target) = pinned_strict_direct_client("https://1.2.3.4/jwks.json", timeout, None)
+            .expect("a public address is admitted");
+        assert_eq!(target.addrs, vec!["1.2.3.4:443".parse().unwrap()]);
+        let (_, fixture) =
+            pinned_strict_direct_client("http://127.0.0.1:9/jwks.json", timeout, Some("http://127.0.0.1:9"))
+                .expect("an allow-listed loopback fixture is admitted");
+        assert_eq!(fixture.addrs, vec!["127.0.0.1:9".parse().unwrap()]);
+        assert!(
+            matches!(
+                pinned_strict_direct_client("http://10.0.0.1/jwks.json", timeout, Some("http://127.0.0.1:9")),
+                Err(EgressError::Blocked(_))
+            ),
+            "the allow-list admits only what it names"
+        );
+        assert!(
+            matches!(
+                vet_strict("http://169.254.169.254/latest/", Some("http://169.254.169.254")),
+                Err(EgressError::Blocked(_))
+            ),
+            "metadata is never allow-listed"
+        );
+    }
+
+    #[test]
     fn parse_error_fails_closed() {
         assert!(matches!(pin_strict("not a url"), Err(EgressError::Blocked(_))));
         assert!(matches!(pin_strict("ftp://example.com/"), Err(EgressError::Blocked(_))));
@@ -835,6 +907,11 @@ mod tests {
                 assert!(!through_proxy(vendor).await, "a vendor call of external consent connects directly");
                 let (metadata, _) = pinned_metadata_client(&url, false, Duration::from_secs(5)).unwrap();
                 assert!(!through_proxy(metadata).await, "authorization server metadata is read directly");
+                let (strict_direct, _) = pinned_strict_direct_client(&url, Duration::from_secs(5), Some(&url)).unwrap();
+                assert!(
+                    !through_proxy(strict_direct).await,
+                    "a JWKS fetch or credential provider token request connects directly"
+                );
 
                 let operator = crate::authz_metadata::EgressPosture::CloudMetadataOnly;
                 let discovery = crate::authz_metadata::discovery_client(
@@ -872,6 +949,12 @@ mod tests {
         assert!(text.contains("connect directly"), "{text}");
         assert!(text.contains("providers' own issuer metadata"), "{text}");
         assert!(text.contains("the code exchange, token refresh, token revocation"), "{text}");
+        assert!(
+            text.contains(
+                "the JWKS fetches of JWT verification strategies and the token requests of credential providers"
+            ),
+            "{text}"
+        );
         assert!(text.contains("MCP authorization server discovery, like all other egress, use the proxy"), "{text}");
         assert!(!text.contains("proxy.internal"), "the proxy's address is not logged: {text}");
 
