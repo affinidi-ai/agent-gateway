@@ -70,6 +70,14 @@ pub struct AgentIdentityCredentialSubject {
     pub region: Option<String>,
 }
 
+/// The surface a request uses its identity on as the managed agent; `None` for a caller.
+fn managed_request_surface(
+    role: Option<IdentityOrigin>,
+    surface_id: Option<&str>,
+) -> Option<&str> {
+    surface_id.filter(|_| role == Some(IdentityOrigin::Managed))
+}
+
 /// VC Issuer configuration
 #[derive(Debug, Clone)]
 pub struct VCIssuerConfig {
@@ -188,7 +196,7 @@ impl VCIssuer {
         let _ = self.surface_store.set(store);
     }
 
-    fn surface_store(&self) -> Option<Arc<dyn crate::surfaces::AgentSurfaceStore>> {
+    pub(crate) fn surface_store(&self) -> Option<Arc<dyn crate::surfaces::AgentSurfaceStore>> {
         self.surface_store
             .get()
             .cloned()
@@ -852,7 +860,7 @@ impl VCIssuer {
         .await?;
 
         let name = self
-            .managed_display_name(&agent_did, origin, channel_config_id.as_deref())
+            .managed_display_name(&agent_did, origin, managed_request_surface(origin, channel_config_id.as_deref()))
             .await;
         let vc = self
             .create_credential(&agent_did, &identity_fields, name.as_ref())
@@ -885,7 +893,7 @@ impl VCIssuer {
         // call exercises the existing-record branch above.
         if let Err(e) = self
             .identity_store
-            .update_usage(&identity_hash, channel_config_id)
+            .update_usage(&identity_hash, channel_config_id, origin)
             .await
         {
             warn!(
@@ -928,11 +936,15 @@ impl VCIssuer {
             (existing, _) => existing,
         };
         self.identity_store
-            .update_usage(identity_hash, channel_config_id.clone())
+            .update_usage(identity_hash, channel_config_id.clone(), origin)
             .await?;
 
         let name = self
-            .managed_display_name(&record.did, effective_origin, channel_config_id.as_deref())
+            .managed_display_name(
+                &record.did,
+                effective_origin,
+                managed_request_surface(origin, channel_config_id.as_deref()),
+            )
             .await;
 
         let vc = self
@@ -965,36 +977,45 @@ impl VCIssuer {
         }
     }
 
-    /// Display name `surface_id` gives its managed agent `agent_did`; `None` when the
+    /// Display name of the managed agent `agent_did` of `surface_id`; `None` when the
     /// surface or the identity list is unavailable.
     pub async fn surface_display_name(
         &self,
         agent_did: &str,
         surface_id: &str,
     ) -> Option<ManagedDisplayName> {
+        self.resolve_display_name(agent_did, Some(surface_id))
+            .await
+    }
+
+    async fn resolve_display_name(
+        &self,
+        agent_did: &str,
+        managed_on: Option<&str>,
+    ) -> Option<ManagedDisplayName> {
         let surface_store = self.surface_store()?;
         resolve_managed_display_name_in(
             surface_store.as_ref(),
             agent_did,
-            surface_id,
+            managed_on,
             self.identity_store.as_ref(),
             &self.surfaces_by_did,
         )
         .await
     }
 
-    /// Display name for a managed identity (its surface name); `None` for callers, unknown origins, unnamed agents and DIDs shared by
-    /// several surfaces.
+    /// Display name for a managed identity (the name of its one managed surface); `None` for
+    /// callers, unknown origins, unnamed agents and shared managed DIDs.
     async fn managed_display_name(
         &self,
         agent_did: &str,
         origin: Option<IdentityOrigin>,
-        surface_id: Option<&str>,
+        managed_on: Option<&str>,
     ) -> Option<DisplayName> {
         if origin != Some(IdentityOrigin::Managed) {
             return None;
         }
-        self.surface_display_name(agent_did, surface_id?)
+        self.resolve_display_name(agent_did, managed_on)
             .await?
             .publishable(agent_did)
             .cloned()
@@ -1015,14 +1036,8 @@ impl VCIssuer {
                 return None;
             }
         };
-        self.managed_display_name(
-            agent_did,
-            record.origin,
-            record
-                .channel_config_id
-                .as_deref(),
-        )
-        .await
+        self.managed_display_name(agent_did, record.origin, None)
+            .await
     }
 
     /// Create a verifiable credential for an agent identity
@@ -2735,18 +2750,18 @@ mod tests {
         #[tokio::test]
         async fn did_on_two_surfaces_gets_no_name() {
             let f = fixture().await;
-            f.save_surface("vc-name-conflict-a", "OXYGEN")
+            f.save_surface("vc-name-shared-a", "OXYGEN")
                 .await;
-            f.save_surface("vc-name-conflict-b", "HELIUM")
+            f.save_surface("vc-name-shared-b", "HELIUM")
                 .await;
             let issuer = &f.issuer;
             let first = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-shared-a".into()), None)
                 .await
                 .unwrap();
 
             let mut sibling =
-                crate::identity::test_helpers::test_surface_identity_record(&first.did, "vc-name-conflict-b");
+                crate::identity::test_helpers::test_surface_identity_record(&first.did, "vc-name-shared-b");
             sibling.identity_hash = "sibling".to_string();
             sibling.origin = Some(IdentityOrigin::Managed);
             issuer
@@ -2756,7 +2771,7 @@ mod tests {
                 .unwrap();
 
             let second = issuer
-                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-shared-a".into()), None)
                 .await
                 .unwrap();
 
@@ -2849,9 +2864,10 @@ mod tests {
                 &self,
                 identity_hash: &str,
                 channel_config_id: Option<String>,
+                role: Option<IdentityOrigin>,
             ) -> Result<()> {
                 self.0
-                    .update_usage(identity_hash, channel_config_id)
+                    .update_usage(identity_hash, channel_config_id, role)
                     .await
             }
             async fn store_external_did(

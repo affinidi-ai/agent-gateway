@@ -1,0 +1,29 @@
+branch: fix/name-conflict-on-identities
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-05T14:14:35Z'
+      title: List a managed agent shared by several surfaces once, with its surfaces
+      description: >-
+        A managed agent DID used on several surfaces with the same identity is shown once on the
+        Identities page as "Unnamed Agent" with "N surfaces" beneath, and its Agent Surface column
+        lists every surface where it is the managed agent. `GET /identities` gains
+        `managed_surfaces`; `surface_id` and `surface_name` are set only for a DID with one managed
+        surface.
+  fixed:
+    - timestamp: '2026-11-05T14:14:35Z'
+      title: Stop counting caller-only and deleted surfaces as a managed agent's surfaces
+      description: >-
+        Each surface use now records whether the DID was the managed agent or a caller there. A
+        managed agent that called another surface, or whose old surface was deleted, is no longer
+        treated as shared: the dashboard names it, and its surface name is signed into its VC and
+        published to the Trust Registry again. Usage saved before this change counts as managed only
+        on a live surface that configures a managed identity.
+  removed:
+    - timestamp: '2026-11-05T14:14:35Z'
+      title: Remove the "name conflict" badge and the "Unnamed only" Identities filter
+      description: >-
+        The badge is replaced by the shared managed DID display, and `name_conflict` is no longer
+        returned by `GET /identities`.
+  security: []
+  breaking: []

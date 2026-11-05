@@ -749,6 +749,7 @@ mod tests {
                 channel_config_id: surface_id.to_string(),
                 usage_count: 1,
                 last_used_at,
+                role: None,
             }],
             private_key: None,
             channel_config_id: Some(surface_id.to_string()),

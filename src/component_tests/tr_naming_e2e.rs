@@ -167,12 +167,12 @@ async fn surface_rename_republishes_managed_agent_name() {
         .await
         .unwrap();
     publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, &[]))
         .await;
 
     surface.name = "HELIUM".to_string();
     let outcomes = publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, &[]))
         .await;
 
     assert_eq!(outcomes, vec![PublishOutcome::Updated]);

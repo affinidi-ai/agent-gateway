@@ -170,7 +170,7 @@ impl Fixture {
     }
 }
 
-fn legacy_managed_record(
+fn managed_record(
     did: &str,
     surface_ids: &[&str],
     fields: HashMap<String, Value>,
@@ -189,6 +189,7 @@ fn legacy_managed_record(
                 channel_config_id: id.to_string(),
                 usage_count: 1,
                 last_used_at: now,
+                role: Some(IdentityOrigin::Managed),
             })
             .collect(),
         private_key: None,
@@ -222,7 +223,7 @@ async fn store_managed(
 async fn managed_identity_shows_surface_name_and_credential_principal() {
     let fixture = Fixture::new(&[("oxygen", "OXYGEN")]).await;
     let fields = HashMap::from([("certificate_id".to_string(), json!("NITROGEN"))]);
-    store_managed(&fixture, legacy_managed_record("did:example:oxygen", &["oxygen"], fields)).await;
+    store_managed(&fixture, managed_record("did:example:oxygen", &["oxygen"], fields)).await;
 
     let row = serde_json::to_value(&fixture.rows().await["did:example:oxygen"]).expect("row JSON");
 
@@ -235,19 +236,48 @@ async fn managed_identity_shows_surface_name_and_credential_principal() {
 }
 
 #[tokio::test]
-async fn did_shared_by_two_surfaces_is_marked_as_a_name_conflict() {
-    let fixture = Fixture::new(&[("oxygen", "OXYGEN"), ("helium", "HELIUM")]).await;
-    store_managed(&fixture, legacy_managed_record("did:example:shared", &["oxygen", "helium"], HashMap::new())).await;
+async fn shared_managed_did_is_listed_once_with_its_managed_surfaces() {
+    let fixture =
+        Fixture::new(&[("alpha", "alpha"), ("bravo", "bravo"), ("charlie", "charlie"), ("delta", "delta")]).await;
+    store_managed(&fixture, managed_record("did:example:shared", &["alpha", "bravo", "charlie"], HashMap::new())).await;
+    fixture
+        .identities
+        .update_usage("hash-did:example:shared", Some("delta".to_string()), Some(IdentityOrigin::ExternalCaller))
+        .await
+        .expect("caller use");
 
-    let row = serde_json::to_value(&fixture.rows().await["did:example:shared"]).expect("row JSON");
+    let rows = fixture.rows().await;
+    let row = serde_json::to_value(&rows["did:example:shared"]).expect("row JSON");
 
-    assert_eq!(row["name_conflict"], json!(true));
-    assert!(
-        row.get("display_name")
-            .is_none(),
-        "conflict row must not carry a name: {row}"
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        row["managed_surfaces"],
+        json!([
+            { "surface_id": "alpha", "surface_name": "alpha" },
+            { "surface_id": "bravo", "surface_name": "bravo" },
+            { "surface_id": "charlie", "surface_name": "charlie" }
+        ])
     );
-    assert_eq!(row["surface_name"], json!("OXYGEN"));
+    for absent in ["display_name", "surface_id", "surface_name", "name_conflict"] {
+        assert!(row.get(absent).is_none(), "{absent} must be omitted for a shared managed DID: {row}");
+    }
+}
+
+#[tokio::test]
+async fn surface_where_the_managed_agent_was_only_a_caller_is_not_listed() {
+    let fixture = Fixture::new(&[("alpha", "alpha"), ("delta", "delta")]).await;
+    store_managed(&fixture, managed_record("did:example:alpha", &["alpha"], HashMap::new())).await;
+    fixture
+        .identities
+        .update_usage("hash-did:example:alpha", Some("delta".to_string()), Some(IdentityOrigin::ExternalCaller))
+        .await
+        .expect("caller use");
+
+    let row = serde_json::to_value(&fixture.rows().await["did:example:alpha"]).expect("row JSON");
+
+    assert_eq!(row["display_name"], json!("alpha"));
+    assert_eq!(row["surface_id"], json!("alpha"));
+    assert_eq!(row["managed_surfaces"], json!([{ "surface_id": "alpha", "surface_name": "alpha" }]));
 }
 
 #[tokio::test]
@@ -267,7 +297,7 @@ async fn external_caller_never_takes_surface_fields() {
     let row = serde_json::to_value(&fixture.rows().await[CALLER_DID]).expect("row JSON");
 
     assert_eq!(row["origin"], json!("external_caller"));
-    for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
+    for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "managed_surfaces"] {
         assert!(row.get(absent).is_none(), "{absent} must be omitted for a caller row: {row}");
     }
 
@@ -336,7 +366,7 @@ async fn delta_includes_caller_after_its_name_resolves() {
 #[tokio::test]
 async fn managed_identity_shows_target_agent_card_name_once_resolved() {
     let fixture = Fixture::with_targets(&[("def", "DEF", TARGET_URL)]).await;
-    store_managed(&fixture, legacy_managed_record("did:example:def", &["def"], HashMap::new())).await;
+    store_managed(&fixture, managed_record("did:example:def", &["def"], HashMap::new())).await;
 
     let first = serde_json::to_value(&fixture.rows().await["did:example:def"]).expect("row JSON");
     assert_eq!(first["display_name"], json!("DEF"));
@@ -365,7 +395,7 @@ async fn managed_identity_shows_target_agent_card_name_once_resolved() {
 #[tokio::test]
 async fn managed_identity_without_reachable_card_keeps_surface_name() {
     let fixture = Fixture::with_targets(&[("ghi", "GHI", "http://localhost:9999")]).await;
-    store_managed(&fixture, legacy_managed_record("did:example:ghi", &["ghi"], HashMap::new())).await;
+    store_managed(&fixture, managed_record("did:example:ghi", &["ghi"], HashMap::new())).await;
 
     fixture.rows().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -377,7 +407,7 @@ async fn managed_identity_without_reachable_card_keeps_surface_name() {
 #[tokio::test]
 async fn delta_includes_managed_identity_after_its_card_name_resolves() {
     let fixture = Fixture::with_targets(&[("def", "DEF", TARGET_URL)]).await;
-    store_managed(&fixture, legacy_managed_record("did:example:def", &["def"], HashMap::new())).await;
+    store_managed(&fixture, managed_record("did:example:def", &["def"], HashMap::new())).await;
     let since = Utc::now() + chrono::Duration::milliseconds(1);
     tokio::time::sleep(Duration::from_millis(5)).await;
 

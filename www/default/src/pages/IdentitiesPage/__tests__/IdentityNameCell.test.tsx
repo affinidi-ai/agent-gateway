@@ -9,6 +9,11 @@ import {
 } from '../IdentityNameCell';
 
 const LONG_DID = 'did:webvh:zQmScid0123456789abcdef:gateway.example.com:surface:0123456789abcdef';
+const SHARED_SURFACES = [
+  { surface_id: 's-alpha', surface_name: 'alpha' },
+  { surface_id: 's-bravo', surface_name: 'bravo' },
+  { surface_id: 's-charlie', surface_name: 'charlie' },
+];
 
 const renderCell = (identity: Partial<NamedIdentity>, liveSurfaceName?: string) =>
   render(
@@ -68,7 +73,7 @@ describe('IdentityNameCell', () => {
     expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
     expect(screen.queryByText('No name')).not.toBeInTheDocument();
     expect(screen.queryByTestId('identities-name-pending')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('identities-name-conflict')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('identities-unnamed-agent')).not.toBeInTheDocument();
     expect(screen.getByTitle(LONG_DID).style.fontSize).toBe('');
     expect(screen.getByTestId('identities-copy-did-button')).toBeInTheDocument();
   });
@@ -98,12 +103,41 @@ describe('IdentityNameCell', () => {
     expect(screen.queryByTestId('identities-name-pending')).not.toBeInTheDocument();
   });
 
-  it('shows the DID as primary with the name conflict marker beside it', () => {
-    renderCell({ name_conflict: true });
+  it('shows a shared managed DID as a muted Unnamed Agent with its surface count above the DID', () => {
+    renderCell({ managed_surfaces: SHARED_SURFACES });
 
-    expect(screen.getByTestId('identities-name-conflict')).toHaveTextContent('name conflict');
+    const unnamed = screen.getByTestId('identities-unnamed-agent');
+    expect(unnamed).toHaveTextContent('Unnamed Agent');
+    expect(unnamed).toHaveClass('text-muted', 'fst-italic');
+    expect(unnamed.tagName).not.toBe('STRONG');
+    expect(screen.getByTestId('identities-shared-surface-count')).toHaveTextContent('3 surfaces');
     expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
-    expect(screen.getByTitle(LONG_DID).style.fontSize).toBe('');
+    expect(screen.getByTitle(LONG_DID).style.fontSize).toBe('0.75rem');
+    expect(screen.getByTestId('identities-copy-did-button')).toBeInTheDocument();
+    expect(screen.queryByText(/name conflict/i)).not.toBeInTheDocument();
+  });
+
+  it('shows Unnamed Agent for a shared managed DID even when a display name is sent', () => {
+    renderCell({
+      managed_surfaces: SHARED_SURFACES,
+      display_name: 'DateTime Agent',
+      display_name_source: 'target_agent_card',
+    });
+
+    expect(screen.getByTestId('identities-unnamed-agent')).toBeInTheDocument();
+    expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
+  });
+
+  it('shows a single-surface managed DID by its name, without the shared lines', () => {
+    renderCell({
+      display_name: 'alpha',
+      display_name_source: 'surface_name',
+      managed_surfaces: [SHARED_SURFACES[0]],
+    });
+
+    expect(screen.getByTestId('identities-name')).toHaveTextContent('alpha');
+    expect(screen.queryByTestId('identities-unnamed-agent')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('identities-shared-surface-count')).not.toBeInTheDocument();
   });
 
   it('shows a verified agent name as local · host with the domain prominent', () => {
@@ -135,14 +169,14 @@ describe('IdentityNameCell', () => {
   it('renders only the DID line when names are hidden', () => {
     render(
       <IdentityNameCell
-        identity={{ did: LONG_DID, display_name_pending: true, name_conflict: true }}
+        identity={{ did: LONG_DID, display_name_pending: true, managed_surfaces: SHARED_SURFACES }}
         showName={false}
       />
     );
 
     expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
     expect(screen.queryByTestId('identities-name-pending')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('identities-name-conflict')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('identities-unnamed-agent')).not.toBeInTheDocument();
     expect(screen.getByTitle(LONG_DID)).toBeInTheDocument();
   });
 });

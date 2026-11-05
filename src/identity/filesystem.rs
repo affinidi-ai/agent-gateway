@@ -26,6 +26,11 @@ pub struct ChannelUsage {
 
     /// Timestamp when this identity was last used on this channel
     pub last_used_at: chrono::DateTime<chrono::Utc>,
+
+    /// Whether the identity was the managed agent or a caller on this channel; `None` for
+    /// entries written before roles were recorded. Once managed, an entry stays managed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<IdentityOrigin>,
 }
 
 fn normalize_did_port(did: &str) -> String {
@@ -142,6 +147,38 @@ impl AgentIdentityRecord {
             Some(origin) => Some(origin),
             None if !self.is_local => Some(IdentityOrigin::ExternalCaller),
             None => None,
+        }
+    }
+
+    /// Count one use on `channel_id` in `role`, making it the last-used channel. A managed
+    /// entry keeps its role; any other entry takes `role` when one is given.
+    pub(crate) fn record_channel_use(
+        &mut self,
+        channel_id: &str,
+        role: Option<IdentityOrigin>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.channel_config_id = Some(channel_id.to_string());
+        match self
+            .channel_usage
+            .iter_mut()
+            .find(|cu| cu.channel_config_id == channel_id)
+        {
+            Some(usage) => {
+                usage.usage_count += 1;
+                usage.last_used_at = now;
+                if role.is_some() && usage.role != Some(IdentityOrigin::Managed) {
+                    usage.role = role;
+                }
+            }
+            None => self
+                .channel_usage
+                .push(ChannelUsage {
+                    channel_config_id: channel_id.to_string(),
+                    usage_count: 1,
+                    last_used_at: now,
+                    role,
+                }),
         }
     }
 }
@@ -311,6 +348,7 @@ impl IdentityStore for FilesystemIdentityStore {
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<IdentityOrigin>,
     ) -> Result<()> {
         let _guard = self
             .record_lock(identity_hash)
@@ -334,29 +372,8 @@ impl IdentityStore for FilesystemIdentityStore {
             record.usage_count += 1;
             record.last_used_at = Some(now);
 
-            // Update channel_config_id to track the last-used channel
             if let Some(ref channel_id) = channel_config_id {
-                record.channel_config_id = Some(channel_id.clone());
-
-                // Update per-channel usage stats
-                if let Some(channel_usage) = record
-                    .channel_usage
-                    .iter_mut()
-                    .find(|cu| &cu.channel_config_id == channel_id)
-                {
-                    // Update existing channel usage
-                    channel_usage.usage_count += 1;
-                    channel_usage.last_used_at = now;
-                } else {
-                    // Add new channel usage entry
-                    record
-                        .channel_usage
-                        .push(ChannelUsage {
-                            channel_config_id: channel_id.clone(),
-                            usage_count: 1,
-                            last_used_at: now,
-                        });
-                }
+                record.record_channel_use(channel_id, role, now);
             }
 
             // Clone record for broadcast before saving
@@ -422,29 +439,8 @@ impl IdentityStore for FilesystemIdentityStore {
             existing.last_used_at = Some(now);
             existing.usage_count += 1;
 
-            // Update channel_config_id to track the last-used channel
             if let Some(ref channel_id) = channel_config_id {
-                existing.channel_config_id = Some(channel_id.clone());
-
-                // Update per-channel usage stats
-                if let Some(channel_usage) = existing
-                    .channel_usage
-                    .iter_mut()
-                    .find(|cu| &cu.channel_config_id == channel_id)
-                {
-                    // Update existing channel usage
-                    channel_usage.usage_count += 1;
-                    channel_usage.last_used_at = now;
-                } else {
-                    // Add new channel usage entry
-                    existing
-                        .channel_usage
-                        .push(ChannelUsage {
-                            channel_config_id: channel_id.clone(),
-                            usage_count: 1,
-                            last_used_at: now,
-                        });
-                }
+                existing.record_channel_use(channel_id, Some(IdentityOrigin::ExternalCaller), now);
             }
 
             // Update verified status if it changed from false to true
@@ -479,6 +475,7 @@ impl IdentityStore for FilesystemIdentityStore {
                 channel_config_id: channel_id.clone(),
                 usage_count: 1,
                 last_used_at: now,
+                role: Some(IdentityOrigin::ExternalCaller),
             }]
         } else {
             vec![]
@@ -936,7 +933,7 @@ mod tests {
     async fn test_update_usage_never_drops_a_concurrent_origin() {
         let lost = origins_lost_to_concurrent(|store, record| async move {
             store
-                .update_usage(&record.identity_hash, Some("surface-a".into()))
+                .update_usage(&record.identity_hash, Some("surface-a".into()), Some(IdentityOrigin::Managed))
                 .await
         })
         .await;
@@ -952,6 +949,107 @@ mod tests {
         })
         .await;
         assert!(lost.is_empty(), "origin overwritten by an external DID update: {lost:?}");
+    }
+
+    fn usage_role(
+        record: &AgentIdentityRecord,
+        channel_id: &str,
+    ) -> Option<IdentityOrigin> {
+        record
+            .channel_usage
+            .iter()
+            .find(|cu| cu.channel_config_id == channel_id)
+            .and_then(|cu| cu.role)
+    }
+
+    #[test]
+    fn test_record_channel_use_keeps_managed_and_upgrades_others() {
+        let now = chrono::Utc::now();
+        let mut record = local_record("h");
+
+        record.record_channel_use("s1", Some(IdentityOrigin::Managed), now);
+        record.record_channel_use("s1", Some(IdentityOrigin::ExternalCaller), now);
+        record.record_channel_use("s2", Some(IdentityOrigin::ExternalCaller), now);
+        record.record_channel_use("s2", Some(IdentityOrigin::Managed), now);
+        record.record_channel_use("s3", Some(IdentityOrigin::ExternalCaller), now);
+        record.record_channel_use("s3", None, now);
+
+        assert_eq!(usage_role(&record, "s1"), Some(IdentityOrigin::Managed));
+        assert_eq!(usage_role(&record, "s2"), Some(IdentityOrigin::Managed));
+        assert_eq!(usage_role(&record, "s3"), Some(IdentityOrigin::ExternalCaller));
+        assert_eq!(record.channel_usage[0].usage_count, 2);
+        assert_eq!(
+            record
+                .channel_config_id
+                .as_deref(),
+            Some("s3")
+        );
+    }
+
+    #[test]
+    fn test_record_channel_use_sets_role_on_legacy_entry() {
+        let now = chrono::Utc::now();
+        let mut record = local_record("h");
+        record.record_channel_use("s1", None, now);
+        assert_eq!(usage_role(&record, "s1"), None);
+
+        record.record_channel_use("s1", Some(IdentityOrigin::ExternalCaller), now);
+
+        assert_eq!(usage_role(&record, "s1"), Some(IdentityOrigin::ExternalCaller));
+    }
+
+    #[test]
+    fn test_legacy_channel_usage_without_role_round_trips_without_key() {
+        let usage: ChannelUsage = serde_json::from_value(serde_json::json!({
+            "channel_config_id": "s1",
+            "usage_count": 1,
+            "last_used_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(usage.role, None);
+        assert!(
+            serde_json::to_value(&usage)
+                .unwrap()
+                .get("role")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_usage_and_external_did_record_role_per_surface() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let mut managed = local_record("m");
+        managed.origin = Some(IdentityOrigin::Managed);
+        let did = managed.did.clone();
+        store
+            .create(managed)
+            .await
+            .unwrap();
+
+        store
+            .update_usage("m", Some("alpha".into()), Some(IdentityOrigin::Managed))
+            .await
+            .unwrap();
+        store
+            .update_usage("m", Some("delta".into()), Some(IdentityOrigin::ExternalCaller))
+            .await
+            .unwrap();
+        store
+            .store_external_did(&did, std::collections::HashMap::new(), Some("echo".into()), true)
+            .await
+            .unwrap();
+
+        let record = store
+            .find_by_hash("m")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage_role(&record, "alpha"), Some(IdentityOrigin::Managed));
+        assert_eq!(usage_role(&record, "delta"), Some(IdentityOrigin::ExternalCaller));
+        assert_eq!(usage_role(&record, "echo"), Some(IdentityOrigin::ExternalCaller));
     }
 
     #[tokio::test]

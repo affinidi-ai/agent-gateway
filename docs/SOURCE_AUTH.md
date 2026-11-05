@@ -1298,9 +1298,9 @@ no name, and Agent Identities lists it as an External Caller with no surface and
 Recorder chip. Trust Recorder writes are unaffected. Issue the Managed Agent a new API key to
 give it a Managed Agent record.
 
-A caller using a Managed Agent's key on another surface that accepts it counts as a use of that
-surface. The Managed Agent is then treated as shared by several surfaces, and its name is not
-published (see [Managed agents](#managed-agents)).
+A caller using a Managed Agent's key on another surface that accepts it is recorded as a caller
+use of that surface. It does not make that surface one of the Managed Agent's managed surfaces,
+so the Managed Agent keeps its name (see [Managed agents](#managed-agents)).
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`, whose `channel_id`
@@ -1455,8 +1455,24 @@ stored as local records linked to the surface, so a link does not prove a manage
 Credential principals (the name of the backing certificate or secret) appear only in
 the dashboard and are never published.
 
-If one DID is managed on more than one surface, no name is published and the dashboard
-shows a name conflict.
+Each surface a DID is used on is recorded with the role the request gave it there: the
+managed agent, or a caller. A managed entry stays managed. A DID's managed surfaces are the
+live surfaces where it is the managed agent; surfaces where it was only a caller, and deleted
+surfaces, are left out. An entry recorded before roles counts as managed only while its
+surface exists and configures a managed identity, on its target or a Transit Point. The
+dashboard, the VC name and trust-registry reference fields all read managed surfaces from
+one function, `managed_surfaces_by_did`
+([`display_name.rs`](../src/identity/display_name.rs)), so the three agree.
+
+A DID with one managed surface is named after that surface, not after the surface it was
+last used on. A DID with more than one is a shared managed DID: no name is signed or
+published for it. `GET /identities` lists it once, with its surfaces in `managed_surfaces`
+(`{ surface_id, surface_name }`, sorted by name) and no `display_name`, `surface_id` or
+`surface_name`; those two are set only for a DID with exactly one managed surface. The
+Identities page shows it as "Unnamed Agent" with "N surfaces" beneath, and lists its
+surfaces in the Agent Surface column. A managed identity moved to another surface while the
+old one still exists keeps a managed entry on the old surface, so the DID stays shared until
+that surface is deleted.
 
 #### Agent Card names
 
@@ -1479,8 +1495,8 @@ after the cache period; with no earlier name, it shows the surface name.
 The card name is self-asserted by the target and never verified. The target is trusted
 to serve traffic, not to choose what the gateway's Issuer signs, so the card name never
 reaches the VC, Trust Recorder context, or trust-registry reference fields, and card
-lookups never sit on the request path. A name conflict shows no name, whatever the card
-says.
+lookups never sit on the request path. A shared managed DID shows no name, whatever the
+card says.
 
 The agent identity VC carries the surface name as `credentialSubject.name` on both the
 legacy and SSI paths. VCs are signed on each issuance, so the next VC after a surface

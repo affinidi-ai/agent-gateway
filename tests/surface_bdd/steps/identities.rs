@@ -94,11 +94,13 @@ fn dashboard_shows_managed_identity_named(
         Some(&Value::String("surface_name".to_string())),
         "expected the Managed Agent name to come from its surface, observed: {identity}"
     );
-    assert!(
-        identity
-            .get("name_conflict")
-            .is_none(),
-        "a uniquely named Managed Agent must not carry a name conflict, observed: {identity}"
+    let managed_surfaces = identity
+        .get("managed_surfaces")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        managed_surfaces, 1,
+        "a named Managed Agent must be the managed agent of exactly one surface, observed: {identity}"
     );
 }
 

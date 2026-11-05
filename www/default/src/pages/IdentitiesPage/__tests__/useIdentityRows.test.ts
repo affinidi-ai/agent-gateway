@@ -19,7 +19,6 @@ const rows = (
     useIdentityRows({
       identities,
       searchTerm: options.searchTerm ?? '',
-      showUnnamedOnly: false,
       recorderFilter: options.recorderFilter,
     })
   ).result.current;
@@ -60,5 +59,66 @@ describe('useIdentityRows recorder status', () => {
   it('ignores the filter when no identity has a recorder', () => {
     const plain = [identity('did:x'), identity('did:y')];
     expect(dids(rows(plain, { recorderFilter: 'recorded' }))).toEqual(['did:x', 'did:y']);
+  });
+});
+
+describe('useIdentityRows managed surfaces', () => {
+  const shared: Identity = {
+    ...identity('did:shared'),
+    origin: 'managed',
+    channel_config_id: 's-delta',
+    channel_name: 'delta',
+    managed_surfaces: [
+      { surface_id: 's-alpha', surface_name: 'alpha' },
+      { surface_id: 's-bravo', surface_name: 'bravo' },
+    ],
+  };
+  const single: Identity = {
+    ...identity('did:single'),
+    origin: 'managed',
+    surface_id: 's-charlie',
+    surface_name: 'charlie',
+    managed_surfaces: [{ surface_id: 's-charlie', surface_name: 'charlie' }],
+  };
+
+  it('links every managed surface of a shared managed DID, not its last-used surface', () => {
+    expect(rows([shared]).surfaceLinksFor(shared)).toEqual([
+      { id: 's-alpha', name: 'alpha' },
+      { id: 's-bravo', name: 'bravo' },
+    ]);
+  });
+
+  it('links the one surface of a single-surface DID', () => {
+    expect(rows([single]).surfaceLinksFor(single)).toEqual([{ id: 's-charlie', name: 'charlie' }]);
+  });
+
+  it('links no surface for a managed DID without a live managed surface', () => {
+    const orphan: Identity = {
+      ...identity('did:orphan'),
+      origin: 'managed',
+      channel_config_id: 's-delta',
+      channel_name: 'delta',
+    };
+    expect(rows([orphan]).surfaceLinksFor(orphan)).toEqual([]);
+    expect(rows([orphan]).surfaceLinkFor(orphan)).toBeNull();
+  });
+
+  it('keeps the last-used surface link for a row that is not managed', () => {
+    const legacy: Identity = {
+      ...identity('did:legacy'),
+      channel_config_id: 's-delta',
+      channel_name: 'delta',
+    };
+    expect(rows([legacy]).surfaceLinksFor(legacy)).toEqual([{ id: 's-delta', name: 'delta' }]);
+  });
+
+  it('finds a shared managed DID by any of its surface names', () => {
+    expect(dids(rows([shared, single], { searchTerm: 'bravo' }))).toEqual(['did:shared']);
+  });
+
+  it('has no unnamed-only filter or count', () => {
+    const view = rows([shared, identity('did:anon')]);
+    expect(view).not.toHaveProperty('unnamedCount');
+    expect(dids(view)).toEqual(['did:shared', 'did:anon']);
   });
 });

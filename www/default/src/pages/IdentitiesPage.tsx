@@ -14,9 +14,11 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { Badge } from '../components/shared/Badge';
 import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
-import { CredentialPrincipalLabel, IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
+import { IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
+import { IdentitySurfaceCell } from './IdentitiesPage/IdentitySurfaceCell';
+import { isSharedManagedDid } from './IdentitiesPage/sharedManagedDid';
 import {
   RECORDER_FILTER_OPTIONS,
   isRecorderFilter,
@@ -38,7 +40,6 @@ const IdentitiesPage: React.FC = () => {
   const [loadingDidDocument, setLoadingDidDocument] = useState(false);
   const identityRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
   const [searchTerm, setSearchTerm] = useState('');
-  const [showUnnamedOnly, setShowUnnamedOnly] = useState(false);
   const [recorderFilter, setRecorderFilter] = useState<RecorderFilter>('all');
   const [issuersCount, setIssuersCount] = useState(0);
   const [authoritiesCount, setAuthoritiesCount] = useState(0);
@@ -157,14 +158,13 @@ const IdentitiesPage: React.FC = () => {
     filteredIdentities,
     hasNamingMetadata,
     hasRecorderStatus,
-    unnamedCount,
     liveSurfaceNames,
     surfaceLinkFor,
+    surfaceLinksFor,
   } = useIdentityRows({
     identities,
     channels: stats?.channels,
     searchTerm,
-    showUnnamedOnly,
     recorderFilter,
   });
 
@@ -405,18 +405,6 @@ const IdentitiesPage: React.FC = () => {
             placeholder="Filter Agent Identities, Issuers, Authorities..."
             width="384px"
           />
-          {hasNamingMetadata && activeTab === 'identities' && (
-            <button
-              type="button"
-              className={`btn btn-sm ms-2 ${showUnnamedOnly ? 'btn-primary' : 'btn-outline-secondary'}`}
-              aria-pressed={showUnnamedOnly}
-              onClick={() => setShowUnnamedOnly(prev => !prev)}
-              data-testid="identities-unnamed-filter-button"
-            >
-              <i className="fas fa-filter me-1" aria-hidden="true"></i>
-              Unnamed only ({unnamedCount})
-            </button>
-          )}
           {hasRecorderStatus && activeTab === 'identities' && (
             <div className="d-flex align-items-center ms-3">
               <label
@@ -480,9 +468,7 @@ const IdentitiesPage: React.FC = () => {
                         className="ms-2"
                         ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
-                          searchTerm ||
-                          (hasNamingMetadata && showUnnamedOnly) ||
-                          (hasRecorderStatus && recorderFilter !== 'all')
+                          searchTerm || (hasRecorderStatus && recorderFilter !== 'all')
                             ? ` of ${identities.length}`
                             : undefined
                         }
@@ -517,6 +503,7 @@ const IdentitiesPage: React.FC = () => {
                             {filteredIdentities.map(identity => {
                               const isExpanded = expandedIdentityDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
+                              const sharedManagedDid = isSharedManagedDid(identity);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -556,24 +543,12 @@ const IdentitiesPage: React.FC = () => {
                                       )}
                                     </td>
                                     <td>
-                                      {surfaceLink ? (
-                                        <button
-                                          type="button"
-                                          onClick={e => {
-                                            e.stopPropagation();
-                                            navigate(`/surfaces/${surfaceLink.id}`);
-                                          }}
-                                          className="btn btn-link p-0 align-baseline text-primary"
-                                          style={{ fontSize: '0.75rem' }}
-                                          data-testid="identities-surface-link"
-                                        >
-                                          {surfaceLink.name}
-                                        </button>
-                                      ) : (
-                                        <span className="text-muted">-</span>
-                                      )}
-                                      <CredentialPrincipalLabel
+                                      <IdentitySurfaceCell
+                                        links={surfaceLinksFor(identity)}
                                         principal={identity.credential_principal}
+                                        onOpenSurface={surfaceId =>
+                                          navigate(`/surfaces/${surfaceId}`)
+                                        }
                                       />
                                     </td>
                                     <td>
@@ -819,7 +794,7 @@ const IdentitiesPage: React.FC = () => {
                                                           <small>{identity.identity_hash}</small>
                                                         </div>
                                                       </div>
-                                                      {surfaceLink && (
+                                                      {surfaceLink && !sharedManagedDid && (
                                                         <div className="mb-2">
                                                           <small className="font-weight-bold text-muted">
                                                             {identity.surface_id

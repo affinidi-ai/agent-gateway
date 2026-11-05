@@ -15,7 +15,9 @@ use super::communication::{TrustRegistryError, TrustRegistryListenerManager};
 use super::types::{CreateReferenceFieldRequest, ReferenceFieldType, UpdateReferenceFieldRequest};
 use crate::authorities::{AuthorityStore, types::Authority};
 use crate::config::agent_surface::AgentSurface;
-use crate::identity::display_name::{DisplayName, resolve_managed_display_name, sanitize_description, surfaces_by_did};
+use crate::identity::display_name::{
+    DisplayName, managed_surfaces_by_did, resolve_managed_display_name, sanitize_description,
+};
 use crate::identity::filesystem::AgentIdentityRecord;
 use crate::issuers::{IssuerStore, types::Issuer};
 
@@ -445,12 +447,22 @@ pub fn registries_for_authority(
         .collect()
 }
 
-/// Entity fields naming every managed DID of `surface`; conflicted DIDs publish nothing.
+/// Entity fields naming every managed DID of `surface`; shared managed DIDs publish nothing.
+/// `live_surfaces` are the gateway's surfaces, `surface` taking the place of its stored copy.
 pub fn surface_reference_values(
     surface: &AgentSurface,
     records: &[AgentIdentityRecord],
+    live_surfaces: &[AgentSurface],
 ) -> Vec<ReferenceFieldValue> {
-    let mut by_did: Vec<_> = surfaces_by_did(records)
+    let live = |id: &str| {
+        if id == surface.surface_id {
+            return Some(surface);
+        }
+        live_surfaces
+            .iter()
+            .find(|s| s.surface_id == id)
+    };
+    let mut by_did: Vec<_> = managed_surfaces_by_did(records, live)
         .into_iter()
         .filter(|(_, surfaces)| surfaces.contains(&surface.surface_id))
         .collect();
@@ -527,7 +539,18 @@ pub fn spawn_surface_rename_publish(surface: AgentSurface) {
                 return;
             }
         };
-        let values = surface_reference_values(&surface, &records);
+        let Some(surface_store) = vc_issuer.surface_store() else {
+            warn!(surface_id = %surface.surface_id, "No surface store for surface rename; names not republished");
+            return;
+        };
+        let live_surfaces = match surface_store.list_all().await {
+            Ok(surfaces) => surfaces,
+            Err(e) => {
+                warn!(surface_id = %surface.surface_id, error = %e, "Surface lookup for surface rename failed");
+                return;
+            }
+        };
+        let values = surface_reference_values(&surface, &records, &live_surfaces);
         if values.is_empty() {
             return;
         }
@@ -1068,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_values_name_managed_dids_and_skip_conflicts() {
+    fn surface_values_name_managed_dids_and_skip_shared_ones() {
         let surface = AgentSurface {
             surface_id: "s1".to_string(),
             name: "OXYGEN".to_string(),
@@ -1085,7 +1108,40 @@ mod tests {
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         let unrelated = test_surface_identity_record("did:web:unrelated", "s9");
 
-        let values = surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated]);
+        let elsewhere = AgentSurface {
+            surface_id: "s2".to_string(),
+            ..Default::default()
+        };
+
+        let values =
+            surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated], &[elsewhere]);
+
+        assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
+    }
+
+    #[test]
+    fn surface_values_name_did_also_seen_as_caller_or_on_deleted_surface() {
+        let surface = AgentSurface {
+            surface_id: "s1".to_string(),
+            name: "OXYGEN".to_string(),
+            ..Default::default()
+        };
+        let mut managed = test_surface_identity_record("did:web:managed", "s1");
+        managed.origin = Some(IdentityOrigin::Managed);
+        let mut seen_as_caller = test_surface_identity_record("did:web:managed", "s2");
+        seen_as_caller.identity_hash = "caller-use".to_string();
+        seen_as_caller.origin = Some(IdentityOrigin::Managed);
+        seen_as_caller.channel_usage[0].role = Some(IdentityOrigin::ExternalCaller);
+        let mut deleted_elsewhere = test_surface_identity_record("did:web:managed", "s3");
+        deleted_elsewhere.identity_hash = "deleted".to_string();
+        deleted_elsewhere.origin = Some(IdentityOrigin::Managed);
+        let caller_surface = AgentSurface {
+            surface_id: "s2".to_string(),
+            ..Default::default()
+        };
+
+        let values =
+            surface_reference_values(&surface, &[managed, seen_as_caller, deleted_elsewhere], &[caller_surface]);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }
@@ -1103,7 +1159,7 @@ mod tests {
         let mut managed = test_surface_identity_record("did:web:managed", "s1");
         managed.origin = Some(IdentityOrigin::Managed);
 
-        let values = surface_reference_values(&surface, &[legacy, managed]);
+        let values = surface_reference_values(&surface, &[legacy, managed], &[]);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }

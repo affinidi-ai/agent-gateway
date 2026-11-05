@@ -11,7 +11,7 @@ use tracing::error;
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
 use crate::auth_manager::pat::PatContext;
 use crate::identity::IdentityStore;
-use crate::identity::display_name::{ManagedDisplayName, resolve_managed_display_name, surfaces_by_did};
+use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
 use crate::identity::filesystem::IdentityOrigin;
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
@@ -309,10 +309,17 @@ pub struct IdentityInfo {
     pub surface_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_principal: Option<CredentialPrincipal>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub name_conflict: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_surfaces: Vec<ManagedSurfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_recorder: Option<RecorderStatus>,
+}
+
+/// A live surface where a DID is the managed agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSurfaceInfo {
+    pub surface_id: String,
+    pub surface_name: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2085,7 +2092,11 @@ pub(crate) async fn build_identity_list_with(
             .entry(s.surface_id.as_str())
             .or_insert(s);
     }
-    let managed_surfaces_by_did = surfaces_by_did(&records);
+    let managed_surfaces_by_did = managed_surfaces_by_did(&records, |id| {
+        surfaces_by_id
+            .get(id)
+            .copied()
+    });
 
     // Get metrics to compute actual usage counts and determine active channels
     let identity_stats = metrics_store
@@ -2137,19 +2148,41 @@ pub(crate) async fn build_identity_list_with(
             let channel_name = surface.map(|s| s.name.clone());
 
             let origin = r.effective_origin();
-            let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
+            let is_managed = origin == Some(IdentityOrigin::Managed);
+            let managed_ids = managed_surfaces_by_did
+                .get(&r.did)
+                .filter(|_| is_managed)
+                .unwrap_or(&no_surfaces);
+            let mut managed_surfaces: Vec<ManagedSurfaceInfo> = managed_ids
+                .iter()
+                .filter_map(|id| surfaces_by_id.get(id.as_str()))
+                .map(|s| ManagedSurfaceInfo {
+                    surface_id: s.surface_id.clone(),
+                    surface_name: s.name.trim().to_string(),
+                })
+                .collect();
+            managed_surfaces.sort_by(|a, b| {
+                (a.surface_name.to_lowercase(), &a.surface_id).cmp(&(b.surface_name.to_lowercase(), &b.surface_id))
+            });
+            let managed_surface = match managed_surfaces.as_slice() {
+                [only] => surfaces_by_id
+                    .get(only.surface_id.as_str())
+                    .copied(),
+                _ => None,
+            };
             let card_name = managed_surface.and_then(|s| {
                 CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
             });
-            let managed_name: Option<ManagedDisplayName> = managed_surface.map(|s| {
-                resolve_managed_display_name(
-                    s,
-                    managed_surfaces_by_did
-                        .get(&r.did)
-                        .unwrap_or(&no_surfaces),
-                    card_name.as_deref(),
-                )
-            });
+            let managed_name: Option<ManagedDisplayName> = match managed_surface {
+                Some(s) => Some(resolve_managed_display_name(s, managed_ids, card_name.as_deref())),
+                None if managed_ids.len() > 1 => Some(ManagedDisplayName::Shared {
+                    surface_ids: managed_ids
+                        .iter()
+                        .cloned()
+                        .collect(),
+                }),
+                None => None,
+            };
             let caller_lookup =
                 (origin == Some(IdentityOrigin::ExternalCaller)).then(|| caller_names.lookup_or_spawn(&r.did));
             let naming = with_target_card_name(
@@ -2157,10 +2190,7 @@ pub(crate) async fn build_identity_list_with(
                 origin,
                 card_name,
             );
-            let is_managed = origin == Some(IdentityOrigin::Managed);
-            let surface_id = channel_config_id
-                .clone()
-                .filter(|_| is_managed);
+            let surface_id = managed_surface.map(|s| s.surface_id.clone());
             let surface_name = managed_surface
                 .map(|s| s.name.trim().to_string())
                 .filter(|name| !name.is_empty());
@@ -2202,7 +2232,7 @@ pub(crate) async fn build_identity_list_with(
                 surface_id,
                 surface_name,
                 credential_principal: principal,
-                name_conflict: naming.name_conflict,
+                managed_surfaces,
                 trust_recorder: None,
             }
         })
@@ -3014,25 +3044,74 @@ mod tests {
             assert!(identities_changed_since(rows, since, &HashSet::new(), &HashSet::new(), &changed).is_empty());
         }
 
+        fn usage(
+            surface_id: &str,
+            role: IdentityOrigin,
+        ) -> crate::identity::filesystem::ChannelUsage {
+            crate::identity::test_helpers::test_channel_usage(surface_id, Some(role))
+        }
+
         #[tokio::test]
-        async fn test_conflicting_did_has_conflict_marker_and_no_name() {
+        async fn test_shared_managed_did_lists_its_managed_surfaces_and_has_no_name() {
             let mut record = managed("did:example:shared", "oxygen");
             record
                 .channel_usage
-                .push(crate::identity::filesystem::ChannelUsage {
-                    channel_config_id: "helium".to_string(),
-                    usage_count: 1,
-                    last_used_at: Utc::now(),
-                });
-            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("helium", "HELIUM")], &names()).await;
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            let surfaces = [surface("oxygen", "OXYGEN"), surface("helium", "HELIUM"), surface("argon", "ARGON")];
+            let rows = list(vec![record], &surfaces, &names()).await;
             let row = &rows["did:example:shared"];
-            assert!(row.name_conflict);
             assert_eq!(row.display_name, None);
+            assert_eq!(row.surface_id, None);
+            assert_eq!(row.surface_name, None);
             let json = serde_json::to_value(row).unwrap();
-            assert_eq!(json["name_conflict"], json!(true));
+            assert_eq!(
+                json["managed_surfaces"],
+                json!([
+                    { "surface_id": "helium", "surface_name": "HELIUM" },
+                    { "surface_id": "oxygen", "surface_name": "OXYGEN" }
+                ])
+            );
             assert!(
-                json.get("display_name")
+                json.get("name_conflict")
                     .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_seen_as_caller_elsewhere_is_named_after_its_managed_surface() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            record.channel_config_id = Some("argon".to_string());
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("argon", "ARGON")], &names()).await;
+            let row = &rows["did:example:oxygen"];
+            assert_eq!(row.display_name.as_deref(), Some("OXYGEN"));
+            assert_eq!(row.surface_id.as_deref(), Some("oxygen"));
+            assert_eq!(
+                row.managed_surfaces,
+                vec![crate::observability::dashboard::ManagedSurfaceInfo {
+                    surface_id: "oxygen".to_string(),
+                    surface_name: "OXYGEN".to_string()
+                }]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_whose_other_surface_was_deleted_is_named() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("deleted", IdentityOrigin::Managed));
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN")], &names()).await;
+            assert_eq!(
+                rows["did:example:oxygen"]
+                    .display_name
+                    .as_deref(),
+                Some("OXYGEN")
             );
         }
 
@@ -3043,7 +3122,7 @@ mod tests {
             let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
             assert_eq!(first["origin"], json!("external_caller"));
             assert_eq!(first["display_name_pending"], json!(true));
-            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
+            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "managed_surfaces"] {
                 assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
             }
 
@@ -3132,7 +3211,10 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(info.origin, None);
-            assert!(!info.name_conflict);
+            assert!(
+                info.managed_surfaces
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
