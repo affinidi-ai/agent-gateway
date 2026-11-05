@@ -27,6 +27,17 @@ changes:
         The dashboard session cookie is now named __Host-session_token and is Secure, so a
         browser sends it only over HTTPS or to localhost and no other host can set it. The old
         session_token cookie is no longer read; an open dashboard receives the new cookie on its
-        next request. Over plain HTTP on a host other than localhost the browser drops the
-        cookie, so the dashboard's live updates stop, while signing in still works.
-  breaking: []
+        next request, and a browser with no open dashboard signs in once. After a rollback to a
+        release that reads only session_token, browsers sign in once again.
+  breaking:
+    - timestamp: '2026-11-05T09:00:00Z'
+      title: Stop passing cookies through Access Points and MCP Proxies
+      description: >-
+        An agent behind an Access Point no longer receives its caller's cookies or sets cookies
+        on its callers, so cookie-based session affinity or agent-held cookie sessions stop
+        working; use a header for affinity instead. An MCP Proxy's REST API no longer receives
+        the caller's cookies, and a JWT bearer method with forward_header on a header named
+        Cookie forwards nothing. Scripts that send Cookie session_token to the management API get
+        401; send Authorization Bearer or the __Host-session_token cookie. The dashboard, and
+        CLI browser login, now need HTTPS or http://localhost: over plain HTTP on any other host
+        the live-update notice keeps returning and CLI login never completes.

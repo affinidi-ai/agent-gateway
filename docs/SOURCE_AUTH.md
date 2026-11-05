@@ -129,7 +129,8 @@ method's credential, such as a partner's `X-API-Key`, to the Target.
 The credential headers of every method are stripped before a request is forwarded, on each
 inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
 forwards its header only when it was the method selected for that request, so a request
-carrying several credentials forwards none.
+carrying several credentials forwards none. A `forward_header` method whose `token_header` is
+`Cookie` forwards nothing, since an Access Point never forwards `Cookie`.
 
 An Access Point never forwards its caller's `Cookie` to the managed agent, directly or over
 Fabric, a gateway receiving a Fabric request drops a `Cookie` its peer sent, and an MCP Proxy
@@ -137,7 +138,9 @@ never forwards its caller's `Cookie` to its REST API; a REST API that takes a co
 from a tool argument its OpenAPI specification declares. The cookies
 belong to the host the caller called, which serves the dashboard too, so its session cookie
 would otherwise reach the agent. For the same reason an Access Point's answer carries no
-`Set-Cookie` the agent sent, so the agent cannot set a cookie on the dashboard's host.
+`Set-Cookie` the agent sent, so the agent cannot set a cookie on the dashboard's host. An
+agent that needs session affinity or its own session must take it from a header, such as one
+the agent returns in its answer and the caller sends back, not from a cookie.
 
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected

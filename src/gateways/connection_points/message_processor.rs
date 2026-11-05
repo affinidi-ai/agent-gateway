@@ -11840,7 +11840,7 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
-                "Cookie": "session_token=peer-dashboard-session",
+                "Cookie": "__Host-session_token=peer-dashboard-session",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}

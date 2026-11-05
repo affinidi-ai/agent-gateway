@@ -21308,7 +21308,7 @@ allow if {
         assert!(!forwards_ap_caller_header("Cookie", &[], None, None, None));
         assert!(!should_forward_ap_request_header_with_mapping("cookie", &[], None, Some("cookie")));
         let mut caller = HeaderMap::new();
-        caller.insert("cookie", HeaderValue::from_static("session_token=dashboard; lb=sticky"));
+        caller.insert("cookie", HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
         caller.insert("x-trace", HeaderValue::from_static("t-1"));
         let (buffered, stream) = access_point_fabric_headers(&caller, &[], None);
         assert!(!buffered.contains_key("COOKIE"));

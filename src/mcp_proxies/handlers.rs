@@ -3944,6 +3944,96 @@ mod tests {
         assert_eq!(error.id, Some(json!("owned")));
     }
 
+    /// A tool whose operation takes a cookie sends the REST API that cookie
+    /// alone, even when the caller sent its own `Cookie`.
+    #[tokio::test]
+    async fn a_cookie_argument_reaches_the_rest_backend_beside_a_caller_cookie() {
+        use serde_json::json;
+
+        let target =
+            crate::component_tests::helpers::MockServer::start_with_response(json!({"value": "kept"}).to_string())
+                .await;
+        let proxy = McpProxy::new(
+            "Cookie tool".into(),
+            String::new(),
+            target.url(),
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/echo": {"get": {
+                        "operationId": "echo",
+                        "parameters": [{"name": "sid", "in": "cookie", "required": true, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "OK"}}
+                    }}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/cookie-tool".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "cookie-tools", "name": "Cookie tools",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        let manager = super::McpServerManager::new();
+        manager
+            .create_server(&proxy)
+            .await
+            .unwrap();
+        let name = manager
+            .get_server(&proxy.id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .get_tool_names()
+            .pop()
+            .unwrap();
+        let mut request = owned_modern_request("tools/list");
+        request.method = "tools/call".to_string();
+        request
+            .params
+            .as_mut()
+            .unwrap()["name"] = json!(name);
+        request
+            .params
+            .as_mut()
+            .unwrap()["arguments"] = json!({"cookie_sid": "from-argument"});
+        let client = reqwest::Client::new();
+        let caller = client
+            .post(format!("proxy://{}", proxy.id))
+            .header("cookie", "__Host-session_token=dashboard-session")
+            .body("{}")
+            .build()
+            .unwrap();
+
+        let response = super::handle_modern_surface_request(
+            &proxy,
+            &surface,
+            &request,
+            caller,
+            &client,
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["result"]["resultType"], "complete", "{response}");
+        let received = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            received
+                .headers
+                .get("cookie")
+                .map(String::as_str),
+            Some("sid=from-argument")
+        );
+    }
+
     #[tokio::test]
     async fn owned_modern_surface_subscription_uses_surface_limits_without_target_execution() {
         use serde_json::json;

@@ -114,11 +114,15 @@ flowchart LR
 | `8080` (HTTP) | The same, without TLS | Only a load balancer that terminates TLS |
 | `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth`, and failed attempts are not throttled (see below) |
 
-The dashboard's session cookie, `__Host-session_token`, is `Secure`, so a browser keeps it
-only over HTTPS or on `http://localhost`. Behind a load balancer that terminates TLS, port
-`8080` serves the dashboard as before. Opened over plain HTTP on any other host, the
-dashboard still signs in, but its live updates stop: the browser drops the cookie, and the
-dashboard's WebSocket authenticates only with it.
+**Serve the dashboard over HTTPS, or open it on `http://localhost`.** Its session cookie,
+`__Host-session_token`, is `Secure`, so a browser keeps it only there. Behind a load balancer
+that terminates TLS, port `8080` serves the dashboard as before. Opened over plain HTTP on any
+other host, the browser drops the cookie, and two things that authenticate only with it fail:
+
+- The dashboard's live-update WebSocket is refused on every attempt, so a full-screen
+  "Reconnecting to Gateway..." notice keeps returning while the tab is open.
+- [CLI browser login](ACCESS_TOKENS.md#cli-browser-login) never completes: the browser moves
+  between sign-in and the authorize page until the authorize throttle answers `429`.
 
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:
