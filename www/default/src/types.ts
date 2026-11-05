@@ -204,6 +204,8 @@ export interface Identity {
   trust_recorder?: TrustRecorderStatus;
   slot?: ManagedSlot;
   rotations?: CredentialRotation[];
+  /** Whether older rotations were dropped; the oldest kept one carries their earliest values. */
+  rotations_dropped?: boolean;
 }
 
 /** The surface slot whose identity setting created a managed identity. */
