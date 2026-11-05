@@ -59,7 +59,7 @@ pub async fn validate_surface_references(
     };
 
     for reference in collect_surface_reference_keys(surface)? {
-        if reference.custom_metadata && surface.tenant_id.is_none() {
+        if !reference.is_checked_on(surface) {
             continue;
         }
         authorizer
@@ -688,6 +688,26 @@ pub(crate) struct SurfaceReferenceKey {
     /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
     /// any secret there, even one that does not exist.
     pub custom_metadata: bool,
+}
+
+impl SurfaceReferenceKey {
+    /// Whether a save of `surface` checks this reference: every one but a `custom_metadata`
+    /// one of a surface with no tenant.
+    fn is_checked_on(
+        &self,
+        surface: &AgentSurface,
+    ) -> bool {
+        !(self.custom_metadata && surface.tenant_id.is_none())
+    }
+}
+
+/// The secrets a save of `surface` requires to exist.
+pub(crate) fn checked_secret_ids(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
+    Ok(collect_surface_reference_keys(surface)?
+        .into_iter()
+        .filter(|reference| reference.kind == ResourceKind::Secrets && reference.is_checked_on(surface))
+        .map(|reference| reference.id)
+        .collect())
 }
 
 pub(crate) fn collect_surface_reference_keys(
@@ -2053,7 +2073,7 @@ fn endpoint_id<'a>(
         .filter(|id| !id.is_empty())
 }
 
-fn inaccessible(label: &str) -> SurfaceApiError {
+pub(super) fn inaccessible(label: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!("{label} reference is not accessible"))
 }
 
@@ -2061,7 +2081,7 @@ fn unavailable(label: &str) -> SurfaceApiError {
     SurfaceApiError::InternalError(format!("{label} store is not configured"))
 }
 
-fn internal(
+pub(super) fn internal(
     label: &str,
     error: impl std::fmt::Display,
 ) -> SurfaceApiError {

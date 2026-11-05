@@ -196,6 +196,33 @@ async fn validate_consent_strategy(
     Ok(())
 }
 
+async fn stored_secret(
+    state: &CredentialProviderState,
+    secret_id: &str,
+) -> Result<crate::secrets::Secret, ProviderValidationError> {
+    state
+        .secrets_store
+        .get_by_secret_id(secret_id)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to validate credential provider secret reference");
+            ProviderValidationError::SecretLookupFailed
+        })?
+        .ok_or(ProviderValidationError::SecretNotAccessible)
+}
+
+/// Refuse `provider` when a secret it names no longer exists. Run while the save holds the
+/// provider lock, it catches a secret deleted since [`validate_secret_references`] checked it.
+async fn refuse_gone_secrets(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+) -> Result<(), ProviderValidationError> {
+    for secret_id in provider.secret_refs() {
+        stored_secret(state, secret_id).await?;
+    }
+    Ok(())
+}
+
 /// Refuse a secret reference that `may_use`, given the secret's tenant and whether the
 /// reference is kept from the stored provider, does not admit, or the caller's scope does not
 /// cover.
@@ -207,15 +234,7 @@ async fn validate_secret_references(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
     for &(secret_id, kept) in references {
-        let secret = state
-            .secrets_store
-            .get_by_secret_id(secret_id)
-            .await
-            .map_err(|error| {
-                warn!(%error, "Failed to validate credential provider secret reference");
-                ProviderValidationError::SecretLookupFailed
-            })?
-            .ok_or(ProviderValidationError::SecretNotAccessible)?;
+        let secret = stored_secret(state, secret_id).await?;
         if !may_use(secret.tenant_id.as_deref(), kept)
             || !scope_allows_resource(
                 resource_scope(scope),
@@ -732,6 +751,10 @@ pub async fn create_provider(
             Some(metadata.authorization_response_iss_parameter_supported);
     }
 
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+    if let Err(error) = refuse_gone_secrets(&state, &provider).await {
+        return error.into_response();
+    }
     match state
         .store
         .create(provider.clone())
@@ -948,11 +971,8 @@ pub async fn update_provider(
         && !updated
             .provider_type
             .sends_gateway_credential();
-    if retypes_to_need_consent
-        && let Err(response) =
-            refuse_retype_while_target_auth_uses(&state, &previous, &context, &scope, &caller, &pat).await
-    {
-        return response;
+    if retypes_to_need_consent && let Err(refusal) = refuse_retype_while_target_auth_uses(&state, &previous).await {
+        return retype_refused(&state, refusal, &context, &scope, &caller, &pat).await;
     }
 
     if let Err(error) = validate_provider_settings(
@@ -970,15 +990,18 @@ pub async fn update_provider(
 
     let _bindings = if retypes_to_need_consent {
         let bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
-        if let Err(response) =
-            refuse_retype_while_target_auth_uses(&state, &previous, &context, &scope, &caller, &pat).await
-        {
-            return response;
+        if let Err(refusal) = refuse_retype_while_target_auth_uses(&state, &previous).await {
+            return retype_refused(&state, refusal, &context, &scope, &caller, &pat).await;
         }
-        Some(bindings)
+        BindingsHold::Exclusive { _guard: bindings }
     } else {
-        None
+        BindingsHold::Shared {
+            _guard: crate::identity::handlers::surface_grants::hold_provider_bindings().await,
+        }
     };
+    if let Err(error) = refuse_gone_secrets(&state, &updated).await {
+        return error.into_response();
+    }
 
     match state
         .store
@@ -993,31 +1016,58 @@ pub async fn update_provider(
     }
 }
 
+/// The provider bindings lock as an update holds it until its store.
+enum BindingsHold {
+    Exclusive { _guard: tokio::sync::RwLockWriteGuard<'static, ()> },
+    Shared { _guard: tokio::sync::RwLockReadGuard<'static, ()> },
+}
+
+/// Why a provider was not retyped to one that needs a user's consent.
+#[derive(Debug, thiserror::Error)]
+enum RetypeRefusal {
+    #[error("{PROVIDER_IN_USE_BY_TARGET_AUTH}")]
+    InUseByTargetAuth(Vec<super::references::Referrer>),
+    #[error("reference scan failed: {0}")]
+    ScanFailed(anyhow::Error),
+}
+
 /// Refuse to retype `previous` to a provider that needs a user's consent while a surface's
 /// Target authentication uses it. The update holds the provider lock exclusively across this
 /// check and its store, so no surface write binds the provider in between.
 async fn refuse_retype_while_target_auth_uses(
     state: &CredentialProviderState,
     previous: &CredentialProvider,
+) -> Result<(), RetypeRefusal> {
+    let referrers = state
+        .references
+        .target_auth_referrers_of_provider(&previous.id)
+        .await
+        .map_err(RetypeRefusal::ScanFailed)?;
+    if referrers.is_empty() {
+        Ok(())
+    } else {
+        Err(RetypeRefusal::InUseByTargetAuth(referrers))
+    }
+}
+
+/// Answer `refusal` with a `409` naming the referrers the caller may see, or a `500`.
+async fn retype_refused(
+    state: &CredentialProviderState,
+    refusal: RetypeRefusal,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
     caller: &Option<Extension<AuthGuardOk>>,
     pat: &Option<Extension<PatContext>>,
-) -> Result<(), Response> {
-    match state
-        .references
-        .target_auth_referrers_of_provider(&previous.id)
-        .await
-    {
-        Ok(referrers) if referrers.is_empty() => Ok(()),
-        Ok(referrers) => Err(super::references::conflict_response(
+) -> Response {
+    match refusal {
+        RetypeRefusal::InUseByTargetAuth(referrers) => super::references::conflict_response(
             PROVIDER_IN_USE_BY_TARGET_AUTH,
             &referrers,
             &viewable_kinds(state, caller, pat).await,
             tenant_context(context),
             resource_scope(scope),
-        )),
-        Err(error) => Err(reference_scan_failed(error)),
+        ),
+        RetypeRefusal::ScanFailed(error) => reference_scan_failed(error),
     }
 }
 
@@ -1911,6 +1961,88 @@ mod jwt_provider_tests {
         let (status, response) = retype.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["provider_type"], "oauth2_authorization_code");
+    }
+
+    async fn delete_secret_named(
+        state: &CredentialProviderState,
+        secret_id: &str,
+    ) {
+        let secret = state
+            .secrets_store
+            .get_by_secret_id(secret_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .secrets_store
+            .delete(&secret.id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_provider_naming_a_secret_deleted_while_it_waited_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let state = state.clone();
+            async move { create(&state, api_key_provider("key", "CLIENT_SECRET")).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        delete_secret_named(&state, "CLIENT_SECRET").await;
+        drop(deleting);
+
+        let (status, response) = creating.await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        assert!(
+            state
+                .store
+                .find_by_provider_id(None, "key")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn updating_a_provider_to_a_secret_deleted_while_it_waited_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, api_key_provider("key", "CLIENT_ID")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let updating = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { update(&state, &id, json!({"api_key_secret_ref": "CLIENT_SECRET"})).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!updating.is_finished(), "the update waits for the secret delete that holds the lock");
+        delete_secret_named(&state, "CLIENT_SECRET").await;
+        drop(deleting);
+
+        let (status, response) = updating.await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .api_key_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

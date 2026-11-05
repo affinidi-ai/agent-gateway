@@ -69,7 +69,12 @@ caller's tenant or appliance-wide and within its resource pattern. The rest are 
 
 The scan reads every surface, provider, A2A proxy and STS client at the time of the request
 ([`credential_providers/references.rs`](../src/credential_providers/references.rs)); a lookup
-that fails answers `500` and deletes nothing.
+that fails answers `500` and deletes nothing. A secret delete and a save of a surface,
+credential provider, A2A proxy or STS client that names the secret do not overlap on the node
+that serves the admin API, which serialises them with an in-process lock: a save stored first
+makes the delete answer `409` unless the delete adds `force=true`, and a save whose check found
+the secret before the delete removed it is refused with `400`, as a reference to a missing
+secret is.
 
 ### https token endpoints
 

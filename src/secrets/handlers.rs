@@ -324,6 +324,7 @@ pub async fn delete_secret(
             }
         }
     }
+    let bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
     let referrers = match references
         .referrers_of_secret(&secret.secret_id)
         .await
@@ -364,7 +365,9 @@ pub async fn delete_secret(
         );
     }
 
-    match store.delete(&id).await {
+    let deleted = store.delete(&id).await;
+    drop(bindings);
+    match deleted {
         Ok(_) => {
             let trigger_secret = crate::integrations::secrets_integration_triggers::Secret {
                 id: secret.id.clone(),
@@ -878,7 +881,6 @@ mod tests {
         surface_tenant: Option<&str>,
     ) -> crate::credential_providers::references::ReferenceStores {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
-        use crate::surfaces::AgentSurfaceStore;
         let providers = FileSystemCredentialProviderStore::new(dir.join("providers"))
             .await
             .expect("provider store");
@@ -897,10 +899,23 @@ mod tests {
         let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(dir.join("surfaces"))
             .await
             .expect("surface store");
+        save_billing_surface(&surfaces, surface_tenant).await;
+        crate::credential_providers::references::ReferenceStores {
+            surfaces: Some(Arc::new(surfaces)),
+            credential_providers: Some(Arc::new(providers)),
+            ..Default::default()
+        }
+    }
+
+    /// Save a surface of `tenant` whose Target authentication sends `billing_api_key`.
+    async fn save_billing_surface(
+        surfaces: &dyn crate::surfaces::AgentSurfaceStore,
+        tenant: Option<&str>,
+    ) {
         surfaces
             .save(
                 &serde_json::from_value(serde_json::json!({
-                    "surface_id": "billing-surface", "name": "Billing surface", "tenant_id": surface_tenant,
+                    "surface_id": "billing-surface", "name": "Billing surface", "tenant_id": tenant,
                     "access_point": {"listen_address": "0.0.0.0:8443", "route": "/billing", "protocol": "a2a"},
                     "target": {"endpoint": "https://billing.example", "auth": {"method": {"static_secret": {
                         "secret_id": "billing_api_key", "header_name": "X-Api-Key"
@@ -910,11 +925,36 @@ mod tests {
             )
             .await
             .expect("save surface");
-        crate::credential_providers::references::ReferenceStores {
-            surfaces: Some(Arc::new(surfaces)),
-            credential_providers: Some(Arc::new(providers)),
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_secret_waits_for_a_write_that_may_reference_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().join("surfaces"))
+                .await
+                .expect("surface store"),
+        );
+        let references = crate::credential_providers::references::ReferenceStores {
+            surfaces: Some(surfaces.clone()),
             ..Default::default()
-        }
+        };
+        let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+        let delete = tokio::spawn(delete_with(recording.clone(), None, references, None, false));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!delete.is_finished(), "the delete waits for the write that holds the lock");
+        save_billing_surface(surfaces.as_ref(), None).await;
+        drop(writing);
+
+        let (status, body) = delete.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
