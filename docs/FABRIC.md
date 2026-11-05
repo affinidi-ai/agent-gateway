@@ -398,7 +398,10 @@ request received by the destination gateway:
    authentication verified, so the agent can call its own Transit Points (see
    [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
    card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
-   transport.
+   transport. The surface's `target.auth` goes only with a request whose caller was vetted, and
+   with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured card
+   location, the sending gateway's own card fetch; any other discovery read gets none (see
+   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 

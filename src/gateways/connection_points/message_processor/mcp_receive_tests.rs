@@ -4030,3 +4030,119 @@ async fn provider_key_fabric_flow() {
     assert_eq!(served["status"], 200, "{served}");
     assert_eq!(reached(), 1);
 }
+
+#[test]
+fn fabric_receive_sends_the_target_credential_only_for_a_get_of_the_surfaces_card_location() {
+    run_in_own_process(card_location_target_credential_flow);
+}
+
+/// A surface that checks no caller, reached over Fabric, sends its Target credential only for a
+/// `GET` of exactly its card location, the sending gateway's own card fetch, in `warn` and under
+/// `target_source_auth` `enforce`. A `HEAD` of it, a query on it, and any other discovery read
+/// reach the Target without the credential.
+async fn card_location_target_credential_flow() {
+    use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, TEST_CREDENTIAL_POLICY};
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    let target = MockServer::start_with_response(json!({"name": "card"}).to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap()
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "target-key".into(),
+            secret_id: "target-key".into(),
+            description: None,
+            value: "target-secret".into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let surface = |id: &str, card_path: Option<&str>| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"),
+                "protocol": "a2a", "public": true, "agent_card_path": card_path},
+            "target": {"endpoint": format!("http://{}", target.addr), "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}}
+        }))
+        .unwrap()
+    };
+    let (default, custom) = (surface("default-card", None), surface("custom-card", Some("custom/card.json")));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&default, &custom]).await;
+
+    let send = |surface: &AgentSurface, method: &str, path: &str| {
+        let mut message = forwarded_post(surface, path, Value::Null, &storage_path)
+            .with_context("secrets_storage_path", json!(secrets_path));
+        message.message_body["method"] = json!(method);
+        message.message_body["headers"] = json!({});
+        message
+            .message_body
+            .as_object_mut()
+            .unwrap()
+            .remove("body");
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let last = || {
+        target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called")
+    };
+
+    let enforced: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+        target_source_auth: RuleMode::Enforce,
+        ..Default::default()
+    }));
+    let warned: &'static CredentialPolicyConfig = Box::leak(Box::default());
+    for policy in [warned, enforced] {
+        TEST_CREDENTIAL_POLICY
+            .scope(policy, async {
+                let cases = [
+                    (&default, "GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json", true),
+                    (&custom, "GET", "/custom/card.json", "/custom/card.json", true),
+                    (&custom, "GET", "/.well-known/agent-card.json", "/custom/card.json", true),
+                    (&default, "GET", "/discovery", "/discovery", false),
+                    (&default, "GET", "/.well-known/agent.json", "/.well-known/agent.json", false),
+                    (&default, "GET", "/a/.well-known/agent-card.json", "/a/.well-known/agent-card.json", false),
+                    (&default, "GET", "/.well-known/agent-card.json?x=1", "/.well-known/agent-card.json", false),
+                    (&default, "HEAD", "/.well-known/agent-card.json", "/.well-known/agent-card.json", false),
+                    (&custom, "GET", "/discovery", "/custom/card.json", false),
+                ];
+                for (surface, method, path, reached_path, credential) in cases {
+                    let before = reached();
+                    let (status, answered) = send(surface, method, path).await;
+                    let case = format!(
+                        "{:?} {} {method} {path}: {status} {answered}",
+                        policy.target_source_auth, surface.surface_id
+                    );
+                    assert_eq!(reached(), before + 1, "{case}");
+                    let request = last();
+                    assert_eq!((request.method.as_str(), request.path.as_str()), (method, reached_path), "{case}");
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("x-target-key")
+                            .map(String::as_str),
+                        credential.then_some("target-secret"),
+                        "{case}: {:?}",
+                        request.headers
+                    );
+                }
+            })
+            .await;
+    }
+}

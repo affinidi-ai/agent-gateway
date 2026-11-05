@@ -28,7 +28,11 @@ resolved on those paths either, on the direct or fabric send leg, so a credentia
 resolved does not fail discovery.
 
 Forwarded requests on those public paths never carry the surface's `target.auth`: that
-credential vouches that the gateway vetted the caller, and discovery vetted nobody.
+credential vouches that the gateway vetted the caller, and discovery vetted nobody. On the
+receiving gateway of a Fabric route, only a `GET` of exactly `/.well-known/agent-card.json` or
+the surface's configured card location, the path a sending gateway's own card fetch uses, is
+treated as that fetch and carries `target.auth`. A `HEAD` of it, a query on it, `/discovery` or
+any other discovery read is a caller's and carries none.
 
 ### Agent card fetch
 

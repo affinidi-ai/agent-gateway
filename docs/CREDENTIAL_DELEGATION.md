@@ -737,7 +737,10 @@ and its secret versions. Changing the provider or one of the secrets its type se
 token issued under the old settings is never reused; a Target and a Transit Point that use one
 provider with different scopes each keep their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
-unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
+unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
+receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
+configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
+credential. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
 `passthrough` forwards without the credential, and the cause is logged only. A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
@@ -814,7 +817,9 @@ The warning is logged only when the credential is sent: a leg where another rule
 withholds the credential logs none for a rule still in `warn`.
 
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
-withholds its credential; `target_https` does. A credential withheld under `enforce` is treated
+withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
+`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
+any other discovery read is a caller's request and never gets the credential. A credential withheld under `enforce` is treated
 as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
 request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a

@@ -657,6 +657,24 @@ impl CallerAssertion {
             Self::for_request(method, path)
         }
     }
+
+    /// A request received over Fabric. Only a `GET` of exactly the default card location or the
+    /// surface's own one is the sending gateway's card fetch; any other request, a `HEAD` or
+    /// another discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
+    pub(crate) fn for_fabric_received_request(
+        surface: &crate::config::agent_surface::AgentSurface,
+        method: &str,
+        path: &str,
+        source_auth_failed: bool,
+    ) -> Self {
+        if method.eq_ignore_ascii_case("GET")
+            && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
+        {
+            Self::GatewayOriginated
+        } else {
+            Self::for_forwarded_request(method, path, source_auth_failed)
+        }
+    }
 }
 
 /// The stores target authentication resolves a credential from, the surface it is resolved
@@ -15233,6 +15251,8 @@ async fn evaluate_mcp_tool_policies(
     })
 }
 
+const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+
 fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentSurface) -> String {
     if surface.override_agent_card_location()
         && let Some(custom_path) = surface.agent_card_location_path()
@@ -15243,7 +15263,7 @@ fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentS
             format!("/{custom_path}")
         }
     } else {
-        "/.well-known/agent-card.json".to_string()
+        DEFAULT_AGENT_CARD_PATH.to_string()
     }
 }
 

@@ -5817,11 +5817,12 @@ async fn process_forward_request_in_request_scope(
             }
         };
 
-        let caller = if is_agent_card_request {
-            crate::proxy::handler::CallerAssertion::GatewayOriginated
-        } else {
-            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed)
-        };
+        let caller = crate::proxy::handler::CallerAssertion::for_fabric_received_request(
+            &surface,
+            method,
+            path,
+            source_auth_failed,
+        );
         let providers = get_credential_provider_store();
         let vault = get_delegation_vault_store();
         let context = crate::proxy::handler::TargetAuthContext::of_surface(
