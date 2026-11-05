@@ -5722,26 +5722,7 @@ async fn step_inject_external_grant(
     let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &grant.access_token);
     ctx.grant_destination = Some(destination);
     apply_credential_injections(ctx, &injections)?;
-    if grant.use_is_due(chrono::Utc::now()) {
-        let vault = Arc::clone(vault);
-        let id = grant.id.clone();
-        let request_id = ctx.request_id.clone();
-        let surface_variant = crate::observability::policy_audit::current_request_variant();
-        tokio::spawn(async move {
-            if let Err(error) = vault
-                .mark_grant_used(&id)
-                .await
-            {
-                debug!(
-                    target: "credential_delegation",
-                    request_id = %request_id,
-                    surface_variant = surface_variant.as_deref(),
-                    error = %error,
-                    "Failed to record a grant's use"
-                );
-            }
-        });
-    }
+    crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
     audit_grant_injected(ctx, &caller, &provider, &grant, subject);
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant,

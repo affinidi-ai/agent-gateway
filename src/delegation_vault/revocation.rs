@@ -760,6 +760,7 @@ impl Revoker {
 /// it is revoked all the same: a revocation is delayed, never lost.
 /// `revoker.providers` must hold the provider of each kept grant that still
 /// exists. Returns how many were decided or tried.
+#[cfg(test)]
 pub async fn revoke_deferred(
     revoker: Revoker,
     now: chrono::DateTime<chrono::Utc>,
@@ -768,6 +769,19 @@ pub async fn revoke_deferred(
         return 0;
     };
     let Some(kept) = kept_revocations(&vault).await else {
+        return 0;
+    };
+    revoke_deferred_of(revoker, kept, now).await
+}
+
+/// [`revoke_deferred`] for `kept`, read already: the sweep leaves out those
+/// whose provider cannot be read now.
+pub async fn revoke_deferred_of(
+    revoker: Revoker,
+    kept: Vec<DeferredRevocation>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some(vault) = revoker.vault.clone() else {
         return 0;
     };
     decide_kept(&vault, kept, &revoker, now, false).await
@@ -782,7 +796,7 @@ pub async fn kept_revocations_of(
     provider_id: &str,
 ) -> anyhow::Result<Vec<DeferredRevocation>> {
     Ok(vault
-        .deferred_revocations()
+        .every_deferred_revocation()
         .await?
         .into_iter()
         .filter(|revocation| {
@@ -903,11 +917,24 @@ async fn decide_kept(
 /// whose stored grant cannot be read, and so cannot be released, is revoked.
 /// `revoker.providers` must hold the provider of each kept grant that still
 /// exists. Returns how many were decided or tried.
+#[cfg(test)]
 pub async fn revoke_pending(revoker: Revoker) -> usize {
     let Some(vault) = revoker.vault.clone() else {
         return 0;
     };
     let Some(kept) = kept_revocations(&vault).await else {
+        return 0;
+    };
+    revoke_pending_of(revoker, kept).await
+}
+
+/// [`revoke_pending`] for the pending ones of `kept`, read already: the sweep
+/// leaves out those whose provider cannot be read now.
+pub async fn revoke_pending_of(
+    revoker: Revoker,
+    kept: Vec<DeferredRevocation>,
+) -> usize {
+    let Some(vault) = revoker.vault.clone() else {
         return 0;
     };
     let pending = kept
@@ -918,6 +945,7 @@ pub async fn revoke_pending(revoker: Revoker) -> usize {
 }
 
 /// Every revocation the vault keeps, `None` when they cannot be read.
+#[cfg(test)]
 async fn kept_revocations(vault: &Arc<dyn DelegationVaultStorage>) -> Option<Vec<DeferredRevocation>> {
     match vault
         .deferred_revocations()
@@ -2385,6 +2413,14 @@ pub(crate) mod tests {
         ) -> anyhow::Result<Vec<crate::delegation_vault::storage::DeferredRevocation>> {
             self.inner
                 .deferred_revocations()
+                .await
+        }
+
+        async fn every_deferred_revocation(
+            &self
+        ) -> anyhow::Result<Vec<crate::delegation_vault::storage::DeferredRevocation>> {
+            self.inner
+                .every_deferred_revocation()
                 .await
         }
 

@@ -14,8 +14,6 @@
 //! reason, in the Access Point's protocol: a JSON-RPC error on MCP, a problem
 //! JSON otherwise.
 
-use std::sync::Arc;
-
 use axum::http::StatusCode;
 use axum::response::Response;
 use tracing::warn;
@@ -1007,24 +1005,7 @@ impl TargetGrantRoute {
         released: &ReleasedTargetGrant,
         grant: &DelegatedGrant,
     ) {
-        if grant.use_is_due(chrono::Utc::now()) {
-            let vault = Arc::clone(release.vault);
-            let id = grant.id.clone();
-            let surface_id = surface.surface_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = vault
-                    .mark_grant_used(&id)
-                    .await
-                {
-                    tracing::debug!(
-                        target: "credential_delegation",
-                        surface_id = %surface_id,
-                        error = %error,
-                        "Failed to record a grant's use"
-                    );
-                }
-            });
-        }
+        crate::delegation_vault::release::record_use_in_background(release.vault, grant, None);
         self.audit_injected(surface, &released.principal, released.caller.clone(), grant);
     }
 

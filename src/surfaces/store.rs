@@ -22,13 +22,12 @@ pub trait AgentSurfaceStore: Send + Sync {
     ) -> anyhow::Result<Option<AgentSurface>>;
 
     /// As [`Self::get`], except that a surface stored but unreadable is an
-    /// error, never `None`.
+    /// error, never `None`. No default: a store that took an unreadable
+    /// surface for a missing one would have the sweep revoke its grants.
     async fn get_checked(
         &self,
         surface_id: &str,
-    ) -> anyhow::Result<Option<AgentSurface>> {
-        self.get(surface_id).await
-    }
+    ) -> anyhow::Result<Option<AgentSurface>>;
 
     /// List all Agent Surfaces
     async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>>;
@@ -1319,6 +1318,13 @@ mod tests {
 
     #[async_trait]
     impl AgentSurfaceStore for FailingStore {
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.get(surface_id).await
+        }
+
         async fn save(
             &self,
             _surface: &AgentSurface,

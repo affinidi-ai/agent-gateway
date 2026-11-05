@@ -2049,7 +2049,9 @@ revocations the vault kept are read; with KMS envelope
 encryption each grant read and each kept is a round trip to the key service, so deleting a
 provider with many grants holds up surface writes for that long. A delete dropped part way puts the grants
 back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
-vault cannot list or delete the grants, or list the revocations it kept, when the grants stored were written under another
+vault cannot list or delete the grants, or read every revocation it kept (the answer names
+that case: while one cannot be read, as with at-rest encryption off, it could never be revoked
+once the provider is gone), when the grants stored were written under another
 identity hash pepper, and when one of its grants cannot be read, for example because at-rest
 encryption is now off: it could not be revoked. The answer names that grant. Make it readable
 again, or [purge it](#removing-grants), then delete the provider. Another
@@ -2140,7 +2142,8 @@ removal left to it (`deferred`, [Revoking grants at the vendor](#revoking-grants
 with their providers, revoking each whose vendor account no other stored grant holds, and each
 that waited 30 days, as pending revocations, so one that cannot reach its vendor is kept and
 tried again; and it tries again the pending revocations kept, which the gateway also tries when
-it starts and each time it becomes active; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
+it starts and each time it becomes active; those whose provider cannot be read wait for the next
+sweep, and the others are decided. The sweep goes binding by binding, found by
 file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
 and only then reads the binding's grants and decides, so a grant the person connected again
 while the sweep waited is the one it decides on. It finishes revoking one binding's removals

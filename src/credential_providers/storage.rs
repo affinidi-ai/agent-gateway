@@ -20,13 +20,12 @@ pub trait CredentialProviderStorage: Send + Sync {
         id: &str,
     ) -> Result<Option<CredentialProvider>>;
     /// As [`Self::get`], except that a provider stored but unreadable is an
-    /// error, never `None`.
+    /// error, never `None`. No default: a store that took an unreadable
+    /// provider for a missing one would have its kept revocations forgotten.
     async fn get_checked(
         &self,
         id: &str,
-    ) -> Result<Option<CredentialProvider>> {
-        self.get(id).await
-    }
+    ) -> Result<Option<CredentialProvider>>;
     async fn list(&self) -> Result<Vec<CredentialProvider>>;
     async fn update(
         &self,

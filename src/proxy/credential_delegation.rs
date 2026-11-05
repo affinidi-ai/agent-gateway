@@ -1748,6 +1748,13 @@ mod tests {
 
     #[async_trait]
     impl CredentialProviderStorage for MockProviderStore {
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::credential_providers::CredentialProvider>> {
+            self.get(id).await
+        }
+
         async fn create(
             &self,
             provider: CredentialProvider,

@@ -264,6 +264,37 @@ pub struct ReleaseContext<'a> {
     pub refusal_limit: u32,
 }
 
+/// Record, on a task of its own, that `grant` was released into the request
+/// `request_id`, when its last recorded use is old enough
+/// ([`DelegatedGrant::use_is_due`]), so a busy route does not rewrite its grant
+/// on every call. A failure is logged with the request's surface variant.
+pub fn record_use_in_background(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    grant: &DelegatedGrant,
+    request_id: Option<String>,
+) {
+    if !grant.use_is_due(Utc::now()) {
+        return;
+    }
+    let vault = Arc::clone(vault);
+    let id = grant.id.clone();
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    tokio::spawn(async move {
+        if let Err(error) = vault
+            .mark_grant_used(&id)
+            .await
+        {
+            tracing::debug!(
+                target: "credential_delegation",
+                request_id = request_id.as_deref(),
+                surface_variant = surface_variant.as_deref(),
+                error = %error,
+                "Failed to record a grant's use"
+            );
+        }
+    });
+}
+
 /// The refusals of a grant's refresh that make a call answer
 /// `connect_required`, as gateway.json's `external_consent_refresh_refusals`
 /// sets them, from 1 to 20.

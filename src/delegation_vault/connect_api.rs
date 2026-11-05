@@ -2483,6 +2483,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.get(surface_id).await
+        }
+
         async fn save(
             &self,
             _surface: &AgentSurface,
