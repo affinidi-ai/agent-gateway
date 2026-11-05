@@ -38,9 +38,23 @@ pub struct AuditLogResponse {
     /// Per-category event counts across the text-filtered set (before the
     /// category filter), so the UI can show each category's count.
     pub category_counts: std::collections::BTreeMap<String, usize>,
-    /// Whether the audit history holds more than the window this page was read
-    /// from: the counts then describe the newest part of the history.
+    /// Whether the read stopped before the end of the audit history: the
+    /// counts then describe the records it reached, not the whole history.
     pub truncated: bool,
+}
+
+impl From<crate::delegation_vault::audit::AuditLogPage> for AuditLogResponse {
+    fn from(page: crate::delegation_vault::audit::AuditLogPage) -> Self {
+        Self {
+            events: page.events,
+            total: page.total,
+            page: page.page,
+            page_size: page.page_size,
+            total_pages: page.total_pages,
+            category_counts: page.category_counts,
+            truncated: page.truncated,
+        }
+    }
 }
 
 pub async fn get_audit_log(
@@ -70,29 +84,73 @@ pub async fn get_audit_log(
     )
     .await;
 
-    let log_page = match result {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to read audit log: {}", e);
-            return Ok(Json(AuditLogResponse {
-                events: Vec::new(),
-                total: 0,
-                page,
-                page_size: limit,
-                total_pages: 0,
-                category_counts: std::collections::BTreeMap::new(),
-                truncated: false,
-            }));
-        }
-    };
+    respond(result)
+}
 
-    Ok(Json(AuditLogResponse {
-        events: log_page.events,
-        total: log_page.total,
-        page: log_page.page,
-        page_size: log_page.page_size,
-        total_pages: log_page.total_pages,
-        category_counts: log_page.category_counts,
-        truncated: log_page.truncated,
-    }))
+/// Answers with the page, or with `500` when the read failed. An empty page
+/// would assert that this is the whole of the administrator's evidence.
+fn respond(
+    result: anyhow::Result<crate::delegation_vault::audit::AuditLogPage>
+) -> Result<Json<AuditLogResponse>, (StatusCode, String)> {
+    match result {
+        Ok(page) => Ok(Json(AuditLogResponse::from(page))),
+        Err(e) => {
+            tracing::warn!(target: "credential_delegation", error = %e, "Failed to read the VP Audit Log");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to read the audit log".to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegation_vault::audit::AuditLogPage;
+
+    #[test]
+    fn a_read_that_failed_is_answered_with_an_error_not_an_empty_page() {
+        let (status, message) = respond(Err(anyhow::anyhow!("Audit logger not initialized")))
+            .expect_err("a failed read must not answer with a page");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to read the audit log", "the io detail stays in the log");
+    }
+
+    #[test]
+    fn a_page_read_from_part_of_the_history_says_so_in_the_response() {
+        let page = AuditLogPage {
+            events: Vec::new(),
+            total: 3,
+            page: 1,
+            page_size: 25,
+            total_pages: 1,
+            category_counts: std::collections::BTreeMap::from([("token_injected".to_string(), 3)]),
+            truncated: true,
+        };
+
+        let Json(response) = respond(Ok(page)).expect("a page is answered with 200");
+        let body = serde_json::to_value(response).unwrap();
+
+        assert_eq!(body["truncated"], serde_json::json!(true));
+        assert_eq!(body["total"], serde_json::json!(3));
+        assert_eq!(body["category_counts"]["token_injected"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn a_page_read_to_the_end_of_the_history_is_not_marked_truncated() {
+        let page = AuditLogPage {
+            events: Vec::new(),
+            total: 0,
+            page: 1,
+            page_size: 25,
+            total_pages: 1,
+            category_counts: std::collections::BTreeMap::new(),
+            truncated: false,
+        };
+
+        let Json(response) = respond(Ok(page)).expect("a page is answered with 200");
+        let body = serde_json::to_value(response).unwrap();
+
+        assert_eq!(body["truncated"], serde_json::json!(false));
+        assert_eq!(body["total_pages"], serde_json::json!(1));
+    }
 }

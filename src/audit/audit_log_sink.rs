@@ -7,9 +7,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::audit::dispatch::Deliver;
 use crate::audit::journal::JournalEntry;
@@ -66,22 +67,29 @@ struct StoredId {
 }
 
 /// Event ids of up to `count` records at the end of the log, oldest first.
-/// Reads back into the rotated files, so a log rotated just before a restart
-/// still recognises the records a redelivery would write again.
+/// Walks back into the rotated files, so a log rotated just before a restart
+/// still recognises the records a redelivery would write again, and stops at
+/// [`TAIL_BYTES`] so a history of any size costs the same to open.
 fn tail_event_ids(
     path: &Path,
     count: usize,
 ) -> io::Result<Vec<String>> {
-    let window = log_files::read_window(path, TAIL_BYTES)?;
-    let lines: Vec<&str> = window.text.lines().collect();
-    let skip = lines
-        .len()
-        .saturating_sub(count);
-    Ok(lines[skip..]
-        .iter()
-        .filter_map(|line| serde_json::from_str::<StoredId>(line).ok())
-        .filter_map(|stored| stored.event_id)
-        .collect())
+    let mut lines = log_files::HistoryLines::open(path);
+    let mut ids = Vec::new();
+    let mut read: u64 = 0;
+    while ids.len() < count && read < TAIL_BYTES {
+        let Some(line) = lines.next_line()? else {
+            break;
+        };
+        read += line.len() as u64 + 1;
+        if let Ok(stored) = serde_json::from_str::<StoredId>(&line)
+            && let Some(id) = stored.event_id
+        {
+            ids.push(id);
+        }
+    }
+    ids.reverse();
+    Ok(ids)
 }
 
 struct Inner {
@@ -92,7 +100,16 @@ struct Inner {
     recent: Mutex<RecentIds>,
     /// How the live log is rotated once it reaches its size cap.
     rotation: Rotation,
+    /// When the current run of rotation failures was last reported. `None`
+    /// while rotation is working.
+    rotation_warned_at: Mutex<Option<Instant>>,
 }
+
+/// How long a run of rotation failures goes unreported after one is logged.
+/// A failure the gateway cannot act on is reported once per appended record if
+/// nothing holds it back, and never again after the first if it is held back
+/// for good — while the live log grows past the cap this sink exists to keep.
+const ROTATION_WARN_INTERVAL: Duration = Duration::from_secs(3600);
 
 impl Inner {
     fn append(
@@ -145,7 +162,8 @@ impl Inner {
     /// Rotates the live log once it has reached its cap, so the file the Audit
     /// page reads stays bounded however long the gateway runs. The record is
     /// already written, so a failed rotation is logged and left for the next
-    /// append rather than failing the delivery.
+    /// append rather than failing the delivery; rotation is tried again on
+    /// every later append, and only the first failure of a run is logged.
     fn rotate_if_full(
         &self,
         file: &mut Option<File>,
@@ -164,14 +182,53 @@ impl Inner {
             let _ = open.sync_data();
         }
         *file = None;
-        if let Err(e) = log_files::rotate(&self.path, self.rotation.keep) {
-            warn!(
-                target: "credential_delegation",
-                error = %e,
-                path = %self.path.display(),
-                "Failed to rotate the VP Audit Log"
-            );
+        match log_files::rotate(&self.path, self.rotation.keep) {
+            Err(e) => {
+                if self.report_failure_at(Instant::now()) {
+                    warn!(
+                        target: "credential_delegation",
+                        error = %e,
+                        path = %self.path.display(),
+                        "Failed to rotate the VP Audit Log; the live log grows past its cap until this clears"
+                    );
+                }
+            }
+            Ok(()) => {
+                if self.report_recovery() {
+                    info!(
+                        target: "credential_delegation",
+                        path = %self.path.display(),
+                        "The VP Audit Log rotated again"
+                    );
+                }
+            }
         }
+    }
+
+    /// Whether this failure is reported: the first of a run, and then once per
+    /// [`ROTATION_WARN_INTERVAL`] for as long as rotation keeps failing, so the
+    /// operator hears about it again instead of once at the start.
+    fn report_failure_at(
+        &self,
+        now: Instant,
+    ) -> bool {
+        let mut warned = self.rotation_warned_at.lock();
+        if let Some(at) = *warned
+            && now.duration_since(at) < ROTATION_WARN_INTERVAL
+        {
+            return false;
+        }
+        *warned = Some(now);
+        true
+    }
+
+    /// Whether this success ends a run of failures, so the recovery is
+    /// reported once.
+    fn report_recovery(&self) -> bool {
+        self.rotation_warned_at
+            .lock()
+            .take()
+            .is_some()
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -216,6 +273,7 @@ impl AuditLogSink {
             closed: AtomicBool::new(false),
             recent: Mutex::new(recent),
             rotation,
+            rotation_warned_at: Mutex::new(None),
         })))
     }
 
@@ -512,6 +570,102 @@ mod tests {
 
         assert_eq!(ids(&path), vec![first.record.event_id, second.record.event_id]);
         assert!(!rotated(&path, 1).exists(), "nothing was rotated away");
+    }
+
+    #[tokio::test]
+    async fn a_record_behind_a_missing_rotated_file_is_not_written_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let record = entry(1);
+        let stored = format!("{}\n", serde_json::to_string(&record.record).unwrap());
+        // The history has lost its `.1`, as a crash during a rotation leaves it.
+        std::fs::write(rotated(&path, 2), stored).unwrap();
+
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
+        sink.deliver(&record)
+            .await
+            .unwrap();
+        sink.commit().await.unwrap();
+
+        assert_eq!(
+            ids(&path),
+            Vec::<Option<String>>::new(),
+            "the record is recognised behind the missing file, so it is not written twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_rotation_is_reported_once_and_once_more_when_it_recovers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        // A directory where a rotated file belongs: rotation cannot delete it.
+        std::fs::create_dir(rotated(&path, 1)).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation { max_bytes: 1, keep: 1 }).unwrap();
+        let failing = || {
+            sink.0
+                .rotation_warned_at
+                .lock()
+                .is_some()
+        };
+
+        sink.deliver(&entry(1))
+            .await
+            .unwrap();
+        assert!(failing(), "the first failed rotation is reported");
+        sink.deliver(&entry(2))
+            .await
+            .unwrap();
+        assert!(failing(), "a rotation that is still failing is not reported again");
+
+        std::fs::remove_dir(rotated(&path, 1)).unwrap();
+        sink.deliver(&entry(3))
+            .await
+            .unwrap();
+        sink.commit().await.unwrap();
+
+        assert!(!failing(), "rotating again is reported as the recovery");
+        assert_eq!(lines(&rotated(&path, 1)).len(), 3, "the records held back rotate once it works");
+    }
+
+    #[test]
+    fn a_rotation_that_keeps_failing_is_reported_again_each_hour() {
+        let dir = TempDir::new().unwrap();
+        let sink = AuditLogSink::open(
+            &dir.path()
+                .join("delegation-audit.jsonl"),
+            16,
+            Rotation::default(),
+        )
+        .unwrap();
+        let start = Instant::now();
+
+        assert!(
+            sink.0
+                .report_failure_at(start),
+            "the first failure of a run is reported"
+        );
+        assert!(
+            !sink
+                .0
+                .report_failure_at(start + ROTATION_WARN_INTERVAL - Duration::from_secs(1)),
+            "a failure within the hour is not reported again"
+        );
+        assert!(
+            sink.0
+                .report_failure_at(start + ROTATION_WARN_INTERVAL),
+            "a rotation still failing an hour later is reported again"
+        );
+        assert!(sink.0.report_recovery(), "the first success after a run reports the recovery");
+        assert!(!sink.0.report_recovery(), "a later success reports nothing");
+        assert!(
+            sink.0
+                .report_failure_at(start + ROTATION_WARN_INTERVAL),
+            "the next run is reported from its own first failure"
+        );
     }
 
     #[tokio::test]

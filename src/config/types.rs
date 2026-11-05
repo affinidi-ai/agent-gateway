@@ -630,6 +630,22 @@ impl AuditConfig {
         *self == Self::default()
     }
 
+    /// Refuses a rotation size small enough to cost more than it saves: the
+    /// writer rotates under the append lock on the request path, so a cap of a
+    /// few hundred bytes rotates on nearly every record and leaves a history of
+    /// tiny files holding almost no evidence. `0`, which switches rotation off,
+    /// is still allowed.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.vp_audit_log_max_bytes > 0 && self.vp_audit_log_max_bytes < crate::audit::log_files::MIN_LIVE_MAX_BYTES
+        {
+            return Err(format!(
+                "audit.vp_audit_log_max_bytes must be 0 or at least {} bytes",
+                crate::audit::log_files::MIN_LIVE_MAX_BYTES
+            ));
+        }
+        Ok(())
+    }
+
     /// How the VP Audit Log is rotated with these settings.
     pub fn rotation(&self) -> crate::audit::log_files::Rotation {
         crate::audit::log_files::Rotation {
@@ -4790,6 +4806,26 @@ mod log_redaction_config_tests {
 
         assert_eq!(audit.rotation().keep, 0, "rotation deletes no rotated file");
         assert!(!audit.is_default());
+    }
+
+    #[test]
+    fn a_rotation_size_below_one_read_chunk_is_refused() {
+        for good in [0, 65_536, AuditConfig::default().vp_audit_log_max_bytes] {
+            let audit = AuditConfig {
+                vp_audit_log_max_bytes: good,
+                ..AuditConfig::default()
+            };
+            assert_eq!(audit.validate(), Ok(()), "{good} should be accepted");
+        }
+
+        let err = AuditConfig {
+            vp_audit_log_max_bytes: 1024,
+            ..AuditConfig::default()
+        }
+        .validate()
+        .expect_err("a cap below one read chunk must be refused");
+
+        assert_eq!(err, "audit.vp_audit_log_max_bytes must be 0 or at least 65536 bytes");
     }
 }
 

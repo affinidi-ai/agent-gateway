@@ -10,6 +10,13 @@ changes:
         every rotated file, so no audit record is deleted and the history grows until the disk
         fills.
   changed:
+    - timestamp: '2026-11-06T11:15:00Z'
+      title: Refuse a VP Audit Log rotation size below 64 KiB at startup
+      description: >-
+        `[audit] vp_audit_log_max_bytes` between 1 and 65535 now fails startup with
+        `audit.vp_audit_log_max_bytes must be 0 or at least 65536 bytes`. A cap that small rotated
+        the log on nearly every record, on the thread appending it, and left a history of tiny
+        files holding almost no evidence. `0`, which switches rotation off, is still accepted.
     - timestamp: '2026-11-05T14:29:50Z'
       title: Keep a bounded VP Audit Log history on disk
       description: >-
@@ -23,11 +30,50 @@ changes:
       description: >-
         Opening the Audit page read and parsed the whole VP Audit Log on every request, so the
         gateway could be killed for using too much memory once the log had grown. A read now
-        keeps only the newest 8 MiB of the records it returns, walking back through the rotated
-        files, on a blocking thread and one read at a time, and the response says when the
-        history held more than that window. Each view spends its window on the records it keeps,
-        so the Credential Delegation Audit Log still finds its records behind a flood of request
-        events.
+        walks the history backwards one line at a time, on a blocking thread and one read at a
+        time, and keeps only the page it returns, so it costs the same memory whether the history
+        is 1 MiB or 1 GiB. Filters and counts are applied as each record is met, so a search or a
+        category filter still reaches every retained record, and a signed presentation is decoded
+        only for the rows a page shows.
+    - timestamp: '2026-11-06T09:30:00Z'
+      title: Tell the Audit page when a read did not reach the end of the history
+      description: >-
+        An audit response now carries `truncated`, set when a read stopped at its limit — a
+        history larger than 256 MiB, which only an appliance that keeps every rotated file
+        reaches — or when a rotated file is missing from the middle of the history after a crash.
+        The counts beside it then describe the records the read reached rather than the whole
+        history, instead of being presented as complete.
+    - timestamp: '2026-11-06T09:30:00Z'
+      title: Answer an unreadable VP Audit Log with an error instead of an empty page
+      description: >-
+        The Audit page showed an empty log when the gateway could not read the audit file,
+        asserting that an administrator was seeing all of the evidence when it had seen none of
+        it. Both audit endpoints now answer a failed read with 500.
+    - timestamp: '2026-11-06T09:30:00Z'
+      title: Keep audit records whole across a rotation or a missing rotated file
+      description: >-
+        A rotated file missing from the middle of the history hid every older record from the
+        Audit page and from the check that stops a record being written twice after a restart, so
+        a redelivered record could be duplicated. The history is now taken from the directory and
+        read past the gap, and a rotation that happens while a page is being read no longer shows
+        the same records twice or skips the file that moved. A rotation that keeps failing is
+        reported when it starts failing and once an hour after that, rather than once per record
+        or once per process, and reported again when it recovers.
+    - timestamp: '2026-11-06T11:15:00Z'
+      title: Keep the records read beside an oversized VP Audit Log line
+      description: >-
+        A line longer than the 1 MiB a read assembles one line in — which the gateway never writes,
+        but a damaged or hand-edited file can hold — took up to 64 KiB of the records read beside
+        it with it, silently, without marking the page as partial, and cost the de-duplication
+        window the event ids it needs to recognise a record redelivered after a restart. Only the
+        oversized line is dropped now.
+    - timestamp: '2026-11-06T11:15:00Z'
+      title: Never open a VP Audit Log name that is not a regular file
+      description: >-
+        A FIFO left at a rotated log name would block the single audit reader for as long as
+        nobody wrote to it, wedging the Audit page and the Credentials audit tab. A name that is
+        not a regular file is now passed over, and only the names rotation itself writes count as
+        rotated files, so an oddly named neighbour such as `.01` can no longer break rotation.
   removed: []
   security: []
   breaking: []

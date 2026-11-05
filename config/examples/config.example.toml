@@ -238,9 +238,11 @@ log_directory = "../_storage/logs"  # Directory to write log files (logs to stdo
 # files are deleted and counted nowhere, so forward anything that must outlive
 # them to a Governance Audit integration, or set vp_audit_log_keep to 0 to keep
 # every rotated file on the appliance — the history then grows until the disk
-# fills, and an audit log that fills the disk stops being written. Startup only.
+# fills, an audit log that fills the disk stops being written, and each rotation
+# renames every file it keeps, so rotation slows as the history grows.
+# A vp_audit_log_max_bytes between 1 and 65535 fails startup. Startup only.
 # [audit]
-# vp_audit_log_max_bytes = 8388608  # 8 MiB; 0 switches rotation off
+# vp_audit_log_max_bytes = 8388608  # 8 MiB; 0 switches rotation off, otherwise at least 65536
 # vp_audit_log_keep = 8             # rotated files kept; 0 keeps every file
 
 # Extension Inspection Configuration (optional)

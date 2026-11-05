@@ -426,9 +426,17 @@ rotated file moves one position back, and `[audit] vp_audit_log_keep` of them ar
 default, about 72 MiB in all). Anything older is deleted, so a long-running gateway keeps a
 bounded audit history on disk. A `vp_audit_log_keep` of `0` keeps every rotated file instead, so
 no audit record is deleted and the history grows with the appliance's request rate — give it the
-disk, because an audit log that fills the disk stops being written. A `vp_audit_log_max_bytes` of
-`0` switches rotation off and lets the live file grow without limit. Both are startup-only; see
+disk, because an audit log that fills the disk stops being written, and expect each rotation to
+cost more as the history grows, because rotation renames every file it keeps one position back
+and under `vp_audit_log_keep = 0` that is all of them, on the thread appending the record. A
+`vp_audit_log_max_bytes` of `0` switches rotation off and lets the live file grow without limit;
+any other value must be at least 64 KiB, or the gateway refuses to start, because a smaller one
+rotates on nearly every record while keeping almost no evidence. Both are startup-only; see
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
+
+A rotation that fails — a full disk, a permission change, something squatting on a rotated name —
+is logged when the failure starts, once an hour while it continues, and once more when rotation
+succeeds again. The live log grows past its cap for as long as it lasts.
 
 Where rotation does delete, it deletes the oldest records outright and that loss is counted
 nowhere: the gateway's own copy of the audit history reaches back only as far as the retained
@@ -436,23 +444,41 @@ files do at the appliance's request rate, and a flood of request events shortens
 records you must keep for longer to a Governance Audit integration, which keeps them wherever it
 delivers them, or set `vp_audit_log_keep` to `0` to keep them all on the appliance.
 
-**Reads.** `/v1/audit` and `/v1/delegation-audit` read on a blocking thread, one read at a time,
-and each keeps only the newest 8 MiB of the records *it* returns. A read walks back from the live
-file through the rotated ones and spends that window on the records its endpoint keeps, so
-`/v1/delegation-audit`, which drops the VP-audit categories, keeps looking past them instead of
-filling its window with records it would discard. A read therefore costs the same however large
-the history has grown: one history file and one window are in memory at a time, and concurrent
-readers wait for each other instead of each holding a copy. The permit belongs to the read rather
-than to the request that asked for it, so a request cancelled mid-read still bars the next read
-until its window is out of memory. When the history holds more records than the window fits, the
-response sets `truncated: true`, and `total`, `total_pages` and `category_counts` then describe
-the window rather than the whole history.
+**Reads.** `/v1/audit` and `/v1/delegation-audit` read on a blocking thread, one read at a time.
+A read walks the history backwards — the live file, then each rotated file in turn — one line at
+a time, filters and counts each record as it meets it, and keeps only the page it returns. Its
+memory therefore follows the page size, not the size of the history: a page of 25 records holds
+25 records whether the history is 1 MiB or 1 GiB. Concurrent readers, a second dashboard tab or a
+filter changed while a page is still loading, wait for each other instead of each running a walk.
+The permit belongs to the read rather than to the request that asked for it, so a request
+cancelled mid-read still bars the next read until the walk it started has finished.
 
-Two limits bound the walk. One history file is read from its end for at most 16 MiB, so raising
-`vp_audit_log_max_bytes` above that leaves only each file's newest 16 MiB readable. And because
-`/v1/audit` keeps every record it meets, its window is normally filled by the live file and the
-newest rotated one: the older rotated files are kept for off-box inspection and for the
-restart de-duplication described under _Delivery_ below, not for the API to page back into.
+Because every filter is applied inside the walk, a search or a category filter reaches the whole
+retained history and is not cut short by a flood of records it discards. `total`, `total_pages`
+and `category_counts` are counted in the same walk: `category_counts` spans every category of the
+records the other filters kept, and `total` follows the selected category. The record shown for a
+policy decision written before the policy version and content hash fields existed takes them from
+its trace's signed VP, which is decoded only for the rows the page returns; a text search matches
+the record as it is stored, so searching for a value only that decoding fills in does not find it.
+
+One limit bounds the walk: a read examines the whole history the configured rotation keeps
+(`vp_audit_log_max_bytes` × `vp_audit_log_keep`, so about 72 MiB with the defaults) and at most
+256 MiB, which only a `vp_audit_log_keep` of `0` or a `vp_audit_log_max_bytes` above the cap can
+reach. A read that stops at that limit, or that meets a rotated file missing from the middle of
+the history (a crash during a rotation), sets `truncated: true` in the response: `total`,
+`total_pages` and `category_counts` then describe the records it reached and not the whole
+history. A single line that does not fit the walk's 1 MiB line buffer — which the gateway never
+writes — is skipped, and only that line: the records read beside it are still returned. No file
+can cost a read more than that buffer and one 64 KiB chunk, however it was damaged or edited, and
+a rotated name that is not a regular file is passed over rather than opened.
+
+A read that fails is answered with `500` by both endpoints. Neither answers an unreadable log
+with an empty page, which would assert that the administrator is looking at all of the evidence.
+
+The dashboard does not show `truncated` yet, so on an appliance whose history is larger than the
+limit the Audit page presents a partial count as a complete one. Until it does, read the flag
+from the API when the history can exceed 256 MiB — which only `vp_audit_log_keep = 0` or a
+`vp_audit_log_max_bytes` above the cap allows.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
@@ -758,8 +784,8 @@ records as it rotates, and that is not counted here (see _File size_ above).
   integration retry policy still applies inside each attempt. Delivery is
   at-least-once: a record may be delivered again after a restart, so receivers should
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
-  its history, reading back into the rotated files so a log rotated just before a restart still
-  recognises them.
+  its history, walking back into the rotated files — past one missing from the middle — so a log
+  rotated just before a restart still recognises them.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
   addressed to a sink before it exists, so it misses nothing. An integration that is disabled,
   whose endpoint is disabled, or whose event set no longer holds audit events is paused: it
