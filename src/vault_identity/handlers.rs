@@ -181,6 +181,7 @@ pub async fn generate_did_webvh_identity(
         slot: None,
         credential_updated_at: None,
         rotations: Vec::new(),
+        rotations_dropped: false,
     };
 
     info!("[Identity Generation] Generated did:webvh identity: {}", final_did);

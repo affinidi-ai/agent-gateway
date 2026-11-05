@@ -1616,7 +1616,8 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 | --- | --- |
 | `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
-| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Only the latest 20 are kept (`MAX_ROTATIONS`), since every Identities row and WebSocket identity update carries the list. |
+| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Only the latest 20 are kept (`MAX_ROTATIONS`), since every Identities row and WebSocket identity update carries the list. When older ones are dropped, the oldest kept rotation's `previous` takes their earliest values, so the fields before it are still the ones the identity was created with. |
+| `rotations_dropped` | `true` once older rotations have been dropped; omitted otherwise. The Identities page then notes "Earlier rotations not shown". |
 
 On each use of a credential-derived managed identity, the gateway compares the credential
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer
@@ -1629,6 +1630,11 @@ rather than as a changed value. `atgk_` API keys are never rotated in place: a n
 it mints a new DID. The record's `identity_fields` then hold the current certificate's
 values.
 
+The identity the gateway presents to Fabric peers follows the same record. After an mTLS
+rotation it keeps its DID but carries the current certificate's fingerprint, subject and
+issuer, matching the certificate its request credentials already use. A peer whose policy
+pins the old fingerprint denies requests from that identity until it updates the policy.
+
 Within one gateway process, usage, origin and rotation updates to one record are serialised
 per identity hash, so concurrent requests don't overwrite each other's writes.
 
@@ -1636,10 +1642,16 @@ Rotations before this tracking began were not recorded. The first use afterwards
 credential's `updated_at` as a baseline; if a certificate's fields differ from the stored
 ones at that point, that is recorded as one rotation with `rotated_at: null`.
 
-The Identities page groups a surface's managed DIDs of the same source (payload, mTLS or API
-key) and slot under one entry, with the most recently used DID as primary. A record without
-a slot joins the only slot of its surface and source. `from_jwt_claim` DIDs, one per claim
-value and all current at once, are never grouped. Without `AG_IDENTITY_HASH_PEPPER`, every
+A surface has one Managed Agent, so the Identities page groups every managed DID of a
+surface under one entry, with the most recently used DID as primary: the DIDs from the
+Managed Agent's responses (including its agent card) and from its outbound requests through
+any Transit Point, whatever their source (payload, mTLS, API key or static) and slot. A
+change of the agent's ID is therefore always a new version, whichever side sees it first,
+and managed records without a slot are grouped straight away (records without an origin
+still show one row per DID until their next use). Several DIDs in use at once share one
+entry, whose primary is the one used last. A DID's surface is the one it was last used on.
+External callers, including the external agent on a Transit Point response, keep one row per
+DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at once. Without `AG_IDENTITY_HASH_PEPPER`, every
 restart mints new credential-derived DIDs, which show as versions with no field changes.
 
 ## Trust Recorder

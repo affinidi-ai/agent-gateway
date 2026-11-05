@@ -195,6 +195,8 @@ const IdentitiesPage: React.FC = () => {
     surfaceLinkFor,
     surfaceLinksFor,
     versionsFor,
+    rotationsDroppedFor,
+    identityFor,
     primaryDidFor,
   } = useIdentityRows({
     identities,
@@ -381,6 +383,37 @@ const IdentitiesPage: React.FC = () => {
     setSelectedIdentity(identity);
     setShowPolicyConfigModal(true);
   };
+
+  const identityActions = (identity: any, testId: (action: string) => string) => (
+    <div className="btn-group btn-group-sm" role="group">
+      {identity.trust_score !== undefined && (
+        <button
+          className="btn btn-outline-primary"
+          data-testid={testId('trust-score')}
+          onClick={e => openTrustScoreModal(identity, e)}
+          title="View Trust Score"
+        >
+          <i className="fas fa-chart-line"></i>
+        </button>
+      )}
+      <button
+        className="btn btn-outline-info"
+        data-testid={testId('policy')}
+        onClick={e => openPolicyConfigModal(identity, e)}
+        title="Configure Policy"
+      >
+        <i className="fas fa-shield-alt"></i>
+      </button>
+      <button
+        className="btn btn-outline-secondary"
+        data-testid={testId('copy-link')}
+        onClick={e => copyDeepLink(identity.did, e)}
+        title="Copy link"
+      >
+        <i className="fas fa-link"></i>
+      </button>
+    </div>
+  );
 
   const handlePolicyConfigSave = async (config: any) => {
     // Use 'id' field from backend API (not 'uuid')
@@ -763,34 +796,10 @@ const IdentitiesPage: React.FC = () => {
                                       </td>
                                     )}
                                     <td>
-                                      <div className="btn-group btn-group-sm" role="group">
-                                        {identity.trust_score !== undefined && (
-                                          <button
-                                            className="btn btn-outline-primary"
-                                            data-testid={`identities-trust-score-button-${identity.did}`}
-                                            onClick={e => openTrustScoreModal(identity, e)}
-                                            title="View Trust Score"
-                                          >
-                                            <i className="fas fa-chart-line"></i>
-                                          </button>
-                                        )}
-                                        <button
-                                          className="btn btn-outline-info"
-                                          data-testid={`identities-policy-button-${identity.did}`}
-                                          onClick={e => openPolicyConfigModal(identity, e)}
-                                          title="Configure Policy"
-                                        >
-                                          <i className="fas fa-shield-alt"></i>
-                                        </button>
-                                        <button
-                                          className="btn btn-outline-secondary"
-                                          data-testid={`identities-copy-link-button-${identity.did}`}
-                                          onClick={e => copyDeepLink(identity.did, e)}
-                                          title="Copy link"
-                                        >
-                                          <i className="fas fa-link"></i>
-                                        </button>
-                                      </div>
+                                      {identityActions(
+                                        identity,
+                                        action => `identities-${action}-button-${identity.did}`
+                                      )}
                                     </td>
                                   </tr>
                                   {isExpanded && (
@@ -975,6 +984,21 @@ const IdentitiesPage: React.FC = () => {
                                                           ? linkedDid
                                                           : undefined
                                                       }
+                                                      rotationsDropped={rotationsDroppedFor(
+                                                        identity.did
+                                                      )}
+                                                      renderActions={version => {
+                                                        const earlier =
+                                                          version.did !== identity.did &&
+                                                          identityFor(version.did);
+                                                        return earlier
+                                                          ? identityActions(
+                                                              earlier,
+                                                              action =>
+                                                                `identities-version-${version.number}-${action}-button`
+                                                            )
+                                                          : null;
+                                                      }}
                                                     />
                                                   </div>
                                                 )}

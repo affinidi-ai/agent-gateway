@@ -6,6 +6,10 @@ interface IdentityVersionHistoryProps {
   versions: IdentityVersion[];
   /** DID whose versions are marked, for a deep link to an earlier DID. */
   highlightedDid?: string;
+  /** Whether older rotations were dropped, so the list is not complete. */
+  rotationsDropped?: boolean;
+  /** Actions of the DID a version introduces; return `null` to show none. */
+  renderActions?: (version: IdentityVersion) => React.ReactNode;
 }
 
 const formatValue = (value: unknown): string =>
@@ -49,6 +53,8 @@ const rotationLabel = (version: IdentityVersion): string =>
 export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
   versions,
   highlightedDid,
+  rotationsDropped = false,
+  renderActions,
 }) => (
   <div data-testid="identities-version-history">
     {versions.length === 0 && (
@@ -76,6 +82,9 @@ export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
               <span className="text-muted">
                 {version.at ? formatDateTime(version.at, true) : 'Time unknown'}
               </span>
+              {renderActions && version.kind === 'did' && (
+                <span className="ms-auto">{renderActions(version)}</span>
+              )}
             </div>
             <ul
               className="small mt-2 mb-0 ps-3"
@@ -100,6 +109,11 @@ export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
         );
       })}
     </ol>
+    {rotationsDropped && (
+      <p className="small text-muted mb-2" data-testid="identities-version-history-dropped">
+        Earlier rotations not shown.
+      </p>
+    )}
   </div>
 );
 

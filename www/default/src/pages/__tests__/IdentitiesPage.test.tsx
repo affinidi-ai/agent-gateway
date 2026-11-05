@@ -835,7 +835,10 @@ describe('IdentitiesPage', () => {
     });
 
     it('says no rotations are recorded yet for a certificate identity, and nothing for a payload one', async () => {
-      renderWithStats([{ ...managedRotatedFixture, rotations: [] }, managedFixture]);
+      renderWithStats([
+        { ...managedRotatedFixture, rotations: [] },
+        { ...managedFixture, surface_id: 'beta' },
+      ]);
 
       fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
       fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
@@ -844,6 +847,56 @@ describe('IdentitiesPage', () => {
       fireEvent.click(screen.getByTestId(`identities-row-${managedRotatedFixture.did}`));
       fireEvent.click(screen.getByTestId(`identities-row-${managedFixture.did}`));
       expect(screen.queryByTestId('identities-version-history-toggle')).not.toBeInTheDocument();
+    });
+
+    it('offers the actions of an earlier DID on its version, not on the current one', async () => {
+      renderWithStats([gpt4o, gpt41]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-1-policy-button')).toBeInTheDocument();
+      expect(screen.getByTestId('identities-version-1-copy-link-button')).toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-2-policy-button')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('identities-version-1-copy-link-button'));
+      expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1);
+    });
+
+    it('groups a surface’s response and Transit Point DIDs, but not an external caller', async () => {
+      const transitPoint = {
+        ...gpt41,
+        did: 'did:webvh:zQmTp:gateway.example.com:surface:alpha',
+        identity_hash: 'hash-tp',
+        last_used_at: '2026-01-05T00:00:00Z',
+        slot: { kind: 'transit_point', alias: 'tp-1' },
+      };
+      renderWithStats([gpt4o, transitPoint, callerNamed]);
+
+      expect(await screen.findByTestId(`identities-row-${transitPoint.did}`)).toBeInTheDocument();
+      expect(screen.queryByTestId(`identities-row-${gpt4o.did}`)).not.toBeInTheDocument();
+      expect(screen.getByTestId('identities-row-did:web:caller.example')).toBeInTheDocument();
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
+    });
+
+    it('notes earlier rotations only when the backend dropped some', async () => {
+      renderWithStats([{ ...managedRotatedFixture, rotations_dropped: true }]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-history-dropped')).toHaveTextContent(
+        'Earlier rotations not shown.'
+      );
+    });
+
+    it('does not note earlier rotations when none were dropped', async () => {
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.queryByTestId('identities-version-history-dropped')).not.toBeInTheDocument();
     });
 
     it('opens the surface entry and marks the version for a deep link to an earlier DID', async () => {

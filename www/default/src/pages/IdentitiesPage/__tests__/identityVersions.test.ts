@@ -87,7 +87,7 @@ describe('groupIdentityVersions', () => {
     expect(entries.every(entry => entry.versions.length === 0)).toBe(true);
   });
 
-  it('separates credential sources and Transit Point slots on one surface', () => {
+  it('groups the Managed Agent’s DIDs of every source and slot on one surface', () => {
     const mtls = version(rotated, 'did:mtls', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', {
       rotations: [],
     });
@@ -95,28 +95,20 @@ describe('groupIdentityVersions', () => {
       managed,
       'did:tp',
       '2026-01-02T00:00:00Z',
-      '2026-01-02T00:00:00Z',
+      '2026-01-09T00:00:00Z',
       {
         slot: { kind: 'transit_point', alias: 'tp-1' },
       }
     );
 
-    const entries = groupIdentityVersions([managed, mtls, transitPoint]);
+    const [entry, ...rest] = groupIdentityVersions([managed, mtls, transitPoint]);
 
-    expect(entries).toHaveLength(3);
+    expect(rest).toEqual([]);
+    expect(entry.primary.did).toBe('did:tp');
+    expect(entry.dids).toEqual([managed.did, 'did:mtls', 'did:tp']);
   });
 
-  it('joins a record without a slot to the only slot of its surface and source', () => {
-    const legacy = version(managed, 'did:legacy', '2025-12-01T00:00:00Z', '2025-12-02T00:00:00Z', {
-      slot: undefined,
-    });
-
-    const [entry] = groupIdentityVersions([legacy, managed]);
-
-    expect(entry.dids).toEqual(['did:legacy', managed.did]);
-  });
-
-  it('keeps records without a slot apart when the surface source has several slots', () => {
+  it('groups a record without a slot by its surface straight away', () => {
     const legacy = version(managed, 'did:legacy', '2025-12-01T00:00:00Z', '2025-12-02T00:00:00Z', {
       slot: undefined,
     });
@@ -130,7 +122,18 @@ describe('groupIdentityVersions', () => {
       }
     );
 
-    expect(groupIdentityVersions([legacy, managed, transitPoint])).toHaveLength(3);
+    const entries = groupIdentityVersions([legacy, managed, transitPoint]);
+
+    expect(entries.map(entry => entry.dids)).toEqual([['did:legacy', managed.did, 'did:tp']]);
+  });
+
+  it('flags an entry when one of its DIDs had older rotations dropped', () => {
+    const dropped = version(rotated, 'did:mtls', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', {
+      rotations_dropped: true,
+    });
+
+    expect(groupIdentityVersions([managed, dropped])[0].rotationsDropped).toBe(true);
+    expect(groupIdentityVersions([managed])[0].rotationsDropped).toBe(false);
   });
 
   it('lists a rotation inside its DID with the fields it changed', () => {

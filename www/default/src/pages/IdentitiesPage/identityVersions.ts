@@ -1,4 +1,4 @@
-import type { Identity, ManagedSlot } from '../../types';
+import type { Identity } from '../../types';
 
 export interface FieldChange {
   field: string;
@@ -26,6 +26,8 @@ export interface IdentityEntry<T extends Identity> {
   dids: string[];
   /** Newest first; empty for a single DID that was never rotated. */
   versions: IdentityVersion[];
+  /** Whether a DID of the entry had older rotations dropped by the backend. */
+  rotationsDropped: boolean;
 }
 
 type Fields = Record<string, unknown>;
@@ -53,48 +55,17 @@ const sourceOf = (identity: Identity): string => {
 export const recordsRotations = (identity: Identity): boolean =>
   identity.origin === 'managed' && ['mtls', 'api_key'].includes(sourceOf(identity));
 
-const slotKey = (slot?: ManagedSlot): string | undefined => {
-  if (!slot) return undefined;
-  return slot.kind === 'transit_point' ? `transit_point:${slot.alias}` : 'protected';
-};
-
 /**
- * Managed identities of one surface, source and slot are versions of each other. A
- * `from_jwt_claim` DID is one parallel agent per claim value, so it is never grouped.
+ * A surface has one Managed Agent, so its managed identities, from its responses and from
+ * its requests through any Transit Point, whatever their source, are versions of each other.
+ * A `from_jwt_claim` DID is one parallel agent per claim value, so it is never grouped.
  */
-const surfaceSourceKey = (identity: Identity): string | undefined => {
-  if (identity.origin !== 'managed' || !identity.surface_id) return undefined;
-  const source = sourceOf(identity);
-  if (source === 'jwt_claim') return undefined;
-  return `${identity.surface_id}|${source}`;
+const groupKey = (identity: Identity): string => {
+  if (identity.origin !== 'managed' || !identity.surface_id || sourceOf(identity) === 'jwt_claim') {
+    return `did|${identity.did}`;
+  }
+  return `surface|${identity.surface_id}`;
 };
-
-/**
- * Group key of each identity: records written before slot tracking join the only slot of
- * their surface and source, or stay together apart from the slotted ones when there are
- * several.
- */
-function groupKeys<T extends Identity>(identities: T[]): Map<T, string> {
-  const slotsBySurfaceSource = new Map<string, Set<string>>();
-  identities.forEach(identity => {
-    const base = surfaceSourceKey(identity);
-    const slot = slotKey(identity.slot);
-    if (!base || !slot) return;
-    const slots = slotsBySurfaceSource.get(base) ?? new Set<string>();
-    slots.add(slot);
-    slotsBySurfaceSource.set(base, slots);
-  });
-
-  return new Map(
-    identities.map(identity => {
-      const base = surfaceSourceKey(identity);
-      if (!base) return [identity, `did|${identity.did}`];
-      const slots = slotsBySurfaceSource.get(base);
-      const slot = slotKey(identity.slot) ?? (slots?.size === 1 ? [...slots][0] : 'unrecorded');
-      return [identity, `${base}|${slot}`];
-    })
-  );
-}
 
 /** The identity's fields before its rotation at `index`; `rotations.length` gives the current ones. */
 function fieldsBefore(identity: Identity, index: number): Fields {
@@ -178,11 +149,13 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
     time(lastUse(member)) > time(lastUse(best)) ? member : best
   );
   const dids = members.map(member => member.did);
+  const rotationsDropped = members.some(member => member.rotations_dropped === true);
   if (members.length === 1) {
     return {
       primary: latest,
       dids,
       versions: latest.rotations?.length ? timeline(members, latest.did) : [],
+      rotationsDropped,
     };
   }
   return {
@@ -193,19 +166,19 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
     },
     dids,
     versions: timeline(members, latest.did),
+    rotationsDropped,
   };
 }
 
 /**
- * One entry per surface identity: a surface's managed DIDs of the same source and slot are
- * its versions, with the most recently used DID as the primary. Every other identity is an
- * entry of its own. Entries keep the order of their first identity.
+ * One entry per surface Managed Agent: a surface's managed DIDs are its versions, with the
+ * most recently used DID as the primary. Every other identity is an entry of its own.
+ * Entries keep the order of their first identity.
  */
 export function groupIdentityVersions<T extends Identity>(identities: T[]): IdentityEntry<T>[] {
-  const keys = groupKeys(identities);
   const groups = new Map<string, T[]>();
   identities.forEach(identity => {
-    const key = keys.get(identity)!;
+    const key = groupKey(identity);
     const members = groups.get(key) ?? [];
     members.push(identity);
     groups.set(key, members);

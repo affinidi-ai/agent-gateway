@@ -1201,6 +1201,7 @@ mod tests {
                 slot: None,
                 credential_updated_at: None,
                 rotations: Vec::new(),
+                rotations_dropped: false,
             })
             .await
             .unwrap();
@@ -1273,6 +1274,7 @@ mod tests {
                 slot: None,
                 credential_updated_at: None,
                 rotations: Vec::new(),
+                rotations_dropped: false,
             })
             .await
             .unwrap();
@@ -1320,6 +1322,7 @@ mod tests {
                 slot: None,
                 credential_updated_at: None,
                 rotations: Vec::new(),
+                rotations_dropped: false,
             })
             .await
             .unwrap();

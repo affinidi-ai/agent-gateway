@@ -1226,13 +1226,13 @@ in `identityVersions.ts`, the shared managed DID check in `sharedManagedDid.ts`,
 parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
 `IdentityRecorderChip`, and `IdentityVersionHistory`.
 
-- One row per surface identity: managed rows with the same `surface_id`, source
-  (`agent_identity.credential_type`: `mtls` or `api_key`, none for payload extraction) and
-  `slot` are versions of one entry (`groupIdentityVersions`). A row without `slot` joins the
-  only slot of its surface and source. The row shows the most recently used DID, a summed
-  usage count, and the latest last use; its actions (Trust Score,
-  Configure Policy, Copy link) belong to that DID. `from_jwt_claim` DIDs (one per claim
-  value), external callers and identities without a surface keep one row per DID.
+- One row per surface Managed Agent: managed rows with the same `surface_id` are versions of
+  one entry (`groupIdentityVersions`), whatever their source
+  (`agent_identity.credential_type`) or `slot`, so the Managed Agent's response and Transit
+  Point DIDs share it. The row shows the most recently used DID, a summed usage count, and the
+  latest last use; its actions (Trust Score, Configure Policy, Copy link) belong to that DID.
+  `from_jwt_claim` DIDs (one per claim value), external callers and identities without a
+  surface keep one row per DID.
 - The expanded row's **Version History** section lists the entry's DIDs and the credential
   rotations inside them as one timeline, newest first, numbered from the oldest. Each version
   shows its time ("Time unknown" for a rotation found when tracking began), its DID, a
@@ -1240,9 +1240,12 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   before it (a new DID against the previous DID, a rotation against its DID's earlier
   fields); the first version lists its values. A rotation with field changes (a certificate)
   is labelled "Credential rotated"; one without (an API key, whose update may only have
-  edited its details) is labelled "Credential updated". A certificate or API key identity
-  with no versions yet still shows the section, saying none are recorded. The rows' `slot`
-  and `rotations` (the latest 20) come from the backend; see
+  edited its details) is labelled "Credential updated". A version that introduces a DID other
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). When
+  the backend dropped older rotations (`rotations_dropped`), the list ends with "Earlier
+  rotations not shown." (`identities-version-history-dropped`). A certificate or API key
+  identity with no versions yet still shows the section, saying none are recorded. The rows'
+  `rotations` (the latest 20) come from the backend; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when
