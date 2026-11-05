@@ -21,3 +21,4 @@ pub mod producer;
 pub mod registry;
 pub mod request_events;
 pub mod sources;
+pub mod target_auth_changes;

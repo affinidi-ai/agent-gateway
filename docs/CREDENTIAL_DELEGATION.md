@@ -841,6 +841,22 @@ the credential in either mode. Only an A2A or AP2 surface sends requests to its 
 Target, on the direct path and Fabric receive alike; a request of any other surface is never
 dispatched to the A2A proxy.
 
+### Auditing Target authentication changes
+
+Every surface write through the management API (create, `PUT`, `PATCH`, a variant create,
+update, patch or delete, and a surface delete) records a `target_auth_changed` event in the VP
+Audit Log for each leg whose Target authentication it added, changed or removed: the Target or a
+Transit Point (by `transit_point_id` and alias), of the base surface (`surface_variant` `_base_`)
+or of a variant as it resolves (by `variant_id` and alias). A change to the base that a variant
+inherits is recorded for that variant too, since its requests now send the new credential. The
+record names the management caller as `actor`, the method before and after (`static_secret`,
+`credential_provider`, `credential_lookup` or `none`), the credential provider id before and
+after, and for a changed setting the parts it replaced (`changed`). It never carries a secret id,
+header name, header format or any value. A write that leaves every Target authentication as it
+was, or changes only the dashboard's `auth_type` hint, records nothing, and so do writes outside
+a management request (startup migrations, replication, a configuration reload). See
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the record.
+
 ### External consent on a Transit Point
 
 A Transit Point's `transit_credentials` with `consent_mode: external` binds an

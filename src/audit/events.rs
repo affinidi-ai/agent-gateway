@@ -1,5 +1,5 @@
 //! Detail types for the governance audit events raised on the request path and by
-//! management changes to policies.
+//! management changes to policies and to Target Authentication.
 
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,39 @@ pub struct TargetAuthRejection {
     /// The token endpoint's OAuth `error` code, when it answered with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_error: Option<String>,
+}
+
+/// The leg of a surface whose Target Authentication a management change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthLeg {
+    Target,
+    TransitPoint,
+}
+
+/// How a leg obtains the credential it sends; `none` when it sends none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthMethodKind {
+    None,
+    StaticSecret,
+    CredentialProvider,
+    CredentialLookup,
+}
+
+/// A part of a Target Authentication setting that a change replaced. Names the part only,
+/// never its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAuthField {
+    Method,
+    SecretId,
+    ProviderId,
+    HeaderName,
+    HeaderFormat,
+    Scopes,
+    Fallback,
+    TargetIdentifier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

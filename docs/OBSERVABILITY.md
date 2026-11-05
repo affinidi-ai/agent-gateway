@@ -521,6 +521,21 @@ or a request body. Writes made outside a management request (startup migrations,
 record nothing, and neither do writes a configuration reload makes, though the reload is asked
 for through the management API: it is the gateway's own work, not the user's change.
 
+**Target authentication change events.** Raised by management API writes to a surface (group
+Auth); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-target-authentication-changes)
+for which writes.
+
+- `target_auth_changed`: the Target authentication of one leg was added, changed or removed, one
+  record per leg. `leg` is `target` or `transit_point`, with `transit_point_id` and
+  `transit_point` (its alias) for a Transit Point; `surface_variant` is the variant's alias, with
+  `variant_id`, or `_base_`. `previous_method` and `method` are `static_secret`,
+  `credential_provider`, `credential_lookup` or `none`; `previous_provider_id` and `provider_id`
+  name the credential provider on either side. `changed` lists the parts a change to an existing
+  setting replaced (`method`, `secret_id`, `provider_id`, `header_name`, `header_format`,
+  `scopes`, `fallback`, `target_identifier`), by name only. `actor` names the management caller
+  as on policy change events, and the top level carries `surface_id` and `channel_name`. No
+  record carries a secret id, header name, header format or value.
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,

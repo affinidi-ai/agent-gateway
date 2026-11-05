@@ -10,7 +10,8 @@
 use crate::audit::events::{
     Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
     PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetAuthRejection, TargetKind,
+    RejectionStage, RequestFailureOutcome, TargetAuthField, TargetAuthLeg, TargetAuthMethodKind, TargetAuthRejection,
+    TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -383,6 +384,34 @@ impl PolicyChangeDetails {
     }
 }
 
+/// A management change to the Target Authentication of one leg of a surface: the Target or a
+/// Transit Point, of the base surface or of a variant as it resolves. Names the method and
+/// credential provider before and after; never a secret id, header name, header format or value.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TargetAuthChangeDetails {
+    pub actor: Actor,
+    /// The variant's alias, or `_base_` for the base surface.
+    pub surface_variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    pub leg: TargetAuthLeg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point_id: Option<String>,
+    /// The Transit Point's alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    pub previous_method: TargetAuthMethodKind,
+    pub method: TargetAuthMethodKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// The parts a change to an existing setting replaced; empty when the setting was added or
+    /// removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<TargetAuthField>,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -578,6 +607,8 @@ pub enum DelegationAuditAction {
     PolicyAttachmentChanged(Box<PolicyChangeDetails>),
     /// A policy change was refused; `action` names the change attempted.
     PolicyChangeRefused(Box<PolicyChangeDetails>),
+    /// The Target Authentication of one leg of a surface was added, changed or removed.
+    TargetAuthChanged(Box<TargetAuthChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -631,6 +662,7 @@ impl DelegationAuditAction {
                 | Self::PolicyDetached(_)
                 | Self::PolicyAttachmentChanged(_)
                 | Self::PolicyChangeRefused(_)
+                | Self::TargetAuthChanged(_)
         )
     }
 }
@@ -1446,6 +1478,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyDetached(_) => "policy_detached",
         DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
+        DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
     }
 }
 

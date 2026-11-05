@@ -8,6 +8,7 @@ pub mod names;
 pub mod policy_changes;
 pub mod provider_token;
 pub mod sts;
+pub mod target_auth_audit;
 pub mod target_auth_save;
 pub mod target_credential;
 pub mod terms;
