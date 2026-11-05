@@ -104,7 +104,7 @@ struct PolicyVariables {
 /// The authenticated caller as a person reads it: email, else display name,
 /// else the authenticated subject (JWT `sub`, API key name, DID, mTLS principal).
 fn principal(caller: &AuditCallerContext) -> String {
-    [&caller.email, &caller.name, &caller.sub]
+    [&caller.email, &caller.name, &caller.principal, &caller.sub]
         .into_iter()
         .flatten()
         .find(|value| !value.is_empty())
@@ -235,6 +235,7 @@ mod tests {
         name: Option<&str>,
     ) -> AuditCallerContext {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
         })
@@ -387,6 +388,14 @@ mod tests {
         assert_eq!(with(jwt_caller(None, Some("Ada Lovelace"))), "Ada Lovelace");
         assert_eq!(with(jwt_caller(None, None)), "user-123");
         assert_eq!(with(jwt_caller(Some(""), None)), "user-123", "an empty claim is skipped");
+        let by_oid = crate::delegation_vault::audit::build_caller_context(
+            &crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "oid".to_string(),
+                subject: "person-1".to_string(),
+                claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+            },
+        );
+        assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");
 
         let api_key =
             crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::ApiKey {

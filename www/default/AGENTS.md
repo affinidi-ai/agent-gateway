@@ -678,6 +678,23 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## JWT verification strategy editor
+
+`/jwt-verification-strategies/new` and `/jwt-verification-strategies/:id`
+(`EditJwtVerificationStrategyPage.tsx`) have a **Caller identity claim** field
+(`jwt-strategy-editor-principal-claim-input`), the strategy's `principal_claim`. A new strategy
+sends the trimmed value only when it is not blank, so a blank field means `sub`. On an existing
+strategy the field shows the stored claim, is disabled, and is left out of the update, since the
+gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
+same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
+
+## Credentials audit tab
+
+`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
+the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
+the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
+other than `sub`.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)

@@ -6701,10 +6701,18 @@ async fn proxy_handler_with_mcp_runtime(
                 .zip(
                     authenticated_identity
                         .as_ref()
-                        .and_then(crate::source_auth::AuthenticatedIdentity::jwt_claims),
+                        .and_then(|identity| {
+                            identity
+                                .jwt_claims()
+                                .zip(identity.jwt_principal_claim())
+                        }),
                 )
-                .and_then(|(profile, claims)| {
-                    crate::delegation_vault::modern_consent::identity::principal_for_claims(profile, claims)
+                .and_then(|(profile, (claims, principal_claim))| {
+                    crate::delegation_vault::modern_consent::identity::principal_for_claims(
+                        profile,
+                        claims,
+                        principal_claim,
+                    )
                 });
 
             let delegation_audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
@@ -20559,6 +20567,7 @@ allow if {
             kind: crate::mcp::request_validation::McpMessageKind::Request,
         };
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
         };
@@ -22069,6 +22078,7 @@ allow if {
             let (issuer, _dir) = test_vc_issuer().await;
             let state = state_with(inbound_from_api_key("pak-wrong-auth"), Some(issuer));
             let jwt = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
             };
@@ -23082,6 +23092,7 @@ mod fabric_extended_card_tests {
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
         });
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
         };
