@@ -82,6 +82,11 @@ The Surface Builder's **Send delegated credentials over Fabric** switch is per r
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Managed Agent panel's **Release per-user grants to Fabric callers** switch writes
+`target.delegated_credentials_for_fabric_callers`, off by default, and is shown only for an HTTP
+or HTTPS Target on a surface with credential bindings, with a warning while on; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
 Transit Point element's **Who can call this Transit Point** section sets the transit token, a

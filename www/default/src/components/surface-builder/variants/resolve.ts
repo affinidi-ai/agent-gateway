@@ -60,6 +60,7 @@ const TARGET_FIELDS = [
   'mpp_auto_pay',
   'mpp_auto_pay_max_amount',
   'fabric_delegated_credentials',
+  'delegated_credentials_for_fabric_callers',
 ] as const;
 
 const SHARED_TRANSIT_FIELDS = [

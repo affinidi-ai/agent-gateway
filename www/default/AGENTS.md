@@ -111,6 +111,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Release per-user grants to Fabric callers** is the Managed Agent panel's
+  `managed-agent/PartnerGrantReleaseSection.tsx`, under a **Fabric Callers** label. It writes
+  `target.delegated_credentials_for_fabric_callers` and appears only when the Target is an HTTP
+  or HTTPS URL and the surface has a Credential Delegation row; a save drops the field for any
+  other Target. It defaults to off, its explanation sits behind `FieldHelp`, and while on an
+  always-visible warning says a paired gateway that sends a person's own token gets that
+  person's grant. A variant carries it in `overrides.target`. Test ids:
+  `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`

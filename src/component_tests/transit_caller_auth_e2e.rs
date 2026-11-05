@@ -736,6 +736,96 @@ async fn a_save_warns_of_a_transit_point_strategy_that_shares_an_issuer_with_ano
     }
 }
 
+/// A save of a surface whose Target releases per-user grants to Fabric callers
+/// answers with a `Warning` header where the switch releases nothing: beside an
+/// API key, which names all of a partner's users alike, and on a Target that is
+/// not an `http://` or `https://` URL, such as `fabric://` or `ws://`, to which
+/// Fabric receive sends no delegated credential. A JWT with an audience in
+/// front of an HTTP Target gets none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_warns_of_a_target_that_releases_grants_where_the_switch_has_no_effect() {
+    const NOT_AN_HTTP_TARGET: &str = "299 - \"the Target sets delegated_credentials_for_fabric_callers, but its \
+                                      endpoint is not an http:// or https:// URL, so Fabric receive sends it no \
+                                      delegated credential and the switch has no effect there\"";
+    let mut admin = None;
+    let peer = crate::gateways::types::Gateway::new(
+        "Peer".to_string(),
+        String::new(),
+        "did:web:peer.example".to_string(),
+        crate::gateways::types::GatewayType::Remote,
+    );
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        admin = Some(configure_admin_api(bootstrap));
+        write_caller_key(temp_dir);
+        let gateways = temp_dir.join("gateways");
+        std::fs::create_dir_all(&gateways).expect("create gateways dir");
+        std::fs::write(gateways.join(format!("{}.json", peer.id)), serde_json::to_vec(&peer).unwrap())
+            .expect("write peer gateway");
+        let dir = temp_dir.join("jwt_verification_strategies");
+        std::fs::create_dir_all(&dir).expect("create strategy dir");
+        let strategy = json!({
+            "id": "workforce", "name": "workforce", "expected_issuer": "https://login.example.com",
+            "jwks_source": { "type": "remote", "jwks_uri": "https://login.example.com/keys" },
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(dir.join("workforce.json"), strategy.to_string()).expect("write strategy");
+    })
+    .await;
+    let admin = admin.unwrap();
+    let per_user = json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "workforce",
+        "audiences": ["api://agent"] });
+    let api_key = json!({ "type": "api_key", "secret_id": CALLER_KEY_SECRET,
+        "extraction": { "source": "http_header", "field": "x-api-key" } });
+    let save = |id: &str, endpoint: &str, method: &serde_json::Value| {
+        admin
+            .post(format!("{}/api/v1/surfaces", h.gateway_base))
+            .json(&json!({
+                "surface_id": id, "name": id, "status": "disabled",
+                "access_point": { "listen_address": h.gateway_base, "route": format!("/{id}"), "protocol": "a2a",
+                    "caller_authentication": { "methods": [method] } },
+                "target": { "endpoint": endpoint, "delegated_credentials_for_fabric_callers": true }
+            }))
+            .send()
+    };
+    let warnings = |response: &reqwest::Response| -> Vec<String> {
+        response
+            .headers()
+            .get_all("warning")
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+
+    for (id, endpoint, method, expected) in [
+        ("per-user", h.mock.url(), &per_user, Vec::new()),
+        (
+            "api-key",
+            h.mock.url(),
+            &api_key,
+            vec![
+                "299 - \"the Target sets delegated_credentials_for_fabric_callers, but the surface's caller \
+                 authentication cannot tell a partner's users apart, and an api_key method names every key in its \
+                 secret as one caller, the partner's and direct callers' alike, so Fabric callers get none of its \
+                 per-user delegated credentials\"",
+            ],
+        ),
+        ("fabric", format!("fabric://{}/peer-surface", peer.id), &per_user, vec![NOT_AN_HTTP_TARGET]),
+        ("websocket", "ws://agent.internal/socket".to_string(), &per_user, vec![NOT_AN_HTTP_TARGET]),
+    ] {
+        let response = save(id, &endpoint, method)
+            .await
+            .unwrap();
+        let (status, found) = (response.status(), warnings(&response));
+        assert_eq!(status, 201, "{id}: {}", response.text().await.unwrap());
+        assert_eq!(found, expected, "{id}");
+    }
+}
+
 /// A tenant access token can point a Transit Point's `source_auth` only at its
 /// own or appliance-wide secrets, on the base and in a variant, as it can on an
 /// Access Point.
