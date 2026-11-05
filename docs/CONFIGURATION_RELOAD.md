@@ -102,8 +102,10 @@ shared outbound ports:
 6. Stop the listener of a port no longer configured.
 
 A listener is bound again only when its port's bind addresses or TLS setting change in
-`gateway.json`; it is then stopped, and requests using it while it is rebound can be
-interrupted. A TLS listener that stays bound reloads the gateway certificate and serves it from
+`gateway.json`, or stopped when its port is removed. Requests using it while it is rebound can
+be interrupted, and a connection it accepted is not carried over: a plain HTTP connection is
+closed, and the next request on a TLS connection, which outlives its listener, is refused with
+`503` and `Connection: close`, so the client reconnects to the listener now bound. A TLS listener that stays bound reloads the gateway certificate and serves it from
 the next handshake on; if the certificate cannot be loaded, it keeps the one it has and the error
 is logged. A port that cannot be bound serves nothing, and its task-monitor entries are removed.
 
@@ -117,7 +119,8 @@ Transit Point refuses it with `404`.
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
 available, reload returns an error. A port whose router cannot be rebuilt keeps serving the router
-it had, and the error is logged.
+it had, and the error is logged; single-surface changes keep updating that router, so a surface
+added or changed on the port afterwards is served.
 
 With `channel_config_source = "local"`, a reload first re-reads the Agent Surface records from disk,
 and each record that changed on disk is then also applied as a single-surface change, as a change

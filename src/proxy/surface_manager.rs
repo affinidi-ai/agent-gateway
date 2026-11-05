@@ -825,6 +825,22 @@ impl SurfaceTaskManager {
             .await;
             if let Err(e) = served {
                 error!("Port listener error for port {}: {}", port, e);
+                // A listener still bound on the port serves its previous router,
+                // so its previous state stays the one single-surface reloads update.
+                if self
+                    .bound_ports
+                    .read()
+                    .await
+                    .contains_key(&port)
+                    && let Some(previous) = self
+                        .port_listener_states
+                        .read()
+                        .await
+                        .get(&port)
+                        .cloned()
+                {
+                    new_port_states.insert(port, previous);
+                }
             }
         }
 

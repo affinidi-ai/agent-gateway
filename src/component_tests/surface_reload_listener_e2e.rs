@@ -1,7 +1,9 @@
 //! Surface saves that reload the whole gateway configuration keep every port
 //! listener bound: the inbound port, which also serves the management API, and
 //! the shared outbound port answer every request made during the saves, and
-//! the routes the saves add or remove take effect on the same listeners.
+//! the routes the saves add or remove take effect on the same listeners. A
+//! port whose router cannot be rebuilt keeps serving its previous router, which
+//! later surface changes still update.
 
 use super::helpers::{GatewayHarness, configure_admin_api, configure_gateway_route_prefixes};
 use serde_json::{Value, json};
@@ -199,4 +201,63 @@ async fn surface_saves_that_reload_the_gateway_refuse_no_connection() {
         &failures[..failures.len().min(5)]
     );
     assert_eq!(call(&h, "/aliased$beta").await, 404, "the deleted surface's alias route stops answering");
+}
+
+/// A port whose router a reload cannot rebuild, because one of its surfaces
+/// names a default variant it does not have, keeps serving its previous
+/// router, and a surface created on that port afterwards is still served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_created_on_a_port_whose_router_could_not_be_rebuilt_is_served() {
+    let mut admin = None;
+    let mut surfaces_directory = None;
+    let h = GatewayHarness::start(|_, _, bootstrap| {
+        admin = Some(configure_admin_api(bootstrap));
+        configure_gateway_route_prefixes(
+            bootstrap,
+            &[("kept", "kept", "/kept"), ("broken", "broken", "/broken"), ("added", "added", "/added")],
+        );
+        surfaces_directory = Some(std::path::PathBuf::from(
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+        ));
+    })
+    .await;
+    let admin = admin.unwrap();
+    let surfaces = format!("{}/api/v1/surfaces", h.gateway_base);
+    let listen_address = format!("http://localhost:{}", port_of(&h.gateway_base));
+    let create = |name: &str| {
+        admin
+            .post(&surfaces)
+            .json(&json!({
+                "name": name,
+                "access_point": {"listen_address": listen_address, "route": format!("/{name}"), "protocol": "a2a", "public": true},
+                "target": {"endpoint": h.mock.url()}
+            }))
+    };
+    let (status, kept) = send(create("kept")).await;
+    assert_eq!(status, 201, "{kept}");
+    let (status, broken) = send(create("broken")).await;
+    assert_eq!(status, 201, "{broken}");
+
+    let stored_path = surfaces_directory
+        .unwrap()
+        .join(format!(
+            "{}.json",
+            broken["surface_id"]
+                .as_str()
+                .unwrap()
+        ));
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&stored_path).unwrap()).unwrap();
+    stored["variants"] = json!([{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true}]);
+    stored["default_variant_id"] = json!("missing");
+    std::fs::write(&stored_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let (status, reloaded) = send(admin.post(format!("{}/api/v1/config/reload", h.gateway_base))).await;
+    assert_eq!(status, 200, "{reloaded}");
+    assert_eq!(call(&h, "/kept").await, 200, "the port keeps serving its previous router");
+
+    let (status, added) = send(create("added")).await;
+    assert_eq!(status, 201, "{added}");
+
+    assert_eq!(call(&h, "/added").await, 200, "the surface created afterwards is served");
 }
