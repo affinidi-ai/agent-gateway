@@ -104,6 +104,11 @@ on neither. The same names set in a variant's `overrides.transit.shared` behave 
 
 See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token) for which requests carry a transit token.
 
+A Transit Point's rate limits are surface fields, not configuration files: `rate_limit` is one
+bucket for the point, and `per_caller_rate_limit` gives each caller the point identifies a bucket
+of their own. Both are counted on each gateway node. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
+
 ## Secret references
 
 Any field documented as accepting a loader reference resolves through

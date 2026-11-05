@@ -155,6 +155,9 @@ fn transit_point_json(
             &target_auth.fallback,
         );
     }
+    if let Some(requests) = transit_point.per_caller_rate_limit_per_minute {
+        transit_point_json["per_caller_rate_limit"] = serde_json::json!({ "requests": requests, "window_secs": 60 });
+    }
     if !transit_point
         .header_metadata_mapping
         .headers

@@ -179,7 +179,7 @@ Several independent layers, evaluated before a request is forwarded.
 | Layer | What it controls |
 | --- | --- |
 | Source authentication | Who the caller is: JWT bearer, API key, API key provider, DID Auth, or mTLS. |
-| Rate limiting | A token bucket per surface, with a rate and a burst size. An empty bucket answers 429 with a `Retry-After` header. |
+| Rate limiting | A token bucket per surface, and per Transit Point, with a rate and a burst size, and optionally a bucket for each caller of a Transit Point. An empty bucket answers 429; the Access Point's and a Transit Point's per-caller buckets add a `Retry-After` header. |
 | Policy | Rego policies, evaluated by an embedded engine, over the request method, path, headers, body, and agent identity. |
 | MCP tool policies | An OPA policy attached to an individual MCP tool. |
 | MCP tool gating | An ordered allow/deny firewall over MCP tool names, matched by pattern and optionally activated by a policy condition. It hides tools from discovery and blocks their invocation. |

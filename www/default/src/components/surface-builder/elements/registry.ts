@@ -19,7 +19,10 @@ import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
+import { RATE_LIMIT_FIELDS, carriesRateLimit, rateLimitConfigFromWire } from './rate-limit/wire';
 import { workloadBindingApiToForm } from './workload-binding/config';
+
+const TRANSIT_POINT_RATE_LIMIT_FIELDS: ReadonlySet<string> = new Set(RATE_LIMIT_FIELDS);
 
 export interface DependencyWarning {
   severity: 'error' | 'warning';
@@ -843,15 +846,15 @@ class ElementRegistry {
       // uses string-typed numeric inputs so coerce wire numbers back to
       // strings on hydration.
       const tpRl = tp?.rate_limit;
-      if (tpRl && typeof tpRl === 'object' && tpRl.requests != null) {
+      const tpCallerRl = tp?.per_caller_rate_limit;
+      const hasTpRl = tpRl && typeof tpRl === 'object' && tpRl.requests != null;
+      const hasTpCallerRl =
+        tpCallerRl && typeof tpCallerRl === 'object' && tpCallerRl.requests != null;
+      if (hasTpRl || hasTpCallerRl) {
         const rlDef = this.get('rate-limit');
         const panelConfig = rlDef?.configFromPayload
           ? rlDef.configFromPayload(tpRl, payload)
-          : {
-              requests: String(tpRl.requests),
-              window_secs: String(tpRl.window_secs ?? 60),
-              ...(tpRl.burst != null ? { burst: String(tpRl.burst) } : {}),
-            };
+          : rateLimitConfigFromWire(hasTpRl ? tpRl : null, hasTpCallerRl ? tpCallerRl : null);
         nodes.push({
           id: `rate-limit-${tpId}`,
           type: 'rate-limit' as SurfaceNodeType,
@@ -1050,15 +1053,19 @@ class ElementRegistry {
           // An element whose payload owns its config only adopts a node
           // on the same path (the Target, or the same Transit Point), so
           // a stale blob node never moves its settings to another path.
+          // A Transit Point's rate limit is read from that Transit Point only,
+          // so like those it adopts no node on another path.
           const ownsConfig = !!this.get(bn.type)?.payloadOwnsConfig;
-          const bnTransitPoint = ownsConfig ? transitPointOf(bn.parentId) : '';
+          const samePathOnly =
+            ownsConfig || (bn.type === 'rate-limit' && transitPointOf(bn.parentId) !== '');
+          const bnTransitPoint = samePathOnly ? transitPointOf(bn.parentId) : '';
           const candidates = nodes.filter(
             n =>
               n.type === bn.type &&
               !claimedIds.has(n.id) &&
               !byId.has(bn.id) &&
               !blob.nodes.some(b => b.id === n.id) &&
-              (!ownsConfig ||
+              (!samePathOnly ||
                 (transitPointOf(n.parentId) === bnTransitPoint &&
                   (!bn.slotId || !n.slotId || n.slotId === bn.slotId)))
           );
@@ -1092,9 +1099,14 @@ class ElementRegistry {
             typeof bn.parentId === 'string'
               ? (blobById.get(bn.parentId)?.type ?? byId.get(bn.parentId)?.type)
               : undefined;
+          const removedTransitPointLimit =
+            bn.type === 'rate-limit' &&
+            this.isTransitPointType(parentType) &&
+            carriesRateLimit(bn.config);
           if (
-            def?.payloadOwnsConfig &&
-            !def.isBlobPlaceholder?.(bn.config ?? {}, { ...bn, parentType }, payload)
+            removedTransitPointLimit ||
+            (def?.payloadOwnsConfig &&
+              !def.isBlobPlaceholder?.(bn.config ?? {}, { ...bn, parentType }, payload))
           ) {
             if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
             continue;
@@ -1144,11 +1156,18 @@ class ElementRegistry {
           // `gateway_id`, `auth_type`) so the panel doesn't "reset"
           // after save. Without this, every save round-trip strips
           // those fields and the panel re-derives them on next mount.
-          // A Transit Point's stored fields come only from the stored
-          // surface, so one removed through the API stays removed.
-          const fill = this.isTransitPointType(target.type)
+          // A Transit Point's stored fields, and the limits of a rate-limit
+          // node on one, come only from the stored surface, so one removed
+          // through the API stays removed.
+          const storedFields: ReadonlySet<string> | null = this.isTransitPointType(target.type)
+            ? TRANSIT_POINT_FIELDS
+            : target.type === 'rate-limit' &&
+                this.isTransitPointType(byId.get(target.parentId ?? '')?.type)
+              ? TRANSIT_POINT_RATE_LIMIT_FIELDS
+              : null;
+          const fill = storedFields
             ? Object.fromEntries(
-                Object.entries(blobConfig).filter(([key]) => !TRANSIT_POINT_FIELDS.has(key))
+                Object.entries(blobConfig).filter(([key]) => !storedFields.has(key))
               )
             : blobConfig;
           target.config = { ...fill, ...(target.config ?? {}) };

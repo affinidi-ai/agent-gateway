@@ -500,6 +500,9 @@ pub enum DelegationAuditAction {
         scope: RateLimitScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        /// The Transit Point whose per-caller limit refused the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
     },
     RequestRejected {
         stage: RejectionStage,
@@ -2207,6 +2210,7 @@ mod tests {
                 DelegationAuditAction::RateLimited {
                     scope: RateLimitScope::SseSessions,
                     retry_after_ms: Some(1500),
+                    transit_point: None,
                 },
                 "rate_limited",
             ),

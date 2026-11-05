@@ -273,6 +273,9 @@ pub struct SurfaceTransitPointConfig {
     pub target_auth_secret: Option<SurfaceTargetAuthConfig>,
     /// The path the Transit Point's target endpoint adds to its destination's address.
     pub target_base_path: Option<String>,
+    /// Requests per minute the Transit Point admits from each caller
+    /// (`per_caller_rate_limit`).
+    pub per_caller_rate_limit_per_minute: Option<u32>,
 }
 
 impl SurfaceTransitPointConfig {
@@ -295,6 +298,7 @@ impl SurfaceTransitPointConfig {
             target_auth_fallback: "reject".to_string(),
             target_auth_secret: None,
             target_base_path: None,
+            per_caller_rate_limit_per_minute: None,
         }
     }
 }

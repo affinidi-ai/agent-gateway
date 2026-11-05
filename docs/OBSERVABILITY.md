@@ -334,7 +334,8 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
+at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
@@ -348,9 +349,16 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the request's trace id, and the TCP peer as `client_ip`, since the outbound listener does not
   resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
-  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
-  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
+  rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target), `transit_point_caller` (a Transit Point's
+  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)) or
+  `transit_point_overflow` (the bucket that per-caller limit's callers share while it holds as
+  many buckets as it may). `retry_after_ms`
+  is the wait the caller is given, when there is one; the surface and per-caller limits also send
+  it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
+  (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
+  a request with no identified caller. A `transit_point_overflow` record names the Transit Point
+  and no caller.
 - `request_rejected`: the gateway refused the request before or while forwarding it.
   `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
   the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP

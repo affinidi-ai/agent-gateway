@@ -2394,6 +2394,7 @@ mod tests {
                     payment_policy: None,
                     networking: None,
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     identity_injection: Default::default(),
                     managed_identity: None,
                     transit_credentials: None,
