@@ -407,19 +407,6 @@ fn response_header_points_at_managed_agent(
     assert_eq!(actual, Some(expected.as_str()), "response headers: {:?}", response.headers);
 }
 
-#[then(expr = "MCP server {string} received {int} request(s)")]
-async fn mcp_server_received_requests(
-    world: &mut SurfaceWorld,
-    name: String,
-    expected: usize,
-) {
-    let requests = world
-        .mock_for_target(&name)
-        .requests()
-        .await;
-    assert_eq!(requests.len(), expected, "MCP server {name} received {requests:?}");
-}
-
 #[then(expr = "MCP server {string} received the forwarded path {string}")]
 async fn mcp_server_received_path(
     world: &mut SurfaceWorld,

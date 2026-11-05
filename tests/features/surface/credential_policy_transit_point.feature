@@ -162,7 +162,7 @@ Feature: Credential policy on a Transit Point
     And managed agent "example-agent" has asked for available tools through Transit Point "alpha" and received status 401
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
     Then the response status is 401
-    And MCP server "bravo" received 3 requests
+    And MCP server "bravo" received exactly 3 requests
     And the credential provider received 1 token request
 
   Scenario: The startup report names a surface whose Transit Point sends a Target credential to a plain http target endpoint
@@ -205,7 +205,7 @@ Feature: Credential policy on a Transit Point
     And MCP server "bravo" answers every request with a redirect to its path "/elsewhere"
     When managed agent "example-agent" asks for available tools through the Transit Point path "/transit/alpha/rpc" exactly as written
     Then the response status is 302
-    And MCP server "bravo" received 1 request
+    And MCP server "bravo" received exactly 1 request
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
 
   Scenario Outline: A Transit Point drops a managed agent header named like its Target credential header
