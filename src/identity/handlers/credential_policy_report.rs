@@ -100,26 +100,6 @@ pub(crate) struct Findings {
     pub skipped: Vec<SkippedSurface>,
 }
 
-/// The surface itself and each variant as it resolves, so a variant's overrides are held to
-/// the same rules. A variant that cannot be resolved is skipped.
-fn effective_views(surface: &AgentSurface) -> Vec<AgentSurface> {
-    let mut views = vec![surface.clone()];
-    for variant in &surface.variants {
-        let mut resolvable = surface.clone();
-        if let Some(candidate) = resolvable
-            .variants
-            .iter_mut()
-            .find(|candidate| candidate.id == variant.id)
-        {
-            candidate.enabled = true;
-        }
-        if let Ok(resolved) = resolvable.resolve_variant(Some(&variant.alias)) {
-            views.push(resolved);
-        }
-    }
-    views
-}
-
 fn sends_credential(auth: Option<&TargetAuthConfig>) -> bool {
     auth.is_some_and(|auth| {
         matches!(auth.method, TargetAuthMethod::StaticSecret { .. } | TargetAuthMethod::CredentialProvider { .. })
@@ -130,10 +110,11 @@ fn sends_credential(auth: Option<&TargetAuthConfig>) -> bool {
 /// breaks on a caller's request: the Target, checked by the Access Point, and each Transit
 /// Point, checked by itself. The backend credential of an A2A proxy Target is held to
 /// `target_source_auth` only, since it does not go over the `a2a-proxy://` endpoint. Every
-/// variant as it resolves is included.
-fn broken_target_rules(surface: &AgentSurface) -> Vec<TargetCredentialRule> {
+/// variant as it resolves is included; a surface with a variant that cannot be resolved is not
+/// checked.
+fn broken_target_rules(surface: &AgentSurface) -> Result<Vec<TargetCredentialRule>, SurfaceApiError> {
     let mut rules = Vec::new();
-    for view in effective_views(surface) {
+    for view in super::surface_tenancy::resolved_views(surface)? {
         if view.dispatches_to_a2a_proxy() {
             rules.extend(broken_target_credential_rules(true, view.authenticates_callers(), false));
         }
@@ -157,7 +138,7 @@ fn broken_target_rules(surface: &AgentSurface) -> Vec<TargetCredentialRule> {
             ));
         }
     }
-    rules
+    Ok(rules)
 }
 
 pub(crate) fn find_breaches(
@@ -210,21 +191,29 @@ pub(crate) fn find_breaches(
             )
             .map(|issues| (breaks, issues))
         });
-        let breaks = verdict.map(|(breaks, issues)| {
-            findings.provider_keys.extend(
-                issues
-                    .into_iter()
-                    .map(|issue| ProviderKeyFinding {
-                        surface_id: surface.surface_id.clone(),
-                        tenant_id: surface.tenant_id.clone(),
-                        issue,
-                    }),
-            );
-            breaks
+        let verdict = verdict.and_then(|(breaks, issues)| {
+            broken_target_rules(surface).map(|target_rules| (breaks, issues, target_rules))
         });
-        match breaks {
-            Ok(true) => rules.push(RULE_TENANT_CREDENTIAL_ISOLATION),
-            Ok(false) => {}
+        match verdict {
+            Ok((breaks, issues, target_rules)) => {
+                findings.provider_keys.extend(
+                    issues
+                        .into_iter()
+                        .map(|issue| ProviderKeyFinding {
+                            surface_id: surface.surface_id.clone(),
+                            tenant_id: surface.tenant_id.clone(),
+                            issue,
+                        }),
+                );
+                if breaks {
+                    rules.push(RULE_TENANT_CREDENTIAL_ISOLATION);
+                }
+                for rule in [TargetCredentialRule::Https, TargetCredentialRule::SourceAuth] {
+                    if target_rules.contains(&rule) {
+                        rules.push(rule.key());
+                    }
+                }
+            }
             Err(error) => findings
                 .skipped
                 .push(SkippedSurface {
@@ -232,12 +221,6 @@ pub(crate) fn find_breaches(
                     tenant_id: surface.tenant_id.clone(),
                     error: format!("{error:?}"),
                 }),
-        }
-        let target_rules = broken_target_rules(surface);
-        for rule in [TargetCredentialRule::Https, TargetCredentialRule::SourceAuth] {
-            if target_rules.contains(&rule) {
-                rules.push(rule.key());
-            }
         }
         findings.breaches.extend(
             rules
@@ -884,6 +867,25 @@ mod tests {
         point.allow_unauthenticated_callers = true;
         open_point.transit = Some(transit_config(vec![point]));
         assert_eq!(surface_rules(&open_point), vec![RULE_TARGET_SOURCE_AUTH]);
+    }
+
+    #[test]
+    fn a_surface_that_cannot_be_inspected_is_not_reported_for_the_target_rules_of_its_other_views() {
+        let mut surface = surface_that_cannot_be_inspected("broken");
+        surface.target = target_surface("http://upstream.example", Some(static_secret()), false).target;
+        let healthy = target_surface("http://upstream.example", Some(static_secret()), true);
+        let findings =
+            find_breaches(&[], &[surface, healthy], &HashMap::new(), None, &egress(CredentialPolicyConfig::default()));
+        assert_eq!(
+            findings
+                .breaches
+                .iter()
+                .map(|breach| (breach.id.as_str(), breach.rule))
+                .collect::<Vec<_>>(),
+            vec![("s", RULE_TARGET_HTTPS)]
+        );
+        assert_eq!(findings.skipped.len(), 1);
+        assert_eq!(findings.skipped[0].id, "broken");
     }
 
     #[test]
