@@ -34,8 +34,9 @@ has no public release effect, leave all category lists empty.
 1. Make the smallest correct change and leave the code better than you found it — DRY, no dead code,
    single-responsibility functions.
 2. Cover changes with tests, positive and negative cases, and assert returned values rather than
-   just the absence of errors. [`docs/development/TESTING.md`](docs/development/TESTING.md) sets out
-   the four layers and which one a given change belongs in.
+   just the absence of errors. Acceptance behaviour is a Gherkin scenario under `tests/features/`;
+   `src/component_tests/` takes no additions. [`docs/development/TESTING.md`](docs/development/TESTING.md)
+   sets out the layers and which one a given change belongs in.
 3. Avoid comments unless a linter requires them or the intent is genuinely non-obvious; code should
    be self-explanatory. Never leave implementation-history breadcrumbs (plan numbers, phases,
    requirement labels).

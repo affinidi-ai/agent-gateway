@@ -438,7 +438,7 @@ from.
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
-| [`component_tests/`](src/component_tests/) | Cross-module tests that need no Docker | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| [`component_tests/`](src/component_tests/) | Frozen legacy cross-module tests; takes no additions | [`TESTING.md`](docs/development/TESTING.md#legacy-component-tests) |
 
 ## Where to look
 

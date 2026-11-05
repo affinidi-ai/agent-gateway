@@ -1,0 +1,16 @@
+branch: component-test-deprecation
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-05T14:00:00Z'
+      title: Freeze component tests and make Gherkin the acceptance test layer
+      description: >-
+        src/component_tests/ takes no new files or test functions; a unit test in its mod.rs
+        fails on any addition. Every new observable behaviour is covered by a Gherkin scenario
+        in tests/features/, bound in surface_bdd or g2g_bdd, and scripts/bdd-gherkin.py --lint
+        runs after any feature or step-binding change. AGENTS.md, CONTRIBUTING.md, TESTING.md,
+        DEVELOPMENT.md and ARCHITECTURE.md describe the new layering.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
