@@ -702,7 +702,7 @@ async fn vp_audit_events_matching(
         .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"))
 }
 
-async fn expect_vp_audit_record(
+pub(crate) async fn expect_vp_audit_record(
     world: &mut SurfaceWorld,
     what: &str,
     matches: impl Fn(&serde_json::Value) -> bool,

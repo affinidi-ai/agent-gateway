@@ -2863,7 +2863,12 @@ async fn vp_audit_log_contains_policy_decision(world: &mut SurfaceWorld) {
         "schedule_meeting".to_string(),
     )
     .await;
-    wait_for_audit_events(world, "/v1/audit?limit=100").await;
+    crate::steps::then::expect_vp_audit_record(world, "the setup request's policy decision", |event| {
+        event["event"]
+            .get("policy_decision")
+            .is_some()
+    })
+    .await;
 }
 
 pub(crate) async fn enable_every_audit_event(world: &mut SurfaceWorld) {
