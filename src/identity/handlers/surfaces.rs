@@ -2356,6 +2356,28 @@ pub(crate) async fn refresh_payment_manifest_snapshots(state: &IdentityApiState)
         })
         .await;
     }
+    match store.list_all().await {
+        Ok(mut surfaces) => {
+            let manifests: Vec<_> = surfaces
+                .iter_mut()
+                .flat_map(|surface| {
+                    agent_pay_policies_mut(surface)
+                        .into_iter()
+                        .filter_map(|(_, policy)| {
+                            policy
+                                .manifest_snapshot
+                                .clone()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let pruned = crate::gateways::payment_logos::prune_unreferenced(&manifests).await;
+            if pruned > 0 {
+                info!("Payment manifest refresh: removed {pruned} payment logo(s) no manifest references");
+            }
+        }
+        Err(e) => warn!("Payment manifest refresh: failed to list surfaces to prune payment logos: {e}"),
+    }
 }
 
 /// `surface` with the manifest snapshot of each of its `agent_pay` policies

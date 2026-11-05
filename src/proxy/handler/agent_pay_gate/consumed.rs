@@ -8,8 +8,8 @@
 //! cancelled on this side can be retried with the same credential, and kept
 //! once [`Claim::commit`] marks the request as dispatched.
 //!
-//! The set is per node. With a [`ClaimJournal`] opened, a dispatched key is
-//! also written to it and read back at startup, so a restart does not forward
+//! The set is per node. With the journal opened, a dispatched key is also
+//! written to it and read back at startup, so a restart does not forward
 //! a request twice within the key's lifetime; another node has no memory of
 //! the key, so "exactly one forward" holds per node and per agent-pay replay
 //! window.
@@ -192,24 +192,76 @@ fn consumed() -> std::sync::MutexGuard<'static, ConsumedKeys> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Where dispatched keys are kept across restarts.
-pub(crate) trait ClaimJournal: Send + Sync {
-    fn forwarded(
+/// A line for the journal's writer thread, with who waits for it to be on the disk.
+struct JournalRequest {
+    line: JournalLine,
+    written: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Hands lines to the thread that owns the [`FileJournal`], so no request waits
+/// on the disk while holding a runtime worker or the journal's lock.
+struct JournalWriter(Mutex<std::sync::mpsc::Sender<JournalRequest>>);
+
+impl JournalWriter {
+    fn spawn(journal: FileJournal) -> std::io::Result<Self> {
+        let (sender, requests) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("payment-claim-journal".to_string())
+            .spawn(move || journal.serve(&requests))?;
+        Ok(Self(Mutex::new(sender)))
+    }
+
+    fn send(
+        &self,
+        line: JournalLine,
+        written: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(JournalRequest { line, written })
+            .is_ok()
+    }
+
+    /// Writes and syncs a dispatched key, returning once it is on the disk.
+    async fn forwarded(
         &self,
         key: &str,
         at_ms: u64,
-    );
+    ) {
+        let (written, on_disk) = tokio::sync::oneshot::channel();
+        let line = JournalLine {
+            key: key.to_string(),
+            at: Some(at_ms),
+            revoked: false,
+        };
+        if !self.send(line, Some(written)) || on_disk.await.is_err() {
+            tracing::warn!(
+                "The payment claim journal is not running; a restart may forward this payment's request again"
+            );
+        }
+    }
 
+    /// Queues a revocation, which is not synced.
     fn revoked(
         &self,
         key: &str,
-    );
+    ) {
+        let line = JournalLine {
+            key: key.to_string(),
+            at: None,
+            revoked: true,
+        };
+        if !self.send(line, None) {
+            tracing::warn!("The payment claim journal is not running; a revoked payment claim is not recorded");
+        }
+    }
 }
 
-static JOURNAL: OnceLock<Box<dyn ClaimJournal>> = OnceLock::new();
+static JOURNAL: OnceLock<JournalWriter> = OnceLock::new();
 
-fn journal() -> Option<&'static dyn ClaimJournal> {
-    JOURNAL.get().map(Box::as_ref)
+fn journal() -> Option<&'static JournalWriter> {
+    JOURNAL.get()
 }
 
 fn epoch_ms(time: SystemTime) -> u64 {
@@ -235,9 +287,10 @@ struct JournalState {
 /// An append-only file of dispatched and revoked keys, rewritten with only the
 /// live keys when it holds twice as many lines as they need. A dispatch line is
 /// written and synced to the disk before the request is dispatched, so it
-/// survives a power loss; the sync runs outside the journal's lock, so
-/// concurrent dispatches share the disk's flushes. A revocation is not synced:
-/// losing one only refuses a retry of a request that was never delivered.
+/// survives a power loss; its writer thread syncs the lines that arrive
+/// together once, so concurrent dispatches share the disk's flushes. A
+/// revocation is not synced: losing one only refuses a retry of a request that
+/// was never delivered.
 pub(crate) struct FileJournal {
     path: PathBuf,
     lifetime: Duration,
@@ -334,10 +387,70 @@ impl FileJournal {
             .open(path)
     }
 
+    /// Writes each request's line, syncs the files the dispatch lines among
+    /// them went to once, then tells their waiters.
+    fn serve(
+        &self,
+        requests: &std::sync::mpsc::Receiver<JournalRequest>,
+    ) {
+        while let Ok(first) = requests.recv() {
+            let mut to_sync: Vec<Arc<std::fs::File>> = Vec::new();
+            let mut waiters = Vec::new();
+            for request in std::iter::once(first).chain(requests.try_iter()) {
+                if let Some(file) = self.write(&request.line)
+                    && !request.line.revoked
+                    && !to_sync
+                        .iter()
+                        .any(|synced| Arc::ptr_eq(synced, &file))
+                {
+                    to_sync.push(file);
+                }
+                waiters.extend(request.written);
+            }
+            for file in &to_sync {
+                self.sync(file);
+            }
+            for waiter in waiters {
+                let _ = waiter.send(());
+            }
+        }
+    }
+
+    /// Writes and, for a dispatch, syncs `line`.
+    #[cfg(test)]
     fn append(
         &self,
         line: &JournalLine,
     ) {
+        if let Some(file) = self.write(line)
+            && !line.revoked
+        {
+            self.sync(&file);
+        }
+    }
+
+    fn sync(
+        &self,
+        file: &std::fs::File,
+    ) {
+        match file.sync_data() {
+            Ok(()) => {
+                self.syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Failed to sync the payment claim journal; a power loss may forward this payment's request again"
+            ),
+        }
+    }
+
+    /// Writes `line`, compacting the file first when it has outgrown its live
+    /// keys, and returns the file that holds it.
+    fn write(
+        &self,
+        line: &JournalLine,
+    ) -> Option<Arc<std::fs::File>> {
         let mut state = self
             .state
             .lock()
@@ -362,42 +475,35 @@ impl FileJournal {
                 Ok(file) => {
                     state.lines = state.live.len();
                     state.file = Arc::new(file);
-                    return;
+                    return Some(Arc::clone(&state.file));
                 }
                 Err(e) => tracing::warn!(error = %e, "Failed to compact the payment claim journal"),
             }
         }
-        let mut encoded = serde_json::to_vec(line).unwrap_or_default();
-        encoded.push(b'\n');
+        let encoded = serde_json::to_vec(line).map(|mut encoded| {
+            encoded.push(b'\n');
+            encoded
+        });
         let file = Arc::clone(&state.file);
-        match (&*file).write_all(&encoded) {
-            Ok(()) => state.lines += 1,
+        match encoded
+            .map_err(std::io::Error::from)
+            .and_then(|encoded| (&*file).write_all(&encoded))
+        {
+            Ok(()) => {
+                state.lines += 1;
+                Some(file)
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "Failed to write the payment claim journal; a restart may forward this payment's request again"
                 );
-                return;
+                None
             }
-        }
-        drop(state);
-        if line.revoked {
-            return;
-        }
-        match file.sync_data() {
-            Ok(()) => {
-                self.syncs
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Failed to sync the payment claim journal; a power loss may forward this payment's request again"
-            ),
         }
     }
-}
 
-impl ClaimJournal for FileJournal {
+    #[cfg(test)]
     fn forwarded(
         &self,
         key: &str,
@@ -410,6 +516,7 @@ impl ClaimJournal for FileJournal {
         });
     }
 
+    #[cfg(test)]
     fn revoked(
         &self,
         key: &str,
@@ -443,7 +550,7 @@ pub(crate) fn open_journal(dir: &Path) -> std::io::Result<usize> {
         }
     }
     if JOURNAL
-        .set(Box::new(journal))
+        .set(JournalWriter::spawn(journal)?)
         .is_err()
     {
         tracing::warn!("The payment claim journal was already open");
@@ -461,15 +568,18 @@ pub(super) struct Claim {
 }
 
 impl Claim {
-    /// Records that the request was dispatched: the claim is kept for good.
-    pub(super) fn commit(&self) {
+    /// Records that the request was dispatched: the claim is kept for good, and
+    /// is on the journal's disk when this returns.
+    pub(super) async fn commit(&self) {
         if !self
             .dispatched
             .swap(true, Ordering::SeqCst)
         {
             consumed().commit(&self.key, self.id);
             if let Some(journal) = journal() {
-                journal.forwarded(&self.key, epoch_ms(SystemTime::now()));
+                journal
+                    .forwarded(&self.key, epoch_ms(SystemTime::now()))
+                    .await;
             }
         }
     }
@@ -634,13 +744,13 @@ mod tests {
         assert!(claim(&key).is_ok(), "dropping the only claim before a dispatch gives the key up");
     }
 
-    #[test]
-    fn a_claim_dropped_before_dispatch_is_released_and_a_committed_one_is_kept() {
+    #[tokio::test]
+    async fn a_claim_dropped_before_dispatch_is_released_and_a_committed_one_is_kept() {
         let released = format!("released-{}", uuid::Uuid::new_v4());
         drop(claim(&released).unwrap());
         let again = claim(&released).expect("released on drop");
-        again.commit();
-        again.commit();
+        again.commit().await;
+        again.commit().await;
         drop(again);
         assert_eq!(claim(&released).err(), Some(Unclaimable::Forwarded));
     }
@@ -737,16 +847,54 @@ mod tests {
         assert!(lines <= FileJournal::COMPACT_SLACK + 2, "{lines} lines");
     }
 
-    #[test]
-    fn a_committed_claim_revoked_for_an_undelivered_request_can_be_claimed_again() {
+    #[tokio::test]
+    async fn a_committed_claim_revoked_for_an_undelivered_request_can_be_claimed_again() {
         let key = format!("revoked-{}", uuid::Uuid::new_v4());
         let first = claim(&key).unwrap();
-        first.commit();
+        first.commit().await;
         assert_eq!(claim(&key).err(), Some(Unclaimable::Forwarded));
         first.revoke();
         drop(first);
         let retry = claim(&key).expect("the credential was given back");
-        retry.commit();
+        retry.commit().await;
         assert_eq!(claim(&key).err(), Some(Unclaimable::Forwarded));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_writer_thread_has_each_dispatch_on_disk_when_its_wait_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let (journal, _) = FileJournal::open(dir.path(), Duration::from_secs(600), now).unwrap();
+        let writer = Arc::new(JournalWriter::spawn(journal).unwrap());
+        let path = dir
+            .path()
+            .join(FileJournal::FILE_NAME);
+
+        let dispatches = (0..20).map(|n| {
+            let writer = Arc::clone(&writer);
+            async move {
+                writer
+                    .forwarded(&format!("key-{n}"), epoch_ms(now))
+                    .await
+            }
+        });
+        futures::future::join_all(dispatches).await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        for n in 0..20 {
+            assert!(written.contains(&format!("\"key-{n}\"")), "key-{n} is on disk once its commit returns");
+        }
+
+        writer.revoked("key-0");
+        writer
+            .forwarded("after-revocation", epoch_ms(now))
+            .await;
+        let (_, keys) = FileJournal::open(dir.path(), Duration::from_secs(600), now).unwrap();
+        let keys: Vec<String> = keys
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(!keys.contains(&"key-0".to_string()), "a queued revocation is written before a later dispatch");
+        assert!(keys.contains(&"after-revocation".to_string()));
+        assert_eq!(keys.len(), 20);
     }
 }

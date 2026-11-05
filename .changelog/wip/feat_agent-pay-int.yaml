@@ -41,7 +41,8 @@ changes:
         payment surfaces, the surfaces that charge through it and a ping, and a connected peer can
         be turned into one with Use as payment gateway (`POST /v1/gateways/{id}/payment-role`,
         `409` while a surface routes to it over `fabric://`). Disabling or deleting a gateway is
-        refused with `409` while surfaces charge through it or it holds unsettled payments.
+        refused with `409` while surfaces charge through it or it holds unsettled payments, and a
+        payment gateway with `503` while the payments ledger is not available to tell.
     - timestamp: '2026-10-26T00:00:00Z'
       title: ⭐ Capture held agent-pay payments only after the Target delivers
       description: >-
@@ -79,9 +80,10 @@ changes:
       description: >-
         agent-pay names each payment point's logo in the Payment Manifest and sends the logo beside
         it. The gateway keeps only referenced SVG logos that match their SHA-256 and pass a safety
-        check, stores them by hash, and serves them from `GET /v1/gateways/payment-logos/{sha256}`
-        as inert images; the Payment element's preview shows them next to each method, or a generic
-        icon.
+        check, stores at most 1,024 of them by hash, deletes those no stored manifest references
+        an hour after they were written, and serves them from
+        `GET /v1/gateways/payment-logos/{sha256}` (`payment_gateways.view`) as inert images; the
+        Payment element's preview shows them next to each method, or a generic icon.
     - timestamp: '2026-10-21T00:00:00Z'
       title: Add payment events and payment gate metrics
       description: >-

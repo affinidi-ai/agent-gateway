@@ -66,7 +66,7 @@ describe('triggerPatternAdvice', () => {
       'This pattern is too long for the browser to check. The gateway checks it when you save.';
 
     expect(triggerPatternAdvice('a'.repeat(1001))).toBe(advice);
-    expect(triggerPatternAdvice('(a+)+$'.repeat(300))).toBe(advice);
+    expect(triggerPatternAdvice('[a-z]+_'.repeat(150))).toBe(advice);
     expect(triggerPatternAdvice('a'.repeat(1000))).toBeNull();
   });
 

@@ -58,17 +58,7 @@ impl CaseStatusSource for FabricCaseStatus {
         payment_gateway_id: &str,
         case_id: &str,
     ) -> Result<Option<PaymentCaseState>, CaseStatusError> {
-        use crate::gateways::GatewayStore;
-
-        let gateway = self
-            .gateways
-            .get(payment_gateway_id)
-            .await
-            .map_err(|e| CaseStatusError::Unavailable(e.to_string()))?
-            .filter(|gateway| gateway.gateway_type == crate::gateways::types::GatewayType::Remote)
-            .ok_or_else(|| {
-                CaseStatusError::Unavailable("the payment gateway is not a connected Remote gateway".to_string())
-            })?;
+        let gateway = super::remote_payment_gateway(&self.gateways, payment_gateway_id).await?;
         let listener_manager = crate::gateways::connection_points::message_processor::get_listener_manager();
         crate::gateways::handlers::fetch_payment_case_status(listener_manager.as_deref(), &gateway, case_id, WAIT).await
     }

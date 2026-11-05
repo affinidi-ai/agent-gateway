@@ -542,8 +542,10 @@ logo's bytes beside the manifest. Every fetch keeps the logos that the manifest 
 hash to their `sha256`, and that are SVG of at most 32 KiB with no script, event handler, embedded
 document or image, entity, doctype, stylesheet import or reference outside the document; anything
 else is dropped with a warning and never fails the fetch. Kept logos are stored by hash under
-`<storage>/payment_logos/` and served by `GET /v1/gateways/payment-logos/{sha256}` (permission
-`gateways.view`) as `image/svg+xml` with `X-Content-Type-Options: nosniff` and
+`<storage>/payment_logos/`, at most 1,024 of them (a new logo past that is not stored and is shown
+as a generic icon); the 15-minute refresh deletes a logo that no stored manifest snapshot
+references and that was written over an hour ago. They are served by
+`GET /v1/gateways/payment-logos/{sha256}` (permission `payment_gateways.view`, like the manifest) as `image/svg+xml` with `X-Content-Type-Options: nosniff` and
 `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox`; a name that is
 not a lowercase hex SHA-256, or a stored file that no longer hashes to it, is `404`.
 
@@ -579,7 +581,8 @@ neither lists them nor acts on them.
 - `POST /v1/gateways/{id}/payment-role` turns a connected peer into a payment gateway and sets its
   exposure to `none`; `409` while a surface routes to it over `fabric://`.
 - Disabling (`PUT` with `status: "disabled"`) or deleting any remote gateway is `409` while a
-  surface's `agent_pay` policy names it or it holds payments that are not settled yet
+  surface's `agent_pay` policy names it or it holds payments that are not settled yet, and `503`
+  for a payment gateway while the payments ledger is not available to tell
   ([`usage.rs`](../src/gateways/usage.rs)).
 - Payment gateways count toward their own appliance limit, `connections.paymentgateways` in
   `limits.json`, and peers toward `connections.gateways`; both count toward the `connections`
@@ -634,7 +637,8 @@ the `payment_signature` (x402) or `payment_credential` (MPP) argument, and on an
 request `_meta["org.paymentauth/credential"]` at the message root or in `params._meta`, or A2A
 `params.metadata` or `params.message.metadata`. Whichever way it arrives, it is removed from the
 request before the request is forwarded, whether or not the request is chargeable. A top-level
-`payment_context` carries:
+`payment_context` carries the following, and its `principal_chain` and `payer_identity` are the
+only facts about the caller that agent-pay receives:
 
 - `principal_chain`, only when the client supplied one in MCP
   `_meta["org.paymentauth/payment_context"]` or A2A `metadata["org.paymentauth/payment_context"]`
@@ -883,8 +887,9 @@ they are older than the window, so the reconciler always sees them. A row the di
 The idempotency keys of payments this node dispatched a request for are written to
 `_storage/payment_claims/dispatched.jsonl` and read back at startup, so a restart does not forward
 a paid request again within ten minutes. The file is per node. Each dispatch line is synced to
-the disk before the request is dispatched, so it survives a power loss; concurrent dispatches
-share the disk's flushes. A revocation line is not synced: losing one only refuses a retry of a
+the disk before the request is dispatched, so it survives a power loss. One writer thread
+writes and syncs the file, so a dispatch waits for the disk without holding a runtime worker, and
+dispatches that arrive together share one flush. A revocation line is not synced: losing one only refuses a retry of a
 request that never reached its Target.
 
 ### Polling a held payment (caller)

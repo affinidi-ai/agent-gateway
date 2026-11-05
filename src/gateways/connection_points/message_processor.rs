@@ -6355,7 +6355,7 @@ async fn process_charged_forward_request(
         Err(refused) => return refused,
     }
     if let Some((receipt, _)) = gate_receipt.as_ref() {
-        receipt.commit();
+        receipt.commit().await;
     }
 
     // MCP shortcut: if we already have a persistent SSE session to this upstream
@@ -8324,7 +8324,7 @@ async fn handle_a2a_proxy_forward(
                         Err(refused) => return refused,
                     }
                     if let Some((receipt, _)) = gate_receipt.as_ref() {
-                        receipt.commit();
+                        receipt.commit().await;
                     }
                     let secrets_store = get_secrets_store();
                     crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
@@ -8787,7 +8787,7 @@ async fn handle_mcp_proxy_forward(
                     Err(refused) => return refused,
                 }
                 if let Some((receipt, _)) = gate_receipt.as_ref() {
-                    receipt.commit();
+                    receipt.commit().await;
                 }
                 // Use execute_mcp_request to apply all surface policies
                 // This ensures MCP channels have feature parity with A2A (timeout, retry, circuit breaker, mirroring)

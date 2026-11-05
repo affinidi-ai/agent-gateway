@@ -131,16 +131,17 @@ fn authorize_gateway_delete(
     Ok(())
 }
 
-/// `409` while surfaces take payments through `gateway` or it holds unsettled payments.
+/// `409` while surfaces take payments through `gateway` or it holds unsettled payments, and `503`
+/// for a payment gateway while the payments ledger is not available.
 async fn refuse_removal_in_use(
     surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
     gateway: &Gateway,
 ) -> Result<(), (StatusCode, String)> {
     match super::usage::gateway_usage(surface_store, &gateway.id)
         .await?
-        .removal_conflict()
+        .removal_refusal(gateway)
     {
-        Some(conflict) => Err((StatusCode::CONFLICT, conflict)),
+        Some(refusal) => Err(refusal),
         None => Ok(()),
     }
 }

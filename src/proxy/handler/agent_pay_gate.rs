@@ -667,9 +667,9 @@ impl Intake {
             .as_mut()
             .is_some_and(remove_body_credentials);
         let body = match message.as_ref() {
-            Some(message) if removed => serde_json::to_vec(message)
-                .map(Bytes::from)
-                .unwrap_or_default(),
+            Some(message) if removed => {
+                Bytes::from(serde_json::to_vec(message).expect("a serde_json::Value always serializes"))
+            }
             _ => inbound.body.clone(),
         };
         let variant = inbound
@@ -1207,7 +1207,7 @@ impl GateTransport for FabricTransport {
         request: GateWireRequest,
     ) -> futures::future::BoxFuture<'_, Result<FabricForwardResponse, FabricForwardError>> {
         Box::pin(async move {
-            let body = serde_json::to_vec(&request.body).unwrap_or_default();
+            let body = serde_json::to_vec(&request.body).expect("a serde_json::Value always serializes");
             let mut extra_body = Map::new();
             extra_body.insert("payment_context".into(), request.payment_context);
             crate::proxy::fabric_forward::forward_via_fabric(
@@ -1731,9 +1731,9 @@ impl Receipt {
     /// the credential cannot pay for another. Until then a request that fails
     /// or is cancelled gives the credential back, and the client can retry it
     /// within agent-pay's replay window.
-    pub(crate) fn commit(&self) {
+    pub(crate) async fn commit(&self) {
         if let Some(claim) = &self.claim {
-            claim.commit();
+            claim.commit().await;
         }
     }
 
@@ -3749,7 +3749,7 @@ pub(crate) mod tests {
         call: GateCall<'_>,
     ) -> Receipt {
         let GateOutcome::Paid(paid) = charge(intake, call).await else { panic!("expected a paid request") };
-        paid.receipt.commit();
+        paid.receipt.commit().await;
         paid.receipt
     }
 
@@ -6603,7 +6603,7 @@ pub(crate) mod tests {
             panic!("a copy of the receipt still holds the claim")
         };
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        held.commit();
+        held.commit().await;
         drop(held);
         let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
             panic!("a dispatched request is not dispatched again")

@@ -21,6 +21,11 @@ pub const MAX_LOGO_BYTES: usize = 32 * 1024;
 
 /// Most logos read from one manifest answer.
 const MAX_LOGOS_PER_MANIFEST: usize = 32;
+/// Most logos kept on disk; past it a new logo is not stored.
+const MAX_STORED_LOGOS: usize = 1024;
+/// How long an unreferenced logo is kept, so one fetched for a manifest preview
+/// that is not saved yet keeps showing.
+const UNREFERENCED_LOGO_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The logo a payment point is shown with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -80,16 +85,25 @@ async fn store_manifest_logos_in(
     else {
         return;
     };
+    let present: std::collections::HashSet<String> = stored_logos(dir)
+        .await
+        .into_iter()
+        .map(|(sha256, _)| sha256)
+        .collect();
+    let mut stored = present.len();
     for asset in assets
         .iter()
         .take(MAX_LOGOS_PER_MANIFEST)
     {
         match accepted_logo(manifest, asset) {
-            Ok((sha256, bytes)) => {
-                if let Err(e) = write_logo(dir, &sha256, &bytes).await {
-                    warn!("payment logo {sha256} not stored: {e}");
-                }
+            Ok((sha256, _)) if stored >= MAX_STORED_LOGOS && !present.contains(&sha256) => {
+                warn!("payment logo {sha256} not stored: {MAX_STORED_LOGOS} logos are already stored");
             }
+            Ok((sha256, bytes)) => match write_logo(dir, &sha256, &bytes).await {
+                Ok(true) => stored += 1,
+                Ok(false) => {}
+                Err(e) => warn!("payment logo {sha256} not stored: {e}"),
+            },
             Err(reason) => warn!("payment logo refused: {reason}"),
         }
     }
@@ -127,22 +141,87 @@ fn accepted_logo(
     Ok((asset.sha256, bytes))
 }
 
+/// Writes the logo unless it is stored already; returns whether it wrote it.
 async fn write_logo(
     dir: &Path,
     sha256: &str,
     bytes: &[u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let path = dir.join(format!("{sha256}.svg"));
     if tokio::fs::try_exists(&path)
         .await
         .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(false);
     }
     tokio::fs::create_dir_all(dir).await?;
     let temporary = dir.join(format!(".{sha256}.{}.tmp", uuid::Uuid::new_v4()));
     tokio::fs::write(&temporary, bytes).await?;
-    tokio::fs::rename(&temporary, &path).await
+    tokio::fs::rename(&temporary, &path).await?;
+    Ok(true)
+}
+
+/// The stored logos, by hash, with when each was written.
+async fn stored_logos(dir: &Path) -> Vec<(String, Option<std::time::SystemTime>)> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut logos = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(sha256) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".svg"))
+            .filter(|sha256| is_logo_hash(sha256))
+        else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        logos.push((sha256.to_string(), modified));
+    }
+    logos
+}
+
+/// Deletes the stored logos no manifest in `manifests` references, except those
+/// written within [`UNREFERENCED_LOGO_GRACE`]; returns how many it deleted.
+pub async fn prune_unreferenced<'m>(manifests: impl IntoIterator<Item = &'m PaymentManifest>) -> usize {
+    let Some(dir) = logos_dir() else {
+        return 0;
+    };
+    prune_unreferenced_in(&dir, manifests, std::time::SystemTime::now()).await
+}
+
+async fn prune_unreferenced_in<'m>(
+    dir: &Path,
+    manifests: impl IntoIterator<Item = &'m PaymentManifest>,
+    now: std::time::SystemTime,
+) -> usize {
+    let referenced: std::collections::HashSet<&str> = manifests
+        .into_iter()
+        .flat_map(|manifest| manifest.payment_points.iter())
+        .filter_map(|point| point.logo.as_ref())
+        .map(|logo| logo.sha256.as_str())
+        .collect();
+    let mut pruned = 0;
+    for (sha256, modified) in stored_logos(dir).await {
+        let recent = modified.is_none_or(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age < UNREFERENCED_LOGO_GRACE)
+                || now < modified
+        });
+        if referenced.contains(sha256.as_str()) || recent {
+            continue;
+        }
+        match tokio::fs::remove_file(dir.join(format!("{sha256}.svg"))).await {
+            Ok(()) => pruned += 1,
+            Err(e) => warn!("unreferenced payment logo {sha256} not removed: {e}"),
+        }
+    }
+    pruned
 }
 
 /// The stored logo named `sha256`, when there is one whose bytes still hash to that name.
@@ -264,6 +343,62 @@ mod tests {
                 .as_deref(),
             Some(SVG.as_bytes())
         );
+    }
+
+    fn svg_numbered(n: usize) -> String {
+        SVG.replace("<rect", &format!("<rect id=\"r{n}\""))
+    }
+
+    #[tokio::test]
+    async fn no_new_logo_is_stored_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..MAX_STORED_LOGOS {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.svg", sha(n.to_string().as_bytes()))),
+                b"x",
+            )
+            .unwrap();
+        }
+        let svg = svg_numbered(1);
+        let hash = sha(svg.as_bytes());
+
+        store_manifest_logos_in(dir.path(), &manifest_with_logo(&hash), &answer(&hash, svg.as_bytes())).await;
+
+        assert_eq!(read_logo_in(dir.path(), &hash).await, None);
+        assert_eq!(
+            stored_logos(dir.path())
+                .await
+                .len(),
+            MAX_STORED_LOGOS
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_referenced_and_recent_logos_and_deletes_old_unreferenced_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hashes = Vec::new();
+        for n in 0..2 {
+            let svg = svg_numbered(n);
+            let hash = sha(svg.as_bytes());
+            store_manifest_logos_in(dir.path(), &manifest_with_logo(&hash), &answer(&hash, svg.as_bytes())).await;
+            hashes.push(hash);
+        }
+        let referenced = manifest_with_logo(&hashes[0]);
+
+        assert_eq!(
+            prune_unreferenced_in(dir.path(), [&referenced], std::time::SystemTime::now()).await,
+            0,
+            "a logo written within the grace period is kept"
+        );
+        let later = std::time::SystemTime::now() + UNREFERENCED_LOGO_GRACE + std::time::Duration::from_secs(1);
+        assert_eq!(prune_unreferenced_in(dir.path(), [&referenced], later).await, 1);
+        assert!(
+            read_logo_in(dir.path(), &hashes[0])
+                .await
+                .is_some()
+        );
+        assert_eq!(read_logo_in(dir.path(), &hashes[1]).await, None);
     }
 
     #[tokio::test]

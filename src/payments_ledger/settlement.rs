@@ -31,7 +31,6 @@ const UNCONFIRMED_GIVE_UP: chrono::Duration = chrono::Duration::hours(24);
 /// caller retries the same request.
 const REPLAY_WINDOW: chrono::Duration = chrono::Duration::seconds(120);
 const MAX_RECEIPT_BYTES: usize = 16 * 1024;
-const MAX_REASON_CHARS: usize = 256;
 
 /// Where a held payment stands, as agent-pay answers a settle or status request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +97,7 @@ pub fn parse_answer(
         receipt: text("receipt")
             .filter(|receipt| receipt.len() <= MAX_RECEIPT_BYTES)
             .map(str::to_string),
-        reason: text("reason").map(|reason| {
-            reason
-                .chars()
-                .take(MAX_REASON_CHARS)
-                .collect()
-        }),
+        reason: text("reason").map(str::to_string),
     })
 }
 
@@ -168,17 +162,7 @@ impl FabricSettlement {
         body: Value,
         wait: Duration,
     ) -> Result<Value, CaseStatusError> {
-        use crate::gateways::GatewayStore;
-
-        let gateway = self
-            .gateways
-            .get(payment_gateway_id)
-            .await
-            .map_err(|e| CaseStatusError::Unavailable(e.to_string()))?
-            .filter(|gateway| gateway.gateway_type == crate::gateways::types::GatewayType::Remote)
-            .ok_or_else(|| {
-                CaseStatusError::Unavailable("the payment gateway is not a connected Remote gateway".to_string())
-            })?;
+        let gateway = super::remote_payment_gateway(&self.gateways, payment_gateway_id).await?;
         let listener_manager = crate::gateways::connection_points::message_processor::get_listener_manager();
         crate::gateways::handlers::query_payment_settlement(
             listener_manager.as_deref(),

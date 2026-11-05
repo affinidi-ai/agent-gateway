@@ -428,6 +428,26 @@ pub async fn flush_global() {
     }
 }
 
+/// The Remote gateway record `payment_gateway_id` names, which settlement and
+/// case status queries are sent to. A payment taken through a gateway is
+/// settled through it whatever its role.
+pub(crate) async fn remote_payment_gateway(
+    gateways: &crate::gateways::FileSystemGatewayStore,
+    payment_gateway_id: &str,
+) -> Result<crate::gateways::types::Gateway, crate::gateways::payment_case::CaseStatusError> {
+    use crate::gateways::GatewayStore;
+    use crate::gateways::payment_case::CaseStatusError;
+
+    gateways
+        .get(payment_gateway_id)
+        .await
+        .map_err(|e| CaseStatusError::Unavailable(e.to_string()))?
+        .filter(|gateway| gateway.gateway_type == crate::gateways::types::GatewayType::Remote)
+        .ok_or_else(|| {
+            CaseStatusError::Unavailable("the payment gateway is not a connected Remote gateway".to_string())
+        })
+}
+
 /// Rebuilds the global store's window from disk when this node becomes Active.
 pub async fn reload_global() {
     if let Some(store) = global() {
@@ -582,6 +602,48 @@ pub(crate) mod tests {
             .unwrap();
         assert!(admits_cancelled(&store), "a closed row makes room");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn settlement_goes_only_to_a_remote_gateway_record() {
+        use crate::gateways::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways =
+            crate::gateways::FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
+                .await
+                .unwrap();
+        let mut remote = Gateway::new("pay".into(), String::new(), "did:web:pay.example".into(), GatewayType::Remote);
+        remote.id = "pay".into();
+        gateways
+            .create(&remote)
+            .await
+            .unwrap();
+        let self_id = gateways
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|gateway| gateway.gateway_type == GatewayType::SelfGateway)
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            remote_payment_gateway(&gateways, "pay")
+                .await
+                .map(|gateway| gateway.id),
+            Ok("pay".to_string())
+        );
+        for id in [self_id.as_str(), "missing"] {
+            assert!(
+                matches!(
+                    remote_payment_gateway(&gateways, id).await,
+                    Err(crate::gateways::payment_case::CaseStatusError::Unavailable(_))
+                ),
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]

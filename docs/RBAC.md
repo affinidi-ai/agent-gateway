@@ -125,7 +125,7 @@ never reaches a payment gateway and `payment_gateways.*` never reaches a peer:
 | --- | --- |
 | `/v1/gateways`, `/v1/gateways/{id}/…`, `/v1/gateways/{gateway_id}/connection-points`, `/v1/connection-points/…` | `gateways.view` / `gateways.edit` / `gateways.delete` |
 | `/v1/payment-gateways`, `/v1/payment-gateways/connect-via-oob`, `/v1/payment-gateways/{id}` (get, put, delete), `/v1/payment-gateways/{id}/ping`, `…/surfaces`, `…/surfaces/{surface_id}/payment-manifest`, `…/info` | `payment_gateways.view` / `payment_gateways.edit` / `payment_gateways.delete` |
-| `GET /v1/gateways/payment-providers` (the Surface Builder's payment gateway list) | `payment_gateways.view` |
+| `GET /v1/gateways/payment-providers` (the Surface Builder's payment gateway list) and `GET /v1/gateways/payment-logos/{sha256}` (payment method logos) | `payment_gateways.view` |
 | `POST /v1/gateways/{id}/payment-role` (turn a peer into a payment gateway) | `gateways.edit` and `payment_gateways.edit` |
 
 A route answers `404` for a gateway of the other role

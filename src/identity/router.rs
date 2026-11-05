@@ -1213,7 +1213,7 @@ pub fn create_identity_api_router(
                     )
                     .route(
                         "/v1/gateways/payment-logos/{sha256}",
-                        gate(get(crate::gateways::handlers::get_payment_logo), Feature::GatewaysView),
+                        gate(get(crate::gateways::handlers::get_payment_logo), Feature::PaymentGatewaysView),
                     )
                     .route(
                         "/v1/gateways/payment-providers",

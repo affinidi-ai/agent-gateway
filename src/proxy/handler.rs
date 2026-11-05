@@ -5846,7 +5846,7 @@ async fn proxy_charged_request(
                 Err(refusal) => break 'dispatch Err(refusal),
             }
             if let Some(receipt) = &gate_receipt {
-                receipt.commit();
+                receipt.commit().await;
             }
             Ok(crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
                 &proxy,
@@ -6983,7 +6983,7 @@ async fn proxy_charged_request(
         }
     }
     if let Some(receipt) = &gate_receipt {
-        receipt.commit();
+        receipt.commit().await;
     }
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
@@ -12354,7 +12354,7 @@ async fn handle_fabric_request_inner(
                 )
             });
         if let Some(receipt) = gate_receipt.as_ref() {
-            receipt.commit();
+            receipt.commit().await;
         }
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
@@ -12480,7 +12480,7 @@ async fn handle_fabric_request_inner(
         })?;
 
         if let Some(receipt) = gate_receipt.as_ref() {
-            receipt.commit();
+            receipt.commit().await;
         }
 
         // Pack and send the message
@@ -15239,7 +15239,7 @@ async fn handle_mcp_proxy_request_inner(
                 Err(response) => return Ok(response),
             }
             if let Some(receipt) = receipt_out.as_ref() {
-                receipt.commit();
+                receipt.commit().await;
             }
             // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)
             let executed = crate::mcp_proxies::handlers::execute_mcp_request(
