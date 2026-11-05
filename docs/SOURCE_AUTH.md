@@ -669,7 +669,7 @@ that a variant's overrides define as `Transit Point 'crm' in variant 'beta'`. A 
 variant inherits from the surface is named as the surface's own, once.
 
 The dashboard shows each such header on the Transit Point it names, in its **Who can call
-this Transit Point** section, and keeps it there until that Transit Point's
+this Transit Point** section and in a toast, and keeps it there until that Transit Point's
 token, caller authentication, open marking or listener changes. Before the save it shows the
 same text when an open Transit Point's listener URL is one other hosts reach; that check sees
 only external URLs, so the header, which also counts bind addresses and shared-domain inbound

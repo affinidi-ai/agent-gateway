@@ -382,14 +382,38 @@ describe('AddSurfacePage create warnings', () => {
     await waitFor(() => expect(showToast).toHaveBeenCalled());
   };
 
-  it("opens the new surface's page with the gateway warnings, leaving them out of the toast", async () => {
+  it("opens the new surface's page with the gateway warnings, in one toast", async () => {
     await create([warning]);
 
     expect(showToast).toHaveBeenCalledTimes(1);
-    expect((showToast as jest.Mock).mock.calls[0][1]).not.toContain(warning);
+    expect(showToast).toHaveBeenCalledWith(
+      'warning',
+      expect.stringContaining(`created, with warnings:\n${warning}`),
+      expect.objectContaining({ autoRemove: true })
+    );
     expect(await screen.findByTestId('location')).toHaveTextContent(
       `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
     );
+  });
+
+  it("carries only the warnings that are not the Access Point's", async () => {
+    const notReady =
+      "variant 'beta': This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.";
+    await create([notReady, warning]);
+
+    expect((showToast as jest.Mock).mock.calls[0][1]).not.toContain(notReady);
+    expect(await screen.findByTestId('location')).toHaveTextContent(
+      `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
+    );
+  });
+
+  it('returns to the surface list when the gateway answers with only Access Point warnings', async () => {
+    const publicMessage =
+      'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
+    await create([publicMessage]);
+
+    expect((showToast as jest.Mock).mock.calls[0][1]).not.toContain(publicMessage);
+    expect(await screen.findByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 
   it('returns to the surface list when the gateway answers with none', async () => {

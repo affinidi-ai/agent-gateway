@@ -166,15 +166,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Public access on: "This Access Point is public. …", on every successful save.
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
-  The dashboard shows none of these after a save: the canvas notice and the Access Point panel
-  already show the Access Point's state, and turning Public access on is the operator's own
-  choice.
+  The dashboard shows none of these after a save (`shownSaveWarnings` in
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
+  Access Point panel already show the Access Point's state, and turning Public access on is the
+  operator's own choice. Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
-  and one line per warning as a `warning` toast for the dashboard's own non-blocking issues
-  (`validateSurfacePayload`), each message once. It never lists `Warning` headers, and the edit
-  page has no banner for them; a create that drew any opens the new surface's page so the
-  Transit Point they name shows them.
+  and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
+  dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
+  headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
+  surface's page so the banner lists them.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so
@@ -209,7 +210,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `useJwtStrategies` and `useApiKeySecrets` (`elements/caller-auth/useCallerAuthOptions.ts`),
   shared with the Access Point's caller authentication editor.
 - The exposure warning: when a save answers with `Warning: 299` headers, `apiClient.createSurface`
-  and `updateSurface` pass their messages to an `onWarnings` option, and
+  and `updateSurface` pass their messages to an `onWarnings` option, the pages toast them and
   `SurfaceMetaContext.saveWarnings` hands them to the Transit Point whose alias they name, in
   the base view, or in the variant view a warning's `in variant '<alias>'` names
   (`transit-point-save-warning`), where each stays until that Transit Point's token, caller

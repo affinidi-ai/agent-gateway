@@ -119,7 +119,7 @@ describe('SurfaceDetailPage save warnings', () => {
     await screen.findByTestId('meta-warnings');
 
     expect(screen.getByTestId('meta-warnings')).toHaveTextContent(createWarning);
-    expect(screen.queryByTestId('surface-save-warnings')).toBeNull();
+    expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(createWarning);
     expect(screen.getByTestId('location-state')).toHaveTextContent('null');
   });
 
@@ -150,7 +150,7 @@ describe('SurfaceDetailPage save warnings', () => {
     expect(screen.getByTestId('meta-warnings')).toBeEmptyDOMElement();
   });
 
-  it('passes the warnings an update answered with to the builder, in no banner or toast', async () => {
+  it('shows the warnings an update answered with, in the banner and the one toast', async () => {
     const updateWarning = createWarning.replace('crm', 'hr');
     jest.spyOn(apiClient, 'updateSurface').mockImplementation(async (_id, _payload, options) => {
       options?.onWarnings?.([updateWarning]);
@@ -161,9 +161,13 @@ describe('SurfaceDetailPage save warnings', () => {
     await waitFor(() => expect(showToast).toHaveBeenCalled());
 
     expect(screen.getByTestId('meta-warnings')).toHaveTextContent(updateWarning);
-    expect(screen.queryByTestId('surface-save-warnings')).toBeNull();
+    expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(updateWarning);
     expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).toHaveBeenCalledWith('success', expect.stringContaining('saved'));
+    expect(showToast).toHaveBeenCalledWith(
+      'warning',
+      expect.stringContaining(updateWarning),
+      expect.objectContaining({ autoRemove: true })
+    );
   });
 });
 
