@@ -4,7 +4,9 @@
 //! record only when a sink selects its event. The [`journal`] makes it
 //! durable; the [`dispatch`]er delivers it to each sink from that sink's own
 //! cursor: the VP Audit Log ([`audit_log_sink`]) and each Governance Audit
-//! integration ([`integration_sink`]).
+//! integration ([`integration_sink`]). [`log_files`] keeps the VP Audit Log's
+//! own file bounded: it rotates the live file and reads only the end of the
+//! history it leaves behind.
 
 pub mod audit_log_sink;
 pub mod catalog;
@@ -14,6 +16,7 @@ pub mod dispatch;
 pub mod events;
 pub mod integration_sink;
 pub mod journal;
+pub mod log_files;
 pub mod pipeline;
 pub mod policy_changes;
 pub mod policy_refusals;

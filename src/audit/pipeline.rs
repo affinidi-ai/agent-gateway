@@ -19,6 +19,7 @@ use crate::audit::cursors::CursorStore;
 use crate::audit::dispatch::{DispatcherConfig, JournalSource, run_dispatcher};
 use crate::audit::integration_sink::ProductionSinks;
 use crate::audit::journal::{JournalWriter, WriterConfig, WriterStopped, spawn_writer};
+use crate::audit::log_files::Rotation;
 use crate::audit::producer::{Producer, producer};
 use crate::audit::registry::{Sinks, sinks};
 use crate::audit::sources::rebuild_sinks_within;
@@ -125,7 +126,7 @@ pub fn start_with(
     let journal_dir = audit_dir.join("journal");
     let writer = JournalWriter::open(&journal_dir, SEGMENT_MAX_BYTES)?;
     let cursors = Arc::new(CursorStore::open(&journal_dir)?);
-    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS)?;
+    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS, Rotation::default())?;
     let factory = ProductionSinks {
         audit_log: audit_log.clone(),
         publish: Arc::new(publish_audit_delivery),

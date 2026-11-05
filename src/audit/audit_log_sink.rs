@@ -1,17 +1,19 @@
 //! The VP Audit Log as a sink: appends records to the JSONL file the Audit
-//! page reads.
+//! page reads, and rotates it once it reaches its size cap.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
+use tracing::warn;
 
 use crate::audit::dispatch::Deliver;
 use crate::audit::journal::JournalEntry;
+use crate::audit::log_files::{self, Rotation};
 
 /// The event ids most recently written, so a record delivered again after a
 /// restart or a failed commit is not written twice.
@@ -64,27 +66,14 @@ struct StoredId {
 }
 
 /// Event ids of up to `count` records at the end of the log, oldest first.
+/// Reads back into the rotated files, so a log rotated just before a restart
+/// still recognises the records a redelivery would write again.
 fn tail_event_ids(
     path: &Path,
     count: usize,
 ) -> io::Result<Vec<String>> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let start = file
-        .metadata()?
-        .len()
-        .saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
+    let window = log_files::read_window(path, TAIL_BYTES)?;
+    let lines: Vec<&str> = window.text.lines().collect();
     let skip = lines
         .len()
         .saturating_sub(count);
@@ -101,6 +90,8 @@ struct Inner {
     /// Set under the `file` lock once the log is closed; later appends are refused.
     closed: AtomicBool,
     recent: Mutex<RecentIds>,
+    /// How the live log is rotated once it reaches its size cap.
+    rotation: Rotation,
 }
 
 impl Inner {
@@ -147,7 +138,40 @@ impl Inner {
                 .lock()
                 .remember(id.clone());
         }
+        self.rotate_if_full(&mut file);
         Ok(())
+    }
+
+    /// Rotates the live log once it has reached its cap, so the file the Audit
+    /// page reads stays bounded however long the gateway runs. The record is
+    /// already written, so a failed rotation is logged and left for the next
+    /// append rather than failing the delivery.
+    fn rotate_if_full(
+        &self,
+        file: &mut Option<File>,
+    ) {
+        if self.rotation.max_bytes == 0 {
+            return;
+        }
+        let full = file
+            .as_ref()
+            .and_then(|open| open.metadata().ok())
+            .is_some_and(|data| data.len() >= self.rotation.max_bytes);
+        if !full {
+            return;
+        }
+        if let Some(open) = file.as_ref() {
+            let _ = open.sync_data();
+        }
+        *file = None;
+        if let Err(e) = log_files::rotate(&self.path, self.rotation.keep) {
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                path = %self.path.display(),
+                "Failed to rotate the VP Audit Log"
+            );
+        }
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -173,10 +197,11 @@ pub struct AuditLogSink(Arc<Inner>);
 
 impl AuditLogSink {
     /// Opens the log at `path`, remembering the event ids of up to `remember`
-    /// records at its end.
+    /// records at its end, and rotating it as `rotation` says.
     pub fn open(
         path: &Path,
         remember: usize,
+        rotation: Rotation,
     ) -> io::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -190,6 +215,7 @@ impl AuditLogSink {
             file: Mutex::new(None),
             closed: AtomicBool::new(false),
             recent: Mutex::new(recent),
+            rotation,
         })))
     }
 
@@ -256,7 +282,7 @@ mod tests {
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         let (first, second) = (entry(1), entry(2));
 
         sink.deliver(&first)
@@ -287,14 +313,14 @@ mod tests {
             .join("delegation-audit.jsonl");
         let earlier = entry(1);
         {
-            let sink = AuditLogSink::open(&path, 16).unwrap();
+            let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
             sink.deliver(&earlier)
                 .await
                 .unwrap();
             sink.commit().await.unwrap();
         }
 
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         let later = entry(2);
         sink.deliver(&earlier)
             .await
@@ -313,7 +339,7 @@ mod tests {
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         let (kept, refused) = (entry(1), entry(2));
         sink.deliver(&kept)
             .await
@@ -336,6 +362,7 @@ mod tests {
             &dir.path()
                 .join("delegation-audit.jsonl"),
             16,
+            Rotation::default(),
         )
         .unwrap();
         // A write in progress holds the file while it appends.
@@ -361,7 +388,7 @@ mod tests {
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         let record = entry(1);
 
         sink.deliver(&record)
@@ -381,7 +408,7 @@ mod tests {
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
-        let sink = AuditLogSink::open(&path, 1).unwrap();
+        let sink = AuditLogSink::open(&path, 1, Rotation::default()).unwrap();
         let (first, second) = (entry(1), entry(2));
 
         sink.deliver(&first)
@@ -404,7 +431,7 @@ mod tests {
         let path = dir
             .path()
             .join("delegation-audit.jsonl");
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         let mut record = entry(1);
         record.record.event_id = None;
 
@@ -428,12 +455,66 @@ mod tests {
         let earlier = entry(1);
         std::fs::write(&path, format!("{}\n", serde_json::to_string(&earlier.record).unwrap())).unwrap();
 
-        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let sink = AuditLogSink::open(&path, 16, Rotation::default()).unwrap();
         sink.deliver(&earlier)
             .await
             .unwrap();
         sink.commit().await.unwrap();
 
         assert_eq!(lines(&path).len(), 1);
+    }
+
+    fn rotated(
+        path: &Path,
+        index: usize,
+    ) -> PathBuf {
+        PathBuf::from(format!("{}.{index}", path.display()))
+    }
+
+    #[tokio::test]
+    async fn the_live_log_is_rotated_once_it_reaches_its_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let sink = AuditLogSink::open(&path, 16, Rotation { max_bytes: 1, keep: 2 }).unwrap();
+        let (first, second) = (entry(1), entry(2));
+
+        sink.deliver(&first)
+            .await
+            .unwrap();
+        sink.deliver(&second)
+            .await
+            .unwrap();
+        sink.commit().await.unwrap();
+
+        assert_eq!(ids(&path), Vec::<Option<String>>::new(), "the live log starts again empty");
+        assert_eq!(ids(&rotated(&path, 1)), vec![second.record.event_id]);
+        assert_eq!(ids(&rotated(&path, 2)), vec![first.record.event_id]);
+    }
+
+    #[tokio::test]
+    async fn a_record_rotated_out_of_the_live_log_is_not_written_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let record = entry(1);
+        {
+            let sink = AuditLogSink::open(&path, 16, Rotation { max_bytes: 1, keep: 2 }).unwrap();
+            sink.deliver(&record)
+                .await
+                .unwrap();
+            sink.commit().await.unwrap();
+        }
+
+        let sink = AuditLogSink::open(&path, 16, Rotation { max_bytes: 1, keep: 2 }).unwrap();
+        sink.deliver(&record)
+            .await
+            .unwrap();
+        sink.commit().await.unwrap();
+
+        assert_eq!(ids(&path), Vec::<Option<String>>::new(), "the redelivered record is skipped");
+        assert_eq!(ids(&rotated(&path, 1)), vec![record.record.event_id]);
     }
 }

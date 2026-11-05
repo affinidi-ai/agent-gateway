@@ -38,6 +38,9 @@ pub struct AuditLogResponse {
     /// Per-category event counts across the text-filtered set (before the
     /// category filter), so the UI can show each category's count.
     pub category_counts: std::collections::BTreeMap<String, usize>,
+    /// Whether the audit history holds more than the window this page was read
+    /// from: the counts then describe the newest part of the history.
+    pub truncated: bool,
 }
 
 pub async fn get_audit_log(
@@ -78,6 +81,7 @@ pub async fn get_audit_log(
                 page_size: limit,
                 total_pages: 0,
                 category_counts: std::collections::BTreeMap::new(),
+                truncated: false,
             }));
         }
     };
@@ -89,5 +93,6 @@ pub async fn get_audit_log(
         page_size: log_page.page_size,
         total_pages: log_page.total_pages,
         category_counts: log_page.category_counts,
+        truncated: log_page.truncated,
     }))
 }

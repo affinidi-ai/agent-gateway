@@ -420,6 +420,16 @@ request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
 agent its presentation is for as `agent_did`.
 
+**File size and reads.** The VP Audit Log is rotated: once the live file reaches 8 MiB it
+becomes `delegation-audit.jsonl.1`, every rotated file moves one position back, and the 8 most
+recent are kept (about 72 MiB in all). Anything older is deleted, so a long-running gateway
+keeps a bounded audit history on disk. `/v1/audit` and `/v1/delegation-audit` read only the
+newest 8 MiB of that history, back through the rotated files, on a blocking thread and one read
+at a time: a read costs the same however large the history has grown, and concurrent readers
+wait for each other instead of each holding a copy. When the history holds more than that
+window the response sets `truncated: true`, and `total`, `total_pages` and `category_counts`
+then describe the window rather than the whole history.
+
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
@@ -722,7 +732,8 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   integration retry policy still applies inside each attempt. Delivery is
   at-least-once: a record may be delivered again after a restart, so receivers should
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
-  its file.
+  its history, reading back into the rotated files so a log rotated just before a restart still
+  recognises them.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
   addressed to a sink before it exists, so it misses nothing. An integration that is disabled,
   whose endpoint is disabled, or whose event set no longer holds audit events is paused: it

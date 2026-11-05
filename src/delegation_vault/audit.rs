@@ -17,11 +17,12 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use crate::audit::log_files;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
 use crate::server::mode::ServerMode;
@@ -1533,6 +1534,10 @@ pub struct AuditLogPage {
     /// **before** the category filter so a dropdown can show how many entries
     /// each category holds regardless of which one is currently selected.
     pub category_counts: std::collections::BTreeMap<String, usize>,
+    /// Whether the audit history holds more than the window this page was read
+    /// from, so `total`, `total_pages` and `category_counts` describe the newest
+    /// part of the history rather than all of it.
+    pub truncated: bool,
 }
 
 /// Return the stable category string for an audit action.
@@ -1611,9 +1616,62 @@ pub struct AuditLogFilter<'a> {
     pub exclude_vp_audit: bool,
 }
 
-/// Read the audit log file with pagination (newest first). Every [`AuditLogFilter`]
+/// Owned [`AuditLogFilter`], so a read can carry its filters onto a blocking
+/// thread.
+#[derive(Debug, Default, Clone)]
+struct OwnedAuditLogFilter {
+    text: Option<String>,
+    category: Option<String>,
+    flow: Option<String>,
+    scope: Option<String>,
+    decision: Option<String>,
+    exclude_vp_audit: bool,
+}
+
+impl From<AuditLogFilter<'_>> for OwnedAuditLogFilter {
+    fn from(opts: AuditLogFilter<'_>) -> Self {
+        Self {
+            text: opts.text.map(String::from),
+            category: opts
+                .category
+                .map(String::from),
+            flow: opts.flow.map(String::from),
+            scope: opts.scope.map(String::from),
+            decision: opts
+                .decision
+                .map(String::from),
+            exclude_vp_audit: opts.exclude_vp_audit,
+        }
+    }
+}
+
+impl OwnedAuditLogFilter {
+    fn borrowed(&self) -> AuditLogFilter<'_> {
+        AuditLogFilter {
+            text: self.text.as_deref(),
+            category: self.category.as_deref(),
+            flow: self.flow.as_deref(),
+            scope: self.scope.as_deref(),
+            decision: self.decision.as_deref(),
+            exclude_vp_audit: self.exclude_vp_audit,
+        }
+    }
+}
+
+/// How many reads parse the audit log at once. Each one holds a window of the
+/// log, and the records parsed from it, in memory, so concurrent readers — a
+/// second dashboard tab, or a filter changed while a page is still loading —
+/// wait for each other instead of multiplying that cost.
+static AUDIT_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Read the audit log with pagination (newest first). Every [`AuditLogFilter`]
 /// is applied **before** pagination and the category tally so `total`,
 /// `total_pages`, and `category_counts` stay consistent with the returned page.
+///
+/// Only the newest [`log_files::READ_WINDOW_BYTES`] of the log are read, back
+/// through the rotated files, so a read costs the same whatever the log has
+/// grown to. [`AuditLogPage::truncated`] says the history held more than that
+/// window, in which case the counts describe the window.
 pub async fn read_audit_log(
     page: usize,
     page_size: usize,
@@ -1621,16 +1679,34 @@ pub async fn read_audit_log(
 ) -> anyhow::Result<AuditLogPage> {
     let path = AUDIT_PATH
         .get()
-        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?;
+        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?
+        .clone();
+    let filter = OwnedAuditLogFilter::from(opts);
 
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_default();
+    let _permit = AUDIT_READS.acquire().await?;
+    tokio::task::spawn_blocking(move || {
+        read_audit_window(&path, page, page_size, &filter, log_files::READ_WINDOW_BYTES)
+    })
+    .await?
+}
 
-    // Parse all lines most-recent first. Text filtering happens after VP-backed
+/// Parse the newest `window_bytes` of the audit log into a page. Runs on a
+/// blocking thread: the window is read, parsed and filtered off the async
+/// runtime, so audit reads never hold up proxy traffic.
+fn read_audit_window(
+    path: &Path,
+    page: usize,
+    page_size: usize,
+    filter: &OwnedAuditLogFilter,
+    window_bytes: u64,
+) -> anyhow::Result<AuditLogPage> {
+    let window = log_files::read_window(path, window_bytes)?;
+
+    // Parse the window most-recent first. Text filtering happens after VP-backed
     // policy evidence enrichment so full-hash searches can match hydrated
     // PolicyDecision rows even when the original JSONL row predated the fields.
-    let mut events: Vec<DelegationAuditEvent> = content
+    let mut events: Vec<DelegationAuditEvent> = window
+        .text
         .lines()
         .rev()
         .filter_map(|line| {
@@ -1644,6 +1720,17 @@ pub async fn read_audit_log(
 
     enrich_policy_decisions_from_signed_vps(&mut events);
 
+    Ok(page_of(events, page, page_size, filter.borrowed(), window.truncated))
+}
+
+/// Filter, tally and paginate parsed events, newest first.
+fn page_of(
+    mut events: Vec<DelegationAuditEvent>,
+    page: usize,
+    page_size: usize,
+    opts: AuditLogFilter<'_>,
+    truncated: bool,
+) -> AuditLogPage {
     if let Some(filter_lower) = opts
         .text
         .map(|f| f.to_lowercase())
@@ -1721,14 +1808,15 @@ pub async fn read_audit_log(
         .take(page_size)
         .collect();
 
-    Ok(AuditLogPage {
+    AuditLogPage {
         events: page_events,
         total,
         page: clamped_page,
         page_size,
         total_pages,
         category_counts,
-    })
+        truncated,
+    }
 }
 
 /// The `payment` records in VP Audit Log `content`, newest first.
@@ -1923,6 +2011,60 @@ pub fn audit_trace_terminated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_line(provider: &str) -> String {
+        let event = audit_event(DelegationAuditAction::TokenInjected, None, None, Some(provider), None);
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    #[test]
+    fn a_read_returns_the_newest_records_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        std::fs::write(&path, format!("{}{}", audit_line("first"), audit_line("second"))).unwrap();
+
+        let page =
+            read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), log_files::READ_WINDOW_BYTES).unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            page.events[1]
+                .provider_id
+                .as_deref(),
+            Some("first")
+        );
+        assert!(!page.truncated, "the whole log fit in the window");
+    }
+
+    #[test]
+    fn a_read_of_a_log_longer_than_its_window_reports_partial_counts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let newest = audit_line("second");
+        let window_bytes = newest.len() as u64;
+        std::fs::write(&path, format!("{}{newest}", audit_line("first"))).unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), window_bytes).unwrap();
+
+        assert_eq!(page.total, 1, "only the records in the window are counted");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("second")
+        );
+        assert!(page.truncated, "the log held more than the window");
+    }
 
     #[test]
     fn test_audit_event_builder_fills_fields() {
