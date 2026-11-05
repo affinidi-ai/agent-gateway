@@ -3681,6 +3681,74 @@ async fn refused_mcp_proxy_token_flow(modern: bool) {
     assert_a_refused_token_is_dropped(&fixture, &answer, &format!("Fabric receive, modern: {modern}"), call).await;
 }
 
+#[test]
+fn an_mcp_proxy_tool_call_received_over_fabric_answers_an_unresolvable_target_credential_with_a_problem() {
+    run_in_own_process(unresolvable_mcp_proxy_credential_flow);
+}
+
+/// A `proxy://` surface reached over Fabric whose Target credential names a missing secret,
+/// with `fallback: reject`, is answered with the same problem as the forward path.
+async fn unresolvable_mcp_proxy_credential_flow() {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{BackendAnswer, echo_tool_call, mcp_proxy_answering};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let (proxy, mut surface, _backend) =
+        mcp_proxy_answering(BackendAnswer::new(std::sync::Mutex::new((200, None)))).await;
+    surface.target.auth = Some(
+        serde_json::from_value(
+            json!({"method": {"static_secret": {"secret_id": "missing", "header_name": "x-target-key"}},
+            "fallback": "reject"}),
+        )
+        .unwrap(),
+    );
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            temp_dir
+                .path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    crate::secrets::FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let storage_path = saved_surfaces(temp_dir.path(), &[&surface]).await;
+    let message = forwarded_post(&surface, "/mcp", echo_tool_call(false).1, &storage_path)
+        .with_context("secrets_storage_path", json!(secrets_path));
+
+    let ProcessingResult::RequiresResponse { response_body, .. } = process_forward_request(&message).await else {
+        panic!("expected a buffered answer");
+    };
+
+    assert_eq!(response_body["status"], 502, "{response_body}");
+    assert_eq!(response_body["headers"]["content-type"], "application/problem+json", "{response_body}");
+    let problem: Value = serde_json::from_str(
+        response_body["body"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        problem,
+        json!({"type": "about:blank", "title": "Bad Gateway", "status": 502,
+            "detail": "Target authentication configuration error"}),
+        "{response_body}"
+    );
+}
+
 /// Saves `surfaces` to a surface store under `root` and returns its storage path.
 async fn saved_surfaces(
     root: &std::path::Path,
