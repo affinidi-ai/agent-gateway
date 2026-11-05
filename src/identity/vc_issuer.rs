@@ -3268,7 +3268,13 @@ mod tests {
             match origin {
                 IdentityOrigin::Managed => {
                     issuer
-                        .issue_or_get_managed_credential(api_key_fields(&key_id), hash, surface, None, ManagedIdentitySource::protected())
+                        .issue_or_get_managed_credential(
+                            api_key_fields(&key_id),
+                            hash,
+                            surface,
+                            None,
+                            ManagedIdentitySource::protected(),
+                        )
                         .await
                 }
                 IdentityOrigin::ExternalCaller => {

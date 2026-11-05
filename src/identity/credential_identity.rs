@@ -1049,7 +1049,9 @@ mod tests {
         let expected = secret.updated_at;
         let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
         let resolver = CredentialIdentityResolver::new();
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: Some("demo-key".into()) };
+        let mi = ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("demo-key".into()),
+        };
 
         for _ in 0..2 {
             let r = resolver
