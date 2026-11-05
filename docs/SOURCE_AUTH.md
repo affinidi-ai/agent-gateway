@@ -213,6 +213,9 @@ itself therefore gets no token the method's strategy rejects, such as one from a
 or for another audience: make the strategy and `audiences` accept the tokens it needs, or give
 it its credential through target authentication instead. A `forward_header` method whose
 `token_header` is `Cookie` forwards nothing, since an Access Point never forwards `Cookie`.
+The token header is matched without regard to case or to `_` against `-`: a token is read only
+from the header spelled as `token_header`, every other spelling is stripped, and a second token
+under any spelling fails the caller.
 
 An Access Point never forwards its caller's `Cookie` to the managed agent, directly or over
 Fabric, a gateway receiving a Fabric request drops a `Cookie` its peer sent, and an MCP Proxy

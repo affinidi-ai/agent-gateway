@@ -8148,7 +8148,7 @@ fn gateway_owned_receive_header(
         Some("cookie")
     } else if source_cred_headers
         .iter()
-        .any(|cred| key.eq_ignore_ascii_case(cred))
+        .any(|cred| crate::config::target_auth_rules::same_header_name(key, cred))
     {
         Some("source auth credential")
     } else if crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(key) {
@@ -13043,9 +13043,10 @@ mod tests {
         }
         assert_eq!(owned("x-caller-key"), Some("source auth credential"));
         assert_eq!(owned("x-second-caller-key"), Some("source auth credential"));
+        assert_eq!(owned("X_Caller_Key"), Some("source auth credential"));
         assert_eq!(owned("x-caller-did"), Some("caller-info"));
         assert_eq!(owned("x-tenant"), Some("mapped"));
-        for key in ["X-Vendor-Tokens", "X-Partner-Context", "X_Caller_Key"] {
+        for key in ["X-Vendor-Tokens", "X-Partner-Context"] {
             assert_eq!(owned(key), None, "{key}");
         }
     }

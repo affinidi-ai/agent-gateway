@@ -222,11 +222,15 @@ impl SourceAuthMiddleware {
         channel_name: &str,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         // 1. Extract bearer token from the configured header / scheme. A value in
-        // another scheme, such as an MPP `Payment` credential, is not a token.
+        // another scheme, such as an MPP `Payment` credential, is not a token. A
+        // value under another spelling of the header, `_` for `-`, counts as a
+        // second token, since some servers read both spellings as one.
         if headers
-            .get_all(config.token_header.as_str())
             .iter()
-            .filter(|value| in_token_scheme(value.as_bytes(), &config.token_scheme))
+            .filter(|(name, value)| {
+                crate::config::target_auth_rules::same_header_name(name.as_str(), &config.token_header)
+                    && in_token_scheme(value.as_bytes(), &config.token_scheme)
+            })
             .count()
             > 1
         {
@@ -1969,6 +1973,57 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
                 assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{case}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_token_under_another_spelling_of_the_token_header_fails() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            token_header: "X-User-Token".to_string(),
+            forward_header: true,
+            ..Default::default()
+        });
+        let authenticate = |headers: HeaderMap| {
+            let mw = &mw;
+            let config = &config;
+            async move {
+                mw.authenticate(config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                    .await
+            }
+        };
+        let valid = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid.clone());
+        headers.insert("x_user_token", HeaderValue::from_static("Bearer other"));
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x_user_token", valid.clone());
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::MissingCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid);
+        let result = authenticate(headers).await;
+        assert!(
+            matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

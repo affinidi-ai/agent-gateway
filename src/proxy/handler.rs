@@ -100,7 +100,9 @@ fn upstream_mcp_session_id(headers: &HeaderMap) -> Result<Option<String>, &'stat
 }
 
 /// Returns `true` if the header should be forwarded upstream, additionally
-/// stripping every source-auth credential header.
+/// stripping every source-auth credential header, whatever its case and whether
+/// it spells `-` as `_`, except the verified header named exactly as
+/// `forwarded_source_auth_header`.
 fn should_forward_ap_request_header_with_mapping(
     name: &str,
     source_auth_headers: &[&str],
@@ -118,7 +120,7 @@ fn should_forward_ap_request_header_with_mapping(
     if name.eq_ignore_ascii_case("authorization")
         || source_auth_headers
             .iter()
-            .any(|header| name.eq_ignore_ascii_case(header))
+            .any(|header| crate::config::target_auth_rules::same_header_name(name, header))
     {
         return false;
     }
@@ -22661,6 +22663,16 @@ allow if {
         let headers = ["authorization", "x-api-key"];
         assert!(should_forward_ap_request_header_with_mapping("authorization", &headers, None, Some("authorization")));
         assert!(!should_forward_ap_request_header_with_mapping("x-api-key", &headers, None, Some("authorization")));
+    }
+
+    #[test]
+    fn every_other_spelling_of_the_forwarded_token_header_is_stripped() {
+        let headers = ["X-User-Token"];
+        assert!(forwards_ap_caller_header("x-user-token", &headers, None, Some("X-User-Token"), &[]));
+        for name in ["X_User_Token", "x_user-token"] {
+            assert!(!forwards_ap_caller_header(name, &headers, None, Some("X-User-Token"), &[]), "{name}");
+            assert!(!should_forward_ap_request_header_with_mapping(name, &headers, None, None), "{name}");
+        }
     }
 
     #[test]
