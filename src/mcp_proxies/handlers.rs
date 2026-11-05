@@ -2544,9 +2544,9 @@ fn legacy_base_directory(base_url: &Url) -> Result<Url, url::ParseError> {
 /// The URL is built the way `rmcp_openapi` builds it: path parameters substituted
 /// unencoded, then resolved against the [`legacy_base_directory`]. Arguments it cannot use
 /// fail the call in `rmcp_openapi` before any request is sent, so they do not
-/// count as leaving. A path parameter value with a brace counts as leaving, since
-/// `rmcp_openapi` substitutes in hash-map order and may expand a placeholder it
-/// carries.
+/// count as leaving. A path parameter value that names another path parameter's
+/// placeholder counts as leaving, since `rmcp_openapi` substitutes in hash-map
+/// order and may expand it.
 fn tool_call_leaves_base(
     base_url: &Url,
     tool: &rmcp_openapi::ToolMetadata,
@@ -2561,7 +2561,11 @@ fn tool_call_leaves_base(
             serde_json::Value::String(value) => value.clone(),
             other => other.to_string(),
         };
-        if value.contains(['{', '}']) {
+        let names_another = parameters
+            .path
+            .keys()
+            .any(|other| other != name && value.contains(&format!("{{{other}}}")));
+        if names_another {
             return true;
         }
         path = path.replace(&format!("{{{name}}}"), &value);
@@ -3252,13 +3256,19 @@ mod tests {
     async fn a_credentialed_tool_call_stays_under_the_proxy_base_path() {
         let (proxy, received) = recording_items_proxy("/base/").await;
 
-        for escaping in ["../../admin", "%2e%2e/%2E%2E/admin", "x/../../../admin", "{id}"] {
+        for escaping in ["../../admin", "%2e%2e/%2E%2E/admin", "x/../../../admin"] {
             assert_eq!(
                 call_get_item(&proxy, escaping, true)
                     .await
                     .expect_err("an escaping path is refused"),
                 super::McpProxyCallError::OutsideTargetBase,
                 "{escaping}"
+            );
+        }
+        for braced in ["{id}", "{abc}", "a{b"] {
+            assert!(
+                matches!(call_get_item(&proxy, braced, true).await, Err(super::McpProxyCallError::Failed(_))),
+                "a braced value under the base fails as invalid arguments: {braced}"
             );
         }
         assert!(
@@ -3278,6 +3288,50 @@ mod tests {
             *received.lock().unwrap(),
             vec![("/base/items/1".to_string(), Some("gateway-value".to_string())), ("/open".to_string(), None)]
         );
+    }
+
+    /// A path parameter value counts as leaving the base when it names another path parameter's
+    /// placeholder, which the substitution could expand, or when the substituted path climbs out.
+    #[test]
+    fn a_path_value_naming_another_path_parameter_counts_as_leaving_the_base() {
+        use serde_json::json;
+
+        let path_parameter = |name: &str| {
+            (
+                name.to_string(),
+                rmcp_openapi::tool::ParameterMapping {
+                    sanitized_name: name.to_string(),
+                    original_name: name.to_string(),
+                    location: "path".to_string(),
+                    explode: false,
+                },
+            )
+        };
+        let tool = rmcp_openapi::ToolMetadata {
+            name: "getPair".to_string(),
+            title: None,
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                "required": ["a", "b"]
+            }),
+            output_schema: None,
+            method: "get".to_string(),
+            path: "/pairs/{a}/{b}".to_string(),
+            security: None,
+            parameter_mappings: [path_parameter("a"), path_parameter("b")]
+                .into_iter()
+                .collect(),
+        };
+        let base = url::Url::parse("https://backend.example/base/").unwrap();
+        let leaves = |a: &str, b: &str| super::tool_call_leaves_base(&base, &tool, &json!({"a": a, "b": b}));
+
+        assert!(leaves("{b}", "x"));
+        assert!(leaves("../..", "x"));
+        assert!(!leaves("{a}", "x"));
+        assert!(!leaves("{c}", "x"));
+        assert!(!leaves("1", "2"));
     }
 
     /// A base URL whose path has no trailing slash keeps its last segment, with or without the

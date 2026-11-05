@@ -810,10 +810,15 @@ origin is also allowed; any other method there is refused.
 | Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | 502 "Target authentication credentials unavailable" |
 | Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | 502 "Target authentication credentials unavailable" |
 
-On the MCP proxy, a path parameter value containing `{` or `}` is also refused while the
-credential is attached, because the OpenAPI client substitutes parameters one at a time. A refused
-request reaches neither the Target nor any other host, and is recorded in the VP Audit Log as a
-`target_auth_failed` refusal with outcome `rejected`, whatever the `fallback`. A surface without `target.auth`, or a
+On the MCP proxy, a path parameter value containing another path parameter's `{name}`
+placeholder is also refused while the credential is attached, because the OpenAPI client
+substitutes parameters one at a time and the value would be rewritten into another parameter's
+place. It is refused as leaving the base: a 502 "Target authentication failed" and a
+`target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
+Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
+which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`
+segment, and checks the base path after substitution. A refused request reaches neither the Target
+nor any other host. A surface without `target.auth`, or a
 Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
 each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
 below a non-root `base_url` path, one that makes an ambiguous segment above (for example

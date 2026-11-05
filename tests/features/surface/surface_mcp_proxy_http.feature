@@ -199,6 +199,15 @@ Feature: Routing through a proxy:// MCP target
     And the response mentions "Target authentication failed"
     And REST API "bravo" was not called
 
+  Scenario: A credentialed tool call with a braced path value is refused as invalid arguments, not as leaving the base path
+    Given the MCP proxy's base URL has the base path "/api/"
+    And the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller invokes the MCP tool "get_weather" for city "{Paris}" with a valid API key
+    Then the response status is 200
+    And the MCP response is a JSON-RPC error with code -32603
+    And REST API "bravo" was not called
+
   Scenario: A credentialed tool call does not follow a redirect from the REST API
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
