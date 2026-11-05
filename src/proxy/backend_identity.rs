@@ -1298,10 +1298,13 @@ mod tests {
         let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
             api_key_id: Some("atgk_bi_origin".to_string()),
         };
-        let Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash, .. }) =
-            crate::identity::credential_identity::derive_credential_identity(&config, None, None)
-                .await
-                .unwrap()
+        let Some(crate::identity::credential_identity::CredentialIdentity::Derived {
+            identity_fields,
+            identity_hash,
+            ..
+        }) = crate::identity::credential_identity::derive_credential_identity(&config, None, None)
+            .await
+            .unwrap()
         else {
             panic!("API key identity is derived");
         };

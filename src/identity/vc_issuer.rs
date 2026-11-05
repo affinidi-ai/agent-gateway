@@ -2784,13 +2784,7 @@ mod tests {
                 .await;
             let issuer = &f.issuer;
             let first = issuer
-                .issue_or_get_managed_credential(
-                    fields("a"),
-                    None,
-                    Some("vc-name-shared-a".into()),
-                    None,
-                    protected(),
-                )
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-shared-a".into()), None, protected())
                 .await
                 .unwrap();
 
@@ -2805,13 +2799,7 @@ mod tests {
                 .unwrap();
 
             let second = issuer
-                .issue_or_get_managed_credential(
-                    fields("a"),
-                    None,
-                    Some("vc-name-shared-a".into()),
-                    None,
-                    protected(),
-                )
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-shared-a".into()), None, protected())
                 .await
                 .unwrap();
 
@@ -3319,7 +3307,13 @@ mod tests {
             match origin {
                 IdentityOrigin::Managed => {
                     issuer
-                        .issue_or_get_managed_credential(api_key_fields(&key_id), hash, surface, None, ManagedIdentitySource::protected())
+                        .issue_or_get_managed_credential(
+                            api_key_fields(&key_id),
+                            hash,
+                            surface,
+                            None,
+                            ManagedIdentitySource::protected(),
+                        )
                         .await
                 }
                 IdentityOrigin::ExternalCaller => {

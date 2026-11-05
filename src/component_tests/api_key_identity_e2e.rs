@@ -128,7 +128,9 @@ async fn configured_key_identity(key_id: &str) -> (std::collections::HashMap<Str
     .await
     .expect("derive configured key identity")
     .expect("configured key identity");
-    let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash, .. } = derived
+    let crate::identity::credential_identity::CredentialIdentity::Derived {
+        identity_fields, identity_hash, ..
+    } = derived
     else {
         panic!("an API key identity is derived");
     };
