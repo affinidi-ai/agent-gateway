@@ -1985,7 +1985,7 @@ fn outbound_listen_path_claims(
 /// would produce overlapping Axum routes.
 ///
 /// Each custom `listen_path` is registered as an exact route on the shared
-/// outbound port listener (`run_outbound_port_server`). Two transit points
+/// outbound port listener (`build_outbound_port_router`). Two transit points
 /// that resolve to the same effective listen address **and** the same
 /// `listen_path` register the same route; `Router::merge` then panics when
 /// the listener is (re)built after a save — taking the whole gateway down.

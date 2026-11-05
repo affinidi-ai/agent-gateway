@@ -41,7 +41,7 @@ There is no external datastore.
 | --- | --- |
 | Runtime | A DashMap cache is authoritative. [`src/state/`](src/state/) holds the per-surface runtime state. |
 | Disk | JSON files under `_storage/`, written immediately on change. [`src/storage/`](src/storage/) holds the store traits and the filesystem implementation. |
-| Reload | Surfaces are hot-reloadable. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
+| Reload | Surfaces are hot-reloadable. A reload swaps the router each port listener serves and keeps the listener bound, so it refuses no connection. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
 
 Encryption at rest is optional and lives in [`src/encryption/`](src/encryption/). See
 [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) for reload mechanics and
