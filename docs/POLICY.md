@@ -594,12 +594,18 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   policy, and reads the card within the Transit Point's response bounds. A
   blocked URL, a redirect or an oversized card yields no card. For a
   `fabric://` target the card is read over Fabric instead, never through the
-  Transit Point's own listener, at the two well-known paths in turn: discovery
-  paths, which the remote gateway answers as public card reads, with its
-  surface's card and identity credential. Any other path is an ordinary
-  request through the remote Access Point, so `agent_card_path` is not used.
-  An oversized or non-JSON answer at one path is skipped for the next, and a
-  Fabric transport failure ends the read with no card. A Transit Point policy
+  Transit Point's own listener, at `/.well-known/agent-card.json` and then,
+  as a fallback, `/.well-known/agent.json`. Both are discovery paths, which the
+  remote gateway answers as public card reads with its surface's card and
+  identity credential. The remote reads `/.well-known/agent-card.json` from its
+  configured card location, with its Target credential when it has one. It
+  reads the `/.well-known/agent.json` fallback as a public discovery read,
+  without that credential, so a remote Target that serves its card only at the
+  legacy path and requires its credential there is reported as
+  `AGENT_CARD_UNAVAILABLE`. Any other path is an ordinary request through the
+  remote Access Point, so `agent_card_path` is not used. An oversized or
+  non-JSON answer at one path is skipped for the next, and a Fabric transport
+  failure ends the read with no card. A Transit Point policy
   with `require_agent_context` does not read a card the request's Trust Checks
   already found unavailable.
 - The **managed agent Agent Card fetch** for display names

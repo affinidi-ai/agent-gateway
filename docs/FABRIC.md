@@ -400,7 +400,8 @@ request received by the destination gateway:
    card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
    transport. The surface's `target.auth` goes only with a request whose caller was vetted, and
    with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured card
-   location, the sending gateway's own card fetch; any other discovery read gets none (see
+   location, the sending gateway's own card fetch; any other discovery read, the
+   `/.well-known/agent.json` fallback included, gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
@@ -613,7 +614,12 @@ the Transit Point) through any Transit Point, which reads no token either. So do
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
 The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
 or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
-not through the Transit Point, with a count of 1 and a trace id of its own.
+not through the Transit Point, with a count of 1 and a trace id of its own. It reads
+`/.well-known/agent-card.json`, which the remote answers from its configured card location with
+its Target credential when it has one, and falls back to `/.well-known/agent.json`, which the
+remote reads as a public discovery read without that credential; a remote Target that serves its
+card only at the legacy path and requires its credential there is reported as
+`AGENT_CARD_UNAVAILABLE`.
 The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
 the agent sending the token it was given each time; two agents that call each other's Access
 Points are not bounded by it, nor are agents that keep calling through any of the resets above.

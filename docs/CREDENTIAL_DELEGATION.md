@@ -741,7 +741,8 @@ request the gateway vetted (`CallerAssertion`), so a provider token is never spe
 unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
 receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
 configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
-credential. A token that
+credential, the legacy
+`/.well-known/agent.json` fallback of a Fabric card read included. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
 `passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
@@ -822,7 +823,8 @@ withholds the credential logs none for a rule still in `warn`.
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
 withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
 `/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
-any other discovery read is a caller's request and never gets the credential. A credential withheld under `enforce` is treated
+any other discovery read, the `/.well-known/agent.json` fallback included, is a caller's request
+and never gets the credential, so a remote Target that serves its card only at that path and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld under `enforce` is treated
 as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
 request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
