@@ -61,6 +61,12 @@ changes:
         code_challenge. Creating such a provider, or updating one to such an endpoint or
         additional_params, is refused with 400. A consent link is not minted for a stored
         provider that fails these checks; the binding is unavailable instead.
+    - timestamp: '2026-11-06T18:00:00Z'
+      title: Update actix-web and actix-http for four security advisories
+      description: >-
+        actix-web moves to 4.18.2 and actix-http to 3.20.3, which fix request smuggling through
+        malformed chunked trailers and request bodies whose decompression could exhaust memory
+        and CPU.
   breaking:
     - timestamp: '2026-11-04T09:00:00Z'
       title: Point the consent_required authorization URL at the gateway's start page
