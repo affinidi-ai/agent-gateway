@@ -1305,7 +1305,16 @@ keys is checked again on its next request.
   folder holds any key record, readable or not, such as the kept keys of a deleted surface: the
   create answers `400` "Surface ID '…' is not available". The create reads only the key folder
   of that id, from disk; when that folder
-  cannot be read it answers `503` "API key store is unavailable".
+  cannot be read it answers `503` "API key store is unavailable". `POST /v1/surfaces` is the only
+  way to create a surface that checks the id: a surface template is applied in the dashboard and
+  saved through it, and `PUT` and `PATCH` answer `404` for an id with no surface. A surface that
+  reaches the gateway another way is not checked: a file written to the agent surface folder by
+  hand or by a seeding tool, picked up at boot, by a configuration reload, the cache refresh scan
+  or as another node's write; a surface loaded from the DynamoDB configuration source; and a
+  backup restore, which replaces the whole `_storage` directory with the surfaces and key folders
+  of one backup when both folders sit in it, as by default. Such a surface counts as the owner of
+  the keys in its id's key folder. The checks below still hold it to the rules for keys of other
+  surfaces, such as `other_surface` and `missing_owner` under `enforce`.
 - A key or owning surface that cannot be found is checked again later. Under `warn` both are
   only reported, and a key that cannot be found is only reported under `enforce` too. The key or
   its owning surface may exist on another node that shares the storage and not be visible here
