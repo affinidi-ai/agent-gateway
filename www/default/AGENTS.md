@@ -411,10 +411,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   responses carry `api_key_references` (`key_id` and `status`), passed to the panels and the
   canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). A
   protected, external or Transit Point From API Key Identity whose current `api_key_id` is
-  `revoked`, `missing` or `unavailable` gets the red dashed ring (`POLICY_UNCONFIGURED_DASH`, as a
-  missing policy), "API key revoked", "API key deleted" or "API key of another surface" under its
-  label, and the full warning in the ring tooltip ("Unconfigured: …"), and the panel shows the
-  same warning under the picker (`identity-api-key-revoked-warning`) and labels the stored id "<id> (revoked)", "(deleted)" or "(belongs to another surface)". The
+  `revoked`, `missing` or `unavailable` gets the canvas's red `unconfigured-ring` (red, dashed
+  and animated by the `.surface-builder-canvas .unconfigured-ring` rule, like every other ring)
+  with "API key revoked", "API key deleted" or "API key of another surface" under its label, and
+  the panel shows the full warning under the picker (`identity-api-key-revoked-warning`) and
+  labels the stored id "<id> (revoked)", "(deleted)" or "(belongs to another surface)". The
   warnings are "The API key this Identity uses was revoked. Select an active API key of this
   surface.", "… was deleted. Select an active API key of this surface." and "The API key this
   Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the
