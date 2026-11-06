@@ -17,7 +17,6 @@ export const ApiKeyDeleteDialog: React.FC<ApiKeyDeleteDialogProps> = ({
   onCancel,
   onConfirm,
 }) => {
-  const [understood, setUnderstood] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   const confirm = async () => {
@@ -30,64 +29,63 @@ export const ApiKeyDeleteDialog: React.FC<ApiKeyDeleteDialogProps> = ({
   };
 
   return (
-    <div
-      className="modal d-block"
-      style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="api-key-delete-dialog-title"
-      data-testid="api-key-delete-dialog"
-    >
-      <div className="modal-dialog modal-dialog-centered">
-        <div className="modal-content">
-          <div className="modal-header">
-            <h5 className="modal-title" id="api-key-delete-dialog-title">
-              <i className="fas fa-triangle-exclamation me-2 text-danger" aria-hidden="true" />
-              Delete API key
-            </h5>
-            <button type="button" className="btn-close" aria-label="Close" onClick={onCancel} />
-          </div>
-          <div className="modal-body">
-            <p>
-              Delete {clientId ? <strong>{clientId}</strong> : null} <code>{keyId}</code>?
-            </p>
-            <p className="mb-3">
-              Callers presenting this key are refused. Any surface whose Identity uses this key
-              becomes Unconfigured and stops serving requests until you select another API key for
-              it. This can&apos;t be undone.
-            </p>
-            <div className="form-check">
-              <input
-                className="form-check-input"
-                type="checkbox"
-                id="api-key-delete-dialog-understood"
-                data-testid="api-key-delete-dialog-understood"
-                checked={understood}
-                onChange={e => setUnderstood(e.target.checked)}
-              />
-              <label className="form-check-label" htmlFor="api-key-delete-dialog-understood">
-                I understand surfaces using this key stop serving until they use another API key
-              </label>
+    <>
+      <div
+        className="modal fade show"
+        style={{ display: 'block' }}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="api-key-delete-dialog-title"
+        data-testid="api-key-delete-dialog"
+      >
+        <div className="modal-dialog modal-dialog-centered">
+          <div className="modal-content">
+            <div className="modal-header">
+              <h5 className="modal-title" id="api-key-delete-dialog-title">
+                <i className="fas fa-triangle-exclamation me-2 text-danger" aria-hidden="true" />
+                Delete API key
+              </h5>
+              <button type="button" className="btn-close" onClick={onCancel} aria-label="Close" />
             </div>
-          </div>
-          <div className="modal-footer">
-            <button type="button" className="btn btn-secondary" onClick={onCancel}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="btn btn-danger"
-              data-testid="api-key-delete-dialog-confirm"
-              disabled={!understood || deleting}
-              onClick={confirm}
-            >
-              <i className="fas fa-trash me-1" aria-hidden="true" />
-              Delete API key
-            </button>
+            <div className="modal-body">
+              <p>
+                Delete {clientId ? <strong>{clientId}</strong> : null} <code>{keyId}</code>?
+              </p>
+              <p className="mb-0">
+                Callers presenting this key are refused. Any surface whose Identity uses this key
+                becomes Unconfigured and stops serving requests until you select another API key for
+                it. This can&apos;t be undone.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn btn-secondary" onClick={onCancel}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                data-testid="api-key-delete-dialog-confirm"
+                disabled={deleting}
+                onClick={confirm}
+              >
+                {deleting ? (
+                  <span
+                    className="spinner-border spinner-border-sm me-1"
+                    role="status"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <i className="fas fa-trash me-1" aria-hidden="true" />
+                )}
+                Delete API key
+              </button>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+      <div className="modal-backdrop fade show" />
+    </>
   );
 };
 

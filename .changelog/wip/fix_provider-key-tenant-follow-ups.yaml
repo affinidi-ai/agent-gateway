@@ -36,7 +36,7 @@ changes:
         Deleting an API key that a stored surface uses is allowed. The Secrets page and the API
         key page open a confirmation dialog before every API key delete, saying that callers
         presenting the key are refused and that surfaces using it become Unconfigured and stop
-        serving, and delete only after a checkbox and a second click. DELETE
+        serving, and delete only after Delete API key is clicked in that dialog. DELETE
         /v1/api-keys/{agent_id}/{key_id} removes the key, also one whose owning surface is gone,
         and a key that is not under the surface named in the path answers 404. Every surface
         naming a deleted key answers 503 until it names another key.

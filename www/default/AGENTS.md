@@ -1032,14 +1032,15 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 
 The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
 (**Delete**) share `useApiKeyDelete` (`src/components/api-keys/ApiKeyDeleteDialog.tsx`). The
-delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, a
-`modal d-block` dialog (`role="dialog"`, `aria-modal`) titled "Delete API key" that names the
-key's client id and key id and says callers presenting the key are refused, and any
-surface whose Identity uses it becomes Unconfigured and stops serving requests until another API
-key is selected. **Delete API key** (`api-key-delete-dialog-confirm`) stays disabled until the
-checkbox "I understand surfaces using this key stop serving until they use another API key"
-(`api-key-delete-dialog-understood`) is ticked, then sends the `DELETE`. **Cancel** and the close
-button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
+like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
+a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
+carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
+client id and key id and says callers presenting the key are refused, and any surface whose
+Identity uses it becomes Unconfigured and stops serving requests until another API key is
+selected. **Delete API key** (`api-key-delete-dialog-confirm`, `btn-danger`) sends the `DELETE`;
+it is enabled on open and disabled, with a spinner, only while the delete runs. **Cancel** and the
+close button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
 with the toast "API key deleted", then the tab reloads its keys and the detail page returns to
 `/secrets`. A failed delete shows an error toast that stays until dismissed: "Delete failed:
 <gateway message> (<status>)", and the detail page stays open.

@@ -55,7 +55,6 @@ describe('ApiKeyDetailPage delete', () => {
     renderPage();
 
     await userEvent.click(await screen.findByTitle('Delete this API key'));
-    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
     await userEvent.click(screen.getByTestId('api-key-delete-dialog-confirm'));
 
     await waitFor(() =>
@@ -78,10 +77,9 @@ describe('ApiKeyDetailPage delete', () => {
     expect(dialog).toHaveTextContent('client-a');
     expect(dialog).toHaveTextContent('becomes Unconfigured');
     const confirm = screen.getByTestId('api-key-delete-dialog-confirm');
-    expect(confirm).toBeDisabled();
+    expect(confirm).toBeEnabled();
     expect(apiClient.deleteApiKey).not.toHaveBeenCalled();
 
-    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
     await userEvent.click(confirm);
 
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/secrets'));

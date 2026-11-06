@@ -2,8 +2,8 @@
  * API key delete confirmation tests
  *
  * Asserts deleting an API key opens a dialog that says surfaces using the key
- * stop serving, sends nothing until the operator ticks the checkbox and
- * confirms, and then sends one plain DELETE; cancelling sends none.
+ * stop serving, sends nothing until the operator confirms with Delete API key,
+ * and then sends one plain DELETE; cancelling sends none.
  */
 
 import type {Page, Request} from '@playwright/test';
@@ -46,7 +46,7 @@ async function mockKeys(page: Page): Promise<Request[]> {
 }
 
 test.describe('API key delete confirmation', () => {
-    test('deletes only after the checkbox and a second confirmation', async ({page}) => {
+    test('deletes only after a second confirmation in the dialog', async ({page}) => {
         const deletes = await mockKeys(page);
         await page.goto(`${BASE_URL}/secrets?tab=api-keys`);
 
@@ -54,13 +54,16 @@ test.describe('API key delete confirmation', () => {
 
         const dialog = page.getByTestId('api-key-delete-dialog');
         await expect(dialog).toBeVisible();
+        await expect(dialog.locator('.modal-title')).toHaveText('Delete API key');
+        await expect(
+            dialog.locator('.modal-title i.fa-triangle-exclamation.text-danger'),
+        ).toBeVisible();
         await expect(dialog).toContainText('delete-client');
         await expect(dialog).toContainText('becomes Unconfigured');
         const confirm = page.getByTestId('api-key-delete-dialog-confirm');
-        await expect(confirm).toBeDisabled();
+        await expect(confirm).toBeEnabled();
         expect(deletes).toHaveLength(0);
 
-        await page.getByTestId('api-key-delete-dialog-understood').check();
         await confirm.click();
 
         await expect(dialog).toHaveCount(0);
