@@ -23,9 +23,11 @@ use crate::bdd_support::config::fabric_surface_fixture::SurfaceSpec;
 use crate::bdd_support::config::modern_consent::{
     ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
 };
+use crate::bdd_support::config::single_surface_fixture::SurfaceTargetAuthProviderConfig;
+use crate::bdd_support::config::target_auth::{TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN};
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::json_rpc::McpVersion;
-use crate::bdd_support::mock_server::MockServer;
+use crate::bdd_support::mock_server::{MockResponse, MockServer};
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 
 use crate::bdd_support::mediator::{Mediator, MediatorCrossBridge, ScenarioDockerMediator, bridge_mediator_pairs};
@@ -55,6 +57,9 @@ pub struct GatewayNode {
     /// gateway is on its own mediator.
     pub mediator_index: usize,
     extra_env: HashMap<String, String>,
+    /// The token endpoints of the credential providers this gateway's surfaces authenticate to
+    /// their Targets with, kept serving for the gateway's lifetime.
+    _token_endpoints: Vec<MockServer>,
     _temp_dir: TempDirGuard,
     gateway: GatewayProcess,
 }
@@ -1036,6 +1041,20 @@ async fn spawn_node(
             mocks.insert(surface.surface_id.clone(), mock);
         }
     }
+    let mut oauth_endpoints = Vec::new();
+    let mut token_endpoints = Vec::new();
+    for provider in surfaces
+        .iter_mut()
+        .filter_map(|surface| {
+            surface
+                .target_auth_provider
+                .as_mut()
+        })
+    {
+        let token_endpoint = start_target_auth_token_endpoint(provider).await;
+        oauth_endpoints.push(format!("{}/token", token_endpoint.url()));
+        token_endpoints.push(token_endpoint);
+    }
 
     let (gateway_port, mut port_reservation) = config::reserve_free_port("");
     let needs_outbound_listener = surfaces
@@ -1079,7 +1098,10 @@ async fn spawn_node(
         }
     }
     if let Some(consent) = &plan.modern_consent {
-        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));
+        oauth_endpoints.push(oauth_endpoint_allowlist(consent));
+    }
+    if !oauth_endpoints.is_empty() {
+        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoints.join(","));
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway
@@ -1136,9 +1158,33 @@ async fn spawn_node(
         mediator_id: mediator_record.id,
         mediator_index,
         extra_env,
+        _token_endpoints: token_endpoints,
         _temp_dir: TempDirGuard::new(temp_dir, name),
         gateway,
     })
+}
+
+/// Serves `provider`'s token endpoint and records its URL on `provider`. It issues
+/// [`TARGET_AUTH_PROVIDER_TOKEN`] or, when `provider` refuses token requests, answers an OAuth
+/// `invalid_client` error whose description and the client secret must never leave the gateway.
+async fn start_target_auth_token_endpoint(provider: &mut SurfaceTargetAuthProviderConfig) -> MockServer {
+    let body = if provider.token_status == 200 {
+        serde_json::json!({
+            "access_token": TARGET_AUTH_PROVIDER_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": provider.expires_in,
+        })
+    } else {
+        serde_json::json!({
+            "error": "invalid_client",
+            "error_description": format!("client secret {TARGET_AUTH_CLIENT_SECRET_VALUE} rejected"),
+        })
+    };
+    let mut response = MockResponse::json(body);
+    response.status = provider.token_status;
+    let token_endpoint = MockServer::start(response).await;
+    provider.token_endpoint = Some(format!("{}/token", token_endpoint.url()));
+    token_endpoint
 }
 
 /// Union of `mediator_egress_allowlist` across every mediator instance in the

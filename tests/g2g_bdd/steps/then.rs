@@ -1187,6 +1187,29 @@ pub async fn response_detail_is(
     assert_eq!(problem["detail"].as_str(), Some(expected.as_str()), "response body {body}");
 }
 
+#[then(expr = "the agent card url points to gateway {int} surface {string}")]
+pub async fn agent_card_url_points_to_gateway_surface(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    let (surface_gw, surface_id) = world.surface(&surface_name);
+    assert_eq!(surface_gw, gw_index, "surface '{surface_name}' is on gateway {surface_gw}");
+    let route = world
+        .surface_spec(gw_index, &surface_id)
+        .route
+        .clone();
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let card = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    assert_eq!(card["url"].as_str(), Some(format!("http://localhost:{port}{route}").as_str()), "card {card}");
+}
+
 #[then(expr = "the response to the caller carried header {string}")]
 pub async fn response_to_caller_carried_header(
     world: &mut G2gWorld,

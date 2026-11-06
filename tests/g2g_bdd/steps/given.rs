@@ -12,6 +12,7 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
+use crate::bdd_support::config::single_surface_fixture::{SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant};
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_agent_card_naming_did,
     build_target_ok_response,
@@ -799,6 +800,37 @@ pub async fn surface_injects_missing_target_credential(
         fallback,
         secret_value: None,
     });
+}
+
+#[given(expr = "surface {string} authenticates to its managed agent with a client credentials provider")]
+pub async fn surface_authenticates_target_with_client_credentials(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).target_auth_provider =
+        Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
+}
+
+#[given(expr = "the credential provider of surface {string} is refusing token requests")]
+pub async fn surface_credential_provider_refuses_tokens(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name)
+        .target_auth_provider
+        .as_mut()
+        .expect("the surface must authenticate to its managed agent with a credential provider first")
+        .token_status = 401;
+}
+
+#[given(expr = "managed agent {string} publishes an agent card with url {string}")]
+pub async fn managed_agent_publishes_card_with_url(
+    world: &mut G2gWorld,
+    agent_name: String,
+    url: String,
+) {
+    let card = serde_json::json!({ "name": agent_name, "url": url, "skills": [] });
+    set_target_response(world, &agent_name, card);
 }
 
 #[given(expr = "MCP server {string} publishes a tool catalog")]

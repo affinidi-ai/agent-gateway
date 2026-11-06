@@ -219,7 +219,7 @@ fn fabric_route_probe_stage(
 ) -> Option<FabricRouteProbeStage> {
     let target = surface_spec(topology, link.to_gw, &link.to_surface);
 
-    if target
+    let target_credential_unavailable = target
         .target_auth
         .as_ref()
         .is_some_and(|target_auth| {
@@ -228,7 +228,11 @@ fn fabric_route_probe_stage(
                 .is_none()
                 && target_auth.fallback == "reject"
         })
-    {
+        || target
+            .target_auth_provider
+            .as_ref()
+            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject");
+    if target_credential_unavailable {
         return None;
     }
 

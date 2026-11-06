@@ -962,22 +962,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
-        if provider.grant == TargetAuthProviderGrant::JwtBearer {
-            let signing_key = if provider.signing_key_is_service_account_file {
-                target_auth_service_account_key_file()
-            } else {
-                target_auth_signing_key()
-                    .private_pem
-                    .clone()
-            };
-            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
-        }
-        if provider.stores_client_id() {
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
-        }
-        if provider.stores_client_secret() {
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
-        }
+        secrets.extend(target_auth_provider_secrets(provider));
     }
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
@@ -1032,7 +1017,30 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
     providers
 }
 
-fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
+/// The secrets the Target credential provider reads: a JWT bearer provider's signing key, and
+/// the client id and client secret a provider stores.
+pub fn target_auth_provider_secrets(provider: &SurfaceTargetAuthProviderConfig) -> Vec<SecretFixture> {
+    let mut secrets = Vec::new();
+    if provider.grant == TargetAuthProviderGrant::JwtBearer {
+        let signing_key = if provider.signing_key_is_service_account_file {
+            target_auth_service_account_key_file()
+        } else {
+            target_auth_signing_key()
+                .private_pem
+                .clone()
+        };
+        secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
+    }
+    if provider.stores_client_id() {
+        secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
+    }
+    if provider.stores_client_secret() {
+        secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
+    }
+    secrets
+}
+
+pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
     let now = chrono::Utc::now();
     let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
     CredentialProviderFixture {

@@ -2175,15 +2175,41 @@ struct TokenEndpoint {
     _server: tokio::task::JoinHandle<()>,
 }
 
+/// The client secret of [`TARGET_PROVIDER`], which never leaves the gateway but in a token request.
+const PROVIDER_CLIENT_SECRET: &str = "fabric-provider-client-secret";
+/// The `error_description` a refusing token endpoint answers with, which the gateway never relays,
+/// records or logs.
+const REFUSED_TOKEN_DESCRIPTION: &str = "fabric-token-endpoint-description";
+
 impl TokenEndpoint {
     async fn start() -> Self {
+        Self::answering(200, json!({ "access_token": PROVIDER_TOKEN, "token_type": "Bearer", "expires_in": 3600 }))
+            .await
+    }
+
+    /// A token endpoint that refuses the client with an OAuth `invalid_client` error whose
+    /// description names the client secret.
+    async fn refusing() -> Self {
+        Self::answering(
+            401,
+            json!({ "error": "invalid_client",
+                "error_description": format!("{REFUSED_TOKEN_DESCRIPTION}: {PROVIDER_CLIENT_SECRET} rejected") }),
+        )
+        .await
+    }
+
+    async fn answering(
+        status: u16,
+        body: Value,
+    ) -> Self {
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = requests.clone();
         let app = axum::Router::new().fallback(axum::routing::post(move || {
             let counted = counted.clone();
+            let body = body.clone();
             async move {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                axum::Json(json!({ "access_token": PROVIDER_TOKEN, "token_type": "Bearer", "expires_in": 3600 }))
+                (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(body))
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2238,7 +2264,7 @@ async fn install_target_provider(
     )
     .await
     .unwrap();
-    for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", "client-secret")] {
+    for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", PROVIDER_CLIENT_SECRET)] {
         secrets
             .create(crate::secrets::CreateSecretRequest {
                 tenant_id: None,
@@ -2304,6 +2330,135 @@ async fn an_agent_card_fetch_over_fabric_presents_the_credential_providers_token
     assert_eq!(request.path, "/.well-known/agent-card.json");
     assert_eq!(header_values(&request.headers, "authorization"), [format!("Bearer {PROVIDER_TOKEN}")]);
     assert_eq!(token_endpoint.requests(), 1, "token requests");
+}
+
+/// A credential provider that refuses its token request fails a peer's agent
+/// card fetch with the direct path's `502` "Target authentication failed"
+/// before the Target is called, and records one rejected `target_auth_failed`
+/// naming the provider and the OAuth `error` code. Neither the token endpoint's
+/// `error_description` nor the client secret reaches the peer, the audit record
+/// or the logs.
+#[tokio::test]
+async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_authentication_failed() {
+    use tracing::instrument::WithSubscriber;
+    if ran_in_child("ATG_FABRIC_REFUSED_PROVIDER_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let token_endpoint = TokenEndpoint::refusing().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &provider_surface(&target.url)).await;
+    install_target_provider(root.path(), &token_endpoint.url).await;
+    let logs = super::mcp_receive_tests::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+
+    let (response, events) = token_endpoint
+        .egress()
+        .scope(crate::audit::producer::capture(forward_response(&peer_request(
+            root.path(),
+            "GET",
+            "/.well-known/agent-card.json",
+        ))))
+        .with_subscriber(subscriber)
+        .await;
+
+    assert_eq!(response["status"], 502, "{response}");
+    let body: Value = serde_json::from_str(
+        response["body"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["detail"], crate::proxy::handler::TARGET_AUTH_FAILED);
+    assert_eq!(token_endpoint.requests(), 1, "token requests");
+    assert!(target.received().is_empty(), "the Target was called");
+    let rejections: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected {
+                reason: RejectionReason::TargetAuthFailed,
+                target_auth: Some(rejection),
+                ..
+            } => Some((
+                event.provider_id.as_deref(),
+                rejection.outcome,
+                rejection
+                    .oauth_error
+                    .as_deref(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rejections,
+        [(Some(TARGET_PROVIDER), crate::audit::request_events::TargetAuthOutcome::Rejected, Some("invalid_client"))]
+    );
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("invalid_client"), "the OAuth error code was not logged:\n{logs}");
+    for (sink, text) in
+        [("response", response.to_string()), ("audit record", serde_json::to_string(&events).unwrap()), ("logs", logs)]
+    {
+        for secret in [REFUSED_TOKEN_DESCRIPTION, PROVIDER_CLIENT_SECRET] {
+            assert!(!text.contains(secret), "{secret} reached the {sink}:\n{text}");
+        }
+    }
+}
+
+/// Under `fallback: passthrough` a credential provider that refuses its token
+/// request leaves the card fetch over Fabric without the credential, and the
+/// Target's card reaches the peer; the failure is recorded once as a passthrough
+/// `target_auth_failed`.
+#[tokio::test]
+async fn a_refused_provider_token_under_passthrough_fetches_the_card_over_fabric_without_it() {
+    if ran_in_child("ATG_FABRIC_PASSTHROUGH_PROVIDER_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::open().await;
+    let token_endpoint = TokenEndpoint::refusing().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(provider_surface(&target.url)).unwrap();
+    value["target"]["auth"]["fallback"] = json!("passthrough");
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    install_target_provider(root.path(), &token_endpoint.url).await;
+
+    let (response, events) = token_endpoint
+        .egress()
+        .scope(crate::audit::producer::capture(forward_response(&peer_request(
+            root.path(),
+            "GET",
+            "/.well-known/agent-card.json",
+        ))))
+        .await;
+
+    assert_eq!(response["status"], 200, "{response}");
+    let card: Value = serde_json::from_str(
+        response["body"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(card["name"], "protected-agent");
+    assert_eq!(token_endpoint.requests(), 1, "token requests");
+    assert_eq!(
+        target_auth_outcomes(&events),
+        [(None, Some(crate::audit::request_events::TargetAuthOutcome::Passthrough))]
+    );
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/.well-known/agent-card.json");
+    assert!(
+        request
+            .headers
+            .get("authorization")
+            .is_none(),
+        "an Authorization header reached the Target: {:?}",
+        request.headers
+    );
 }
 
 /// The card read for the policy input presents the client credentials

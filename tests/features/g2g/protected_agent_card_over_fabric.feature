@@ -34,6 +34,30 @@ Feature: Protected agent card fetch over Fabric
     And the response detail is "Target authentication failed"
     And managed agent "bravo" was not called
 
+  Scenario: gateway 2 fetches the agent card with its credential provider's token
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" publishes an agent card with url "http://bravo.internal/a2a"
+    And surface "alpha" authenticates to its managed agent with a client credentials provider
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And the agent card url points to gateway 1 surface "charlie"
+    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "authorization" with value "Bearer bdd-target-provider-token"
+
+  Scenario: gateway 2 refuses the agent card fetch when its credential provider refuses a token
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" authenticates to its managed agent with a client credentials provider
+    And the credential provider of surface "alpha" is refusing token requests
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
+    Then the response status is 502
+    And the response detail is "Target authentication failed"
+    And the response does not say "bdd-target-client-secret-value"
+    And the response does not say "invalid_client"
+    And managed agent "bravo" was not called
+
   Scenario: gateway 2 answers a redirected agent card fetch as the direct path does
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"

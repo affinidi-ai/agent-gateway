@@ -1,5 +1,7 @@
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
-use crate::bdd_support::config::single_surface_fixture::{McpToolPolicyFixture, SurfaceTargetAuthConfig};
+use crate::bdd_support::config::single_surface_fixture::{
+    McpToolPolicyFixture, SurfaceTargetAuthConfig, SurfaceTargetAuthProviderConfig,
+};
 
 #[derive(Debug, Clone)]
 pub enum SourceAuthSpec {
@@ -21,6 +23,10 @@ pub struct SurfaceSpec {
     /// `proxy://{id}`. May be rewritten post-federation.
     pub target_endpoint: String,
     pub target_auth: Option<TargetAuthSpec>,
+    /// Target Authentication with a credential provider's token. The harness serves the
+    /// provider's token endpoint and sets `token_endpoint` before the gateway starts; one
+    /// surface per gateway may use it.
+    pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub source_auth: Option<SourceAuthSpec>,
     pub inbound_policy_rego: Option<String>,
     /// Surface-level request policy (`target.policy`) written into the config at boot.
@@ -111,6 +117,7 @@ impl SurfaceSpec {
             protocol: protocol.to_string(),
             target_endpoint: target_endpoint.to_string(),
             target_auth: None,
+            target_auth_provider: None,
             source_auth: None,
             inbound_policy_rego: None,
             target_policy_rego: None,
