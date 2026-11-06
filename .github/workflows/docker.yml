@@ -45,7 +45,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
           && '[{"platform":"linux/amd64","runner":"ubuntu-latest","pair":"amd64"}]'
-          || '[{"platform":"linux/amd64","runner":"ubuntu-latest","pair":"amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","pair":"arm64"}]') }}
+          || '[{"platform":"linux/amd64","runner":"ubuntu-latest","pair":"amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","pair":"arm64","build_args":"CARGO_BUILD_FLAGS=-j2\nCARGO_PROFILE_RELEASE_CODEGEN_UNITS=1"}]') }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -63,6 +63,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: ${{ matrix.build_args }}
           load: true
           tags: agent-gateway:verify
           provenance: false
@@ -88,6 +89,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: ${{ matrix.build_args }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
