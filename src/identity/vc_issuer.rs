@@ -2608,11 +2608,7 @@ mod tests {
                 name: &str,
             ) {
                 self.surfaces
-                    .save(&crate::config::agent_surface::AgentSurface {
-                        surface_id: surface_id.to_string(),
-                        name: name.to_string(),
-                        ..Default::default()
-                    })
+                    .save(&crate::identity::test_helpers::test_surface_with_managed_identity(surface_id, name))
                     .await
                     .expect("save surface");
             }
@@ -2781,6 +2777,33 @@ mod tests {
                     .get("name")
                     .is_none()
             );
+        }
+
+        #[tokio::test]
+        async fn managed_agent_calling_another_surface_keeps_its_name() {
+            let f = fixture().await;
+            f.save_surface("vc-name-calls-oxygen", "OXYGEN")
+                .await;
+            f.save_surface("vc-name-calls-delta", "DELTA")
+                .await;
+            let issuer = &f.issuer;
+            let managed = issuer
+                .issue_or_get_managed_credential(fields("bravo"), None, Some("vc-name-calls-oxygen".into()), None)
+                .await
+                .unwrap();
+            let caller = issuer
+                .issue_or_get_caller_credential(fields("bravo"), None, Some("vc-name-calls-delta".into()), None)
+                .await
+                .unwrap();
+
+            let reissued = issuer
+                .issue_or_get_managed_credential(fields("bravo"), None, Some("vc-name-calls-oxygen".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(caller.did, managed.did);
+            assert_eq!(reissued.did, managed.did);
+            assert_eq!(jwt_subject(&reissued.credential)["name"], json!("OXYGEN"));
         }
 
         #[tokio::test]

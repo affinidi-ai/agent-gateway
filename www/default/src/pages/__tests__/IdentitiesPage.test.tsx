@@ -957,20 +957,62 @@ describe('IdentitiesPage', () => {
       });
     });
 
-    it('looks as before when the backend sends no naming fields', async () => {
+    it('shows the Name and DID columns with Unnamed Agent when the backend sends no naming fields', async () => {
       renderWithStats([
         { did: 'did:key:legacy-a', identity_hash: 'a', created_at: '2026-01-01T00:00:00Z' },
         { did: 'did:key:legacy-b', identity_hash: 'b', created_at: '2026-01-02T00:00:00Z' },
       ]);
 
       expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument();
       expect(screen.getByRole('columnheader', { name: 'DID' })).toBeInTheDocument();
       expect(screen.getByRole('columnheader', { name: 'Origin' })).toBeInTheDocument();
+      expect(screen.queryByRole('columnheader', { name: 'Usage Count' })).not.toBeInTheDocument();
       expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
       expect(screen.queryByTestId('identities-unnamed-filter-button')).not.toBeInTheDocument();
+      expect(screen.getAllByTestId('identities-name-empty')).toHaveLength(2);
+      expect(screen.getAllByTestId('identities-name-empty')[0]).toHaveTextContent('Unnamed Agent');
       expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
       expect(screen.queryByText('No name')).not.toBeInTheDocument();
       expect(screen.queryByTestId(/^identities-origin-/)).not.toBeInTheDocument();
+    });
+
+    it('shows a DID:webvh identity under its metadata agent name', async () => {
+      (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({
+        identities: [
+          {
+            did: 'did:webvh:zLegacy:example.com:agents:legacy',
+            created_at: '2026-01-01T00:00:00Z',
+            metadata: { agent_name: 'legacy' },
+          },
+        ],
+      });
+      renderWithStats([]);
+
+      const row = await screen.findByTestId(
+        'identities-row-did:webvh:zLegacy:example.com:agents:legacy'
+      );
+      expect(within(row).getByTestId('identities-name')).toHaveTextContent('legacy');
+      expect(within(row).queryByTestId('identities-name-empty')).not.toBeInTheDocument();
+    });
+
+    it('shows Unnamed Agent when the metadata agent name is not a string', async () => {
+      (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({
+        identities: [
+          {
+            did: 'did:webvh:zObject:example.com:agents:object',
+            created_at: '2026-01-01T00:00:00Z',
+            metadata: { agent_name: { first: 'not', last: 'text' } },
+          },
+        ],
+      });
+      renderWithStats([]);
+
+      const row = await screen.findByTestId(
+        'identities-row-did:webvh:zObject:example.com:agents:object'
+      );
+      expect(within(row).getByTestId('identities-name-empty')).toHaveTextContent('Unnamed Agent');
+      expect(within(row).queryByTestId('identities-name')).not.toBeInTheDocument();
     });
 
     it('expands rows independently', async () => {

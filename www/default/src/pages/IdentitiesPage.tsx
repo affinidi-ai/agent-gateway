@@ -28,6 +28,11 @@ import { useIdentityRows } from './IdentitiesPage/useIdentityRows';
 import IssuersTab from './SettingsPage/IssuersTab';
 import AuthoritiesTab from './SettingsPage/AuthoritiesTab';
 
+const metadataAgentName = (metadata?: { agent_name?: unknown }): string | undefined =>
+  typeof metadata?.agent_name === 'string' && metadata.agent_name !== ''
+    ? metadata.agent_name
+    : undefined;
+
 const IdentitiesPage: React.FC = () => {
   const { actions, getCurrentStats } = useApp();
   const { hasPermission } = usePermissions();
@@ -137,7 +142,7 @@ const IdentitiesPage: React.FC = () => {
           ...identity,
           is_local: true,
           is_didwebvh: true,
-          name: identity.metadata?.agent_name || identity.did.split(':').pop(),
+          name: metadataAgentName(identity.metadata) || identity.did.split(':').pop(),
           created_at: identity.created_at,
         });
       } else {
@@ -524,7 +529,7 @@ const IdentitiesPage: React.FC = () => {
                                           identity={identity}
                                           showName={hasNamingMetadata}
                                           showDid={false}
-                                          fallbackName={identity.metadata?.agent_name}
+                                          fallbackName={metadataAgentName(identity.metadata)}
                                           liveSurfaceName={
                                             identity.surface_id
                                               ? liveSurfaceNames.get(identity.surface_id)
@@ -695,7 +700,10 @@ const IdentitiesPage: React.FC = () => {
                                     {hasRecorderStatus && (
                                       <td>
                                         {identity.trust_recorder ? (
-                                          <IdentityRecorderChip status={identity.trust_recorder} />
+                                          <IdentityRecorderChip
+                                            status={identity.trust_recorder}
+                                            surface={identity.trust_recorder_surface}
+                                          />
                                         ) : (
                                           <span className="text-muted">-</span>
                                         )}

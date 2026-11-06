@@ -203,6 +203,7 @@ export interface Identity {
   // Every live surface where this DID is the managed agent, sorted by name; omitted when empty.
   managed_surfaces?: ManagedSurfaceRef[];
   trust_recorder?: TrustRecorderStatus;
+  trust_recorder_surface?: ManagedSurfaceRef;
 }
 
 export interface ManagedSurfaceRef {

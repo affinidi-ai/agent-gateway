@@ -865,8 +865,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   pending (`display_name_pending`), it shows a muted "resolving…" line. A verified agent
   name renders as `local · host` with a verified marker. A caller's Agent Card name
   (`agent_card`), a managed agent's target Agent Card name (`target_agent_card`) and a
-  surface name show no badge. Without a display name, it shows `metadata.agent_name`, else
-  a muted, italic "Unnamed Agent".
+  surface name show no badge. Without a display name, it shows `metadata.agent_name` when that
+  is a non-empty string, else a muted, italic "Unnamed Agent".
 - The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
   monospace with a copy button for the full DID, then the version badge and SCID when set.
 - The table has no Usage Count column; the usage count is still in the expanded details and
@@ -893,7 +893,13 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
-  A shared managed DID carries the worst outcome across those surfaces. It is the gateway
+  A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
+  Partly recorded > Skipped > Not attempted yet > Recorded. "Not attempted yet" outranks
+  "Recorded", so a DID recorded on one surface whose other surface's recorder has not run
+  shows "Not attempted yet". Such a DID also carries `trust_recorder_surface` (a
+  `ManagedSurfaceRef`, sent only for a shared managed DID), the surface whose outcome
+  `trust_recorder` holds; the chip's accessible name reads "Trust Recorder status on
+  <surface>: <state>" and its tooltip opens with "Recorder on <surface>". It is the gateway
   recorder's last known outcome, not a live registry check. When any identity has it,
   the table gains a **Recorder** column and the filter row gains a **Recorder** select; with
   none, neither appears and the page looks as before.
@@ -926,6 +932,7 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Recorder filter                | `identities-recorder-filter`                                             |
 | Recorder chip                  | `identities-recorder-chip-<state>`                                       |
 | Recorder tooltip               | `identities-recorder-tooltip`                                            |
+| Tooltip recorder surface       | `identities-recorder-surface`                                            |
 | Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
 | Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 

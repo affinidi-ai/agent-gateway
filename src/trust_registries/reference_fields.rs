@@ -658,7 +658,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::identity::filesystem::IdentityOrigin;
-    use crate::identity::test_helpers::test_surface_identity_record;
+    use crate::identity::test_helpers::{test_surface_identity_record, test_surface_with_managed_identity};
 
     fn value(name: &str) -> ReferenceFieldValue {
         ReferenceFieldValue::entity("did:web:agent", DisplayName::parse(name).unwrap())
@@ -1092,11 +1092,7 @@ mod tests {
 
     #[test]
     fn surface_values_name_managed_dids_and_skip_shared_ones() {
-        let surface = AgentSurface {
-            surface_id: "s1".to_string(),
-            name: "OXYGEN".to_string(),
-            ..Default::default()
-        };
+        let surface = test_surface_with_managed_identity("s1", "OXYGEN");
         let mut managed = test_surface_identity_record("did:web:managed", "s1");
         managed.origin = Some(IdentityOrigin::Managed);
         let mut shared = test_surface_identity_record("did:web:shared", "s1");
@@ -1108,10 +1104,7 @@ mod tests {
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         let unrelated = test_surface_identity_record("did:web:unrelated", "s9");
 
-        let elsewhere = AgentSurface {
-            surface_id: "s2".to_string(),
-            ..Default::default()
-        };
+        let elsewhere = test_surface_with_managed_identity("s2", "");
 
         let values =
             surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated], &[elsewhere]);
@@ -1121,11 +1114,7 @@ mod tests {
 
     #[test]
     fn surface_values_name_did_also_seen_as_caller_or_on_deleted_surface() {
-        let surface = AgentSurface {
-            surface_id: "s1".to_string(),
-            name: "OXYGEN".to_string(),
-            ..Default::default()
-        };
+        let surface = test_surface_with_managed_identity("s1", "OXYGEN");
         let mut managed = test_surface_identity_record("did:web:managed", "s1");
         managed.origin = Some(IdentityOrigin::Managed);
         let mut seen_as_caller = test_surface_identity_record("did:web:managed", "s2");
@@ -1135,10 +1124,7 @@ mod tests {
         let mut deleted_elsewhere = test_surface_identity_record("did:web:managed", "s3");
         deleted_elsewhere.identity_hash = "deleted".to_string();
         deleted_elsewhere.origin = Some(IdentityOrigin::Managed);
-        let caller_surface = AgentSurface {
-            surface_id: "s2".to_string(),
-            ..Default::default()
-        };
+        let caller_surface = test_surface_with_managed_identity("s2", "");
 
         let values =
             surface_reference_values(&surface, &[managed, seen_as_caller, deleted_elsewhere], &[caller_surface]);
@@ -1148,11 +1134,7 @@ mod tests {
 
     #[test]
     fn surface_values_skip_legacy_records_without_origin() {
-        let surface = AgentSurface {
-            surface_id: "s1".to_string(),
-            name: "OXYGEN".to_string(),
-            ..Default::default()
-        };
+        let surface = test_surface_with_managed_identity("s1", "OXYGEN");
         let mut legacy = test_surface_identity_record("did:web:legacy", "s1");
         legacy.origin = None;
         legacy.is_local = true;

@@ -72,6 +72,24 @@ pub fn test_channel_usage(
     }
 }
 
+/// A surface named `name` that issues a managed agent identity, so a managed DID used on it
+/// counts as its managed agent.
+pub fn test_surface_with_managed_identity(
+    surface_id: &str,
+    name: &str,
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = crate::config::agent_surface::AgentSurface {
+        surface_id: surface_id.to_string(),
+        name: name.to_string(),
+        ..Default::default()
+    };
+    surface
+        .target
+        .identity_injection
+        .identity_type = Some("from_jwt_claim".to_string());
+    surface
+}
+
 pub struct MockIdentityStore {
     records: Arc<RwLock<HashMap<String, AgentIdentityRecord>>>,
 }

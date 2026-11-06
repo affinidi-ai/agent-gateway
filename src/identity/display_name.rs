@@ -119,17 +119,14 @@ fn is_managed(record: &AgentIdentityRecord) -> bool {
     record.effective_origin() == Some(IdentityOrigin::Managed)
 }
 
-/// Whether a usage entry in `role` makes `surface` a managed surface of the DID. Entries
-/// recorded before roles count only on a surface that issues a managed identity.
+/// Whether a usage entry in `role` makes `surface` a managed surface of the DID: a managed
+/// use, or one recorded before roles, counts only while the surface still issues a managed
+/// identity.
 fn counts_as_managed(
     role: Option<IdentityOrigin>,
     surface: &AgentSurface,
 ) -> bool {
-    match role {
-        Some(IdentityOrigin::Managed) => true,
-        Some(IdentityOrigin::ExternalCaller) => false,
-        None => surface.has_managed_identity(),
-    }
+    role != Some(IdentityOrigin::ExternalCaller) && surface.has_managed_identity()
 }
 
 /// The live surfaces where each managed DID is the managed agent: surfaces where it was only
@@ -455,7 +452,7 @@ mod tests {
     fn live(ids: &[&str]) -> Surfaces {
         Surfaces(
             ids.iter()
-                .map(|id| surface(id, &id.to_uppercase()))
+                .map(|id| with_managed_identity(surface(id, &id.to_uppercase())))
                 .collect(),
         )
     }
@@ -711,7 +708,8 @@ mod tests {
             .channel_usage
             .push(usage("delta", Some(IdentityOrigin::ExternalCaller)));
         record.channel_config_id = Some("delta".to_string());
-        let surfaces = [surface("alpha", "ALPHA"), with_managed_identity(surface("delta", "DELTA"))];
+        let surfaces =
+            [with_managed_identity(surface("alpha", "ALPHA")), with_managed_identity(surface("delta", "DELTA"))];
 
         assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha"]));
     }
@@ -723,7 +721,21 @@ mod tests {
             .channel_usage
             .push(usage("bravo", Some(IdentityOrigin::Managed)));
 
-        assert_eq!(by_did_over(&[record], &[surface("alpha", "ALPHA")])["did:web:a"], set(&["alpha"]));
+        assert_eq!(
+            by_did_over(&[record], &[with_managed_identity(surface("alpha", "ALPHA"))])["did:web:a"],
+            set(&["alpha"])
+        );
+    }
+
+    #[test]
+    fn managed_surfaces_leave_out_surfaces_that_no_longer_issue_a_managed_identity() {
+        let mut record = managed("did:web:a", "alpha");
+        record
+            .channel_usage
+            .push(usage("bravo", Some(IdentityOrigin::Managed)));
+        let surfaces = [with_managed_identity(surface("alpha", "ALPHA")), surface("bravo", "BRAVO")];
+
+        assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha"]));
     }
 
     #[test]
@@ -759,7 +771,7 @@ mod tests {
             usage("charlie", Some(IdentityOrigin::Managed)),
             usage("delta", Some(IdentityOrigin::ExternalCaller)),
         ];
-        let surfaces = ["alpha", "bravo", "charlie", "delta"].map(|id| surface(id, id));
+        let surfaces = ["alpha", "bravo", "charlie", "delta"].map(|id| with_managed_identity(surface(id, id)));
 
         assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha", "bravo", "charlie"]));
     }

@@ -10,14 +10,17 @@ changes:
         lists every surface where it is the managed agent. The dashboard identity list
         (`/v1/dashboard/stats` and its live updates) gains `managed_surfaces`; `surface_id` and
         `surface_name` are set only for a DID with one managed surface, and `trust_recorder` of a
-        shared DID is the worst outcome across its managed surfaces.
+        shared DID is the worst outcome across its managed surfaces, with
+        `trust_recorder_surface` naming the surface it came from; the Recorder chip names that
+        surface too.
     - timestamp: '2026-11-06T10:00:00Z'
       title: Show the name and the DID in separate Identities columns
       description: >-
         The Identities table has a Name column and a DID column with its copy button. A row
         without a display name shows `metadata.agent_name`, else "Unnamed Agent". The Usage Count
         column left the table; the usage count is still in the row details and the API. Search no
-        longer matches a managed row by the last surface it called.
+        longer matches a managed row by the last surface it called. A `metadata.agent_name` that
+        is not a string is ignored instead of breaking the table.
   fixed:
     - timestamp: '2026-11-05T14:14:35Z'
       title: Stop counting caller-only and deleted surfaces as a managed agent's surfaces
@@ -25,12 +28,13 @@ changes:
         Each surface use now records whether the DID was the managed agent or a caller there. A
         managed agent that called another surface, or whose old surface was deleted, is no longer
         treated as shared: the dashboard names it, and its surface name is signed into its VC and
-        published to the Trust Registry again. Usage saved before this change counts as managed only
-        on a live surface that issues a managed identity (an `a2a-proxy://` target, or a managed
-        identity configured on the surface). An older entry for a surface where the DID was only a
-        caller therefore still counts until the DID calls that surface again. A DID stays shared while a surface it was once the managed agent on still exists,
-        even after that surface's managed identity is moved, removed or switched; deleting the
-        surface clears it.
+        published to the Trust Registry again. A surface counts as managed only while it exists and
+        still issues a managed identity (an `a2a-proxy://` target, or a managed identity configured
+        on the surface), so moving or removing a surface's managed identity also clears it. Usage
+        saved before this change follows the same rule, so an older entry for a surface where the
+        DID was only a caller still counts until the DID calls that surface again. A surface that
+        switches its managed identity to another credential keeps its old DID as managed until the
+        surface is deleted or stops issuing a managed identity.
   removed:
     - timestamp: '2026-11-05T14:14:35Z'
       title: Remove the "name conflict" badge and the "Unnamed only" Identities filter

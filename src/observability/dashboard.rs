@@ -315,6 +315,10 @@ pub struct IdentityInfo {
     pub managed_surfaces: Vec<ManagedSurfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_recorder: Option<RecorderStatus>,
+    /// For a DID managed on several surfaces, the surface whose Trust Recorder outcome
+    /// `trust_recorder` shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
 }
 
 /// A live surface where a DID is the managed agent.
@@ -2236,6 +2240,7 @@ pub(crate) async fn build_identity_list_with(
                 credential_principal: principal,
                 managed_surfaces,
                 trust_recorder: None,
+                trust_recorder_surface: None,
             }
         })
         .collect();
@@ -2257,7 +2262,12 @@ pub(crate) async fn build_identity_list_with(
     }
     if let Some(recorder_status) = recorder_status {
         for identity in &mut identities {
-            identity.trust_recorder = recorder_status_for(identity, &surfaces_by_id, recorder_status).await;
+            let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await
+            else {
+                continue;
+            };
+            identity.trust_recorder = Some(status);
+            identity.trust_recorder_surface = (identity.managed_surfaces.len() > 1).then_some(surface);
         }
     }
     Ok(identities)
@@ -2265,16 +2275,16 @@ pub(crate) async fn build_identity_list_with(
 
 /// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
 /// `not_attempted` before the first one. A DID managed on several such surfaces carries the
-/// worst of their outcomes. Every other identity carries none.
+/// worst of their outcomes, with the surface it came from. Every other identity carries none.
 async fn recorder_status_for(
     identity: &IdentityInfo,
     surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
     recorder_status: &TrustRecorderStatusStore,
-) -> Option<RecorderStatus> {
+) -> Option<(RecorderStatus, ManagedSurfaceInfo)> {
     if identity.origin != Some(IdentityOrigin::Managed) {
         return None;
     }
-    let mut worst: Option<RecorderStatus> = None;
+    let mut worst: Option<(RecorderStatus, ManagedSurfaceInfo)> = None;
     for managed in &identity.managed_surfaces {
         let Some(surface) = surfaces_by_id.get(managed.surface_id.as_str()) else {
             continue;
@@ -2291,9 +2301,9 @@ async fn recorder_status_for(
             .unwrap_or_else(RecorderStatus::not_attempted);
         if worst
             .as_ref()
-            .is_none_or(|w| recorder_severity(status.state) > recorder_severity(w.state))
+            .is_none_or(|(w, _)| recorder_severity(status.state) > recorder_severity(w.state))
         {
-            worst = Some(status);
+            worst = Some((status, managed.clone()));
         }
     }
     worst
@@ -2721,7 +2731,9 @@ mod tests {
         use chrono::Utc;
         use serde_json::{Value, json};
 
-        use super::super::{IdentityInfo, build_identity_list_with, identities_changed_since};
+        use super::super::{
+            IdentityInfo, ManagedSurfaceInfo, build_identity_list_with, identities_changed_since, recorder_severity,
+        };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
         use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
@@ -2762,11 +2774,7 @@ mod tests {
             id: &str,
             name: &str,
         ) -> AgentSurface {
-            AgentSurface {
-                surface_id: id.to_string(),
-                name: name.to_string(),
-                ..Default::default()
-            }
+            crate::identity::test_helpers::test_surface_with_managed_identity(id, name)
         }
 
         fn managed(
@@ -2977,6 +2985,9 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert_eq!(helium.state, RecorderState::Failed);
+            for did in ["did:example:oxygen", "did:example:helium"] {
+                assert_eq!(rows[did].trust_recorder_surface, None, "a single-surface DID names no recorder surface");
+            }
         }
 
         #[tokio::test]
@@ -3023,6 +3034,34 @@ mod tests {
                     .map(|status| status.state),
                 Some(RecorderState::Failed)
             );
+            assert_eq!(
+                row.trust_recorder_surface,
+                Some(ManagedSurfaceInfo {
+                    surface_id: "helium".to_string(),
+                    surface_name: "HELIUM".to_string(),
+                })
+            );
+        }
+
+        #[test]
+        fn test_recorder_severity_ranks_every_state() {
+            use crate::trust_registry_verification::recorder_status::RecorderState;
+            let ranked = [
+                RecorderState::Recorded,
+                RecorderState::NotAttempted,
+                RecorderState::Skipped,
+                RecorderState::Partial,
+                RecorderState::Failed,
+            ];
+
+            for pair in ranked.windows(2) {
+                assert!(
+                    recorder_severity(pair[0]) < recorder_severity(pair[1]),
+                    "{:?} must rank below {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
 
         #[tokio::test]

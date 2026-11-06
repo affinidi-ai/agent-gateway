@@ -15,10 +15,8 @@ Feature: Identity names on the Identities dashboard
     And the Identities dashboard shows a Managed Agent identity named "oxygen"
     And the Managed Agent identity belongs to surface "oxygen"
 
-  @wip
   Scenario: A managed agent shared by several surfaces is listed once
-    Given A2A surface "oxygen" exists for route "/oxygen" with managed agent "bravo" as its target
-    And A2A surface "helium" exists for route "/helium" with managed agent "bravo" as its target
+    Given A2A surfaces "oxygen" and "helium" exist with managed agent "bravo" as their target
     And surfaces "oxygen" and "helium" have managed identity enabled
     And managed agent "bravo" response contains the agent-identity extension
     And the caller has sent a request to surface "oxygen"
@@ -28,12 +26,10 @@ Feature: Identity names on the Identities dashboard
     And the Identities dashboard shows one Managed Agent identity without a name
     And the Managed Agent identity belongs to surfaces "helium" and "oxygen"
 
-  @wip
   Scenario: A surface where the managed agent was only a caller is not listed
-    Given A2A surface "oxygen" exists for route "/oxygen" with managed agent "bravo" as its target
-    And A2A surface "delta" exists for route "/delta" with managed agent "charlie" as its target
+    Given A2A surfaces "oxygen" and "delta" exist with managed agents "bravo" and "charlie" as their targets
     And surface "oxygen" takes its managed identity from API key "bravo-key"
-    And surface "delta" requires "api_key" source authentication
+    And surface "delta" identifies its callers by API key "bravo-key"
     And managed agent "bravo" has called surface "oxygen"
     And managed agent "bravo" has called surface "delta" with API key "bravo-key"
     When the operator reads the Identities dashboard

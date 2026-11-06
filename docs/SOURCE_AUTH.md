@@ -1456,11 +1456,11 @@ Credential principals (the name of the backing certificate or secret) appear onl
 the dashboard and are never published.
 
 Each surface a DID is used on is recorded with the role the request gave it there: the
-managed agent, or a caller. A managed entry stays managed. A DID's managed surfaces are the
-live surfaces where it is the managed agent; surfaces where it was only a caller, and deleted
-surfaces, are left out. An entry recorded before roles counts as managed only while its
-surface exists and issues a managed identity: an `a2a-proxy://` target, or a managed identity
-configured on its target or a Transit Point. The
+managed agent, or a caller. A DID's managed surfaces are the live surfaces where it is the
+managed agent and that still issue a managed identity: an `a2a-proxy://` target, or a managed
+identity configured on its target or a Transit Point. Surfaces where it was only a caller,
+deleted surfaces, and surfaces whose managed identity was moved away or removed are left
+out. An entry recorded before roles follows the same rule. The
 dashboard, the VC name and trust-registry reference fields all read managed surfaces from
 one function, `managed_surfaces_by_did`
 ([`display_name.rs`](../src/identity/display_name.rs)), so the three agree.
@@ -1472,13 +1472,16 @@ dashboard WebSocket) lists it once, with its surfaces in `managed_surfaces`
 (`{ surface_id, surface_name }`, sorted by name) and no `display_name`, `surface_id` or
 `surface_name`; those two are set only for a DID with exactly one managed surface. Its
 `trust_recorder` is the worst outcome across its managed surfaces that have a Trust
-Recorder. The Identities page shows it as "Unnamed Agent" with "N surfaces" beneath, and
-lists its surfaces in the Agent Surface column.
+Recorder, ranked Failed, Partial, Skipped, Not attempted, then Recorded, and
+`trust_recorder_surface` (`{ surface_id, surface_name }`) names the surface that outcome
+came from. A surface whose recorder has not run yet therefore outranks one that recorded the
+DID. The Identities page shows it as "Unnamed Agent" with "N surfaces" beneath, and lists its
+surfaces in the Agent Surface column.
 
-A managed entry never changes back, so a DID stays shared while a surface it was once the
-managed agent on still exists, even if that surface no longer uses it as its managed
-identity: the managed identity was moved to another surface, removed, or switched to another
-credential. The DID gets its name back only when that surface is deleted. A DID first issued
+A surface that switches its managed identity to another credential still issues a managed
+identity, so the DID it used before stays one of its managed surfaces and stays shared if it
+is managed elsewhere too. It gets its name back when that surface is deleted or stops
+issuing a managed identity. A DID first issued
 to a caller keeps its External Caller origin when the same key later becomes a Managed
 Agent's key, so it is never named; issue that Managed Agent a new key.
 
