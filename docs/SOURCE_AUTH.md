@@ -1262,31 +1262,34 @@ keys is checked again on its next request.
 - Under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
   tenant, the key of a surface with no tenant, the key of any other surface (`other_surface`), or
-  a key whose owning surface cannot be found (`missing_owner`) is not ready. A surface stored
-  before a surface named only its own keys, naming another surface's key of its tenant, is
-  therefore not ready under `enforce` and serves, logged, under `warn`. Deleting a surface revokes its API keys (actor
-  `surface-delete`) and keeps them, so a surface naming the key of a deleted surface stops
-  serving. The delete reads the surface's key folder from disk, so keys another node created
-  are revoked too; a folder that cannot be read is logged as an error naming the surface and
-  its keys stay active. A key record in the folder that names another surface as its owner is
-  not revoked by the delete, and keeps the id taken. A new surface cannot take an id whose key
-  folder holds any key record, readable or not, such as the kept keys of a deleted surface: the
-  create answers `400` "Surface ID '…' is not available". The create reads only the key folder
-  of that id, from disk; when that folder
-  cannot be read it answers `503` "API key store is unavailable". `POST /v1/surfaces` is the only
-  way to create a surface that checks the id: a surface template is applied in the dashboard and
-  saved through it, and `PUT` and `PATCH` answer `404` for an id with no surface. A surface that
-  reaches the gateway another way is not checked: a file written to the agent surface folder by
-  hand or by a seeding tool, picked up at boot, by a configuration reload, the cache refresh scan
-  or as another node's write; a surface loaded from the DynamoDB configuration source; and a
-  backup restore, which replaces the whole `_storage` directory with the surfaces and key folders
-  of one backup when both folders sit in it, as by default. Such a surface counts as the owner of
-  the keys in its id's key folder. The checks below still hold it to the rules for keys of other
-  surfaces, such as `other_surface` and `missing_owner` under `enforce`.
-- A key or owning surface that cannot be found is checked again later. Under `warn` both are
-  only reported, and a key that cannot be found is only reported under `enforce` too. The key or
-  its owning surface may exist on another node that shares the storage and not be visible here
-  yet, so the request after
+  a key whose owning surface cannot be found (`missing_owner`) is not ready. A stored surface
+  naming another surface's key of its own tenant is therefore not ready under `enforce` and
+  serves, logged, under `warn`.
+- In either mode, deleting a surface revokes its API keys (actor `surface-delete`) and keeps
+  them, so a surface naming the key of a deleted surface stops serving. The delete reads the
+  surface's key folder from disk, so keys another node created are revoked too; a folder that
+  cannot be read is logged as an error naming the surface and its keys stay active. A key record
+  in the folder that names another surface as its owner is not revoked by the delete, and keeps
+  the id taken.
+- In either mode, a new surface cannot take an id whose key folder holds any key record,
+  readable or not, such as the kept keys of a deleted surface: the create answers `400` "Surface
+  ID '…' is not available". The create reads only the key folder of that id, from disk; when
+  that folder cannot be read it answers `503` "API key store is unavailable". `POST
+  /v1/surfaces` is the only way to create a surface that checks the id: a surface template is
+  applied in the dashboard and saved through it, and `PUT` and `PATCH` answer `404` for an id
+  with no surface. A surface that reaches the gateway another way is not checked: a file written
+  to the agent surface folder by hand or by a seeding tool, picked up at boot, by a
+  configuration reload, the cache refresh scan or as another node's write; a surface loaded from
+  the DynamoDB configuration source; and a backup restore, which replaces the whole `_storage`
+  directory with the surfaces and key folders of one backup when both folders sit in it, as by
+  default. Such a surface counts as the owner of the keys in its id's key folder. The checks
+  above and below still hold it to the rules for keys of other surfaces, such as
+  `other_surface` and `missing_owner` under `enforce`.
+- A key or owning surface that cannot be found is checked again later. A key that cannot be
+  found (`missing_key`) is only reported, in either mode; an owning surface that cannot be found
+  (`missing_owner`) is only reported under `warn` and makes the surface not ready under
+  `enforce`. The key or its owning surface may exist on another node that shares the storage and
+  not be visible here yet, so the request after
   `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
   appeared by then is held to the rules above. Until then the verdict is kept, so a surface
   naming a key that does not exist does not read the API key store on every request. Each read
