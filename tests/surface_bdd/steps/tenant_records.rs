@@ -271,14 +271,33 @@ fn audit_log_holds_token_injections_and_a_revoke(world: &mut SurfaceWorld) {
         .expect("appending to the VP Audit Log");
 }
 
+/// The record id of the surface's delegated OAuth provider, whose slug is
+/// `provider`.
+fn delegated_provider_record_id(
+    world: &SurfaceWorld,
+    provider: &str,
+) -> String {
+    let delegation = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .expect("the surface requires delegated credentials");
+    assert_eq!(delegation.provider_id, provider, "the surface's delegated provider");
+    delegation
+        .record_id()
+        .to_string()
+}
+
 /// Audit records reach the log shortly after the request that produced them,
 /// so this reads the operator's view of the Credential Delegation Audit Log
-/// again until it holds a `consent_granted`, for up to five seconds.
+/// again until it holds a `consent_granted` naming the provider's record id,
+/// for up to five seconds.
 #[given(expr = "the Credential Delegation Audit Log holds the consent granted for OAuth provider {string}")]
 async fn audit_log_holds_consent_granted(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
+    let id = delegated_provider_record_id(world, &provider);
     ensure_admin_session(world).await;
     let client = world
         .admin_client
@@ -295,14 +314,14 @@ async fn audit_log_holds_consent_granted(
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|event| event["event"] == "consent_granted")
+            .filter(|event| event["event"] == "consent_granted" && event["provider_id"] == id.as_str())
             .count();
         if consents > 0 {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("no consent granted for OAuth provider {provider} reached the audit log: {page}");
+    panic!("no consent granted for OAuth provider {provider} ({id}) reached the audit log: {page}");
 }
 
 /// The vault is read from disk on every request.
@@ -513,24 +532,17 @@ fn audit_read_shows_consent_granted_for(
     provider: String,
     tenant: String,
 ) {
-    let delegation = world
+    let owner = world
         .surface_config
         .credential_delegation
         .as_ref()
-        .expect("the surface requires delegated credentials");
-    assert_eq!(
-        (
-            delegation
-                .provider_id
-                .as_str(),
+        .and_then(|delegation| {
             delegation
                 .tenant_id
                 .as_deref()
-        ),
-        (provider.as_str(), Some(tenant.as_str())),
-        "the surface's delegated provider"
-    );
-    let id = json!(delegation.record_id());
+        });
+    assert_eq!(owner, Some(tenant.as_str()), "the tenant of the surface's delegated provider");
+    let id = json!(delegated_provider_record_id(world, &provider));
     let (page, events) = audit_page(world);
     let consents: Vec<&Value> = events
         .iter()
