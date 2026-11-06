@@ -255,7 +255,7 @@ receiving gateway records the variant the sending route's `fabric://` Target pin
 (`fabric://<gateway>/<surface>$<alias>`), else its own default variant's alias, else `_base_`. The
 caller's URL alias never selects the receiving gateway's variant (see
 [Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)). Records outside surface requests carry none: management API
-records, `consent_granted` (the OAuth callback), settlement-worker `payment` records, config
+records, `consent_granted` and `delegation_failed` (the OAuth consent start page and callback), settlement-worker `payment` records, config
 reloads and traffic refused before a surface matched. A `policy_decision` of gateway scope on a
 surface request carries the variant it applied to; the policy itself is the same for every
 surface and variant. Records written before this field existed have none.

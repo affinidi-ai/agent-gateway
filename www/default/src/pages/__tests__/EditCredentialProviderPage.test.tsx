@@ -212,3 +212,122 @@ describe('EditCredentialProviderPage tenant-aware secrets and https error', () =
     ).not.toBeInTheDocument();
   });
 });
+
+describe('EditCredentialProviderPage callback URL', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const renderProvider = (record: Record<string, unknown>) => {
+    mockFetch.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v1/credential-providers/')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(record),
+          text: () => Promise.resolve(''),
+        });
+      }
+      if (url === '/api/v1/config/surface-routing') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              available_listen_addresses: ['https://gw.example'],
+              oauth_callback_route: '/v1/identity/oauth/callback',
+            }),
+        });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  };
+
+  it('saves a stored callback URL behind a reverse proxy prefix unchanged', async () => {
+    renderProvider({
+      id: 'p1',
+      name: 'GitHub',
+      provider_id: 'github',
+      provider_type: 'oauth2_authorization_code',
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      client_id_secret_ref: 'CLIENT_ID',
+      client_secret_secret_ref: 'CLIENT_SECRET',
+      default_scopes: ['repo'],
+      token_refresh_enabled: true,
+      callback_path: '/v1/identity/oauth/callback/github',
+      callback_url: 'https://gw.example/prefix/v1/identity/oauth/callback/github',
+    });
+    expect(
+      await screen.findByText('https://gw.example/prefix/v1/identity/oauth/callback/github')
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/v1/credential-providers/p1',
+        expect.objectContaining({ method: 'PUT' })
+      )
+    );
+    const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
+    expect(JSON.parse(init.body).callback_url).toBe(
+      'https://gw.example/prefix/v1/identity/oauth/callback/github'
+    );
+  });
+
+  it('saves a callback URL ending in the provider stored callback path', async () => {
+    const record = {
+      id: 'p1',
+      name: 'GitHub',
+      provider_id: 'github',
+      provider_type: 'oauth2_authorization_code',
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      client_id_secret_ref: 'CLIENT_ID',
+      client_secret_secret_ref: 'CLIENT_SECRET',
+      default_scopes: ['repo'],
+      token_refresh_enabled: true,
+      callback_path: '/old/route/github',
+      callback_url: 'https://gw.example/old/route/github',
+    };
+    mockFetch.mockImplementation((url: string) => {
+      if (url.startsWith('/api/v1/credential-providers/')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(record),
+          text: () => Promise.resolve(''),
+        });
+      }
+      if (url === '/api/v1/config/surface-routing') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              available_listen_addresses: ['https://gw.example'],
+              oauth_callback_route: '/v1/identity/oauth/callback',
+            }),
+        });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText('https://gw.example/old/route/github')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/v1/credential-providers/p1',
+        expect.objectContaining({ method: 'PUT' })
+      )
+    );
+    const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
+    expect(JSON.parse(init.body).callback_url).toBe('https://gw.example/old/route/github');
+  });
+});

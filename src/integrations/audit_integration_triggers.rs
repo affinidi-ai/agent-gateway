@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn the_event_catalog_lists_every_audit_record_category_the_gateway_produces() {
-        let unproduced = ["delegation_failed", "request_failed", "request_completed"];
+        let unproduced = ["request_failed", "request_completed"];
         let actions = every_action();
         actions
             .iter()

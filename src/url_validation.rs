@@ -326,6 +326,15 @@ pub(crate) fn bdd_oauth_endpoint_allowlist() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Whether `url` is https, or an http URL the BDD exact endpoint allowlist
+/// names, which only `AG_TEST_MODE` admits.
+pub(crate) fn is_https_or_bdd_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        || bdd_oauth_endpoint_allowlist().is_some_and(|allowlist| {
+            parse_oauth_endpoint_allowlist(&allowlist).is_ok_and(|allowed| allowed.contains(url))
+        })
+}
+
 fn parse_oauth_endpoint_allowlist(raw: &str) -> Result<Vec<Url>, String> {
     raw.split(',')
         .map(str::trim)

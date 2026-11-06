@@ -247,3 +247,54 @@ export function externalProviderUpdate(form: {
     token_refresh_enabled: form.token_refresh_enabled,
   };
 }
+
+/**
+ * The callback URL of an authorization code provider: `host` followed by the path the
+ * gateway stored for it (`storedPath`), or, for a new provider, the callback route followed
+ * by the lowercased provider id, which is the path the gateway will store.
+ */
+export function callbackUrlFor(
+  host: string,
+  route: string,
+  providerId: string,
+  storedPath: string
+): string {
+  const path = storedPath || `${route}/${providerId.trim().toLowerCase()}`;
+  return `${host}${path}`;
+}
+
+/** What `callbackUrlToSave` builds the callback URL from, by name. */
+export interface CallbackUrlInputs {
+  storedUrl: string;
+  host: string;
+  route: string;
+  providerId: string;
+  storedPath: string;
+}
+
+/**
+ * The callback URL to save: the stored one, reverse proxy prefix and all, while the chosen
+ * `host` is still its host; otherwise the URL `callbackUrlFor` builds.
+ */
+export function callbackUrlToSave({
+  storedUrl,
+  host,
+  route,
+  providerId,
+  storedPath,
+}: CallbackUrlInputs): string {
+  try {
+    const stored = new URL(storedUrl);
+    if (
+      stored.origin === new URL(host).origin &&
+      stored.protocol === 'https:' &&
+      storedPath !== '' &&
+      stored.pathname.endsWith(storedPath)
+    ) {
+      return storedUrl;
+    }
+  } catch {
+    // no stored URL, or one that does not parse: build it
+  }
+  return callbackUrlFor(host, route, providerId, storedPath);
+}

@@ -204,6 +204,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
         Auth,
     ),
+    event(
+        "delegation_failed",
+        "Delegation Failed",
+        "An OAuth consent start or callback was refused, with the reason",
+        Delegation,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -310,7 +316,7 @@ mod tests {
 
     #[test]
     fn record_types_the_gateway_does_not_produce_are_not_offered() {
-        for unproduced in ["delegation_failed", "request_failed", "request_completed"] {
+        for unproduced in ["request_failed", "request_completed"] {
             assert_eq!(event_bit(unproduced), None, "{unproduced}");
         }
     }

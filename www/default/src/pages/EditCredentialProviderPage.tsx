@@ -23,6 +23,7 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
+  callbackUrlToSave,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderForm extends JwtFormFields {
@@ -39,6 +40,10 @@ interface CredentialProviderForm extends JwtFormFields {
   additional_params: string;
   description: string;
   callback_host: string;
+  /** The callback path the gateway stored for an existing provider; empty for a new one. */
+  callback_path: string;
+  /** The callback URL stored for an existing provider; empty for a new one. */
+  callback_url: string;
   /** The stored resource, shown only through the Entra warning; never sent on save. */
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
@@ -64,6 +69,8 @@ const EMPTY_FORM: CredentialProviderForm = {
   additional_params: '',
   description: '',
   callback_host: '',
+  callback_path: '',
+  callback_url: '',
   resource: '',
   issuer: '',
   ...EMPTY_JWT_FIELDS,
@@ -161,6 +168,8 @@ const EditCredentialProviderPage: React.FC = () => {
           : '',
         description: data.description ?? '',
         callback_host: callbackHost,
+        callback_path: data.callback_path ?? '',
+        callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         ...jwtFieldsOf(data),
@@ -193,6 +202,17 @@ const EditCredentialProviderPage: React.FC = () => {
       setForm(prev => ({ ...prev, [name]: value }));
     }
   };
+
+  const callbackUrl =
+    form.callback_host && routingConfig
+      ? callbackUrlToSave({
+          storedUrl: form.callback_url,
+          host: form.callback_host,
+          route: routingConfig.oauth_callback_route,
+          providerId: form.provider_id,
+          storedPath: form.callback_path,
+        })
+      : '';
 
   const handleSubmit = useCallback(
     async (e?: React.FormEvent) => {
@@ -255,8 +275,7 @@ const EditCredentialProviderPage: React.FC = () => {
         form.callback_host &&
         routingConfig
       ) {
-        const callbackPath = `${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-        body.callback_url = `${form.callback_host}${callbackPath}`;
+        body.callback_url = callbackUrl;
       }
 
       await run(
@@ -285,7 +304,7 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       );
     },
-    [form, isNew, id, run]
+    [callbackUrl, form, isNew, id, run, routingConfig]
   );
 
   // Keyboard shortcut: Ctrl+S / Cmd+S to save
@@ -620,15 +639,13 @@ const EditCredentialProviderPage: React.FC = () => {
                     {form.callback_host && form.provider_id.trim() && routingConfig && (
                       <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
                         <i className="fas fa-info-circle me-2"></i>
-                        <strong>Callback URL:</strong>{' '}
-                        {`${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`}
+                        <strong>Callback URL:</strong> {callbackUrl}
                         <button
                           type="button"
                           className="btn btn-xs ms-2"
                           style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
                           onClick={e => {
-                            const url = `${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-                            navigator.clipboard.writeText(url);
+                            navigator.clipboard.writeText(callbackUrl);
                             const btn = e.currentTarget as HTMLButtonElement;
                             const originalHtml = btn.innerHTML;
                             btn.innerHTML = '<i class="fas fa-check"></i>';
