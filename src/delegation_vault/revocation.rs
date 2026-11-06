@@ -1336,7 +1336,7 @@ pub(crate) mod tests {
         /// Sent only once the gate has a permit, after the request is
         /// recorded, so a test can act while a request waits for its answer.
         pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
-        /// The connection is closed once the request is recorded, unanswered.
+        /// The request is recorded, then the connection is closed without a response.
         pub(crate) hang_up: bool,
     }
 
