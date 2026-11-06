@@ -3557,11 +3557,15 @@ fn credentialed_card_fetch_error_body(status: u16) -> String {
 /// read without it. The outcome is cached per surface and Target authentication
 /// for the card cache's TTLs, so a request neither fetches the card nor resolves
 /// the credential again, and a variant with its own Target authentication reads
-/// its own card.
+/// its own card. A Target that is not an `http(s)` URL, such as a `proxy://` MCP
+/// proxy, has no card to read, so no credential is resolved for it.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
     config_id: &str,
 ) -> Option<serde_json::Value> {
+    if !crate::config::agent_surface::endpoint_is_http_url(surface.target_endpoint()) {
+        return None;
+    }
     let card_url = match surface.agent_card_location_path() {
         Some(_) => crate::proxy::handler::agent_card::card_target_url(surface),
         None => format!(
@@ -3598,7 +3602,7 @@ async fn read_policy_agent_card(
                 providers.as_ref(),
                 vault.as_ref(),
             );
-            match crate::proxy::handler::inject_target_auth_header(
+            match crate::proxy::handler::resolve_target_credential(
                 target_auth,
                 &context,
                 &surface.name,
@@ -3628,16 +3632,18 @@ async fn read_policy_agent_card(
         .get()
         .copied()
         .unwrap_or(std::time::Duration::from_secs(30));
-    fetch_agent_card(card_url, credential, timeout, fabric_body_limits(surface), config_id).await
+    fetch_agent_card(card_url, credential.as_ref(), timeout, fabric_body_limits(surface), config_id).await
 }
 
 /// Fetch the local Target's agent card for the GW2 policy context, through the
 /// same pinned, redirect-free client as the forward and within the buffered
-/// response bounds, with `credential` as its only header. Any failure,
-/// including a blocked target or a redirect, yields no card.
+/// response bounds, with `credential` as its only header. A provider token the
+/// Target refuses as `invalid_token` is dropped, as on the forward, so the next
+/// read asks the provider for a new one. Any failure, including a blocked target
+/// or a redirect, yields no card.
 async fn fetch_agent_card(
     card_url: &str,
-    credential: Option<(String, String)>,
+    credential: Option<&crate::proxy::handler::TargetCredential>,
     timeout: std::time::Duration,
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
@@ -3655,7 +3661,11 @@ async fn fetch_agent_card(
         }
     };
     let mut request = client.get(card_url);
-    if let Some((header_name, header_value)) = &credential {
+    if let Some(crate::proxy::handler::TargetCredential {
+        header: (header_name, header_value),
+        ..
+    }) = credential
+    {
         request = request.header(header_name.as_str(), header_value.as_str());
     }
     let response = match request.send().await {
@@ -3670,6 +3680,14 @@ async fn fetch_agent_card(
             return None;
         }
     };
+    crate::proxy::handler::forget_refused_target_token(
+        get_delegation_vault_store().as_deref(),
+        credential.and_then(|credential| credential.issued.as_ref()),
+        config_id,
+        response.status().as_u16(),
+        response.headers(),
+    )
+    .await;
     channel_info!(config_id, "GW2: Agent card fetch HTTP status: {}", response.status());
     if !response.status().is_success() {
         channel_warn!(config_id, "GW2: Agent card fetch returned non-success status: {}", response.status());

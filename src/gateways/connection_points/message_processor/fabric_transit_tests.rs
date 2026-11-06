@@ -2269,6 +2269,69 @@ async fn the_policy_card_read_presents_the_credential_providers_token() {
     assert_eq!(token_endpoint.requests(), 1, "token requests");
 }
 
+/// The card read for the policy input drops a provider token the Target refuses
+/// as `invalid_token`, as the forward does, so a refused token does not leave a
+/// policy that needs the card without one until the token expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_card_read_drops_a_token_its_target_refuses_as_invalid() {
+    use crate::proxy::handler::target_auth_tests::{
+        BackendAnswer, Fixture, assert_a_refused_token_is_dropped, backend_answering, provider_auth,
+    };
+    if ran_in_child("ATG_FABRIC_POLICY_CARD_REFUSED_TOKEN_CHILD").await {
+        return;
+    }
+    let fixture = Fixture::new(200).await;
+    let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+    let (target_url, _target) = backend_answering(answer.clone(), json!({ "name": "protected-agent" })).await;
+    let mut surface = surface("a2a", &target_url, &[]);
+    surface.target.auth = Some(provider_auth("machine"));
+    super::init_credential_provider_store(fixture.providers.clone()).await;
+    super::init_delegation_vault_store(fixture.vault.clone()).await;
+    let card_url = format!("{target_url}/.well-known/agent.json");
+    let call = || {
+        let read = fixture.egress.clone().scope(
+            super::TEST_SECRETS_STORE
+                .scope(fixture.secrets.clone(), super::read_policy_agent_card(&surface, &card_url, SURFACE_ID)),
+        );
+        async move { json!({ "isError": read.await.is_none() }) }
+    };
+
+    assert_a_refused_token_is_dropped(&fixture, &answer, "policy card read", call).await;
+}
+
+/// A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy or a
+/// further `fabric://` hop, has no card to read for the policy input, so no
+/// credential is resolved and no provider token requested for it.
+#[tokio::test]
+async fn the_policy_card_read_resolves_no_credential_for_a_target_that_is_not_http() {
+    if ran_in_child("ATG_FABRIC_POLICY_CARD_NOT_HTTP_CHILD").await {
+        return;
+    }
+    let token_endpoint = TokenEndpoint::start().await;
+    let root = tempfile::tempdir().unwrap();
+    install_target_provider(root.path(), &token_endpoint.url).await;
+    let store: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            root.path()
+                .join("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    for endpoint in ["proxy://tools", "fabric://did:web:peer.example/orders"] {
+        let surface = provider_surface(endpoint);
+        let card = token_endpoint
+            .egress()
+            .scope(super::TEST_SECRETS_STORE.scope(store.clone(), super::policy_agent_card(&surface, SURFACE_ID)))
+            .await;
+        assert_eq!(card, None, "{endpoint}");
+    }
+    assert_eq!(token_endpoint.requests(), 0, "no provider token is requested for a card that cannot be read");
+}
+
 /// The card read for the policy input logs the card's `url` without its
 /// userinfo or query values, as it logs the card location.
 #[tokio::test]

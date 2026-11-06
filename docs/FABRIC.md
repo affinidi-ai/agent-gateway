@@ -507,8 +507,11 @@ Two things differ from the direct path:
   location.
 
 The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
-from the gateway's secrets store rather than opening one per request. Under
+from the gateway's secrets store rather than opening one per request, and drops a provider token
+the Target refuses as `invalid_token`, as the forward does. Under
 `target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
+A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so no
+credential is resolved for it.
 The outcome, card or none, is cached per surface and `target.auth` (so a variant with its own
 `target.auth` reads its own card) for 60 seconds (10 seconds for none) and cleared on
 configuration reload or a surface save; see

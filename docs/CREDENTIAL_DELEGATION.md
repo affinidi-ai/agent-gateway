@@ -425,14 +425,15 @@ asks the provider for a new token, with these limits:
 The refused request is answered as the Target answered it and is not retried. A `401` without
 `invalid_token`, a `403`, a static secret or `api_key` credential, and a provider token sent in
 another header or scheme change nothing: a Bearer challenge speaks only about the `Authorization`
-Bearer token, which in that case may be the caller's. The direct path, Fabric receive and the
-agent card fetch check the answer, and so does a `proxy://` MCP Target, direct or on Fabric
-receive, legacy or `2026-07-28`: its tool call's REST backend answers the token, while the
-caller gets that answer as a tool result with `isError` set. A Transit Point and the Fabric send
-leg do not: their refusals leave the token in place until it is renewed. The Target and a Transit
-Point that use the same provider and scopes on one surface share one cached token, so only the
-Target's own answers can drop it. To keep a Transit Point's token unusable at the Target, give the
-Transit Point a provider whose `resource` names its own server.
+Bearer token, which in that case may be the caller's. The direct path, Fabric receive, the
+receiving gateway's card read for its policy input and the agent card fetch check the answer, and
+so does a `proxy://` MCP Target, direct or on Fabric receive, legacy or `2026-07-28`: its tool
+call's REST backend answers the token, while the caller gets that answer as a tool result with
+`isError` set. A Transit Point and the Fabric send leg do not: their refusals leave the token in
+place until it is renewed. The Target and a Transit Point that use the same provider and scopes on
+one surface share one cached token, so only the Target's own answers can drop it. To keep a Transit
+Point's token unusable at the Target, give the Transit Point a provider whose `resource` names its
+own server.
 
 ### Logging token endpoint errors
 
@@ -1002,8 +1003,8 @@ receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or 
 configured card location; a `HEAD`, a query, `/discovery` and every other discovery read a peer
 sends get no credential, a peer's read of the legacy `/.well-known/agent.json` included. The
 receiving gateway's own card read for its policy input is a card fetch too: it presents the
-credential at the configured card location, or else at `<target>/.well-known/agent.json` (see
-[`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
+credential at the configured card location, or else at `<target>/.well-known/agent.json`, of an
+`http(s)` Target (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
 `passthrough` forwards without the credential, and either way a `target_auth_failed` record in the
 VP Audit Log names the cause. The policy card read is the exception: it writes no record, logs a

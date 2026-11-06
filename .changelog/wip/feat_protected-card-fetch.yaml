@@ -31,8 +31,9 @@ changes:
         included, is forwarded without the credential. A GET at the configured card location is
         the card fetch after source authentication, including for a caller who failed it on a
         surface that forwards failed callers to policy; a closed surface or one that rejects
-        failed callers answers it 401. The card read for
-        policy input now presents the Target credential and is cached per surface and Target
+        failed callers answers it 401. The card read for policy input now presents the Target
+        credential, drops a provider token the Target refuses as invalid_token, reads no card
+        from a Target that is not an http or https URL, and is cached per surface and Target
         authentication for up to 60 seconds.
   removed: []
   security:

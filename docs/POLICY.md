@@ -728,11 +728,14 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
   and does not follow redirects, and reads the card within `a2a.max_body_size`.
   It presents the surface's `target.auth` as the gateway's own request, so the
-  policy input sees the card of a protected Target. A blocked target, a
+  policy input sees the card of a protected Target, and drops a provider token
+  the Target refuses as `invalid_token`, as the forward does. A blocked target, a
   redirect, a non-success answer or a `target.auth` credential that cannot be
   resolved yields no card in the policy input; the failure is logged as a
   warning without the credential. Under `target.auth.fallback: passthrough` a
-  credential that cannot be resolved reads the card without it. The outcome is
+  credential that cannot be resolved reads the card without it. A Target that is
+  not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so
+  no credential is resolved for it. The outcome is
   cached per surface and `target.auth` for 60 seconds (10 seconds for no card),
   is not cleared when a secret or credential provider changes, and is cleared on
   configuration reload or a surface save, so the policy input may see a card up
