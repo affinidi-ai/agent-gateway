@@ -103,7 +103,7 @@ pub async fn mint_consent_link(
     secrets_store: &Arc<dyn SecretsStore>,
     provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
 ) -> Result<String> {
-    let redirect_uri = provider
+    provider
         .consent_redirect_uri(gateway_base_url)
         .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
     if crate::credential_providers::redirect_uri_taken_by(provider_store, provider, gateway_base_url)
@@ -116,15 +116,12 @@ pub async fn mint_consent_link(
         .client_id_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
+    resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
         .await
         .context("Failed to resolve client_id secret")?;
-    let effective_scopes = if scopes.is_empty() {
-        &provider.default_scopes
-    } else {
-        scopes
-    };
-    vendor_authorization_url(provider, &client_id, redirect_uri.as_str(), effective_scopes, "preflight", "preflight")?;
+    provider
+        .consent_authorization_endpoint()
+        .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
     build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url)
 }
 
@@ -185,15 +182,9 @@ pub async fn begin_consent(
     })
 }
 
-/// The authorization request parameters the gateway sets itself, which neither
-/// the endpoint's own query nor `additional_params` may repeat.
-const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
-    ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"];
-
-/// The vendor's authorization URL. The endpoint must be an https URL with a
-/// host and no credentials or fragment; it and `additional_params` together
-/// hold at most 32 parameters, none reserved or repeated, names of at most 128
-/// bytes and values of at most 2048.
+/// The vendor's authorization URL: the provider's
+/// [`consent_authorization_endpoint`](CredentialProvider::consent_authorization_endpoint)
+/// with the gateway's parameters and `additional_params` added.
 fn vendor_authorization_url(
     provider: &CredentialProvider,
     client_id: &str,
@@ -202,48 +193,9 @@ fn vendor_authorization_url(
     state: &str,
     code_challenge: &str,
 ) -> Result<url::Url> {
-    let endpoint = provider
-        .authorization_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no authorization_endpoint", provider.provider_id))?;
-    let mut url = url::Url::parse(endpoint)
-        .map_err(|_| anyhow!("Provider '{}' has an invalid authorization_endpoint", provider.provider_id))?;
-    if !crate::url_validation::is_https_or_bdd_allowed(&url)
-        || url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(anyhow!(
-            "Provider '{}' authorization_endpoint must be an https URL with a host and no credentials or fragment",
-            provider.provider_id
-        ));
-    }
-    let mut names = std::collections::HashSet::new();
-    let mut count = 0usize;
-    let endpoint_params = url
-        .query_pairs()
-        .map(|(name, value)| (name.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    for (name, value) in endpoint_params
-        .iter()
-        .map(|(name, value)| (name, value))
-        .chain(&provider.additional_params)
-    {
-        count += 1;
-        if count > 32
-            || RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str())
-            || name.len() > 128
-            || value.len() > 2048
-            || !names.insert(name.as_str())
-        {
-            return Err(anyhow!(
-                "Provider '{}' authorization_endpoint query or additional_params repeat a reserved or duplicate \
-                 parameter, or exceed the limits",
-                provider.provider_id
-            ));
-        }
-    }
+    let mut url = provider
+        .consent_authorization_endpoint()
+        .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
     url.query_pairs_mut()
         .extend_pairs([
             ("response_type", "code"),

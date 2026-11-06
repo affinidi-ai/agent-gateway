@@ -510,10 +510,13 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
 /// The consent-flow rules a provider passes before it is stored: an
 /// `authorization_response_issuer` only where allowed, and for an authorization
 /// code provider without an `issuer`, a redirect URI the consent flow can use
-/// and that no other provider, in any tenant, uses.
+/// and that no other provider, in any tenant, uses. An update that keeps the
+/// `previous` consent provider's redirect URI is not checked against the
+/// redirect URI rules, so a stored provider that breaks them can still be edited.
 async fn consent_flow_error(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
+    previous: Option<&CredentialProvider>,
 ) -> Option<Response> {
     let refused =
         |message: &str| Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response());
@@ -521,6 +524,13 @@ async fn consent_flow_error(
         return refused(message);
     }
     if !provider.uses_legacy_consent() {
+        return None;
+    }
+    let keeps_redirect_uri = previous.is_some_and(|previous| {
+        previous.uses_legacy_consent()
+            && previous.redirect_uri(&state.gateway_base_url) == provider.redirect_uri(&state.gateway_base_url)
+    });
+    if keeps_redirect_uri {
         return None;
     }
     if let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
@@ -709,7 +719,7 @@ pub async fn create_provider(
     {
         return error.into_response();
     }
-    if let Some(response) = consent_flow_error(&state, &provider).await {
+    if let Some(response) = consent_flow_error(&state, &provider, None).await {
         return response;
     }
 
@@ -1030,7 +1040,7 @@ pub async fn update_provider(
     {
         return error.into_response();
     }
-    if let Some(response) = consent_flow_error(&state, &updated).await {
+    if let Some(response) = consent_flow_error(&state, &updated, Some(&previous)).await {
         return response;
     }
 
@@ -1844,6 +1854,53 @@ mod jwt_provider_tests {
         client_credentials["callback_url"] = json!("http://198.51.100.7/elsewhere");
         let (status, body) = create(&state, client_credentials).await;
         assert_eq!(status, StatusCode::CREATED, "the rule is for consent providers only: {body}");
+    }
+
+    /// A stored provider whose redirect URI breaks the consent rules, or is
+    /// shared, can still be edited while its redirect URI stays the same; an
+    /// update that changes it must make it conform.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_non_conforming_provider_takes_edits_that_keep_its_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_url = Some("http://198.51.100.7/oauth/callback/github".into());
+        state
+            .store
+            .update(stored.clone())
+            .await
+            .unwrap();
+        let mut shared = stored.clone();
+        shared.id = "shared-twin".into();
+        state
+            .store
+            .create(shared)
+            .await
+            .unwrap();
+
+        for target in [id.as_str(), "shared-twin"] {
+            let (status, body) = update(&state, target, json!({"name": "Renamed"})).await;
+            assert_eq!(status, StatusCode::OK, "{target}: {body}");
+            assert_eq!(body["name"], "Renamed", "{target}");
+        }
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": "http://198.51.100.7/elsewhere/oauth/callback/github"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url must be an https URL with a host");
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": "https://198.51.100.7/oauth/callback/github"})).await;
+        assert_eq!(status, StatusCode::OK, "an update may make it conform: {body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

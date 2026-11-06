@@ -159,6 +159,11 @@ you open any listener:
   private one. Failed attempts are not throttled, so protect such a listener with your load
   balancer or firewall too. See
   [Reachable from other hosts](SOURCE_AUTH.md#reachable-from-other-hosts).
+- **Send the OAuth consent routes to one gateway process.** A used consent start link is
+  remembered only by the process that used it, so with several replicas behind one callback
+  URL, a start link can be confirmed once on each. Route `{oauth_callback_route}/*` (by
+  default `/v1/identity/oauth/callback/*`) to a single process. See
+  [Consent flow](CREDENTIAL_DELEGATION.md#consent-flow).
 
 You also need:
 

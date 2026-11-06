@@ -203,6 +203,17 @@ const EditCredentialProviderPage: React.FC = () => {
     }
   };
 
+  const callbackUrl =
+    form.callback_host && routingConfig
+      ? callbackUrlToSave({
+          storedUrl: form.callback_url,
+          host: form.callback_host,
+          route: routingConfig.oauth_callback_route,
+          providerId: form.provider_id,
+          storedPath: form.callback_path,
+        })
+      : '';
+
   const handleSubmit = useCallback(
     async (e?: React.FormEvent) => {
       if (e) e.preventDefault();
@@ -264,13 +275,7 @@ const EditCredentialProviderPage: React.FC = () => {
         form.callback_host &&
         routingConfig
       ) {
-        body.callback_url = callbackUrlToSave(
-          form.callback_url,
-          form.callback_host,
-          routingConfig.oauth_callback_route,
-          form.provider_id,
-          form.callback_path
-        );
+        body.callback_url = callbackUrl;
       }
 
       await run(
@@ -299,7 +304,7 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       );
     },
-    [form, isNew, id, run]
+    [callbackUrl, form, isNew, id, run, routingConfig]
   );
 
   // Keyboard shortcut: Ctrl+S / Cmd+S to save
@@ -634,27 +639,13 @@ const EditCredentialProviderPage: React.FC = () => {
                     {form.callback_host && form.provider_id.trim() && routingConfig && (
                       <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
                         <i className="fas fa-info-circle me-2"></i>
-                        <strong>Callback URL:</strong>{' '}
-                        {callbackUrlToSave(
-                          form.callback_url,
-                          form.callback_host,
-                          routingConfig.oauth_callback_route,
-                          form.provider_id,
-                          form.callback_path
-                        )}
+                        <strong>Callback URL:</strong> {callbackUrl}
                         <button
                           type="button"
                           className="btn btn-xs ms-2"
                           style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
                           onClick={e => {
-                            const url = callbackUrlToSave(
-                              form.callback_url,
-                              form.callback_host,
-                              routingConfig.oauth_callback_route,
-                              form.provider_id,
-                              form.callback_path
-                            );
-                            navigator.clipboard.writeText(url);
+                            navigator.clipboard.writeText(callbackUrl);
                             const btn = e.currentTarget as HTMLButtonElement;
                             const originalHtml = btn.innerHTML;
                             btn.innerHTML = '<i class="fas fa-check"></i>';

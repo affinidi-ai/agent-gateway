@@ -585,6 +585,51 @@ impl CredentialProvider {
         Ok(url)
     }
 
+    /// The authorization endpoint parsed, when the consent flow may build the
+    /// vendor's authorization URL from it: an https URL with a host and no
+    /// credentials or fragment, whose query and `additional_params` together
+    /// hold at most 32 parameters, none reserved or repeated, with names of at
+    /// most 128 bytes and values of at most 2048.
+    pub fn consent_authorization_endpoint(&self) -> Result<url::Url, &'static str> {
+        let url = self
+            .authorization_endpoint
+            .as_deref()
+            .and_then(|endpoint| url::Url::parse(endpoint).ok())
+            .ok_or("authorization_endpoint must be an https URL with a host")?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url)
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("authorization_endpoint must be an https URL with a host and no credentials or fragment");
+        }
+        let endpoint_params: Vec<_> = url
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+        let mut names = std::collections::HashSet::new();
+        for (count, (name, value)) in endpoint_params
+            .iter()
+            .map(|(name, value)| (name, value))
+            .chain(&self.additional_params)
+            .enumerate()
+        {
+            if count >= MAX_AUTHORIZATION_PARAMS
+                || RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str())
+                || name.len() > 128
+                || value.len() > 2048
+                || !names.insert(name.as_str())
+            {
+                return Err(
+                    "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                     parameter or exceed the limits",
+                );
+            }
+        }
+        Ok(url)
+    }
+
     /// Why `authorization_response_issuer` may not be stored on this provider:
     /// only an authorization code provider without an `issuer` takes it, and
     /// only as an https URL with a host and no credentials, query or fragment.
@@ -625,6 +670,14 @@ impl CredentialProvider {
         crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
     }
 }
+
+/// The authorization request parameters the gateway sets itself, which neither
+/// the endpoint's own query nor `additional_params` may repeat.
+pub const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
+    ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"];
+
+/// How many parameters the endpoint's query and `additional_params` may hold together.
+const MAX_AUTHORIZATION_PARAMS: usize = 32;
 
 /// Another consent-flow provider, of any tenant, whose redirect URI is
 /// `provider`'s. Each redirect URI names one provider, so the vendor's
@@ -683,6 +736,36 @@ pub fn log_redirect_uri_conflicts<'provider>(
         }
     }
     conflicts
+}
+
+/// Logs an ERROR for each consent-flow provider whose redirect URI or
+/// authorization endpoint breaks the consent rules, naming it by id and the
+/// rule only, and returns them. Such a provider gets no consent link until it
+/// is fixed.
+pub fn log_consent_rule_breaches<'provider>(
+    providers: &'provider [CredentialProvider],
+    gateway_base_url: &str,
+) -> Vec<(&'provider str, &'static str)> {
+    let breaches: Vec<_> = providers
+        .iter()
+        .filter(|provider| provider.uses_legacy_consent())
+        .filter_map(|provider| {
+            provider
+                .consent_redirect_uri(gateway_base_url)
+                .and_then(|_| provider.consent_authorization_endpoint())
+                .err()
+                .map(|rule| (provider.id.as_str(), rule))
+        })
+        .collect();
+    for (id, rule) in &breaches {
+        tracing::error!(
+            target: "credential_delegation",
+            provider_id = %id,
+            rule = %rule,
+            "A credential provider breaks the consent rules, so it gets no consent link until it is fixed"
+        );
+    }
+    breaches
 }
 
 /// Request to create a new credential provider
@@ -977,6 +1060,73 @@ mod tests {
             "no tenant is named: {}",
             logs.text()
         );
+    }
+
+    /// A stored consent provider whose redirect URI or authorization endpoint
+    /// breaks the consent rules is logged as an ERROR naming it and the rule,
+    /// never its URLs or parameters; conforming providers and providers
+    /// outside the consent flow are not.
+    #[test]
+    fn stored_consent_providers_that_break_the_consent_rules_are_logged_as_errors() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let with = |id: &str, callback_url: Option<&str>, endpoint: &str, params: &[(&str, &str)]| {
+            let mut provider = consent_provider(id, id, callback_url);
+            provider.authorization_endpoint = Some(endpoint.to_string());
+            provider.additional_params = params
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            provider
+        };
+        let endpoint = "https://idp.example/authorize";
+        let mut external = with("external", Some("http://gw.example/cb"), "http://idp.example/authorize", &[]);
+        external.issuer = Some("https://idp.example".to_string());
+        let mut client_credentials = with("cc", Some("http://gw.example/cb"), endpoint, &[]);
+        client_credentials.provider_type = CredentialProviderType::OAuth2ClientCredentials;
+        let providers = [
+            with("fine", None, endpoint, &[("prompt", "consent")]),
+            with("plain-http", Some("http://gw.example/v1/identity/oauth/callback/plain-http"), endpoint, &[]),
+            with("query", Some("https://gw.example/v1/identity/oauth/callback/query?x=1"), endpoint, &[]),
+            with("http-endpoint", None, "http://idp.example/authorize", &[]),
+            with("reserved", None, endpoint, &[("state", "secret-param-value")]),
+            external,
+            client_credentials,
+        ];
+
+        let breaches = log_consent_rule_breaches(&providers, "https://gw.example");
+
+        assert_eq!(
+            breaches,
+            [
+                ("plain-http", "callback_url must be an https URL with a host"),
+                ("query", "callback_url must not carry credentials, a query or a fragment"),
+                (
+                    "http-endpoint",
+                    "authorization_endpoint must be an https URL with a host and no credentials or fragment"
+                ),
+                (
+                    "reserved",
+                    "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                     parameter or exceed the limits"
+                ),
+            ]
+        );
+        let text = logs.text();
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("breaks the consent rules"))
+            .collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("ERROR")),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("provider_id=plain-http"), "{}", lines[0]);
+        for leaked in ["gw.example", "idp.example", "secret-param-value", "tenant-of-"] {
+            assert!(!text.contains(leaked), "the log names no URL, parameter or tenant: {text}");
+        }
     }
 
     #[test]

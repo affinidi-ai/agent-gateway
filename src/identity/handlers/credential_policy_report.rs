@@ -221,16 +221,15 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         },
         None => return,
     };
-    crate::credential_providers::log_redirect_uri_conflicts(
-        &providers,
-        &format!(
-            "https://{}",
-            state
-                .network_config
-                .did
-                .domain
-        ),
+    let gateway_base_url = format!(
+        "https://{}",
+        state
+            .network_config
+            .did
+            .domain
     );
+    crate::credential_providers::log_redirect_uri_conflicts(&providers, &gateway_base_url);
+    crate::credential_providers::log_consent_rule_breaches(&providers, &gateway_base_url);
     let secrets = match &state.secrets_store {
         Some(store) => match store.list_all().await {
             Ok(secrets) => secrets,

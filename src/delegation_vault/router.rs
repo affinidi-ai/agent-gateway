@@ -440,14 +440,19 @@ mod tests {
                 refused.body
             );
         }
-        assert_eq!(
-            consent::reasons(&events),
-            [
-                DelegationFailureReason::ConsentDenied,
-                DelegationFailureReason::ConsentResponseInvalid,
-                DelegationFailureReason::ConsentResponseInvalid
-            ]
-        );
+        assert!(events.is_empty(), "a callback without a state is not audited: {events:?}");
+        let refusals: Vec<_> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("OAuth consent refused"))
+            .map(|line| {
+                ["ConsentDenied", "ConsentResponseInvalid"]
+                    .into_iter()
+                    .find(|reason| line.contains(&format!("reason={reason}")))
+                    .unwrap_or("none")
+            })
+            .collect();
+        assert_eq!(refusals, ["ConsentDenied", "ConsentResponseInvalid", "ConsentResponseInvalid"]);
         let lines: Vec<_> = logs
             .text()
             .lines()
@@ -625,6 +630,54 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// A refusal is audited only when the request carried a state this gateway
+    /// sealed for that stage; any other is logged as a WARN only, so a loop of
+    /// requests without a valid state writes no audit records.
+    #[tokio::test]
+    async fn only_a_refusal_of_a_gateway_sealed_state_is_audited() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let fixture = consent::Fixture::new().await;
+        let (callback_state, cookie) = fixture.begin().await;
+        let (results, events) = capture(async {
+            let mut results = Vec::new();
+            for query in ["code=c", "code=c&state=bogus", "error=access_denied", "error=access_denied&state=bogus"] {
+                results.push(
+                    fixture
+                        .callback("github", query, None)
+                        .await,
+                );
+            }
+            results.push(
+                fixture
+                    .get("/v1/identity/oauth/callback/github/start?state=bogus", &[])
+                    .await,
+            );
+            results.push(
+                fixture
+                    .start_post("bogus", &[("origin", "https://198.51.100.7")])
+                    .await,
+            );
+            results.push(
+                fixture
+                    .callback("github", &format!("error=access_denied&state={callback_state}"), Some(&cookie))
+                    .await,
+            );
+            results
+        })
+        .await;
+        for refused in &results[..6] {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+        }
+        consent::assert_refused(&results[6], StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentDenied]);
+        let text = logs.text();
+        let warnings = text
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("OAuth consent refused"))
+            .count();
+        assert_eq!(warnings, 7, "every refusal is logged: {text}");
+    }
+
     /// Only a callback state, sealed by the start POST with a binding, reaches
     /// the exchange: a start state and an older state without a binding are
     /// refused at the callback, and a callback state at the start POST.
@@ -658,7 +711,7 @@ mod tests {
         for refused in &results {
             consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
         }
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid; 4]);
+        assert!(events.is_empty(), "a state of the other stage is not audited: {events:?}");
         assert_eq!(fixture.token_calls(), 0);
         assert_eq!(fixture.vault_records(), 0);
     }
@@ -755,12 +808,18 @@ mod tests {
         }
         let state = consent::start_state(&start_url);
         let first = fixture
-            .start_post(&state, &[("sec-fetch-site", "same-origin")])
+            .start_post(
+                &state,
+                &[("sec-fetch-site", "same-origin"), ("sec-fetch-user", "?1"), ("sec-fetch-dest", "document")],
+            )
             .await;
         assert_eq!(first.status, StatusCode::FOUND, "{}", first.body);
         let (second, events) = capture(async {
             fixture
-                .start_post(&state, &[("sec-fetch-site", "same-origin")])
+                .start_post(
+                    &state,
+                    &[("sec-fetch-site", "same-origin"), ("sec-fetch-user", "?1"), ("sec-fetch-dest", "document")],
+                )
                 .await
         })
         .await;
@@ -772,9 +831,10 @@ mod tests {
         assert_eq!(after.status, StatusCode::OK, "the page still shows the link it describes");
     }
 
-    /// A start POST another site's page sends is refused, so a cross-site form
-    /// cannot skip the start page and bind a victim's browser to someone else's
-    /// link; nothing is claimed.
+    /// A start POST another site's page sends, or one no person clicked, is
+    /// refused, so neither a cross-site form nor script on the gateway's origin
+    /// can skip the start page and bind a browser to someone else's link;
+    /// nothing is claimed.
     #[tokio::test]
     async fn a_start_post_from_another_site_is_refused_and_claims_nothing() {
         let fixture = consent::Fixture::new().await;
@@ -788,6 +848,8 @@ mod tests {
                 vec![("sec-fetch-site", "cross-site"), ("origin", "https://attacker.example")],
                 vec![("sec-fetch-site", "same-site")],
                 vec![("sec-fetch-site", "same-origin"), ("origin", "https://attacker.example")],
+                vec![("sec-fetch-site", "same-origin"), ("sec-fetch-dest", "document")],
+                vec![("sec-fetch-site", "same-origin"), ("sec-fetch-user", "?1"), ("sec-fetch-dest", "empty")],
             ] {
                 results.push(
                     fixture
@@ -801,11 +863,51 @@ mod tests {
         for refused in &results {
             consent::assert_refused(refused, StatusCode::FORBIDDEN, None);
         }
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CrossSiteConsentStart; 6]);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CrossSiteConsentStart; 8]);
         let started = fixture
             .start_post(&state, &[("origin", "https://198.51.100.7")])
             .await;
         assert_eq!(started.status, StatusCode::FOUND, "the refused POSTs left the start state unused");
+    }
+
+    /// A token endpoint that refuses the exchange is the one refusal after the
+    /// state is claimed: the state is used up, nothing is stored and the
+    /// binding cookie is cleared.
+    #[tokio::test]
+    async fn a_refused_token_exchange_uses_up_the_state_and_stores_nothing() {
+        let fixture = consent::Fixture::new().await;
+        let mut provider = fixture.provider();
+        provider.token_endpoint = provider
+            .token_endpoint
+            .map(|endpoint| endpoint.replace("/token", "/token-refused"));
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+        let (callback_state, cookie) = fixture.begin().await;
+        let query = format!("code=c&state={callback_state}");
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .callback("github", &query, Some(&cookie))
+                    .await,
+                fixture
+                    .callback("github", &query, Some(&cookie))
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&cookie)));
+        }
+        assert_eq!(
+            consent::reasons(&events),
+            [DelegationFailureReason::TokenExchangeFailed, DelegationFailureReason::ConsentStateReused]
+        );
+        assert_eq!(fixture.vault_records(), 0);
+        let decoded = crate::delegation_vault::oauth::decode_callback_state(&callback_state).unwrap();
+        assert!(crate::delegation_vault::oauth::is_claimed(&decoded).await, "the refused exchange used up the state");
     }
 
     /// With the operator's `authorization_response_issuer` set, the callback
@@ -903,7 +1005,14 @@ mod tests {
                         .get(&consent::local(&start_url), &[])
                         .await,
                     fixture
-                        .start_post(&state, &[("sec-fetch-site", "same-origin")])
+                        .start_post(
+                            &state,
+                            &[
+                                ("sec-fetch-site", "same-origin"),
+                                ("sec-fetch-user", "?1"),
+                                ("sec-fetch-dest", "document"),
+                            ],
+                        )
                         .await,
                 ]
             })
@@ -1049,7 +1158,7 @@ mod tests {
         for refused in &results {
             consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
         }
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid; 2]);
+        assert!(events.is_empty(), "an expired state is not audited: {events:?}");
     }
 
     mod consent {
@@ -1171,24 +1280,31 @@ mod tests {
                 let counter = calls.clone();
                 let forms = Arc::new(Mutex::new(Vec::new()));
                 let recorded = forms.clone();
-                let vendor = Router::new().route(
-                    "/token",
-                    post(move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
-                        let counter = counter.clone();
-                        let recorded = recorded.clone();
-                        async move {
-                            counter.fetch_add(1, Ordering::SeqCst);
-                            recorded
-                                .lock()
-                                .unwrap()
-                                .push(form);
-                            axum::Json(serde_json::json!({
-                                "access_token": "vendor-access", "token_type": "Bearer", "expires_in": 3600,
-                                "scope": "repo read:user"
-                            }))
-                        }
-                    }),
-                );
+                let vendor = Router::new()
+                    .route(
+                        "/token",
+                        post(move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
+                            let counter = counter.clone();
+                            let recorded = recorded.clone();
+                            async move {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                recorded
+                                    .lock()
+                                    .unwrap()
+                                    .push(form);
+                                axum::Json(serde_json::json!({
+                                    "access_token": "vendor-access", "token_type": "Bearer", "expires_in": 3600,
+                                    "scope": "repo read:user"
+                                }))
+                            }
+                        }),
+                    )
+                    .route(
+                        "/token-refused",
+                        post(|| async {
+                            (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
+                        }),
+                    );
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await
                     .unwrap();
