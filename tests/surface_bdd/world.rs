@@ -153,6 +153,8 @@ pub struct SurfaceWorld {
     pub surface_draft: Option<serde_json::Value>,
     /// A client presenting the personal access token an operator minted in the scenario.
     pub personal_access_token_client: Option<reqwest::Client>,
+    /// API keys the scenario created, by scenario name: the owning surface id and the key id.
+    pub api_keys: HashMap<String, (String, String)>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -222,6 +224,7 @@ impl SurfaceWorld {
             transit_token: None,
             surface_draft: None,
             personal_access_token_client: None,
+            api_keys: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

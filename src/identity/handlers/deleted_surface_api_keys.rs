@@ -417,6 +417,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deleted_surfaces_keys_are_revoked_from_disk_including_one_another_node_created() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let keys = store(&directory).await;
+        let own = create(&keys, "deleted-surface").await;
+        let other_node = create(&store(&directory).await, "deleted-surface").await;
+        let neighbour = create(&keys, "live-surface").await;
+
+        let revoked = revoke_api_keys_of(&keys, "deleted-surface").await;
+
+        assert_eq!(revoked, 2);
+        let fresh = store(&directory).await;
+        for key_id in [&own, &other_node] {
+            assert_eq!(
+                status(&fresh, "deleted-surface", key_id)
+                    .await
+                    .0,
+                ApiKeyStatus::Revoked,
+                "{key_id}"
+            );
+        }
+        assert_eq!(status(&fresh, "live-surface", &neighbour).await, (ApiKeyStatus::Active, None));
+        assert_eq!(revoke_api_keys_of(&keys, "deleted-surface").await, 0, "a second delete revokes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_surface_whose_key_folder_cannot_be_read_revokes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::TempDir::new().unwrap();
+        let keys = store(&directory).await;
+        let key = create(&keys, "locked-surface").await;
+        let locked = directory
+            .path()
+            .join("locked-surface");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: no read fails.
+            return;
+        }
+
+        let revoked = revoke_api_keys_of(&keys, "locked-surface").await;
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(revoked, 0);
+        assert_eq!(status(&store(&directory).await, "locked-surface", &key).await, (ApiKeyStatus::Active, None));
+    }
+
+    #[tokio::test]
     async fn a_standby_node_revokes_nothing_until_it_becomes_active() {
         let directory = tempfile::TempDir::new().unwrap();
         let keys = store(&directory).await;

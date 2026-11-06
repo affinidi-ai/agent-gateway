@@ -1710,6 +1710,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitting_a_surface_whose_own_key_another_node_deleted_judges_it_missing_in_both_modes() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let enforced = gate().await;
+            use_isolation(mode);
+            let own = naming("owner-a", "tenant-a", external(KEY_A));
+            other_node(&enforced)
+                .await
+                .delete("owner-a", KEY_A, "test")
+                .await
+                .unwrap();
+
+            enforced
+                .gate
+                .admit_all([&own])
+                .await;
+
+            assert_eq!(
+                enforced
+                    .gate
+                    .recorded_refusal(&own),
+                Some(API_KEY_MISSING),
+                "{mode:?}: this node's cached copy of the key is not trusted"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn admitting_a_surface_reads_the_status_of_the_keys_it_names_from_disk() {
         use crate::api_keys::store::ApiKeyStore as _;
         let enforced = gate().await;

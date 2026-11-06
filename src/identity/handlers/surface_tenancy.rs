@@ -2496,6 +2496,14 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+
+        let stored_key = vec![(ResourceKind::ApiKeys, "atgk_stored".to_string())];
+        assert_eq!(reference_rule(&stored_key, RuleMode::Warn, ResourceKind::ApiKeys, "atgk_stored"), RuleMode::Warn);
+        assert_eq!(
+            reference_rule(&stored_key, RuleMode::Enforce, ResourceKind::ApiKeys, "atgk_stored"),
+            RuleMode::Enforce
+        );
+        assert_eq!(reference_rule(&stored_key, RuleMode::Warn, ResourceKind::ApiKeys, "atgk_new"), RuleMode::Enforce);
     }
 
     #[test]
