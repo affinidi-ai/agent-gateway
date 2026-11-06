@@ -1178,8 +1178,8 @@ mod tests {
     #[tokio::test]
     async fn a_surface_naming_another_tenants_api_key_gets_no_preview_and_no_fetch() {
         let _gate = crate::identity::provider_key_gate::test_support::enforced_gate(
-            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
-            &[("owner-a", "atgk_preview_a"), ("owner-b", "atgk_preview_b")],
+            &[("own", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("own", "atgk_preview_a"), ("owner-b", "atgk_preview_b")],
         )
         .await;
         let target = MockServer::start_with_response(agent_card().to_string()).await;

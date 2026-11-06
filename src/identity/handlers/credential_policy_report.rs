@@ -1035,7 +1035,8 @@ mod tests {
         let owners = key_owners();
         let surfaces = || {
             vec![
-                naming("own", Some("t1"), "atgk_t1"),
+                naming("owner-t1", Some("t1"), "atgk_t1"),
+                naming("same-tenant", Some("t1"), "atgk_t1"),
                 naming("cross", Some("t1"), "atgk_t2"),
                 naming("tenant-key-wide", None, "atgk_t1"),
                 naming("appliance-key", Some("t1"), "atgk_wide"),
@@ -1048,9 +1049,11 @@ mod tests {
         assert_eq!(
             warn,
             vec![
+                ("same-tenant".to_string(), "other_surface", false),
                 ("cross".to_string(), "other_tenant", false),
                 ("tenant-key-wide".to_string(), "other_tenant", false),
                 ("appliance-key".to_string(), "appliance_key", false),
+                ("wide-wide".to_string(), "other_surface", false),
                 ("missing-key".to_string(), "missing_key", false),
                 ("missing-owner".to_string(), "missing_owner", false),
             ]
@@ -1059,16 +1062,19 @@ mod tests {
         assert_eq!(
             enforce,
             vec![
+                ("same-tenant".to_string(), "other_surface", true),
                 ("cross".to_string(), "other_tenant", true),
                 ("tenant-key-wide".to_string(), "other_tenant", true),
                 ("appliance-key".to_string(), "appliance_key", true),
+                ("wide-wide".to_string(), "other_surface", true),
                 ("missing-key".to_string(), "missing_key", false),
                 ("missing-owner".to_string(), "missing_owner", true),
             ]
         );
         assert!(
-            provider_key_findings(vec![naming("own", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
-                .is_empty()
+            provider_key_findings(vec![naming("owner-t1", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
+                .is_empty(),
+            "a surface naming its own key is not reported"
         );
     }
 
@@ -1093,7 +1099,7 @@ mod tests {
             provider_key_findings(
                 vec![
                     legacy_caller("legacy-cross", Some("t1"), "atgk_t2", true),
-                    legacy_caller("legacy-own", Some("t1"), "atgk_t1", true),
+                    legacy_caller("legacy-same-tenant", Some("t1"), "atgk_t1", true),
                     legacy_caller("legacy-wide", Some("t1"), "atgk_wide", true),
                     legacy_caller("legacy-unowned", Some("t1"), "atgk_gone", true),
                     legacy_caller("legacy-no-identity", Some("t1"), "atgk_t2", false),
@@ -1103,6 +1109,7 @@ mod tests {
             ),
             vec![
                 ("legacy-cross".to_string(), "other_tenant", true),
+                ("legacy-same-tenant".to_string(), "other_surface", true),
                 ("legacy-wide".to_string(), "appliance_key", true)
             ]
         );

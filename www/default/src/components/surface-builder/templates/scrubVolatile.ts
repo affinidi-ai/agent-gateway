@@ -28,9 +28,42 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+/**
+ * A surface names only its own API keys, and a new surface has none, so
+ * every API key id a template carries is dropped: the Identity is left
+ * without a key, to be chosen once the new surface has one.
+ */
+function dropApiKeyId(value: unknown): void {
+  if (isObject(value) && 'api_key_id' in value) delete value.api_key_id;
+}
+
+function dropApiKeyIds(view: unknown): void {
+  if (!isObject(view)) return;
+  const slots = view.identity_slots;
+  if (isObject(slots)) {
+    for (const slot of ['inbound', 'protected', 'external']) dropApiKeyId(slots[slot]);
+  }
+  if (isObject(view.target)) dropApiKeyId(view.target.identity_injection);
+  const transit = view.transit;
+  if (isObject(transit) && Array.isArray(transit.points)) {
+    for (const tp of transit.points) {
+      if (!isObject(tp)) continue;
+      dropApiKeyId(tp.managed_identity);
+      dropApiKeyId(tp.identity_injection);
+    }
+  }
+}
+
 export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
   if (!isObject(payload)) return payload;
   const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+
+  dropApiKeyIds(out);
+  if (Array.isArray(out.variants)) {
+    for (const variant of out.variants) {
+      if (isObject(variant)) dropApiKeyIds(variant.overrides);
+    }
+  }
 
   const transit = out.transit;
   if (isObject(transit)) {
@@ -54,6 +87,7 @@ export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
         const cfg = (n as Record<string, unknown>).config;
         if (!isObject(cfg)) continue;
         const type = (n as Record<string, unknown>).type;
+        if (type === 'identity') dropApiKeyId(cfg);
         if (typeof type === 'string' && type.startsWith('transit-point-')) {
           for (const f of VOLATILE_TP_CANVAS_FIELDS) {
             if (f in cfg) delete (cfg as Record<string, unknown>)[f];

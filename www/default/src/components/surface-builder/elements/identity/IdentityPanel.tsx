@@ -11,6 +11,7 @@ import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping'
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
 import { isInboundIdentity } from './placement';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
 interface ApiKeyOption {
   key_id: string;
@@ -154,21 +155,26 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const extractionType: ExtractionType = (config.type as ExtractionType) || '';
   const slotContext = describeIdentitySlot(node.slotId);
   const isInbound = isInboundIdentity(node);
+  const meta = useOptionalSurfaceMeta();
+  const surfaceId = meta?.isCreate ? undefined : meta?.surfaceId;
   const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([]);
   const [certificates, setCertificates] = useState<CertificateOption[]>([]);
   const [loadingKeys, setLoadingKeys] = useState(false);
   const [loadingCerts, setLoadingCerts] = useState(false);
 
   useEffect(() => {
-    if (extractionType !== 'from_api_key' || isInbound || apiKeys.length > 0) return;
+    if (extractionType !== 'from_api_key' || isInbound || !surfaceId || apiKeys.length > 0) return;
     setLoadingKeys(true);
     apiClient
-      .fetch('/api/v1/api-keys')
+      .fetch(`/api/v1/api-keys/${encodeURIComponent(surfaceId)}`)
       .then(r => (r.ok ? r.json() : []))
       .then((data: ApiKeyOption[]) => setApiKeys(data.filter(k => k.status === 'active')))
       .catch(() => setApiKeys([]))
       .finally(() => setLoadingKeys(false));
-  }, [extractionType, isInbound, apiKeys.length]);
+  }, [extractionType, isInbound, surfaceId, apiKeys.length]);
+
+  const storedKeyId: string = config.api_key_id || '';
+  const storedKeyListed = !storedKeyId || apiKeys.some(k => k.key_id === storedKeyId);
 
   useEffect(() => {
     if (extractionType !== 'from_mtls' || certificates.length > 0) return;
@@ -358,23 +364,38 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
 
       {extractionType === 'from_api_key' && !isInbound && (
         <div className="config-section">
-          <label>API Key</label>
+          <label className="d-flex align-items-center gap-1">
+            API Key
+            <FieldHelp testId="field-help-identity-api-key" ariaLabel="About API Key">
+              A surface names only its own API keys: the list shows this surface&apos;s active keys,
+              and the gateway refuses a key of another surface.
+            </FieldHelp>
+          </label>
           <Form.Select
             size="sm"
             className="dropdown-styling"
             data-testid="identity-panel-api-key-select"
-            value={config.api_key_id || ''}
+            value={storedKeyId}
             onChange={e => updateField('api_key_id', e.target.value)}
             disabled={loadingKeys}
           >
             <option value="">{loadingKeys ? 'Loading…' : 'Select an API key'}</option>
+            {!loadingKeys && !storedKeyListed && (
+              <option value={storedKeyId}>{storedKeyId} (not an active key of this surface)</option>
+            )}
             {apiKeys.map(k => (
               <option key={k.key_id} value={k.key_id}>
-                {k.client_id} — {k.agent_id}
+                {k.client_id}
               </option>
             ))}
           </Form.Select>
-          {!loadingKeys && (
+          {!surfaceId && (
+            <Form.Text className="text-muted d-block" data-testid="identity-panel-api-key-unsaved">
+              A new surface has no API keys yet. Remove this Identity or choose another type, save
+              the surface, add an API key, then come back and select it.
+            </Form.Text>
+          )}
+          {surfaceId && !loadingKeys && (
             <Form.Text className="text-muted">
               {apiKeys.length === 0 ? 'No active API keys yet. ' : "Don't see the one you need? "}
               <AddResourceLink to={deepLinks.apiKey} testid="identity-panel-add-api-key-link">

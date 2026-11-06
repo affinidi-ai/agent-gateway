@@ -60,4 +60,22 @@ changes:
         DID where a gone owner, or another tenant's key, takes it out of service under enforce. The
         error names the
         surfaces the caller may see and counts the rest. Revoking the key is still allowed.
-  breaking: []
+    - timestamp: '2026-11-05T12:30:00Z'
+      title: Let a surface name only its own API keys in an Identity
+      description: >-
+        A from_api_key Identity, identity injection or Transit Point identity now saves only an
+        API key of the surface itself, as does a Caller Context API Key secret named like a key on
+        a surface whose inbound Identity is From API Key. A new reference to another surface's key,
+        of any tenant, answers 400, so no Identity can derive another surface's key DID. A reference
+        the stored surface already had is kept on save under warn. The provider key check reports
+        such a key as other_surface, and the Surface Builder key picker lists only the surface's
+        own active keys.
+  breaking:
+    - timestamp: '2026-11-05T12:30:00Z'
+      title: Take surfaces naming another surface's API key out of service under enforce
+      description: >-
+        Under tenant_credential_isolation enforce, a stored surface whose Identity names another
+        surface's API key, even one of its own tenant, is not ready after upgrade and answers 503,
+        and saving it unchanged answers 400. Under warn it keeps serving and is logged as
+        other_surface. In either mode, a create or save that newly names another surface's key
+        answers 400: create the surface, add its API key, then save the surface naming that key.

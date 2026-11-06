@@ -403,7 +403,20 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the panel shows the one line "Each caller is identified by the API key it presents."
   (`identity-panel-inbound-api-key-note`);
   `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
-  the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
+  the picker (`identity-panel-api-key-select`) and need a key. The picker lists only the active
+  keys of the surface being edited (`GET /api-keys/{surface_id}`, from `SurfaceMetaContext`), as
+  the gateway refuses another surface's key; a stored id that is not among them stays selected as
+  "<id> (not an active key of this surface)". On the create page (`isCreate`, which already has a
+  client-made `surfaceId`) it fetches nothing and shows "A new surface has no API keys yet. Remove
+  this Identity or choose another type, save the surface, add an API key, then come back and
+  select it." (`identity-panel-api-key-unsaved`); the rule is behind
+  `field-help-identity-api-key`. A protected or external From API Key Identity without a key is
+  incomplete and blocks Save with "Select an API key of this surface. A new surface has no API keys
+  yet: remove this Identity or choose another type, save the surface, add an API key, then come
+  back and select it." (`SELECT_OWN_API_KEY`). A template capture or apply
+  (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
+  injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
+  canvas Identity nodes, so the new surface's Identity asks for its own key. An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
