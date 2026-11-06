@@ -109,7 +109,7 @@ impl VaultReadScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation_vault::test_support::{InMemoryProviders, delegation, pattern, reader, tenant};
+    use crate::delegation_vault::test_support::{InMemoryProviders, delegation, extensions, pattern, reader, tenant};
 
     async fn tenant_scope(
         providers: &InMemoryProviders,
@@ -206,5 +206,38 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "credential providers unreadable");
+    }
+
+    /// The extensions the session and access-token middleware set for each
+    /// kind of caller decide its scope through the extractor.
+    #[tokio::test]
+    async fn the_vault_reader_takes_the_whole_caller_from_the_request() {
+        let providers = InMemoryProviders::of_two_tenants();
+        let callers = [
+            ("a session", extensions(None, None, None), VaultReadScope::Appliance),
+            ("an appliance-wide token", extensions(None, None, Some(delegation(false))), VaultReadScope::Appliance),
+            (
+                "a tenant token",
+                extensions(Some(tenant("tenant-a")), Some(pattern("tenant-a")), Some(delegation(true))),
+                VaultReadScope::Tenant(HashSet::from(["cp-a".to_string()])),
+            ),
+            (
+                "a token scoped by required headers alone",
+                extensions(None, None, Some(delegation(true))),
+                VaultReadScope::Nothing,
+            ),
+        ];
+        for (caller, extensions, expected) in callers {
+            let mut request = axum::http::Request::new(());
+            *request.extensions_mut() = extensions;
+            let (mut parts, ()) = request.into_parts();
+            let reader = VaultReader::from_request_parts(&mut parts, &())
+                .await
+                .unwrap();
+            let scope = VaultReadScope::of(Some(&providers), &reader)
+                .await
+                .unwrap();
+            assert_eq!(scope, expected, "{caller}");
+        }
     }
 }
