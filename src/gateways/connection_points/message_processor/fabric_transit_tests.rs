@@ -2092,6 +2092,81 @@ async fn a_refused_card_fetch_over_fabric_answers_only_the_status() {
     );
 }
 
+/// A Target that redirects the gateway's own card fetch answers the peer `502`
+/// "Upstream redirected", as on the direct path: the gateway never follows the
+/// redirect, and neither its `Location` nor its body reaches the peer. Without
+/// Target authentication the redirect is relayed as before.
+#[tokio::test]
+async fn a_redirected_card_fetch_over_fabric_answers_upstream_redirected() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering::SeqCst;
+    if ran_in_child("ATG_FABRIC_REDIRECTED_CARD_CHILD").await {
+        return;
+    }
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(302));
+    let keyed_fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (answer, keyed) = (status.clone(), keyed_fetches.clone());
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+        let (answer, keyed) = (answer.clone(), keyed.clone());
+        async move {
+            if headers
+                .get(TARGET_KEY_HEADER)
+                .is_some_and(|value| value == TARGET_KEY)
+            {
+                keyed.fetch_add(1, SeqCst);
+            }
+            (
+                axum::http::StatusCode::from_u16(answer.load(SeqCst)).unwrap(),
+                [("location", "https://idp.example/login?state=redirect-state")],
+                "sign in for account acme-7731",
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let target_url = format!("http://{}", listener.local_addr().unwrap());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .ok();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &protected_surface(&target_url, "target-key", None)).await;
+    store_target_key(&root.path().join("secrets")).await;
+
+    let redirects = [301, 302, 303, 307, 308];
+    for redirect in redirects {
+        status.store(redirect, SeqCst);
+        let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+        assert_eq!(response["status"], 502, "{redirect}: {response}");
+        assert!(!response_header_names(&response).contains(&"location".to_string()), "{redirect}: {response}");
+        let body = response["body"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !body.contains("idp.example") && !body.contains("acme"),
+            "{redirect}: the Target's answer reached the peer: {body}"
+        );
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["detail"], crate::proxy::handler::UPSTREAM_REDIRECTED, "{redirect}");
+        assert_eq!(body["status"], 502, "{redirect}");
+    }
+    assert_eq!(keyed_fetches.load(SeqCst), redirects.len(), "every fetch carried the Target credential");
+
+    let mut value = serde_json::to_value(protected_surface(&target_url, "target-key", None)).unwrap();
+    value["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("auth");
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    status.store(302, SeqCst);
+    let response = forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")).await;
+    assert_eq!(response["status"], 302, "without Target authentication the redirect is relayed as before: {response}");
+}
+
 /// A client credentials token endpoint that issues [`PROVIDER_TOKEN`] and counts
 /// the token requests it answered.
 struct TokenEndpoint {

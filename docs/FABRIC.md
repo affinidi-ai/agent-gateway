@@ -475,9 +475,10 @@ configured card location, and no `X-Gateway-Trace-Id`.
 The Target's answer reaches the peer with only `Content-Type`, `Content-Language`,
 `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a session cookie or authentication header
 the Target sets for the credential stays on the receiving gateway, and a card is processed as an
-agent card response. The client does not follow redirects. A non-2xx answer, a 3xx included,
-reaches the peer as its status with the body "Upstream error: <status>", as on the direct path, so
-nothing the Target says about the credential reaches the peer.
+agent card response. The client does not follow redirects: a 3xx answers the peer `502` "Upstream
+redirected", as on the direct path, without the Target's `Location`. Any other non-2xx answer
+reaches the peer as its status with the body "Upstream error: <status>", so nothing the Target says
+about the credential reaches the peer.
 
 Every other public read skips caller authentication and is forwarded without the credential:
 another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the card path, the
@@ -490,6 +491,14 @@ case-sensitive: it is a caller's request, source authentication runs on it, and 
 credential when the caller authenticated. A credential that cannot be resolved under
 `target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as the
 direct path and the MCP proxy path.
+
+The sending gateway's agent card route gives its caller the same answer: a peer's `502` whose
+detail is exactly "Target authentication failed" or "Upstream redirected", the gateway's own fixed
+texts, is answered with that text, and any other refusal with its status and "Upstream error:
+<status>", never the peer's words. The sending gateway asks for `/.well-known/agent-card.json`, or
+the configured card location of its own surface, so give both surfaces the same `agent_card_path`:
+a location only the sending gateway configures is not a card fetch at the receiving gateway and
+gets no `target.auth`.
 
 Two things differ from the direct path:
 

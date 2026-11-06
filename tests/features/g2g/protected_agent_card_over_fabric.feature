@@ -31,8 +31,21 @@ Feature: Protected agent card fetch over Fabric
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
     Then the response status is 502
-    And the response says "Upstream error: 502"
+    And the response detail is "Target authentication failed"
     And managed agent "bravo" was not called
+
+  Scenario: gateway 2 answers a redirected agent card fetch as the direct path does
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And managed agent "bravo" refuses with status 302 saying "sign in at the identity provider"
+    And managed agent "bravo" answers with header "location" set to "https://idp.example/login"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
+    Then the response status is 502
+    And the response detail is "Upstream redirected"
+    And the response to the caller did not carry header "location"
+    And the response does not say "idp.example"
 
   Scenario: gateway 2 refuses a Fabric A2A message when its Target credential cannot be resolved
     Given a fabric with 2 gateways

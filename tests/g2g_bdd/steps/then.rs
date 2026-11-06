@@ -1169,6 +1169,24 @@ pub async fn response_does_not_say(
     assert!(!text.contains(&unexpected), "response body {text:?} contains {unexpected:?}");
 }
 
+/// The `detail` of the problem the caller was answered with, compared whole, so a
+/// detail that only contains the text does not pass.
+#[then(expr = "the response detail is {string}")]
+pub async fn response_detail_is(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let problem = match body {
+        Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+        other => other.clone(),
+    };
+    assert_eq!(problem["detail"].as_str(), Some(expected.as_str()), "response body {body}");
+}
+
 #[then(expr = "the response to the caller carried header {string}")]
 pub async fn response_to_caller_carried_header(
     world: &mut G2gWorld,

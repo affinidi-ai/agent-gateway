@@ -893,6 +893,10 @@ pub(crate) fn a2a_proxy_target_caller(
 
 pub(crate) const TARGET_AUTH_FAILED: &str = "Target authentication failed";
 
+/// The detail of the `502` the gateway answers when the Target redirects the gateway's own agent
+/// card fetch, which never follows a redirect.
+pub(crate) const UPSTREAM_REDIRECTED: &str = "Upstream redirected";
+
 /// Why a target credential could not be resolved. Rendered to the caller only as a
 /// generic failure; the variant is logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

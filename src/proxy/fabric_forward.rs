@@ -110,9 +110,10 @@ pub(crate) struct FabricCardRequest<'a> {
 /// stands, so the read is not cached.
 pub(crate) enum FabricCardOutcome {
     Card(serde_json::Value),
-    /// The remote answered with this non-success status.
+    /// The remote answered with this non-success status and body.
     Refused {
         status: u16,
+        body: Vec<u8>,
     },
     /// The remote answered with a card body over the size bound.
     TooLarge,
@@ -136,7 +137,7 @@ impl FabricCardOutcome {
     pub(crate) fn describes_the_remote(&self) -> bool {
         match self {
             Self::Failed(error) => !error.never_reached_the_remote(),
-            Self::Refused { status } => *status != 503,
+            Self::Refused { status, .. } => *status != 503,
             _ => true,
         }
     }
@@ -211,7 +212,13 @@ where
                     by_gateway,
                     "Fabric agent card read refused"
                 );
-                (FabricCardOutcome::Refused { status: response.status }, by_gateway)
+                (
+                    FabricCardOutcome::Refused {
+                        status: response.status,
+                        body: response.body,
+                    },
+                    by_gateway,
+                )
             }
             Err(error) => {
                 debug!(trace_id = request.trace_id, label = request.log_label, path, error = %error, "Fabric agent card read failed");
@@ -220,7 +227,7 @@ where
         };
         // A path the remote could not answer for the moment keeps the read
         // uncached, whatever a later path says.
-        if !matches!(outcome, FabricCardOutcome::Refused { status: 503 }) {
+        if !matches!(outcome, FabricCardOutcome::Refused { status: 503, .. }) {
             outcome = answer;
         }
         if last {
@@ -1061,7 +1068,7 @@ mod tests {
                     assert_eq!(card, &serde_json::json!({"name": "partner"}), "{case}");
                     "card".to_string()
                 }
-                FabricCardOutcome::Refused { status } => format!("refused {status}"),
+                FabricCardOutcome::Refused { status, .. } => format!("refused {status}"),
                 FabricCardOutcome::TooLarge => "too large".to_string(),
                 FabricCardOutcome::NotJson => "not JSON".to_string(),
                 FabricCardOutcome::Failed(_) => "failed".to_string(),
@@ -1127,8 +1134,8 @@ mod tests {
         let failed = |error| FabricCardOutcome::Failed(error);
         for (case, outcome, expected) in [
             ("card", FabricCardOutcome::Card(serde_json::json!({})), true),
-            ("refused", FabricCardOutcome::Refused { status: 404 }, true),
-            ("briefly unavailable", FabricCardOutcome::Refused { status: 503 }, false),
+            ("refused", FabricCardOutcome::Refused { status: 404, body: Vec::new() }, true),
+            ("briefly unavailable", FabricCardOutcome::Refused { status: 503, body: Vec::new() }, false),
             ("too large", FabricCardOutcome::TooLarge, true),
             ("not JSON", FabricCardOutcome::NotJson, true),
             ("no answer in time", failed(FabricForwardError::NoResponse("peer".into())), true),

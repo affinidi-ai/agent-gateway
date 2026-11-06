@@ -8,8 +8,9 @@ changes:
         When the Target credential cannot be resolved and the fallback is reject, the Fabric
         receiving gateway and the MCP proxy path now answer 502 with the text Target
         authentication failed, the same text as the direct path, instead of Target
-        authentication configuration error. Clients that match the old text must match the new
-        one.
+        authentication configuration error. The sending gateway's agent card route passes that
+        text, and Upstream redirected, on to its caller instead of Upstream error: 502 Bad
+        Gateway. Clients that match the old text must match the new one.
     - timestamp: '2026-11-03T12:30:00Z'
       title: Skip the sending gateway's surface policy for every public discovery read
       description: >-
@@ -26,8 +27,8 @@ changes:
         follows the direct path's header, body and failure rules. It is a new GET with no body
         that carries the Target credential and keeps only Accept, Accept-Language and User-Agent
         from the peer, with no delegated credential, transit token or trace id. Its answer
-        reaches the peer with only the headers that describe the card, and a refusal with only
-        its status. Any other public read, a HEAD of the card path or the legacy agent.json
+        reaches the peer with only the headers that describe the card. A redirect answers 502
+        Upstream redirected, as on the direct path, and any other refusal only its status. Any other public read, a HEAD of the card path or the legacy agent.json
         included, is forwarded without the credential. A GET at the configured card location is
         the card fetch after source authentication, including for a caller who failed it on a
         surface that forwards failed callers to policy; a closed surface or one that rejects

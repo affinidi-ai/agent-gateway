@@ -3536,17 +3536,25 @@ fn is_relayed_from_credentialed_card_fetch(name: &str) -> bool {
         .any(|relayed| name.eq_ignore_ascii_case(relayed))
 }
 
-/// The body that answers the peer when the Target refuses the gateway's own
-/// agent card fetch: only the status, as on the direct path, so nothing the
-/// Target said about the gateway's credential reaches the peer.
-fn credentialed_card_fetch_error_body(status: u16) -> String {
-    serde_json::json!({
+/// The status and body that answer the peer when the Target does not answer the gateway's own
+/// agent card fetch with a `2xx`, so nothing the Target said about the gateway's credential
+/// reaches the peer. A redirect, which the gateway never follows and whose `Location` is not
+/// relayed, answers `502` "Upstream redirected", as on the direct path; any other status is
+/// relayed with the body "Upstream error: <status>".
+fn credentialed_card_fetch_refusal(target_status: u16) -> (u16, String) {
+    let (status, title, detail) = if (300..400).contains(&target_status) {
+        (502, "Bad Gateway", crate::proxy::handler::UPSTREAM_REDIRECTED.to_string())
+    } else {
+        (target_status, "Upstream error", format!("Upstream error: {target_status}"))
+    };
+    let body = serde_json::json!({
         "type": "about:blank",
-        "title": "Upstream error",
+        "title": title,
         "status": status,
-        "detail": format!("Upstream error: {status}"),
+        "detail": detail,
     })
-    .to_string()
+    .to_string();
+    (status, body)
 }
 
 /// The local Target's agent card for the GW2 policy context: the configured card
@@ -6609,6 +6617,21 @@ async fn process_charged_forward_request(
             // Start response timer (measures response processing time)
             let response_start = std::time::Instant::now();
             let status = response.status().as_u16();
+            let card_fetch_refusal =
+                (credentialed_card_fetch && !(200..300).contains(&status)).then(|| credentialed_card_fetch_refusal(status));
+            if let Some((answered, _)) = &card_fetch_refusal
+                && *answered != status
+            {
+                channel_warn!(
+                    config_id,
+                    "GW2: The Target redirected the gateway's own agent card fetch (status {}); answering {}",
+                    status,
+                    answered
+                );
+            }
+            let status = card_fetch_refusal
+                .as_ref()
+                .map_or(status, |(answered, _)| *answered);
 
             // MCP Legacy SSE fallback: if the upstream rejects a plain POST
             // (400/404/405), it likely only supports Legacy SSE transport.
@@ -6745,12 +6768,14 @@ async fn process_charged_forward_request(
                 (Some(response), String::new())
             } else {
                 match read_forward_target_body(response, is_sse_response, &body_bytes, fabric_body_limits(&surface), config_id).await {
-                    Ok(_) if credentialed_card_fetch && !(200..300).contains(&status) => {
-                        response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
-                        response_headers.insert("content-type".to_string(), vec!["application/problem+json".to_string()]);
-                        (None, credentialed_card_fetch_error_body(status))
-                    }
-                    Ok(body) => (None, body),
+                    Ok(body) => match card_fetch_refusal {
+                        Some((_, refusal)) => {
+                            response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
+                            response_headers.insert("content-type".to_string(), vec!["application/problem+json".to_string()]);
+                            (None, refusal)
+                        }
+                        None => (None, body),
+                    },
                     Err(error) => return ForwardRefusal::from(error).into_forward_response(&body_bytes).await,
                 }
             };
