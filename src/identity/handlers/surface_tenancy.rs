@@ -2061,6 +2061,101 @@ impl KeyListing {
     }
 }
 
+/// How a surface's API Key Provider key id stands, as the surface API reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyReferenceStatus {
+    /// A key of this surface that is not revoked.
+    Active,
+    /// A key of this surface that is revoked.
+    Revoked,
+    /// No key has this id.
+    Missing,
+    /// A key of another surface; its status is not reported.
+    Unavailable,
+    /// The API key store could not be read.
+    Unknown,
+}
+
+/// An API Key Provider key id a surface names and how it stands.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ApiKeyReference {
+    pub key_id: String,
+    pub status: ApiKeyReferenceStatus,
+}
+
+/// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` names, judged as
+/// [`judge_provider_keys`] does: a legacy secret is reported only when a key of that id exists,
+/// and every id is `unknown` when `listing` is `None`. Only a key of this surface reports its
+/// status, so nothing of another surface's key is revealed. Sorted by key id.
+pub(crate) fn api_key_references(
+    surface_id: &str,
+    ids: &ProviderKeyIds,
+    listing: Option<&KeyListing>,
+) -> Vec<ApiKeyReference> {
+    let mut references: Vec<_> = ids
+        .keys
+        .iter()
+        .map(|key_id| (key_id, false))
+        .chain(
+            ids.legacy_secrets
+                .iter()
+                .map(|key_id| (key_id, true)),
+        )
+        .filter_map(|(key_id, legacy)| {
+            let status = match listing {
+                None => ApiKeyReferenceStatus::Unknown,
+                Some(listing) => match listing.owners.get(key_id) {
+                    None if legacy => return None,
+                    None => ApiKeyReferenceStatus::Missing,
+                    Some(owners)
+                        if !owners
+                            .iter()
+                            .any(|owner| owner == surface_id) =>
+                    {
+                        ApiKeyReferenceStatus::Unavailable
+                    }
+                    Some(_)
+                        if listing
+                            .revoked
+                            .contains(key_id) =>
+                    {
+                        ApiKeyReferenceStatus::Revoked
+                    }
+                    Some(_) => ApiKeyReferenceStatus::Active,
+                },
+            };
+            Some(ApiKeyReference { key_id: key_id.clone(), status })
+        })
+        .collect();
+    references.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+    references
+}
+
+/// The [`ApiKeyReference`]s of `surface` in its base and every variant, read from the complete
+/// key listing the provider key gate reads, so a key in a folder that cannot be loaded is
+/// `unknown`, never `missing`. `None` when the surface names no key id or its variants cannot be
+/// resolved.
+pub(crate) async fn surface_api_key_references(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Option<Vec<ApiKeyReference>> {
+    let ids = provider_key_ids(surface).ok()?;
+    if ids.is_empty() {
+        return None;
+    }
+    let listing = match state.api_key_store.as_deref() {
+        Some(store) => complete_provider_key_listing_in(store)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(surface = %surface.surface_id, ?error, "Could not list the API keys a surface names");
+            })
+            .ok(),
+        None => None,
+    };
+    Some(api_key_references(&surface.surface_id, &ids, listing.as_ref()))
+}
+
 #[cfg(test)]
 impl From<std::collections::HashMap<String, Vec<String>>> for KeyListing {
     fn from(owners: std::collections::HashMap<String, Vec<String>>) -> Self {
@@ -2399,6 +2494,53 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    #[test]
+    fn api_key_references_report_status_only_for_the_surfaces_own_keys() {
+        let ids = ProviderKeyIds {
+            keys: vec![
+                "atgk_active".into(),
+                "atgk_foreign".into(),
+                "atgk_foreign_revoked".into(),
+                "atgk_missing".into(),
+                "atgk_revoked".into(),
+            ],
+            legacy_secrets: vec!["atgk_legacy_own".into(), "atgk_legacy_plain".into()],
+        };
+        let mut listing = KeyListing::from(std::collections::HashMap::from([
+            ("atgk_active".to_string(), vec!["own".to_string()]),
+            ("atgk_revoked".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+            ("atgk_foreign_revoked".to_string(), vec!["other".to_string()]),
+            ("atgk_legacy_own".to_string(), vec!["own".to_string()]),
+        ]));
+        listing.revoked = HashSet::from(["atgk_revoked".to_string(), "atgk_foreign_revoked".to_string()]);
+        let reference = |key_id: &str, status| ApiKeyReference { key_id: key_id.into(), status };
+
+        assert_eq!(
+            api_key_references("own", &ids, Some(&listing)),
+            vec![
+                reference("atgk_active", ApiKeyReferenceStatus::Active),
+                reference("atgk_foreign", ApiKeyReferenceStatus::Unavailable),
+                reference("atgk_foreign_revoked", ApiKeyReferenceStatus::Unavailable),
+                reference("atgk_legacy_own", ApiKeyReferenceStatus::Active),
+                reference("atgk_missing", ApiKeyReferenceStatus::Missing),
+                reference("atgk_revoked", ApiKeyReferenceStatus::Revoked),
+            ]
+        );
+        assert_eq!(
+            api_key_references("own", &ids, None)
+                .into_iter()
+                .map(|reference| reference.status)
+                .collect::<Vec<_>>(),
+            vec![ApiKeyReferenceStatus::Unknown; 7],
+            "the store being unavailable makes every id unknown, as the gate's store_unavailable"
+        );
+        assert_eq!(
+            serde_json::to_value(reference("atgk_x", ApiKeyReferenceStatus::Unavailable)).unwrap(),
+            serde_json::json!({"key_id": "atgk_x", "status": "unavailable"})
+        );
     }
 
     #[test]

@@ -119,7 +119,8 @@ fn collection_key_allowed(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParentAuthorization {
     Existing,
-    OrphanCleanup,
+    /// The parent surface no longer exists; only an unrestricted caller is let through.
+    Orphaned,
 }
 
 #[allow(clippy::result_large_err)] // FIXME: Response is not an error
@@ -130,7 +131,7 @@ async fn authorize_agent(
     _scope: &Option<Extension<PatResourceScope>>,
     access: CallerAccess,
     mutation: bool,
-    allow_orphan_cleanup: bool,
+    allow_orphaned: bool,
 ) -> Result<ParentAuthorization, axum::response::Response> {
     match surface_store
         .get(agent_id)
@@ -141,9 +142,7 @@ async fn authorize_agent(
             Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "Agent not accessible" }))).into_response())
         }
         Ok(Some(_)) => Err(ApiKeyError::AgentNotFound { agent_id: agent_id.to_string() }.into_response()),
-        Ok(None) if allow_orphan_cleanup && access == CallerAccess::Unrestricted => {
-            Ok(ParentAuthorization::OrphanCleanup)
-        }
+        Ok(None) if allow_orphaned && access == CallerAccess::Unrestricted => Ok(ParentAuthorization::Orphaned),
         Ok(None) => Err(ApiKeyError::AgentNotFound { agent_id: agent_id.to_string() }.into_response()),
         Err(error) => {
             error!(agent_id = %agent_id, %error, "Failed to resolve API-key parent surface");
@@ -372,7 +371,17 @@ pub async fn create_key(
     }
 }
 
-/// Get a specific API key's metadata (never the secret)
+/// An API key's metadata as `GET /api/v1/api-keys/{agent_id}/{key_id}` returns it, with whether
+/// the surface owning the key no longer exists.
+#[derive(Debug, serde::Serialize)]
+struct ApiKeyDetail {
+    #[serde(flatten)]
+    meta: super::types::ApiKeyMeta,
+    surface_deleted: bool,
+}
+
+/// Get a specific API key's metadata (never the secret). An unrestricted caller also reads a key
+/// whose surface is gone; a restricted one gets `404` for it.
 ///
 /// GET /api/v1/api-keys/{agent_id}/{key_id}
 pub async fn get_key(
@@ -381,12 +390,13 @@ pub async fn get_key(
     Path(KeyPath { agent_id, key_id }): Path<KeyPath>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
 ) -> impl IntoResponse {
-    if let Err(response) =
-        authorize_agent(&surface_store, &agent_id, &context, &scope, CallerAccess::Restricted, false, false).await
-    {
-        return response;
-    }
+    let access = caller_access(&delegation, &context, &scope);
+    let parent = match authorize_agent(&surface_store, &agent_id, &context, &scope, access, false, true).await {
+        Ok(parent) => parent,
+        Err(response) => return response,
+    };
     if !api_key_allowed(&key_id, &context, &scope) {
         return ApiKeyError::not_found(&key_id).into_response();
     }
@@ -394,7 +404,14 @@ pub async fn get_key(
         .get_record(&agent_id, &key_id)
         .await
     {
-        Ok(Some(key)) => (StatusCode::OK, Json(super::types::ApiKeyMeta::from(key))).into_response(),
+        Ok(Some(key)) => (
+            StatusCode::OK,
+            Json(ApiKeyDetail {
+                meta: key.into(),
+                surface_deleted: parent == ParentAuthorization::Orphaned,
+            }),
+        )
+            .into_response(),
         Ok(None) => ApiKeyError::not_found(&key_id).into_response(),
         Err(e) => e.into_response(),
     }
@@ -487,7 +504,7 @@ pub async fn delete_key(
         Ok(parent) => parent,
         Err(response) => return response,
     };
-    let orphan_cleanup = parent == ParentAuthorization::OrphanCleanup;
+    let orphan_cleanup = parent == ParentAuthorization::Orphaned;
     if orphan_cleanup {
         info!(
             actor = %actor,
@@ -1441,6 +1458,75 @@ mod tests {
                 .load(Ordering::SeqCst),
             1
         );
+    }
+
+    async fn get_as(
+        key_store: &Arc<CountingKeyStore>,
+        agent_id: &str,
+        key_id: &str,
+        tenant: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let surface_store: ApiKeySurfaceState = Arc::new(SurfacesStore {
+            surfaces: vec![surface("live", tenant)],
+            list_fails: false,
+        });
+        let context = tenant.map(|tenant_id| {
+            Extension(PatTenantContext {
+                token_id: "atgat-test".into(),
+                tenant_id: tenant_id.into(),
+            })
+        });
+        let response = get_key(
+            State(key_store.clone() as ApiKeyState),
+            Extension(surface_store),
+            Path(KeyPath {
+                agent_id: agent_id.into(),
+                key_id: key_id.into(),
+            }),
+            context,
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_caller_reads_an_orphaned_key_as_surface_deleted() {
+        let key_store = counting_key_store(&[("gone", "atgk_orphan"), ("live", "atgk_live")]);
+
+        let (orphan_status, orphan) = get_as(&key_store, "gone", "atgk_orphan", None).await;
+        let (live_status, live) = get_as(&key_store, "live", "atgk_live", None).await;
+
+        assert_eq!(orphan_status, StatusCode::OK);
+        assert_eq!(orphan["key_id"], "atgk_orphan");
+        assert_eq!(orphan["surface_deleted"], true);
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(live["key_id"], "atgk_live");
+        assert_eq!(live["surface_deleted"], false);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_caller_gets_not_found_for_an_orphaned_key() {
+        let key_store = counting_key_store(&[("gone", "atgk_orphan"), ("live", "atgk_live")]);
+
+        let (orphan_status, orphan) = get_as(&key_store, "gone", "atgk_orphan", Some("tenant-a")).await;
+        let (live_status, live) = get_as(&key_store, "live", "atgk_live", Some("tenant-a")).await;
+
+        assert_eq!(orphan_status, StatusCode::NOT_FOUND);
+        assert!(
+            orphan
+                .get("surface_deleted")
+                .is_none(),
+            "{orphan}"
+        );
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(live["surface_deleted"], false);
     }
 
     #[tokio::test]

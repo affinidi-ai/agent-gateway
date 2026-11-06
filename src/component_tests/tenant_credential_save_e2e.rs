@@ -2414,6 +2414,90 @@ async fn a_new_legacy_secret_named_like_an_own_revoked_key_is_refused() {
         .await;
 }
 
+const REFERENCES_OWNER: &str = "references-owner";
+const REFERENCES_OTHER_TENANT: &str = "references-other-tenant";
+const REFERENCED_ACTIVE: &str = "atgk_00000000000000000000000000000c11";
+const REFERENCED_REVOKED: &str = "atgk_00000000000000000000000000000c12";
+const REFERENCED_MISSING: &str = "atgk_00000000000000000000000000000c13";
+const REFERENCED_OTHER_TENANT: &str = "atgk_00000000000000000000000000000c14";
+
+/// A tenant `a` surface naming its own two keys in the base, a key no store holds in a variant,
+/// and the key of a tenant `b` surface naming it on a Transit Point, as stored before those
+/// rules applied.
+fn seed_key_references(bootstrap: &crate::config::BootstrapConfig) {
+    write_stored_surface(
+        bootstrap,
+        REFERENCES_OTHER_TENANT,
+        json!({"tenant_id": "tenant-b", "identity_slots": {"protected": from_api_key(REFERENCED_OTHER_TENANT)}}),
+    );
+    seed_api_key(bootstrap, REFERENCES_OTHER_TENANT, REFERENCED_OTHER_TENANT);
+    write_stored_surface(
+        bootstrap,
+        REFERENCES_OWNER,
+        json!({
+            "identity_slots": {
+                "protected": from_api_key(REFERENCED_ACTIVE),
+                "external": from_api_key(REFERENCED_REVOKED)
+            },
+            "transit": transit_point_identity(REFERENCED_OTHER_TENANT),
+            "variants": [{
+                "id": "variant-id", "alias": "variant", "name": "Variant", "enabled": true,
+                "overrides": {"identity_slots": {"protected": from_api_key(REFERENCED_MISSING)}}
+            }]
+        }),
+    );
+    seed_api_key(bootstrap, REFERENCES_OWNER, REFERENCED_ACTIVE);
+    seed_api_key(bootstrap, REFERENCES_OWNER, REFERENCED_REVOKED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_read_reports_its_own_keys_and_hides_another_surfaces_key_status() {
+    let (_harness, api) = harness_seeded(RuleMode::Warn, seed_key_references).await;
+    api.revoke_api_key(REFERENCES_OWNER, REFERENCED_REVOKED)
+        .await;
+    api.revoke_api_key(REFERENCES_OTHER_TENANT, REFERENCED_OTHER_TENANT)
+        .await;
+    let expected = json!([
+        {"key_id": REFERENCED_ACTIVE, "status": "active"},
+        {"key_id": REFERENCED_REVOKED, "status": "revoked"},
+        {"key_id": REFERENCED_MISSING, "status": "missing"},
+        {"key_id": REFERENCED_OTHER_TENANT, "status": "unavailable"}
+    ]);
+
+    let stored = api
+        .stored(REFERENCES_OWNER)
+        .await;
+    assert_eq!(stored["api_key_references"], expected, "{stored}");
+
+    let own_revoked = json!([{"key_id": REFERENCED_OTHER_TENANT, "status": "revoked"}]);
+    let other = api
+        .stored(REFERENCES_OTHER_TENANT)
+        .await;
+    assert_eq!(other["api_key_references"], own_revoked, "{other}");
+    let (status, saved) = api
+        .put(REFERENCES_OTHER_TENANT, &other)
+        .await;
+    assert_eq!(status, 200, "a read body sent back saves: {saved}");
+    assert_eq!(saved["api_key_references"], own_revoked, "{saved}");
+    let (status, patched) = api
+        .patch(REFERENCES_OTHER_TENANT, &json!({"description": "patched", "api_key_references": []}))
+        .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["description"], "patched");
+    assert_eq!(patched["api_key_references"], own_revoked, "a sent value is never stored: {patched}");
+
+    let plain = api
+        .created_id(&api.surface("/smoke/references-none", Some("tenant-a"), json!({})))
+        .await;
+    let plain = api.stored(&plain).await;
+    assert!(
+        plain
+            .get("api_key_references")
+            .is_none(),
+        "a surface naming no key has none: {plain}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_surface_that_names_only_its_own_key_to_another_tenant_is_allowed() {
     let (_harness, api) = harness(RuleMode::Enforce).await;
@@ -2887,9 +2971,23 @@ async fn an_unreadable_api_key_folder_refuses_only_a_create_taking_its_id() {
     let mut fresh = api.surface("/smoke/fresh-beside-locked", Some("tenant-a"), json!({}));
     fresh["surface_id"] = json!("fresh-beside-locked");
     let fresh_created = api.create(&fresh).await;
+    let (read_status, read) = api
+        .send(
+            api.client
+                .get(api.url(&format!("surfaces/{NAMED_KEY_OWNER}"))),
+        )
+        .await;
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert_saved(saved);
+    let unknown = json!([{"key_id": NAMED_KEY, "status": "unknown"}]);
+    assert_saved(saved.clone());
+    assert_eq!(
+        saved.1["api_key_references"], unknown,
+        "an unreadable key folder makes every key unknown, never missing: {}",
+        saved.1
+    );
+    assert_eq!(read_status, 200, "{read}");
+    assert_eq!(read["api_key_references"], unknown, "{read}");
     assert_refused(unseen, "API key reference is not accessible");
     assert_eq!(reassigned.0, 409, "a reassignment still checks the keys it can read: {}", reassigned.1);
     assert_eq!(reassigned.1["error"], "tenant_reassignment_blocked", "{}", reassigned.1);

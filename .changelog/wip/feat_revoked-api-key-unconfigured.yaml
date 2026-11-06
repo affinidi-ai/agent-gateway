@@ -1,6 +1,24 @@
 branch: feat/revoked-api-key-unconfigured
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Report the status of each API key a surface names in surface responses
+      description: >-
+        A surface read and the create, update and patch responses of a surface that names an
+        API Key Provider key id now carry a read-only api_key_references list, one key_id and
+        status per id in the base and every variant: active or revoked for a key of the
+        surface, missing when no key has the id, unavailable for another surface's key, whose
+        status is never reported, and unknown when the API key store cannot be read. It is
+        computed by the gateway, so a tenant caller who cannot list API keys sees it too, and
+        a write body that sends it back has it dropped. It lets a client flag an Identity whose
+        key was revoked or deleted.
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Let an unrestricted admin read an API key whose surface was deleted
+      description: >-
+        GET /v1/api-keys/{agent_id}/{key_id} now answers an unrestricted caller for a key whose
+        surface no longer exists, instead of 404, and every answer carries surface_deleted, which
+        tells whether the key is still in use by a surface. Tenant-, resource- and
+        header-gated callers still get 404 for such a key.
   changed: []
   fixed: []
   removed: []

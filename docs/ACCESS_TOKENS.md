@@ -235,12 +235,14 @@ longer be established.
 
 | Caller | Access to the orphaned keys |
 | --- | --- |
-| Unrestricted session | List and delete, for cleanup |
-| Appliance-wide PAT with neither a resource pattern nor required-header gates | List and delete, for cleanup |
-| Tenant-, resource-, or header-gated PAT | None. It can neither see nor mutate them. |
+| Unrestricted session | List, get and delete, for cleanup |
+| Appliance-wide PAT with neither a resource pattern nor required-header gates | List, get and delete, for cleanup |
+| Tenant-, resource-, or header-gated PAT | None. It can neither see nor mutate them; a get answers `404`. |
 
-Get, revoke, and rotate stay parent-gated for every caller. A permanent deletion is
-attributed to the authenticated actor and records whether it was orphan cleanup.
+`GET /v1/api-keys/{agent_id}/{key_id}` answers with `surface_deleted`: `true` for an
+orphaned key, `false` while its surface exists. Revoke and rotate stay parent-gated for
+every caller. A permanent deletion is attributed to the authenticated actor and records
+whether it was orphan cleanup.
 
 ### References between records
 
