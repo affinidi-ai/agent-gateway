@@ -324,7 +324,10 @@ and the selections are independent: an integration can receive an event the VP A
 not keep, and the reverse. Nothing is selected on a fresh install, and a record nobody selects
 is never built. `/v1/audit` shows a tenant's access token only the records of its own tenant's
 credential providers, so no policy decision or other record without a provider; see
-[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records).
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records). While the credential provider
+store cannot be read, `/v1/audit` answers a tenant's access token an empty page (`200`) and
+`/api/v1/delegation-audit` answers it `500`; sessions and appliance-wide access tokens never read
+that store and keep reading the whole log.
 
 **Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
