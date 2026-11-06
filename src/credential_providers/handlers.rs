@@ -509,10 +509,12 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
 
 /// The consent-flow rules a provider passes before it is stored: an
 /// `authorization_response_issuer` only where allowed, and for an authorization
-/// code provider without an `issuer`, a redirect URI the consent flow can use
-/// and that no other provider, in any tenant, uses. An update that keeps the
-/// `previous` consent provider's redirect URI is not checked against the
-/// redirect URI rules, so a stored provider that breaks them can still be edited.
+/// code provider without an `issuer`, an authorization endpoint, when it has
+/// one, that the consent start can build the vendor's URL from, and a redirect URI the consent flow
+/// can use and that no other provider, in any tenant, uses. An update that
+/// keeps the `previous` consent provider's endpoint and `additional_params`, or
+/// its redirect URI, is not checked against those rules, so a stored provider
+/// that breaks them can still be edited.
 async fn consent_flow_error(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
@@ -526,9 +528,21 @@ async fn consent_flow_error(
     if !provider.uses_legacy_consent() {
         return None;
     }
+    let previous = previous.filter(|previous| previous.uses_legacy_consent());
+    let keeps_endpoint = previous.is_some_and(|previous| {
+        previous.authorization_endpoint == provider.authorization_endpoint
+            && previous.additional_params == provider.additional_params
+    });
+    if !keeps_endpoint
+        && provider
+            .authorization_endpoint
+            .is_some()
+        && let Err(message) = provider.consent_authorization_endpoint()
+    {
+        return refused(message);
+    }
     let keeps_redirect_uri = previous.is_some_and(|previous| {
-        previous.uses_legacy_consent()
-            && previous.redirect_uri(&state.gateway_base_url) == provider.redirect_uri(&state.gateway_base_url)
+        previous.redirect_uri(&state.gateway_base_url) == provider.redirect_uri(&state.gateway_base_url)
     });
     if keeps_redirect_uri {
         return None;
@@ -1854,6 +1868,57 @@ mod jwt_provider_tests {
         client_credentials["callback_url"] = json!("http://198.51.100.7/elsewhere");
         let (status, body) = create(&state, client_credentials).await;
         assert_eq!(status, StatusCode::CREATED, "the rule is for consent providers only: {body}");
+    }
+
+    /// A consent provider's authorization endpoint and `additional_params` must
+    /// let the consent start build the vendor's URL, on create and on an update
+    /// that changes them; a stored provider that breaks the rule can still take
+    /// other edits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_providers_authorization_endpoint_must_follow_the_consent_start_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let endpoint_error = "authorization_endpoint must be an https URL with a host and no credentials or fragment";
+        let params_error = "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                            parameter or exceed the limits";
+        for (fields, error) in [
+            (json!({"authorization_endpoint": "http://github.com/login/oauth/authorize"}), endpoint_error),
+            (json!({"authorization_endpoint": "https://github.com/authorize#f"}), endpoint_error),
+            (json!({"authorization_endpoint": "https://github.com/authorize?state=x"}), params_error),
+            (json!({"additional_params": {"redirect_uri": "https://attacker.example"}}), params_error),
+        ] {
+            let (status, body) = create(&state, with(authorization_code("github"), fields.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields}: {body}");
+            assert_eq!(body["error"], error, "{fields}");
+        }
+
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"additional_params": {"prompt": "consent"}})))
+                .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) =
+            update(&state, &id, json!({"authorization_endpoint": "http://github.com/login/oauth/authorize"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], endpoint_error);
+
+        let mut stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.authorization_endpoint = Some("http://github.com/login/oauth/authorize".into());
+        state
+            .store
+            .update(stored)
+            .await
+            .unwrap();
+        let (status, body) = update(&state, &id, json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "an edit that keeps the stored endpoint is accepted: {body}");
     }
 
     /// A stored provider whose redirect URI breaks the consent rules, or is

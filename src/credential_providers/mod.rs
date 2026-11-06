@@ -673,7 +673,7 @@ impl CredentialProvider {
 
 /// The authorization request parameters the gateway sets itself, which neither
 /// the endpoint's own query nor `additional_params` may repeat.
-pub const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
+const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
     ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"];
 
 /// How many parameters the endpoint's query and `additional_params` may hold together.

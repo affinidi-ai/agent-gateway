@@ -420,29 +420,31 @@ struct ConsentStartRequest {
     redirect_uri: url::Url,
 }
 
+/// Why a consent start was refused, and whether its start state was valid, so
+/// the refusal is audited.
+struct StartRefused {
+    refusal: ConsentRefusal,
+    audited: bool,
+}
+
 /// Decodes the start state `params` carry and resolves its provider, whose
-/// redirect URI must follow the consent rules and be no other provider's;
-/// otherwise the refusal page.
+/// redirect URI must follow the consent rules and be no other provider's.
 async fn resolve_consent_start(
     state: &DelegationVaultState,
     path_provider_id: &str,
     params: Option<ConsentStartParams>,
-) -> Result<ConsentStartRequest, Response> {
+) -> Result<ConsentStartRequest, StartRefused> {
     let (encoded, start) = params
         .and_then(|params| {
             oauth::decode_start_state(&params.state)
                 .ok()
                 .map(|start| (params.state, start))
         })
-        .ok_or_else(|| {
-            consent_refused(
-                ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-                path_provider_id,
-                None,
-                false,
-            )
+        .ok_or(StartRefused {
+            refusal: ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            audited: false,
         })?;
-    let refuse = |refusal| consent_refused(refusal, path_provider_id, None, true);
+    let refuse = |refusal| StartRefused { refusal, audited: true };
     let provider = consent_provider(state, path_provider_id, &start)
         .await
         .map_err(refuse)?;
@@ -490,7 +492,7 @@ pub async fn consent_start_page(
     .await
     {
         Ok(request) => request,
-        Err(refused) => return refused,
+        Err(StartRefused { refusal, audited }) => return consent_refused(refusal, &provider_id, None, audited),
     };
     let surface_name = match &state.agent_surface_store {
         Some(store) => store
@@ -599,7 +601,7 @@ pub async fn consent_start(
     .await
     {
         Ok(request) => request,
-        Err(refused) => return refused,
+        Err(StartRefused { refusal, audited }) => return consent_refused(refusal, &provider_id, None, audited),
     };
     if !same_origin_post(&headers, &redirect_uri) {
         return consent_refused(
