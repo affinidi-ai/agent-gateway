@@ -5,11 +5,13 @@ changes:
     - timestamp: '2026-11-05T14:00:00Z'
       title: Freeze component tests and make Gherkin the acceptance test layer
       description: >-
-        src/component_tests/ takes no new files or test functions; a unit test in its mod.rs
-        fails on any addition. Every new observable behaviour is covered by a Gherkin scenario
-        in tests/features/, bound in surface_bdd or g2g_bdd, and scripts/bdd-gherkin.py --lint
-        runs after any feature or step-binding change. AGENTS.md, CONTRIBUTING.md, TESTING.md,
-        DEVELOPMENT.md and ARCHITECTURE.md describe the new layering.
+        Unit tests in src/component_tests/mod.rs pin every file there to its number of tests.
+        They fail when a file is added or gains a test, and when a test or file is deleted
+        without lowering its pin, so the folder can only shrink; new helpers are a review rule.
+        New observable behaviour is covered by Gherkin scenarios in tests/features/, and
+        scripts/bdd-gherkin.py --lint runs after any feature or step-binding change. AGENTS.md
+        also asks for every step to be written test-first, with the test seen failing for the
+        step's reason before it passes.
   fixed: []
   removed: []
   security: []

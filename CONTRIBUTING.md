@@ -53,6 +53,7 @@ Run the local checks and make sure CI passes:
 2. `cargo fmt --all`
 3. `cargo test --no-fail-fast --all-targets --all-features`
 4. If `www/default/` files changed: `cd www/default && npx prettier --write src && npm run lint`
+5. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`
 
 For faster inner-loop feedback, use `cargo test --no-run` for a compile check and
 `cargo test --bin agent-gateway "<module name>"` to run a single module's tests.

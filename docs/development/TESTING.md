@@ -1,6 +1,7 @@
 # Testing
 
-Four test layers, what belongs in each, and how to run them.
+Three test layers and the frozen legacy component tests: what belongs in each, and how to run
+them.
 
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) states the requirement: cover changes with
 tests, positive and negative cases, and assert returned values rather than the absence of
@@ -10,14 +11,14 @@ an error. This page says which layer to put them in.
 
 | Layer | Lives in | Covers | Needs |
 | --- | --- | --- | --- |
-| Unit | `#[cfg(test)] mod tests` inline in each module | One function or type in isolation | Nothing |
+| Unit | `#[cfg(test)] mod tests` inline in each module | One function or type, or an in-process seam where real collaborators from several modules meet | Nothing |
 | Behaviour | [`tests/`](../../tests/) with Gherkin features under [`tests/features/`](../../tests/features/) | A described behaviour end to end, in the project's own vocabulary. This is the acceptance layer | A built binary, and containers for the federation suite |
 | Dashboard | [`ui-tests/`](../../ui-tests/) | The dashboard in a real browser | A running gateway and Playwright |
 | Legacy component (frozen) | [`src/component_tests/`](../../src/component_tests/) | Flows written before the Behaviour layer existed; takes no additions | Nothing |
 
 ```mermaid
 flowchart LR
-    U["Unit<br/>one function"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
+    U["Unit<br/>one function or seam"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
 ```
 
 Left to right, each layer is slower and covers more at once.
@@ -63,6 +64,13 @@ cargo test --bin agent-gateway "<module name>"
 
 For a compile check without running anything, `cargo test --no-run`.
 
+A seam test lives in the module that owns the seam, such as the store that notifies a
+registry. It wires the real collaborators in process, keeps storage in a temporary
+directory, and fakes only what sits outside the gateway, through its trait. Fixtures
+shared across a module's tests go in a `test_support` module beside it, as
+[`src/secrets/test_support.rs`](../../src/secrets/test_support.rs) does, never in
+`src/component_tests/helpers/`.
+
 ## Behaviour tests
 
 The acceptance layer. Every behaviour an operator or caller can observe is described as a
@@ -74,8 +82,8 @@ Two Cucumber suites, both declared as harness-free test targets in
 
 | Suite | Features | Step definitions | Scope |
 | --- | --- | --- | --- |
-| `surface_bdd` | [`tests/features/surface/`](../../tests/features/surface/), 50 files | `tests/surface_bdd/`, `tests/surface_bdd_support.rs` | One gateway: surfaces, source auth, policy, MCP, STS, trust recording |
-| `g2g_bdd` | [`tests/features/g2g/`](../../tests/features/g2g/), 14 files | `tests/g2g_bdd/`, `tests/g2g_bdd_support.rs` | Two gateways over the fabric, with a managed DIDComm mediator |
+| `surface_bdd` | [`tests/features/surface/`](../../tests/features/surface/) | `tests/surface_bdd/`, `tests/surface_bdd_support.rs` | One gateway: surfaces, source auth, policy, MCP, STS, trust recording |
+| `g2g_bdd` | [`tests/features/g2g/`](../../tests/features/g2g/) | `tests/g2g_bdd/`, `tests/g2g_bdd_support.rs` | Two gateways over the fabric, with a managed DIDComm mediator |
 
 ```bash
 cargo test --test surface_bdd
@@ -108,8 +116,14 @@ python3 scripts/bdd-gherkin.py --lint
 Behaviour layer existed. It is frozen: no new files, test functions or helpers. Existing
 tests may be fixed when the code they cover changes, or deleted once a scenario covers the
 same behaviour. The `freeze` tests in
-[`src/component_tests/mod.rs`](../../src/component_tests/mod.rs) fail when a file is added
-or an existing file gains a test.
+[`src/component_tests/mod.rs`](../../src/component_tests/mod.rs) pin each file's number of
+tests in `FROZEN_FILES`. They fail when a file is added, a file gains a test, or a test or
+file is deleted without lowering or removing its pin. New helpers are caught in review, not
+by the tests.
+
+Pins only go down. A change that deletes tests lowers the pin in the same change. Raising a
+pin needs a stated reason in the pull request; the usual one is a rebase that brings in a
+test main already added.
 
 They compile into the binary's test target, so they still run with the unit tests:
 
@@ -119,7 +133,7 @@ cargo test --bin agent-gateway component_tests
 
 ## Dashboard tests
 
-Playwright, in [`ui-tests/`](../../ui-tests/), with 6 specs under `ui-tests/specs/`.
+Playwright, in [`ui-tests/`](../../ui-tests/), with specs under `ui-tests/specs/`.
 
 ```bash
 make ui-test
@@ -162,19 +176,8 @@ it afterwards for debugging, so a test run never touches a development instance.
 
 ## Before opening a pull request
 
-The checks from [`CONTRIBUTING.md`](../../CONTRIBUTING.md):
-
-```bash
-cargo clippy --all-targets --all-features
-cargo fmt --all
-cargo test --no-fail-fast --all-targets --all-features
-```
-
-And, when `www/default/` changed:
-
-```bash
-cd www/default && npx prettier --write src && npm run lint
-```
+Run the checks listed under _Before Opening A Pull Request_ in
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md#before-opening-a-pull-request).
 
 ## Related
 
