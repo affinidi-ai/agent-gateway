@@ -1292,8 +1292,8 @@ impl ReferenceAuthorizer<'_> {
     /// the stored surface already named it, and that owning surface must be one this surface may
     /// reference. A tenant surface names a key of a surface with no tenant only as it sends an
     /// appliance-wide secret upstream. A surface names only its own keys: another surface's key
-    /// the stored surface already named is kept under `warn`. The token's API key pattern must
-    /// match every key id.
+    /// the stored surface already named is kept under `warn`. A revoked key is refused unless the
+    /// stored surface already named it. The token's API key pattern must match every key id.
     async fn provider_keys(
         &self,
         ids: &ProviderKeyIds,
@@ -1301,9 +1301,9 @@ impl ReferenceAuthorizer<'_> {
         if ids.is_empty() {
             return Ok(());
         }
-        let owners = provider_key_owners(self.state).await?;
+        let listing = provider_key_listing(self.state).await?;
         for secret_id in &ids.legacy_secrets {
-            self.legacy_secret(secret_id, &owners)
+            self.legacy_secret(secret_id, &listing)
                 .await?;
         }
         for key_id in &ids.keys {
@@ -1311,7 +1311,7 @@ impl ReferenceAuthorizer<'_> {
             if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
                 return Err(inaccessible("API-key parent Surface"));
             }
-            let Some(surface_ids) = owners.get(key_id) else {
+            let Some(surface_ids) = listing.owners.get(key_id) else {
                 if kept {
                     continue;
                 }
@@ -1335,25 +1335,51 @@ impl ReferenceAuthorizer<'_> {
                     return Err(another_surfaces_key(key_id));
                 }
             }
+            self.revoked_key(key_id, surface_ids, &listing, kept)?;
         }
         Ok(())
     }
 
+    /// Refuses a new reference to the revoked key `key_id` owned by `surface_ids`; one the
+    /// stored surface already named (`kept`) is left to the provider key gate. Only a key of
+    /// this surface is named as revoked.
+    fn revoked_key(
+        &self,
+        key_id: &str,
+        surface_ids: &[String],
+        listing: &KeyListing,
+        kept: bool,
+    ) -> Result<(), SurfaceApiError> {
+        if kept
+            || !listing
+                .revoked
+                .contains(key_id)
+        {
+            return Ok(());
+        }
+        if surface_ids
+            .iter()
+            .any(|surface_id| surface_id == self.current_surface_id)
+        {
+            return Err(revoked_key(key_id));
+        }
+        Err(inaccessible("API-key parent Surface"))
+    }
+
     /// A Caller Context API Key `secret_id` shaped like a key id, on a view whose inbound
     /// Identity is From API Key, shares the DID of a key of that id. A new one is refused when
-    /// that key belongs to another surface; one the stored surface already named is kept under
-    /// `warn`. An id no key has stays a plain secret.
+    /// that key belongs to another surface or is revoked; one the stored surface already named
+    /// is kept under `warn`. An id no key has stays a plain secret.
     async fn legacy_secret(
         &self,
         secret_id: &str,
-        owners: &std::collections::HashMap<String, Vec<String>>,
+        listing: &KeyListing,
     ) -> Result<(), SurfaceApiError> {
         let rule = self.rule_for(ResourceKind::ApiKeys, secret_id);
-        for surface_id in owners
-            .get(secret_id)
-            .into_iter()
-            .flatten()
-        {
+        let Some(surface_ids) = listing.owners.get(secret_id) else {
+            return Ok(());
+        };
+        for surface_id in surface_ids {
             let Some(tenant_id) = self
                 .api_key_parent_tenant(surface_id)
                 .await?
@@ -1369,7 +1395,8 @@ impl ReferenceAuthorizer<'_> {
                 return Err(another_surfaces_key(secret_id));
             }
         }
-        Ok(())
+        let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, secret_id);
+        self.revoked_key(secret_id, surface_ids, listing, kept)
     }
 }
 
@@ -1965,7 +1992,14 @@ pub(crate) fn judge_provider_keys(
 pub(crate) async fn provider_key_owners(
     state: &IdentityApiState
 ) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    provider_key_owners_in(
+    provider_key_listing(state)
+        .await
+        .map(|listing| listing.owners)
+}
+
+/// The [`KeyListing`] of the API key store; a key folder that could not be loaded is left out.
+async fn provider_key_listing(state: &IdentityApiState) -> Result<KeyListing, SurfaceApiError> {
+    provider_key_listing_in(
         state
             .api_key_store
             .as_deref()
@@ -2037,11 +2071,11 @@ impl From<std::collections::HashMap<String, Vec<String>>> for KeyListing {
     }
 }
 
-/// [`provider_key_owners`] read from `store`. A key folder that could not be loaded is left out.
-pub(crate) async fn provider_key_owners_in(
+/// The [`KeyListing`] of `store`. A key folder that could not be loaded is left out.
+pub(crate) async fn provider_key_listing_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    key_listing(store.list_all().await).map(|listing| listing.owners)
+) -> Result<KeyListing, SurfaceApiError> {
+    key_listing(store.list_all().await)
 }
 
 /// The [`KeyListing`] of `store`, an error when the keys of an agent could not be loaded.
@@ -2201,6 +2235,10 @@ fn another_surfaces_key(key_id: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!(
         "API key '{key_id}' belongs to another surface; a surface names only its own API keys"
     ))
+}
+
+fn revoked_key(key_id: &str) -> SurfaceApiError {
+    SurfaceApiError::BadRequest(format!("API key '{key_id}' is revoked; name an active API key of this surface"))
 }
 
 fn unavailable(label: &str) -> SurfaceApiError {

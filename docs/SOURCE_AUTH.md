@@ -1222,8 +1222,16 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   Identity is From API Key, when a key of that id belongs to another surface. Such a secret takes
   that key's DID, so it is held to the same rule as naming the key. One the stored surface
   already named is kept under `warn` and refused under `enforce`. An id no key has is a plain
-  secret. A key whose owning surface was deleted is not checked: such a secret is accepted in
-  either mode, unlike an Identity naming that key.
+  secret. A key whose owning surface was deleted is not checked for its owner: such a secret is
+  accepted in either mode, unlike an Identity naming that key, unless the key is revoked (deleting
+  a surface revokes its keys), which the next rule refuses;
+- a new reference, in an Identity slot, a Transit Point or such a Caller Context secret, to a
+  revoked key of the surface's own: "API key '<key id>' is revoked; name an active API key of this
+  surface", in either mode. The rules above run first, so a revoked key the surface may not name
+  for another reason answers with that rule's message, and a revoked key whose owning surface was
+  deleted with "API-key parent Surface reference is not accessible"; neither tells the key's
+  status. One the stored surface already named is kept, so a GET→PUT of that surface saves; the
+  surface stays [not ready](#provider-keys-when-a-surface-goes-live) until it names an active key.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
