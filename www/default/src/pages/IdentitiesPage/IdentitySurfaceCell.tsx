@@ -1,5 +1,4 @@
 import React from 'react';
-import { Badge } from '../../components/shared/Badge';
 import type { CredentialPrincipal } from '../../types';
 import { CredentialPrincipalLabel } from './IdentityNameCell';
 import type { SurfaceLink } from './useIdentityRows';
@@ -21,20 +20,12 @@ export const SurfaceLinkButton: React.FC<SurfaceLinkButtonProps> = ({
   if (surface.archived) {
     return (
       <span
-        className="d-inline-flex align-items-center flex-nowrap"
+        className="text-muted"
+        title={surface.id}
+        style={style}
         data-testid="identities-surface-archived"
       >
-        <span className="text-muted" title={surface.id} style={style}>
-          {surface.name}
-        </span>
-        <Badge
-          tone="secondary"
-          size="sm"
-          value="Deleted"
-          className="ms-1"
-          title="This agent surface has been deleted"
-          data-testid="identities-surface-deleted-badge"
-        />
+        {surface.name}
       </span>
     );
   }
