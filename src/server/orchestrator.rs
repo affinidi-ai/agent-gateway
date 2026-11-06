@@ -1500,6 +1500,7 @@ pub async fn run_axum_proxy(
                 .clone()
                 .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
         );
+        crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(&identity_state).await;
         let mut provider_key_listing = None;
         if let Some(ref surface_store) = agent_surface_store {
             match surface_store.list_all().await {
@@ -4560,6 +4561,7 @@ async fn rederive_planes_on_activation(
         warn!("API key store refresh on activation failed: {e}");
     }
     crate::payments_ledger::reload_global().await;
+    crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(identity_state).await;
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state

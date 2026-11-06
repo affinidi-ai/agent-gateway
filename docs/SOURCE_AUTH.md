@@ -1319,6 +1319,28 @@ keys is checked again on its next request.
   cannot be read is logged as an error naming the surface and its keys stay active. A key record
   in the folder that names another surface as its owner is not revoked by the delete, and keeps
   the id taken.
+- In either mode, when the gateway boots Active or a Standby node becomes Active, it revokes
+  the keys of surfaces deleted before deletes revoked them: every active key whose owning
+  surface no longer exists, under the actor `surface-delete`, keeping the keys. It logs one
+  `INFO` line with the count; each revoked key is logged as a delete revokes it. It never
+  revokes a key whose owner any of these holds: a file in the agent surface folder, by name,
+  whether or not it can be read; the agent surface store, at any status; the static gateway
+  configuration; the DynamoDB configuration source, read again for this; or an API Key
+  Provider `agent_id` any of those surfaces names, in its base, variants or Transit Points; a
+  surface delete revokes the deleted surface's keys even when a provider names its id. It
+  also keeps the keys of an owner whose newest key was created within
+  `cache_refresh_interval_secs` (30 seconds when it is `0`), since its surface may exist on
+  another node sharing the storage and not be visible here yet; those keys wait for the next
+  activation. It revokes nothing, with a `WARN`, when the keys cannot all be read, the agent
+  surface folder cannot be read, the DynamoDB source cannot be read, a surface's variants
+  cannot be resolved, the configuration source is neither `local` nor `dynamodb`, or no
+  surface is found at all (the folder, the store, the static configuration and the DynamoDB
+  source hold none), which the `WARN` reports naming the agent surface folder, as when
+  `storage_paths.agent_surfaces` points at the wrong or an unmounted folder. It reads the keys
+  before the surfaces, so a surface created meanwhile, whose keys can only follow it, is seen.
+  A Standby node revokes nothing, a node that steps down while the sweep runs stops before the
+  next owner, and a configuration reload does not run it. A key a concurrent delete revoked
+  first is left as it is, without an error. A second run revokes nothing more.
 - In either mode, a new surface cannot take an id whose key folder holds any key record,
   readable or not, such as the kept keys of a deleted surface: the create answers `400` "Surface
   ID '…' is not available". The create reads only the key folder of that id, from disk; when

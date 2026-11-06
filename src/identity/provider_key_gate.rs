@@ -61,7 +61,7 @@ const MISSING_KEY_RECHECK: std::time::Duration = std::time::Duration::from_secs(
 
 /// How long a key id is kept as judged: `cache_refresh_interval_secs` when set, the interval at
 /// which this node's stores pick up other nodes' writes, else [`MISSING_KEY_RECHECK`].
-fn missing_key_recheck() -> std::time::Duration {
+pub(crate) fn missing_key_recheck() -> std::time::Duration {
     match crate::storage::filesystem::cache_refresh_interval_secs() {
         0 => MISSING_KEY_RECHECK,
         secs => std::time::Duration::from_secs(secs),

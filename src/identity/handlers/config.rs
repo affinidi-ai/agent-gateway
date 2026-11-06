@@ -154,6 +154,24 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     Ok((channels_count, surfaces_count, is_fallback, warning))
 }
 
+/// The gateway configuration stored in the DynamoDB table of `bootstrap`, read now; an error
+/// when no table is named or the table cannot be read.
+pub(crate) async fn load_dynamodb_config(bootstrap: &crate::config::BootstrapConfig) -> anyhow::Result<GatewayConfig> {
+    let table_name = bootstrap
+        .dynamodb_table
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DynamoDB table name not specified"))?;
+    info!("Reading channels from DynamoDB table: {}", table_name);
+    crate::storage::DynamoDbConfigStore::new(
+        table_name.clone(),
+        bootstrap.aws_region.clone(),
+        bootstrap.aws_profile.clone(),
+    )
+    .await?
+    .load_config()
+    .await
+}
+
 /// Build the base `GatewayConfig` from the configured channel source
 /// (DynamoDB or the local filesystem channel store).
 async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Arc<GatewayConfig>> {
@@ -163,34 +181,8 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
         .as_str()
     {
         "dynamodb" => {
-            let table_name = match state
-                .bootstrap_config
-                .dynamodb_table
-                .as_ref()
-            {
-                Some(name) => name,
-                None => {
-                    return Err(anyhow::anyhow!("DynamoDB table name not specified"));
-                }
-            };
-
-            info!("Reloading channels from DynamoDB table: {}", table_name);
-
             async {
-                let store = crate::storage::DynamoDbConfigStore::new(
-                    table_name.clone(),
-                    state
-                        .bootstrap_config
-                        .aws_region
-                        .clone(),
-                    state
-                        .bootstrap_config
-                        .aws_profile
-                        .clone(),
-                )
-                .await?;
-
-                let mut config = store.load_config().await?;
+                let mut config = load_dynamodb_config(&state.bootstrap_config).await?;
                 crate::config::fall_back_to_first_source_auth_methods_in_memory(&mut config.surfaces);
 
                 info!("Using TLS, A2A, logging, and extension inspection configurations from bootstrap config");

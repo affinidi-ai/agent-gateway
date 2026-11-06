@@ -3111,6 +3111,84 @@ async fn deleting_a_surface_revokes_a_key_another_node_created_after_boot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn booting_active_revokes_only_the_active_keys_of_surfaces_that_no_longer_exist() {
+    const ORPHANED: &str = "atgk_00000000000000000000000000000f01";
+    const STORED: &str = "atgk_00000000000000000000000000000f02";
+    const UNREADABLE_OWNER: &str = "atgk_00000000000000000000000000000f03";
+    const REVOKED: &str = "atgk_00000000000000000000000000000f04";
+    let mut key_dir = None;
+    let mut revoked_at = None;
+    let _harness = GatewayHarness::start(|_, _, bootstrap| {
+        key_dir = Some(api_keys_dir(bootstrap));
+        let seed_old_key = |owner: &str, key_id: &str| {
+            seed_api_key(bootstrap, owner, key_id);
+            let path = api_keys_dir(bootstrap)
+                .join(owner)
+                .join(format!("{key_id}.json"));
+            let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record["created_at"] = json!("2026-01-01T00:00:00Z");
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        };
+        seed_old_key("deleted-before-upgrade", ORPHANED);
+        seed_api_key(bootstrap, "deleted-just-now", "atgk_00000000000000000000000000000f05");
+        write_stored_surface(bootstrap, "stored-key-owner", json!({}));
+        seed_old_key("stored-key-owner", STORED);
+        std::fs::write(
+            std::path::Path::new(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            )
+            .join("unreadable-owner.json"),
+            b"{\"surface_id\": }",
+        )
+        .unwrap();
+        seed_old_key("unreadable-owner", UNREADABLE_OWNER);
+        seed_old_key("revoked-before-upgrade", REVOKED);
+        revoked_at = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::api_keys::store::ApiKeyStore as _;
+                let store = other_node_key_store(&api_keys_dir(bootstrap)).await;
+                store
+                    .revoke("revoked-before-upgrade", REVOKED, "component-test")
+                    .await
+                    .unwrap();
+                store
+                    .get_record("revoked-before-upgrade", REVOKED)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revoked_at
+            })
+        });
+    })
+    .await;
+    let key_dir = key_dir.unwrap();
+
+    use crate::api_keys::ApiKeyStatus::{Active, Revoked};
+    assert_eq!(stored_key_status(&key_dir, "deleted-before-upgrade", ORPHANED).await, Revoked);
+    assert_eq!(stored_key_status(&key_dir, "stored-key-owner", STORED).await, Active);
+    assert_eq!(
+        stored_key_status(&key_dir, "deleted-just-now", "atgk_00000000000000000000000000000f05").await,
+        Active,
+        "a key created within the recheck window is kept, as its surface may not be visible yet"
+    );
+    assert_eq!(
+        stored_key_status(&key_dir, "unreadable-owner", UNREADABLE_OWNER).await,
+        Active,
+        "a surface file that cannot be read still owns its keys"
+    );
+    use crate::api_keys::store::ApiKeyStore as _;
+    let revoked = other_node_key_store(&key_dir)
+        .await
+        .get_record("revoked-before-upgrade", REVOKED)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((revoked.status, revoked.revoked_at), (Revoked, revoked_at), "an already revoked key is untouched");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_surface_whose_key_folder_cannot_be_read_still_deletes_it() {
     use crate::api_keys::store::ApiKeyStore as _;
     use std::os::unix::fs::PermissionsExt as _;

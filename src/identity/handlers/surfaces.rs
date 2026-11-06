@@ -4427,43 +4427,14 @@ pub async fn patch_variant(
     ))
 }
 
-/// The actor a deleted surface's API keys are revoked under.
-const SURFACE_DELETE_ACTOR: &str = "surface-delete";
-
-/// Revokes every active API key of the deleted surface `surface_id`, read from its key folder on
-/// disk so keys another node created are revoked too. The keys are kept, so the surface id still
-/// owns them and cannot be taken by a new surface. A folder that cannot be read, or a key that
-/// cannot be revoked, is logged.
+/// Revokes every active API key of the deleted surface `surface_id`
+/// ([`super::deleted_surface_api_keys::revoke_api_keys_of`]).
 async fn revoke_api_keys_of_deleted_surface(
     state: &IdentityApiState,
     surface_id: &str,
 ) {
-    let Some(api_keys) = state.api_key_store.as_deref() else {
-        return;
-    };
-    let keys = match api_keys
-        .list_from_disk(surface_id)
-        .await
-    {
-        Ok(keys) => keys,
-        Err(error) => {
-            error!(surface = %surface_id, %error, "Could not read the API keys of a deleted surface to revoke them");
-            return;
-        }
-    };
-    for key in keys
-        .into_iter()
-        .filter(|key| key.agent_id == surface_id && key.status == crate::api_keys::ApiKeyStatus::Active)
-    {
-        match api_keys
-            .revoke(surface_id, &key.key_id, SURFACE_DELETE_ACTOR)
-            .await
-        {
-            Ok(()) => crate::identity::provider_key_gate::gate().key_changed(&key.key_id),
-            Err(error) => {
-                error!(surface = %surface_id, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface")
-            }
-        }
+    if let Some(api_keys) = state.api_key_store.as_deref() {
+        super::deleted_surface_api_keys::revoke_api_keys_of(api_keys, surface_id).await;
     }
 }
 

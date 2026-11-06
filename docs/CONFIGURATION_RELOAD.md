@@ -228,7 +228,9 @@ Also on becoming Active, before it reloads its configuration, a node reconciles 
 policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
 created, rotated or revoked while this node was Standby therefore authenticate, or stop
 authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
-held.
+held. The node then revokes the API keys of surfaces that no longer exist, as it does when it
+boots Active; a Standby node and a configuration reload revoke none (see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)).
 
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
