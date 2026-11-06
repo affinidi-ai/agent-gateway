@@ -35,6 +35,17 @@ then
   echo "🔑 Generated local backup encryption key (${backup_key_file})"
 fi
 
+# Generate a persistent master key (hex, 32 bytes) for encryption at rest. Every
+# environment scripts/_prepare.sh creates encrypts its storage with it. Keep it:
+# without it the storage it encrypted cannot be read.
+master_key_file="${envs_dir}/master_encryption_key"
+if [[ ! -s "${master_key_file}" ]]
+then
+  (umask 077 && openssl rand -hex 32 > "${master_key_file}")
+  chmod 600 "${master_key_file}"
+  echo "🔑 Generated local master encryption key (${master_key_file})"
+fi
+
 if [[ ! -f "${envs_dir}/certs/cert.pem" ]]
 then
   cd "${envs_dir}"

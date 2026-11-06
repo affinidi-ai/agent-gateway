@@ -31,6 +31,7 @@ container_id=$(docker run \
     --env AWS_REGION \
     --env AG_IDENTITY_HASH_PEPPER \
     --env AG_BACKUP_ENCRYPTION_KEY \
+    --env AG_MASTER_KEY \
     --workdir /app \
 	"${tag}")
 
