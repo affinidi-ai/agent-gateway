@@ -210,7 +210,7 @@ describe('SecretsPage API key delete', () => {
 
     const dialog = screen.getByTestId('api-key-delete-dialog');
     expect(dialog).toHaveTextContent('client-a');
-    expect(dialog).toHaveTextContent('stops serving requests until you select another API key');
+    expect(dialog).toHaveTextContent('will stop working until you pick another key');
     expect(screen.getByRole('dialog', { name: 'Delete API key' })).toBe(dialog);
     const confirm = screen.getByTestId('api-key-delete-dialog-confirm');
     expect(confirm).toBeEnabled();

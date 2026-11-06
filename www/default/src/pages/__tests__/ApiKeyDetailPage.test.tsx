@@ -75,7 +75,7 @@ describe('ApiKeyDetailPage delete', () => {
 
     const dialog = screen.getByTestId('api-key-delete-dialog');
     expect(dialog).toHaveTextContent('client-a');
-    expect(dialog).toHaveTextContent('becomes Unconfigured');
+    expect(dialog).toHaveTextContent('Surfaces that use it will stop working');
     const confirm = screen.getByTestId('api-key-delete-dialog-confirm');
     expect(confirm).toBeEnabled();
     expect(apiClient.deleteApiKey).not.toHaveBeenCalled();

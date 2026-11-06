@@ -59,7 +59,7 @@ test.describe('API key delete confirmation', () => {
             dialog.locator('.modal-title i.fa-triangle-exclamation.text-danger'),
         ).toBeVisible();
         await expect(dialog).toContainText('delete-client');
-        await expect(dialog).toContainText('becomes Unconfigured');
+        await expect(dialog).toContainText('Surfaces that use it will stop working');
         const confirm = page.getByTestId('api-key-delete-dialog-confirm');
         await expect(confirm).toBeEnabled();
         expect(deletes).toHaveLength(0);
