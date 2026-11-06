@@ -108,8 +108,13 @@ update that changes the redirect URI, refuse with `400`:
   `provider_id` on the gateway's own host keeps it, and another tenant's provider of that
   `provider_id` needs a `callback_url` on a host of its own.
 
-An update that keeps the stored redirect URI is not checked against these rules, so a stored
-provider that breaks them can still be renamed or otherwise edited before it is fixed.
+Create, and an update that changes either, also refuse with `400` an `authorization_endpoint` or
+`additional_params` that break the rules in [The start page](#the-start-page). A provider without
+an `authorization_endpoint` is accepted but gets no consent link.
+
+An update that keeps the stored redirect URI, or the stored `authorization_endpoint` and
+`additional_params`, is not checked against those rules, so a stored provider that breaks them
+can still be renamed or otherwise edited before it is fixed.
 
 A stored provider that breaks either rule gets no consent link (the binding is unavailable, see
 [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved)) and is refused at the
