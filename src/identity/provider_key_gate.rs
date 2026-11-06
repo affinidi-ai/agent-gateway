@@ -352,6 +352,15 @@ impl ProviderKeyGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Sources { api_keys, surfaces };
     }
 
+    /// The API key store verdicts read keys from, when one is set.
+    pub fn api_key_store(&self) -> Option<Arc<dyn crate::api_keys::store::ApiKeyStore>> {
+        self.sources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .api_keys
+            .clone()
+    }
+
     /// Judges `surface` as it goes live, in its base and every variant, replacing any verdict
     /// kept for it, and logs what it may not use.
     pub async fn admit(

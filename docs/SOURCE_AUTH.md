@@ -1655,20 +1655,29 @@ issuing a managed identity. A DID first issued
 to a caller keeps its External Caller origin when the same key later becomes a Managed
 Agent's key, so it is never named; issue that Managed Agent a new key.
 
-#### Archived identities
+#### Revoked identities
 
-The dashboard identity list marks an identity `archived` when it is linked to at least one
-surface, through the surface it was created or last used on or any surface in its usage, and
-none of those surfaces exists any more. The flag is computed on every list and never stored, so
-an identity whose surface id comes back is no longer archived. An identity with no surface link
-is never archived, and when the surface store cannot be listed nothing is archived. When the
-surface an identity was created or last used on is deleted but another surface in its usage
-is live, the list shows the most recently used live surface (ties broken by surface id) as the
-identity's surface, so a deleted surface is never linked. The
-identity record keeps no surface name, so the Identities page shows the surface id of an
-archived identity, as plain text marked Deleted, beside an Archived badge on the identity. A dashboard update re-sends the
-identities a surface delete on this node archived; one deleted on another node shows on the
-next full load.
+The dashboard identity list marks an identity `revoked` when the API key its DID comes from is
+revoked or deleted, or when every surface it is linked to was deleted, whatever its DID comes
+from. Both are computed on every list and never stored.
+
+- The API key is the identity's `api_key_id` credential principal; an identity with a
+  `certificate_id` has none. A key is deleted when its id has the `atgk_` prefix and no key
+  record has it, so a plain secret id never reads as deleted. The keys are read from one
+  complete listing of the API key store; when it is not set or a key folder cannot be read, no
+  identity is marked revoked for its key.
+- An identity is linked to a surface through the surface it was created or last used on and
+  every surface in its usage. It is marked `surface_deleted` when it has at least one such link
+  and none of those surfaces exists; an identity with no surface link never is, and when the
+  surface store cannot be listed none is. When the surface it was created or last used on is
+  deleted but another surface in its usage is live, the list shows the most recently used live
+  surface (ties broken by surface id) as the identity's surface, so a deleted surface is never
+  linked. The identity record keeps no surface name, so the Identities page shows the surface id
+  of a deleted surface as plain text marked Deleted.
+
+The Identities page shows a red Revoked badge on a revoked identity. A dashboard update re-sends
+the identities whose API key this node revoked or deleted, and those whose last surface this
+node deleted; a change made on another node shows on the next full load.
 
 #### Agent Card names
 

@@ -19,18 +19,18 @@ const renderModal = (value: Record<string, unknown>) =>
     </MemoryRouter>
   );
 
-describe('IdentityDetailsModal archived identity', () => {
-  it('explains that an archived identity is no longer in use', () => {
-    renderModal({ ...identity, archived: true });
+describe('IdentityDetailsModal revoked identity', () => {
+  it('explains that an identity whose API key was revoked or deleted is no longer in use', () => {
+    renderModal({ ...identity, revoked: true });
 
-    expect(screen.getByTestId('identity-archived-info')).toHaveTextContent(
-      'This identity is no longer in use because the associated surface has been deleted.'
+    expect(screen.getByTestId('identity-revoked-info')).toHaveTextContent(
+      'This identity is no longer in use: its API key was revoked or deleted, or its surface was deleted.'
     );
   });
 
-  it('shows no archived message for an identity in use', () => {
+  it('shows no revoked message for an identity in use', () => {
     renderModal(identity);
 
-    expect(screen.queryByTestId('identity-archived-info')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('identity-revoked-info')).not.toBeInTheDocument();
   });
 });

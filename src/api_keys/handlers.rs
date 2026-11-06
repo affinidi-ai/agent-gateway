@@ -359,6 +359,7 @@ pub async fn revoke_key(
     {
         Ok(()) => {
             crate::identity::provider_key_gate::gate().key_changed(&key_id);
+            crate::observability::dashboard::record_api_key_withdrawn(&key_id);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => e.into_response(),
@@ -441,6 +442,7 @@ pub async fn delete_key(
     {
         Ok(()) => {
             crate::identity::provider_key_gate::gate().key_changed(&key_id);
+            crate::observability::dashboard::record_api_key_withdrawn(&key_id);
             info!(
                 actor = %actor,
                 agent_id = %agent_id,

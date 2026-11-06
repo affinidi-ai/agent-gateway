@@ -83,14 +83,14 @@ describe('useIdentityRows managed surfaces', () => {
 
   it('links every managed surface of a shared managed DID, not its last-used surface', () => {
     expect(rows([shared]).surfaceLinksFor(shared)).toEqual([
-      { id: 's-alpha', name: 'alpha', archived: false },
-      { id: 's-bravo', name: 'bravo', archived: false },
+      { id: 's-alpha', name: 'alpha', deleted: false },
+      { id: 's-bravo', name: 'bravo', deleted: false },
     ]);
   });
 
   it('links the one surface of a single-surface DID', () => {
     expect(rows([single]).surfaceLinksFor(single)).toEqual([
-      { id: 's-charlie', name: 'charlie', archived: false },
+      { id: 's-charlie', name: 'charlie', deleted: false },
     ]);
   });
 
@@ -112,7 +112,7 @@ describe('useIdentityRows managed surfaces', () => {
       channel_name: 'delta',
     };
     expect(rows([legacy]).surfaceLinksFor(legacy)).toEqual([
-      { id: 's-delta', name: 'delta', archived: false },
+      { id: 's-delta', name: 'delta', deleted: false },
     ]);
   });
 
@@ -150,28 +150,30 @@ describe('useIdentityRows surface link', () => {
     expect(surfaceLinkFor({ surface_id: 'oxygen', surface_name: 'Old' })).toEqual({
       id: 'oxygen',
       name: 'OXYGEN',
-      archived: false,
+      deleted: false,
     });
   });
 
-  it('marks the surface of an archived identity and keeps its last known name', () => {
-    expect(surfaceLinkFor({ surface_id: 'gone', surface_name: 'GONE', archived: true })).toEqual({
+  it('marks a deleted surface and keeps its last known name', () => {
+    expect(
+      surfaceLinkFor({ surface_id: 'gone', surface_name: 'GONE', surface_deleted: true })
+    ).toEqual({
       id: 'gone',
       name: 'GONE',
-      archived: true,
+      deleted: true,
     });
   });
 
-  it('falls back to the surface id of an archived identity without a name', () => {
-    expect(surfaceLinkFor({ surface_id: 'gone', archived: true })).toEqual({
+  it('falls back to the id of a deleted surface without a name', () => {
+    expect(surfaceLinkFor({ surface_id: 'gone', surface_deleted: true })).toEqual({
       id: 'gone',
       name: 'gone',
-      archived: true,
+      deleted: true,
     });
-    expect(surfaceLinkFor({ channel_config_id: 'gone', archived: true })).toEqual({
+    expect(surfaceLinkFor({ channel_config_id: 'gone', surface_deleted: true })).toEqual({
       id: 'gone',
       name: 'gone',
-      archived: true,
+      deleted: true,
     });
   });
 });

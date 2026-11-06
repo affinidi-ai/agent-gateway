@@ -199,7 +199,10 @@ export interface Identity {
   display_name_pending?: boolean;
   surface_id?: string;
   surface_name?: string;
-  archived?: boolean;
+  // Every surface this identity is linked to was deleted.
+  surface_deleted?: boolean;
+  // The API key this identity's DID comes from is revoked or deleted.
+  revoked?: boolean;
   credential_principal?: CredentialPrincipal;
   // Every live surface where this DID is the managed agent, sorted by name; omitted when empty.
   managed_surfaces?: ManagedSurfaceRef[];
