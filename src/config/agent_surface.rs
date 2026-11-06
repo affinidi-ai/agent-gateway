@@ -470,11 +470,14 @@ pub enum SurfaceProtocol {
 }
 
 /// Caller authentication configuration.
-/// Only the first method is enforced; see [`AgentSurface::source_auth`].
+/// Each request is verified by the one method whose credential it carries,
+/// or by the first method when it carries none. A request carrying
+/// credentials for more than one method fails as `ambiguous_credentials`;
+/// see [`AgentSurface::source_auth_for_request`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallerAuthentication {
-    /// Authentication methods. Only the first is enforced.
+    /// Authentication methods, the first being the primary method.
     pub methods: Vec<SourceAuthConfig>,
     /// RFC 9728 discovery for an MCP Access Point whose JWT Bearer method
     /// accepts tokens from an external authorization server.
@@ -718,6 +721,18 @@ pub struct Target {
     /// to a `fabric://` peer on modern MCP requests. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fabric_delegated_credentials: bool,
+
+    /// Releases the per-user grants of this Target's `outbound_credentials`
+    /// to a legacy Fabric request, for the caller the surface's own
+    /// `source_auth` or resource token verified, while that caller
+    /// authentication tells a partner's users apart
+    /// ([`AgentSurface::fabric_caller_authentication_gap`]). A view that sets
+    /// it keeps each person's grant under the surface, for legacy direct and
+    /// Fabric callers alike. Off by default, when a per-user binding refuses
+    /// every Fabric request it applies to. It has no effect on a Target that
+    /// is not an HTTP or HTTPS URL ([`AgentSurface::target_is_http_url`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated_credentials_for_fabric_callers: bool,
 }
 
 /// Payment policy configuration.
@@ -1854,14 +1869,13 @@ pub struct TransitPoint {
     /// resource token verified on that request. Off by default, when such a
     /// call gets none. Only a Transit Point that requires the transit token
     /// may set it.
-    /// The admin API refuses it on a surface whose caller authentication
-    /// cannot tell a partner's users apart
+    /// The admin API saves it with a `Warning` on a surface whose caller
+    /// authentication cannot tell a partner's users apart
     /// ([`AgentSurface::fabric_caller_authentication_gap`]), such as an API
     /// key, where every request from that partner, and every direct caller
-    /// with a key in the same secret, has the same key. A surface stored with
-    /// it otherwise releases nothing to partners: the receiving surface puts
-    /// no principal in the token, and the Transit Point checks its own view
-    /// again.
+    /// with a key in the same secret, has the same key. Such a surface releases
+    /// nothing to partners: the receiving surface puts no principal in the
+    /// token, and the Transit Point checks its own view again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegated_credentials_for_fabric_callers: bool,
 
@@ -3419,6 +3433,13 @@ pub fn endpoint_runs_target_trust_checks(endpoint: &str) -> bool {
     endpoint.starts_with(A2A_PROXY_ENDPOINT_PREFIX) || endpoint.starts_with("fabric://")
 }
 
+/// Whether `endpoint` is an `http://` or `https://` URL exactly as written: a
+/// lower-case scheme with nothing before it. Fabric receive dials only such a
+/// URL through a client pinned to the address it vetted.
+pub fn endpoint_is_http_url(endpoint: &str) -> bool {
+    endpoint.starts_with("http://") || endpoint.starts_with("https://")
+}
+
 impl Target {
     /// Validate target-leg trust_check_list invariants.
     pub fn validate(&self) -> Result<(), TrustCheckValidationError> {
@@ -3633,6 +3654,12 @@ impl AgentSurface {
         self.target
             .endpoint
             .starts_with(A2A_PROXY_ENDPOINT_PREFIX)
+    }
+
+    /// True when requests are dispatched to an A2A proxy: an A2A or AP2 Access Point with an
+    /// `a2a-proxy://` Target.
+    pub fn dispatches_to_a2a_proxy(&self) -> bool {
+        self.uses_a2a_settings() && self.is_a2a_proxy_target()
     }
 
     /// The A2A settings requests on this surface are served with: the stored
@@ -3926,7 +3953,9 @@ impl AgentSurface {
             .collect()
     }
 
-    fn authenticates_callers(&self) -> bool {
+    /// Whether the Access Point checks its callers: at least one caller authentication method,
+    /// or a resource access token (`mcp_http.authorization`).
+    pub fn authenticates_callers(&self) -> bool {
         self.has_source_auth()
             || self
                 .mcp_http
@@ -6215,6 +6244,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -6293,6 +6323,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: Some(TransitConfig {
                 points: vec![
@@ -6392,6 +6423,37 @@ mod tests {
             surface
                 .find_transit_point("nonexistent")
                 .is_none()
+        );
+    }
+
+    /// A Target releases no per-user grant to Fabric callers unless it says
+    /// so, and the switch is stored only when set, so a surface saved without
+    /// it reads the same on a release that does not know it.
+    #[test]
+    fn target_fabric_caller_release_defaults_off_and_is_omitted_when_off() {
+        let off: Target = serde_json::from_value(serde_json::json!({ "endpoint": "https://agent.example" })).unwrap();
+        assert!(!off.delegated_credentials_for_fabric_callers);
+        assert!(
+            serde_json::to_value(&off)
+                .unwrap()
+                .get("delegated_credentials_for_fabric_callers")
+                .is_none()
+        );
+
+        let on: Target = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://agent.example", "delegated_credentials_for_fabric_callers": true
+        }))
+        .unwrap();
+        assert!(on.delegated_credentials_for_fabric_callers);
+        assert!(!on.fabric_delegated_credentials, "independent of the switch that sends grants to a peer");
+        assert_eq!(serde_json::to_value(&on).unwrap()["delegated_credentials_for_fabric_callers"], true);
+
+        assert!(
+            serde_json::from_value::<Target>(serde_json::json!({
+                "endpoint": "https://agent.example", "delegated_credentials_for_fabric_caller": true
+            }))
+            .is_err(),
+            "a misspelt switch is refused, not read as off"
         );
     }
 

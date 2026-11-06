@@ -18,7 +18,8 @@ use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
-/// Validates the resources a surface references. A tenant surface may not send an
+/// Validates the resources a surface references and the rules its Target authentication
+/// must meet. A tenant surface may not send an
 /// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
 /// credential of a provider holding a secret outside the provider's tenant: a reference that
 /// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
@@ -58,7 +59,7 @@ pub async fn validate_surface_references(
     };
 
     for reference in collect_surface_reference_keys(surface)? {
-        if reference.custom_metadata && surface.tenant_id.is_none() {
+        if !reference.is_checked_on(surface) {
             continue;
         }
         authorizer
@@ -68,8 +69,13 @@ pub async fn validate_surface_references(
     authorizer
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
-    validate_target_auth_methods(state, surface).await
+    validate_target_auth_methods(state, surface).await?;
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
+    super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
+
+pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
+    "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent";
 
 /// The target authentication methods of every Target and Transit Point, in every
 /// variant, must be usable: `credential_lookup` was never implemented, and a provider
@@ -109,9 +115,7 @@ async fn validate_target_auth_methods(
                         .map_err(|error| internal("Credential provider", error))?
                         .ok_or_else(|| inaccessible("Credential provider"))?;
                     if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
-                        return Err(SurfaceApiError::BadRequest(
-                            "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent".into(),
-                        ));
+                        return Err(SurfaceApiError::BadRequest(TARGET_AUTH_NEEDS_CONSENT.into()));
                     }
                 }
             }
@@ -685,6 +689,26 @@ pub(crate) struct SurfaceReferenceKey {
     /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
     /// any secret there, even one that does not exist.
     pub custom_metadata: bool,
+}
+
+impl SurfaceReferenceKey {
+    /// Whether a save of `surface` checks this reference: every one but a `custom_metadata`
+    /// one of a surface with no tenant.
+    fn is_checked_on(
+        &self,
+        surface: &AgentSurface,
+    ) -> bool {
+        !(self.custom_metadata && surface.tenant_id.is_none())
+    }
+}
+
+/// The secrets a save of `surface` requires to exist.
+pub(crate) fn checked_secret_ids(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
+    Ok(collect_surface_reference_keys(surface)?
+        .into_iter()
+        .filter(|reference| reference.kind == ResourceKind::Secrets && reference.is_checked_on(surface))
+        .map(|reference| reference.id)
+        .collect())
 }
 
 pub(crate) fn collect_surface_reference_keys(
@@ -2053,7 +2077,7 @@ fn endpoint_id<'a>(
         .filter(|id| !id.is_empty())
 }
 
-fn inaccessible(label: &str) -> SurfaceApiError {
+pub(super) fn inaccessible(label: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!("{label} reference is not accessible"))
 }
 
@@ -2061,7 +2085,7 @@ fn unavailable(label: &str) -> SurfaceApiError {
     SurfaceApiError::InternalError(format!("{label} store is not configured"))
 }
 
-fn internal(
+pub(super) fn internal(
     label: &str,
     error: impl std::fmt::Display,
 ) -> SurfaceApiError {

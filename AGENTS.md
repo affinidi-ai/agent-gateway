@@ -113,6 +113,11 @@ saved surface's Target is asked by `surface_id` under the forward step's egress 
 select-all, Select all and Clear over the filtered list. See _Payment_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Managed Agent panel's **Release per-user grants to Fabric callers** switch writes
+`target.delegated_credentials_for_fabric_callers`, off by default, and is shown only for an HTTP
+or HTTPS Target on a surface with credential bindings, with a warning while on; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
 does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
 Transit Point element's **Who can call this Transit Point** section sets the transit token, a
@@ -191,10 +196,11 @@ a setting the operator switched off in the same PUT; see _Authorization server d
 [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Access Point panel's **Public access** switch writes `access_point.public`. A closed
-surface with no Caller Context saves but is not ready, shown as "Not ready for external
-access" under the Access Point URL with a **Configure Authentication** action. Saving a public
-surface, a not-ready one, or a surface without `public` and without a Caller Context, warns
-after the save; see
+surface with no Caller Context saves but is not ready (unless it sends a Target credential,
+or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is `enforce`,
+which refuses the save), shown as "Not ready for external access" under the Access Point URL
+with a **Configure Authentication** action. Saving a public surface, a not-ready one, or a
+surface without `public` and without a Caller Context, warns after the save; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

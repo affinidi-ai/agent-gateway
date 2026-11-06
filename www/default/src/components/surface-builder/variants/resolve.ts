@@ -58,6 +58,7 @@ const TARGET_FIELDS = [
   'mcp_identity_config',
   'fabric_target_name',
   'fabric_delegated_credentials',
+  'delegated_credentials_for_fabric_callers',
 ] as const;
 
 const SHARED_TRANSIT_FIELDS = [

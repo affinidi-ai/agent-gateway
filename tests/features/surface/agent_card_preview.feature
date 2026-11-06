@@ -21,7 +21,7 @@ Feature: Agent card preview
   Scenario: A target token the provider refuses is reported while the preview still answers
     Given the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider is refusing token requests
-    And the target authentication fallback is "reject"
+    And the gateway's authentication to the managed agent falls back to "reject"
     When the operator reads the agent card preview of the surface
     Then the agent card preview answers 200
     And the agent card preview field "fetch.status" is "failed"

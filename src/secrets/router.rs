@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 /// Create the secrets API router. When `gate` is `Some`, mutating routes are
 /// wrapped with RBAC enforcement (`SecretsEdit` / `SecretsDelete`). With
-/// `definitions`, a secret an integration endpoint references is not deleted.
+/// `definitions`, a secret an integration endpoint references is not deleted; one the records
+/// in `references` use is deleted only with `force=true`.
 pub fn create_secrets_router(
     secrets_store: Arc<dyn SecretsStore>,
     notification_store: Option<Arc<crate::integrations::FileSystemNotificationStore>>,
     secrets_cache: Option<crate::a2a::auth::SecretsCache>,
     definitions: Option<Arc<crate::integrations::definitions::DefinitionStores>>,
+    references: crate::credential_providers::references::ReferenceStores,
     gate: Option<RbacGuard>,
 ) -> Router {
     let g = gate.as_ref();
@@ -31,5 +33,7 @@ pub fn create_secrets_router(
         .layer(Extension(notification_store))
         .layer(Extension(secrets_cache))
         .layer(Extension(definitions))
+        .layer(Extension(references))
+        .layer(Extension(gate.clone()))
         .with_state(secrets_store)
 }

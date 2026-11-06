@@ -1862,12 +1862,18 @@ fn tool_call_failure(error: &rmcp_openapi::ToolCallError) -> String {
     }
 }
 
-/// The egress allow-list for an owned MCP Proxy's REST backend: the BDD
-/// allow-list in production, and the proxy's own loopback fixture in unit
-/// tests, whose refusal without it is covered by `modern_rest` and `egress`.
+/// The egress allow-list for an MCP Proxy's REST backend: the BDD allow-list in
+/// production, and in unit tests the proxy's own fixture when its host is a
+/// loopback IP literal, so a host name that resolves to loopback is still refused.
 fn rest_egress_allowlist(proxy: &McpProxy) -> Option<String> {
     if cfg!(test) {
-        return Some(proxy.base_url.clone());
+        return Url::parse(&proxy.base_url)
+            .ok()
+            .filter(|url| matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))))
+            .map(|url| {
+                url.origin()
+                    .ascii_serialization()
+            });
     }
     crate::egress::bdd_egress_allowlist()
 }
@@ -1879,7 +1885,7 @@ async fn process_modern_mcp_request(
     request: &crate::mcp::request_validation::ValidatedModernMessage,
     versions: crate::mcp::request_validation::McpVersionPolicy<'_>,
 ) -> Result<serde_json::Value, Box<crate::mcp::request_validation::McpRequestValidationError>> {
-    process_modern_mcp_request_with_headers(proxy, manager, request, versions, &HeaderMap::new(), None).await
+    process_modern_mcp_request_with_headers(proxy, manager, request, versions, &HeaderMap::new(), None, None).await
 }
 
 async fn process_modern_mcp_request_with_headers(
@@ -1889,6 +1895,7 @@ async fn process_modern_mcp_request_with_headers(
     versions: crate::mcp::request_validation::McpVersionPolicy<'_>,
     request_headers: &HeaderMap,
     target_headers: Option<&HeaderMap>,
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
 ) -> Result<serde_json::Value, Box<crate::mcp::request_validation::McpRequestValidationError>> {
     use crate::mcp::error_codes;
     use crate::mcp::modern::{complete_response, owned_discovery_response, require_active_version};
@@ -2063,6 +2070,7 @@ async fn process_modern_mcp_request_with_headers(
                 &config,
                 &content_type,
                 rest_egress_allowlist(proxy).as_deref(),
+                sent_token,
             ),
         )
         .await
@@ -2176,6 +2184,7 @@ pub(crate) async fn handle_modern_surface_http_request(
     prepared: reqwest::Request,
     client: &reqwest::Client,
     versions: crate::mcp::request_validation::McpVersionPolicy<'_>,
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
 ) -> Result<axum::response::Response, Box<crate::mcp::request_validation::McpRequestValidationError>> {
     use axum::response::IntoResponse;
     if request.method == "subscriptions/listen" {
@@ -2183,7 +2192,8 @@ pub(crate) async fn handle_modern_surface_http_request(
         proxy.mcp_http = surface.mcp_http.clone();
         return owned_modern_subscription(&proxy, request, versions);
     }
-    let message = handle_modern_surface_request(proxy, surface, request, prepared, client, versions).await?;
+    let message =
+        handle_modern_surface_request(proxy, surface, request, prepared, client, versions, sent_token).await?;
     let mut response = Json(message).into_response();
     response
         .headers_mut()
@@ -2198,6 +2208,7 @@ pub(crate) async fn handle_modern_surface_request(
     prepared: reqwest::Request,
     _client: &reqwest::Client,
     versions: crate::mcp::request_validation::McpVersionPolicy<'_>,
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
 ) -> Result<serde_json::Value, Box<crate::mcp::request_validation::McpRequestValidationError>> {
     crate::mcp::modern::require_active_version(request, versions)?;
     let mut proxy = proxy.clone();
@@ -2223,6 +2234,7 @@ pub(crate) async fn handle_modern_surface_request(
         versions,
         prepared.headers(),
         Some(prepared.headers()),
+        sent_token,
     )
     .await
 }
@@ -2559,7 +2571,9 @@ async fn owned_modern_http_response(
         };
     }
     let mut response =
-        match process_modern_mcp_request_with_headers(proxy, manager, request, versions, request_headers, None).await {
+        match process_modern_mcp_request_with_headers(proxy, manager, request, versions, request_headers, None, None)
+            .await
+        {
             Ok(message) => Json(message).into_response(),
             Err(error) => (*error).into_response(),
         };
@@ -2603,6 +2617,145 @@ pub(crate) fn owned_modern_subscription(
     )
 }
 
+/// Why [`prepare_mcp_request`] refused a request or [`execute_mcp_request`] answered no MCP result.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum McpProxyCallError {
+    /// A tool call that carries the Target credential would leave the MCP proxy's base path.
+    #[error("the tool call leaves the MCP proxy base path")]
+    OutsideTargetBase,
+    /// Any other failure, as a message that names no URL or argument value.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for McpProxyCallError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// The directory `rmcp_openapi` resolves a legacy MCP proxy's tool paths against: the
+/// base URL with `/` appended to its path when missing (`/v1/x/` for both `/v1/x` and
+/// `/v1/x/`), without its query or fragment.
+fn legacy_base_directory(base_url: &Url) -> Result<Url, url::ParseError> {
+    let mut base_url = base_url.clone();
+    if !base_url.path().ends_with('/') {
+        base_url.set_path(&format!("{}/", base_url.path()));
+    }
+    base_url.join(".")
+}
+
+/// Whether a tool call sent with these arguments would leave the proxy's base URL.
+/// The URL is built the way `rmcp_openapi` builds it: path parameters substituted
+/// unencoded, then resolved against the [`legacy_base_directory`]. Arguments it cannot use
+/// fail the call in `rmcp_openapi` before any request is sent, so they do not
+/// count as leaving. A path parameter value that names another path parameter's
+/// placeholder counts as leaving, since `rmcp_openapi` substitutes in hash-map
+/// order and may expand it.
+fn tool_call_leaves_base(
+    base_url: &Url,
+    tool: &rmcp_openapi::ToolMetadata,
+    arguments: &serde_json::Value,
+) -> bool {
+    let Ok(parameters) = rmcp_openapi::ToolGenerator::extract_parameters(tool, arguments) else {
+        return false;
+    };
+    let mut path = tool.path.clone();
+    for (name, value) in &parameters.path {
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+        let names_another = parameters
+            .path
+            .keys()
+            .any(|other| other != name && value.contains(&format!("{{{other}}}")));
+        if names_another {
+            return true;
+        }
+        path = path.replace(&format!("{{{name}}}"), &value);
+    }
+    let path = path
+        .strip_prefix('/')
+        .unwrap_or(&path);
+    let Ok(directory) = legacy_base_directory(base_url) else {
+        return false;
+    };
+    let Ok(url) = directory.join(path) else {
+        return false;
+    };
+    !crate::proxy::paths::is_within_target_base(directory.as_str(), url.as_str())
+}
+
+/// What a credentialed legacy tool call sends through the gateway's REST client, worked out once
+/// per call rather than per retry: the [`legacy_base_directory`] of the proxy's `base_url`, the tool with its
+/// output schema, the request content type, and the egress allow-list its backend is vetted with.
+struct StoredToolCall {
+    directory: Url,
+    metadata: rmcp_openapi::ToolMetadata,
+    content_type: String,
+    egress_allowlist: Option<String>,
+}
+
+impl StoredToolCall {
+    fn prepare(
+        proxy: &McpProxy,
+        spec: &serde_json::Value,
+        tool: &rmcp_openapi::Tool,
+    ) -> Result<Self, String> {
+        let directory = Url::parse(&proxy.base_url)
+            .and_then(|base_url| legacy_base_directory(&base_url))
+            .map_err(|_| super::modern_rest::RestError::Target.to_string())?;
+        let mut metadata = tool.metadata.clone();
+        metadata.output_schema =
+            super::modern_rest::output_schema(spec, &metadata).map_err(|error| error.to_string())?;
+        let content_type =
+            super::modern_rest::request_content_type(spec, &metadata).map_err(|error| error.to_string())?;
+        Ok(Self {
+            directory,
+            metadata,
+            content_type,
+            egress_allowlist: rest_egress_allowlist(proxy),
+        })
+    }
+}
+
+/// Run a legacy MCP proxy tool call. A call that carries the Target credential is
+/// sent by the gateway's REST client, which never follows a redirect, since the
+/// `rmcp_openapi` client follows redirects and would carry the credential to the
+/// redirect target. That client resolves the tool against the [`legacy_base_directory`]
+/// of the base URL, vets and pins each call as a 2026-07-28 tool call is, and builds the
+/// same `CallToolResult`. It drops `sent_token`, the issued service token behind that
+/// credential, when the backend refuses it as invalid.
+async fn call_legacy_tool(
+    tool: &rmcp_openapi::Tool,
+    arguments: &serde_json::Value,
+    credentialed: Option<(&StoredToolCall, &ReqwestHeaderMap)>,
+    limits: &crate::config::McpHttpConfig,
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+) -> Result<rmcp::model::CallToolResult, String> {
+    let Some((stored, credential_headers)) = credentialed else {
+        return tool
+            .call(arguments, rmcp_openapi::Authorization::None, None)
+            .await
+            .map_err(|error| tool_call_failure(&error));
+    };
+    super::modern_rest::call(
+        stored.directory.as_str(),
+        &stored.metadata,
+        arguments,
+        credential_headers,
+        limits,
+        &stored.content_type,
+        stored
+            .egress_allowlist
+            .as_deref(),
+        sent_token,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// An MCP request a proxy can serve, checked and with its MCP server built:
 /// everything that can be refused without calling the backend has been.
 pub struct PreparedMcpRequest {
@@ -2614,23 +2767,30 @@ pub struct PreparedMcpRequest {
 enum McpCall {
     Initialize,
     ToolsList,
-    ToolsCall { tool_name: String, arguments: serde_json::Value },
+    ToolsCall {
+        tool_name: String,
+        arguments: serde_json::Value,
+        credentialed: Option<Box<(StoredToolCall, ReqwestHeaderMap)>>,
+    },
 }
 
 /// Checks that `proxy` can serve `request` and builds its MCP server: an
 /// active proxy, a readable OpenAPI spec and base URL, a known method and, for a
-/// `tools/call`, a tool the spec defines. Nothing is sent to the backend, so a
-/// refusal here can be given before the request is charged.
+/// `tools/call`, a tool the spec defines that, when it carries the Target
+/// credential, stays under the proxy's base path. Nothing is sent to the
+/// backend, so a refusal here can be given before the request is charged.
 pub fn prepare_mcp_request(
     proxy: &super::types::McpProxy,
     request: serde_json::Value,
     target_auth_header: Option<(String, String)>,
     config_id: &str,
-) -> Result<PreparedMcpRequest, String> {
+) -> Result<PreparedMcpRequest, McpProxyCallError> {
     // Check if proxy is active
     if proxy.status != super::types::McpProxyStatus::Active {
         channel_warn!(config_id, "❌ Proxy '{}' is disabled", proxy.name);
-        return Err("MCP proxy is disabled".to_string());
+        return Err("MCP proxy is disabled"
+            .to_string()
+            .into());
     }
 
     // Create MCP server from proxy config
@@ -2656,16 +2816,16 @@ pub fn prepare_mcp_request(
         None
     };
 
-    let mut server = if let Some(headers) = default_headers {
+    let mut server = if let Some(headers) = default_headers.clone() {
         McpServer::builder()
             .openapi_spec(openapi_json)
-            .base_url(base_url)
+            .base_url(base_url.clone())
             .default_headers(headers)
             .build()
     } else {
         McpServer::builder()
             .openapi_spec(openapi_json)
-            .base_url(base_url)
+            .base_url(base_url.clone())
             .build()
     };
 
@@ -2706,17 +2866,32 @@ pub fn prepare_mcp_request(
                 raw_arguments
             };
 
-            if server
+            let tool = server
                 .get_tool(&tool_name)
-                .is_none()
-            {
-                return Err(format!("Tool '{}' not found", tool_name));
+                .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+            if default_headers.is_some() && tool_call_leaves_base(&base_url, &tool.metadata, &arguments) {
+                channel_warn!(
+                    config_id,
+                    "Refusing a tool call outside the MCP proxy base path: it would carry the Target credential"
+                );
+                return Err(McpProxyCallError::OutsideTargetBase);
             }
-            McpCall::ToolsCall { tool_name, arguments }
+            let stored_call = default_headers
+                .as_ref()
+                .map(|_| StoredToolCall::prepare(proxy, &server.openapi_spec, tool))
+                .transpose()
+                .map_err(|error| format!("Tool execution failed: {error}"))?;
+            McpCall::ToolsCall {
+                tool_name,
+                arguments,
+                credentialed: stored_call
+                    .zip(default_headers)
+                    .map(Box::new),
+            }
         }
         _ => {
             warn!("❌ Unknown MCP method: {}", method);
-            return Err(format!("Unknown MCP method: {}", method));
+            return Err(format!("Unknown MCP method: {}", method).into());
         }
     };
     Ok(PreparedMcpRequest { server, request, call })
@@ -2726,8 +2901,8 @@ const CIRCUIT_OPEN_ERROR: &str = "Circuit breaker open";
 
 /// Whether `error`, from [`execute_mcp_request`], says the circuit breaker
 /// refused the call, so the request never reached the proxy's backend.
-pub fn is_circuit_open_error(error: &str) -> bool {
-    error.starts_with(CIRCUIT_OPEN_ERROR)
+pub fn is_circuit_open_error(error: &McpProxyCallError) -> bool {
+    matches!(error, McpProxyCallError::Failed(message) if message.starts_with(CIRCUIT_OPEN_ERROR))
 }
 
 /// The circuit breaker of `surface`, when it has one configured.
@@ -2743,7 +2918,9 @@ pub async fn surface_circuit_breaker(
 
 /// Handle a prepared MCP request with full surface policy support (timeout,
 /// retry, circuit breaker, mirroring). This applies all network policies for
-/// feature parity with A2A channels.
+/// feature parity with A2A channels. A tool call that carries the Target
+/// credential drops `sent_token`, the issued service token behind it, when the
+/// backend refuses it as invalid.
 pub async fn execute_mcp_request(
     proxy: &super::types::McpProxy,
     prepared: PreparedMcpRequest,
@@ -2751,9 +2928,8 @@ pub async fn execute_mcp_request(
     policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
     client: &reqwest::Client,
     channel_name: &str,
-) -> Result<serde_json::Value, String> {
-    use rmcp_openapi::Authorization;
-
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+) -> Result<serde_json::Value, McpProxyCallError> {
     let PreparedMcpRequest { server, request, call } = prepared;
     let request_id = request.get("id").cloned();
     let config_id = surface
@@ -2810,13 +2986,29 @@ pub async fn execute_mcp_request(
                 }
             }))
         }
-        McpCall::ToolsCall { tool_name, arguments } => {
+        McpCall::ToolsCall {
+            tool_name,
+            arguments,
+            credentialed,
+        } => {
             let tool_name = tool_name.as_str();
             let tool = server
                 .get_tool(tool_name)
                 .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
             channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
 
+            let default_limits;
+            let limits = match surface.mcp_http.as_ref() {
+                Some(limits) => limits,
+                None => {
+                    default_limits = crate::config::McpHttpConfig::default();
+                    &default_limits
+                }
+            };
+            let credentialed = credentialed
+                .as_deref()
+                .map(|(stored, headers)| (stored, headers));
+            let call_tool = || call_legacy_tool(tool, &arguments, credentialed, limits, sent_token);
             // Apply timeout if configured
             let timeout_duration = surface
                 .timeout()
@@ -2831,22 +3023,14 @@ pub async fn execute_mcp_request(
                         attempt += 1;
                         debug!("Tool call attempt {} of {}", attempt, retry_config.max_attempts + 1);
 
-                        match tool
-                            .call(&arguments, Authorization::None, None)
-                            .await
-                        {
+                        match call_tool().await {
                             Ok(result) => {
                                 info!("✓ Tool '{}' executed successfully on attempt {}", tool_name, attempt);
                                 return Ok(result);
                             }
                             Err(e) => {
                                 if attempt <= retry_config.max_attempts {
-                                    warn!(
-                                        "Tool '{}' failed on attempt {}: {}",
-                                        tool_name,
-                                        attempt,
-                                        tool_call_failure(&e)
-                                    );
+                                    warn!("Tool '{}' failed on attempt {}: {}", tool_name, attempt, e);
 
                                     // Calculate backoff delay
                                     let backoff_ms = std::cmp::min(
@@ -2862,21 +3046,20 @@ pub async fn execute_mcp_request(
                                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                                     continue;
                                 } else {
-                                    let failure = tool_call_failure(&e);
                                     error!(
                                         "❌ Tool '{}' execution failed after {} attempts: {}",
-                                        tool_name, attempt, failure
+                                        tool_name, attempt, e
                                     );
-                                    return Err(format!("Tool execution failed: {}", failure));
+                                    return Err(format!("Tool execution failed: {}", e));
                                 }
                             }
                         }
                     }
                 } else {
                     // No retry configured, call once
-                    tool.call(&arguments, Authorization::None, None)
+                    call_tool()
                         .await
-                        .map_err(|e| format!("Tool execution failed: {}", tool_call_failure(&e)))
+                        .map_err(|e| format!("Tool execution failed: {}", e))
                 }
             };
 
@@ -2904,10 +3087,10 @@ pub async fn execute_mcp_request(
                     Ok(r) => r,
                     Err(crate::policies::CircuitBreakerError::Open { retry_after }) => {
                         error!("Circuit breaker is open for channel '{}', retry after {:?}", channel_name, retry_after);
-                        return Err(format!("{CIRCUIT_OPEN_ERROR}, retry after {:?}", retry_after));
+                        return Err(format!("{CIRCUIT_OPEN_ERROR}, retry after {:?}", retry_after).into());
                     }
                     Err(crate::policies::CircuitBreakerError::Inner(e)) => {
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             } else {
@@ -2998,6 +3181,22 @@ mod tests {
     use crate::auth_manager::pat::PatResourceScope;
     use crate::mcp_proxies::types::McpProxy;
     use crate::tenancy::PatTenantContext;
+
+    /// `request` prepared and, when it can be served, executed, as a surface's
+    /// MCP proxy Target runs it.
+    async fn handle_mcp_request_with_policies(
+        proxy: &super::super::types::McpProxy,
+        request: serde_json::Value,
+        surface: &crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+        client: &reqwest::Client,
+        channel_name: &str,
+        target_auth_header: Option<(String, String)>,
+        sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+    ) -> Result<serde_json::Value, super::McpProxyCallError> {
+        let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name)?;
+        super::execute_mcp_request(proxy, prepared, surface, policy_manager, client, channel_name, sent_token).await
+    }
 
     #[test]
     fn tool_call_failure_names_the_kind_without_url_arguments_or_body() {
@@ -3117,14 +3316,357 @@ mod tests {
                 "{path}"
             );
 
-            let prepared = super::prepare_mcp_request(&proxy, request.clone(), None, "tool-errors").unwrap();
-            let error =
-                super::execute_mcp_request(&proxy, prepared, &surface, Some(&policy_manager), &client, "tool-errors")
-                    .await
-                    .expect_err("a closed backend fails the tool call");
+            let error = handle_mcp_request_with_policies(
+                &proxy,
+                request.clone(),
+                &surface,
+                Some(&policy_manager),
+                &client,
+                "tool-errors",
+                None,
+                None,
+            )
+            .await
+            .expect_err("a closed backend fails the tool call");
 
-            assert_eq!(error, "Tool execution failed: network error (Connect)", "{path}");
+            assert_eq!(
+                error,
+                super::McpProxyCallError::Failed("Tool execution failed: network error (Connect)".to_string()),
+                "{path}"
+            );
         }
+    }
+
+    type ReceivedRequests = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// An MCP proxy with one `getItem` tool at `/items/{id}`, whose backend records the path and
+    /// `x-api-key` header of every request it receives.
+    async fn recording_items_proxy(base_path: &str) -> (McpProxy, ReceivedRequests) {
+        use serde_json::json;
+
+        let received = ReceivedRequests::default();
+        let log = received.clone();
+        let backend = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let log = log.clone();
+            async move {
+                let key = request
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                log.lock().unwrap().push((
+                    request
+                        .uri()
+                        .path()
+                        .to_string(),
+                    key,
+                ));
+                axum::Json(json!({"ok": true}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base_url = format!("http://{}{base_path}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, backend).await });
+        let proxy = McpProxy::new(
+            "Base path".into(),
+            String::new(),
+            base_url,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"},
+                "paths": {"/items/{id}": {"get": {
+                    "operationId": "getItem",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}
+                }}}
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/items".into(),
+        );
+        (proxy, received)
+    }
+
+    async fn call_get_item(
+        proxy: &McpProxy,
+        id: &str,
+        credential: bool,
+    ) -> Result<serde_json::Value, super::McpProxyCallError> {
+        use serde_json::json;
+
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "base-path", "name": "Base path",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://base-path"}
+        }))
+        .unwrap();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "getItem", "arguments": {"id": id}}
+        });
+        let credential = credential.then(|| ("X-Api-Key".to_string(), "gateway-value".to_string()));
+        handle_mcp_request_with_policies(
+            proxy,
+            request,
+            &surface,
+            None,
+            &reqwest::Client::new(),
+            "base-path",
+            credential,
+            None,
+        )
+        .await
+    }
+
+    #[test]
+    fn the_legacy_base_directory_ends_the_base_path_with_a_slash_as_rmcp_openapi_does() {
+        let directory = |base: &str| {
+            super::legacy_base_directory(&url::Url::parse(base).unwrap())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(directory("https://h/api/v4"), "https://h/api/v4/");
+        assert_eq!(directory("https://h/api/v4/"), "https://h/api/v4/");
+        assert_eq!(directory("https://h/api/v4?key=1#top"), "https://h/api/v4/");
+        assert_eq!(directory("https://h"), "https://h/");
+    }
+
+    /// A tool call that carries the Target credential reaches only paths under the MCP
+    /// proxy's base URL; a path parameter that climbs out is refused before any request.
+    #[tokio::test]
+    async fn a_credentialed_tool_call_stays_under_the_proxy_base_path() {
+        let (proxy, received) = recording_items_proxy("/base/").await;
+
+        for escaping in ["../../admin", "%2e%2e/%2E%2E/admin", "x/../../../admin"] {
+            assert_eq!(
+                call_get_item(&proxy, escaping, true)
+                    .await
+                    .expect_err("an escaping path is refused"),
+                super::McpProxyCallError::OutsideTargetBase,
+                "{escaping}"
+            );
+        }
+        for braced in ["{id}", "{abc}", "a{b"] {
+            assert!(
+                matches!(call_get_item(&proxy, braced, true).await, Err(super::McpProxyCallError::Failed(_))),
+                "a braced value under the base fails as invalid arguments: {braced}"
+            );
+        }
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        call_get_item(&proxy, "1", true)
+            .await
+            .expect("a path under the base is forwarded");
+        call_get_item(&proxy, "../../open", false)
+            .await
+            .expect("without a credential the call is not checked");
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![("/base/items/1".to_string(), Some("gateway-value".to_string())), ("/open".to_string(), None)]
+        );
+    }
+
+    /// A tool call that carries the Target credential is vetted and pinned at call time: a
+    /// backend host that resolves to a refused address, as a rebinding host would, gets no
+    /// request and no credential. Without the credential the call still reaches it.
+    #[tokio::test]
+    async fn a_credentialed_tool_call_is_refused_when_its_backend_resolves_to_a_refused_address() {
+        let (mut proxy, received) = recording_items_proxy("/base/").await;
+        proxy.base_url = proxy
+            .base_url
+            .replacen("127.0.0.1", "localhost", 1);
+
+        assert_eq!(
+            call_get_item(&proxy, "1", true)
+                .await
+                .expect_err("a backend resolving to loopback is refused"),
+            super::McpProxyCallError::Failed("Tool execution failed: REST tool target is not permitted".to_string())
+        );
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        call_get_item(&proxy, "1", false)
+            .await
+            .expect("an uncredentialed call is forwarded");
+        assert_eq!(*received.lock().unwrap(), vec![("/base/items/1".to_string(), None)]);
+    }
+
+    /// A path parameter value counts as leaving the base when it names another path parameter's
+    /// placeholder, which the substitution could expand, or when the substituted path climbs out.
+    #[test]
+    fn a_path_value_naming_another_path_parameter_counts_as_leaving_the_base() {
+        use serde_json::json;
+
+        let path_parameter = |name: &str| {
+            (
+                name.to_string(),
+                rmcp_openapi::tool::ParameterMapping {
+                    sanitized_name: name.to_string(),
+                    original_name: name.to_string(),
+                    location: "path".to_string(),
+                    explode: false,
+                },
+            )
+        };
+        let tool = rmcp_openapi::ToolMetadata {
+            name: "getPair".to_string(),
+            title: None,
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                "required": ["a", "b"]
+            }),
+            output_schema: None,
+            method: "get".to_string(),
+            path: "/pairs/{a}/{b}".to_string(),
+            security: None,
+            parameter_mappings: [path_parameter("a"), path_parameter("b")]
+                .into_iter()
+                .collect(),
+        };
+        let base = url::Url::parse("https://backend.example/base/").unwrap();
+        let leaves = |a: &str, b: &str| super::tool_call_leaves_base(&base, &tool, &json!({"a": a, "b": b}));
+
+        assert!(leaves("{b}", "x"));
+        assert!(leaves("../..", "x"));
+        assert!(!leaves("{a}", "x"));
+        assert!(!leaves("{c}", "x"));
+        assert!(!leaves("1", "2"));
+    }
+
+    /// A base URL whose path has no trailing slash keeps its last segment, with or without the
+    /// Target credential, and the base path the credential is held to includes that segment.
+    #[tokio::test]
+    async fn a_credentialed_tool_call_keeps_the_last_segment_of_a_base_url_without_a_trailing_slash() {
+        let (proxy, received) = recording_items_proxy("/api/v4").await;
+
+        for escaping in ["../../pets/1", "../../../api/pets/1"] {
+            assert_eq!(
+                call_get_item(&proxy, escaping, true)
+                    .await
+                    .expect_err("a path that leaves /api/v4/ is refused"),
+                super::McpProxyCallError::OutsideTargetBase,
+                "{escaping}"
+            );
+        }
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        call_get_item(&proxy, "1", true)
+            .await
+            .expect("a credentialed call is forwarded");
+        call_get_item(&proxy, "1", false)
+            .await
+            .expect("an uncredentialed call is forwarded");
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![
+                ("/api/v4/items/1".to_string(), Some("gateway-value".to_string())),
+                ("/api/v4/items/1".to_string(), None)
+            ]
+        );
+    }
+
+    /// A tool call that carries the Target credential never follows a redirect, so the
+    /// credential cannot reach the redirect target; one without a credential still
+    /// follows it through the OpenAPI client.
+    #[tokio::test]
+    async fn a_credentialed_tool_call_never_follows_a_redirect() {
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let followed = Arc::new(AtomicUsize::new(0));
+        let counter = followed.clone();
+        let elsewhere = axum::Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({"followed": true})) }
+        });
+        let elsewhere_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let location = format!(
+            "http://localhost:{}/stolen",
+            elsewhere_listener
+                .local_addr()
+                .unwrap()
+                .port()
+        );
+        tokio::spawn(async move { axum::serve(elsewhere_listener, elsewhere).await });
+        let redirecting = axum::Router::new().fallback(move || {
+            let location = location.clone();
+            async move { (StatusCode::FOUND, [(axum::http::header::LOCATION, location)]) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base_url = format!("http://{}/base/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, redirecting).await });
+        let proxy = McpProxy::new(
+            "Redirect".into(),
+            String::new(),
+            base_url,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"},
+                "paths": {"/items": {"get": {
+                    "operationId": "listItems",
+                    "responses": {"200": {"description": "OK"}}
+                }}}
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/items".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "redirect", "name": "Redirect",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://redirect"}
+        }))
+        .unwrap();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "listItems", "arguments": {}}
+        });
+        let client = reqwest::Client::new();
+
+        let refused = handle_mcp_request_with_policies(
+            &proxy,
+            request.clone(),
+            &surface,
+            None,
+            &client,
+            "redirect",
+            Some(("X-Api-Key".to_string(), "gateway-value".to_string())),
+            None,
+        )
+        .await
+        .expect_err("a credentialed redirect is not followed");
+        assert_eq!(
+            refused,
+            super::McpProxyCallError::Failed(
+                "Tool execution failed: REST tool redirects are not permitted".to_string()
+            )
+        );
+        assert_eq!(followed.load(Ordering::SeqCst), 0);
+
+        handle_mcp_request_with_policies(&proxy, request, &surface, None, &client, "redirect", None, None)
+            .await
+            .expect("without a credential the redirect is followed");
+        assert_eq!(followed.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3795,10 +4337,11 @@ mod tests {
             if let Some(value) = value {
                 headers.insert("mcp-param-query", value.parse().unwrap());
             }
-            let error =
-                super::process_modern_mcp_request_with_headers(&proxy, &manager, &request, versions, &headers, None)
-                    .await
-                    .unwrap_err();
+            let error = super::process_modern_mcp_request_with_headers(
+                &proxy, &manager, &request, versions, &headers, None, None,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
             assert_eq!(error.code, crate::mcp::error_codes::HEADER_MISMATCH);
             assert_eq!(error.id, Some(json!("owned")));
@@ -3813,6 +4356,7 @@ mod tests {
             &request,
             versions,
             &axum::http::HeaderMap::new(),
+            None,
             None,
         )
         .await
@@ -3938,7 +4482,7 @@ mod tests {
             .unwrap()["arguments"] = json!({"message": " padded "});
         let mut headers = axum::http::HeaderMap::new();
         let error =
-            super::process_modern_mcp_request_with_headers(&proxy, &manager, &request, versions, &headers, None)
+            super::process_modern_mcp_request_with_headers(&proxy, &manager, &request, versions, &headers, None, None)
                 .await
                 .unwrap_err();
         assert_eq!(error.code, crate::mcp::error_codes::HEADER_MISMATCH);
@@ -3955,7 +4499,7 @@ mod tests {
                 .unwrap(),
         );
         let response =
-            super::process_modern_mcp_request_with_headers(&proxy, &manager, &request, versions, &headers, None)
+            super::process_modern_mcp_request_with_headers(&proxy, &manager, &request, versions, &headers, None, None)
                 .await
                 .unwrap();
         assert_eq!(response["result"]["resultType"], "complete");
@@ -4052,9 +4596,10 @@ mod tests {
                 .unwrap()
         };
         let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
-        let response = super::handle_modern_surface_request(&proxy, &surface, &request, prepared(), &client, versions)
-            .await
-            .unwrap();
+        let response =
+            super::handle_modern_surface_request(&proxy, &surface, &request, prepared(), &client, versions, None)
+                .await
+                .unwrap();
         assert_eq!(response["id"], "owned");
         assert_eq!(response["result"]["resultType"], "complete");
         let received = target
@@ -4078,9 +4623,10 @@ mod tests {
             );
         }
         surface.mcp_http = Some(serde_json::from_value(json!({"max_response_bytes": 1})).unwrap());
-        let error = super::handle_modern_surface_request(&proxy, &surface, &request, prepared(), &client, versions)
-            .await
-            .unwrap_err();
+        let error =
+            super::handle_modern_surface_request(&proxy, &surface, &request, prepared(), &client, versions, None)
+                .await
+                .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.id, Some(json!("owned")));
     }
@@ -4156,6 +4702,7 @@ mod tests {
             caller,
             &client,
             crate::mcp::request_validation::MODERN_ONLY_POLICY,
+            None,
         )
         .await
         .unwrap();
@@ -4209,6 +4756,7 @@ mod tests {
                 .unwrap(),
             &client,
             crate::mcp::request_validation::MODERN_ONLY_POLICY,
+            None,
         )
         .await
         .unwrap();

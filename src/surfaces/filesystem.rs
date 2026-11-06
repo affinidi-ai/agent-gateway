@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::audit::context::current_actor;
-use crate::audit::policy_changes;
+use crate::audit::{policy_changes, target_auth_changes};
 use crate::config::agent_surface::AgentSurface;
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
@@ -15,8 +15,9 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 pub struct FileSystemAgentSurfaceStore {
     storage: Box<dyn StorageBackend<AgentSurface>>,
     /// Held from reading a surface before a write until the write's policy
-    /// changes are recorded, so they are relative to the surface it replaced
-    /// and the records of concurrent writes come in write order.
+    /// and Target Authentication changes are recorded, so they are relative
+    /// to the surface it replaced and the records of concurrent writes come in
+    /// write order.
     writes: tokio::sync::Mutex<()>,
 }
 
@@ -52,7 +53,8 @@ impl FileSystemAgentSurfaceStore {
     }
 
     /// The stored surface a management request is about to change, so its
-    /// policy attachments can be compared after the write. Not read outside
+    /// policy attachments and Target Authentication can be compared after the
+    /// write. Not read outside
     /// one, or inside one under `without_actor` (a config reload), so `None`
     /// means either a new surface or a write that records nothing;
     /// `surface_written` checks the actor again and records nothing for the
@@ -87,6 +89,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
             .save(surface)
             .await?;
         policy_changes::surface_written(before.as_ref(), Some(surface)).await;
+        target_auth_changes::surface_written(before.as_ref(), Some(surface));
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),
@@ -119,6 +122,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
             .delete(surface_id)
             .await?;
         policy_changes::surface_written(before.as_ref(), None).await;
+        target_auth_changes::surface_written(before.as_ref(), None);
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface_id.to_string(),

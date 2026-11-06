@@ -26,15 +26,15 @@ use crate::proxy::transit_token::{FabricTransitClaims, TransitTokenClaims, Trans
 use crate::surface_context::IdentityVerification;
 use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 
-const PEER_CONNECTION_POINT_DID: &str = "did:web:peer.example";
-const PEER_ISSUER_DID: &str = "did:web:partner.example";
-const SURFACE_ID: &str = "fabric-transit";
-const CALLER_KEY: &str = "peer-target-auth-key";
+pub(super) const PEER_CONNECTION_POINT_DID: &str = "did:web:peer.example";
+pub(super) const PEER_ISSUER_DID: &str = "did:web:partner.example";
+pub(super) const SURFACE_ID: &str = "fabric-transit";
+pub(super) const CALLER_KEY: &str = "peer-target-auth-key";
 
 /// Runs the calling test again in a child process, where the process-wide
 /// stores this path reads are unset until the test sets them. Returns `true`
 /// in the parent, which then has nothing more to do.
-async fn ran_in_child(variable: &str) -> bool {
+pub(super) async fn ran_in_child(variable: &str) -> bool {
     if std::env::var_os(variable).is_some() {
         return false;
     }
@@ -59,7 +59,7 @@ async fn ran_in_child(variable: &str) -> bool {
     true
 }
 
-fn test_issuer() -> TransitTokenIssuer {
+pub(super) fn test_issuer() -> TransitTokenIssuer {
     TransitTokenIssuer::new(TransitTokenKey::from_parts("fabric-test-kid", [9; 32]), "receiver.example".to_string())
 }
 
@@ -87,7 +87,7 @@ fn peer() -> Gateway {
 /// A surface whose Target is `target` and whose Transit Points are `aliases`,
 /// authenticating its callers with an API key header the peer's
 /// `target_auth` sends.
-fn surface(
+pub(super) fn surface(
     protocol: &str,
     target: &str,
     aliases: &[&str],
@@ -125,10 +125,21 @@ async fn receiver(
 
 /// [`receiver`], whose source authentication reads JWT verification
 /// strategies from `strategies`.
-async fn receiver_with_strategies(
+pub(super) async fn receiver_with_strategies(
     root: &std::path::Path,
     surface: &AgentSurface,
     strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
+) -> (Gateway, tempfile::TempDir) {
+    receiver_trusting(root, surface, strategies, Vec::new()).await
+}
+
+/// [`receiver_with_strategies`], whose connection to the peer also trusts
+/// identity presentations from `trusted_issuers`.
+pub(super) async fn receiver_trusting(
+    root: &std::path::Path,
+    surface: &AgentSurface,
+    strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
+    trusted_issuers: Vec<String>,
 ) -> (Gateway, tempfile::TempDir) {
     use crate::secrets::SecretsStore;
     let secrets = crate::secrets::FilesystemSecretsStore::new_async(
@@ -168,7 +179,9 @@ async fn receiver_with_strategies(
         .save(surface)
         .await
         .unwrap();
-    let issuer_dir = crate::gateways::test_helpers::install_listener_manager_with_peers(root, &[peer()]).await;
+    let mut paired = peer();
+    paired.trusted_issuer_dids = trusted_issuers;
+    let issuer_dir = crate::gateways::test_helpers::install_listener_manager_with_peers(root, &[paired]).await;
     let peer = crate::gateways::FileSystemGatewayStore::new(root.join("gateways"), None)
         .await
         .unwrap()
@@ -179,7 +192,7 @@ async fn receiver_with_strategies(
     (peer, issuer_dir)
 }
 
-fn forward_request(
+pub(super) fn forward_request(
     root: &std::path::Path,
     headers: Value,
     body: Value,
@@ -208,7 +221,7 @@ fn forward_request(
 
 /// The forward-response for `message`, served as the listener serves a
 /// forward-request: in the trace the peer named.
-async fn forward_response(message: &ReceivedMessage) -> Value {
+pub(super) async fn forward_response(message: &ReceivedMessage) -> Value {
     let trace_id = message.message_body["trace_id"]
         .as_str()
         .unwrap_or_default()
@@ -229,7 +242,7 @@ async fn forward_response(message: &ReceivedMessage) -> Value {
     }
 }
 
-fn header_values<'headers>(
+pub(super) fn header_values<'headers>(
     headers: &'headers axum::http::HeaderMap,
     name: &str,
 ) -> Vec<&'headers str> {
@@ -801,15 +814,15 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 }
 
-const PER_USER_PROVIDER: &str = "per-user";
+pub(super) const PER_USER_PROVIDER: &str = "per-user";
 const SERVICE_PROVIDER: &str = "service";
 const SERVICE_KEY: &str = "service-key-value";
-const JWT_AUDIENCE: &str = "https://receiver.example/agent";
+pub(super) const JWT_AUDIENCE: &str = "https://receiver.example/agent";
 
 /// A binding of the receiving surface's Target to `provider`. The key of
 /// [`SERVICE_PROVIDER`] travels in `x-service-key`, a per-user grant as the
 /// `Authorization` bearer.
-fn binding(provider: &str) -> crate::config::types::OutboundCredentialBinding {
+pub(super) fn binding(provider: &str) -> crate::config::types::OutboundCredentialBinding {
     let mut binding = json!({ "credential_provider_id": provider, "scopes": ["read"] });
     if provider == SERVICE_PROVIDER {
         binding["inject_as"] = json!({ "type": "custom_header", "name": "x-service-key", "format": "{value}" });
@@ -900,7 +913,7 @@ async fn install_delegation_stores(
 }
 
 /// An A2A request whose agent identity extension names `metadata`.
-fn naming(metadata: Value) -> Value {
+pub(super) fn naming(metadata: Value) -> Value {
     let mut body = a2a_body();
     body["params"]["message"]["extensions"] = json!([crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION]);
     body["params"]["message"]["metadata"] = json!({ crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: metadata });
@@ -909,7 +922,7 @@ fn naming(metadata: Value) -> Value {
 
 /// The forward-response for `message` with the reason its body names, and the
 /// `request_rejected` records it wrote.
-async fn refused(message: &ReceivedMessage) -> (Value, Value, Vec<(RejectionStage, RejectionReason, bool)>) {
+pub(super) async fn refused(message: &ReceivedMessage) -> (Value, Value, Vec<(RejectionStage, RejectionReason, bool)>) {
     let (response, events) = crate::audit::producer::capture(forward_response(message)).await;
     let body: Value = response["body"]
         .as_str()
@@ -925,7 +938,8 @@ async fn refused(message: &ReceivedMessage) -> (Value, Value, Vec<(RejectionStag
     (response, body, rejected)
 }
 
-/// A partner's request never reaches a per-user credential of the Target. A
+/// While the Target does not set `delegated_credentials_for_fabric_callers`,
+/// a partner's request never reaches a per-user credential of the Target. A
 /// request a per-user binding applies to is refused with `403` and a fixed
 /// reason before the Target is called, and recorded as a `request_rejected`,
 /// even when a grant is stored for the caller the surface verified or for the

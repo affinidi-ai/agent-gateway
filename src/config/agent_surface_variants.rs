@@ -439,6 +439,9 @@ pub struct TargetOverrides {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric_delegated_credentials: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_credentials_for_fabric_callers: Option<bool>,
 }
 
 impl TargetOverrides {
@@ -545,6 +548,13 @@ impl TargetOverrides {
                 .unwrap_or(false);
         } else if let Some(v) = self.fabric_delegated_credentials {
             base.fabric_delegated_credentials = v;
+        }
+        if complete {
+            base.delegated_credentials_for_fabric_callers = self
+                .delegated_credentials_for_fabric_callers
+                .unwrap_or(false);
+        } else if let Some(v) = self.delegated_credentials_for_fabric_callers {
+            base.delegated_credentials_for_fabric_callers = v;
         }
     }
 }
@@ -994,6 +1004,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -1686,6 +1697,108 @@ mod tests {
                 .unwrap()
                 .target
                 .fabric_delegated_credentials
+        );
+    }
+
+    /// A variant inherits the Target's release of per-user grants to Fabric
+    /// callers unless it overrides it; a `complete` variant that does not set
+    /// it releases nothing, and one that sets it releases on a base that does
+    /// not.
+    #[test]
+    fn target_fabric_caller_release_override_fails_closed_in_complete_mode() {
+        let mut s = base_surface();
+        s.target
+            .delegated_credentials_for_fabric_callers = true;
+        let target = |value: Option<bool>| {
+            Some(TargetOverrides {
+                delegated_credentials_for_fabric_callers: value,
+                ..Default::default()
+            })
+        };
+        s.variants = vec![
+            variant(
+                "id-sparse",
+                "sparse",
+                SurfaceOverrides {
+                    target: target(None),
+                    ..Default::default()
+                },
+            ),
+            variant(
+                "id-frozen",
+                "frozen",
+                SurfaceOverrides {
+                    complete: true,
+                    target: target(None),
+                    ..Default::default()
+                },
+            ),
+            variant(
+                "id-off",
+                "off",
+                SurfaceOverrides {
+                    target: target(Some(false)),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let resolved = |surface: &AgentSurface, alias| {
+            surface
+                .resolve_variant(Some(alias))
+                .unwrap()
+                .target
+                .delegated_credentials_for_fabric_callers
+        };
+        assert!(resolved(&s, "sparse"));
+        assert!(!resolved(&s, "frozen"));
+        assert!(!resolved(&s, "off"));
+
+        s.target
+            .delegated_credentials_for_fabric_callers = false;
+        s.variants = vec![
+            variant(
+                "id-on",
+                "on",
+                SurfaceOverrides {
+                    target: target(Some(true)),
+                    ..Default::default()
+                },
+            ),
+            variant(
+                "id-complete-on",
+                "complete-on",
+                SurfaceOverrides {
+                    complete: true,
+                    target: target(Some(true)),
+                    ..Default::default()
+                },
+            ),
+        ];
+        assert!(resolved(&s, "on"));
+        assert!(resolved(&s, "complete-on"));
+        assert!(
+            !s.resolve_variant(None)
+                .unwrap()
+                .target
+                .delegated_credentials_for_fabric_callers
+        );
+
+        let stored = serde_json::to_value(&s.variants[0].overrides).unwrap();
+        assert_eq!(stored["target"]["delegated_credentials_for_fabric_callers"], true);
+        let unset = serde_json::to_value(TargetOverrides::default()).unwrap();
+        assert!(
+            unset
+                .get("delegated_credentials_for_fabric_callers")
+                .is_none(),
+            "{unset}"
+        );
+        assert_eq!(
+            serde_json::from_value::<TargetOverrides>(serde_json::json!({
+                "delegated_credentials_for_fabric_callers": true
+            }))
+            .unwrap()
+            .delegated_credentials_for_fabric_callers,
+            Some(true)
         );
     }
 

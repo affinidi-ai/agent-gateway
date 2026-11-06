@@ -31,8 +31,9 @@ leaves a secret out keeps it, and one that sends it as `null` clears it. A secre
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
 resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
-secret that an endpoint references is refused with `409` naming the endpoints; change or
-delete those endpoints first. Changing the secret's value is allowed, and the next delivery
+secret that an endpoint references is refused with `409` naming the endpoints, even with
+`?force=true`, which overrides only references from surfaces, credential providers, A2A proxies
+and STS clients; change or delete those endpoints first. Changing the secret's value is allowed, and the next delivery
 uses it. Only appliance-wide secrets resolve; a tenant-owned one never does. No `secrets.*`
 permission is checked when a reference is saved or resolved, so `integrations.edit` can use, and
 therefore read, every appliance-wide secret: pointing an endpoint that holds a reference at a

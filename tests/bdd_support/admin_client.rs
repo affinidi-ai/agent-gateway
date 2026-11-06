@@ -471,9 +471,24 @@ impl AdminApiClient {
     }
 }
 
+/// Collects the headers of an admin API response, keeping every `Warning` header a save
+/// answers with, one per line, where a plain collection keeps only the last.
+fn collect_admin_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut collected = collect_headers(headers);
+    let warnings: Vec<&str> = headers
+        .get_all(reqwest::header::WARNING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    if !warnings.is_empty() {
+        collected.insert(reqwest::header::WARNING.to_string(), warnings.join("\n"));
+    }
+    collected
+}
+
 pub async fn recorded_response(response: reqwest::Response) -> Result<RecordedResponse> {
     let status = response.status().as_u16();
-    let headers = collect_headers(response.headers());
+    let headers = collect_admin_headers(response.headers());
     let body = response
         .json()
         .await
@@ -486,7 +501,7 @@ pub async fn recorded_response(response: reqwest::Response) -> Result<RecordedRe
 /// error) as a JSON string instead of dropping it.
 pub async fn recorded_response_keeping_text(response: reqwest::Response) -> Result<RecordedResponse> {
     let status = response.status().as_u16();
-    let headers = collect_headers(response.headers());
+    let headers = collect_admin_headers(response.headers());
     let text = response.text().await?;
     let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
 

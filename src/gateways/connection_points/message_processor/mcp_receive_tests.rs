@@ -1083,6 +1083,53 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     );
 }
 
+/// The status and JSON-RPC body of a Fabric receive's answer, buffered or streamed.
+async fn decode(result: ProcessingResult) -> (u16, Value) {
+    use futures::TryStreamExt;
+
+    match result {
+        ProcessingResult::RequiresResponse { response_body, .. } => {
+            let text = response_body["body"]
+                .as_str()
+                .unwrap_or("");
+            (
+                response_body["status"]
+                    .as_u64()
+                    .unwrap() as u16,
+                if text.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(text).unwrap()
+                },
+            )
+        }
+        ProcessingResult::StreamingResponse { response } => {
+            let status = response.status().as_u16();
+            let sse = response
+                .headers()
+                .get("content-type")
+                .is_some_and(|value| value == "text/event-stream");
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body = if sse {
+                let events: Vec<_> = crate::mcp::modern_sse::decode_events(
+                    futures::stream::iter([Ok::<_, std::io::Error>(bytes)]),
+                    crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
+                )
+                .try_collect()
+                .await
+                .unwrap();
+                serde_json::from_str(&events.last().unwrap().data).unwrap()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, body)
+        }
+        other => panic!("unexpected Fabric result: {other:?}"),
+    }
+}
+
 #[test]
 fn fabric_consent_uses_receiver_authority_and_rejects_cross_peer_retries() {
     if std::env::var_os("ATG_MCP_CONSENT_RECEIVE_CHILD").is_none() {
@@ -1126,7 +1173,6 @@ async fn fabric_consent_flow() {
     use std::sync::Arc;
 
     use axum::{extract::State, http::HeaderMap, response::IntoResponse};
-    use futures::TryStreamExt;
     use sha2::{Digest, Sha256};
 
     use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
@@ -1153,50 +1199,6 @@ async fn fabric_consent_flow() {
         did_peer::DIDPeer::create_peer_did(&keys, None)
             .unwrap()
             .0
-    }
-
-    async fn decode(result: ProcessingResult) -> (u16, Value) {
-        match result {
-            ProcessingResult::RequiresResponse { response_body, .. } => {
-                let text = response_body["body"]
-                    .as_str()
-                    .unwrap_or("");
-                (
-                    response_body["status"]
-                        .as_u64()
-                        .unwrap() as u16,
-                    if text.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_str(text).unwrap()
-                    },
-                )
-            }
-            ProcessingResult::StreamingResponse { response } => {
-                let status = response.status().as_u16();
-                let sse = response
-                    .headers()
-                    .get("content-type")
-                    .is_some_and(|value| value == "text/event-stream");
-                let bytes = axum::body::to_bytes(response.into_body(), 65536)
-                    .await
-                    .unwrap();
-                let body = if sse {
-                    let events: Vec<_> = crate::mcp::modern_sse::decode_events(
-                        futures::stream::iter([Ok::<_, std::io::Error>(bytes)]),
-                        crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
-                    )
-                    .try_collect()
-                    .await
-                    .unwrap();
-                    serde_json::from_str(&events.last().unwrap().data).unwrap()
-                } else {
-                    serde_json::from_slice(&bytes).unwrap()
-                };
-                (status, body)
-            }
-            other => panic!("unexpected Fabric result: {other:?}"),
-        }
     }
 
     type ObservedCalls = Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>;
@@ -3936,6 +3938,478 @@ async fn fabric_multi_method_flow() {
 }
 
 #[test]
+fn fabric_receive_sends_the_target_credential_only_for_a_caller_one_method_verified() {
+    run_in_own_process(multi_method_target_credential_flow);
+}
+
+/// On an Access Point with two API key methods, under `target_source_auth` `enforce`, a caller
+/// verified by either method gets the Target credential over Fabric receive, and its API key
+/// is not forwarded. A caller carrying both keys fails as ambiguous: it reaches the Target
+/// without the credential when failed callers go on to policy, and is refused when the Access
+/// Point rejects them.
+async fn multi_method_target_credential_flow() {
+    use std::sync::Arc;
+
+    use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, init_credential_policy};
+    use crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore;
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    const PARTNER_KEY: &str = "partner-key";
+    const AGENT_KEY: &str = "agent-key";
+
+    init_credential_policy(CredentialPolicyConfig {
+        target_source_auth: RuleMode::Enforce,
+        ..Default::default()
+    });
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    for (secret_id, value) in [("partners", PARTNER_KEY), ("agents", AGENT_KEY), ("target-key", "target-secret")] {
+        secrets
+            .create(CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: value.into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+    let surface = |id: &str, on_failure: &str| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": "mcp",
+                "public": true,
+                "caller_authentication": {"on_failure": on_failure, "methods": [
+                    {"type": "api_key", "secret_id": "partners",
+                     "extraction": {"source": "http_header", "field": "x-partner-key"}},
+                    {"type": "api_key", "secret_id": "agents",
+                     "extraction": {"source": "http_header", "field": "x-agent-key"}}
+                ]}},
+            "target": {"endpoint": format!("http://{}", target.addr), "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}}
+        }))
+        .unwrap()
+    };
+    let (forwarding, rejecting) = (surface("forwarding", "continue"), surface("rejecting", "reject"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&forwarding, &rejecting]).await;
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                temp_dir
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        ),
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        Some(secrets),
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let send = |surface: &AgentSurface, credentials: &[(&str, &str)]| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        for (name, value) in credentials {
+            headers[*name] = json!(value);
+        }
+        let mut message = forwarded_post(
+            surface,
+            &format!("/{}", surface.surface_id),
+            json!({"jsonrpc": "2.0", "id": "call", "method": "tools/list"}),
+            &storage_path,
+        )
+        .with_context("secrets_storage_path", json!(secrets_path));
+        message.message_body["headers"] = headers;
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let last_headers = || {
+        target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called")
+            .headers
+    };
+
+    for (caller, credential) in [("x-partner-key", PARTNER_KEY), ("x-agent-key", AGENT_KEY)] {
+        let (status, answered) = send(&forwarding, &[(caller, credential)]).await;
+        assert_eq!(status, 200, "{caller}: {answered}");
+        let headers = last_headers();
+        assert_eq!(
+            headers
+                .get("x-target-key")
+                .map(String::as_str),
+            Some("target-secret"),
+            "{caller}: {headers:?}"
+        );
+        assert!(!headers.contains_key(caller), "the caller's API key is not forwarded: {headers:?}");
+    }
+    assert_eq!(reached(), 2);
+
+    let both = [("x-partner-key", PARTNER_KEY), ("x-agent-key", AGENT_KEY)];
+    let (status, answered) = send(&forwarding, &both).await;
+    assert_eq!(status, 200, "an ambiguous caller goes on to policy: {answered}");
+    assert_eq!(reached(), 3);
+    let headers = last_headers();
+    assert!(!headers.contains_key("x-target-key"), "an ambiguous caller gets no Target credential: {headers:?}");
+    assert!(!headers.contains_key("x-partner-key") && !headers.contains_key("x-agent-key"), "{headers:?}");
+
+    let (status, answered) = send(&rejecting, &both).await;
+    assert_eq!(status, 401, "{answered}");
+    assert_eq!(reached(), 3, "a refused caller never reaches the Target");
+}
+
+#[test]
+fn a_legacy_mcp_proxy_tool_call_received_over_fabric_drops_a_token_its_backend_refuses_as_invalid() {
+    run_in_own_process(|| refused_mcp_proxy_token_flow(false));
+}
+
+#[test]
+fn a_modern_mcp_proxy_tool_call_received_over_fabric_drops_a_token_its_backend_refuses_as_invalid() {
+    run_in_own_process(|| refused_mcp_proxy_token_flow(true));
+}
+
+/// A `proxy://` surface reached over Fabric sends the Target credential from its client
+/// credentials provider, and drops the token the MCP proxy's backend refuses as
+/// `invalid_token` under the same limits as the direct path.
+async fn refused_mcp_proxy_token_flow(modern: bool) {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{
+        BackendAnswer, Fixture, assert_a_refused_token_is_dropped, echo_tool_call, mcp_proxy_answering, provider_auth,
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let fixture = Fixture::new(200).await;
+    let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+    let (proxy, mut surface, _backend) = mcp_proxy_answering(answer.clone()).await;
+    surface.target.auth = Some(provider_auth("machine"));
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            temp_dir
+                .path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    super::init_credential_provider_store(fixture.providers.clone()).await;
+    super::init_delegation_vault_store(fixture.vault.clone()).await;
+
+    let call = || {
+        let (headers, body) = echo_tool_call(modern);
+        let headers = Value::Object(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), json!(value)))
+                .collect(),
+        );
+        let mut forwarded =
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers});
+        if !modern {
+            forwarded["body"] = body.clone();
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(super::super::envelope_replay::now_secs() + 60),
+            forwarded,
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path))
+        .with_context("secrets_storage_path", json!(fixture.secrets_path()));
+        let stream = modern.then(|| super::FabricStreamRequest {
+            headers: crate::proxy::fabric_stream::wire::headers_from_json(Some(&headers)).unwrap(),
+            body: serde_json::to_vec(&body)
+                .unwrap()
+                .into(),
+            surface: surface.clone(),
+            variant: crate::config::agent_surface_variants::ForwardedVariant {
+                id: None,
+                recorded: "_base_".into(),
+            },
+            capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+            scope: crate::observability::policy_audit::RequestScope::fresh(),
+        });
+        let egress = fixture.egress.clone();
+        async move {
+            let received = egress
+                .scope(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    stream,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    None,
+                )))
+                .await;
+            let (status, answered) = decode(received).await;
+            assert_eq!(status, 200, "modern: {modern}: {answered}");
+            answered["result"].clone()
+        }
+    };
+    assert_a_refused_token_is_dropped(&fixture, &answer, &format!("Fabric receive, modern: {modern}"), call).await;
+}
+
+#[test]
+fn an_mcp_proxy_tool_call_received_over_fabric_answers_an_unresolvable_target_credential_with_a_problem() {
+    run_in_own_process(unresolvable_mcp_proxy_credential_flow);
+}
+
+/// A `proxy://` surface reached over Fabric whose Target credential names a missing secret,
+/// with `fallback: reject`, is answered with the same problem as the forward path.
+async fn unresolvable_mcp_proxy_credential_flow() {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{BackendAnswer, echo_tool_call, mcp_proxy_answering};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let (proxy, mut surface, _backend) =
+        mcp_proxy_answering(BackendAnswer::new(std::sync::Mutex::new((200, None)))).await;
+    surface.target.auth = Some(
+        serde_json::from_value(
+            json!({"method": {"static_secret": {"secret_id": "missing", "header_name": "x-target-key"}},
+            "fallback": "reject"}),
+        )
+        .unwrap(),
+    );
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            temp_dir
+                .path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    crate::secrets::FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let storage_path = saved_surfaces(temp_dir.path(), &[&surface]).await;
+    let message = forwarded_post(&surface, "/mcp", echo_tool_call(false).1, &storage_path)
+        .with_context("secrets_storage_path", json!(secrets_path));
+
+    let ProcessingResult::RequiresResponse { response_body, .. } = process_forward_request(&message).await else {
+        panic!("expected a buffered answer");
+    };
+
+    assert_eq!(response_body["status"], 502, "{response_body}");
+    assert_eq!(response_body["headers"]["content-type"], "application/problem+json", "{response_body}");
+    let problem: Value = serde_json::from_str(
+        response_body["body"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        problem,
+        json!({"type": "about:blank", "title": "Bad Gateway", "status": 502,
+            "detail": "Target authentication configuration error"}),
+        "{response_body}"
+    );
+}
+
+/// Saves `surfaces` to a surface store under `root` and returns its storage path.
+async fn saved_surfaces(
+    root: &std::path::Path,
+    surfaces: &[&AgentSurface],
+) -> std::path::PathBuf {
+    let storage_path = root.join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for surface in surfaces {
+        store
+            .save(surface)
+            .await
+            .unwrap();
+    }
+    storage_path
+}
+
+/// A `POST` of `body` to `surface` as the sending Connection Point forwards it over Fabric.
+fn forwarded_post(
+    surface: &AgentSurface,
+    path: &str,
+    body: Value,
+    storage_path: &std::path::Path,
+) -> ReceivedMessage {
+    ReceivedMessage::new(
+        "receiver-connection".to_string(),
+        "receiver-gateway".to_string(),
+        MessageType::ForwardRequest.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        Some(SENDER_CONNECTION_POINT_DID.to_string()),
+        vec!["did:web:receiver.example".to_string()],
+        None,
+        Some(super::super::envelope_replay::now_secs() + 60),
+        json!({"channel_id": surface.surface_id, "method": "POST", "path": path,
+            "headers": {"content-type": "application/json"}, "body": body}),
+        MessageMetadata {
+            encrypted: true,
+            authenticated: true,
+            from_key: None,
+            extra: Value::Null,
+        },
+    )
+    .with_context("agent_surface_storage_path", json!(storage_path))
+}
+
+#[test]
+fn a_request_received_over_fabric_drops_a_token_its_http_target_refuses_as_invalid() {
+    run_in_own_process(refused_http_target_token_flow);
+}
+
+/// A surface whose Target is an http URL, reached over Fabric, sends the Target credential from
+/// its client credentials provider and drops the token the Target refuses as `invalid_token`
+/// under the same limits as the direct path.
+async fn refused_http_target_token_flow() {
+    use crate::proxy::handler::target_auth_tests::{
+        BackendAnswer, Fixture, assert_a_refused_token_is_dropped, backend_answering, provider_auth,
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let fixture = Fixture::new(200).await;
+    let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+    let (target_url, _target) =
+        backend_answering(answer.clone(), json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})).await;
+    let mut surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "http-target", "name": "HTTP Target",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": target_url}
+    }))
+    .unwrap();
+    surface.target.auth = Some(provider_auth("machine"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&surface]).await;
+    super::init_credential_provider_store(fixture.providers.clone()).await;
+    super::init_delegation_vault_store(fixture.vault.clone()).await;
+
+    let call = || {
+        let message =
+            forwarded_post(&surface, "/mcp", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), &storage_path)
+                .with_context("secrets_storage_path", json!(fixture.secrets_path()));
+        let egress = fixture.egress.clone();
+        async move {
+            let received = egress
+                .scope(Box::pin(super::process_forward_request(&message)))
+                .await;
+            let (status, answered) = decode(received).await;
+            json!({"isError": status != 200, "status": status, "answered": answered})
+        }
+    };
+    assert_a_refused_token_is_dropped(&fixture, &answer, "Fabric receive HTTP forward", call).await;
+}
+
+#[test]
+fn only_an_a2a_or_ap2_surface_received_over_fabric_reaches_its_a2a_proxy() {
+    run_in_own_process(a2a_proxy_dispatch_flow);
+}
+
+/// No A2A proxy store is installed, so a request that reaches the A2A proxy is answered that its
+/// storage is unavailable. An MCP surface whose Target names an A2A proxy is not dispatched to
+/// it, as on the direct path, so its Direct Line credential is never sent for that surface.
+async fn a2a_proxy_dispatch_flow() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let surface = |id: &str, protocol: &str| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol},
+            "target": {"endpoint": "a2a-proxy://proxy-1"}
+        }))
+        .unwrap()
+    };
+    let (a2a, ap2, mcp) = (surface("a2a", "a2a"), surface("ap2", "ap2"), surface("mcp", "mcp"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&a2a, &ap2, &mcp]).await;
+    let send = |surface: &AgentSurface, body: Value| {
+        let message = forwarded_post(surface, "/", body, &storage_path);
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let message_send = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+        "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]
+    }}});
+
+    for dispatched in [&a2a, &ap2] {
+        let (status, answered) = send(dispatched, message_send.clone()).await;
+        assert_eq!(
+            (status, answered["error"]["message"].as_str()),
+            (200, Some("Failed to access A2A proxy storage")),
+            "{}: {answered}",
+            dispatched.surface_id
+        );
+    }
+    let (status, answered) = send(&mcp, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+    assert_ne!(status, 200, "{answered}");
+    assert!(
+        !answered
+            .to_string()
+            .contains("A2A proxy"),
+        "{status}: {answered}"
+    );
+}
+
+#[test]
 fn fabric_receive_refuses_a_surface_naming_another_tenants_provider_key_when_enforced() {
     run_in_own_process(provider_key_fabric_flow);
 }
@@ -4074,4 +4548,120 @@ async fn provider_key_fabric_flow() {
     let served = send("names-own").await;
     assert_eq!(served["status"], 200, "{served}");
     assert_eq!(reached(), 1);
+}
+
+#[test]
+fn fabric_receive_sends_the_target_credential_only_for_a_get_of_the_surfaces_card_location() {
+    run_in_own_process(card_location_target_credential_flow);
+}
+
+/// A surface that checks no caller, reached over Fabric, sends its Target credential only for a
+/// `GET` of exactly its card location, the sending gateway's own card fetch, in `warn` and under
+/// `target_source_auth` `enforce`. A `HEAD` of it, a query on it, and any other discovery read
+/// reach the Target without the credential.
+async fn card_location_target_credential_flow() {
+    use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, TEST_CREDENTIAL_POLICY};
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    let target = MockServer::start_with_response(json!({"name": "card"}).to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap()
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "target-key".into(),
+            secret_id: "target-key".into(),
+            description: None,
+            value: "target-secret".into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let surface = |id: &str, card_path: Option<&str>| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"),
+                "protocol": "a2a", "public": true, "agent_card_path": card_path},
+            "target": {"endpoint": format!("http://{}", target.addr), "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}}
+        }))
+        .unwrap()
+    };
+    let (default, custom) = (surface("default-card", None), surface("custom-card", Some("custom/card.json")));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&default, &custom]).await;
+
+    let send = |surface: &AgentSurface, method: &str, path: &str| {
+        let mut message = forwarded_post(surface, path, Value::Null, &storage_path)
+            .with_context("secrets_storage_path", json!(secrets_path));
+        message.message_body["method"] = json!(method);
+        message.message_body["headers"] = json!({});
+        message
+            .message_body
+            .as_object_mut()
+            .unwrap()
+            .remove("body");
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let last = || {
+        target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called")
+    };
+
+    let enforced: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+        target_source_auth: RuleMode::Enforce,
+        ..Default::default()
+    }));
+    let warned: &'static CredentialPolicyConfig = Box::leak(Box::default());
+    for policy in [warned, enforced] {
+        TEST_CREDENTIAL_POLICY
+            .scope(policy, async {
+                let cases = [
+                    (&default, "GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json", true),
+                    (&custom, "GET", "/custom/card.json", "/custom/card.json", true),
+                    (&custom, "GET", "/.well-known/agent-card.json", "/custom/card.json", true),
+                    (&default, "GET", "/discovery", "/discovery", false),
+                    (&default, "GET", "/.well-known/agent.json", "/.well-known/agent.json", false),
+                    (&default, "GET", "/a/.well-known/agent-card.json", "/a/.well-known/agent-card.json", false),
+                    (&default, "GET", "/.well-known/agent-card.json?x=1", "/.well-known/agent-card.json", false),
+                    (&default, "HEAD", "/.well-known/agent-card.json", "/.well-known/agent-card.json", false),
+                    (&custom, "GET", "/discovery", "/custom/card.json", false),
+                ];
+                for (surface, method, path, reached_path, credential) in cases {
+                    let before = reached();
+                    let (status, answered) = send(surface, method, path).await;
+                    let case = format!(
+                        "{:?} {} {method} {path}: {status} {answered}",
+                        policy.target_source_auth, surface.surface_id
+                    );
+                    assert_eq!(reached(), before + 1, "{case}");
+                    let request = last();
+                    assert_eq!((request.method.as_str(), request.path.as_str()), (method, reached_path), "{case}");
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("x-target-key")
+                            .map(String::as_str),
+                        credential.then_some("target-secret"),
+                        "{case}: {:?}",
+                        request.headers
+                    );
+                }
+            })
+            .await;
+    }
 }

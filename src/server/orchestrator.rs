@@ -3571,12 +3571,30 @@ pub async fn run_axum_proxy(
             pat_authenticator.clone(),
         );
 
+        let reference_stores = crate::credential_providers::references::ReferenceStores {
+            surfaces: identity_state
+                .agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+            credential_providers: identity_state
+                .credential_provider_store
+                .clone(),
+            a2a_proxies: identity_state
+                .a2a_proxy_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::a2a_proxies::A2aProxyStore>),
+            sts_clients: identity_state
+                .sts_client_store
+                .clone(),
+        };
+
         // Create secrets API router (secrets_cache is None here since it's created per-proxy instance)
         let secrets_router = crate::secrets::router::create_secrets_router(
             secrets_store.clone(),
             notification_store.clone(),
             None,
             Some(definition_stores.clone()),
+            reference_stores.clone(),
             vault_rbac_guard.clone(),
         );
 
@@ -3620,6 +3638,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .external_consent_issuers
                     .clone(),
+                reference_stores.clone(),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {

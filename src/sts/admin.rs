@@ -288,6 +288,7 @@ pub async fn create_client(
     {
         return response.into_response();
     }
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
     if let Err(response) = validate_secret_reference(
         body.tenant_id.as_deref(),
         body.client_secret_ref
@@ -450,6 +451,7 @@ pub async fn update_client(
     {
         return response.into_response();
     }
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
     if let Err(response) = validate_secret_reference(
         body.tenant_id.as_deref(),
         body.client_secret_ref
@@ -933,6 +935,116 @@ mod tests {
         .await
         .into_response()
         .status()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saving_an_sts_client_waits_for_a_secret_delete_in_progress() {
+        let fixture = Arc::new(sts_fixture(Some("tenant-a")).await);
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let fixture = fixture.clone();
+            async move {
+                let mut body = base_request();
+                body.client_id = "other".into();
+                body.client_secret_ref = None;
+                create_client(
+                    Extension("admin".to_string()),
+                    Extension(fixture.storage.clone()),
+                    Extension(Arc::new(RbacConfig::default())),
+                    State(fixture.store.clone()),
+                    None,
+                    Extension(Arc::new(crate::sts::resource_owners::NoResourceOwners)),
+                    None,
+                    None,
+                    None,
+                    Json(body),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        });
+        let updating = tokio::spawn({
+            let fixture = fixture.clone();
+            async move { update_as_tenant_a(&fixture).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "a create waits for the secret delete that holds the lock");
+        assert!(!updating.is_finished(), "an update waits for the secret delete that holds the lock");
+        drop(deleting);
+        assert_eq!(creating.await.unwrap(), StatusCode::CREATED);
+        assert_eq!(updating.await.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_an_sts_client_naming_a_secret_deleted_while_it_waited_is_refused() {
+        let fixture = Arc::new(sts_fixture(None).await);
+        let secrets: Arc<dyn SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                fixture
+                    ._temp
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let secret = secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "sts-secret-other".into(),
+                secret_id: "sts-secret-other".into(),
+                description: None,
+                value: "client-secret".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let fixture = fixture.clone();
+            let secrets = secrets.clone();
+            async move {
+                let mut body = base_request();
+                body.client_id = "other".into();
+                body.client_secret_ref = Some("sts-secret-other".into());
+                create_client(
+                    Extension("admin".to_string()),
+                    Extension(fixture.storage.clone()),
+                    Extension(Arc::new(RbacConfig::default())),
+                    State(fixture.store.clone()),
+                    Some(Extension(secrets)),
+                    Extension(Arc::new(crate::sts::resource_owners::NoResourceOwners)),
+                    None,
+                    None,
+                    None,
+                    Json(body),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        secrets
+            .delete(&secret.id)
+            .await
+            .unwrap();
+        drop(deleting);
+
+        assert_eq!(creating.await.unwrap(), StatusCode::BAD_REQUEST);
+        assert!(
+            fixture
+                .store
+                .get_by_client_id("other")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

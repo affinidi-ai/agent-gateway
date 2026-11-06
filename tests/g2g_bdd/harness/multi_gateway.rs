@@ -990,6 +990,14 @@ async fn spawn_node(
     // Start a mock per surface that needs one, then patch the surface target to
     // the mock URL before writing config.
     let mut mocks: HashMap<String, MockServer> = HashMap::new();
+    let mut egress_allowlist: Vec<String> = egress_allowlist
+        .map(|allowlist| {
+            allowlist
+                .split(',')
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut surfaces = plan.surfaces.clone();
     for surface in surfaces.iter_mut() {
         if let Some(response) = plan
@@ -1006,8 +1014,12 @@ async fn spawn_node(
             }
             match &mut surface.mcp_proxy {
                 // Proxy-backed surfaces keep their `proxy://` target; the mock
-                // is the proxy's REST API target endpoint (its `base_url`).
-                Some(proxy) => proxy.target_url = mock.url(),
+                // is the proxy's REST API target endpoint (its `base_url`), which
+                // a credentialed tool call vets against the egress allow-list.
+                Some(proxy) => {
+                    proxy.target_url = mock.url();
+                    egress_allowlist.push(mock.url());
+                }
                 // Plain surfaces forward directly to the mock URL.
                 None => surface.target_endpoint = mock.url(),
             }
@@ -1044,8 +1056,8 @@ async fn spawn_node(
         reservation.release_listener();
     }
     let mut extra_env: HashMap<String, String> = HashMap::new();
-    if let Some(allowlist) = egress_allowlist {
-        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist.to_string());
+    if !egress_allowlist.is_empty() {
+        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_allowlist.join(","));
     }
     match &plan.fabric_receive_only {
         None => {}

@@ -28,6 +28,12 @@ pub use grant_refresh::{GRANT_REFRESH_CLAIMS_DIRECTORY, GrantRefreshClaim};
 mod deferred_revocation;
 pub use deferred_revocation::{DEFERRED_REVOCATIONS_DIRECTORY, Deferral, DeferredRevocation};
 
+/// SHA-256 of an access token, which names a token value without keeping it.
+pub fn access_token_fingerprint(access_token: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(access_token.as_bytes()).into()
+}
+
 /// Trait for delegation vault storage operations
 #[async_trait]
 pub trait DelegationVaultStorage: Send + Sync {
@@ -65,6 +71,19 @@ pub trait DelegationVaultStorage: Send + Sync {
         &self,
         user_identity_hash: &str,
     ) -> Result<usize>;
+
+    /// Delete the token with this id, and its refresh claim, only while its access token has
+    /// the [`access_token_fingerprint`] `fingerprint`, the one a Target refused; `false` when
+    /// no token is stored there or it holds another token since, which is kept. Unlike
+    /// [`Self::delete`], it is no revocation: no pending consent is revoked and no
+    /// subscription ends.
+    async fn delete_token_holding(
+        &self,
+        _id: &str,
+        _fingerprint: &[u8; 32],
+    ) -> Result<bool> {
+        anyhow::bail!("This vault does not delete a token by the value it holds")
+    }
 
     /// Store `token`, and in the same step delete the expired tokens of its agent and
     /// provider whose user hash starts with `user_hash_prefix`. Unlike a revoke, it leaves
@@ -1323,6 +1342,37 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         .await
     }
 
+    async fn delete_token_holding(
+        &self,
+        id: &str,
+        fingerprint: &[u8; 32],
+    ) -> Result<bool> {
+        let id = id.to_string();
+        let fingerprint = *fingerprint;
+        self.mutate(move |store| async move {
+            let Some(current) = store.storage.get(&id).await? else {
+                return Ok(false);
+            };
+            if !bool::from(subtle::ConstantTimeEq::ct_eq(
+                &access_token_fingerprint(&current.access_token)[..],
+                &fingerprint[..],
+            )) {
+                return Ok(false);
+            }
+            store
+                .refreshes
+                .delete(&id)
+                .await?;
+            store
+                .storage
+                .delete(&id)
+                .await?;
+            info!(target: "credential_delegation", id = %id, "Delegation token deleted: its Target refused it");
+            Ok(true)
+        })
+        .await
+    }
+
     async fn update(
         &self,
         mut token: DelegationToken,
@@ -2302,6 +2352,115 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_is_deleted_only_while_it_holds_that_value_and_revokes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut refused = super::super::tests::make_token(Some(3600), true);
+        refused.agent_did = "surface:a".into();
+        refused.user_identity_hash = "__target_auth__:a".into();
+        let refused = store
+            .store(refused)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp() as u64;
+        store
+            .claim_refresh(&refused, now)
+            .await
+            .unwrap();
+        let pending = super::super::tests::make_token(Some(3600), true);
+        let consent = StagedConsent {
+            id: uuid::Uuid::new_v4().to_string(),
+            binding_digest: [1; 32],
+            issued_at: now,
+            expires_at: now + 300,
+            snapshot: store
+                .consent_snapshot(&pending.agent_did, &pending.user_identity_hash, &pending.credential_provider_id)
+                .await
+                .unwrap(),
+            credential: pending,
+        };
+        let consent_id = uuid::Uuid::parse_str(&consent.id).unwrap();
+        store
+            .stage_consent(consent, now)
+            .await
+            .unwrap();
+        let epoch = store
+            .access_revision()
+            .await
+            .unwrap();
+
+        let mut renewed = refused.clone();
+        renewed.access_token = "renewed".into();
+        let renewed = store
+            .update(renewed)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .delete_token_holding(&refused.id, &access_token_fingerprint(&refused.access_token))
+                .await
+                .unwrap(),
+            "a row that holds another token since is kept"
+        );
+        assert_eq!(
+            store
+                .get(&refused.id)
+                .await
+                .unwrap()
+                .map(|token| token.access_token),
+            Some("renewed".to_string())
+        );
+
+        assert!(
+            store
+                .delete_token_holding(&renewed.id, &access_token_fingerprint(&renewed.access_token))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .get(&renewed.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .refreshes
+                .get(&renewed.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the refresh claim goes with the token"
+        );
+        assert_eq!(
+            store
+                .access_revision()
+                .await
+                .unwrap(),
+            epoch,
+            "the revocation epoch is unchanged"
+        );
+        assert!(
+            store
+                .staged_consent(consent_id, [1; 32], now)
+                .await
+                .unwrap()
+                .is_some(),
+            "a staged consent survives"
+        );
+        assert!(
+            !store
+                .delete_token_holding(&renewed.id, &access_token_fingerprint(&renewed.access_token))
+                .await
+                .unwrap(),
+            "a row that is gone is not deleted again"
         );
     }
 
