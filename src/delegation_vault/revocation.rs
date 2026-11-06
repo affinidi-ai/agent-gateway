@@ -270,6 +270,10 @@ pub struct ChangeOutcome {
     /// It runs while the task still holds its `hold`, so the lock that
     /// serialises the change covers the read.
     pub stored: futures::future::BoxFuture<'static, bool>,
+    /// The revocations kept for the earlier removals of the grants' provider,
+    /// read before the change, which a provider's delete decides once it was
+    /// saved ([`decide_kept`]).
+    pub kept: Vec<DeferredRevocation>,
 }
 
 /// Delete each of `grants`, as read, from the vault, which ends its release at
@@ -301,10 +305,14 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
     grants: Vec<DelegatedGrant>,
     revoker: Revoker,
     hold: Hold,
-    outcome: Option<ChangeOutcome>,
+    mut outcome: Option<ChangeOutcome>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let vault = Arc::clone(vault);
     let (report, deletions) = tokio::sync::oneshot::channel();
+    let earlier = outcome
+        .as_mut()
+        .map(|outcome| std::mem::take(&mut outcome.kept))
+        .unwrap_or_default();
     let task = crate::audit::producer::spawn_audited(async move {
         let mut deleted = Vec::with_capacity(grants.len());
         let mut failure = None;
@@ -326,7 +334,7 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         let kept = keep_pending(revoker.vault.as_ref(), deleted).await;
         let revoke = match outcome {
             Some(_) if refused => false,
-            Some(ChangeOutcome { saved, stored }) => match saved.await {
+            Some(ChangeOutcome { saved, stored, .. }) => match saved.await {
                 Ok(saved) => saved,
                 Err(_) => stored.await,
             },
@@ -340,6 +348,9 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         }
         drop(hold);
         decide_each(kept, &revoker, None).await;
+        if !earlier.is_empty() {
+            decide_kept(&vault, earlier, &revoker, chrono::Utc::now(), true).await;
+        }
     });
     match deletions.await {
         Ok(None) => Ok(task),
@@ -760,6 +771,7 @@ impl Revoker {
 /// it is revoked all the same: a revocation is delayed, never lost.
 /// `revoker.providers` must hold the provider of each kept grant that still
 /// exists. Returns how many were decided or tried.
+#[cfg(test)]
 pub async fn revoke_deferred(
     revoker: Revoker,
     now: chrono::DateTime<chrono::Utc>,
@@ -770,10 +782,57 @@ pub async fn revoke_deferred(
     let Some(kept) = kept_revocations(&vault).await else {
         return 0;
     };
+    revoke_deferred_of(revoker, kept, now).await
+}
+
+/// [`revoke_deferred`] for `kept`, read already: the sweep leaves out those
+/// whose provider cannot be read now.
+pub async fn revoke_deferred_of(
+    revoker: Revoker,
+    kept: Vec<DeferredRevocation>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some(vault) = revoker.vault.clone() else {
+        return 0;
+    };
+    decide_kept(&vault, kept, &revoker, now, false).await
+}
+
+/// The revocations the vault keeps for grants of provider `provider_id`, read
+/// before the provider is deleted, so a provider's delete ([`ChangeOutcome::kept`]) can
+/// decide them with it. An error when they cannot be read: the provider must
+/// then be kept, or they could only be forgotten unrevoked.
+pub async fn kept_revocations_of(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    provider_id: &str,
+) -> anyhow::Result<Vec<DeferredRevocation>> {
+    Ok(vault
+        .every_deferred_revocation()
+        .await?
+        .into_iter()
+        .filter(|revocation| {
+            revocation
+                .grant
+                .credential_provider_id
+                == provider_id
+        })
+        .collect())
+}
+
+/// [`revoke_deferred`] for `kept`, read already. `provider_gone` says each
+/// grant's provider was deleted with all its grants, so no other grant holds
+/// a kept one's vendor account and each is revoked.
+async fn decide_kept(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    kept: Vec<DeferredRevocation>,
+    revoker: &Revoker,
+    now: chrono::DateTime<chrono::Utc>,
+    provider_gone: bool,
+) -> usize {
     let (pending, deferred): (Vec<_>, Vec<_>) = kept
         .into_iter()
         .partition(|revocation| revocation.deferral == Deferral::Pending);
-    let mut decided = retry_pending(&vault, pending, &revoker).await;
+    let mut decided = retry_pending(vault, pending, revoker).await;
     if deferred.is_empty() {
         return decided;
     }
@@ -781,7 +840,7 @@ pub async fn revoke_deferred(
         .iter()
         .map(|deferral| deferral.grant.clone())
         .collect();
-    let in_use = AuthorizationsInUse::read(Some(&vault), &revoker.providers, &grants).await;
+    let in_use = AuthorizationsInUse::read(Some(vault), &revoker.providers, &grants).await;
     for deferral in deferred {
         let grant = &deferral.grant;
         match revoker
@@ -797,7 +856,7 @@ pub async fn revoke_deferred(
                 &[],
             ),
             Some(provider) => {
-                let holds_another = if provider.revocation_ends_authorization {
+                let holds_another = if provider.revocation_ends_authorization && !provider_gone {
                     in_use.holds_another(grant)
                 } else {
                     Some(false)
@@ -856,11 +915,24 @@ pub async fn revoke_deferred(
 /// whose stored grant cannot be read, and so cannot be released, is revoked.
 /// `revoker.providers` must hold the provider of each kept grant that still
 /// exists. Returns how many were decided or tried.
+#[cfg(test)]
 pub async fn revoke_pending(revoker: Revoker) -> usize {
     let Some(vault) = revoker.vault.clone() else {
         return 0;
     };
     let Some(kept) = kept_revocations(&vault).await else {
+        return 0;
+    };
+    revoke_pending_of(revoker, kept).await
+}
+
+/// [`revoke_pending`] for the pending ones of `kept`, read already: the sweep
+/// leaves out those whose provider cannot be read now.
+pub async fn revoke_pending_of(
+    revoker: Revoker,
+    kept: Vec<DeferredRevocation>,
+) -> usize {
+    let Some(vault) = revoker.vault.clone() else {
         return 0;
     };
     let pending = kept
@@ -871,6 +943,7 @@ pub async fn revoke_pending(revoker: Revoker) -> usize {
 }
 
 /// Every revocation the vault keeps, `None` when they cannot be read.
+#[cfg(test)]
 async fn kept_revocations(vault: &Arc<dyn DelegationVaultStorage>) -> Option<Vec<DeferredRevocation>> {
     match vault
         .deferred_revocations()
@@ -2341,6 +2414,14 @@ pub(crate) mod tests {
                 .await
         }
 
+        async fn every_deferred_revocation(
+            &self
+        ) -> anyhow::Result<Vec<crate::delegation_vault::storage::DeferredRevocation>> {
+            self.inner
+                .every_deferred_revocation()
+                .await
+        }
+
         async fn forget_deferred_revocation(
             &self,
             id: &str,
@@ -2526,6 +2607,51 @@ pub(crate) mod tests {
             "one the vault still cannot tell about after thirty days is revoked all the same"
         );
         assert_eq!(server.revoked_tokens(), ["overdue", "overdue-refresh", "removed", "removed-refresh"]);
+        assert!(
+            vault
+                .deferred_revocations()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A deleted provider's kept revocation is revoked even while the vault
+    /// cannot tell whether another grant holds its vendor account: with the
+    /// provider and all its grants deleted, none can.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_providers_kept_revocation_is_revoked_while_the_vault_cannot_tell() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let server = RecordingServer::start(200).await;
+        let (inner, _) = vault_with(&directory, 0).await;
+        let vault = ListingVault::new(inner);
+        vault
+            .outage
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut flagged = provider(Some(&server.url), "none", None);
+        flagged.revocation_ends_authorization = true;
+        let revoker = Revoker {
+            providers: HashMap::from([("provider".to_string(), flagged)]),
+            secrets: Some(secrets),
+            exact_allowlist: Some(server.origin()),
+            actor: None,
+            vault: Some(vault.clone()),
+        };
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "hop", "provider");
+        revoke_removed(vec![account_grant(&key, "removed", Some("account-1"))], revoker.clone()).await;
+        let kept = kept_revocations_of(&(vault.clone() as Arc<dyn DelegationVaultStorage>), "provider")
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+
+        assert_eq!(
+            decide_kept(&(vault.clone() as Arc<dyn DelegationVaultStorage>), kept, &revoker, chrono::Utc::now(), true)
+                .await,
+            1
+        );
+
+        assert_eq!(server.revoked_tokens(), ["removed", "removed-refresh"]);
         assert!(
             vault
                 .deferred_revocations()
@@ -2727,6 +2853,7 @@ pub(crate) mod tests {
             Some(ChangeOutcome {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
+                kept: Vec::new(),
             }),
         )
         .await
@@ -2756,6 +2883,7 @@ pub(crate) mod tests {
             Some(ChangeOutcome {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
+                kept: Vec::new(),
             }),
         )
         .await

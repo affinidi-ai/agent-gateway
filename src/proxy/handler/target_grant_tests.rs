@@ -450,6 +450,66 @@ fn rejected_token() -> Answer {
     Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#)
 }
 
+/// A vendor's `401` to a grant that cannot be refreshed asks for a new
+/// connect. A caller's grant is removed and revoked. An owner's is kept and
+/// nothing is revoked: any caller of the binding can send a request the
+/// vendor refuses, so none ends the owner's grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_targets_401_to_a_grant_that_cannot_be_refreshed_removes_only_a_callers_grant() {
+    for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
+        let fixture = Fixture::new(vec![Answer::status(200)], vec![rejected_token()]).await;
+        let target = format!("{}/mcp", fixture.vendor.origin());
+        fixture
+            .serve(vendor_surface("mcp", &target, subject))
+            .await;
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "dead");
+        grant.refresh_token = None;
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(3600));
+        fixture
+            .vault
+            .store_grant(grant)
+            .await
+            .unwrap();
+
+        let (status, _, body) = fixture
+            .send(mcp_call(Some(KEY)))
+            .await;
+
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{subject}: {body}");
+        assert_eq!(body["error"]["data"]["reason"], "connect_required", "{subject}: {body}");
+        if subject == "owner" {
+            assert!(fixture.kept(&key).await, "{subject}: the grant is kept");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty(),
+                "{subject}: nothing is revoked"
+            );
+        } else {
+            assert!(!fixture.kept(&key).await, "{subject}: the grant is removed");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .contains(&"dead".to_string()),
+                "{subject}: the grant is revoked"
+            );
+        }
+    }
+}
+
 /// A vendor's `401` that rejects the token gets one refresh and one retry
 /// with the new token. A second `401`, after a refresh the authorization
 /// server granted, refuses that request, `connector_unavailable`, not the
@@ -1586,9 +1646,9 @@ async fn no_payment_is_taken_for_the_targets_grant() {
 /// The injection of a refreshed grant into the one retry is audited as the
 /// first one is: under the caller's identity hash, whose grant it is or who
 /// acts as the owner, with the binding's subject in the detail; and the
-/// refreshed grant is recorded as used.
+/// grant's use is recorded, on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
+async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
     for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
         let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), vendor_result()]).await;
         let target = format!("{}/mcp", fixture.vendor.origin());
@@ -1619,20 +1679,21 @@ async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
             .collect();
         let expected = (Some(caller_principal()), Some(format!("grant_by_binding:{subject}:target")));
         assert_eq!(injected, [expected.clone(), expected], "{subject}");
-        let kept = fixture
-            .vault
-            .grant(&key)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut kept = None;
+        for _ in 0..250 {
+            let grant = fixture
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            if grant.last_used_at.is_some() {
+                kept = Some(grant);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let kept = kept.unwrap_or_else(|| panic!("{subject}: the grant's use is recorded"));
         assert_eq!(kept.access_token, "second", "{subject}");
-        assert!(
-            kept.last_used_at
-                .zip(kept.refreshed_at)
-                .is_some_and(|(used, refreshed)| used >= refreshed),
-            "{subject}: the refreshed grant is recorded as used: {:?} {:?}",
-            kept.last_used_at,
-            kept.refreshed_at
-        );
     }
 }

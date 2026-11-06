@@ -11,10 +11,10 @@
 //! written under, it removes no grant. Every grant it removes is revoked at its authorization server, as every
 //! removal is. It also decides the revocations a removal left to it because
 //! the vault could not tell whether the vendor account's authorization was
-//! still in use ([`super::revocation::revoke_deferred`]), and tries again the
+//! still in use ([`super::revocation::revoke_deferred_of`]), and tries again the
 //! pending revocations kept: those in flight when the gateway stopped, which
 //! it also tries when the gateway starts, and those that could not reach
-//! their vendor ([`super::revocation::revoke_pending`]).
+//! their vendor ([`super::revocation::revoke_pending_of`]).
 //!
 //! Grants are found by their file names, one binding at a time: the sweep
 //! reads one of the binding's grants to learn its surface, takes that
@@ -126,7 +126,9 @@ impl Sweeper {
                 if crate::server::mode::is_standby() {
                     continue;
                 }
-                let report = self.sweep(Utc::now()).await;
+                let report = self
+                    .sweep_while(Utc::now(), || !crate::server::mode::is_standby())
+                    .await;
                 tracing::info!(
                     target: "credential_delegation",
                     expired_connects = report.expired_connects,
@@ -144,9 +146,22 @@ impl Sweeper {
     }
 
     /// Sweep once, as of `now`.
+    #[cfg(test)]
     pub async fn sweep(
         &self,
         now: DateTime<Utc>,
+    ) -> SweepReport {
+        self.sweep_while(now, || true)
+            .await
+    }
+
+    /// Sweep once, as of `now`, stopping between bindings once `keep_going`
+    /// says no: a sweep waits for each binding's revocations, so it can
+    /// outlast the node being active.
+    pub async fn sweep_while(
+        &self,
+        now: DateTime<Utc>,
+        keep_going: impl Fn() -> bool,
     ) -> SweepReport {
         let mut report = SweepReport {
             expired_connects: self
@@ -159,6 +174,9 @@ impl Sweeper {
                 }),
             ..SweepReport::default()
         };
+        if !keep_going() {
+            return report;
+        }
         let mut providers = HashMap::new();
         report.deferred_revocations = self
             .decide_deferred(now, &mut providers)
@@ -204,6 +222,9 @@ impl Sweeper {
             }
         }
         for ids in bindings.into_values() {
+            if !keep_going() {
+                break;
+            }
             self.sweep_binding(ids, now, &mut providers, &mut report)
                 .await;
         }
@@ -220,42 +241,42 @@ impl Sweeper {
     }
 
     /// Try again the pending revocations kept, with the providers of their
-    /// grants. While one of those providers cannot be read, none is tried,
-    /// and they wait for the next sweep.
+    /// grants. Those whose provider cannot be read wait for the next sweep.
     pub async fn retry_pending(&self) -> usize {
-        let Some(revoker) = self
+        let Some((revoker, kept)) = self
             .kept_revoker(&mut HashMap::new())
             .await
         else {
             return 0;
         };
-        super::revocation::revoke_pending(revoker).await
+        super::revocation::revoke_pending_of(revoker, kept).await
     }
 
     /// Decide, as of `now`, the revocations kept, with the providers of their
-    /// grants. While one of those providers cannot be read, none is decided,
-    /// and they wait for the next sweep.
+    /// grants. Those whose provider cannot be read wait for the next sweep.
     async fn decide_deferred(
         &self,
         now: DateTime<Utc>,
         providers: &mut HashMap<String, Option<CredentialProvider>>,
     ) -> usize {
-        let Some(revoker) = self
+        let Some((revoker, kept)) = self
             .kept_revoker(providers)
             .await
         else {
             return 0;
         };
-        super::revocation::revoke_deferred(revoker, now).await
+        super::revocation::revoke_deferred_of(revoker, kept, now).await
     }
 
-    /// The revoker of the revocations kept, with the provider of each of
-    /// their grants that still exists; `None` when there are none, or they or
-    /// one of those providers cannot be read.
+    /// The revocations kept that can be decided now, and their revoker, with
+    /// the provider of each of their grants that still exists. Those whose
+    /// provider cannot be read are left out, so one unreadable provider never
+    /// holds up the others, and never has its revocations taken for a gone
+    /// provider's. `None` when none are left, or they cannot be read.
     async fn kept_revoker(
         &self,
         providers: &mut HashMap<String, Option<CredentialProvider>>,
-    ) -> Option<super::revocation::Revoker> {
+    ) -> Option<(super::revocation::Revoker, Vec<crate::delegation_vault::storage::DeferredRevocation>)> {
         let deferred = match self
             .vault
             .deferred_revocations()
@@ -271,10 +292,14 @@ impl Sweeper {
             return None;
         }
         let mut known = HashMap::new();
+        let mut unreadable = std::collections::HashSet::new();
         for deferral in &deferred {
             let id = &deferral
                 .grant
                 .credential_provider_id;
+            if known.contains_key(id) || unreadable.contains(id) {
+                continue;
+            }
             match self
                 .provider(id, providers)
                 .await
@@ -287,19 +312,35 @@ impl Sweeper {
                     tracing::warn!(
                         target: "credential_delegation",
                         error = %error,
-                        "Failed to read a provider to decide kept revocations; they wait for the next sweep"
+                        "Failed to read a provider to decide its kept revocations; they wait for the next sweep"
                     );
-                    return None;
+                    unreadable.insert(id.clone());
                 }
             }
         }
-        Some(super::revocation::Revoker {
-            providers: known,
-            secrets: self.secrets.clone(),
-            exact_allowlist: self.exact_allowlist.clone(),
-            actor: None,
-            vault: Some(self.vault.clone()),
-        })
+        let decidable: Vec<_> = deferred
+            .into_iter()
+            .filter(|deferral| {
+                !unreadable.contains(
+                    &deferral
+                        .grant
+                        .credential_provider_id,
+                )
+            })
+            .collect();
+        if decidable.is_empty() {
+            return None;
+        }
+        Some((
+            super::revocation::Revoker {
+                providers: known,
+                secrets: self.secrets.clone(),
+                exact_allowlist: self.exact_allowlist.clone(),
+                actor: None,
+                vault: Some(self.vault.clone()),
+            },
+            decidable,
+        ))
     }
 
     /// The provider `id`, read once per sweep. A provider store that cannot
@@ -312,7 +353,10 @@ impl Sweeper {
         if let Some(provider) = providers.get(id) {
             return Ok(provider.clone());
         }
-        let provider = self.providers.get(id).await?;
+        let provider = self
+            .providers
+            .get_checked(id)
+            .await?;
         providers.insert(id.to_string(), provider.clone());
         Ok(provider)
     }
@@ -349,7 +393,7 @@ impl Sweeper {
         let lock = crate::identity::handlers::surface_grants::lock_surface(&surface_id).await;
         let surface = match self
             .surfaces
-            .get(&surface_id)
+            .get_checked(&surface_id)
             .await
         {
             Ok(surface) => surface,
@@ -430,7 +474,7 @@ impl Sweeper {
             vault: Some(self.vault.clone()),
         };
         match super::revocation::delete_then_revoke(&self.vault, removed, revoker, lock, None).await {
-            Ok(_) => {
+            Ok(revocations) => {
                 for (_, removal) in removals {
                     match removal {
                         Removal::Unbound => report.unbound_grants += 1,
@@ -438,6 +482,11 @@ impl Sweeper {
                         Removal::Expired => report.expired_grants += 1,
                         Removal::Failing => report.failing_grants += 1,
                     }
+                }
+                // One binding's revocations at a time, so a sweep never has
+                // more vendor calls open than one revocation task allows.
+                if let Err(error) = revocations.await {
+                    tracing::warn!(target: "credential_delegation", error = %error, "A swept binding's revocations ended early");
                 }
             }
             Err(error) => {
@@ -563,6 +612,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CredentialProviderStorage for UnreadableProviders {
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::credential_providers::CredentialProvider>> {
+            self.get(id).await
+        }
+
         async fn create(
             &self,
             _provider: CredentialProvider,
@@ -733,6 +789,165 @@ mod tests {
             "the grant is kept"
         );
         assert!(server.requests().is_empty(), "and not revoked");
+    }
+
+    /// A surface whose file is stored but cannot be read is not a surface that
+    /// is gone: the sweep skips its binding, and removes and revokes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_skips_a_binding_whose_surface_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let mut sweeper = sweeper(&directory, &server, true).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        store(&sweeper, &key, "live", 3600).await;
+        let surfaces = directory
+            .path()
+            .join("surfaces");
+        for entry in std::fs::read_dir(&surfaces).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("surface.json")
+                })
+            {
+                std::fs::write(path, b"not a surface").unwrap();
+            }
+        }
+        sweeper.surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(surfaces)
+                .await
+                .unwrap(),
+        );
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+        assert_eq!(report.unbound_grants, 0);
+        assert_eq!(report.skipped_bindings, 1);
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the grant is kept"
+        );
+        assert!(server.requests().is_empty(), "and not revoked");
+    }
+
+    /// A sweep told to stop, as when the node is demoted, decides no further
+    /// binding: nothing is removed or revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_told_to_stop_decides_no_further_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, false).await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor");
+        store(&sweeper, &key, "unbound", 3600).await;
+
+        let report = sweeper
+            .sweep_while(Utc::now(), || false)
+            .await;
+
+        assert_eq!(report.unbound_grants, 0);
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    /// A sweep told to stop partway decides the bindings before it and leaves
+    /// the rest: `keep_going` is asked before each binding, not once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_told_to_stop_partway_leaves_the_bindings_after_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, false).await;
+        let keys = [
+            GrantKey::owner(Some("tenant-a"), "surface", "removed-hop-a", "vendor"),
+            GrantKey::owner(Some("tenant-a"), "surface", "removed-hop-b", "vendor"),
+        ];
+        for (key, access) in keys
+            .iter()
+            .zip(["unbound-a", "unbound-b"])
+        {
+            store(&sweeper, key, access, 3600).await;
+        }
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+
+        // Asked once before the kept revocations, then before each binding.
+        let report = sweeper
+            .sweep_while(Utc::now(), || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2)
+            .await;
+
+        assert_eq!(report.unbound_grants, 1);
+        let mut kept = 0;
+        for key in &keys {
+            if sweeper
+                .vault
+                .grant(key)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 1, "the binding after the stop is left");
+    }
+
+    /// The kept revocations of a provider that cannot be read wait for the
+    /// next sweep; those of every other provider are decided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_provider_holds_up_only_its_own_kept_revocations() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let mut sweeper = sweeper(&directory, &server, false).await;
+        for (provider, access) in [("vendor", "readable"), ("broken", "unreadable")] {
+            let key = GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", provider);
+            let mut removed = crate::delegation_vault::grants::tests::grant(&key, access);
+            removed.id = key.record_id();
+            sweeper
+                .vault
+                .defer_revocation(removed)
+                .await
+                .unwrap();
+        }
+        let providers = directory
+            .path()
+            .join("providers");
+        std::fs::write(providers.join("broken.json"), b"not a provider").unwrap();
+        sweeper.providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(providers)
+                .await
+                .unwrap(),
+        );
+
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+
+        assert_eq!(report.deferred_revocations, 1, "{report:?}");
+        revoked(&server, &["readable", "readable-refresh"]).await;
+        let kept: Vec<_> = sweeper
+            .vault
+            .deferred_revocations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|kept| {
+                kept.grant
+                    .credential_provider_id
+            })
+            .collect();
+        assert_eq!(kept, ["broken"]);
     }
 
     /// The sweep reads a binding's grants under its surface's lock, so a

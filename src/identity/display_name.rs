@@ -419,6 +419,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentSurfaceStore for Surfaces {
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<AgentSurface>> {
+            self.get(surface_id).await
+        }
+
         async fn save(
             &self,
             _surface: &AgentSurface,
