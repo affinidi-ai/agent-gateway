@@ -41,9 +41,18 @@ changes:
         text, which can quote storage file paths. They now answer a fixed body, such as
         {"error":"Failed to revoke"}, and log the detail instead. The revokes log it escaped,
         since it can quote the id the caller sent.
+    - timestamp: '2026-11-06T15:23:03Z'
+      title: Refuse the server log download to a tenant's access token
+      description: >-
+        GET /v1/logs/download served the server logs, which hold every tenant's request and
+        credential delegation detail, to any caller with audit.view, a tenant's access token or one
+        scoped by a resource pattern included. It now answers such a token 403; sessions and
+        appliance-wide access tokens still download the logs. A failed download answers
+        {"error":"Failed to download logs"} instead of an error naming the log directory, and the
+        detail is logged.
   breaking:
     - timestamp: '2026-11-06T15:01:09Z'
-      title: ⭐ Refuse delegation records to access tokens scoped by required headers alone
+      title: ⭐ Refuse delegation records and logs to tokens scoped by required headers alone
       description: >-
         An access token scoped by required headers alone, or by a resource pattern without a
         tenant, read every tenant's agent-keyed vault tokens and delegation audit records on
@@ -52,6 +61,7 @@ changes:
         revoke any tenant's tokens. Such a token now reads none of them: lists and audit pages are
         empty and every token answers 404. DELETE /api/v1/delegation-vault/{id} and DELETE
         /api/v1/delegation-vault/by-user/{user_hash} now answer 403 to every caller but a session or
-        an appliance-wide access token, and keep the tokens. Automation that read or revoked these
-        records with such a token needs an appliance-wide access token, or a tenant's token to
-        read its own tenant's.
+        an appliance-wide access token, and keep the tokens, and GET /v1/logs/download answers 403
+        to such a token. Automation that read or revoked these records, or downloaded the logs,
+        with such a token needs an appliance-wide access token, or a tenant's token to read its
+        own tenant's records.

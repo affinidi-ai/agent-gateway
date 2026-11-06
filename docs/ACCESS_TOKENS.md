@@ -310,6 +310,11 @@ are filtered by the tenant of each record's credential provider
 ([Delegation vault tokens](#delegation-vault-tokens),
 [Delegation audit records](#delegation-audit-records)).
 
+The server logs are unpartitioned as well and hold every tenant's request and credential
+delegation detail, so `GET /v1/logs/download` serves them only to an appliance-wide caller: a
+session, or a PAT with neither a resource pattern nor required headers. A tenant PAT, and a PAT
+scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not.
+
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
 owner's role, and routes open to any signed-in caller, such as the caller's own profile and

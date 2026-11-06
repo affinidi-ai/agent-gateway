@@ -2,7 +2,26 @@ Feature: Management route permissions
   Removing rotated log files and truncating stored metrics need settings.edit. Reading or
   changing the user welcome template and sending a welcome notification need users.approve.
   Both permissions belong to administrators by default. A personal access token with feature
-  scopes also needs the permission among its scopes.
+  scopes also needs the permission among its scopes. Downloading the server logs needs
+  audit.view, and since the logs hold every tenant's request and delegation detail, a tenant's
+  access token or one scoped by required headers alone cannot download them.
+
+  Scenario: An administrator downloads the server logs
+    Given a log file "agent-gateway.log"
+    And operator "ada" has the "administrator" role
+    When operator "ada" downloads the server logs
+    Then the admin API response status is 200
+    And the answer is a ZIP archive of the server logs
+
+  Scenario: A tenant token cannot download the server logs
+    Given a log file "agent-gateway.log"
+    When a token of tenant "tenant-a" downloads the server logs
+    Then the admin API response status is 403
+
+  Scenario: An access token scoped by required headers alone cannot download the server logs
+    Given a log file "agent-gateway.log"
+    When an access token scoped by required headers alone downloads the server logs
+    Then the admin API response status is 403
 
   Scenario: A base user cannot remove rotated log files
     Given a log file "agent-gateway.log.1"

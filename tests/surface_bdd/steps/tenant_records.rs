@@ -416,6 +416,19 @@ async fn header_scoped_token_reads_credential_delegation_audit_log(world: &mut S
     send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, path).await;
 }
 
+#[when(expr = "a token of tenant {string} downloads the server logs")]
+async fn tenant_downloads_server_logs(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    send_with_token(world, TokenScope::Tenant(&tenant), Method::GET, "/v1/logs/download").await;
+}
+
+#[when("an access token scoped by required headers alone downloads the server logs")]
+async fn header_scoped_token_downloads_server_logs(world: &mut SurfaceWorld) {
+    send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, "/v1/logs/download").await;
+}
+
 #[when("an appliance-wide access token lists the delegation vault")]
 async fn appliance_wide_token_lists_delegation_vault(world: &mut SurfaceWorld) {
     send_with_token(world, TokenScope::ApplianceWide, Method::GET, "/v1/delegation-vault").await;
