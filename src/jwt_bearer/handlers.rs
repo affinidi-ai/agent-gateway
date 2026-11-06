@@ -34,6 +34,29 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
+/// Refuses a remote `jwks_uri` the JWKS fetch would refuse: one that is not an
+/// http(s) URL or whose host resolves to loopback, an unspecified address or
+/// cloud metadata. A host that does
+/// not resolve now is saved, and is vetted again on every fetch.
+async fn check_jwks_source(source: &JwksSource) -> Result<(), axum::response::Response> {
+    let JwksSource::Remote { jwks_uri } = source else {
+        return Ok(());
+    };
+    match crate::jwt_bearer::jwks::vet_jwks_uri(jwks_uri).await {
+        Err(crate::jwt_bearer::errors::JwtBearerError::JwksUriBlocked) => {
+            Err((StatusCode::BAD_REQUEST, ErrorBody::json(JWKS_URI_BLOCKED)).into_response())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Why a `jwks_uri` is refused on save and by the probe.
+const JWKS_URI_BLOCKED: &str =
+    "jwks_uri rejected: it must be an http(s) URL whose host resolves to neither loopback nor cloud metadata";
+
+/// The probe's answer for a `jwks_uri` it could vet but not use.
+const JWKS_URI_UNUSABLE: &str = "jwks_uri could not be fetched or did not return a valid JWKS";
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// Axum state type for JWT verification strategy handlers.
@@ -174,10 +197,8 @@ pub async fn create_strategy(
         return (StatusCode::FORBIDDEN, ErrorBody::json(e.message())).into_response();
     }
 
-    if let JwksSource::Remote { ref jwks_uri } = body.jwks_source
-        && let Err(e) = crate::url_validation::validate_url_not_cloud_metadata(jwks_uri)
-    {
-        return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
+    if let Err(response) = check_jwks_source(&body.jwks_source).await {
+        return response;
     }
 
     let principal_claim = match normalize_principal_claim(
@@ -366,10 +387,8 @@ pub async fn update_strategy(
             .into_response();
     }
 
-    if let JwksSource::Remote { ref jwks_uri } = body.jwks_source
-        && let Err(e) = crate::url_validation::validate_url_not_cloud_metadata(jwks_uri)
-    {
-        return (StatusCode::BAD_REQUEST, ErrorBody::json(format!("jwks_uri rejected: {}", e))).into_response();
+    if let Err(response) = check_jwks_source(&body.jwks_source).await {
+        return response;
     }
 
     // A stored claim the API would refuse is kept as it is: it names no caller
@@ -506,11 +525,13 @@ pub struct JwksUriValidationResponse {
 
 /// `POST /v1/jwt-verification-strategies/validate-jwks-uri`
 ///
-/// Probes whether the given URI is reachable and returns a parseable JWKS.
-/// Returns `200 OK` with `{ "valid": true, "key_count": N }` on success, or
-/// `400 Bad Request` with `{ "valid": false, "error": "…" }` on failure.
+/// Probes whether the given URI passes the Configured egress policy and returns a
+/// parseable JWKS. Returns `200 OK` with `{ "valid": true, "key_count": N }` on
+/// success, or `400 Bad Request` with `{ "valid": false, "error": "…" }` on
+/// failure, where `error` is one of two fixed messages and the detail is only
+/// logged.
 ///
-/// Requires `JwtVerificationStrategiesView`. A personal access token restricted
+/// Requires `JwtVerificationStrategiesEdit`. A personal access token restricted
 /// to explicit feature scopes must also include that feature.
 pub async fn validate_jwks_uri(
     Extension(user_id): Extension<String>,
@@ -524,7 +545,7 @@ pub async fn validate_jwks_uri(
         &user_id,
         &passkey_storage,
         &rbac_config,
-        &crate::rbac::Feature::JwtVerificationStrategiesView,
+        &crate::rbac::Feature::JwtVerificationStrategiesEdit,
         pat.as_ref()
             .map(|Extension(pat)| pat),
     )
@@ -551,12 +572,16 @@ pub async fn validate_jwks_uri(
         }
         Err(e) => {
             warn!(uri = %params.uri, error = %e, "JWKS URI validation failed");
+            let error = match e {
+                crate::jwt_bearer::errors::JwtBearerError::JwksUriBlocked => JWKS_URI_BLOCKED,
+                _ => JWKS_URI_UNUSABLE,
+            };
             (
                 StatusCode::BAD_REQUEST,
                 Json(JwksUriValidationResponse {
                     valid: false,
                     key_count: None,
-                    error: Some(e.to_string()),
+                    error: Some(error.to_string()),
                 }),
             )
                 .into_response()
@@ -1420,12 +1445,123 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = response_body(resp).await;
         assert_eq!(body["valid"], false);
-        assert!(
-            body["error"]
-                .as_str()
-                .is_some(),
-            "error field must be a string"
+        assert_eq!(body["error"], JWKS_URI_BLOCKED);
+    }
+
+    async fn probe(
+        router: &Router,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        send_strategy(
+            router,
+            "POST",
+            "/v1/jwt-verification-strategies/validate-jwks-uri",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_probe_answers_fixed_messages_without_the_upstream_detail() {
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            Arc::new(MemStore::default()),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
         );
+
+        for uri in ["https://127.0.0.1:8443/keys", "https://[::1]/keys", "https://169.254.169.254/keys"] {
+            let (status, body) = probe(&router, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, serde_json::json!({ "valid": false, "error": JWKS_URI_BLOCKED }), "{uri}");
+        }
+
+        let (base_url, _server) = crate::jwt_bearer::test_utils::start_jwks_server("not json".into(), None).await;
+        let (status, body) = probe(&router, &format!("{base_url}/.well-known/jwks.json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::json!({ "valid": false, "error": JWKS_URI_UNUSABLE }));
+    }
+
+    #[tokio::test]
+    async fn the_probe_needs_the_edit_permission() {
+        let mut rbac = RbacConfig::default();
+        rbac.permissions
+            .insert("jwt_verification_strategies.view".into(), "user".into());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::User).await;
+        let router = build_test_router(
+            Arc::new(MemStore::default()),
+            Arc::new(ps),
+            Arc::new(rbac.clone()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let (status, _) = probe(&router, "https://example.com/jwks.json").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "view alone does not allow the probe");
+
+        rbac.permissions
+            .insert("jwt_verification_strategies.edit".into(), "user".into());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::User).await;
+        let router = build_test_router(
+            Arc::new(MemStore::default()),
+            Arc::new(ps),
+            Arc::new(rbac),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let (status, body) = probe(&router, "https://169.254.169.254/keys").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "edit allows the probe: {body}");
+        assert_eq!(body["error"], JWKS_URI_BLOCKED);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_or_metadata_jwks_uri_is_refused_on_create_and_update() {
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        );
+        let with_uri = |uri: &str| {
+            let mut body = strategy_body(None);
+            body["jwks_source"]["jwks_uri"] = serde_json::json!(uri);
+            body
+        };
+
+        for uri in ["https://127.0.0.1:8080/keys", "https://169.254.169.254/keys", "https://[fd00:ec2::254]/keys"] {
+            let (status, body) = send_strategy(&router, "POST", "/v1/jwt-verification-strategies", with_uri(uri)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["error"], JWKS_URI_BLOCKED);
+        }
+        assert!(
+            store
+                .list()
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is stored"
+        );
+
+        let (status, created) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", with_uri("https://1.2.3.4/keys")).await;
+        assert_eq!(status, StatusCode::CREATED, "a public address is saved: {created}");
+        let (status, private) =
+            send_strategy(&router, "POST", "/v1/jwt-verification-strategies", with_uri("https://192.168.1.1/keys"))
+                .await;
+        assert_eq!(status, StatusCode::CREATED, "a private network address is saved: {private}");
+        let path = format!(
+            "/v1/jwt-verification-strategies/{}",
+            created["id"]
+                .as_str()
+                .unwrap()
+        );
+        let (status, body) = send_strategy(&router, "PUT", &path, with_uri("https://[::1]/keys")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], JWKS_URI_BLOCKED);
     }
 
     #[tokio::test]

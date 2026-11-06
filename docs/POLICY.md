@@ -580,18 +580,37 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
-- `egress::pinned_configured_client` also pins the **credential provider
-  token requests** of `src/delegation_vault/oauth.rs`: service-token grants,
-  refreshes, and the legacy and `2026-07-28` authorization-code exchanges (a
-  grant's connect code exchange and refresh go through `pinned_vendor_client`,
-  below). The
-  token endpoint is resolved once, off the async runtime, and the request goes
-  to that address with redirects off; a blocked address is refused before any
-  request. The pin holds when no HTTP proxy is configured: with `HTTPS_PROXY`,
-  `HTTP_PROXY` or `ALL_PROXY` set, the proxy resolves the host itself. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
-  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
-- `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
-  (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
+- `egress::pinned_configured_direct_client` (Configured policy — blocks cloud
+  metadata, loopback and unspecified addresses, and their IPv4-mapped forms;
+  allows private networks, so an identity provider inside the operator's
+  network keeps working) pins the **credential provider token requests** of
+  `src/delegation_vault/oauth.rs`: service-token grants, refreshes, and the
+  legacy and `2026-07-28` authorization-code exchanges (a grant's connect code
+  exchange and refresh go through `pinned_vendor_client`, below). The token
+  endpoint is resolved once, off the async runtime, and the request goes to
+  that address with redirects off, so a host cannot rebind to a blocked
+  address after the check; a blocked address is refused before any request.
+  Saving a provider whose token endpoint resolves to a blocked address is
+  refused with `400`. The client ignores any HTTP proxy, since a proxy would
+  resolve the host again and void the pin; see
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md). Under
+  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback
+  test endpoints.
+- `egress::pinned_configured_direct_client` also pins the **JWKS** fetch of a
+  JWT verification strategy (`src/jwt_bearer/jwks.rs`, fresh client per fetch,
+  answer read up to 256 KiB). Creating or updating a strategy whose `jwks_uri`
+  resolves to a blocked address is refused with `400`, and a stored strategy
+  whose `jwks_uri` resolves to one is refused on every fetch; a host that does
+  not resolve at save time is saved and vetted on every fetch. `POST
+  /api/v1/jwt-verification-strategies/validate-jwks-uri` needs
+  `jwt_verification_strategies.edit` and answers one of two fixed errors (the
+  URI is refused, or it could not be fetched or is not a JWKS); the detail is
+  only logged. Since private networks are allowed, this probe and the
+  credential provider probe still tell a user with the edit permission whether
+  a private host answers. The fetch ignores any HTTP proxy. Under
+  `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` admits listed loopback
+  fixtures, never cloud metadata.
+- `egress::pinned_forward_client` (cloud-metadata-only) pins the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
   construction, resolve/pin on `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
