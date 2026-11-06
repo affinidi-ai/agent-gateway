@@ -3687,8 +3687,12 @@ async fn fetch_agent_card(
             channel_info!(
                 config_id,
                 "GW2: Agent card fetched successfully: name={:?} url={:?}",
-                card.get("name"),
+                card.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(loggable::untrusted),
                 card.get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(loggable::url)
             );
             Some(card)
         }

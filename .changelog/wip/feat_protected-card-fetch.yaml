@@ -45,4 +45,11 @@ changes:
         method to a path ending in .well-known/agent-card.json or .well-known/agent.json is
         answered by the gateway's own agent card fetch, a GET to the Target, before policy, so
         it never reaches the Target as sent.
+    - timestamp: '2026-11-06T10:00:00Z'
+      title: Redact the agent card url in the receiving gateway's card read log
+      description: >-
+        When the receiving gateway of a Fabric route reads its Target's agent card for the policy
+        input, the success log now shows the card's url without userinfo or query values and the
+        card's name escaped, as the card location is already logged, so a credential in the
+        card's url no longer reaches the logs.
   breaking: []

@@ -2268,3 +2268,49 @@ async fn the_policy_card_read_presents_the_credential_providers_token() {
     assert_eq!(header_values(&request.headers, "authorization"), [format!("Bearer {PROVIDER_TOKEN}")]);
     assert_eq!(token_endpoint.requests(), 1, "token requests");
 }
+
+/// The card read for the policy input logs the card's `url` without its
+/// userinfo or query values, as it logs the card location.
+#[tokio::test]
+async fn the_policy_card_read_logs_the_cards_url_redacted() {
+    use axum::response::IntoResponse;
+    use tracing::instrument::WithSubscriber;
+    let app = axum::Router::new().fallback(|| async {
+        (
+            [("content-type", "application/json")],
+            r#"{"name":"agent","url":"https://user:card-password@agent.example/a2a?token=card-query-secret"}"#,
+        )
+            .into_response()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let card_url = format!("http://{}/.well-known/agent.json", listener.local_addr().unwrap());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .ok();
+    });
+    let logs = super::mcp_receive_tests::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+
+    let card = super::fetch_agent_card(
+        &card_url,
+        None,
+        Duration::from_secs(5),
+        super::fabric_body_limits(&surface("a2a", "http://127.0.0.1", &[])),
+        SURFACE_ID,
+    )
+    .with_subscriber(subscriber)
+    .await;
+
+    assert_eq!(card.unwrap()["name"], "agent");
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("agent.example/a2a"), "the card url was not logged:\n{logs}");
+    for secret in ["card-password", "card-query-secret"] {
+        assert!(!logs.contains(secret), "{secret} was logged:\n{logs}");
+    }
+}
