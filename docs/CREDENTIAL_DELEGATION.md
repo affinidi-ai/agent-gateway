@@ -1502,8 +1502,8 @@ to the redirect URI's origin. Any other POST, including one with neither header 
 3. claims the start state's nonce, so a second POST of the same link is refused with `400`;
 4. answers `302` to the provider's authorization URL, with `Cache-Control: no-store`,
    `Referrer-Policy: no-referrer` and the bytes, base64url-encoded, in the cookie
-   `__Host-ag_consent_<id>`, where `<id>` is the first 16 characters of the sealed binding, with
-   `Path=/`, no `Domain`, `Secure; HttpOnly; SameSite=Lax` and a `Max-Age` of the callback
+   `__Host-ag_consent_<id>`, where `<id>` is the first 16 characters of the base64url SHA-256 the
+   callback state holds, with `Path=/`, no `Domain`, `Secure; HttpOnly; SameSite=Lax` and a `Max-Age` of the callback
    state's remaining lifetime. `__Host-` keeps the cookie on the gateway's own host, so a sibling
    subdomain cannot set one, and each consent has a cookie of its own, so two consents started
    in one browser both complete.
@@ -1562,7 +1562,9 @@ state, the code, the cookie or `iss`:
 | `vault_store_rejected` | The token was obtained but could not be stored (`500`) |
 
 Once the state is claimed the code is exchanged; an exchange that fails uses the state up, as
-it uses up the code. A callback refused before the claim can be retried with the same state.
+it uses up the code. A callback refused before the claim leaves the state unused, but the
+refusal clears the browser's binding cookie, so the person starts the consent again from the
+agent rather than reopening the same callback.
 
 ### What the start page and the cookie protect against
 
