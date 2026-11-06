@@ -193,31 +193,69 @@ describe('SecretsPage API key delete', () => {
     mockFetchByUrl();
   });
 
-  it('shows the surfaces that still name an API key the gateway refused to delete', async () => {
-    const message =
-      'API key is named by surface(s) user-a and 1 other surface(s); remove it from them before deleting the key (409)';
-    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([
-      {
-        key_id: 'atgk_named',
-        agent_id: 'owner-a',
-        client_id: 'client-a',
-        status: 'active',
-        created_at: '2026-07-01T10:00:00Z',
-      },
-    ]);
+  const key = {
+    key_id: 'atgk_named',
+    agent_id: 'owner-a',
+    client_id: 'client-a',
+    status: 'active',
+    created_at: '2026-07-01T10:00:00Z',
+  };
+
+  it('deletes an API key only after the operator confirms it in the dialog', async () => {
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([key]);
+    (apiClient.deleteApiKey as jest.Mock).mockResolvedValue(undefined);
+    renderAt('/secrets?tab=api-keys');
+
+    await userEvent.click(await screen.findByTestId('api-keys-delete-button-atgk_named'));
+
+    const dialog = screen.getByTestId('api-key-delete-dialog');
+    expect(dialog).toHaveTextContent('client-a');
+    expect(dialog).toHaveTextContent('stops serving requests until you select another API key');
+    const confirm = screen.getByTestId('api-key-delete-dialog-confirm');
+    expect(confirm).toBeDisabled();
+    await userEvent.click(confirm);
+    expect(apiClient.deleteApiKey).not.toHaveBeenCalled();
+
+    const listings = (apiClient.listAllApiKeys as jest.Mock).mock.calls.length;
+    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
+    await userEvent.click(confirm);
+
+    await waitFor(() =>
+      expect(apiClient.deleteApiKey).toHaveBeenCalledWith('owner-a', 'atgk_named')
+    );
+    await waitFor(() => expect(screen.queryByTestId('api-key-delete-dialog')).toBeNull());
+    expect(showToast).toHaveBeenCalledWith('success', 'API key deleted');
+    await waitFor(() =>
+      expect((apiClient.listAllApiKeys as jest.Mock).mock.calls.length).toBeGreaterThan(listings)
+    );
+  });
+
+  it('deletes nothing when the dialog is cancelled', async () => {
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([key]);
+    renderAt('/secrets?tab=api-keys');
+
+    await userEvent.click(await screen.findByTestId('api-keys-delete-button-atgk_named'));
+    await userEvent.click(screen.getByText('Cancel'));
+
+    expect(screen.queryByTestId('api-key-delete-dialog')).toBeNull();
+    expect(apiClient.deleteApiKey).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('shows why a delete failed', async () => {
+    const message = 'Internal server error (500)';
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([key]);
     (apiClient.deleteApiKey as jest.Mock).mockRejectedValue(new Error(message));
     renderAt('/secrets?tab=api-keys');
 
-    const remove = await screen.findByTestId('api-keys-delete-button-atgk_named');
-    await userEvent.click(remove);
-    await userEvent.click(remove);
+    await userEvent.click(await screen.findByTestId('api-keys-delete-button-atgk_named'));
+    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
+    await userEvent.click(screen.getByTestId('api-key-delete-dialog-confirm'));
 
     await waitFor(() =>
       expect(showToast).toHaveBeenCalledWith('error', `Delete failed: ${message}`, {
         autoRemove: false,
       })
     );
-    expect(apiClient.deleteApiKey).toHaveBeenCalledWith('owner-a', 'atgk_named');
-    expect((showToast as jest.Mock).mock.calls[0][1]).toContain('user-a');
   });
 });

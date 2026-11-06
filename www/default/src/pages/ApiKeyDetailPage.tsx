@@ -3,9 +3,8 @@ import { useParams } from 'react-router-dom';
 import { apiClient, ApiKeyRecord, ApiKeyCreated } from '../api';
 import { useApp } from '../context/AppContext';
 import { showToast } from '../utils/toaster';
-import { getErrorMessage } from '../utils/apiError';
 import { formatDateTime } from '../utils/stringUtils';
-import { DeleteButton } from '../components/shared/DeleteButton';
+import { useApiKeyDelete } from '../components/api-keys/ApiKeyDeleteDialog';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 
 const ApiKeyDetailPage: React.FC = () => {
@@ -77,18 +76,11 @@ const ApiKeyDetailPage: React.FC = () => {
     }
   };
 
-  const handleDelete = async () => {
+  const { requestDelete, dialog: deleteDialog } = useApiKeyDelete(() => navigate('/secrets'));
+
+  const handleDelete = () => {
     if (!agentId || !keyId) return;
-    try {
-      await apiClient.deleteApiKey(agentId, keyId);
-      showToast('success', 'API key deleted');
-      navigate('/secrets');
-    } catch (err: any) {
-      console.error('Failed to delete API key:', err);
-      showToast('error', `Delete failed: ${getErrorMessage(err, 'Failed to delete API key')}`, {
-        autoRemove: false,
-      });
-    }
+    requestDelete(agentId, keyId, apiKey?.client_id);
   };
 
   if (loading) {
@@ -234,9 +226,15 @@ const ApiKeyDetailPage: React.FC = () => {
                 </div>
               )}
               <div className="d-flex justify-content-end">
-                <DeleteButton onDelete={handleDelete} title="Delete this API key" variant="danger">
+                <button
+                  type="button"
+                  className="btn btn-outline-danger"
+                  title="Delete this API key"
+                  onClick={handleDelete}
+                >
+                  <i className="fas fa-trash me-1" aria-hidden="true"></i>
                   Delete
-                </DeleteButton>
+                </button>
               </div>
             </div>
           </div>
@@ -293,6 +291,8 @@ const ApiKeyDetailPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {deleteDialog}
 
       {/* Rotated Key Secret Modal */}
       {rotatedKey && (

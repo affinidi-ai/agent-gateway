@@ -1300,19 +1300,12 @@ not configured". A key a surface names as such a secret counts as named, so movi
 surface is checked like moving the owner of any named key.
 
 Deleting an API key (`DELETE /v1/api-keys/{agent_id}/{key_id}`), also the cleanup of a key whose
-owning surface is gone, first looks the key up under `agent_id`: a key that is not there answers
-`404` "API key not found: <key id>", before any naming surface is checked. A key that is there answers `409` while any
-stored surface names its id, in its base or any variant: the ids collected above, and a Caller
-Context API Key `secret_id` of that id on a view whose inbound Identity is From API Key. Deleting
-such a key would turn a `missing_owner` verdict, which takes the surface out of service under
-`enforce`, into a `missing_key` one, which does not, and would turn such a secret that names
-another tenant's key into a plain secret with the same DID. The `error` names the naming surfaces
-the caller may see and counts the others; the dashboard shows it in the delete error toast. A
-stored surface whose variants cannot be resolved is read without resolving them: it names the
-key when the id appears anywhere in its base or variant overrides, so it blocks only the deletes
-of keys it holds. A surface store that cannot be listed answers `500` and deletes nothing.
-Revoking a named key is allowed. A save that names the key while it is being deleted, on this
-node or another, is not seen by the check.
+owning surface is gone, removes its record whether or not a stored surface names it; a key that
+is not there answers `404` "API key not found: <key id>". On this node every surface naming the
+key is checked again on its next request and refused as `missing_key` (`503`) in either mode;
+other nodes see it at their next check (see below). Such a surface's Identity reads as
+Unconfigured until it names another key. The dashboard asks the operator to confirm a delete
+first; the API itself takes no confirmation.
 
 #### Provider keys when a surface goes live
 
@@ -1329,6 +1322,11 @@ reference. It carries no secret. When a surface that
 owns keys changes the same ways, or by a save, or is deleted, every surface naming one of its
 keys is checked again on its next request.
 
+- In either mode, a surface naming a key id no key has (`missing_key`), such as a deleted key,
+  is not ready: a deleted key's DID must not stay in use. A key the
+  surface's own key folder holds is never mistaken for a missing one, since each check reads that
+  folder from disk. A Caller Context API Key secret with no key of its id stays a plain secret
+  and is not reported.
 - In either mode, a surface naming a revoked key (`revoked_key`), its own or any other, is not
   ready: its DID is derived from the key id with no key lookup, so a revoked key would otherwise
   keep it. On the node that revokes the key, through `POST
@@ -1368,8 +1366,8 @@ keys is checked again on its next request.
   above and below still hold it to the rules for keys of other surfaces, such as
   `other_surface` and `missing_owner` under `enforce`.
 - A key or owning surface that cannot be found is checked again later. A key that cannot be
-  found (`missing_key`) is only reported, in either mode; an owning surface that cannot be found
-  (`missing_owner`) is only reported under `warn` and makes the surface not ready under
+  found (`missing_key`) makes the surface not ready in either mode; an owning surface that cannot
+  be found (`missing_owner`) is only reported under `warn` and makes the surface not ready under
   `enforce`. The key or its owning surface may exist on another node that shares the storage and
   not be visible here yet, so the request after
   `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
@@ -1415,8 +1413,9 @@ prefix was reserved can reach this, since new secret ids may not start with `atg
 
 A not-ready surface refuses every request with `503` before source authentication, policy and
 the target, on direct inbound, Fabric receive and its Transit Points, as a [not ready Access
-Point](#not-ready-access-points) does. The refusal is logged with `reason=api_key_revoked` for a
-revoked key, `reason=provider_key_tenant` for a key the surface may not use, or
+Point](#not-ready-access-points) does. The refusal is logged with the reason `api_key_revoked`
+for a revoked key, `api_key_missing` for a key id no key has, `provider_key_tenant` for a key
+the surface may not use, or
 `reason=api_key_store_unavailable` during a store outage, which is named first, and recorded in
 the Audit Log as
 `request_rejected` with the reason `access_point_not_ready` (a Transit Point refusal is logged

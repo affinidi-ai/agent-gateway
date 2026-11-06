@@ -38,6 +38,9 @@ pub const API_KEY_STORE_UNAVAILABLE: &str = "api_key_store_unavailable";
 /// The reason a surface naming a revoked key is not ready.
 pub const API_KEY_REVOKED: &str = "api_key_revoked";
 
+/// The reason a surface naming a key id no key has is not ready.
+pub const API_KEY_MISSING: &str = "api_key_missing";
+
 /// The surfaces owning each API key, by key id, and the revoked key ids, from one listing of the
 /// API key store that loaded every key folder, or why the store could not be read.
 pub type KeyOwnersListing = Result<KeyListing, &'static str>;
@@ -81,8 +84,8 @@ struct Owners {
 }
 
 /// The key ids judged for a surface of `tenant_id`, those found in a key folder, those of them it
-/// may not use, those revoked, those judged while the stores could not be read, the surfaces read
-/// as their owners, and when each id is judged again.
+/// may not use, those revoked, those no key has, those judged while the stores could not be read,
+/// the surfaces read as their owners, and when each id is judged again.
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     tenant_id: Option<String>,
@@ -90,6 +93,7 @@ struct Entry {
     found: HashSet<String>,
     refused: HashSet<String>,
     revoked: HashSet<String>,
+    missing: HashSet<String>,
     unavailable: HashSet<String>,
     owners: HashSet<String>,
     recheck: HashMap<String, Instant>,
@@ -117,7 +121,7 @@ impl Entry {
                 ids.all()
                     .any(|id| set.contains(id))
             };
-            refusal(any(&self.unavailable), any(&self.revoked), any(&self.refused))
+            refusal(any(&self.unavailable), any(&self.revoked), any(&self.missing), any(&self.refused))
         })
     }
 
@@ -179,9 +183,15 @@ impl Entry {
             found: verdict.found.clone(),
             unavailable: ids_where(&|kind| kind == ProviderKeyIssueKind::StoreUnavailable),
             revoked: ids_where(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
+            missing: ids_where(&|kind| kind == ProviderKeyIssueKind::MissingKey),
             refused: ids_where(&|kind| {
                 kind.is_breach()
-                    && !matches!(kind, ProviderKeyIssueKind::StoreUnavailable | ProviderKeyIssueKind::RevokedKey)
+                    && !matches!(
+                        kind,
+                        ProviderKeyIssueKind::StoreUnavailable
+                            | ProviderKeyIssueKind::RevokedKey
+                            | ProviderKeyIssueKind::MissingKey
+                    )
             }),
             owners: verdict.owners.clone(),
             recheck: ids
@@ -218,6 +228,7 @@ impl Entry {
             self.found.remove(id);
             self.refused.remove(id);
             self.revoked.remove(id);
+            self.missing.remove(id);
             self.unavailable.remove(id);
             self.recheck.remove(id);
         }
@@ -228,6 +239,8 @@ impl Entry {
             .extend(later.refused);
         self.revoked
             .extend(later.revoked);
+        self.missing
+            .extend(later.missing);
         self.unavailable
             .extend(later.unavailable);
         self.owners
@@ -254,22 +267,26 @@ impl Verdict {
         refusal(
             self.store_unavailable,
             any(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
+            any(&|kind| kind == ProviderKeyIssueKind::MissingKey),
             any(&|kind| kind.is_breach()),
         )
     }
 }
 
-/// Why a surface is refused: while the stores cannot be read, then for a revoked key, then for
-/// a key it may not use.
+/// Why a surface is refused: while the stores cannot be read, then for a revoked key, then for a
+/// key id no key has, then for a key it may not use.
 fn refusal(
     unavailable: bool,
     revoked: bool,
+    missing: bool,
     refused: bool,
 ) -> Option<NotReadyReason> {
     if unavailable {
         Some(NotReadyReason::ApiKeyStoreUnavailable)
     } else if revoked {
         Some(NotReadyReason::ApiKeyRevoked)
+    } else if missing {
+        Some(NotReadyReason::ApiKeyMissing)
     } else {
         refused.then_some(NotReadyReason::ProviderKeyTenant)
     }
@@ -549,6 +566,7 @@ impl ProviderKeyGate {
         {
             Some(NotReadyReason::ApiKeyStoreUnavailable) => Some(API_KEY_STORE_UNAVAILABLE),
             Some(NotReadyReason::ApiKeyRevoked) => Some(API_KEY_REVOKED),
+            Some(NotReadyReason::ApiKeyMissing) => Some(API_KEY_MISSING),
             Some(NotReadyReason::ProviderKeyTenant) => Some(PROVIDER_KEY_TENANT_RULE),
             Some(NotReadyReason::NoSourceAuthentication) | None => None,
         }
@@ -781,7 +799,9 @@ async fn read_named_keys_from_disk<'a>(
 }
 
 /// Reads each key folder of `folders` from disk and takes the keys of `named` it holds into
-/// `owners`; an error when a folder cannot be read.
+/// `owners`, dropping the folder as an owner of every named key it no longer holds, so a key
+/// another node deleted is not found from this node's cache; an error when a folder cannot be
+/// read.
 async fn take_in_from_disk(
     owners: &mut Owners,
     folders: HashSet<String>,
@@ -793,6 +813,24 @@ async fn take_in_from_disk(
             .list_from_disk(&folder)
             .await
             .map_err(|_| "reading a key folder from disk failed")?;
+        let held: HashSet<String> = keys
+            .iter()
+            .map(|key| key.key_id.clone())
+            .collect();
+        for id in named {
+            if held.contains(*id) {
+                continue;
+            }
+            let listing = &mut owners.keys;
+            let Some(key_owners) = listing.owners.get_mut(*id) else {
+                continue;
+            };
+            key_owners.retain(|owner| *owner != folder);
+            if key_owners.is_empty() {
+                listing.owners.remove(*id);
+                listing.revoked.remove(*id);
+            }
+        }
         for key in keys {
             if named.contains(key.key_id.as_str()) {
                 owners.keys.add(key);
@@ -960,6 +998,7 @@ mod tests {
             refused: [KEY_B.to_string()].into(),
             found: HashSet::new(),
             revoked: ["atgk_revoked".to_string()].into(),
+            missing: ["atgk_missing".to_string()].into(),
             unavailable: ["atgk_unread".to_string()].into(),
             owners: HashSet::new(),
             recheck: [("atgk_missing".to_string(), later), ("atgk_unread".to_string(), later)].into(),
@@ -971,7 +1010,13 @@ mod tests {
         assert_eq!(entry.decides(Some("tenant-b"), &ids(&[KEY_A]), now), None, "another tenant is judged again");
         assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, "atgk_new"]), now), None, "a new id is judged");
         assert_eq!(entry.decides(None, &ids(&[KEY_A]), now), None);
-        assert_eq!(entry.decides(Some("tenant-a"), &ids(&["atgk_missing"]), now), Some(None));
+        let missing = NotReadyReason::ApiKeyMissing;
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&["atgk_missing"]), now), Some(Some(missing)));
+        assert_eq!(
+            entry.decides(Some("tenant-a"), &ids(&[KEY_B, "atgk_missing"]), now),
+            Some(Some(missing)),
+            "a missing key is named before a key the surface may not use"
+        );
         assert_eq!(
             entry.decides(Some("tenant-a"), &ids(&["atgk_missing"]), later),
             None,
@@ -984,6 +1029,11 @@ mod tests {
             entry.decides(Some("tenant-a"), &ids(&[KEY_B, "atgk_revoked"]), now),
             Some(Some(revoked)),
             "a revoked key is named before a key the surface may not use"
+        );
+        assert_eq!(
+            entry.decides(Some("tenant-a"), &ids(&["atgk_missing", "atgk_revoked"]), now),
+            Some(Some(revoked)),
+            "a revoked key is named before a missing one"
         );
         assert_eq!(
             entry.decides(Some("tenant-a"), &ids(&["atgk_revoked", "atgk_unread"]), now),
@@ -1440,8 +1490,8 @@ mod tests {
                 .gate
                 .refuses(&naming_later)
                 .await,
-            None,
-            "a missing key is no breach"
+            Some(NotReadyReason::ApiKeyMissing),
+            "a missing key is a breach"
         );
         enforced
             .api_keys
@@ -1453,7 +1503,7 @@ mod tests {
                 .gate
                 .refuses(&naming_later)
                 .await,
-            None,
+            Some(NotReadyReason::ApiKeyMissing),
             "within the interval the missing verdict is kept"
         );
 

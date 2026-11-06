@@ -206,7 +206,8 @@ pub fn access_point_unavailable(
 
 /// Why an Access Point is not ready: it is closed and authenticates no caller
 /// ([`AgentSurface::refuses_every_request`]), or it derives a DID from an API
-/// key it may not use or that is revoked ([`crate::identity::provider_key_gate`]).
+/// key it may not use, that is revoked, or that does not exist
+/// ([`crate::identity::provider_key_gate`]).
 ///
 /// [`AgentSurface::refuses_every_request`]: crate::config::agent_surface::AgentSurface::refuses_every_request
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +216,7 @@ pub enum NotReadyReason {
     ProviderKeyTenant,
     ApiKeyStoreUnavailable,
     ApiKeyRevoked,
+    ApiKeyMissing,
 }
 
 impl NotReadyReason {
@@ -224,6 +226,7 @@ impl NotReadyReason {
             Self::ProviderKeyTenant => crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
             Self::ApiKeyStoreUnavailable => crate::identity::provider_key_gate::API_KEY_STORE_UNAVAILABLE,
             Self::ApiKeyRevoked => crate::identity::provider_key_gate::API_KEY_REVOKED,
+            Self::ApiKeyMissing => crate::identity::provider_key_gate::API_KEY_MISSING,
         }
     }
 

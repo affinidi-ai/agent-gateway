@@ -1091,7 +1091,7 @@ mod tests {
                 ("tenant-key-wide".to_string(), "other_tenant", false),
                 ("appliance-key".to_string(), "appliance_key", false),
                 ("wide-wide".to_string(), "other_surface", false),
-                ("missing-key".to_string(), "missing_key", false),
+                ("missing-key".to_string(), "missing_key", true),
                 ("missing-owner".to_string(), "missing_owner", false),
             ]
         );
@@ -1104,7 +1104,7 @@ mod tests {
                 ("tenant-key-wide".to_string(), "other_tenant", true),
                 ("appliance-key".to_string(), "appliance_key", true),
                 ("wide-wide".to_string(), "other_surface", true),
-                ("missing-key".to_string(), "missing_key", false),
+                ("missing-key".to_string(), "missing_key", true),
                 ("missing-owner".to_string(), "missing_owner", true),
             ]
         );

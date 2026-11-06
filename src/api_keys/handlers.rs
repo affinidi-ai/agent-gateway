@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::errors::ApiKeyError;
 use super::generator::DefaultKeyGenerator;
@@ -149,93 +149,6 @@ async fn authorize_agent(
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
         }
     }
-}
-
-/// Whether a stored surface whose variants cannot be resolved holds `key_id` anywhere in its base
-/// or variant overrides, read without resolving. A surface that cannot be read counts as naming it.
-fn unresolved_surface_names_key(
-    surface: &crate::config::agent_surface::AgentSurface,
-    key_id: &str,
-) -> bool {
-    fn holds(
-        value: &serde_json::Value,
-        key_id: &str,
-    ) -> bool {
-        match value {
-            serde_json::Value::String(text) => text == key_id,
-            serde_json::Value::Array(items) => items
-                .iter()
-                .any(|item| holds(item, key_id)),
-            serde_json::Value::Object(fields) => fields
-                .values()
-                .any(|field| holds(field, key_id)),
-            _ => false,
-        }
-    }
-    serde_json::to_value(surface).map_or(true, |value| holds(&value, key_id))
-}
-
-/// Refuses deleting `key_id` with `409` while a stored surface names it as an API Key Provider
-/// key, in its base or any variant, as the go-live provider key check does. The answer names the
-/// naming surfaces the caller may see and only counts the others.
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
-async fn refuse_named_key(
-    surface_store: &ApiKeySurfaceState,
-    key_id: &str,
-    context: &Option<Extension<PatTenantContext>>,
-    scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), axum::response::Response> {
-    let surfaces = surface_store
-        .list_all()
-        .await
-        .map_err(|error| {
-            error!(key_id = %key_id, %error, "Failed to list surfaces naming an API key");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
-    let mut visible = Vec::new();
-    let mut hidden = 0usize;
-    for surface in &surfaces {
-        let names = match crate::identity::handlers::surface_tenancy::provider_key_ids(surface) {
-            Ok(ids) => ids
-                .all()
-                .any(|id| id == key_id),
-            Err(error) => {
-                warn!(surface = %surface.surface_id, ?error, "Surface variants cannot be resolved; reading its stored API key ids");
-                unresolved_surface_names_key(surface, key_id)
-            }
-        };
-        if !names {
-            continue;
-        }
-        if surface_allows_api_keys(surface, context, false)
-            && scope_allows_resource(
-                resource_scope(scope),
-                tenant_context(context),
-                ResourceKind::Surfaces,
-                &surface.surface_id,
-            )
-        {
-            visible.push(surface.surface_id.as_str());
-        } else {
-            hidden += 1;
-        }
-    }
-    if visible.is_empty() && hidden == 0 {
-        return Ok(());
-    }
-    visible.sort_unstable();
-    let named_by = match (visible.is_empty(), hidden) {
-        (false, 0) => format!("surface(s) {}", visible.join(", ")),
-        (false, hidden) => format!("surface(s) {} and {hidden} other surface(s)", visible.join(", ")),
-        (true, hidden) => format!("{hidden} surface(s)"),
-    };
-    Err((
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": format!("API key is named by {named_by}; remove it from them before deleting the key")
-        })),
-    )
-        .into_response())
 }
 
 /// Convert ApiKeyError to HTTP response
@@ -484,7 +397,8 @@ pub async fn rotate_key(
     }
 }
 
-/// Delete an API key permanently
+/// Delete an API key. A surface still naming it stops serving, as the go-live provider key check
+/// refuses a key id no key has; the dashboard asks the operator to confirm first.
 ///
 /// DELETE /api/v1/api-keys/{agent_id}/{key_id}
 pub async fn delete_key(
@@ -520,17 +434,6 @@ pub async fn delete_key(
             Json(serde_json::json!({ "error": "API key is outside this token's permitted scope" })),
         )
             .into_response();
-    }
-    match store
-        .get_record(&agent_id, &key_id)
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiKeyError::not_found(&key_id).into_response(),
-        Err(e) => return e.into_response(),
-    }
-    if let Err(response) = refuse_named_key(&surface_store, &key_id, &context, &scope).await {
-        return response;
     }
     match store
         .delete(&agent_id, &key_id, &actor)
@@ -710,7 +613,6 @@ mod tests {
 
     struct SurfacesStore {
         surfaces: Vec<crate::config::agent_surface::AgentSurface>,
-        list_fails: bool,
     }
 
     #[async_trait]
@@ -734,9 +636,6 @@ mod tests {
         }
 
         async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
-            if self.list_fails {
-                anyhow::bail!("surface store unavailable");
-            }
             Ok(self.surfaces.clone())
         }
 
@@ -786,7 +685,17 @@ mod tests {
     async fn delete_as(
         key_store: &Arc<CountingKeyStore>,
         surfaces: Vec<crate::config::agent_surface::AgentSurface>,
-        list_fails: bool,
+        agent_id: &str,
+        key_id: &str,
+    ) -> StatusCode {
+        delete_by(key_store, surfaces, agent_id, key_id, None)
+            .await
+            .0
+    }
+
+    async fn delete_by(
+        key_store: &Arc<CountingKeyStore>,
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
         agent_id: &str,
         key_id: &str,
         tenant: Option<&str>,
@@ -799,7 +708,7 @@ mod tests {
         });
         let response = delete_key(
             State(key_store.clone() as ApiKeyState),
-            Extension(Arc::new(SurfacesStore { surfaces, list_fails }) as ApiKeySurfaceState),
+            Extension(Arc::new(SurfacesStore { surfaces }) as ApiKeySurfaceState),
             Path(KeyPath {
                 agent_id: agent_id.into(),
                 key_id: key_id.into(),
@@ -818,129 +727,8 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
     }
 
-    fn deletes(key_store: &CountingKeyStore) -> usize {
-        key_store
-            .deletes
-            .load(Ordering::SeqCst)
-    }
-
     #[tokio::test]
-    async fn deleting_a_key_a_surface_names_is_a_conflict() {
-        let key_store = counting_key_store(&[("owner", "atgk_named")]);
-
-        let (status, body) = delete_as(
-            &key_store,
-            vec![surface("owner", None), naming("user", None, "atgk_named")],
-            false,
-            "owner",
-            "atgk_named",
-            None,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "API key is named by surface(s) user; remove it from them before deleting the key");
-        assert_eq!(deletes(&key_store), 0);
-    }
-
-    #[tokio::test]
-    async fn deleting_a_key_named_only_in_a_variant_is_a_conflict() {
-        let key_store = counting_key_store(&[("owner", "atgk_named")]);
-        let mut user = surface("user", None);
-        user.variants = serde_json::from_value(serde_json::json!([{
-            "id": "variant-id", "alias": "variant", "name": "Variant",
-            "overrides": {"identity_slots": {"protected": {"type": "from_api_key", "api_key_id": "atgk_named"}}}
-        }]))
-        .unwrap();
-
-        let (status, body) =
-            delete_as(&key_store, vec![surface("owner", None), user], false, "owner", "atgk_named", None).await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "API key is named by surface(s) user; remove it from them before deleting the key");
-        assert_eq!(deletes(&key_store), 0);
-    }
-
-    #[tokio::test]
-    async fn deleting_a_key_named_as_a_legacy_caller_secret_is_a_conflict() {
-        let key_store = counting_key_store(&[("owner", "atgk_named")]);
-        let mut legacy = surface("legacy", None);
-        legacy.identity_slots =
-            serde_json::from_value(serde_json::json!({"inbound": {"type": "from_api_key"}})).unwrap();
-        legacy
-            .access_point
-            .caller_authentication = serde_json::from_value(serde_json::json!({"methods": [{
-            "type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "atgk_named"
-        }]}))
-        .unwrap();
-
-        let (status, _) =
-            delete_as(&key_store, vec![surface("owner", None), legacy], false, "owner", "atgk_named", None).await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(deletes(&key_store), 0);
-    }
-
-    #[tokio::test]
-    async fn deleting_a_key_no_surface_names_succeeds() {
-        let key_store = counting_key_store(&[("owner", "atgk_unnamed")]);
-
-        let (status, _) = delete_as(
-            &key_store,
-            vec![surface("owner", None), naming("user", None, "atgk_other")],
-            false,
-            "owner",
-            "atgk_unnamed",
-            None,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(deletes(&key_store), 1);
-    }
-
-    #[tokio::test]
-    async fn orphan_cleanup_refuses_a_named_key_and_deletes_an_unnamed_one() {
-        let key_store = counting_key_store(&[("gone", "atgk_orphan_named"), ("gone", "atgk_orphan_unnamed")]);
-        let surfaces = || vec![naming("user", None, "atgk_orphan_named")];
-
-        let (named, body) = delete_as(&key_store, surfaces(), false, "gone", "atgk_orphan_named", None).await;
-        assert_eq!(named, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "API key is named by surface(s) user; remove it from them before deleting the key");
-        assert_eq!(deletes(&key_store), 0);
-
-        let (unnamed, _) = delete_as(&key_store, surfaces(), false, "gone", "atgk_orphan_unnamed", None).await;
-        assert_eq!(unnamed, StatusCode::NO_CONTENT);
-        assert_eq!(deletes(&key_store), 1);
-    }
-
-    #[tokio::test]
-    async fn conflict_counts_but_does_not_name_another_tenants_surfaces() {
-        let key_store = counting_key_store(&[("owner-a", "atgk_named")]);
-        let surfaces = vec![
-            surface("owner-a", Some("tenant-a")),
-            naming("user-a", Some("tenant-a"), "atgk_named"),
-            naming("user-b", Some("tenant-b"), "atgk_named"),
-            naming("user-b2", Some("tenant-b"), "atgk_named"),
-        ];
-
-        let (status, body) =
-            delete_as(&key_store, surfaces.clone(), false, "owner-a", "atgk_named", Some("tenant-a")).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            body["error"],
-            "API key is named by surface(s) user-a and 2 other surface(s); remove it from them before deleting the key"
-        );
-
-        let only_hidden = vec![surfaces[0].clone(), surfaces[2].clone()];
-        let (status, body) = delete_as(&key_store, only_hidden, false, "owner-a", "atgk_named", Some("tenant-a")).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "API key is named by 1 surface(s); remove it from them before deleting the key");
-        assert_eq!(deletes(&key_store), 0);
-    }
-
-    #[tokio::test]
-    async fn deleting_another_surfaces_key_through_an_own_surface_is_not_found_without_a_count() {
+    async fn deleting_another_surfaces_key_through_an_own_surface_is_not_found() {
         let key_store = counting_key_store(&[("owner-a", "atgk_a"), ("owner-b", "atgk_b")]);
         let surfaces = vec![
             surface("owner-a", Some("tenant-a")),
@@ -948,7 +736,7 @@ mod tests {
             naming("user-b", Some("tenant-b"), "atgk_b"),
         ];
 
-        let (status, body) = delete_as(&key_store, surfaces, false, "owner-a", "atgk_b", Some("tenant-a")).await;
+        let (status, body) = delete_by(&key_store, surfaces, "owner-a", "atgk_b", Some("tenant-a")).await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], ApiKeyError::not_found("atgk_b").to_string());
@@ -961,55 +749,41 @@ mod tests {
         assert_eq!(deletes(&key_store), 0);
     }
 
-    fn unresolvable(
-        surface_id: &str,
-        key_id: Option<&str>,
-    ) -> crate::config::agent_surface::AgentSurface {
-        let overrides = key_id.map_or(serde_json::json!({}), |key_id| {
-            serde_json::json!({"identity_slots": {"protected": {"type": "from_api_key", "api_key_id": key_id}}})
-        });
-        let mut surface = surface(surface_id, None);
-        surface.variants = serde_json::from_value(serde_json::json!([
-            {"id": "v-1", "alias": "same", "name": "first", "enabled": false, "overrides": {}},
-            {"id": "v-2", "alias": "same", "name": "second", "overrides": overrides}
-        ]))
-        .unwrap();
-        assert!(crate::identity::handlers::surface_tenancy::provider_key_ids(&surface).is_err());
-        surface
+    fn deletes(key_store: &CountingKeyStore) -> usize {
+        key_store
+            .deletes
+            .load(Ordering::SeqCst)
     }
 
     #[tokio::test]
-    async fn an_unresolvable_surface_blocks_only_the_keys_it_names() {
-        let key_store = counting_key_store(&[("owner", "atgk_named"), ("owner", "atgk_unnamed")]);
-        let surfaces = || {
-            vec![
-                surface("owner", None),
-                unresolvable("broken-naming", Some("atgk_named")),
-                unresolvable("broken-empty", None),
-            ]
-        };
+    async fn deleting_a_key_a_surface_names_deletes_it() {
+        let key_store = counting_key_store(&[("owner", "atgk_named"), ("gone", "atgk_orphan_named")]);
+        let surfaces = || vec![naming("owner", None, "atgk_named"), naming("user", None, "atgk_orphan_named")];
 
-        let (named, body) = delete_as(&key_store, surfaces(), false, "owner", "atgk_named", None).await;
-        assert_eq!(named, StatusCode::CONFLICT);
+        assert_eq!(delete_as(&key_store, surfaces(), "owner", "atgk_named").await, StatusCode::NO_CONTENT);
         assert_eq!(
-            body["error"],
-            "API key is named by surface(s) broken-naming; remove it from them before deleting the key"
+            delete_as(&key_store, surfaces(), "gone", "atgk_orphan_named").await,
+            StatusCode::NO_CONTENT,
+            "orphan cleanup deletes a named key too"
         );
-        assert_eq!(deletes(&key_store), 0);
-
-        let (unnamed, _) = delete_as(&key_store, surfaces(), false, "owner", "atgk_unnamed", None).await;
-        assert_eq!(unnamed, StatusCode::NO_CONTENT);
-        assert_eq!(deletes(&key_store), 1);
+        assert_eq!(deletes(&key_store), 2);
+        assert_eq!(
+            key_store
+                .delete_actors
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["admin-user", "admin-user"]
+        );
     }
 
     #[tokio::test]
-    async fn surface_listing_failure_deletes_nothing() {
-        let key_store = counting_key_store(&[("owner", "atgk_unnamed")]);
+    async fn deleting_a_key_that_is_not_there_is_not_found() {
+        let key_store = counting_key_store(&[("owner", "atgk_other")]);
 
-        let (status, _) =
-            delete_as(&key_store, vec![surface("owner", None)], true, "owner", "atgk_unnamed", None).await;
+        let status = delete_as(&key_store, vec![surface("owner", None)], "owner", "atgk_absent").await;
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(deletes(&key_store), 0);
     }
 
@@ -1475,7 +1249,6 @@ mod tests {
     ) -> (StatusCode, serde_json::Value) {
         let surface_store: ApiKeySurfaceState = Arc::new(SurfacesStore {
             surfaces: vec![surface("live", tenant)],
-            list_fails: false,
         });
         let context = tenant.map(|tenant_id| {
             Extension(PatTenantContext {

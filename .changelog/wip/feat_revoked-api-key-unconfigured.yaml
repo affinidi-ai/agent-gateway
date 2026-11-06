@@ -30,6 +30,16 @@ changes:
         surface no longer exists, instead of 404, and every 200 answer carries surface_deleted,
         true when the key's surface was deleted, so the dashboard can say the key is no longer
         in use. Tenant-, resource- and header-gated callers still get 404 for such a key.
+    - timestamp: '2026-11-05T21:00:00Z'
+      title: Delete an API key a surface uses after confirming it in the dashboard
+      description: >-
+        Deleting an API key that a stored surface uses is allowed. The Secrets page and the API
+        key page open a confirmation dialog before every API key delete, saying that callers
+        presenting the key are refused and that surfaces using it become Unconfigured and stop
+        serving, and delete only after a checkbox and a second click. DELETE
+        /v1/api-keys/{agent_id}/{key_id} removes the key, also one whose owning surface is gone,
+        and a key that is not under the surface named in the path answers 404. Every surface
+        naming a deleted key answers 503 until it names another key.
   fixed: []
   removed: []
   security:
@@ -68,3 +78,13 @@ changes:
         deleting a surface revokes its keys. To keep such a surface serving, select an active
         API key of that surface in place of the revoked one and save it; the Surface Builder
         marks the affected Identity as unconfigured.
+    - timestamp: '2026-11-05T21:00:00Z'
+      title: Stop serving a stored surface that names an API key that no longer exists
+      description: >-
+        After the upgrade, a stored surface whose Identity slot, target identity injection or
+        Transit Point names an API Key Provider key id that no key has answers every request
+        with 503 under tenant_credential_isolation warn as well as enforce, logged with reason
+        api_key_missing and reported as missing_key with not_ready true. Before, such a surface
+        kept serving the DID of a key that was gone. A legacy Caller Context secret with no key
+        of its id stays a plain secret. To keep such a surface serving, select an existing API
+        key of that surface and save it; the Surface Builder marks the Identity as unconfigured.
