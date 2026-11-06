@@ -58,6 +58,18 @@ pub struct DelegationVaultState {
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
+/// A read refused because the credential providers could not be read. It
+/// answers `500` with `refusal` and no detail.
+struct ProvidersUnreadable {
+    refusal: &'static str,
+}
+
+impl IntoResponse for ProvidersUnreadable {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": self.refusal }))).into_response()
+    }
+}
+
 /// What the caller may read of the agent-keyed tokens and the delegation
 /// audit. While the credential providers cannot be read, a caller that needs
 /// them is refused with `refusal` and no detail.
@@ -66,7 +78,7 @@ async fn caller_read_scope(
     reader: &VaultReader,
     action: &'static str,
     refusal: &'static str,
-) -> Result<VaultReadScope, Response> {
+) -> Result<VaultReadScope, ProvidersUnreadable> {
     VaultReadScope::of(Some(state.provider_store.as_ref()), reader)
         .await
         .map_err(|error| {
@@ -76,7 +88,7 @@ async fn caller_read_scope(
                 error = %error,
                 "Delegation vault read refused: the credential providers could not be read"
             );
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": refusal }))).into_response()
+            ProvidersUnreadable { refusal }
         })
 }
 
@@ -101,7 +113,7 @@ pub async fn list_tokens(
     }
     let scope = match caller_read_scope(&state, &reader, "list", "Failed to list").await {
         Ok(scope) => scope,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
 
     match state
@@ -146,7 +158,7 @@ pub async fn get_token(
     }
     let scope = match caller_read_scope(&state, &reader, "get", "Failed to get").await {
         Ok(scope) => scope,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
 
     match state
@@ -847,7 +859,7 @@ pub async fn list_audit_events(
     let filter = query.filter.as_deref();
     let scope = match caller_read_scope(&state, &reader, "audit", "Failed to read audit log").await {
         Ok(scope) => scope,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
 
     // Exclude VP-audit categories (policy decisions / trust checks) up front so
