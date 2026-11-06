@@ -1561,16 +1561,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_revoked_on_another_node_is_refused_once_the_recheck_is_due_and_not_before() {
+        a_key_revoked_on_another_node_is_refused_once_due(crate::config::credential_policy::RuleMode::Warn).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_revoked_on_another_node_is_refused_once_the_recheck_is_due_under_enforce() {
+        a_key_revoked_on_another_node_is_refused_once_due(crate::config::credential_policy::RuleMode::Enforce).await;
+    }
+
+    async fn a_key_revoked_on_another_node_is_refused_once_due(mode: crate::config::credential_policy::RuleMode) {
         use crate::api_keys::store::ApiKeyStore as _;
         let enforced = gate().await;
-        use_isolation(crate::config::credential_policy::RuleMode::Warn);
+        use_isolation(mode);
         let own = naming("owner-a", "tenant-a", external(KEY_A));
         assert_eq!(
             enforced
                 .gate
                 .refuses(&own)
                 .await,
-            None
+            None,
+            "{mode:?}"
         );
         other_node(&enforced)
             .await
@@ -1595,7 +1605,7 @@ mod tests {
                 .refuses(&own)
                 .await,
             None,
-            "within the recheck interval the kept verdict stands"
+            "{mode:?}: within the recheck interval the kept verdict stands"
         );
 
         expire_rechecks(enforced.gate, "owner-a");
@@ -1605,7 +1615,7 @@ mod tests {
                 .refuses(&own)
                 .await,
             Some(NotReadyReason::ApiKeyRevoked),
-            "once due, the key's folder is read from disk"
+            "{mode:?}: once due, the key's folder is read from disk"
         );
         assert_eq!(cached_status(&enforced).await, crate::api_keys::ApiKeyStatus::Revoked);
     }

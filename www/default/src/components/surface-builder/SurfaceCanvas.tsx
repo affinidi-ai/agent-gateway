@@ -3324,25 +3324,17 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           { type: d.type, config: cn?.config },
           surfacePolicyIdsRef.current
         );
-        const apiKeyWarning = cn ? apiKeyReferenceWarning(cn, apiKeyStatusesRef.current) : null;
         const featureReason =
           hasFeatureError && cn
             ? _registry
                 .getDependencyWarnings(d.type, cn.config, buildSurfaceContext(protocol, nodes), cn)
                 .find(w => w.severity === 'error')?.message
             : null;
-        const reason = incompleteReason || featureReason || apiKeyWarning || null;
-        const useAnts = hasFeatureError && !incompleteReason && !policyMissing && !apiKeyWarning;
+        const reason = incompleteReason || featureReason || null;
+        const useAnts = hasFeatureError && !incompleteReason && !policyMissing;
         // A policy node with no policy selected (incomplete) or a missing
-        // attached policy, and an Identity whose API key is unusable, get a
-        // dotted ring per the surface-builder spec.
-        const dottedPolicy =
-          (d.type === 'policy' && (!d.configured || policyMissing)) || !!apiKeyWarning;
-        const prefix = useAnts
-          ? 'Missing dependency'
-          : apiKeyWarning && reason === apiKeyWarning
-            ? 'Unconfigured'
-            : 'Incomplete';
+        // attached policy gets a dotted ring per the surface-builder spec.
+        const dottedPolicy = d.type === 'policy' && (!d.configured || policyMissing);
         const ringClass = useAnts ? 'unconfigured-ring marching' : 'unconfigured-ring';
         const shape = _registry.get(d.type)?.shape;
         if (shape === 'rect' || shape === 'diamond') {
@@ -3361,7 +3353,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
             .attr('stroke-width', 2)
             .attr('opacity', 0.8);
           if (useAnts) ring.attr('stroke-dasharray', '6 4');
-          if (reason) ring.append('title').text(`${prefix}: ${reason}`);
+          if (reason) {
+            const prefix = useAnts ? 'Missing dependency' : 'Incomplete';
+            ring.append('title').text(`${prefix}: ${reason}`);
+          }
         } else {
           const ring = el
             .append('circle')
@@ -3374,7 +3369,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
             .attr('pointer-events', 'visible');
           if (dottedPolicy) ring.attr('stroke-dasharray', POLICY_UNCONFIGURED_DASH);
           else if (useAnts) ring.attr('stroke-dasharray', '6 4');
-          if (reason) ring.append('title').text(`${prefix}: ${reason}`);
+          if (reason) {
+            const prefix = useAnts ? 'Missing dependency' : 'Incomplete';
+            ring.append('title').text(`${prefix}: ${reason}`);
+          }
         }
       });
 
@@ -4529,16 +4527,15 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       const ring = nodeG.select('.unconfigured-ring');
       const hasFeatureError = updateFeatureErrorIds.has(n.id);
       const policyMissing = policyDefinitionMissing(n, surfacePolicyIds);
-      const apiKeyWarning = apiKeyReferenceWarning(n, apiKeyStatuses);
+      const apiKeyMissing = apiKeyReferenceWarning(n, apiKeyStatuses) !== null;
       const wantRing =
-        (!n.configured || hasFeatureError || policyMissing || !!apiKeyWarning) &&
+        (!n.configured || hasFeatureError || policyMissing || apiKeyMissing) &&
         n.type !== 'surface';
-      const useAnts = hasFeatureError && n.configured && !policyMissing && !apiKeyWarning;
-      // A policy node with no policy selected or a missing attached policy,
-      // and an Identity whose API key is unusable, use a dotted ring (distinct
-      // from the solid incomplete ring and the marching-ants feature-error ring).
-      const dottedPolicy =
-        (n.type === 'policy' && (!n.configured || policyMissing)) || !!apiKeyWarning;
+      const useAnts = hasFeatureError && n.configured && !policyMissing;
+      // A policy node with no policy selected or a missing attached policy
+      // uses a dotted ring (distinct from the solid incomplete ring and the
+      // marching-ants feature-error ring).
+      const dottedPolicy = n.type === 'policy' && (!n.configured || policyMissing);
       if (!wantRing && !ring.empty()) {
         ring.remove();
       } else if (wantRing && ring.empty()) {
