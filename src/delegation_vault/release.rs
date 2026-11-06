@@ -264,6 +264,26 @@ pub struct ReleaseContext<'a> {
     pub refusal_limit: u32,
 }
 
+static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Held by the one task recording a grant's use, so concurrent requests
+/// before its write lands do not each spawn one.
+struct UseClaim(String);
+
+impl UseClaim {
+    fn take(grant_id: &str) -> Option<Self> {
+        USES_IN_FLIGHT
+            .insert(grant_id.to_string())
+            .then(|| Self(grant_id.to_string()))
+    }
+}
+
+impl Drop for UseClaim {
+    fn drop(&mut self) {
+        USES_IN_FLIGHT.remove(&self.0);
+    }
+}
+
 /// Record, on a task of its own, that `grant` was released into the request
 /// `request_id`, when its last recorded use is old enough
 /// ([`DelegatedGrant::use_is_due`]), so a busy route does not rewrite its grant
@@ -276,10 +296,14 @@ pub fn record_use_in_background(
     if !grant.use_is_due(Utc::now()) {
         return;
     }
+    let Some(claim) = UseClaim::take(&grant.id) else {
+        return;
+    };
     let vault = Arc::clone(vault);
     let id = grant.id.clone();
     let surface_variant = crate::observability::policy_audit::current_request_variant();
     tokio::spawn(async move {
+        let _claim = claim;
         if let Err(error) = vault
             .mark_grant_used(&id)
             .await
@@ -1157,5 +1181,19 @@ mod connect_hint_tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         );
         assert_ne!(connect_hint("owner"), connect_hint("another"));
+    }
+}
+
+#[cfg(test)]
+mod use_claim_tests {
+    use super::UseClaim;
+
+    #[test]
+    fn a_grant_has_one_use_claim_until_it_is_dropped() {
+        let first = UseClaim::take("claim-grant").expect("first claim");
+        assert!(UseClaim::take("claim-grant").is_none());
+        assert!(UseClaim::take("another-claim-grant").is_some());
+        drop(first);
+        assert!(UseClaim::take("claim-grant").is_some());
     }
 }

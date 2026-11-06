@@ -19,7 +19,6 @@ use uuid::Uuid;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::delegation_vault::oauth::TokenEgress;
-use crate::delegation_vault::storage::DeferredRevocation;
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
@@ -1161,41 +1160,14 @@ async fn remove_provider(
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
         saved: outcome,
         stored: Box::pin(provider_deleted(Arc::clone(&state.store), id.to_string())),
+        kept: Vec::new(),
     };
-    let (revocations, kept) =
-        match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
-            Ok(removal) => removal,
-            Err(refused) => return (refused.into_response(), None),
-        };
-    // Spawned before the delete, so a delete dropped part way still decides
-    // them once the provider is gone, as the task deleting its grants does.
-    let (kept_deleted, revocations) = match state.vault.as_ref() {
-        Some(vault) if !kept.is_empty() => {
-            let (sender, outcome) = tokio::sync::oneshot::channel();
-            let revoker = provider_revoker(state, &existing, actor, vault);
-            let store = Arc::clone(&state.store);
-            let provider_id = id.to_string();
-            let task = crate::audit::producer::spawn_audited(async move {
-                let gone = match outcome.await {
-                    Ok(gone) => gone,
-                    Err(_) => provider_deleted(store, provider_id).await,
-                };
-                if let Some(revocations) = revocations {
-                    let _ = revocations.await;
-                }
-                if gone {
-                    crate::delegation_vault::revocation::decide_kept_of_deleted_provider(revoker, kept).await;
-                }
-            });
-            (Some(sender), Some(task))
-        }
-        _ => (None, revocations),
+    let revocations = match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
+        Ok(revocations) => revocations,
+        Err(refused) => return (refused.into_response(), None),
     };
     let result = state.store.delete(id).await;
     let _ = deleted.send(result.is_ok());
-    if let Some(kept_deleted) = kept_deleted {
-        let _ = kept_deleted.send(result.is_ok());
-    }
     drop(bindings);
     let response = match result {
         Ok(true) => {
@@ -1246,6 +1218,12 @@ enum ProviderDeleteError {
          cannot be found; restore the AG_IDENTITY_HASH_PEPPER they were written under, or have an operator purge them"
     )]
     PepperMismatch,
+    #[error(
+        "The delegation vault keeps revocations it cannot read now, so the provider is kept: once it is gone they \
+         could never be revoked. Make them readable again (for at-rest encryption, enable [encryption] with the key \
+         they were written under), then delete the provider"
+    )]
+    UnreadableKeptRevocation,
     /// A surface binds the provider; `surface_id` names it when the caller
     /// may see it.
     #[error("The credential provider is bound by an agent surface; remove the binding first")]
@@ -1265,7 +1243,8 @@ impl IntoResponse for ProviderDeleteError {
             Self::SurfacesUnavailable
             | Self::VaultUnavailable
             | Self::UnreadableGrant { .. }
-            | Self::PepperMismatch => {
+            | Self::PepperMismatch
+            | Self::UnreadableKeptRevocation => {
                 (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": self.to_string() })))
                     .into_response()
             }
@@ -1332,10 +1311,10 @@ async fn remove_provider_grants(
     provider: &CredentialProvider,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     bindings: Arc<tokio::sync::RwLockWriteGuard<'static, ()>>,
-    outcome: crate::delegation_vault::revocation::ChangeOutcome,
-) -> Result<(Option<tokio::task::JoinHandle<()>>, Vec<DeferredRevocation>), ProviderDeleteError> {
+    mut outcome: crate::delegation_vault::revocation::ChangeOutcome,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ProviderDeleteError> {
     if !provider.is_external_consent() {
-        return Ok((None, Vec::new()));
+        return Ok(None);
     }
     let Some(vault) = state.vault.as_ref() else {
         return Err(ProviderDeleteError::VaultUnavailable);
@@ -1365,24 +1344,21 @@ async fn remove_provider_grants(
         Ok(kept) => kept,
         Err(error) if error.is::<crate::delegation_vault::grants::UnreadableKeptRevocation>() => {
             warn!(target: "credential_delegation", error = %error, "Failed to read a provider's kept revocations");
-            return Err(unavailable(
-                "The delegation vault keeps revocations it cannot read now, so the provider is kept: once it is gone \
-                 they could never be revoked. Make them readable again (for at-rest encryption, enable [encryption] \
-                 with the key they were written under), then delete the provider",
-            ));
+            return Err(ProviderDeleteError::UnreadableKeptRevocation);
         }
         Err(error) => {
             warn!(target: "credential_delegation", error = %error, "Failed to read a provider's kept revocations");
             return Err(ProviderDeleteError::VaultUnavailable);
         }
     };
-    if grants.is_empty() {
-        return Ok((None, kept));
+    if grants.is_empty() && kept.is_empty() {
+        return Ok(None);
     }
+    outcome.kept = kept;
     let revoker = provider_revoker(state, provider, actor, vault);
     crate::delegation_vault::revocation::delete_then_revoke(vault, grants, revoker, bindings, Some(outcome))
         .await
-        .map(|revocations| (Some(revocations), kept))
+        .map(Some)
         .map_err(|error| {
             warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
             ProviderDeleteError::VaultUnavailable
@@ -4608,5 +4584,21 @@ mod external_provider_tests {
             .expect("the revocation names its actor");
         assert_eq!(caller.sub.as_deref(), Some("operator"));
         assert_eq!(caller.token_id.as_deref(), Some("pat-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_kept_revocation_keeps_the_provider_with_a_503() {
+        let response = ProviderDeleteError::UnreadableKeptRevocation.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("the provider is kept")
+        );
     }
 }
