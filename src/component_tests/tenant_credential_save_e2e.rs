@@ -593,6 +593,13 @@ fn write_stored_surface(
 }
 
 async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
+    harness_seeded(isolation, |_| {}).await
+}
+
+async fn harness_seeded(
+    isolation: RuleMode,
+    seed: impl FnOnce(&crate::config::BootstrapConfig),
+) -> (GatewayHarness, Api) {
     let mut client = None;
     let harness = GatewayHarness::start(|_, _, bootstrap| {
         bootstrap.credential_policy = CredentialPolicyConfig {
@@ -600,6 +607,7 @@ async fn harness(isolation: RuleMode) -> (GatewayHarness, Api) {
             ..Default::default()
         };
         seed_stored_credentials(bootstrap);
+        seed(bootstrap);
         client = Some(configure_admin_api(bootstrap));
     })
     .await;
@@ -1922,40 +1930,83 @@ async fn moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict_when_enforced
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_surface_keeps_a_provider_key_it_already_named_after_the_key_is_deleted_but_cannot_add_one() {
+async fn deleting_a_provider_key_a_surface_names_is_a_conflict_until_the_surface_drops_it() {
     let (_harness, api) = harness(RuleMode::Enforce).await;
     let owner = api
-        .created_id(&api.surface("/smoke/deleted-key-owner", Some("tenant-a"), json!({})))
+        .created_id(&api.surface("/smoke/named-delete-owner", Some("tenant-a"), json!({})))
         .await;
     let key_id = api.api_key(&owner).await;
-    let protected = json!({"identity_slots": {"protected": from_api_key(&key_id)}});
     let naming = api
-        .created_id(&api.surface("/smoke/deleted-key-user", Some("tenant-a"), protected.clone()))
+        .created_id(&api.surface(
+            "/smoke/named-delete-user",
+            Some("tenant-a"),
+            json!({"identity_slots": {"protected": from_api_key(&key_id)}}),
+        ))
         .await;
-    let other = api
-        .created_id(&api.surface("/smoke/deleted-key-other", Some("tenant-a"), json!({})))
-        .await;
-    let (status, body) = api
-        .send(
+    let delete = || {
+        api.send(
             api.client
                 .delete(api.url(&format!("api-keys/{owner}/{key_id}"))),
         )
-        .await;
-    assert!(matches!(status, 200 | 204), "{status} {body}");
-    let (status, body) = api
-        .send(
+    };
+    let get = || {
+        api.send(
             api.client
                 .get(api.url(&format!("api-keys/{owner}/{key_id}"))),
         )
-        .await;
-    assert_eq!(status, 404, "the key is gone: {body}");
+    };
 
-    let stored = api.stored(&naming).await;
+    let (status, body) = delete().await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        body["error"],
+        format!("API key is named by surface(s) {naming}; remove it from them before deleting the key")
+    );
+    let (status, body) = get().await;
+    assert_eq!(status, 200, "the key is kept: {body}");
+
+    let mut dropped = api.stored(&naming).await;
+    dropped["identity_slots"] = json!({});
     assert_saved(
-        api.put(&naming, &stored)
+        api.put(&naming, &dropped)
             .await,
     );
-    assert_eq!(api.stored(&naming).await["identity_slots"]["protected"]["api_key_id"], json!(key_id));
+    let (status, body) = delete().await;
+    assert!(matches!(status, 200 | 204), "{status} {body}");
+    let (status, body) = get().await;
+    assert_eq!(status, 404, "the key is gone: {body}");
+}
+
+const GONE_KEY: &str = "atgk_00000000000000000000000000000d01";
+const GONE_KEY_USER: &str = "gone-key-user";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_keeps_a_provider_key_it_already_named_after_the_key_is_gone_but_cannot_add_one() {
+    let (_harness, api) = harness_seeded(RuleMode::Enforce, |bootstrap| {
+        write_stored_surface(
+            bootstrap,
+            GONE_KEY_USER,
+            json!({"identity_slots": {"protected": from_api_key(GONE_KEY)}}),
+        );
+    })
+    .await;
+    let protected = json!({"identity_slots": {"protected": from_api_key(GONE_KEY)}});
+    let other = api
+        .created_id(&api.surface("/smoke/deleted-key-other", Some("tenant-a"), json!({})))
+        .await;
+
+    let stored = api
+        .stored(GONE_KEY_USER)
+        .await;
+    assert_saved(
+        api.put(GONE_KEY_USER, &stored)
+            .await,
+    );
+    assert_eq!(
+        api.stored(GONE_KEY_USER)
+            .await["identity_slots"]["protected"]["api_key_id"],
+        json!(GONE_KEY)
+    );
 
     let mut added = api.stored(&other).await;
     added["identity_slots"] = protected["identity_slots"].clone();
