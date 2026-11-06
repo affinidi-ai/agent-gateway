@@ -5517,6 +5517,13 @@ fn refuse_grant(
         refusal = refusal.reason(),
         "The Transit Point's grant by binding cannot be released - refusing the request"
     );
+    audit_connector_call(
+        ctx,
+        ConnectorCallResult::Refused {
+            reason: refusal.reason(),
+            cause: reason,
+        },
+    );
     OutboundPipelineError::GrantRefused {
         refusal,
         mcp_request_id: mcp_refusal_id(ctx),
@@ -5613,6 +5620,13 @@ async fn step_inject_external_grant(
             request_id = %ctx.request_id,
             reason = "caller_not_identified",
             "The Transit Point's grant by binding cannot be released - refusing the request"
+        );
+        audit_connector_call(
+            ctx,
+            ConnectorCallResult::Refused {
+                reason: "caller_not_identified",
+                cause: "caller_not_identified",
+            },
         );
         return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
     };
@@ -5782,6 +5796,75 @@ fn audit_grant_injected(
         event.caller = outbound_caller(ctx);
         event
     });
+}
+
+/// What a call through a connector's Transit Point came to, for
+/// [`audit_connector_call`].
+enum ConnectorCallResult {
+    Forwarded { status: StatusCode },
+    Refused { reason: &'static str, cause: &'static str },
+}
+
+/// Audit a call through a Transit Point that carries a grant by binding as
+/// `connector_call`: the tenant, surface, Transit Point, provider, the caller's
+/// identity hash and whose grant it is, the tool the call names, and either the
+/// class of the vendor's answer or the fixed reason it was refused. The record
+/// carries no argument, token or vendor text, and names the caller by the hash
+/// alone.
+fn audit_connector_call(
+    ctx: &OutboundPipelineContext,
+    result: ConnectorCallResult,
+) {
+    use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+    let Some(binding) = ctx
+        .surface
+        .transit_point_external_credentials(&ctx.virtual_channel)
+    else {
+        return;
+    };
+    crate::delegation_vault::audit::emit("connector_call", || {
+        let (outcome, status_class, reason, cause) = match result {
+            ConnectorCallResult::Forwarded { status } => {
+                (ConnectorCallOutcome::Forwarded, Some(status_class(status).to_string()), None, None)
+            }
+            ConnectorCallResult::Refused { reason, cause } => {
+                (ConnectorCallOutcome::Refused, None, Some(reason.to_string()), Some(cause.to_string()))
+            }
+        };
+        let caller = delegation_caller_hash(ctx);
+        let mut event = crate::delegation_vault::audit::audit_event(
+            DelegationAuditAction::ConnectorCall {
+                transit_point: ctx.virtual_channel.id.clone(),
+                subject: binding.subject,
+                outcome,
+                status_class,
+                reason,
+                cause,
+            },
+            None,
+            caller.as_deref(),
+            Some(&binding.credential_provider_id),
+            Some(&ctx.surface.surface_id),
+        );
+        event.tenant_id = ctx.surface.tenant_id.clone();
+        event.channel_name = Some(ctx.surface.name.clone());
+        event.mcp_tool_name = ctx
+            .body_bytes
+            .as_deref()
+            .and_then(crate::mcp::tool_analyzer::called_tool_name);
+        event
+    });
+}
+
+/// The class of an HTTP status: `2xx`, `4xx`, and so on.
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        _ => "5xx",
+    }
 }
 
 /// Unified upstream response, abstracting over the two outbound transports so
@@ -6539,6 +6622,7 @@ async fn step_answer_a_refused_grant(
     match vendor_answer(response.status(), response.headers()) {
         VendorAnswer::Pass => {
             ctx.released_grant = Some(released);
+            audit_connector_call(ctx, ConnectorCallResult::Forwarded { status: response.status() });
             return Ok(UpstreamResponse::Http(response));
         }
         VendorAnswer::Refuse(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
@@ -6597,6 +6681,7 @@ async fn step_answer_a_refused_grant(
         subject,
         injection,
     }));
+    audit_connector_call(ctx, ConnectorCallResult::Forwarded { status: retried.status() });
     Ok(UpstreamResponse::Http(retried))
 }
 
@@ -17345,6 +17430,203 @@ mod tests {
                 refused,
                 "{protocol} {encoding}: {sent:?}"
             );
+        }
+    }
+
+    fn connector_calls(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+    ) -> Vec<&crate::delegation_vault::audit::DelegationAuditEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConnectorCall { .. })
+            })
+            .collect()
+    }
+
+    /// A call carrying a grant is audited once, with the Transit Point, the
+    /// provider, whose grant it is, the caller's hash, the tool and the class
+    /// of the vendor's answer, and with no argument, token or vendor text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_carrying_a_grant_is_audited_with_its_caller_tool_and_outcome() {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::status(200),
+            Answer::json(503, json!({"error": "vendor words"})),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let alice = "a".repeat(64);
+        store_grant(
+            &state,
+            GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &alice).unwrap(),
+            "alice-access",
+            3600,
+        )
+        .await;
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "create_issue", "arguments": {"title": "launch codes"}}})
+        .to_string();
+
+        let ((), events) = crate::audit::producer::capture(async {
+            for _ in 0..2 {
+                let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&alice));
+                ctx.body_bytes = Some(Bytes::from(body.clone()));
+                send_with_grant(&state, &mut ctx)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 2, "{events:?}");
+        for (call, class) in calls
+            .iter()
+            .zip(["2xx", "5xx"])
+        {
+            assert_eq!(
+                call.user_identity_hash
+                    .as_deref(),
+                Some(alice.as_str())
+            );
+            assert_eq!(call.provider_id.as_deref(), Some("fixture-vendor"));
+            assert_eq!(call.surface_id.as_deref(), Some(surface.surface_id.as_str()));
+            assert_eq!(call.mcp_tool_name.as_deref(), Some("create_issue"));
+            assert_eq!(call.tenant_id, None);
+            assert!(call.caller.is_none(), "the caller is named by the hash alone");
+            match &call.event {
+                DelegationAuditAction::ConnectorCall {
+                    transit_point,
+                    subject,
+                    outcome,
+                    status_class,
+                    reason,
+                    cause,
+                } => {
+                    assert_eq!(transit_point, VENDOR_HOP);
+                    assert_eq!(*subject, Some(crate::config::agent_surface::GrantSubject::Caller));
+                    assert_eq!(*outcome, ConnectorCallOutcome::Forwarded);
+                    assert_eq!(status_class.as_deref(), Some(class));
+                    assert_eq!((reason, cause), (&None, &None));
+                }
+                other => panic!("expected ConnectorCall, got {other:?}"),
+            }
+            let written = serde_json::to_string(call).unwrap();
+            for secret in ["launch codes", "alice-access", "vendor words"] {
+                assert!(!written.contains(secret), "{secret} is in {written}");
+            }
+        }
+    }
+
+    /// A call refused before it is forwarded is audited with the fixed reason
+    /// the caller was told and the cause inside it, for a missing grant, a
+    /// provider of another tenant, and a caller who names no one; the surface's
+    /// tenant is on the record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_refused_before_it_is_forwarded_is_audited_with_its_reason() {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-tenant-b"), "access", 3600)
+            .await;
+        let unconnected = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let mut tenanted =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-tenant-b", "owner")]), json!([]));
+        tenanted.tenant_id = Some("tenant-1".to_string());
+
+        let ((), events) = crate::audit::producer::capture(async {
+            for (surface, caller) in
+                [(&unconnected, Some(caller.as_str())), (&tenanted, Some(caller.as_str())), (&unconnected, None)]
+            {
+                let mut ctx = external_grant_context(surface, VENDOR_HOP, caller);
+                step_inject_credentials(&state, &mut ctx)
+                    .await
+                    .unwrap_err();
+            }
+        })
+        .await;
+
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 3, "{events:?}");
+        let fields: Vec<_> = calls
+            .iter()
+            .map(|call| match &call.event {
+                DelegationAuditAction::ConnectorCall {
+                    outcome,
+                    status_class,
+                    reason,
+                    cause,
+                    ..
+                } => {
+                    assert_eq!(*outcome, ConnectorCallOutcome::Refused);
+                    assert_eq!(*status_class, None);
+                    (
+                        reason.clone().unwrap(),
+                        cause.clone().unwrap(),
+                        call.tenant_id.clone(),
+                        call.user_identity_hash
+                            .clone(),
+                    )
+                }
+                other => panic!("expected ConnectorCall, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(fields[0].0, "connect_required");
+        assert_eq!((fields[0].2.as_deref(), fields[0].3.as_deref()), (None, Some(caller.as_str())));
+        assert_eq!(
+            (fields[1].0.as_str(), fields[1].1.as_str(), fields[1].2.as_deref()),
+            ("connector_unavailable", "provider_of_another_tenant", Some("tenant-1"))
+        );
+        assert_eq!(
+            (fields[2].0.as_str(), fields[2].1.as_str(), fields[2].3.as_deref()),
+            ("caller_not_identified", "caller_not_identified", None)
+        );
+    }
+
+    /// A call the vendor first rejects, retried with a refreshed token, is one
+    /// `connector_call`, carrying the retry's answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retried_call_is_audited_once_with_the_answer_to_the_retry() {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![refresh_answer("fresh")]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#),
+            Answer::status(200),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "stale", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+
+        let (sent, events) = crate::audit::producer::capture(async {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            send_with_grant(&state, &mut ctx).await
+        })
+        .await;
+
+        assert_eq!(sent.unwrap(), reqwest::StatusCode::OK);
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        match &calls[0].event {
+            DelegationAuditAction::ConnectorCall {
+                outcome, status_class, subject, ..
+            } => {
+                assert_eq!(*outcome, ConnectorCallOutcome::Forwarded);
+                assert_eq!(status_class.as_deref(), Some("2xx"));
+                assert_eq!(*subject, Some(crate::config::agent_surface::GrantSubject::Owner));
+            }
+            other => panic!("expected ConnectorCall, got {other:?}"),
         }
     }
 

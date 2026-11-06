@@ -1,0 +1,21 @@
+branch: feat/transit-point-call-audit
+changes:
+  added:
+    - timestamp: '2026-11-05T10:00:00Z'
+      title: Audit each call through a connector's Transit Point
+      description: >-
+        A call through a Transit Point whose transit_credentials take a connector grant
+        (consent_mode external) is recorded as a connector_call audit event, once per call: the
+        Transit Point, provider, surface and its tenant, the caller's identity hash, whose grant it
+        is (the owner's or the caller's own), the tool an MCP tools/call names, and either
+        forwarded with the class of the vendor's answer (2xx to 5xx) or refused with the fixed
+        reason the caller was told and its cause. A call retried with a refreshed token is one
+        record. The record carries no argument, token or text from the vendor, and names the caller
+        by the hash alone. Delegation audit records gain an optional tenant_id, set on these
+        records. connector_call is in the audit event catalog, in the Delegation group, and can be
+        selected for the VP Audit Log and for integrations.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
