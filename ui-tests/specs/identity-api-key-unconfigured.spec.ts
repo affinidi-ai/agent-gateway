@@ -84,7 +84,7 @@ const CASES = [
     {
         status: 'revoked' as const,
         reason: 'API key revoked',
-        label: `${STORED_KEY} (revoked)`,
+        label: 'stored-client (revoked)',
         warning:
             'The API key this Identity uses was revoked. Select an active API key of this surface.',
     },
@@ -113,6 +113,7 @@ test.describe('Identity — unconfigured API key', () => {
             const picker = page.getByTestId('identity-panel-api-key-select');
             await expect(picker).toHaveValue(STORED_KEY);
             await expect(picker.locator('option:checked')).toHaveText(label);
+            await expect(picker.locator('option:checked')).toBeDisabled();
             await expect(page.getByTestId('identity-api-key-revoked-warning')).toHaveText(warning);
 
             await picker.selectOption(ACTIVE_KEY);

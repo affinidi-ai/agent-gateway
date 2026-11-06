@@ -162,25 +162,31 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const isInbound = isInboundIdentity(node);
   const meta = useOptionalSurfaceMeta();
   const surfaceId = meta?.isCreate ? undefined : meta?.surfaceId;
-  const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([]);
+  const [surfaceKeys, setSurfaceKeys] = useState<ApiKeyOption[]>([]);
   const [certificates, setCertificates] = useState<CertificateOption[]>([]);
   const [loadingKeys, setLoadingKeys] = useState(false);
   const [loadingCerts, setLoadingCerts] = useState(false);
 
   useEffect(() => {
-    if (extractionType !== 'from_api_key' || isInbound || !surfaceId || apiKeys.length > 0) return;
+    if (extractionType !== 'from_api_key' || isInbound || !surfaceId || surfaceKeys.length > 0)
+      return;
     setLoadingKeys(true);
     apiClient
       .fetch(`/api/v1/api-keys/${encodeURIComponent(surfaceId)}`)
       .then(r => (r.ok ? r.json() : []))
-      .then((data: ApiKeyOption[]) => setApiKeys(data.filter(k => k.status === 'active')))
-      .catch(() => setApiKeys([]))
+      .then((data: ApiKeyOption[]) => setSurfaceKeys(data))
+      .catch(() => setSurfaceKeys([]))
       .finally(() => setLoadingKeys(false));
-  }, [extractionType, isInbound, surfaceId, apiKeys.length]);
+  }, [extractionType, isInbound, surfaceId, surfaceKeys.length]);
 
+  const apiKeys = surfaceKeys.filter(k => k.status === 'active');
   const storedKeyId: string = config.api_key_id || '';
   const storedKeyListed = !storedKeyId || apiKeys.some(k => k.key_id === storedKeyId);
   const storedKeyProblem = unusableApiKeyStatus(storedKeyId, meta?.apiKeyStatuses);
+  const storedKeyName =
+    storedKeyProblem === 'revoked'
+      ? surfaceKeys.find(k => k.key_id === storedKeyId)?.client_id
+      : undefined;
 
   useEffect(() => {
     if (extractionType !== 'from_mtls' || certificates.length > 0) return;
@@ -387,8 +393,8 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
           >
             <option value="">{loadingKeys ? 'Loading…' : 'Select an API key'}</option>
             {!loadingKeys && !storedKeyListed && (
-              <option value={storedKeyId}>
-                {unlistedApiKeyLabel(storedKeyId, storedKeyProblem)}
+              <option value={storedKeyId} disabled>
+                {unlistedApiKeyLabel(storedKeyName ?? storedKeyId, storedKeyProblem)}
               </option>
             )}
             {apiKeys.map(k => (
