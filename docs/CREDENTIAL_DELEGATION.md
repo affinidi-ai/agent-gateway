@@ -1104,10 +1104,12 @@ withholds the credential logs none for a rule still in `warn`.
 
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
 withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
-`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
-any other discovery read, the `/.well-known/agent.json` fallback included, is a caller's request
-and never gets the credential, so a remote Target that serves its card only at that path and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld under `enforce` is treated
-as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
+`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch,
+beside the receiving gateway's own card read for its policy input (above). Any other discovery
+read a peer sends, its read of the legacy `/.well-known/agent.json` included, is a caller's
+request and never gets the credential, so a remote Target that serves its card only at that path
+and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld
+under `enforce` is treated as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
 request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
 Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
