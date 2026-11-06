@@ -52,18 +52,44 @@ fn answer(world: &SurfaceWorld) -> &RecordedResponse {
         .expect("the gateway must have answered a read")
 }
 
-/// A client sending a personal access token the operator minted for
-/// `tenant`, and the tenant's selector header.
-async fn tenant_token_client(
+/// What a personal access token the operator mints for a read limits it to.
+#[derive(Clone, Copy)]
+enum TokenScope<'a> {
+    /// A tenant's token: a resource pattern naming the tenant its selector
+    /// header names.
+    Tenant(&'a str),
+    /// A token that requires the tenant selector header but has no resource
+    /// pattern.
+    RequiredHeadersAlone(&'a str),
+    /// A token with neither a resource pattern nor a required header.
+    ApplianceWide,
+}
+
+/// The tenant whose selector header a token scoped by required headers alone
+/// requires.
+const HEADER_TENANT: &str = "tenant-a";
+
+/// A client sending a personal access token the operator minted with
+/// `scope`, and the selector header the token requires.
+async fn token_client(
     world: &mut SurfaceWorld,
-    tenant: &str,
+    scope: TokenScope<'_>,
 ) -> Client {
     ensure_admin_session(world).await;
+    let (resource_pattern, tenant) = match scope {
+        TokenScope::Tenant(tenant) => (Some("TENANT:${x-external-account}:credential-providers:.*"), Some(tenant)),
+        TokenScope::RequiredHeadersAlone(tenant) => (None, Some(tenant)),
+        TokenScope::ApplianceWide => (None, None),
+    };
+    let required_headers: Vec<Value> = tenant
+        .iter()
+        .map(|tenant| json!({"name": TENANT_HEADER, "pattern": tenant}))
+        .collect();
     let request = json!({
         "name": "tenant records token",
         "scopes": [],
-        "resource_pattern": "TENANT:${x-external-account}:credential-providers:.*",
-        "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
+        "resource_pattern": resource_pattern,
+        "required_headers": required_headers,
     });
     let created = world
         .admin_client
@@ -83,7 +109,9 @@ async fn tenant_token_client(
     authorization.set_sensitive(true);
     let mut headers = header::HeaderMap::new();
     headers.insert(header::AUTHORIZATION, authorization);
-    headers.insert(TENANT_HEADER, header::HeaderValue::from_str(tenant).expect("a tenant header"));
+    if let Some(tenant) = tenant {
+        headers.insert(TENANT_HEADER, header::HeaderValue::from_str(tenant).expect("a tenant header"));
+    }
     Client::builder()
         .no_proxy()
         .default_headers(headers)
@@ -91,27 +119,65 @@ async fn tenant_token_client(
         .expect("an HTTP client")
 }
 
-async fn read_as_tenant(
+/// Sends `method path` with a token of `scope` and records the answer.
+async fn send_with_token(
     world: &mut SurfaceWorld,
-    tenant: &str,
+    scope: TokenScope<'_>,
+    method: Method,
     path: &str,
 ) {
-    let client = tenant_token_client(world, tenant).await;
+    let client = token_client(world, scope).await;
     let port = world
         .infra
         .as_ref()
         .expect("the gateway must be running")
         .gateway_port;
     let response = client
-        .get(format!("http://127.0.0.1:{port}/api{path}"))
+        .request(method, format!("http://127.0.0.1:{port}/api{path}"))
         .send()
         .await
-        .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+        .unwrap_or_else(|error| panic!("sending {path}: {error}"));
     world.admin_response = Some(
         recorded_response(response)
             .await
-            .unwrap_or_else(|error| panic!("reading {path}: {error}")),
+            .unwrap_or_else(|error| panic!("sending {path}: {error}")),
     );
+}
+
+async fn read_as_tenant(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    path: &str,
+) {
+    send_with_token(world, TokenScope::Tenant(tenant), Method::GET, path).await;
+}
+
+/// Creates the credential provider `provider` of `tenant`, or an
+/// appliance-wide one, with client secrets of the same tenant, and keeps its
+/// id under `provider`.
+async fn own_credential_provider(
+    world: &mut SurfaceWorld,
+    tenant: Option<&str>,
+    provider: &str,
+) {
+    let client_id = format!("{provider}-client-id");
+    let client_secret = format!("{provider}-client-secret");
+    create_secret(world, &client_id, tenant).await;
+    create_secret(world, &client_secret, tenant).await;
+    create_provider(world, provider, "https://192.0.2.1/token", tenant, (&client_id, &client_secret)).await;
+    let created = world
+        .admin_response
+        .take()
+        .expect("the gateway must have answered the provider create");
+    assert_eq!(created.status, 201, "creating credential provider {provider}: {}", created.body);
+    assert_eq!(created.body["tenant_id"], json!(tenant), "{}", created.body);
+    let id = created.body["id"]
+        .as_str()
+        .expect("a created provider has an id")
+        .to_string();
+    world
+        .credential_provider_ids
+        .insert(provider.to_string(), id);
 }
 
 #[given(expr = "tenant {string} owns the credential provider {string}")]
@@ -120,24 +186,38 @@ async fn tenant_owns_credential_provider(
     tenant: String,
     provider: String,
 ) {
-    let client_id = format!("{provider}-client-id");
-    let client_secret = format!("{provider}-client-secret");
-    create_secret(world, &client_id, Some(&tenant)).await;
-    create_secret(world, &client_secret, Some(&tenant)).await;
-    create_provider(world, &provider, "https://192.0.2.1/token", Some(&tenant), (&client_id, &client_secret)).await;
-    let created = world
-        .admin_response
-        .take()
-        .expect("the gateway must have answered the provider create");
-    assert_eq!(created.status, 201, "creating credential provider {provider}: {}", created.body);
-    assert_eq!(created.body["tenant_id"], tenant.as_str(), "{}", created.body);
-    let id = created.body["id"]
-        .as_str()
-        .expect("a created provider has an id")
-        .to_string();
-    world
-        .credential_provider_ids
-        .insert(provider, id);
+    own_credential_provider(world, Some(&tenant), &provider).await;
+}
+
+#[given(expr = "the appliance-wide credential provider {string} exists")]
+async fn appliance_wide_credential_provider_exists(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    own_credential_provider(world, None, &provider).await;
+}
+
+#[given(expr = "a token of tenant {string} has tried to revoke the vault token of credential provider {string}")]
+async fn tenant_has_tried_to_revoke_vault_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    provider: String,
+) {
+    revoke_as_tenant(world, &tenant, &provider).await;
+}
+
+async fn revoke_as_tenant(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    provider: &str,
+) {
+    send_with_token(
+        world,
+        TokenScope::Tenant(tenant),
+        Method::DELETE,
+        &format!("/v1/delegation-vault/{}", vault_token_id(provider)),
+    )
+    .await;
 }
 
 /// The gateway rereads its VP Audit Log on every read, so records appended to
@@ -232,6 +312,49 @@ async fn tenant_reads_missing_vault_token(
     read_as_tenant(world, &tenant, "/v1/delegation-vault/no-such-token").await;
 }
 
+#[when(expr = "a token of tenant {string} revokes the vault token of credential provider {string}")]
+async fn tenant_revokes_vault_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    provider: String,
+) {
+    revoke_as_tenant(world, &tenant, &provider).await;
+}
+
+#[when("an access token scoped by required headers alone lists the delegation vault")]
+async fn header_scoped_token_lists_delegation_vault(world: &mut SurfaceWorld) {
+    send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, "/v1/delegation-vault").await;
+}
+
+#[when(expr = "an access token scoped by required headers alone reads the vault token of credential provider {string}")]
+async fn header_scoped_token_reads_vault_token(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let path = format!("/v1/delegation-vault/{}", vault_token_id(&provider));
+    send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, &path).await;
+}
+
+#[when("an access token scoped by required headers alone reads the Credential Delegation Audit Log")]
+async fn header_scoped_token_reads_credential_delegation_audit_log(world: &mut SurfaceWorld) {
+    let path = "/v1/delegation-audit?page_size=100";
+    send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, path).await;
+}
+
+#[when("an appliance-wide access token lists the delegation vault")]
+async fn appliance_wide_token_lists_delegation_vault(world: &mut SurfaceWorld) {
+    send_with_token(world, TokenScope::ApplianceWide, Method::GET, "/v1/delegation-vault").await;
+}
+
+#[when(expr = "an appliance-wide access token reads the vault token of credential provider {string}")]
+async fn appliance_wide_token_reads_vault_token(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let path = format!("/v1/delegation-vault/{}", vault_token_id(&provider));
+    send_with_token(world, TokenScope::ApplianceWide, Method::GET, &path).await;
+}
+
 #[when("the operator lists the delegation vault")]
 async fn operator_lists_delegation_vault(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
@@ -296,6 +419,13 @@ fn audit_read_shows_every_record(world: &mut SurfaceWorld) {
     assert_eq!(page["total"], json!(events.len()), "{page}");
 }
 
+#[then("the audit read shows no record")]
+fn audit_read_shows_no_record(world: &mut SurfaceWorld) {
+    let (page, events) = audit_page(world);
+    assert!(events.is_empty(), "{page}");
+    assert_eq!((&page["total"], &page["category_counts"]), (&json!(0), &json!({})), "{page}");
+}
+
 fn listed_vault_tokens(world: &SurfaceWorld) -> Vec<(String, String)> {
     let body = &answer(world).body;
     let mut tokens: Vec<(String, String)> = body
@@ -326,6 +456,11 @@ fn vault_list_shows_only_the_token_of(
 ) {
     let expected = vec![(vault_token_id(&provider), provider_id(world, &provider))];
     assert_eq!(listed_vault_tokens(world), expected);
+}
+
+#[then("the vault list is empty")]
+fn vault_list_is_empty(world: &mut SurfaceWorld) {
+    assert_eq!(listed_vault_tokens(world), Vec::<(String, String)>::new());
 }
 
 #[then("the vault list shows the token of every credential provider")]
