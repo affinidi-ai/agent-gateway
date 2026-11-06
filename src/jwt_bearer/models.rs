@@ -126,17 +126,52 @@ pub fn normalize_principal_claim(claim: Option<&str>) -> Result<Option<String>, 
     Ok((claim != DEFAULT_PRINCIPAL_CLAIM).then(|| claim.to_string()))
 }
 
+/// The claim a JWT Bearer method matches against its `audiences`.
+///
+/// `aud` binds the token to the service it was issued for. `azp` and
+/// `client_id` bind it only to the client it was issued to, for identity
+/// providers whose access tokens carry no `aud`: a token that client was
+/// issued for another service is accepted too, so no per-user grant is
+/// released to callers it verifies.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudienceClaim {
+    #[default]
+    Aud,
+    Azp,
+    ClientId,
+}
+
+impl AudienceClaim {
+    pub fn is_aud(&self) -> bool {
+        *self == Self::Aud
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Aud => "aud",
+            Self::Azp => "azp",
+            Self::ClientId => "client_id",
+        }
+    }
+}
+
 /// JWT Bearer-specific authentication configuration attached to a channel or pipe.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JwtBearerAuthConfig {
     /// UUID of the `JwtVerificationStrategy` to use for validation.
     pub jwt_verification_strategy_id: String,
 
-    /// Acceptable `aud` claim values. May be empty — when empty, audience
-    /// validation is skipped entirely to accommodate OAuth servers that do not
-    /// include an `aud` claim in their access tokens.
-    /// The token is accepted if its `aud` claim matches *any* value in this list.
+    /// Acceptable values of the `audience_claim` claim. The token is accepted
+    /// if that claim matches *any* value in this list. A save must name at
+    /// least one, unless the Access Point publishes a protected resource. A
+    /// method stored with an empty list, from before that rule, skips the
+    /// audience check and is warned about at startup and on each save.
     pub audiences: Vec<String>,
+
+    /// The claim `audiences` is matched against. Defaults to `aud`.
+    #[serde(default, skip_serializing_if = "AudienceClaim::is_aud")]
+    pub audience_claim: AudienceClaim,
 
     /// HTTP header to read the token from. Defaults to `Authorization`.
     #[serde(default = "default_token_header")]
@@ -167,6 +202,7 @@ impl Default for JwtBearerAuthConfig {
         Self {
             jwt_verification_strategy_id: String::new(),
             audiences: Vec::new(),
+            audience_claim: AudienceClaim::Aud,
             token_header: default_token_header(),
             token_scheme: default_token_scheme(),
             forward_header: false,
@@ -344,5 +380,43 @@ mod tests {
                 .expected_issuer
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn audience_claim_defaults_to_aud_and_is_left_out_when_aud() {
+        let config: JwtBearerAuthConfig = serde_json::from_value(serde_json::json!({
+            "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"]
+        }))
+        .unwrap();
+        assert_eq!(config.audience_claim, AudienceClaim::Aud);
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("audience_claim")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn audience_claim_round_trips_client_id_and_azp() {
+        for (claim, name) in [(AudienceClaim::ClientId, "client_id"), (AudienceClaim::Azp, "azp")] {
+            let config: JwtBearerAuthConfig = serde_json::from_value(serde_json::json!({
+                "jwt_verification_strategy_id": "idp", "audiences": ["app"], "audience_claim": name
+            }))
+            .unwrap();
+            assert_eq!(config.audience_claim, claim);
+            assert_eq!(claim.as_str(), name);
+            assert_eq!(serde_json::to_value(&config).unwrap()["audience_claim"], name);
+        }
+    }
+
+    #[test]
+    fn audience_claim_refuses_a_claim_that_does_not_bind_the_token() {
+        for name in ["sub", "email", "iss", ""] {
+            let parsed = serde_json::from_value::<JwtBearerAuthConfig>(serde_json::json!({
+                "jwt_verification_strategy_id": "idp", "audiences": ["x"], "audience_claim": name
+            }));
+            assert!(parsed.is_err(), "audience_claim '{name}' should be refused");
+        }
     }
 }

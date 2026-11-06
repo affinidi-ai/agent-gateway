@@ -1011,9 +1011,9 @@ removes and revokes its grants, move the surface and the provider, then bind it 
 A binding with external consent, on a Transit Point or the Access Point Target, needs callers
 authenticated by something the gateway can check. A surface whose Access Point, in its base or
 any variant, has a `did_auth` method without `allowed_dids`, which accepts any DID that signs
-its challenge, or a `jwt_bearer` method without `audiences` while it publishes no
-`protected_resource` (which binds the audience), so that a token its issuer minted for any
-other service is accepted, is refused such a binding, `owner` or `caller`. A `caller` binding is
+its challenge, or a `jwt_bearer` method without `audiences`, or whose `audience_claim` is
+`client_id` or `azp`, while it publishes no `protected_resource` (which binds the audience), so
+that a token its issuer minted for any other service is accepted, is refused such a binding, `owner` or `caller`. A `caller` binding is
 also refused on a surface whose Access Point takes the gateway's resource access tokens
 (`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
 gateway's issuer, so callers of two identity providers with the same subject would share a
@@ -1116,7 +1116,7 @@ API, the grants report and their removal take `"hop": "target"`.
 | `inject_as` | `bearer_header` or `custom_header`. The grant goes in a header, which replaces any of the same name; `meta`, which would put it in the body, is refused |
 | The only binding | `outbound_credentials` holds no other binding, and the surface has no Transit Points, its own or a variant's: `outbound_credentials` would apply on every Transit Point |
 | In place of every other credential | The Target has no `target.auth`, and the Access Point does not forward the caller's JWT (`forward_header`). The caller's own `Authorization`, and the header its credential came in, never reach the vendor |
-| Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
+| Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` or with an `audience_claim` other than `aud` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
 | No presentation of the agent | No identity VP (`target.identity_injection.inject_vp`, or `identity_slots.inbound`), no enabled `target.workload_binding`, and the surface's DID, if it has one, injected in a header rather than `protocol_native`. A presentation of the managed agent, minted without an audience or a nonce, would describe the agent to the vendor, which could present it elsewhere |
 | No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |
 | No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |

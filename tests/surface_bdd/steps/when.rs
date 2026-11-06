@@ -2119,6 +2119,34 @@ async fn request_with_valid_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
+#[when(expr = "the caller sends a request to the surface with a token for audience {string}")]
+async fn request_with_token_for_audience(
+    world: &mut SurfaceWorld,
+    audience: String,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_subject(
+        get_jwt_source_auth_issuer(world),
+        "test-user",
+        serde_json::json!({ "aud": audience }),
+    );
+    send_request_with_bearer_token(world, token).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a token issued to client {string}")]
+async fn request_with_token_issued_to_client(
+    world: &mut SurfaceWorld,
+    client: String,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_subject(
+        get_jwt_source_auth_issuer(world),
+        "test-user",
+        serde_json::json!({ "client_id": client }),
+    );
+    send_request_with_bearer_token(world, token).await;
+}
+
 const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
 const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 

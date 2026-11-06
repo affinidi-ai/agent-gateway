@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::jwt_bearer::{
     errors::{JwtBearerError, JwtBearerResult},
     jwks::JwksClient,
-    models::{JwksSource, JwtVerificationStrategy},
+    models::{AudienceClaim, JwksSource, JwtVerificationStrategy},
 };
 
 /// All decoded JWT claims, returned on successful validation.
@@ -68,7 +68,8 @@ impl JwtBearerVerifier {
         Arc::clone(&self.jwks_client)
     }
 
-    /// Validate `token` against `strategy` and check `aud` against `audiences`.
+    /// Validate `token` against `strategy` and check `audience_claim` against
+    /// `audiences`.
     ///
     /// On success returns the full decoded claims payload.
     /// On any failure returns a specific [`JwtBearerError`] variant.
@@ -77,7 +78,12 @@ impl JwtBearerVerifier {
         token: &str,
         strategy: &JwtVerificationStrategy,
         audiences: &[String],
+        audience_claim: AudienceClaim,
     ) -> JwtBearerResult<Claims> {
+        if audiences.is_empty() && !audience_claim.is_aud() {
+            return Err(JwtBearerError::InvalidAudience);
+        }
+
         // 1. Decode header to get kid and algorithm
         let header: Header = decode_header(token)
             .map_err(|e| JwtBearerError::InvalidToken(format!("Failed to decode JWT header: {}", e)))?;
@@ -113,14 +119,12 @@ impl JwtBearerVerifier {
 
         let mut required_spec_claims = vec!["iss", "exp"];
 
-        // An empty list disables the audience check. That is a supported shape:
-        // some OAuth servers do not put `aud` on their access tokens at all, and
-        // the BDD suite exercises exactly that. It is still a weaker posture,
-        // because a token minted for another service of the same issuer is then
-        // accepted, so say so once rather than failing closed and breaking every
-        // deployment that relies on it. Requiring an allow-list is a
-        // supported-issuer decision, not a code fix.
-        if audiences.is_empty() {
+        // A save refuses an empty list; one stored before that rule skips the
+        // audience check, so a token minted for another service of the same
+        // issuer is accepted.
+        if !audience_claim.is_aud() {
+            validation.validate_aud = false;
+        } else if audiences.is_empty() {
             warn!(
                 strategy_id = %strategy.id,
                 "No audience allow-list configured: a token minted for another service of the same issuer will be accepted"
@@ -151,6 +155,19 @@ impl JwtBearerVerifier {
         })?;
 
         let claims = token_data.claims;
+        if !audience_claim.is_aud() {
+            let matched = claims
+                .get(audience_claim.as_str())
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    audiences
+                        .iter()
+                        .any(|audience| audience == value)
+                });
+            if !matched {
+                return Err(JwtBearerError::InvalidAudience);
+            }
+        }
 
         info!(
             strategy_id = %strategy.id,
@@ -380,7 +397,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         let decoded = result.expect("valid token should pass validation");
@@ -407,7 +424,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let tampered = format!("{}X", token);
 
         let result = validator
-            .validate(&tampered, &strategy, &["https://api.example.com".to_string()])
+            .validate(&tampered, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(matches!(result, Err(JwtBearerError::InvalidToken(_))), "tampered token should be rejected");
@@ -429,7 +446,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(matches!(result, Err(JwtBearerError::InvalidIssuer)), "wrong issuer should be rejected");
@@ -451,7 +468,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(matches!(result, Err(JwtBearerError::InvalidAudience)), "wrong audience should be rejected");
@@ -472,7 +489,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         if let Ok(claims) = &result {
@@ -505,14 +522,14 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(result.is_ok(), "token with matching aud in array should pass");
     }
 
     #[tokio::test]
-    async fn test_empty_audiences_skips_aud_validation() {
+    async fn test_stored_empty_audiences_skip_aud_validation() {
         let kid = "test-key-no-aud";
         let (base, _handle) = start_test_jwks_server(kid).await;
         let (validator, strategy) = make_validator_with_pem_key(&base);
@@ -525,12 +542,103 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         });
         let token = make_token(claims, kid);
 
-        // Supported shape: issuers that omit `aud`. The weaker posture it implies
-        // is warned about at validation time, see the note in `validate`.
         validator
-            .validate(&token, &strategy, &[])
+            .validate(&token, &strategy, &[], AudienceClaim::Aud)
             .await
-            .expect("a token with no aud is accepted when no allow-list is configured");
+            .expect("a method stored with no allow-list keeps skipping the audience check");
+    }
+
+    async fn validate_client_bound(
+        kid: &str,
+        claims: Value,
+        audiences: &[&str],
+        audience_claim: AudienceClaim,
+    ) -> JwtBearerResult<Claims> {
+        let (base, _handle) = start_test_jwks_server(kid).await;
+        let (validator, strategy) = make_validator_with_pem_key(&base);
+        let audiences: Vec<String> = audiences
+            .iter()
+            .map(|audience| audience.to_string())
+            .collect();
+        validator
+            .validate(&make_token(claims, kid), &strategy, &audiences, audience_claim)
+            .await
+    }
+
+    #[tokio::test]
+    async fn client_id_bound_method_accepts_a_token_with_no_aud_from_a_listed_client() {
+        let claims = validate_client_bound(
+            "client-id-ok",
+            json!({ "iss": "https://issuer.example.com", "sub": "user-1", "client_id": "app-1", "exp": now_secs() + 3600 }),
+            &["app-1"],
+            AudienceClaim::ClientId,
+        )
+        .await
+        .expect("a token whose client_id is listed is accepted without aud");
+        assert_eq!(claims["sub"], "user-1");
+    }
+
+    #[tokio::test]
+    async fn azp_bound_method_accepts_a_listed_azp() {
+        let claims = validate_client_bound(
+            "azp-ok",
+            json!({ "iss": "https://issuer.example.com", "sub": "user-2", "azp": "app-2", "exp": now_secs() + 3600 }),
+            &["app-2"],
+            AudienceClaim::Azp,
+        )
+        .await
+        .expect("a token whose azp is listed is accepted");
+        assert_eq!(claims["sub"], "user-2");
+    }
+
+    #[tokio::test]
+    async fn client_bound_method_refuses_an_unlisted_missing_or_non_string_client() {
+        for (case, client_id) in
+            [("unlisted", Some(json!("other-app"))), ("missing", None), ("not a string", Some(json!(["app-1"])))]
+        {
+            let mut claims = json!({ "iss": "https://issuer.example.com", "sub": "user-1", "exp": now_secs() + 3600 });
+            if let Some(client_id) = client_id {
+                claims["client_id"] = client_id;
+            }
+            let result =
+                validate_client_bound(&format!("client-id-{case}"), claims, &["app-1"], AudienceClaim::ClientId).await;
+            assert!(
+                matches!(result, Err(JwtBearerError::InvalidAudience)),
+                "{case} client_id should be InvalidAudience, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_bound_method_with_no_allow_list_refuses_every_token() {
+        let result = validate_client_bound(
+            "client-id-empty",
+            json!({ "iss": "https://issuer.example.com", "sub": "user-1", "client_id": "app-1", "exp": now_secs() + 3600 }),
+            &[],
+            AudienceClaim::ClientId,
+        )
+        .await;
+        assert!(matches!(result, Err(JwtBearerError::InvalidAudience)), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn client_bound_method_still_checks_the_signature_issuer_and_expiry() {
+        let result = validate_client_bound(
+            "client-id-wrong-iss",
+            json!({ "iss": "https://other.example.com", "sub": "user-1", "client_id": "app-1", "exp": now_secs() + 3600 }),
+            &["app-1"],
+            AudienceClaim::ClientId,
+        )
+        .await;
+        assert!(matches!(result, Err(JwtBearerError::InvalidIssuer)), "got {result:?}");
+        let result = validate_client_bound(
+            "client-id-expired",
+            json!({ "iss": "https://issuer.example.com", "sub": "user-1", "client_id": "app-1", "exp": now_secs() - 3600 }),
+            &["app-1"],
+            AudienceClaim::ClientId,
+        )
+        .await;
+        assert!(matches!(result, Err(JwtBearerError::ExpiredToken)), "got {result:?}");
     }
 
     #[tokio::test]
@@ -549,7 +657,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         let token = make_token(claims, kid);
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(matches!(result, Err(JwtBearerError::ExpiredToken)), "expired token should be rejected");
@@ -575,15 +683,15 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         };
 
         let early = validator
-            .validate(&token(now_secs() + 3600), &strategy, &audiences)
+            .validate(&token(now_secs() + 3600), &strategy, &audiences, AudienceClaim::Aud)
             .await;
         assert!(matches!(early, Err(JwtBearerError::InvalidToken(_))), "a token before its nbf should be rejected");
         validator
-            .validate(&token(now_secs() + 30), &strategy, &audiences)
+            .validate(&token(now_secs() + 30), &strategy, &audiences, AudienceClaim::Aud)
             .await
             .expect("an nbf within the 60 s leeway is accepted");
         validator
-            .validate(&token(now_secs() - 60), &strategy, &audiences)
+            .validate(&token(now_secs() - 60), &strategy, &audiences, AudienceClaim::Aud)
             .await
             .expect("a token past its nbf is accepted");
     }
@@ -652,7 +760,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         );
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         let decoded = result.expect("valid token with static JWK should pass validation");
@@ -679,7 +787,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
         );
 
         let result = validator
-            .validate(&token, &strategy, &["https://api.example.com".to_string()])
+            .validate(&token, &strategy, &["https://api.example.com".to_string()], AudienceClaim::Aud)
             .await;
 
         assert!(
@@ -709,7 +817,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
             "okp-key",
         );
         JwtBearerVerifier::new(Arc::new(JwksClient::new()))
-            .validate(&token, &strategy, &[])
+            .validate(&token, &strategy, &[], AudienceClaim::Aud)
             .await
     }
 
