@@ -54,11 +54,12 @@ mod freeze {
     const FROZEN_FILES: &[(&str, usize)] = &[
         ("a2a_extended_card_e2e.rs", 17),
         ("a2a_flow_e2e.rs", 51),
-        ("a2a_proxy_e2e.rs", 20),
+        ("a2a_proxy_e2e.rs", 22),
         ("a2a_streaming_e2e.rs", 11),
         ("access_point_closed_e2e.rs", 12),
         ("access_tokens_pat.rs", 52),
         ("agent_card_preview.rs", 5),
+        ("agent_pay_gate_e2e.rs", 20),
         ("api_key_identity_e2e.rs", 12),
         ("channel_e2e.rs", 13),
         ("connection_point_integration_events_e2e.rs", 2),
