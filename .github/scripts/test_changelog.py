@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import tempfile
 import unittest
 from io import StringIO
@@ -115,13 +117,40 @@ class ChangelogTests(unittest.TestCase):
             "- **Add release flow** — Reviewed details."
         )
 
-    def test_manual_bump_overrides_fragment_inference(self) -> None:
-        fragments = [(Path("fragment.yaml"), fragment("feat/x", "added"))]
-        with patch.object(changelog, "load_all", return_value=fragments):
-            args = type("Args", (), {"current": "0.3.16", "bump": "patch"})()
-            with patch("builtins.print") as output:
+    def next_version(self, section: str, current: str, bump: str | None) -> tuple[str, str]:
+        fragments = [(Path("fragment.yaml"), fragment("feat/x", section))]
+        args = type("Args", (), {"current": current, "bump": bump})()
+        with (
+            patch.object(changelog, "load_all", return_value=fragments),
+            patch("builtins.print") as output,
+        ):
+            try:
                 changelog.cmd_next_version(args)
-        output.assert_called_once_with("patch 0.3.17")
+            except SystemExit:
+                return "exit", output.call_args.args[0]
+        return "ok", output.call_args.args[0]
+
+    def test_manual_bump_may_exceed_fragment_inference(self) -> None:
+        self.assertEqual(self.next_version("added", "0.3.16", "major"), ("ok", "major 1.0.0"))
+
+    def test_manual_bump_below_fragment_inference_fails(self) -> None:
+        status, message = self.next_version("added", "0.3.16", "patch")
+        self.assertEqual(status, "exit")
+        self.assertIn("require at least a minor release, but a patch release was requested", message)
+
+    def test_breaking_fragment_requires_major_after_one_zero_zero(self) -> None:
+        status, message = self.next_version("breaking", "1.0.0", "minor")
+        self.assertEqual(status, "exit")
+        self.assertIn("at least a major release", message)
+
+    def test_missing_bump_uses_fragment_inference(self) -> None:
+        self.assertEqual(self.next_version("added", "0.3.16", None), ("ok", "minor 0.4.0"))
+
+    def test_prepends_release_below_unreleased_heading(self) -> None:
+        existing = "# Changelog\n\n## [Unreleased]\n\n## [1.0.0]\n\n- Initial.\n"
+        result = changelog.prepend_release(existing, "## [1.0.1] - 2026-10-05\n")
+        self.assertLess(result.index("## [Unreleased]"), result.index("## [1.0.1]"))
+        self.assertLess(result.index("## [1.0.1]"), result.index("## [1.0.0]"))
 
     def test_archives_fragments_under_release_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

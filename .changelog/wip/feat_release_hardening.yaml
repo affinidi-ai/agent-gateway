@@ -1,0 +1,36 @@
+branch: feat/release_hardening
+changes:
+  added:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Publish GitHub Releases with a prebuilt Linux binary
+      description: >-
+        A manual Prepare release workflow bumps the version, builds the changelog and opens a
+        reviewed release pull request. Merging it tags the commit and creates a GitHub Release
+        whose notes are the reviewed changelog text, with the agent-gateway binary, a SHA256
+        checksum and a build-provenance attestation.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Publish a multi-arch container image to GHCR
+      description: >-
+        Each release tag builds linux/amd64 and linux/arm64 images, boot-probes both, and
+        publishes one multi-arch manifest to ghcr.io/affinidi-ai/agent-gateway tagged X.Y.Z, X.Y
+        and latest, with an attested build provenance.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-06T00:00:00.000Z'
+      title: Ship the container image on a slim runtime base without build tools
+      description: >-
+        The runtime image is now built from a digest-pinned debian:bookworm-slim with only the
+        shared libraries, xmlsec1 and bootstrap CLIs the gateway needs, instead of the Rust build
+        image. It no longer contains compilers, development packages or git, which removes most of
+        the scanner findings the larger image carried.
+    - timestamp: '2026-11-06T00:00:00.000Z'
+      title: Scan the Dockerfile and container image for vulnerabilities in CI
+      description: >-
+        Every container build now scans the Dockerfile for misconfigurations and the built image
+        for fixable high and critical vulnerabilities and embedded secrets, and lists the findings
+        in the job summary. The scan only warns until the TRIVY_ENFORCE repository variable is set
+        to true, after which it blocks a release image from getting a version tag. The boot probe
+        also checks for missing shared libraries.
+  breaking: []
