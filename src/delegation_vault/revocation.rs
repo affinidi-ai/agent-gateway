@@ -270,6 +270,10 @@ pub struct ChangeOutcome {
     /// It runs while the task still holds its `hold`, so the lock that
     /// serialises the change covers the read.
     pub stored: futures::future::BoxFuture<'static, bool>,
+    /// The revocations kept for the earlier removals of the grants' provider,
+    /// read before the change, which a provider's delete decides once it was
+    /// saved ([`decide_kept`]).
+    pub kept: Vec<DeferredRevocation>,
 }
 
 /// Delete each of `grants`, as read, from the vault, which ends its release at
@@ -301,10 +305,14 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
     grants: Vec<DelegatedGrant>,
     revoker: Revoker,
     hold: Hold,
-    outcome: Option<ChangeOutcome>,
+    mut outcome: Option<ChangeOutcome>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let vault = Arc::clone(vault);
     let (report, deletions) = tokio::sync::oneshot::channel();
+    let earlier = outcome
+        .as_mut()
+        .map(|outcome| std::mem::take(&mut outcome.kept))
+        .unwrap_or_default();
     let task = crate::audit::producer::spawn_audited(async move {
         let mut deleted = Vec::with_capacity(grants.len());
         let mut failure = None;
@@ -326,7 +334,7 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         let kept = keep_pending(revoker.vault.as_ref(), deleted).await;
         let revoke = match outcome {
             Some(_) if refused => false,
-            Some(ChangeOutcome { saved, stored }) => match saved.await {
+            Some(ChangeOutcome { saved, stored, .. }) => match saved.await {
                 Ok(saved) => saved,
                 Err(_) => stored.await,
             },
@@ -340,6 +348,9 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         }
         drop(hold);
         decide_each(kept, &revoker, None).await;
+        if !earlier.is_empty() {
+            decide_kept(&vault, earlier, &revoker, chrono::Utc::now(), true).await;
+        }
     });
     match deletions.await {
         Ok(None) => Ok(task),
@@ -788,7 +799,7 @@ pub async fn revoke_deferred_of(
 }
 
 /// The revocations the vault keeps for grants of provider `provider_id`, read
-/// before the provider is deleted, so [`decide_kept_of_deleted_provider`] can
+/// before the provider is deleted, so a provider's delete ([`ChangeOutcome::kept`]) can
 /// decide them with it. An error when they cannot be read: the provider must
 /// then be kept, or they could only be forgotten unrevoked.
 pub async fn kept_revocations_of(
@@ -806,19 +817,6 @@ pub async fn kept_revocations_of(
                 == provider_id
         })
         .collect())
-}
-
-/// Decide `kept`, the revocations a deleted provider's grants left, read by
-/// [`kept_revocations_of`], as [`revoke_deferred`] does, while `revoker` still
-/// holds the provider: once it is gone, they could only be forgotten unrevoked.
-pub async fn decide_kept_of_deleted_provider(
-    revoker: Revoker,
-    kept: Vec<DeferredRevocation>,
-) -> usize {
-    let Some(vault) = revoker.vault.clone() else {
-        return 0;
-    };
-    decide_kept(&vault, kept, &revoker, chrono::Utc::now(), true).await
 }
 
 /// [`revoke_deferred`] for `kept`, read already. `provider_gone` says each
@@ -2647,7 +2645,11 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(kept.len(), 1);
 
-        assert_eq!(decide_kept_of_deleted_provider(revoker, kept).await, 1);
+        assert_eq!(
+            decide_kept(&(vault.clone() as Arc<dyn DelegationVaultStorage>), kept, &revoker, chrono::Utc::now(), true)
+                .await,
+            1
+        );
 
         assert_eq!(server.revoked_tokens(), ["removed", "removed-refresh"]);
         assert!(
@@ -2851,6 +2853,7 @@ pub(crate) mod tests {
             Some(ChangeOutcome {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
+                kept: Vec::new(),
             }),
         )
         .await
@@ -2880,6 +2883,7 @@ pub(crate) mod tests {
             Some(ChangeOutcome {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
+                kept: Vec::new(),
             }),
         )
         .await

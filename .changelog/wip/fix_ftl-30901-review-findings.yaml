@@ -31,7 +31,7 @@ changes:
         Deleting a credential provider revoked its stored grants but left the revocations kept for
         its earlier removals, pending or deferred to the daily sweep, which the sweep then forgot
         unrevoked once the provider was gone. The delete now decides them while it still holds the
-        provider, and answers 503 and keeps the provider, naming the cause, while any revocation the
+        provider, and the sweep leaves them to it meanwhile, and answers 503 and keeps the provider, naming the cause, while any revocation the
         vault kept cannot be read.
     - timestamp: '2026-11-04T16:45:03Z'
       title: Record an Access Point grant's use at most hourly, off the request path
