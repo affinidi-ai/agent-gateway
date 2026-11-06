@@ -4418,13 +4418,13 @@ pub async fn patch_variant(
     Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
 }
 
-/// Delete an agent surface (hard delete: removes from cache + filesystem).
 /// The actor a deleted surface's API keys are revoked under.
 const SURFACE_DELETE_ACTOR: &str = "surface-delete";
 
-/// Revokes every active API key of the deleted surface `surface_id`. The keys are kept, so the
-/// surface id still owns them and cannot be taken by a new surface. A key that cannot be revoked
-/// is logged.
+/// Revokes every active API key of the deleted surface `surface_id`, read from its key folder on
+/// disk so keys another node created are revoked too. The keys are kept, so the surface id still
+/// owns them and cannot be taken by a new surface. A folder that cannot be read, or a key that
+/// cannot be revoked, is logged.
 async fn revoke_api_keys_of_deleted_surface(
     state: &IdentityApiState,
     surface_id: &str,
@@ -4432,10 +4432,13 @@ async fn revoke_api_keys_of_deleted_surface(
     let Some(api_keys) = state.api_key_store.as_deref() else {
         return;
     };
-    let keys = match api_keys.list_all().await {
+    let keys = match api_keys
+        .list_from_disk(surface_id)
+        .await
+    {
         Ok(keys) => keys,
         Err(error) => {
-            error!(surface = %surface_id, %error, "Could not list the API keys of a deleted surface to revoke them");
+            error!(surface = %surface_id, %error, "Could not read the API keys of a deleted surface to revoke them");
             return;
         }
     };
@@ -4452,6 +4455,7 @@ async fn revoke_api_keys_of_deleted_surface(
     }
 }
 
+/// Delete an agent surface (hard delete: removes from cache + filesystem).
 pub async fn delete_surface(
     Path(surface_id): Path<String>,
     State(state): State<IdentityApiState>,

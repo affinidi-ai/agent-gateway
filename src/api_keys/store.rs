@@ -51,6 +51,15 @@ pub trait ApiKeyStore: Send + Sync {
         agent_id: &str,
     ) -> ApiKeyResult<Vec<ApiKeyMeta>>;
 
+    /// [`Self::list`] read from storage, so keys another node sharing it wrote are included; an
+    /// error when the agent's keys cannot be read. The default is [`Self::list`].
+    async fn list_from_disk(
+        &self,
+        agent_id: &str,
+    ) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        self.list(agent_id).await
+    }
+
     /// List all keys across all agents (metadata only, no secrets)
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>>;
 

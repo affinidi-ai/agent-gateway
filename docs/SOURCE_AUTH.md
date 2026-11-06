@@ -1253,8 +1253,12 @@ another tenant on disk or by another node takes those surfaces out of service un
   tenant, the key of a surface with no tenant, or a key whose owning surface cannot be found
   (`missing_owner`) is not ready. Deleting a surface revokes its API keys (actor
   `surface-delete`) and keeps them, so a surface naming the key of a deleted surface stops
-  serving. A new surface cannot take the id of a deleted surface
-  whose keys remain: the create answers `400` "Surface ID '…' is not available".
+  serving. The delete reads the surface's key folder from disk, so keys another node created
+  are revoked too; a folder that cannot be read is logged as an error naming the surface and
+  its keys stay active. A new surface cannot take the id of a deleted surface
+  whose keys remain: the create answers `400` "Surface ID '…' is not available". The create
+  reads only the key folder of that id, from disk; when that folder cannot be read it answers
+  `503` "API key store is unavailable".
 - A key or owning surface that cannot be found is checked again later. Under `warn` both are
   only reported, and a key that cannot be found is only reported under `enforce` too. The key or
   its owning surface may exist on another node that shares the storage and not be visible here
@@ -1272,9 +1276,12 @@ another tenant on disk or by another node takes those surfaces out of service un
   verdict is kept like a missing key's, so the request after `cache_refresh_interval_secs` (30
   seconds when it is `0`) checks again and the surface serves once a read succeeds; requests
   before then are refused without reading the store.
-- The store counts as unreadable while the keys of any surface's key folder cannot be loaded,
-  for example when the folder cannot be read, so a key in that folder is never mistaken for a
-  missing one. The `GET /v1/api-keys` listing still answers, without that folder's keys.
+- When a surface goes live, the store counts as unreadable while the keys of any surface's key
+  folder cannot be loaded, for example when the folder cannot be read, so a key in that folder
+  is never mistaken for a missing one. Saves, tenant reassignment, the credential policy report
+  and the `GET /v1/api-keys` listing still answer, without that folder's keys: a save naming a
+  key in that folder is refused as `API key reference is not accessible` unless the stored
+  surface already named it.
 - Boot and a configuration reload read the API key store once for all the surfaces they bring
   live.
 - If the API key store fails to start, the gateway runs without it until it restarts: every

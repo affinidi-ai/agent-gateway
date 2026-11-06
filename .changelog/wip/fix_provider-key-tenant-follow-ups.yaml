@@ -28,12 +28,15 @@ changes:
       title: Revoke a surface's API keys when the surface is deleted
       description: >-
         Deleting a surface now revokes its active API keys and keeps their records, so they
-        no longer authenticate callers and the deleted surface's id stays tied to them.
+        no longer authenticate callers and the deleted surface's id stays tied to them. The
+        surface's key folder is read from disk, so keys another node created are revoked too.
     - timestamp: '2026-11-05T09:35:33Z'
       title: Treat an API key folder that fails to load as a key store outage
       description: >-
-        The provider key tenant check no longer reads the keys of a folder it could not load as
-        missing. Surfaces naming an API key id answer 503 until the folder can be read, so a
-        surface cannot keep serving another tenant's key DID because that key failed to load.
-        The API key listing still answers without the folder's keys.
+        The provider key tenant check run when a surface goes live no longer reads the keys of
+        a folder it could not load as missing. Surfaces naming an API key id answer 503 until
+        the folder can be read, so a surface cannot keep serving another tenant's key DID
+        because that key failed to load. Surface saves, tenant reassignment, the credential
+        policy report and the API key listing still answer without the folder's keys, and
+        creating a surface with the id of that folder answers 503.
   breaking: []
