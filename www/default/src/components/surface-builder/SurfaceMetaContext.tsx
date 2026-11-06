@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react';
 import type { AgentSurface } from '../../api';
 import type { Protocol } from './elements/types';
 import type { AccessPointNotice } from './elements/access-point/readiness';
+import type { ApiKeyStatuses } from './elements/identity/apiKeyStatus';
 
 export type DidwebvhInjectionMode = 'header' | 'signed_header' | 'protocol_native';
 
@@ -65,6 +66,8 @@ export interface SurfaceMetaValue {
    * which hands callers whose credential fails to policy unless it is closed.
    */
   legacyAccessPoint?: boolean;
+  /** Status of each API key the stored surface names, by key id; absent while creating. */
+  apiKeyStatuses?: ApiKeyStatuses;
   /** Selects the Access Point and points at the Caller Context element in the palette. */
   onConfigureAuthentication?: () => void;
   setName: (v: string) => void;

@@ -80,3 +80,34 @@ describe('ApiKeyDetailPage delete', () => {
     expect(showToast).toHaveBeenCalledWith('success', 'API key deleted');
   });
 });
+
+describe('ApiKeyDetailPage surface deleted', () => {
+  const key = {
+    key_id: 'atgk_named',
+    agent_id: 'owner-a',
+    client_id: 'client-a',
+    status: 'active',
+    created_at: '2026-07-01T10:00:00Z',
+    labels: {},
+    issuer: { actor: 'admin', method: 'api' },
+  };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('says the key is no longer in use when its surface was deleted', async () => {
+    (apiClient.getApiKey as jest.Mock).mockResolvedValue({ ...key, surface_deleted: true });
+    renderPage();
+
+    expect(await screen.findByTestId('api-key-surface-deleted-info')).toHaveTextContent(
+      'This API key is no longer in use because the associated surface has been deleted.'
+    );
+  });
+
+  it.each([false, undefined])('shows no message when surface_deleted is %s', async value => {
+    (apiClient.getApiKey as jest.Mock).mockResolvedValue({ ...key, surface_deleted: value });
+    renderPage();
+
+    expect(await screen.findByText('client-a')).toBeInTheDocument();
+    expect(screen.queryByTestId('api-key-surface-deleted-info')).toBeNull();
+  });
+});

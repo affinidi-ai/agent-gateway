@@ -6,6 +6,7 @@ import { apiClient } from '../../../../../api';
 import IdentityPanel from '../IdentityPanel';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../../SurfaceMetaContext';
 import type { CanvasNode } from '../../types';
+import { apiKeyStatusMap, type ApiKeyStatuses } from '../apiKeyStatus';
 
 jest.mock('../../../../../api', () => ({ apiClient: { fetch: jest.fn(), get: jest.fn() } }));
 
@@ -17,7 +18,13 @@ const renderPanel = (
     surfaceId,
     apiKeyId,
     isCreate,
-  }: { surfaceId?: string; apiKeyId?: string; isCreate?: boolean } = {
+    apiKeyStatuses,
+  }: {
+    surfaceId?: string;
+    apiKeyId?: string;
+    isCreate?: boolean;
+    apiKeyStatuses?: ApiKeyStatuses;
+  } = {
     surfaceId: 'surface-1',
   }
 ) => {
@@ -26,7 +33,7 @@ const renderPanel = (
   const node: CanvasNode = { ...placement, type: 'identity', label: '', configured: true, config };
   return render(
     <MemoryRouter>
-      <SurfaceMetaProvider value={{ surfaceId, isCreate } as SurfaceMetaValue}>
+      <SurfaceMetaProvider value={{ surfaceId, isCreate, apiKeyStatuses } as SurfaceMetaValue}>
         <IdentityPanel
           node={node}
           config={config}
@@ -83,6 +90,48 @@ describe('IdentityPanel From API Key', () => {
       })
     ).toHaveValue('atgk_other');
     expect(select).toHaveValue('atgk_other');
+    expect(screen.queryByTestId('identity-api-key-revoked-warning')).toBeNull();
+  });
+
+  it.each([
+    [
+      'revoked',
+      'atgk_revoked (revoked)',
+      'The API key this Identity uses was revoked. Select an active API key of this surface.',
+    ],
+    [
+      'missing',
+      'atgk_revoked (deleted)',
+      'The API key this Identity uses was deleted. Select an active API key of this surface.',
+    ],
+    [
+      'unavailable',
+      'atgk_revoked (belongs to another surface)',
+      'The API key this Identity uses belongs to another surface.',
+    ],
+  ] as const)('names a %s stored key and warns', async (status, label, warning) => {
+    renderPanel(protectedSlot, {
+      surfaceId: 'surface-1',
+      apiKeyId: 'atgk_revoked',
+      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_revoked', status }]),
+    });
+    const select = screen.getByTestId('identity-panel-api-key-select');
+    await within(select).findByRole('option', { name: 'client-1' });
+    expect(within(select).getByRole('option', { name: label })).toHaveValue('atgk_revoked');
+    expect(select).toHaveValue('atgk_revoked');
+    expect(screen.getByTestId('identity-api-key-revoked-warning')).toHaveTextContent(warning);
+  });
+
+  it('shows no warning for an active stored key', async () => {
+    renderPanel(protectedSlot, {
+      surfaceId: 'surface-1',
+      apiKeyId: 'atgk_own',
+      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_own', status: 'active' }]),
+    });
+    const select = screen.getByTestId('identity-panel-api-key-select');
+    await within(select).findByRole('option', { name: 'client-1' });
+    expect(select).toHaveValue('atgk_own');
+    expect(screen.queryByTestId('identity-api-key-revoked-warning')).toBeNull();
   });
 
   it('lists no keys on the create page, which already has a surface id', () => {

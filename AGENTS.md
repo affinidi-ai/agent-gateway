@@ -148,6 +148,12 @@ Key or API Key Provider; the protected and external Identities' key picker lists
 surface's own active keys; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+A protected, external or Transit Point Identity whose API key was revoked, deleted or belongs to
+another surface (`api_key_references`) is drawn unconfigured, with a red dashed ring and a
+warning on the canvas and in its panel, without blocking Save; the API key detail page says a
+key of a deleted surface is no longer in use. See _Surface Builder_ and _API key delete_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The secret editor has one save button and never shows a stored secret value; see

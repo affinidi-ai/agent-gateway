@@ -152,6 +152,16 @@ const ApiKeyDetailPage: React.FC = () => {
               )}
             </div>
             <div className="card-body">
+              {apiKey.surface_deleted && (
+                <div
+                  className="alert alert-info"
+                  role="status"
+                  data-testid="api-key-surface-deleted-info"
+                >
+                  <i className="fas fa-info-circle me-2"></i>
+                  This API key is no longer in use because the associated surface has been deleted.
+                </div>
+              )}
               {apiKey.needs_rotation && (
                 <div className="alert alert-warning" role="alert">
                   <i className="fas fa-exclamation-triangle me-2"></i>

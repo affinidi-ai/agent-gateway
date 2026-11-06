@@ -24,6 +24,10 @@ const VOLATILE_TP_CANVAS_FIELDS = [
   'alias',
 ] as const;
 
+// Read-only fields the gateway sets on a surface response; they describe the
+// stored surface, not the configuration a template carries.
+const DERIVED_SURFACE_FIELDS = ['access_point_status', 'api_key_references'] as const;
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -77,6 +81,7 @@ export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
   if (!isObject(payload)) return payload;
   const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
 
+  for (const derived of DERIVED_SURFACE_FIELDS) delete out[derived];
   dropApiKeyIds(out);
   dropCanvasApiKeyIds(out.canvas);
   if (Array.isArray(out.variants)) {
