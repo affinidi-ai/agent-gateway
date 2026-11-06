@@ -2,6 +2,7 @@ import {
   apiKeyReferenceCanvasReason,
   apiKeyReferenceWarning,
   apiKeyStatusMap,
+  firstUnusableApiKeyIdentity,
   unlistedApiKeyLabel,
 } from '../apiKeyStatus';
 
@@ -94,6 +95,31 @@ describe('apiKeyReferenceCanvasReason', () => {
         statuses
       )
     ).toBe(reason);
+  });
+});
+
+describe('firstUnusableApiKeyIdentity', () => {
+  it('returns the first Identity whose key is revoked or deleted, with its warning', () => {
+    const active = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_active' });
+    const missing = {
+      ...protectedNode({ type: 'from_api_key', api_key_id: 'atgk_missing' }),
+      id: 'identity-external',
+      slotId: 'response:identity-external',
+    };
+    const revoked = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_revoked' });
+    expect(firstUnusableApiKeyIdentity([active, missing, revoked], statuses)).toEqual({
+      node: missing,
+      warning:
+        'The API key this Identity uses was deleted. Select an active API key of this surface.',
+    });
+  });
+
+  it('returns null when every key is usable or statuses are unknown', () => {
+    const active = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_active' });
+    const revoked = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_revoked' });
+    expect(firstUnusableApiKeyIdentity([active], statuses)).toBeNull();
+    expect(firstUnusableApiKeyIdentity([revoked], undefined)).toBeNull();
+    expect(firstUnusableApiKeyIdentity([], statuses)).toBeNull();
   });
 });
 

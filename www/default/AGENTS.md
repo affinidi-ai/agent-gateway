@@ -423,9 +423,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   surface.", "… was deleted. Select an active API key of this surface." and "The API key this
   Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the
   list, and the inbound Identity show nothing. The lookup is by key id, so variant canvases use
-  the same list, and picking an active key clears the ring before Save. It is not a Save
-  blocker: it is not part of `configured` or `getIncompleteReason`, since the gateway keeps a
-  reference the stored surface already named. On the create page (`isCreate`, which already has a
+  the same list, and picking an active key clears the ring before Save. It blocks Save on the
+  surface page, in the base and every variant, with "Identity: " and the full warning
+  (`firstUnusableApiKeyIdentity` in `computeBlockingReason`), and the toast's "Show me" selects
+  the Identity. It is not part of `configured` or `getIncompleteReason`, since the statuses come
+  from the stored surface, not the node. On the create page (`isCreate`, which already has a
   client-made `surfaceId`) it fetches nothing and shows "A new surface has no API keys yet. Remove
   this Identity or choose another type, save the surface, add an API key, then come back and
   select it." (`identity-panel-api-key-unsaved`); the rule is behind
