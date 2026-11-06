@@ -2262,12 +2262,15 @@ pub(crate) async fn build_identity_list_with(
     }
     if let Some(recorder_status) = recorder_status {
         for identity in &mut identities {
-            let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await
-            else {
+            let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await else {
                 continue;
             };
             identity.trust_recorder = Some(status);
-            identity.trust_recorder_surface = (identity.managed_surfaces.len() > 1).then_some(surface);
+            identity.trust_recorder_surface = (identity
+                .managed_surfaces
+                .len()
+                > 1)
+            .then_some(surface);
         }
     }
     Ok(identities)
