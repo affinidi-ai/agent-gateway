@@ -4325,7 +4325,10 @@ impl FabricPayment<'_> {
     /// is free and `Ok(Some(receipt))` when it was paid for. `Err(result)` is
     /// the gate's answer when it was not, already recorded in the connection
     /// metrics.
-    async fn charge(&self) -> Result<Option<crate::proxy::handler::agent_pay_gate::Receipt>, ProcessingResult> {
+    // FIXME: the error is boxed only to keep it under Clippy's `result_large_err`
+    // limit. A refusal should be a domain error that the caller renders, not a
+    // `ProcessingResult` carrying a rendered response.
+    async fn charge(&self) -> Result<Option<crate::proxy::handler::agent_pay_gate::Receipt>, Box<ProcessingResult>> {
         use crate::proxy::handler::agent_pay_gate;
 
         let Some(intake) = self.intake else {
@@ -4383,7 +4386,7 @@ impl FabricPayment<'_> {
                     &trace_id,
                     response.status(),
                 );
-                Err(axum_response_to_forward_result(response).await)
+                Err(Box::new(axum_response_to_forward_result(response).await))
             }
         }
     }
@@ -5550,7 +5553,7 @@ async fn process_charged_forward_request(
             }
             Err(ModernDelegationError::Unpaid) => {
                 match (FabricPayment { evidence: None, ..fabric_payment }).charge().await {
-                    Err(refused) => return refused,
+                    Err(refused) => return *refused,
                     Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
                 }
                 return axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await;
@@ -6366,7 +6369,7 @@ async fn process_charged_forward_request(
             }
         }
         Ok(None) => {}
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     }
     if let Some((receipt, _)) = gate_receipt.as_ref() {
         receipt.commit().await;
@@ -8419,7 +8422,7 @@ async fn handle_a2a_proxy_forward(
                 Ok(prepared) => {
                     match payment.charge().await {
                         Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
-                        Err(refused) => return refused,
+                        Err(refused) => return *refused,
                     }
                     if let Some((receipt, _)) = gate_receipt.as_ref() {
                         receipt.commit().await;
@@ -8891,7 +8894,7 @@ async fn handle_mcp_proxy_forward(
             } else {
                 match payment.charge().await {
                     Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
-                    Err(refused) => return refused,
+                    Err(refused) => return *refused,
                 }
                 if let Some((receipt, _)) = gate_receipt.as_ref() {
                     receipt.commit().await;
