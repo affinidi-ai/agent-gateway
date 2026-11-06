@@ -1429,6 +1429,7 @@ async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
 
 const TARGET_KEY_HEADER: &str = "x-target-key";
 const TARGET_KEY: &str = "target-key-value";
+const PROVIDER_TOKEN: &str = "provider-issued-token";
 
 /// One request the protected Target received.
 #[derive(Clone, Debug)]
@@ -1440,8 +1441,8 @@ struct TargetRequest {
 }
 
 /// A Target that records every request and serves an agent card, with a
-/// session cookie and an internal header, only to a request carrying its key;
-/// any other request gets `401`.
+/// session cookie and an internal header, only to a request carrying its key
+/// or the credential provider's token; any other request gets `401`.
 struct ProtectedTarget {
     url: String,
     received: Arc<std::sync::Mutex<Vec<TargetRequest>>>,
@@ -1450,6 +1451,23 @@ struct ProtectedTarget {
 
 impl ProtectedTarget {
     async fn start() -> Self {
+        Self::serving(|headers| {
+            headers
+                .get(TARGET_KEY_HEADER)
+                .is_some_and(|value| value == TARGET_KEY)
+                || headers
+                    .get("authorization")
+                    .is_some_and(|value| value == format!("Bearer {PROVIDER_TOKEN}").as_str())
+        })
+        .await
+    }
+
+    /// A Target that serves its card to every request.
+    async fn open() -> Self {
+        Self::serving(|_| true).await
+    }
+
+    async fn serving(accepts: fn(&axum::http::HeaderMap) -> bool) -> Self {
         use axum::response::IntoResponse;
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = received.clone();
@@ -1460,10 +1478,7 @@ impl ProtectedTarget {
                 let body = axum::body::to_bytes(body, usize::MAX)
                     .await
                     .unwrap();
-                let keyed = parts
-                    .headers
-                    .get(TARGET_KEY_HEADER)
-                    .is_some_and(|value| value == TARGET_KEY);
+                let keyed = accepts(&parts.headers);
                 recorded
                     .lock()
                     .unwrap()
@@ -1731,8 +1746,33 @@ async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_withou
     assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
 }
 
-/// A Target credential that cannot be resolved fails the card fetch and any
-/// other request with the direct path's `502` text, before the Target is called.
+/// The outcome of each `target_auth_failed` record in `events`, with its HTTP status.
+fn target_auth_outcomes(
+    events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+) -> Vec<(Option<u16>, Option<crate::audit::request_events::TargetAuthOutcome>)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected {
+                reason: RejectionReason::TargetAuthFailed,
+                http_status,
+                target_auth,
+                ..
+            } => Some((
+                *http_status,
+                target_auth
+                    .as_ref()
+                    .map(|rejection| rejection.outcome),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A Target credential that cannot be resolved fails the card fetch, at the
+/// well-known path or the configured card location, and any other request with
+/// the direct path's `502` text, before the Target is called, and each is
+/// recorded once as a rejected `target_auth_failed`.
 #[tokio::test]
 async fn an_unresolvable_target_credential_over_fabric_answers_target_authentication_failed() {
     if ran_in_child("ATG_FABRIC_TARGET_AUTH_FAILED_CHILD").await {
@@ -1741,11 +1781,23 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
     let target = ProtectedTarget::start().await;
     let root = tempfile::tempdir().unwrap();
     let _receiver = receiver(root.path(), &protected_surface(&target.url, "absent-key", None)).await;
+    let located = tempfile::tempdir().unwrap();
+    let _located_receiver =
+        receiver(located.path(), &protected_surface(&target.url, "absent-key", Some("/cards/me"))).await;
 
-    for (method, path) in [("GET", "/.well-known/agent-card.json"), ("POST", "/rpc")] {
-        let mut message = peer_request(root.path(), method, path);
+    for (stores, method, path) in [
+        (root.path(), "GET", "/.well-known/agent-card.json"),
+        (root.path(), "POST", "/rpc"),
+        (located.path(), "GET", "/cards/me"),
+    ] {
+        let mut message = peer_request(stores, method, path);
         message.message_body["headers"]["x-api-key"] = json!(CALLER_KEY);
-        let response = forward_response(&message).await;
+        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+        assert_eq!(
+            target_auth_outcomes(&events),
+            [(None, Some(crate::audit::request_events::TargetAuthOutcome::Rejected))],
+            "{method} {path}"
+        );
         assert_eq!(response["status"], 502, "{method} {path}: {response}");
         assert_eq!(response["error"], "Target authentication failed", "{method} {path}");
         let body: Value = serde_json::from_str(
@@ -1757,6 +1809,61 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
         assert_eq!(body["detail"], "Target authentication failed", "{method} {path}");
     }
     assert!(target.received().is_empty(), "the Target was called");
+}
+
+/// Under `fallback: passthrough` a Target credential that cannot be resolved
+/// leaves the card fetch the gateway's own bodiless `GET` with only the peer's
+/// `Accept`, `Accept-Language` and `User-Agent`, sent without the credential,
+/// and the card the Target serves reaches the peer; the failure is recorded once
+/// as a passthrough `target_auth_failed`.
+#[tokio::test]
+async fn a_passthrough_card_fetch_over_fabric_without_its_credential_returns_the_card() {
+    if ran_in_child("ATG_FABRIC_PASSTHROUGH_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::open().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(protected_surface(&target.url, "absent-key", None)).unwrap();
+    value["target"]["auth"]["fallback"] = json!("passthrough");
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+
+    let (response, events) = crate::audit::producer::capture(forward_response(&peer_request(
+        root.path(),
+        "GET",
+        "/.well-known/agent-card.json",
+    )))
+    .await;
+
+    assert_eq!(response["status"], 200, "{response}");
+    let card: Value = serde_json::from_str(
+        response["body"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(card["name"], "protected-agent");
+    assert_eq!(
+        target_auth_outcomes(&events),
+        [(None, Some(crate::audit::request_events::TargetAuthOutcome::Passthrough))]
+    );
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.method, axum::http::Method::GET);
+    assert_eq!(request.path, "/.well-known/agent-card.json");
+    assert!(request.body.is_empty(), "the peer's body was forwarded");
+    let mut names: Vec<&str> = request
+        .headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .filter(|name| *name != "host")
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["accept", "accept-language", "user-agent"]);
+    assert_eq!(header_values(&request.headers, "accept"), ["application/json"]);
+    assert_eq!(header_values(&request.headers, "accept-language"), ["en-GB"]);
+    assert_eq!(header_values(&request.headers, "user-agent"), ["peer-agent"]);
 }
 
 /// The card read for the policy input authenticates to the Target as the
@@ -1983,4 +2090,181 @@ async fn a_refused_card_fetch_over_fabric_answers_only_the_status() {
             .contains("acme"),
         "without Target authentication the answer is relayed as before: {response}"
     );
+}
+
+/// A client credentials token endpoint that issues [`PROVIDER_TOKEN`] and counts
+/// the token requests it answered.
+struct TokenEndpoint {
+    url: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl TokenEndpoint {
+    async fn start() -> Self {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(json!({ "access_token": PROVIDER_TOKEN, "token_type": "Bearer", "expires_in": 3600 }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        Self { url, requests, _server: server }
+    }
+
+    fn requests(&self) -> usize {
+        self.requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn egress(&self) -> crate::delegation_vault::oauth::TokenEgress {
+        crate::delegation_vault::oauth::TokenEgress {
+            timeout: Duration::from_secs(5),
+            exact_allowlist: Some(self.url.clone()),
+            policy: Default::default(),
+        }
+    }
+}
+
+const TARGET_PROVIDER: &str = "target-provider";
+
+/// [`surface`] for an A2A Target that requires a token from the client
+/// credentials provider [`TARGET_PROVIDER`].
+fn provider_surface(target: &str) -> AgentSurface {
+    let mut value = serde_json::to_value(surface("a2a", target, &[])).unwrap();
+    value["target"]["auth"] = json!({ "method": { "credential_provider": { "provider_id": TARGET_PROVIDER } } });
+    serde_json::from_value(value).unwrap()
+}
+
+/// Installs the client credentials provider [`TARGET_PROVIDER`] of `token_endpoint`
+/// and a delegation vault as the gateway's stores, with the provider's client
+/// credentials in `root/secrets`.
+async fn install_target_provider(
+    root: &std::path::Path,
+    token_endpoint: &str,
+) {
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+    use crate::secrets::SecretsStore;
+    let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+        root.join("secrets")
+            .to_str()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    for (secret_id, value) in [("CLIENT_ID", "client"), ("CLIENT_SECRET", "client-secret")] {
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: value.into(),
+                secret_type: "General".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+    let providers = FileSystemCredentialProviderStore::new(root.join("providers"))
+        .await
+        .unwrap();
+    providers
+        .create(
+            serde_json::from_value(json!({
+                "id": TARGET_PROVIDER, "name": TARGET_PROVIDER, "provider_id": TARGET_PROVIDER,
+                "provider_type": "oauth2_client_credentials", "token_endpoint": token_endpoint,
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    super::init_credential_provider_store(Arc::new(providers) as Arc<dyn CredentialProviderStorage>).await;
+    super::init_delegation_vault_store(Arc::new(
+        crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(root.join("vault"))
+            .await
+            .unwrap(),
+    ))
+    .await;
+}
+
+/// A peer's agent card fetch reaches a Target protected by a client credentials
+/// provider with the provider's token as a bearer token, obtained with one token
+/// request, and never with the peer's own `Authorization`.
+#[tokio::test]
+async fn an_agent_card_fetch_over_fabric_presents_the_credential_providers_token() {
+    if ran_in_child("ATG_FABRIC_PROVIDER_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let token_endpoint = TokenEndpoint::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &provider_surface(&target.url)).await;
+    install_target_provider(root.path(), &token_endpoint.url).await;
+
+    let response = token_endpoint
+        .egress()
+        .scope(forward_response(&peer_request(root.path(), "GET", "/.well-known/agent-card.json")))
+        .await;
+
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.method, axum::http::Method::GET);
+    assert_eq!(request.path, "/.well-known/agent-card.json");
+    assert_eq!(header_values(&request.headers, "authorization"), [format!("Bearer {PROVIDER_TOKEN}")]);
+    assert_eq!(token_endpoint.requests(), 1, "token requests");
+}
+
+/// The card read for the policy input presents the client credentials
+/// provider's token too, obtained with one token request.
+#[tokio::test]
+async fn the_policy_card_read_presents_the_credential_providers_token() {
+    if ran_in_child("ATG_FABRIC_PROVIDER_POLICY_CARD_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let token_endpoint = TokenEndpoint::start().await;
+    let root = tempfile::tempdir().unwrap();
+    install_target_provider(root.path(), &token_endpoint.url).await;
+    let store: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            root.path()
+                .join("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let surface = provider_surface(&target.url);
+
+    let card = token_endpoint
+        .egress()
+        .scope(super::TEST_SECRETS_STORE.scope(store, async { super::policy_agent_card(&surface, SURFACE_ID).await }))
+        .await;
+
+    assert_eq!(card, Some(json!({ "name": "protected-agent" })));
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/.well-known/agent.json");
+    assert_eq!(header_values(&request.headers, "authorization"), [format!("Bearer {PROVIDER_TOKEN}")]);
+    assert_eq!(token_endpoint.requests(), 1, "token requests");
 }
