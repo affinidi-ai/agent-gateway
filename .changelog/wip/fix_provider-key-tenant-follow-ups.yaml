@@ -20,10 +20,11 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-05T09:35:33Z'
-      title: Stop surfaces serving the API key DID of a deleted surface under enforce
+      title: Stop Identities serving the API key DID of a deleted surface under enforce
       description: >-
-        Under tenant_credential_isolation enforce, a surface naming an API key whose owning
-        surface no longer exists is not ready, as the key's tenant cannot be told. In either
+        Under tenant_credential_isolation enforce, a surface whose Identity slot, identity
+        injection or Transit Point identity names an API key whose owning surface no longer
+        exists is not ready, as the key's tenant cannot be told. In either
         mode, creating a surface with an id whose API key folder holds any key record, readable
         or not and whatever owner it names, such as the kept keys of a deleted surface, answers
         400, and answers 503 when that folder cannot be read, so a new surface cannot take over
@@ -63,7 +64,10 @@ changes:
         missing_owner verdict, which takes it out of service under enforce, into a missing_key
         one, which does not, and would turn a secret naming another tenant's key into a plain
         secret with the same DID. The error names the surfaces the caller may see and counts the
-        rest. Revoking the key is still allowed.
+        rest, and a key that is not under the surface named in the path answers 404 first. A
+        stored surface whose variants cannot be resolved blocks only the deletes of keys it
+        holds. The dashboard shows the refusal in the delete error toast on the Secrets page
+        and the API key page. Revoking the key is still allowed.
     - timestamp: '2026-11-05T12:30:00Z'
       title: Let a surface name only its own API keys in an Identity
       description: >-
@@ -73,7 +77,8 @@ changes:
         of any tenant, answers 400, so no Identity can derive another surface's key DID. A reference
         the stored surface already had is kept on save under warn. The provider key check reports
         such a key as other_surface, and the Surface Builder key picker lists only the surface's
-        own active keys.
+        own active keys. A surface template drops every API key id it would carry, including an
+        API key shaped Caller Context secret and the Identity nodes of variant canvases.
   breaking:
     - timestamp: '2026-11-05T12:30:00Z'
       title: Take surfaces naming another surface's API key out of service under enforce
@@ -83,3 +88,5 @@ changes:
         and saving it unchanged answers 400. Under warn it keeps serving and is logged as
         other_surface. To fix such a surface, add an API key to it and save it naming that key;
         to set up a new one, create the surface, add its API key, then save it naming that key.
+        A stored surface naming a key whose owning surface was deleted is also not ready under
+        enforce after upgrade.

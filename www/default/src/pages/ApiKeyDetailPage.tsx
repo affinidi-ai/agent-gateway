@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { apiClient, ApiKeyRecord, ApiKeyCreated } from '../api';
 import { useApp } from '../context/AppContext';
 import { showToast } from '../utils/toaster';
+import { getErrorMessage } from '../utils/apiError';
 import { formatDateTime } from '../utils/stringUtils';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
@@ -84,7 +85,9 @@ const ApiKeyDetailPage: React.FC = () => {
       navigate('/secrets');
     } catch (err: any) {
       console.error('Failed to delete API key:', err);
-      showToast('error', 'Failed to delete API key');
+      showToast('error', `Delete failed: ${getErrorMessage(err, 'Failed to delete API key')}`, {
+        autoRemove: false,
+      });
     }
   };
 

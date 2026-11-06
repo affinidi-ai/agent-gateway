@@ -15,6 +15,7 @@ jest.mock('../../api', () => ({
     listSurfaces: jest.fn(),
     listAllApiKeys: jest.fn(),
     listAccessTokens: jest.fn(),
+    deleteApiKey: jest.fn(),
   },
 }));
 
@@ -183,5 +184,40 @@ describe('SecretsPage secret delete', () => {
       })
     );
     expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1', { method: 'DELETE' });
+  });
+});
+
+describe('SecretsPage API key delete', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockFetchByUrl();
+  });
+
+  it('shows the surfaces that still name an API key the gateway refused to delete', async () => {
+    const message =
+      'API key is named by surface(s) user-a and 1 other surface(s); remove it from them before deleting the key (409)';
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([
+      {
+        key_id: 'atgk_named',
+        agent_id: 'owner-a',
+        client_id: 'client-a',
+        status: 'active',
+        created_at: '2026-07-01T10:00:00Z',
+      },
+    ]);
+    (apiClient.deleteApiKey as jest.Mock).mockRejectedValue(new Error(message));
+    renderAt('/secrets?tab=api-keys');
+
+    const remove = await screen.findByTestId('api-keys-delete-button-atgk_named');
+    await userEvent.click(remove);
+    await userEvent.click(remove);
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', `Delete failed: ${message}`, {
+        autoRemove: false,
+      })
+    );
+    expect(apiClient.deleteApiKey).toHaveBeenCalledWith('owner-a', 'atgk_named');
+    expect((showToast as jest.Mock).mock.calls[0][1]).toContain('user-a');
   });
 });

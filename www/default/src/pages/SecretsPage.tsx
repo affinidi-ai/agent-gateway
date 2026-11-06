@@ -182,6 +182,9 @@ const SecretsPage: React.FC = () => {
       loadApiKeys();
     } catch (error) {
       console.error('Failed to delete API key:', error);
+      showToast('error', `Delete failed: ${getErrorMessage(error, 'Failed to delete API key')}`, {
+        autoRemove: false,
+      });
     }
   };
 
