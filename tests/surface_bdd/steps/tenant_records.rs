@@ -271,7 +271,6 @@ fn audit_log_holds_token_injections_and_a_revoke(world: &mut SurfaceWorld) {
         .expect("appending to the VP Audit Log");
 }
 
-/// The vault is read from disk on every request.
 /// Audit records reach the log shortly after the request that produced them,
 /// so this reads the operator's view of the Credential Delegation Audit Log
 /// again until it holds a `consent_granted`, for up to five seconds.
@@ -306,6 +305,7 @@ async fn audit_log_holds_consent_granted(
     panic!("no consent granted for OAuth provider {provider} reached the audit log: {page}");
 }
 
+/// The vault is read from disk on every request.
 #[given("the delegation vault holds a token of each credential provider")]
 fn delegation_vault_holds_a_token_of_each_provider(world: &mut SurfaceWorld) {
     let directory = storage(world).join("delegation_vault");
