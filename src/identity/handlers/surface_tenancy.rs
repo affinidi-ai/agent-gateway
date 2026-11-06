@@ -1834,7 +1834,8 @@ pub(crate) enum ProviderKeyIssueKind {
     /// The key belongs to another surface the surface may reference: a surface names only its
     /// own keys. A breach only when enforced.
     OtherSurface { enforced: bool },
-    /// No key has this id; key ids are never reused, so its DID is no other key's.
+    /// No key has this id, as when the key was deleted; its DID must not be derived, a breach in
+    /// every isolation mode.
     MissingKey,
     /// The surface owning the key no longer exists, so its tenant cannot be told; a breach only
     /// when enforced.
@@ -1864,6 +1865,7 @@ impl ProviderKeyIssueKind {
             self,
             Self::StoreUnavailable
                 | Self::RevokedKey
+                | Self::MissingKey
                 | Self::OtherTenant { enforced: true }
                 | Self::ApplianceKey { enforced: true }
                 | Self::OtherSurface { enforced: true }

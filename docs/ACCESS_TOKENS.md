@@ -244,7 +244,8 @@ orphaned key, `false` while its surface exists. Deleting a surface revokes its k
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), so an orphaned
 key is normally revoked too. Revoke and rotate stay parent-gated for
 every caller. A permanent deletion is attributed to the authenticated actor and records
-whether it was orphan cleanup.
+whether it was orphan cleanup. Deleting a key a stored surface still names takes that surface
+out of service; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys).
 
 ### References between records
 

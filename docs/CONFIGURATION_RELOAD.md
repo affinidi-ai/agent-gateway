@@ -288,7 +288,8 @@ reference to another tenant's is refused in both modes (see
 stored surface that derives a DID from another tenant's API Key Provider key, from the key of a
 surface with no tenant, from another surface's key of its own tenant, or from a key whose owning
 surface is gone, keeps serving under `"warn"` and answers `503` under `"enforce"`; one deriving
-it from a revoked key answers `503` in both modes; see
+it from a revoked key or from a key id no key has, such as a deleted key, answers `503` in both
+modes; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
 those surfaces, then restart with `"enforce"`. An

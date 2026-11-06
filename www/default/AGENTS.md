@@ -1022,10 +1022,18 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 ## API key delete
 
 The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
-(**Delete**) show a failed delete in an error toast that stays until dismissed: "Delete failed:
-<gateway message> (<status>)". The gateway refuses deleting a key a surface still names with
-`409`, and the message names the surfaces the caller may see, so the operator knows which
-Identity to change first. The detail page stays open after a failed delete.
+(**Delete**) share `useApiKeyDelete` (`src/components/api-keys/ApiKeyDeleteDialog.tsx`). The
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, a
+`modal d-block` dialog (`role="dialog"`, `aria-modal`) titled "Delete API key" that names the
+key's client id and key id and says callers presenting the key are refused, and any
+surface whose Identity uses it becomes Unconfigured and stops serving requests until another API
+key is selected. **Delete API key** (`api-key-delete-dialog-confirm`) stays disabled until the
+checkbox "I understand surfaces using this key stop serving until they use another API key"
+(`api-key-delete-dialog-understood`) is ticked, then sends the `DELETE`. **Cancel** and the close
+button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
+with the toast "API key deleted", then the tab reloads its keys and the detail page returns to
+`/secrets`. A failed delete shows an error toast that stays until dismissed: "Delete failed:
+<gateway message> (<status>)", and the detail page stays open.
 
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated

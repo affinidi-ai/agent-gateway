@@ -2016,49 +2016,35 @@ async fn moving_a_named_keys_owner_out_of_its_tenant_is_a_conflict_when_enforced
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn deleting_a_provider_key_a_surface_names_is_a_conflict_until_the_surface_drops_it() {
-    let (_harness, api) = harness(RuleMode::Enforce).await;
-    let owner = api
-        .created_id(&api.surface("/smoke/named-delete-owner", Some("tenant-a"), json!({})))
-        .await;
-    let key_id = api.api_key(&owner).await;
-    assert_saved(
-        api.put_with(&owner, json!({"identity_slots": {"protected": from_api_key(&key_id)}}))
-            .await,
-    );
-    let naming = owner.clone();
-    let delete = || {
-        api.send(
-            api.client
-                .delete(api.url(&format!("api-keys/{owner}/{key_id}"))),
-        )
-    };
-    let get = || {
-        api.send(
-            api.client
-                .get(api.url(&format!("api-keys/{owner}/{key_id}"))),
-        )
-    };
+async fn deleting_a_provider_key_a_surface_names_removes_it_and_the_surface_reads_it_missing() {
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let (_harness, api) = harness(mode).await;
+        let owner = api
+            .created_id(&api.surface("/smoke/named-delete-owner", Some("tenant-a"), json!({})))
+            .await;
+        let key_id = api.api_key(&owner).await;
+        assert_saved(
+            api.put_with(&owner, json!({"identity_slots": {"protected": from_api_key(&key_id)}}))
+                .await,
+        );
+        let key_url = api.url(&format!("api-keys/{owner}/{key_id}"));
 
-    let (status, body) = delete().await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(
-        body["error"],
-        format!("API key is named by surface(s) {naming}; remove it from them before deleting the key")
-    );
-    let (status, body) = get().await;
-    assert_eq!(status, 200, "the key is kept: {body}");
-
-    let mut dropped = api.stored(&naming).await;
-    dropped["identity_slots"] = json!({});
-    assert_saved(
-        api.put(&naming, &dropped)
-            .await,
-    );
-    let (status, body) = delete().await;
-    assert!(matches!(status, 200 | 204), "{status} {body}");
-    let (status, body) = get().await;
-    assert_eq!(status, 404, "the key is gone: {body}");
+        let (status, body) = api
+            .send(api.client.delete(&key_url))
+            .await;
+        assert_eq!(status, 204, "{mode:?}: {body}");
+        let (status, body) = api
+            .send(api.client.get(&key_url))
+            .await;
+        assert_eq!(status, 404, "{mode:?}: the record is removed: {body}");
+        let stored = api.stored(&owner).await;
+        assert_eq!(
+            stored["api_key_references"],
+            json!([{"key_id": key_id, "status": "missing"}]),
+            "{mode:?}: {stored}"
+        );
+        assert_saved(api.put(&owner, &stored).await);
+    }
 }
 
 const GONE_KEY: &str = "atgk_00000000000000000000000000000d01";

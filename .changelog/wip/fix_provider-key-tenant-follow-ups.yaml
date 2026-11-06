@@ -55,19 +55,6 @@ changes:
         with cache_refresh_interval_secs at its default of 0, at restart or promotion to
         Active. A rotation re-reads the key from disk and refuses one another node revoked, and
         key records are replaced atomically so concurrent writes cannot leave a partial record.
-    - timestamp: '2026-11-05T11:30:00Z'
-      title: Refuse deleting an API key that a surface still names
-      description: >-
-        Deleting an API key, also one whose owning surface is gone, now answers 409 while any
-        stored surface names the key id in its base or a variant, as an API Key Provider key or
-        a Caller Context secret of that id. Deleting it would turn the naming surface's
-        missing_owner verdict, which takes it out of service under enforce, into a missing_key
-        one, which does not, and would turn a secret naming another tenant's key into a plain
-        secret with the same DID. The error names the surfaces the caller may see and counts the
-        rest, and a key that is not under the surface named in the path answers 404 first. A
-        stored surface whose variants cannot be resolved blocks only the deletes of keys it
-        holds. The dashboard shows the refusal in the delete error toast on the Secrets page
-        and the API key page. Revoking the key is still allowed.
     - timestamp: '2026-11-05T12:30:00Z'
       title: Let a surface name only its own API keys in an Identity
       description: >-

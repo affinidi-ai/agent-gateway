@@ -24,6 +24,7 @@ struct Gate {
     h: GatewayHarness,
     admin: reqwest::Client,
     surfaces_dir: std::path::PathBuf,
+    keys_dir: std::path::PathBuf,
 }
 
 fn api_keys_dir(bootstrap: &crate::config::BootstrapConfig) -> std::path::PathBuf {
@@ -101,6 +102,7 @@ impl Gate {
         let target = mock.url();
         let mut admin = None;
         let mut surfaces_dir = None;
+        let mut keys_dir = None;
         let h = GatewayHarness::start_with_mock(mock, |temp_dir, _, bootstrap| {
             bootstrap.credential_policy = CredentialPolicyConfig {
                 tenant_credential_isolation: isolation,
@@ -141,6 +143,7 @@ impl Gate {
             }
             surfaces_dir = Some(directory);
             let api_keys = api_keys_dir(bootstrap);
+            keys_dir = Some(api_keys.clone());
             if !key_store {
                 std::fs::create_dir_all(api_keys.parent().unwrap()).unwrap();
                 std::fs::write(&api_keys, b"not a directory").unwrap();
@@ -173,6 +176,7 @@ impl Gate {
             h,
             admin: admin.unwrap(),
             surfaces_dir: surfaces_dir.unwrap(),
+            keys_dir: keys_dir.unwrap(),
         };
         gate.reload().await;
         gate
@@ -490,5 +494,129 @@ async fn revoking_a_surfaces_own_key_takes_it_out_of_service_at_once_in_both_mod
         assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a revoked key never reaches the Target");
         let (status, body) = gate.call("owner-b").await;
         assert_eq!(status, 200, "{mode:?}: a surface naming no revoked key serves: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_surfaces_own_key_takes_it_out_of_service_at_once_in_both_modes() {
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        let (status, body) = gate.call(NAMES_OWN).await;
+        assert_eq!(status, 200, "{mode:?}: an active own key serves: {body}");
+        let key_url = format!("{}/api/v1/api-keys/{NAMES_OWN}/{KEY_A}", gate.h.gateway_base);
+
+        let deleted = gate
+            .admin
+            .delete(&key_url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 204, "{mode:?}");
+
+        let reached = gate.reached();
+        assert_not_ready(gate.call(NAMES_OWN).await, "its own key deleted, the next request");
+        assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a deleted key never reaches the Target");
+        let gone = gate
+            .admin
+            .get(&key_url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), 404, "{mode:?}: the record is removed");
+        let (status, body) = gate.call("owner-b").await;
+        assert_eq!(status, 200, "{mode:?}: a surface naming no deleted key serves: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_naming_a_key_no_store_holds_is_not_ready_in_both_modes_but_a_legacy_secret_serves() {
+    const NEVER: &str = "atgk_0000000000000000000000000000gn01";
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        gate.rewrite(NAMES_OWN, |stored| {
+            stored["identity_slots"]["external"]["api_key_id"] = json!(NEVER);
+        });
+        gate.rewrite(LEGACY_CALLER, |stored| {
+            stored["access_point"]["caller_authentication"]["methods"][0]["secret_id"] = json!(NEVER);
+        });
+        gate.reload().await;
+
+        assert_not_ready(
+            gate.call_until(NAMES_OWN, 503)
+                .await,
+            "a key id no key has",
+        );
+        let reached = gate.reached();
+        assert_not_ready(gate.call(NAMES_OWN).await, "a key id no key has");
+        assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a missing key never reaches the Target");
+        let (status, body) = gate.call(LEGACY_CALLER).await;
+        assert_ne!(
+            body["detail"], ACCESS_POINT_UNAVAILABLE,
+            "{mode:?}: a legacy secret no key has stays a plain secret ({status}): {body}"
+        );
+        assert_ne!(status, 503, "{mode:?}: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_another_node_created_before_the_first_judgment_serves() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        gate.rewrite_and_reload(NAMES_OWN, |stored| {
+            stored["identity_slots"]["external"]["api_key_id"] = json!("atgk_0000000000000000000000000000gn02");
+        })
+        .await;
+        assert_not_ready(
+            gate.call_until(NAMES_OWN, 503)
+                .await,
+            "a key id no key has",
+        );
+        let other_node = crate::api_keys::FileSystemApiKeyStore::new(
+            &gate
+                .keys_dir
+                .to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let created = other_node
+            .create(NAMES_OWN, "client", None, "component-test")
+            .await
+            .unwrap();
+        gate.rewrite(NAMES_OWN, |stored| {
+            stored["identity_slots"]["external"]["api_key_id"] = json!(created.key_id);
+        });
+        gate.reload().await;
+
+        let (status, body) = gate
+            .call_until(NAMES_OWN, 200)
+            .await;
+        assert_eq!(status, 200, "{mode:?}: a key in the surface's own folder is read from disk: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_another_node_deleted_is_missing_at_the_next_full_judgment_in_both_modes() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        let (status, body) = gate.call(NAMES_OWN).await;
+        assert_eq!(status, 200, "{mode:?}: an active own key serves: {body}");
+
+        crate::api_keys::FileSystemApiKeyStore::new(
+            &gate
+                .keys_dir
+                .to_string_lossy(),
+        )
+        .await
+        .unwrap()
+        .delete(NAMES_OWN, KEY_A, "other-node")
+        .await
+        .unwrap();
+        gate.reload().await;
+
+        let reached = gate.reached();
+        assert_not_ready(gate.call(NAMES_OWN).await, "its own key deleted by another node, after a reload");
+        assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a deleted key never reaches the Target");
     }
 }
