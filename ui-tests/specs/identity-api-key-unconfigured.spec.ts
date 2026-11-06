@@ -3,9 +3,9 @@
  *
  * Asserts a protected From API Key Identity whose stored key the surface
  * response reports as revoked or deleted (`api_key_references`) gets the red
- * canvas ring, a short reason under the node, and a labelled picker entry
- * with a warning in its panel; choosing an active key clears both, and an
- * active stored key shows neither.
+ * canvas ring, a short reason under the node, a labelled picker entry with a
+ * warning in its panel, and a Save error; choosing an active key clears the
+ * ring and warning, and an active stored key shows neither.
  */
 
 import type {Page} from '@playwright/test';
@@ -115,6 +115,9 @@ test.describe('Identity — unconfigured API key', () => {
             await expect(picker.locator('option:checked')).toHaveText(label);
             await expect(picker.locator('option:checked')).toBeDisabled();
             await expect(page.getByTestId('identity-api-key-revoked-warning')).toHaveText(warning);
+
+            await page.getByTestId('surface-save-button').click();
+            await expect(page.getByText(`Identity: ${warning}`, {exact: true})).toBeVisible();
 
             await picker.selectOption(ACTIVE_KEY);
             await expect(page.getByTestId('identity-api-key-revoked-warning')).toHaveCount(0);

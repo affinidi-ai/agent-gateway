@@ -71,6 +71,18 @@ export function apiKeyReferenceWarning(
   return status ? WARNINGS[status] : null;
 }
 
+/** The first Identity whose stored key was revoked, deleted or belongs to another surface, with its warning. */
+export function firstUnusableApiKeyIdentity<T extends IdentityNodeLike>(
+  nodes: readonly T[],
+  statuses: ApiKeyStatuses | null | undefined
+): { node: T; warning: string } | null {
+  for (const node of nodes) {
+    const warning = apiKeyReferenceWarning(node, statuses);
+    if (warning) return { node, warning };
+  }
+  return null;
+}
+
 export function apiKeyReferenceWarningText(status: UnusableApiKeyStatus): string {
   return WARNINGS[status];
 }

@@ -19,8 +19,8 @@ changes:
         external or Transit Point Identity whose stored API key was revoked, deleted, or belongs
         to another surface, in the base and every variant, and the Identity panel names that
         state in the key picker with a warning. The stored key stays selected, by name when it
-        was revoked, as a disabled option that cannot be picked again once changed. It does not block saving other edits, since the
-        gateway keeps a reference the surface already named. The API key detail page says
+        was revoked, as a disabled option that cannot be picked again once changed. Save shows
+        that warning as an error and does not save until the Identity names an active key. The API key detail page says
         "This API key is no longer in use because the associated surface has been deleted."
         for a key whose surface was deleted.
     - timestamp: '2026-11-06T10:00:00Z'

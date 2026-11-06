@@ -150,7 +150,7 @@ surface's own active keys; see _Surface Builder_ in
 
 A protected, external or Transit Point Identity whose API key was revoked, deleted or belongs to
 another surface (`api_key_references`) is drawn unconfigured, with a red dashed ring and a
-short reason under the node on the canvas and the full warning in its panel, without blocking Save; the API key detail page says a
+short reason under the node on the canvas and the full warning in its panel, and Save shows that warning as an error until it names an active key; the API key detail page says a
 key of a deleted surface is no longer in use. See _Surface Builder_ and
 [_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
