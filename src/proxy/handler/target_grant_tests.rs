@@ -783,6 +783,41 @@ async fn a_refused_refresh_after_the_targets_refusal_removes_the_grant() {
     );
 }
 
+/// A grant asked for beyond its binding's scopes as saved now is not sent:
+/// the caller is told to connect, and the grant is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_beyond_its_bindings_scopes_is_not_sent() {
+    let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    fixture
+        .store(&owner_key(), "read-access")
+        .await;
+    let mut narrowed: Value =
+        serde_json::to_value(vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner")).unwrap();
+    narrowed["outbound_credentials"][0]["scopes"] = json!(["write"]);
+    fixture
+        .serve(serde_json::from_value(narrowed).unwrap())
+        .await;
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"], json!({"reason": "connect_required", "subject": "owner"}));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .kept(&owner_key())
+            .await
+    );
+}
+
 /// A retry with the refreshed token that cannot be sent answers `502`, and
 /// keeps the refreshed grant for the next call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
