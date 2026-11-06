@@ -1047,6 +1047,42 @@ pub fn write_api_key_secret(
     });
 }
 
+/// Store an active API key `key_id` owned by the surface `owner`. Call from the harness `setup`
+/// closure, before the gateway boots.
+pub fn seed_api_key(
+    bootstrap: &BootstrapConfig,
+    owner: &str,
+    key_id: &str,
+) {
+    use crate::api_keys::store::ApiKeyStore as _;
+
+    let directory = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .expect("secrets path has a parent")
+    .join("api_keys");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            crate::api_keys::FileSystemApiKeyStore::new(&directory.to_string_lossy())
+                .await
+                .expect("create API key store")
+                .create_with_material(
+                    owner,
+                    key_id.to_string(),
+                    format!("atgs_{key_id}"),
+                    "client",
+                    None,
+                    "component-test",
+                )
+                .await
+                .expect("create API key");
+        })
+    });
+}
+
 /// Mount the identity API at `/api` on the gateway listener and seed an
 /// approved administrator session. Returns a client that sends its bearer token.
 /// Call from the harness `setup` closure, before the gateway boots.
@@ -1307,10 +1343,10 @@ pub fn build_identity_channel() -> AgentSurface {
 ///
 /// `from_api_key` is credential-derived: the DID comes from a peppered HMAC of
 /// the `api_key_id`, not from the response body, so no JSON schema is needed.
-/// An `atgk_`-prefixed key derives directly without any store lookup, which
-/// makes this the lightest e2e exercise of the credential-derived `Derived`
-/// path through the proxy (the inbound counterpart to the unit tests in
-/// `credential_identity.rs`).
+/// The surface serves only while an active key of that id belongs to it: set
+/// its `surface_id` and seed the key with [`seed_api_key`]. This is the
+/// lightest e2e exercise of the credential-derived `Derived` path through the
+/// proxy (the inbound counterpart to the unit tests in `credential_identity.rs`).
 pub fn build_api_key_identity_channel(api_key_id: &str) -> AgentSurface {
     let json = serde_json::json!({
         "name": "smoke-api-key-identity",

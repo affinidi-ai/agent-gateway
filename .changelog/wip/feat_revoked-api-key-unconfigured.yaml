@@ -67,6 +67,20 @@ changes:
         message, so the status of another surface's key is not disclosed. A reference the stored surface
         already named is kept on save, and the surface stays not ready until it names an
         active key.
+    - timestamp: '2026-11-05T22:00:00Z'
+      title: Revoke the API keys of surfaces deleted before the upgrade when going Active
+      description: >-
+        When the gateway boots Active or a Standby node becomes Active, it revokes every active
+        API key whose owning surface no longer exists, under the actor surface-delete, and logs
+        how many it revoked. Keys of surfaces deleted by an earlier release stayed active, so a
+        surface deriving its DID from one kept serving it under warn; it now answers 503 as
+        revoked_key until it names an active key. A surface counts as existing when its file is
+        in the agent surface folder, readable or not, or when the surface store, the static
+        configuration or the DynamoDB source holds it; a key owner an API Key Provider of a
+        surface names keeps its keys too, unlike a surface delete, and so does an owner whose
+        newest key was created within cache_refresh_interval_secs (30 seconds when it is 0).
+        When the API keys, the surface folder or the DynamoDB source cannot all be read, or no
+        surface is found at all, nothing is revoked. A Standby node revokes nothing.
   breaking:
     - timestamp: '2026-11-05T20:00:00Z'
       title: Stop serving a stored surface that names a revoked API key, under warn too
@@ -74,8 +88,9 @@ changes:
         After the upgrade, a stored surface whose Identity slot, target identity injection,
         Transit Point or legacy Caller Context secret names a revoked API Key Provider key
         answers every request with 503 under tenant_credential_isolation warn as well as
-        enforce. This includes a key of a surface deleted since the previous release, since
-        deleting a surface revokes its keys. To keep such a surface serving, select an active
+        enforce. This includes a key of a deleted surface: deleting a surface revokes its keys,
+        and the gateway revokes the keys of surfaces deleted before the upgrade when it becomes
+        Active. To keep such a surface serving, select an active
         API key of that surface in place of the revoked one and save it; the Surface Builder
         marks the affected Identity as unconfigured.
     - timestamp: '2026-11-05T21:00:00Z'
