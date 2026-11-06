@@ -17,5 +17,20 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-06T00:00:00.000Z'
+      title: Ship the container image on a slim runtime base without build tools
+      description: >-
+        The runtime image is now built from a digest-pinned debian:bookworm-slim with only the
+        shared libraries, xmlsec1 and bootstrap CLIs the gateway needs, instead of the Rust build
+        image. It no longer contains compilers, development packages or git, which removes most of
+        the scanner findings the larger image carried.
+    - timestamp: '2026-11-06T00:00:00.000Z'
+      title: Scan the Dockerfile and container image for vulnerabilities in CI
+      description: >-
+        Every container build now scans the Dockerfile for misconfigurations and the built image
+        for fixable high and critical vulnerabilities and embedded secrets, and lists the findings
+        in the job summary. The scan only warns until the TRIVY_ENFORCE repository variable is set
+        to true, after which it blocks a release image from getting a version tag. The boot probe
+        also checks for missing shared libraries.
   breaking: []
