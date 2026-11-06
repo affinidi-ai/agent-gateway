@@ -1503,14 +1503,15 @@ pub async fn run_axum_proxy(
         if let Some(ref surface_store) = agent_surface_store {
             match surface_store.list_all().await {
                 Ok(surfaces) => {
-                    for surface in surfaces
-                        .iter()
-                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
-                    {
-                        provider_key_gate
-                            .admit(surface)
-                            .await;
-                    }
+                    provider_key_gate
+                        .admit_all(
+                            surfaces
+                                .iter()
+                                .filter(|surface| {
+                                    surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                                }),
+                        )
+                        .await;
                 }
                 Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
             }

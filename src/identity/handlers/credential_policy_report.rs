@@ -1057,11 +1057,13 @@ mod tests {
         );
         let enforce = provider_key_findings(surfaces(), Some(&owners), RuleMode::Enforce);
         assert_eq!(
-            enforce[..3],
-            [
+            enforce,
+            vec![
                 ("cross".to_string(), "other_tenant", true),
                 ("tenant-key-wide".to_string(), "other_tenant", true),
                 ("appliance-key".to_string(), "appliance_key", true),
+                ("missing-key".to_string(), "missing_key", false),
+                ("missing-owner".to_string(), "missing_owner", true),
             ]
         );
         assert!(

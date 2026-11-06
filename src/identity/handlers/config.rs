@@ -349,13 +349,14 @@ async fn inject_surfaces_into_config(
                             .iter()
                             .map(|s| s.surface_id.clone())
                             .collect();
-                        for surface in &surfaces {
-                            if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
-                                continue;
-                            }
-                            crate::identity::provider_key_gate::gate()
-                                .admit(surface)
-                                .await;
+                        let active: Vec<_> = surfaces
+                            .iter()
+                            .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                            .collect();
+                        crate::identity::provider_key_gate::gate()
+                            .admit_all(active.iter().copied())
+                            .await;
+                        for surface in active {
                             if existing_surface_ids.contains(&surface.surface_id) {
                                 continue;
                             }
