@@ -4,7 +4,7 @@
 
 _The control layer for agentic AI._
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](Cargo.toml) [![Documentation](https://img.shields.io/badge/docs-Agent_Gateway-9047ff.svg)](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/) [![GitHub Issues](https://img.shields.io/badge/GitHub-Issues-181717?logo=github)](https://github.com/affinidi-ai/agent-gateway/issues)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.99.1%2B-orange.svg)](Cargo.toml) [![Documentation](https://img.shields.io/badge/docs-Agent_Gateway-9047ff.svg)](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/) [![GitHub Issues](https://img.shields.io/badge/GitHub-Issues-181717?logo=github)](https://github.com/affinidi-ai/agent-gateway/issues)
 
 Agent Gateway is an intercepting proxy for AI agents. It sits between callers and the
 agents it manages, and applies identity verification, policy evaluation, trust-registry
@@ -107,7 +107,7 @@ traffic.
 
 ### Build from source
 
-The primary local path uses macOS with Homebrew. Install Git, Rust `1.95.0` or newer,
+The primary local path uses macOS with Homebrew. Install Git, Rust `1.99.1` or newer,
 Node.js with npm, and a WebAuthn-capable browser and authenticator, then run:
 
 ```bash
