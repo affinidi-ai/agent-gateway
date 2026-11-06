@@ -84,7 +84,7 @@ export function apiKeyReferenceCanvasReason(
   return status ? CANVAS_REASONS[status] : null;
 }
 
-/** Picker label of a stored key id that is not among the surface's active keys. */
-export function unlistedApiKeyLabel(keyId: string, status: UnusableApiKeyStatus | null): string {
-  return `${keyId} (${status ? LABELS[status] : 'not an active key of this surface'})`;
+/** Picker label of a stored key, by name or id, that is not among the surface's active keys. */
+export function unlistedApiKeyLabel(keyName: string, status: UnusableApiKeyStatus | null): string {
+  return `${keyName} (${status ? LABELS[status] : 'not an active key of this surface'})`;
 }

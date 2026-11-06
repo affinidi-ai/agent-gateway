@@ -84,11 +84,11 @@ describe('IdentityPanel From API Key', () => {
     renderPanel(protectedSlot, { surfaceId: 'surface-1', apiKeyId: 'atgk_other' });
     const select = screen.getByTestId('identity-panel-api-key-select');
     await within(select).findByRole('option', { name: 'client-1' });
-    expect(
-      within(select).getByRole('option', {
-        name: 'atgk_other (not an active key of this surface)',
-      })
-    ).toHaveValue('atgk_other');
+    const stored = within(select).getByRole('option', {
+      name: 'atgk_other (not an active key of this surface)',
+    });
+    expect(stored).toHaveValue('atgk_other');
+    expect(stored).toBeDisabled();
     expect(select).toHaveValue('atgk_other');
     expect(screen.queryByTestId('identity-api-key-revoked-warning')).toBeNull();
   });
@@ -96,7 +96,7 @@ describe('IdentityPanel From API Key', () => {
   it.each([
     [
       'revoked',
-      'atgk_revoked (revoked)',
+      'client-2 (revoked)',
       'The API key this Identity uses was revoked. Select an active API key of this surface.',
     ],
     [
@@ -117,7 +117,9 @@ describe('IdentityPanel From API Key', () => {
     });
     const select = screen.getByTestId('identity-panel-api-key-select');
     await within(select).findByRole('option', { name: 'client-1' });
-    expect(within(select).getByRole('option', { name: label })).toHaveValue('atgk_revoked');
+    const stored = within(select).getByRole('option', { name: label });
+    expect(stored).toHaveValue('atgk_revoked');
+    expect(stored).toBeDisabled();
     expect(select).toHaveValue('atgk_revoked');
     expect(screen.getByTestId('identity-api-key-revoked-warning')).toHaveTextContent(warning);
   });
