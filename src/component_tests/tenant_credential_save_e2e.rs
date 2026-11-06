@@ -2833,6 +2833,8 @@ async fn a_new_surface_cannot_take_the_id_of_a_deleted_surface_that_still_owns_a
             .replace("127.0.0.1", "localhost"),
         target: harness.mock.url(),
     };
+    api.secret("caller-key", None, "v")
+        .await;
 
     let mut reused = api.surface("/smoke/reused-id", Some("tenant-a"), json!({}));
     reused["surface_id"] = json!(DELETED_OWNER);
@@ -2930,6 +2932,8 @@ async fn an_unreadable_api_key_folder_refuses_only_a_create_taking_its_id() {
             .replace("127.0.0.1", "localhost"),
         target: harness.mock.url(),
     };
+    api.secret("caller-key", None, "v")
+        .await;
     let naming = |route: &str, key_id: &str| {
         api.surface(route, Some("tenant-a"), json!({"identity_slots": {"protected": from_api_key(key_id)}}))
     };
@@ -3005,6 +3009,8 @@ async fn harness_with_key_dir() -> (GatewayHarness, Api, std::path::PathBuf) {
             .replace("127.0.0.1", "localhost"),
         target: harness.mock.url(),
     };
+    api.secret("caller-key", None, "v")
+        .await;
     (harness, api, key_dir.unwrap())
 }
 
