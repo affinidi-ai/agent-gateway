@@ -225,26 +225,40 @@ impl FileSystemApiKeyStore {
             .collect();
         for (agent_id, store) in agents {
             if !fs::try_exists(self.agent_dir(&agent_id)).await? {
-                self.stores.remove(&agent_id);
-                self.hash_index
-                    .remove(&agent_id);
+                self.forget_agent(&agent_id);
                 continue;
             }
-            let refreshed = match store
-                .refresh_from_disk()
+            if let Err(error) = self
+                .refresh_agent(&agent_id, store.as_ref())
                 .await
             {
-                Ok(()) => {
-                    self.index_agent(&agent_id, store.as_ref())
-                        .await
-                }
-                Err(error) => Err(error.into()),
-            };
-            if let Err(error) = refreshed {
                 warn!("Failed to refresh keys for agent {}: {}", agent_id, error);
             }
         }
         Ok(())
+    }
+
+    /// Drop an agent whose folder is gone from memory.
+    fn forget_agent(
+        &self,
+        agent_id: &str,
+    ) {
+        self.stores.remove(agent_id);
+        self.hash_index
+            .remove(agent_id);
+    }
+
+    /// Re-read one loaded agent's records from disk and rebuild its secret-hash lookup.
+    async fn refresh_agent(
+        &self,
+        agent_id: &str,
+        store: &dyn StorageBackend<ApiKeyRecord>,
+    ) -> ApiKeyResult<()> {
+        store
+            .refresh_from_disk()
+            .await?;
+        self.index_agent(agent_id, store)
+            .await
     }
 
     /// Insert or replace this record's `secret_hash -> key_id` entry.
@@ -430,6 +444,36 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         };
 
         Ok(keys)
+    }
+
+    /// Loads the agent's folder when another node created it, or re-reads it when loaded. A
+    /// folder that does not exist holds no keys and is not created.
+    async fn list_from_disk(
+        &self,
+        agent_id: &str,
+    ) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        if crate::storage::validate_storage_id(agent_id).is_err() {
+            return Ok(Vec::new());
+        }
+        if !fs::try_exists(self.agent_dir(agent_id)).await? {
+            self.forget_agent(agent_id);
+            return Ok(Vec::new());
+        }
+        let loaded = self
+            .stores
+            .get(agent_id)
+            .map(|s| s.value().clone());
+        match loaded {
+            Some(store) => {
+                self.refresh_agent(agent_id, store.as_ref())
+                    .await?
+            }
+            None => {
+                self.agent_store(agent_id)
+                    .await?;
+            }
+        }
+        self.list(agent_id).await
     }
 
     async fn get_record(
@@ -855,6 +899,191 @@ mod tests {
                 .len(),
             2,
             "the folder is loaded once it can be read"
+        );
+    }
+
+    fn key_ids(keys: Vec<ApiKeyMeta>) -> Vec<String> {
+        let mut ids: Vec<String> = keys
+            .into_iter()
+            .map(|key| key.key_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn listing_one_agent_from_disk_sees_keys_another_store_on_the_same_directory_created() {
+        let (first, temp_dir) = create_test_store().await;
+        let known = first
+            .create("agent-known", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let in_new_folder = second
+            .create("agent-new", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let in_known_folder = second
+            .create("agent-known", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+
+        assert!(
+            first
+                .list("agent-new")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a plain listing reads only loaded folders"
+        );
+        assert_eq!(
+            key_ids(
+                first
+                    .list_from_disk("agent-new")
+                    .await
+                    .unwrap()
+            ),
+            vec![in_new_folder.key_id]
+        );
+        let mut both = vec![known.key_id, in_known_folder.key_id];
+        both.sort();
+        assert_eq!(
+            key_ids(
+                first
+                    .list_from_disk("agent-known")
+                    .await
+                    .unwrap()
+            ),
+            both
+        );
+        assert!(
+            first
+                .revoke(
+                    "agent-new",
+                    &key_ids(
+                        first
+                            .list("agent-new")
+                            .await
+                            .unwrap()
+                    )[0],
+                    "test-actor"
+                )
+                .await
+                .is_ok(),
+            "a folder read from disk is loaded, so its keys can be revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_one_agent_from_disk_without_a_folder_is_empty_and_creates_none() {
+        let (store, temp_dir) = create_test_store().await;
+
+        assert!(
+            store
+                .list_from_disk("agent-none")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_from_disk("../escape")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !temp_dir
+                .path()
+                .join("agent-none")
+                .exists()
+        );
+
+        store
+            .create("agent-gone", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(
+            temp_dir
+                .path()
+                .join("agent-gone"),
+        )
+        .unwrap();
+        assert!(
+            store
+                .list_from_disk("agent-gone")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a folder found gone is dropped from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_one_agent_from_disk_fails_only_for_that_agents_unreadable_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (first, temp_dir) = create_test_store().await;
+        let readable = first
+            .create("agent-readable", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        first
+            .create("agent-locked", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let locked = temp_dir
+            .path()
+            .join("agent-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: no read fails.
+            return;
+        }
+
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let unreadable = second
+            .list_from_disk("agent-locked")
+            .await;
+        let readable_keys = second
+            .list_from_disk("agent-readable")
+            .await;
+        let loaded_unreadable = first
+            .list_from_disk("agent-locked")
+            .await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(unreadable.is_err(), "a folder that is not loaded yet cannot be read");
+        assert!(loaded_unreadable.is_err(), "a loaded folder cannot be re-read");
+        assert_eq!(key_ids(readable_keys.unwrap()), vec![readable.key_id]);
+        assert_eq!(
+            second
+                .list_from_disk("agent-locked")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the folder is read once it can be"
         );
     }
 

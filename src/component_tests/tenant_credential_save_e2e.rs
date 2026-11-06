@@ -2484,3 +2484,80 @@ async fn deleting_a_surface_revokes_its_api_keys_and_keeps_its_id_taken() {
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["details"], format!("Surface ID '{surface_id}' is not available"), "{body}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_api_key_folder_refuses_only_a_create_taking_its_id() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const LOCKED_OWNER: &str = "locked-key-owner";
+    const LOCKED_KEY: &str = "atgk_00000000000000000000000000000c01";
+    let mut client = None;
+    let mut locked = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        seed_api_key(bootstrap, LOCKED_OWNER, LOCKED_KEY);
+        let folder = api_keys_dir(bootstrap).join(LOCKED_OWNER);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        locked = Some(folder);
+    })
+    .await;
+    let locked = locked.unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        // Running as root: no read fails.
+        return;
+    }
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+    let owner = api
+        .created_id(&api.surface("/smoke/readable-owner", Some("tenant-a"), json!({})))
+        .await;
+    let key_id = api.api_key(&owner).await;
+    let naming = |route: &str, key_id: &str| {
+        api.surface(route, Some("tenant-a"), json!({"identity_slots": {"protected": from_api_key(key_id)}}))
+    };
+
+    let saved = api
+        .create(&naming("/smoke/readable-key", &key_id))
+        .await;
+    let unseen = api
+        .create(&naming("/smoke/locked-key", LOCKED_KEY))
+        .await;
+    let reassigned = api
+        .reassign("surfaces", &owner, Some("tenant-b"))
+        .await;
+    let mut taking_locked = api.surface("/smoke/taking-locked", Some("tenant-a"), json!({}));
+    taking_locked["surface_id"] = json!(LOCKED_OWNER);
+    let (locked_status, locked_body) = api
+        .create(&taking_locked)
+        .await;
+    let (stored_status, _) = api
+        .send(
+            api.client
+                .get(api.url(&format!("surfaces/{LOCKED_OWNER}"))),
+        )
+        .await;
+    let mut fresh = api.surface("/smoke/fresh-beside-locked", Some("tenant-a"), json!({}));
+    fresh["surface_id"] = json!("fresh-beside-locked");
+    let fresh_created = api.create(&fresh).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_saved(saved);
+    assert_refused(unseen, "API key reference is not accessible");
+    assert_eq!(reassigned.0, 409, "a reassignment still checks the keys it can read: {}", reassigned.1);
+    assert_eq!(reassigned.1["error"], "tenant_reassignment_blocked", "{}", reassigned.1);
+    assert_eq!(locked_status, 503, "{locked_body}");
+    assert_eq!(locked_body["details"], "API key store is unavailable", "{locked_body}");
+    assert_eq!(stored_status, 404, "a refused create stores nothing");
+    assert_saved(fresh_created);
+    assert_refused(
+        api.create(&taking_locked)
+            .await,
+        &format!("Surface ID '{LOCKED_OWNER}' is not available"),
+    );
+}

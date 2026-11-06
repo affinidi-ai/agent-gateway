@@ -1941,7 +1941,9 @@ pub(crate) async fn provider_key_owners(
 }
 
 /// Refuses a new surface whose id still owns API keys, kept from a deleted surface of that id, so
-/// a new surface never takes over another surface's keys and the DIDs derived from them.
+/// a new surface never takes over another surface's keys and the DIDs derived from them. Only the
+/// key folder of `surface_id` is read, from disk; when it cannot be read the create is refused as
+/// unavailable.
 pub(crate) async fn refuse_id_owning_api_keys(
     state: &IdentityApiState,
     surface_id: &str,
@@ -1949,28 +1951,45 @@ pub(crate) async fn refuse_id_owning_api_keys(
     let Some(store) = state.api_key_store.as_deref() else {
         return Ok(());
     };
-    if provider_key_owners_in(store)
-        .await?
-        .values()
-        .flatten()
-        .any(|owner| owner == surface_id)
+    let keys = store
+        .list_from_disk(surface_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(surface = %surface_id, %error, "Could not read the API keys of a new surface's id");
+            SurfaceApiError::Unavailable("API key store is unavailable".to_string())
+        })?;
+    if keys
+        .iter()
+        .any(|key| key.agent_id == surface_id)
     {
         return Err(SurfaceApiError::BadRequest(format!("Surface ID '{surface_id}' is not available")));
     }
     Ok(())
 }
 
-/// [`provider_key_owners`] read from `store`, an error when the keys of an agent could not be
-/// loaded.
+/// [`provider_key_owners`] read from `store`. A key folder that could not be loaded is left out.
 pub(crate) async fn provider_key_owners_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
 ) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
+    owners_by_key(store.list_all().await)
+}
+
+/// [`provider_key_owners_in`], an error when the keys of an agent could not be loaded.
+pub(crate) async fn complete_provider_key_owners_in(
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
+    owners_by_key(
+        store
+            .list_all_complete()
+            .await,
+    )
+}
+
+fn owners_by_key(
+    keys: crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>>
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
     let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for key in store
-        .list_all_complete()
-        .await
-        .map_err(|error| internal("API key", error))?
-    {
+    for key in keys.map_err(|error| internal("API key", error))? {
         owners
             .entry(key.key_id)
             .or_default()

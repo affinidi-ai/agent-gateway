@@ -18,8 +18,8 @@ use tracing::{info, warn};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::handlers::surface_tenancy::{
-    ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, judge_provider_keys, provider_key_ids,
-    provider_key_owners_in, served_provider_key_ids,
+    ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, complete_provider_key_owners_in, judge_provider_keys,
+    provider_key_ids, served_provider_key_ids,
 };
 use crate::source_auth::errors::NotReadyReason;
 
@@ -422,7 +422,7 @@ impl ProviderKeyGate {
         let (Some(api_keys), Some(surfaces)) = (sources.api_keys, sources.surfaces) else {
             return Err("the API key store is not configured");
         };
-        let keys = provider_key_owners_in(api_keys.as_ref())
+        let keys = complete_provider_key_owners_in(api_keys.as_ref())
             .await
             .map_err(|_| "listing API keys failed")?;
         Ok(Owners { keys, surfaces })
@@ -555,7 +555,7 @@ pub(crate) mod test_support {
         pub gate: &'static ProviderKeyGate,
         pub api_keys: Arc<crate::api_keys::FileSystemApiKeyStore>,
         pub surfaces: Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
-        _dir: tempfile::TempDir,
+        pub dir: tempfile::TempDir,
     }
 
     pub(crate) async fn enforced_gate(
@@ -608,12 +608,7 @@ pub(crate) mod test_support {
         let gate: &'static ProviderKeyGate = Box::leak(Box::default());
         gate.set_sources(Some(api_keys.clone()), Some(surfaces.clone()));
         super::use_thread_gate(gate);
-        EnforcedGate {
-            gate,
-            api_keys,
-            surfaces,
-            _dir: dir,
-        }
+        EnforcedGate { gate, api_keys, surfaces, dir }
     }
 }
 
@@ -1300,6 +1295,46 @@ mod tests {
             None,
             "under warn it is only logged"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_key_folder_refuses_surfaces_naming_a_key_id_but_not_the_save_listing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let enforced = gate().await;
+        let keys_dir = enforced
+            .dir
+            .path()
+            .join("api_keys");
+        let locked = keys_dir.join("owner-b");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: no read fails.
+            return;
+        }
+        let other_node = Arc::new(
+            crate::api_keys::FileSystemApiKeyStore::new(&keys_dir.to_string_lossy())
+                .await
+                .unwrap(),
+        );
+        enforced
+            .gate
+            .set_sources(Some(other_node.clone()), Some(enforced.surfaces.clone()));
+
+        let refused = enforced
+            .gate
+            .refuses(&naming("own", "tenant-a", external(KEY_A)))
+            .await;
+        let lenient = crate::identity::handlers::surface_tenancy::provider_key_owners_in(other_node.as_ref()).await;
+        let strict = complete_provider_key_owners_in(other_node.as_ref()).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(refused, Some(NotReadyReason::ApiKeyStoreUnavailable));
+        assert_eq!(
+            lenient.unwrap(),
+            HashMap::from([(KEY_A.to_string(), vec!["owner-a".to_string()])]),
+            "the save rule's listing leaves the folder out"
+        );
+        assert!(strict.is_err());
     }
 
     #[tokio::test]
