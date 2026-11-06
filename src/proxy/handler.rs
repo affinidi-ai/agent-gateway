@@ -10466,9 +10466,8 @@ fn bind_api_key_caller_did(
     }
 }
 
-/// `from_jwt_claim` needs the validated claims of `jwt_bearer` source auth. A
-/// caller whose credential is missing or invalid is refused before this point,
-/// so reaching it means the surface has no such claims to read.
+/// Reaching this means the verified credential carries no JWT claims, for
+/// example an API key accepted on a stored surface that also lists `jwt_bearer`.
 fn from_jwt_claim_without_claims() -> Response {
     create_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -23142,7 +23141,7 @@ mod fabric_extended_card_tests {
         );
     }
     #[tokio::test]
-    async fn fabric_from_jwt_claim_without_caller_claims_is_not_forwarded() {
+    async fn fabric_forward_without_caller_claims_fails_closed_when_bypassing_source_auth() {
         let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
         let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = sends.clone();
@@ -23164,6 +23163,7 @@ mod fabric_extended_card_tests {
             "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
         });
 
+        // Calls the forward handler directly, so the receive-side source auth 401 is skipped.
         let result = super::handle_fabric_request(
             peer.state.clone(),
             "Fabric A2A",

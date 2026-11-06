@@ -84,8 +84,8 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
-  method is `jwt_bearer`;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless
+  `jwt_bearer` is the only method;
 - an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
@@ -119,7 +119,7 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_jwt_claim` identity without `jwt_bearer` as its only method, or an inbound
 `from_api_key` identity beside a method other than an API key, is logged as a warning at
 startup and refused on the next save.
 
