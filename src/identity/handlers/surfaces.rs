@@ -852,7 +852,9 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 ///
 /// Each enabled variant is validated as resolved, against the stored variant
 /// of the same alias, since it can override the caller authentication methods
-/// and the identity slots.
+/// and the identity slots. A variant with no enabled stored counterpart, one
+/// added, renamed or enabled again, is validated against the stored surface,
+/// whose settings it inherits.
 fn validate_source_auth(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -863,11 +865,13 @@ fn validate_source_auth(
         let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
             continue;
         };
-        let stored_resolved = stored.and_then(|stored| {
-            stored
-                .resolve_variant(Some(&variant.alias))
-                .ok()
-        });
+        let stored_resolved = stored
+            .and_then(|stored| {
+                stored
+                    .resolve_variant(Some(&variant.alias))
+                    .ok()
+            })
+            .or_else(|| stored.cloned());
         crate::config::validate_source_auth_config(&resolved, stored_resolved.as_ref())
             .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
     }
@@ -1126,6 +1130,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 
 /// The `Warning` headers (code 299) a save of `surface` answers with: its
 /// Access Point's ([`AgentSurface::access_point_warnings`]), then one naming
+/// each JWT bearer method stored without an audience
+/// ([`AgentSurface::unchecked_audience_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
@@ -1155,6 +1161,7 @@ async fn save_warnings(
     for warning in surface
         .access_point_warnings()
         .into_iter()
+        .chain(surface.unchecked_audience_warnings())
         .chain(
             crate::proxy::server::open_transit_points(&state.network_config, surface)
                 .iter()

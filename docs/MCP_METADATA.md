@@ -1432,8 +1432,9 @@ token. It opts in with `caller_authentication.protected_resource`:
 
 The setting is valid only on an MCP Access Point whose first caller
 authentication method, the one enforced, is JWT Bearer reading the
-`Authorization` header with the `Bearer` scheme, without `forward_header` and
-with empty `audiences`, and it cannot be combined with `mcp_http.authorization`.
+`Authorization` header with the `Bearer` scheme, without `forward_header`, with
+empty `audiences` and with `audience_claim` `aud` (the default), and it cannot be
+combined with `mcp_http.authorization`.
 The token audience is bound to the resource instead, as the MCP authorization
 specification requires (RFC 8707): a token is accepted only when its `aud`
 names the resource advertised for the route called, `resource` on the base
@@ -1541,8 +1542,8 @@ would leave the JWT Bearer method, whose `audiences` stay empty, checking no
 audience at all. A PUT after which the setting itself no longer fits, one that
 switches the method, sets `forward_header` or `audiences`, or moves the
 protocol off MCP, drops it with a warning in the log instead of being refused
-over a setting the client did not send; the method then checks an audience
-only if the edit set `audiences`. `null` removes it, sent with PATCH, or with
+over a setting the client did not send; the save is then refused with `400`
+unless the edit set `audiences`, since the method must name an audience. `null` removes it, sent with PATCH, or with
 PUT in the same request as the rest of the edit, a route or listen address
 change included. A variant PUT
 (`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
