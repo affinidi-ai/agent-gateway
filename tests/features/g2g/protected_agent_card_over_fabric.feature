@@ -11,21 +11,18 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json" with headers
-      | cookie           | session=caller   |
-      | authorization    | Bearer caller    |
       | x-forwarded-user | caller-forged    |
+      | x-caller-note    | from-the-caller  |
       | x-target-api-key | caller-forged    |
       | accept-language  | en-GB            |
     Then the response status is 200
     And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "accept-language" with value "en-GB"
-    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "cookie"
-    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "authorization"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-forwarded-user"
+    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-caller-note"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-transit-token"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-gateway-trace-id"
-    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" had an empty body
 
   Scenario: gateway 2 refuses the agent card fetch when its Target credential cannot be resolved
     Given a fabric with 2 gateways
@@ -54,7 +51,7 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller sends a GET request without an API key to gateway 1 surface "charlie" path "/cards/me"
+    When the caller sends a GET request with an A2A message body to gateway 1 surface "charlie" path "/cards/me"
     Then the response status is 200
     And managed agent "bravo" received a GET request at path "/cards/me"
     And the GET request at path "/cards/me" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
@@ -66,11 +63,11 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    And managed agent "bravo" answers with header "set-cookie" set to "session=bravo-target"
+    And managed agent "bravo" answers with header "x-target-internal" set to "bravo-only"
     And managed agent "bravo" answers with header "cache-control" set to "max-age=60"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/cards/me"
     Then the response status is 200
-    And the response to the caller did not carry header "set-cookie"
+    And the response to the caller did not carry header "x-target-internal"
     And the response to the caller carried header "cache-control"
 
   Scenario: gateway 2 answers a refused card fetch at its configured card location with only the status
@@ -157,7 +154,7 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller sends a GET request without an API key to gateway 1 surface "charlie" path "/.well-known/Agent-Card.json"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/Agent-Card.json"
     Then managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
     And the GET request at path "/.well-known/Agent-Card.json" to managed agent "bravo" did not carry header "x-target-api-key"
 

@@ -305,18 +305,21 @@ async fn method_request_sent_to_surface_path(
     surface_name: String,
     path: String,
 ) {
-    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new()).await;
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new(), None).await;
 }
 
-#[when(expr = "the caller sends a {word} request without an API key to gateway {int} surface {string} path {string}")]
-async fn method_request_without_api_key_sent_to_surface_path(
+#[when(
+    expr = "the caller sends a {word} request with an A2A message body to gateway {int} surface {string} path {string}"
+)]
+async fn method_request_with_a2a_body_sent_to_surface_path(
     world: &mut G2gWorld,
     method: String,
     gw_index: usize,
     surface_name: String,
     path: String,
 ) {
-    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new()).await;
+    let body = build_a2a_request_body();
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new(), Some(body)).await;
 }
 
 #[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string} with headers")]
@@ -339,7 +342,7 @@ async fn method_request_sent_to_surface_path_with_headers(
             other => panic!("header row must have a name and a value, got {other:?}"),
         })
         .collect();
-    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, headers).await;
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, headers, None).await;
 }
 
 async fn send_method_request_to_surface_path(
@@ -349,6 +352,7 @@ async fn send_method_request_to_surface_path(
     surface_name: &str,
     path: &str,
     headers: Vec<(String, String)>,
+    body: Option<Value>,
 ) {
     world.start().await;
     let (_gw, surface_id) = world.surface(surface_name);
@@ -361,8 +365,10 @@ async fn send_method_request_to_surface_path(
     for (name, value) in &headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    if method == reqwest::Method::POST {
-        request = request.json(&build_a2a_request_body());
+    match body {
+        Some(body) => request = request.json(&body),
+        None if method == reqwest::Method::POST => request = request.json(&build_a2a_request_body()),
+        None => {}
     }
     let response = request
         .send()

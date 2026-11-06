@@ -273,13 +273,12 @@ fn named_non_a2a_managed_agent_did_not_receive_header(
 ) {
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
-    let header_name = header_name.to_ascii_lowercase();
+    assert!(!requests.is_empty(), "non-A2A managed agent '{agent_name}' received no request to inspect");
     for request in requests {
-        assert!(
-            !request
-                .headers
-                .contains_key(&header_name),
-            "non-A2A managed agent '{agent_name}' should not receive header '{header_name}'; observed request was {request:?}"
+        assert_collaborator_header_absent(
+            &request.headers,
+            &header_name,
+            &format!("non-A2A managed agent '{agent_name}'"),
         );
     }
 }

@@ -64,6 +64,7 @@ pub fn assert_header_absent(
     header: &str,
     context: &str,
 ) {
+    assert!(!headers.is_empty(), "{context} recorded no headers, so a missing '{header}' proves nothing");
     assert!(
         header_value(headers, header).is_none(),
         "{context} unexpectedly carried header '{header}'; headers: {headers:?}"
@@ -189,6 +190,17 @@ mod tests {
         let request = request();
 
         super::assert_header_value(&request.headers, "Content-Type", "application/json; charset=utf-8", "request");
+    }
+
+    #[test]
+    fn header_absent_accepts_a_request_without_the_header() {
+        super::assert_header_absent(&request().headers, "authorization", "request");
+    }
+
+    #[test]
+    #[should_panic(expected = "recorded no headers")]
+    fn header_absent_refuses_a_request_with_no_recorded_headers() {
+        super::assert_header_absent(&HashMap::new(), "authorization", "request");
     }
 
     #[test]

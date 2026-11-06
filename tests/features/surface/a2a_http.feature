@@ -277,7 +277,7 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A path whose case differs is not served as the agent card fetch
     Given the surface requires "API Key" source authentication and forwards failed callers to policy
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
-    When the caller sends a GET request without an API key to the surface route path "/.well-known/Agent-Card.json"
+    When the caller sends a GET request to the surface route path "/.well-known/Agent-Card.json"
     Then the response status is 200
     And managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
     And managed agent "bravo" did not receive header "x-target-api-key"
