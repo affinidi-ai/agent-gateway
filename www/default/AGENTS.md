@@ -978,10 +978,24 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   unchanged (a reverse proxy prefix included) while the chosen listen address is still its origin
   and the stored URL is `https` and its path ends in the stored `callback_path`
   (`callbackUrlToSave`). Otherwise it is the chosen listen address followed by the provider's
-  stored `callback_path` when editing, or, when creating, the current `oauth_callback_route` and
-  the lowercased provider id, the path the gateway will store (`callbackUrlFor`). The preview, the
-  copy button and Save all use it, because the gateway refuses a `callback_url` whose path does
-  not end in the stored `callback_path`, or that is not `https`.
+  stored `callback_path` (`callbackUrlFor`). The preview, the copy button and Save all use it,
+  because the gateway refuses a `callback_url` whose path does not end in the stored
+  `callback_path`, or that is not `https`. A stored provider with no `callback_url` and no listen
+  address chosen shows, in the same preview (`credential-provider-callback-url`), the redirect URI
+  it gets: `gateway_base_url` from `GET /config/surface-routing` followed by its `callback_path`;
+  that URL is not saved.
+- A new authorization code provider has no Callback URL until it is created: the gateway builds
+  its `callback_path` from the id it generates for the provider (not the Provider ID slug) and
+  refuses a `callback_url` on create. The editor shows a notice in its place
+  (`credential-provider-callback-url-after-create`) and creates the provider without one. With a
+  listen address chosen, it then saves that address followed by the returned `callback_path` with
+  a PUT. Create refuses an http listen address before sending anything (`isHttpsAddress`), since
+  the gateway refuses an http `callback_url`; the message says to choose an https address or
+  leave the host unselected. After a create the editor opens the created provider, so its
+  Callback URL is in front of the operator. If the PUT fails, an error toast says the provider
+  was created and gives the gateway's reason, and the editor still opens the created provider, so
+  saving again updates it instead of creating it a second time. The Provider ID input has no
+  route prefix, since a new provider's callback path does not contain it.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,

@@ -69,26 +69,39 @@ changes:
         the gateway's {callback URL}/start page, not the vendor's authorization URL, so agents
         that checked it for the vendor's host, and vendor mobile-app handoff from that link,
         no longer work. Remedy: open the URL as given; a reverse proxy in front of the gateway
-        must also forward {oauth_callback_route}/{provider_id}/start.
+        must also forward {callback_path}/start.
     - timestamp: '2026-11-04T09:00:00Z'
       title: Refuse a non-conforming or shared callback_url on authorization code providers
       description: >-
-        Creating an oauth2_authorization_code provider without an issuer, or updating one in a
-        way that changes its redirect URI, now needs an https callback_url with no query or
-        fragment whose path ends in the provider's stored callback_path, and a redirect URI no
-        other provider in any tenant uses. Two stored providers sharing a redirect URI, such as
-        two tenants' providers with the same provider_id and no callback_url, both fail closed
-        at consent, and the gateway logs an ERROR naming each pair by provider id at startup and
-        reload; the first tenant to create a provider_id on the gateway's own host keeps it. A
+        Updating an oauth2_authorization_code provider without an issuer in a way that changes
+        its redirect URI now needs an https callback_url with no query or fragment whose path
+        ends in the provider's stored callback_path, and a redirect URI no other provider in any
+        tenant uses. Two stored providers sharing a redirect URI, such as two tenants' providers
+        with the same provider_id and no callback_url, both fail closed at consent, and the
+        gateway logs an ERROR naming each pair by provider id at startup and reload. A
         stored provider whose callback_url breaks these rules, or whose authorization_endpoint
         or additional_params break the consent start rules, also stops getting consent links,
         and the gateway logs an ERROR naming its provider id and the rule at startup and reload.
         Remedy: give one of two providers sharing a redirect URI a callback_url on a distinct
-        host, or recreate it with a distinct provider_id, and register the new redirect URI with
-        the vendor; correct the setting a rule ERROR names through the API or the dashboard. An
-        update that keeps the stored redirect URI is accepted, so such a provider can still be
-        edited. The dashboard's Credential Provider editor now keeps an existing provider's
-        stored callback_url, reverse proxy prefix included, while its host is unchanged and it
-        already conforms, and otherwise builds it from the stored callback_path (or, when
-        creating, the lowercased provider id), so a provider saved from the dashboard keeps a
-        conforming path.
+        host, or recreate it, which gives it a path of its own, and register the new redirect
+        URI with the vendor; correct the setting a rule ERROR names through the API or the
+        dashboard. An update that keeps the stored redirect URI is accepted, so such a provider
+        can still be edited. The dashboard's Credential Provider editor now keeps an existing
+        provider's stored callback_url, reverse proxy prefix included, while its host is
+        unchanged and it already conforms, and otherwise builds it from the stored
+        callback_path, so a provider saved from the dashboard keeps a conforming path.
+    - timestamp: '2026-11-06T20:00:00Z'
+      title: Build a new consent provider's callback path from its id, not its provider_id
+      description: >-
+        Every new credential provider gets the callback_path {oauth_callback_route}/{id}, the
+        id the gateway generates for it, so an authorization code provider's redirect URI is its
+        own and tenants can use the same provider_id without one refusing the other or learning
+        that it exists. Creating an oauth2_authorization_code provider without an issuer with a
+        callback_url is refused with 400, since its path is known only once it is created; set
+        callback_url with an update. Providers stored before keep their
+        {oauth_callback_route}/{provider_id} path and vendor registrations. The dashboard
+        creates the provider, then saves its Callback URL from the returned path, and opens the
+        created provider so the URL to register is shown; a provider without a callback_url
+        shows the gateway's own Callback URL. Remedy for API clients: create without callback_url,
+        then PUT it ending in the returned callback_path, and register that redirect URI with
+        the vendor.

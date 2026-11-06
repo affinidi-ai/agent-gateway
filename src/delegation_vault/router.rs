@@ -76,7 +76,7 @@ pub fn create_delegation_vault_router(
 /// person's browser opens the start page and the OAuth provider redirects it
 /// to the callback.
 pub fn create_delegation_vault_oauth_router(state: DelegationVaultState) -> Router {
-    let callback_route = format!("{}/{{provider_id}}", state.oauth_callback_route);
+    let callback_route = format!("{}/{{callback_segment}}", state.oauth_callback_route);
     Router::new()
         .route(&callback_route, get(handlers::oauth_callback))
         .route(&format!("{callback_route}/start"), get(handlers::consent_start_page).post(handlers::consent_start))
@@ -788,6 +788,101 @@ mod tests {
         assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
     }
 
+    /// A provider whose callback path ends in its id, as a new provider's does,
+    /// takes its start POST and callback at that path, and not at its slug.
+    #[tokio::test]
+    async fn a_provider_with_an_id_callback_path_consents_only_at_that_path() {
+        let fixture = consent::Fixture::new().await;
+        let id_path = format!("/v1/identity/oauth/callback/{}", consent::PROVIDER_ID);
+        let mut provider = fixture.provider();
+        provider.callback_path = id_path.clone();
+        provider.callback_url = Some(format!("https://198.51.100.7{id_path}"));
+        fixture
+            .providers
+            .update(provider.clone())
+            .await
+            .unwrap();
+        let start_url = crate::delegation_vault::oauth::build_authorization_url(
+            &provider,
+            "did:web:agent.example",
+            "sha256:user",
+            "surface",
+            &["repo".to_string()],
+            "https://198.51.100.7",
+        )
+        .unwrap();
+        assert_eq!(
+            url::Url::parse(&start_url)
+                .unwrap()
+                .path(),
+            format!("{id_path}/start")
+        );
+        let start_state = consent::start_state(&start_url);
+        let origin = [("origin", "https://198.51.100.7")];
+
+        let (at_slug, events) = capture(async {
+            fixture
+                .start_post_at("github", &start_state, &origin)
+                .await
+        })
+        .await;
+        consent::assert_refused(&at_slug, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentProviderMismatch]);
+        let started = fixture
+            .start_post_at(consent::PROVIDER_ID, &start_state, &origin)
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        let callback_state = consent::start_state(
+            started
+                .header("location")
+                .unwrap(),
+        );
+        let cookie = started
+            .header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let query = format!("code=vendor-code&state={callback_state}");
+
+        let (at_slug, events) = capture(async {
+            fixture
+                .callback("github", &query, Some(&cookie))
+                .await
+        })
+        .await;
+        consent::assert_refused(&at_slug, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentProviderMismatch]);
+        assert_eq!(fixture.token_calls(), 0);
+
+        let (in_another_browser, events) = capture(async {
+            fixture
+                .callback(consent::PROVIDER_ID, &query, None)
+                .await
+        })
+        .await;
+        consent::assert_refused(&in_another_browser, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&cookie)));
+        let named: Vec<_> = events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::DelegationFailed { provider_id, .. } => provider_id.clone(),
+                _ => panic!("{event:?}"),
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [Some("github".to_string())],
+            "a refusal at the id path names the provider by its slug, as its grant does"
+        );
+
+        let accepted = fixture
+            .callback(consent::PROVIDER_ID, &query, Some(&cookie))
+            .await;
+        assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+        assert_eq!(fixture.vault_records(), 1);
+    }
+
     /// The start page claims nothing and sets no cookie, so it may be fetched
     /// any number of times; the start POST then succeeds once, and a second
     /// POST of the same start state is refused.
@@ -1470,13 +1565,28 @@ mod tests {
                 state: &str,
                 headers: &[(&str, &str)],
             ) -> Answer {
+                self.start_post_at("github", state, headers)
+                    .await
+            }
+
+            pub async fn start_post_at(
+                &self,
+                path_segment: &str,
+                state: &str,
+                headers: &[(&str, &str)],
+            ) -> Answer {
                 let mut headers = headers.to_vec();
                 headers.push(("content-type", "application/x-www-form-urlencoded"));
                 let body = url::form_urlencoded::Serializer::new(String::new())
                     .append_pair("state", state)
                     .finish();
-                self.send("POST", "/v1/identity/oauth/callback/github/start", &headers, Body::from(body))
-                    .await
+                self.send(
+                    "POST",
+                    &format!("/v1/identity/oauth/callback/{path_segment}/start"),
+                    &headers,
+                    Body::from(body),
+                )
+                .await
             }
 
             pub async fn callback(

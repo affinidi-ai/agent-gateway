@@ -248,27 +248,28 @@ export function externalProviderUpdate(form: {
   };
 }
 
+/** Whether `host` is an https address, the only kind the gateway takes in a callback URL. */
+export function isHttpsAddress(host: string): boolean {
+  try {
+    return new URL(host).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The callback URL of an authorization code provider: `host` followed by the path the
- * gateway stored for it (`storedPath`), or, for a new provider, the callback route followed
- * by the lowercased provider id, which is the path the gateway will store.
+ * gateway stored for it (`storedPath`). A provider not yet created has none: the gateway
+ * builds its path from the provider's id when it creates it.
  */
-export function callbackUrlFor(
-  host: string,
-  route: string,
-  providerId: string,
-  storedPath: string
-): string {
-  const path = storedPath || `${route}/${providerId.trim().toLowerCase()}`;
-  return `${host}${path}`;
+export function callbackUrlFor(host: string, storedPath: string): string {
+  return storedPath ? `${host}${storedPath}` : '';
 }
 
 /** What `callbackUrlToSave` builds the callback URL from, by name. */
 export interface CallbackUrlInputs {
   storedUrl: string;
   host: string;
-  route: string;
-  providerId: string;
   storedPath: string;
 }
 
@@ -276,13 +277,7 @@ export interface CallbackUrlInputs {
  * The callback URL to save: the stored one, reverse proxy prefix and all, while the chosen
  * `host` is still its host; otherwise the URL `callbackUrlFor` builds.
  */
-export function callbackUrlToSave({
-  storedUrl,
-  host,
-  route,
-  providerId,
-  storedPath,
-}: CallbackUrlInputs): string {
+export function callbackUrlToSave({ storedUrl, host, storedPath }: CallbackUrlInputs): string {
   try {
     const stored = new URL(storedUrl);
     if (
@@ -296,5 +291,5 @@ export function callbackUrlToSave({
   } catch {
     // no stored URL, or one that does not parse: build it
   }
-  return callbackUrlFor(host, route, providerId, storedPath);
+  return callbackUrlFor(host, storedPath);
 }

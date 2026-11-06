@@ -353,7 +353,7 @@ fn write_single_surface_config_inner(
                 DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
             };
             serde_json::json!({
-                "credential_provider_id": delegation.provider_id,
+                "credential_provider_id": surface_config.oauth_provider_record_id(&delegation.provider_id),
                 "scopes": delegation.scopes,
                 "required_for": required_for,
                 "consent_mode": "on_demand",
@@ -895,8 +895,9 @@ fn oauth_provider_fixture(
         .oauth_provider_base_url
         .as_ref()
         .expect("OAuth provider base URL must be configured before writing credential provider fixture");
+    let record_id = surface_config.oauth_provider_record_id(provider_id);
     CredentialProviderFixture {
-        id: provider_id.to_string(),
+        id: record_id.clone(),
         name: provider_id.to_string(),
         provider_id: provider_id.to_string(),
         provider_type: "oauth2_authorization_code".to_string(),
@@ -905,11 +906,11 @@ fn oauth_provider_fixture(
         client_id_secret_ref: Some(format!("bdd-{provider_id}-client-id")),
         client_secret_secret_ref: Some(format!("bdd-{provider_id}-client-secret")),
         default_scopes,
-        callback_path: format!("/v1/identity/oauth/callback/{provider_id}"),
+        callback_path: format!("/v1/identity/oauth/callback/{record_id}"),
         callback_url: surface_config
             .oauth_callback_base_url
             .as_ref()
-            .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
+            .map(|base| format!("{base}/v1/identity/oauth/callback/{record_id}")),
         token_refresh_enabled: true,
         api_key_secret_ref: None,
         authorization_response_issuer,

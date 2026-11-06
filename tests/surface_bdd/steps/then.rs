@@ -2263,9 +2263,12 @@ fn response_includes_authorization_url(
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("consent entry for '{provider}' should include authorization_url, got {entry}"));
     let url = url::Url::parse(url).unwrap_or_else(|_| panic!("authorization_url should be a URL, got {url}"));
+    let segment = world
+        .surface_config
+        .oauth_provider_record_id(&provider);
     assert_eq!(
         url.path(),
-        format!("/v1/identity/oauth/callback/{provider}/start"),
+        format!("/v1/identity/oauth/callback/{segment}/start"),
         "authorization_url should point at the gateway's consent start page, got {url}"
     );
     assert!(

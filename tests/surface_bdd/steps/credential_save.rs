@@ -60,6 +60,137 @@ pub(crate) async fn create_provider(
     world.admin_response = Some(response);
 }
 
+async fn create_authorization_code_provider(
+    world: &mut SurfaceWorld,
+    provider_id: &str,
+    tenant: Option<&str>,
+    client_secrets: (&str, &str),
+    callback_url: Option<&str>,
+) -> RecordedResponse {
+    let body = json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_authorization_code",
+        "authorization_endpoint": "https://192.0.2.1/authorize", "token_endpoint": "https://192.0.2.1/token",
+        "client_id_secret_ref": client_secrets.0, "client_secret_secret_ref": client_secrets.1,
+        "tenant_id": tenant, "callback_url": callback_url
+    });
+    send(world, Method::POST, "/v1/credential-providers", Some(&body)).await
+}
+
+#[given(
+    expr = "the operator has created the authorization code provider {string} for tenant {string} using secrets {string} and {string}"
+)]
+async fn operator_has_created_tenant_authorization_code_provider(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    tenant: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        Some(&tenant),
+        (&client_id_secret, &client_secret_secret),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 201, "creating provider {provider_id} for {tenant}: {}", response.body);
+}
+
+#[when(
+    expr = "the operator creates the authorization code provider {string} for tenant {string} using secrets {string} and {string}"
+)]
+async fn operator_creates_tenant_authorization_code_provider(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    tenant: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        Some(&tenant),
+        (&client_id_secret, &client_secret_secret),
+        None,
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[when(
+    expr = "the operator creates the authorization code provider {string} with callback URL {string} using secrets {string} and {string}"
+)]
+async fn operator_creates_authorization_code_provider_with_callback_url(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    callback_url: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        None,
+        (&client_id_secret, &client_secret_secret),
+        Some(&callback_url),
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[when("the operator reads the surface routing settings")]
+async fn operator_reads_surface_routing_settings(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/config/surface-routing", None).await;
+    world.admin_response = Some(response);
+}
+
+#[then(expr = "the surface routing settings name the gateway's own base URL {string}")]
+fn surface_routing_settings_name_gateway_base_url(
+    world: &mut SurfaceWorld,
+    base_url: String,
+) {
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("an admin API response");
+    assert_eq!(response.body["gateway_base_url"], base_url, "surface routing settings: {}", response.body);
+}
+
+#[then(expr = "both credential providers {string} have a callback path ending in the id the gateway gave each")]
+async fn each_provider_has_a_callback_path_of_its_own(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+) {
+    let response = send(world, Method::GET, "/v1/credential-providers", None).await;
+    assert_eq!(response.status, 200, "listing credential providers: {}", response.body);
+    let ids: Vec<String> = response
+        .body
+        .as_array()
+        .expect("the provider list is an array")
+        .iter()
+        .filter(|provider| provider["provider_id"] == provider_id.as_str())
+        .filter_map(|provider| {
+            provider["id"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "expected two providers {provider_id}, got {ids:?}");
+    for id in &ids {
+        let stored = send(world, Method::GET, &format!("/v1/credential-providers/{id}"), None).await;
+        assert_eq!(stored.status, 200, "reading provider {id}: {}", stored.body);
+        let path = stored.body["callback_path"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            path,
+            format!("/v1/identity/oauth/callback/{id}"),
+            "provider {id} should have the consent route the gateway serves, ending in its id"
+        );
+    }
+}
+
 async fn create_jwt_bearer_provider(
     world: &mut SurfaceWorld,
     provider_id: &str,

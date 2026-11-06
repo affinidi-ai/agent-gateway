@@ -2,6 +2,7 @@ import {
   EMPTY_JWT_FIELDS,
   callbackUrlFor,
   callbackUrlToSave,
+  isHttpsAddress,
   ProviderFormValues,
   entraRejectsResource,
   jwtFieldsOf,
@@ -184,27 +185,28 @@ describe('credential provider form', () => {
   });
 });
 
+describe('isHttpsAddress', () => {
+  it('accepts only an https address', () => {
+    expect(isHttpsAddress('https://gw.example')).toBe(true);
+    expect(isHttpsAddress('http://gw.example')).toBe(false);
+    expect(isHttpsAddress('gw.example')).toBe(false);
+    expect(isHttpsAddress('')).toBe(false);
+  });
+});
+
 describe('callbackUrlFor', () => {
   it('keeps the stored callback path of an existing provider', () => {
-    expect(
-      callbackUrlFor(
-        'https://gw.example',
-        '/v1/identity/oauth/callback',
-        'github',
-        '/old/route/github'
-      )
-    ).toBe('https://gw.example/old/route/github');
+    expect(callbackUrlFor('https://gw.example', '/old/route/github')).toBe(
+      'https://gw.example/old/route/github'
+    );
   });
 
-  it('builds a new provider path from the lowercased provider id, as the gateway stores it', () => {
-    expect(
-      callbackUrlFor('https://gw.example', '/v1/identity/oauth/callback', ' GitHub ', '')
-    ).toBe('https://gw.example/v1/identity/oauth/callback/github');
+  it('has no URL for a provider not yet created, whose path the gateway builds from its id', () => {
+    expect(callbackUrlFor('https://gw.example', '')).toBe('');
   });
 });
 
 describe('callbackUrlToSave', () => {
-  const route = '/v1/identity/oauth/callback';
   const stored = 'https://gw.example/prefix/v1/identity/oauth/callback/github';
 
   it('keeps a stored callback URL, reverse proxy prefix included, while its host is unchanged', () => {
@@ -212,8 +214,6 @@ describe('callbackUrlToSave', () => {
       callbackUrlToSave({
         storedUrl: stored,
         host: 'https://gw.example',
-        route: route,
-        providerId: 'github',
         storedPath: '/v1/identity/oauth/callback/github',
       })
     ).toBe(stored);
@@ -224,8 +224,6 @@ describe('callbackUrlToSave', () => {
       callbackUrlToSave({
         storedUrl: stored,
         host: 'https://other.example',
-        route: route,
-        providerId: 'github',
         storedPath: '/v1/identity/oauth/callback/github',
       })
     ).toBe('https://other.example/v1/identity/oauth/callback/github');
@@ -236,8 +234,6 @@ describe('callbackUrlToSave', () => {
       callbackUrlToSave({
         storedUrl: 'https://gw.example/v1/identity/oauth/callback/GitHub',
         host: 'https://gw.example',
-        route: route,
-        providerId: 'github',
         storedPath: '/v1/identity/oauth/callback/github',
       })
     ).toBe('https://gw.example/v1/identity/oauth/callback/github');
@@ -248,8 +244,6 @@ describe('callbackUrlToSave', () => {
       callbackUrlToSave({
         storedUrl: 'http://gw.example/prefix/v1/identity/oauth/callback/github',
         host: 'http://gw.example',
-        route: route,
-        providerId: 'github',
         storedPath: '/v1/identity/oauth/callback/github',
       })
     ).toBe('http://gw.example/v1/identity/oauth/callback/github');
@@ -260,22 +254,18 @@ describe('callbackUrlToSave', () => {
       callbackUrlToSave({
         storedUrl: stored,
         host: 'https://GW.example:443/',
-        route: route,
-        providerId: 'github',
         storedPath: '/v1/identity/oauth/callback/github',
       })
     ).toBe(stored);
   });
 
-  it('builds the URL when nothing is stored', () => {
+  it('has no URL when nothing is stored', () => {
     expect(
       callbackUrlToSave({
         storedUrl: '',
         host: 'https://gw.example',
-        route: route,
-        providerId: 'GitHub',
         storedPath: '',
       })
-    ).toBe('https://gw.example/v1/identity/oauth/callback/github');
+    ).toBe('');
   });
 });

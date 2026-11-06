@@ -95,18 +95,21 @@ See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the r
 An `oauth2_authorization_code` provider without an `issuer` grants its credential through the
 gateway's [consent flow](#consent-flow). Its redirect URI is its `callback_url`, or, without
 one, the gateway's `https://{did.domain}` followed by its `callback_path`, which the gateway
-sets at create to `{oauth_callback_route}/{provider_id}` and never changes. Create, and an
-update that changes the redirect URI, refuse with `400`:
+sets at create to `{oauth_callback_route}/{id}`, the provider's own id, and never changes. Each
+new provider's redirect URI is therefore its own, whatever its tenant and `provider_id`. Providers
+stored before keep their `{oauth_callback_route}/{provider_id}` path, so their vendor
+registrations still match.
+
+Create refuses such a provider's `callback_url` with `400`, since its `callback_path` is not known
+until the create returns it; set the `callback_url` with an update. An update that changes the
+redirect URI refuses with `400`:
 
 - a `callback_url` that is not an `https` URL with a host, or carries credentials, a query or a
   fragment, or whose path does not end in the provider's `callback_path`; a reverse proxy prefix
-  before it is kept, so `https://gw.example/prefix/v1/identity/oauth/callback/github` is accepted
-  for `/v1/identity/oauth/callback/github`. The path comparison is exact: a `callback_url` built
-  from an uppercase `provider_id` does not match the lowercase `callback_path`;
-- a redirect URI that another such provider, of any tenant, already has. Two tenants' providers
-  with the same `provider_id` and no `callback_url` share one, so the first tenant to create a
-  `provider_id` on the gateway's own host keeps it, and another tenant's provider of that
-  `provider_id` needs a `callback_url` on a host of its own.
+  before it is kept, so `https://gw.example/prefix/v1/identity/oauth/callback/{id}` is accepted
+  for `/v1/identity/oauth/callback/{id}`. The path comparison is exact and case-sensitive;
+- a redirect URI that another such provider, of any tenant, already has. Two providers stored
+  with the same `provider_id` path, in different tenants, can share one.
 
 Create, and an update that changes either, also refuse with `400` an `authorization_endpoint` or
 `additional_params` that break the rules in [The start page](#the-start-page). A provider without
@@ -124,8 +127,8 @@ configuration reload naming each such pair by provider id. A stored provider who
 or authorization endpoint breaks the rules here or in [The start page](#the-start-page) is
 logged the same way, as an `ERROR` naming its provider id and the rule it breaks, never its
 URLs or parameters. The remedy is to give one of them a
-`callback_url` on a distinct host, or to recreate it with a distinct `provider_id`; either way,
-register the new redirect URI with the vendor. A tenant move changes neither rule's outcome, so
+`callback_url` on a distinct host, or to recreate it, which gives it a path of its own; either
+way, register the new redirect URI with the vendor. A tenant move changes neither rule's outcome, so
 it is not checked again.
 
 `authorization_response_issuer` is the `iss` (RFC 9207) the provider's authorization server puts
@@ -1494,7 +1497,7 @@ find the gateway's instead, and a provider's mobile-app handoff no longer starts
 
 ### The start page
 
-`GET {oauth_callback_route}/{provider_id}/start` shows the agent DID, the surface, the provider
+`GET {callback_path}/start` shows the agent DID, the surface, the provider
 and the scopes, with a button that POSTs the page back. It claims nothing and sets no cookie,
 so a link scanner or a chat unfurler may fetch it any number of times. It is sent with
 `Cache-Control: no-store`, `Referrer-Policy: same-origin`, `X-Frame-Options: DENY` and a
@@ -1540,8 +1543,8 @@ Every check runs before the code is exchanged:
 
 - the `state` is a callback state this gateway sealed, not expired, carrying a browser binding;
   a start state, or any state without a browser binding, is refused;
-- the callback's path names the state's provider, and the provider the state names still has
-  that id and slug, is `oauth2_authorization_code` and has no `issuer`;
+- the provider the state names still has that id and slug, is `oauth2_authorization_code`, has
+  no `issuer`, and its `callback_path` ends in the callback's path segment;
 - the browser presents the state's own cookie, `__Host-ag_consent_<id>`, whose SHA-256,
   compared in constant time, is the state's (no other consent cookie is read): a callback URL opened in another browser, forwarded or leaked, is
   refused with `403`;
@@ -1558,13 +1561,15 @@ other cookie is set. Every refusal is logged as a `WARN` with the reason and the
 never the state, the code, the cookie or `iss`. It is also recorded as a `delegation_failed`
 audit event whose `reason` names the check, but only when the request carried a state this
 gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
-only logged, so a stream of such requests cannot flood the audit log or its integrations:
+only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
+and the event name the provider by its `provider_id` when the path is the sealed provider's own
+callback path, as `consent_granted` does, and otherwise by the path's segment:
 
 | `reason` | Refused because |
 | --- | --- |
 | `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of the other stage, or the start POST's binding cookie cannot be sent |
 | `consent_state_reused` | The start state or callback state was already used on this process |
-| `consent_provider_mismatch` | The path names another provider, or the state's provider is gone or changed |
+| `consent_provider_mismatch` | The path's last segment is not that of the state's provider's `callback_path`, or that provider is gone or changed |
 | `browser_binding_mismatch` | The callback has no binding cookie, or another browser's |
 | `iss_missing`, `iss_mismatch` | The callback lacks, or differs from, the provider's `authorization_response_issuer` |
 | `consent_response_invalid` | The callback is malformed, carries no code, or an `error` outside `[A-Za-z0-9_]{1,128}` |
@@ -1622,7 +1627,8 @@ followed, and a token endpoint resolving to a blocked address is refused before 
 
 The start page and the callback live under `/v1/identity/oauth/callback` unless `gateway.json`
 sets `oauth_callback_route`; a reverse proxy in front of the gateway must forward both
-`{route}/{provider_id}` and `{route}/{provider_id}/start`. On success the gateway stores the
+`{route}/{segment}` and `{route}/{segment}/start`, where `{segment}` is the provider's id for a
+new provider and its `provider_id` for one stored before. On success the gateway stores the
 token and issues a `DelegationCredential`, a verifiable credential recording the
 delegation chain, kept with the token as `delegation_vc`.
 

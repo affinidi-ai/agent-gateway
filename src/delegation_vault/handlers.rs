@@ -293,25 +293,26 @@ impl ConsentRefusal {
 
 /// The fixed refusal page for `refusal`, with `Cache-Control: no-store`,
 /// `Referrer-Policy: no-referrer` and the binding cookie cleared on
-/// `cookie`, logged as a WARN with the reason and the path's provider id only,
+/// `cookie`, logged as a WARN with the reason and the provider it names, only
 /// when that is a plain slug. It is audited as `delegation_failed` only when
-/// `audited`: the request carried a state this gateway sealed for its stage,
-/// so requests without one cannot flood the audit log or its integrations.
+/// `audited` names the provider: the request carried a state this gateway
+/// sealed for its stage, so requests without one cannot flood the audit log or
+/// its integrations. Without one, the path's segment names the provider.
 fn consent_refused(
     refusal: ConsentRefusal,
-    provider_id: &str,
+    path_segment: &str,
     cookie: Option<&str>,
-    audited: bool,
+    audited: Option<&str>,
 ) -> Response {
     let ConsentRefusal { status, reason } = refusal;
-    let provider_id = plain_slug(provider_id);
+    let provider_id = plain_slug(audited.unwrap_or(path_segment));
     warn!(
         target: "credential_delegation",
         provider_id,
         reason = ?reason,
         "OAuth consent refused"
     );
-    if audited {
+    if audited.is_some() {
         super::audit::emit("delegation_failed", || {
             super::audit::audit_event(
                 super::audit::DelegationAuditAction::DelegationFailed {
@@ -379,17 +380,31 @@ fn plain_slug(provider_id: &str) -> Option<&str> {
     .then_some(provider_id)
 }
 
-/// The provider a consent state names, checked against the path: the path's
-/// provider is the state's, and the stored provider still has the state's id
-/// and slug and is an authorization code provider without an issuer.
+/// The provider a refusal of a request carrying `sealed` names: the state's
+/// `provider_id` slug when the path's segment is the state's own record id, as
+/// it is for a provider whose callback path ends in its id, so refusals and
+/// grants name the provider alike; otherwise the path's segment, which is a
+/// provider's slug or names another provider than the state's.
+fn refused_provider<'a>(
+    path_segment: &'a str,
+    sealed: &'a super::OAuthState,
+) -> &'a str {
+    if path_segment == sealed.credential_provider_id {
+        &sealed.provider_id
+    } else {
+        path_segment
+    }
+}
+
+/// The provider a consent state names, checked against the path: the stored
+/// provider still has the state's id and slug, is an authorization code
+/// provider without an issuer, and its `callback_path` ends in the path's
+/// segment.
 async fn consent_provider(
     state: &DelegationVaultState,
-    path_provider_id: &str,
+    path_segment: &str,
     oauth_state: &super::OAuthState,
 ) -> Result<crate::credential_providers::CredentialProvider, ConsentRefusal> {
-    if path_provider_id != oauth_state.provider_id {
-        return Err(ConsentRefusal::bad_request(DelegationFailureReason::ConsentProviderMismatch));
-    }
     match state
         .provider_store
         .get(&oauth_state.credential_provider_id)
@@ -398,7 +413,12 @@ async fn consent_provider(
         Ok(Some(provider))
             if provider.id == oauth_state.credential_provider_id
                 && provider.provider_id == oauth_state.provider_id
-                && provider.uses_legacy_consent() =>
+                && provider.uses_legacy_consent()
+                && provider
+                    .callback_path
+                    .rsplit('/')
+                    .next()
+                    == Some(path_segment) =>
         {
             Ok(provider)
         }
@@ -420,18 +440,18 @@ struct ConsentStartRequest {
     redirect_uri: url::Url,
 }
 
-/// Why a consent start was refused, and whether its start state was valid, so
-/// the refusal is audited.
+/// Why a consent start was refused and, when its start state was valid so the
+/// refusal is audited, the provider it names.
 struct StartRefused {
     refusal: ConsentRefusal,
-    audited: bool,
+    audited: Option<String>,
 }
 
 /// Decodes the start state `params` carry and resolves its provider, whose
 /// redirect URI must follow the consent rules and be no other provider's.
 async fn resolve_consent_start(
     state: &DelegationVaultState,
-    path_provider_id: &str,
+    path_segment: &str,
     params: Option<ConsentStartParams>,
 ) -> Result<ConsentStartRequest, StartRefused> {
     let (encoded, start) = params
@@ -442,10 +462,14 @@ async fn resolve_consent_start(
         })
         .ok_or(StartRefused {
             refusal: ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-            audited: false,
+            audited: None,
         })?;
-    let refuse = |refusal| StartRefused { refusal, audited: true };
-    let provider = consent_provider(state, path_provider_id, &start)
+    let named = refused_provider(path_segment, &start).to_string();
+    let refuse = |refusal| StartRefused {
+        refusal,
+        audited: Some(named.clone()),
+    };
+    let provider = consent_provider(state, path_segment, &start)
         .await
         .map_err(refuse)?;
     let redirect_uri = provider
@@ -472,7 +496,7 @@ async fn resolve_consent_start(
     }
 }
 
-/// GET {oauth_callback_route}/{provider_id}/start
+/// GET {callback_path}/start
 ///
 /// The consent start page: shows the agent, surface, provider and scopes a
 /// start link asks for, with a button that POSTs it back. It claims nothing and
@@ -492,7 +516,9 @@ pub async fn consent_start_page(
     .await
     {
         Ok(request) => request,
-        Err(StartRefused { refusal, audited }) => return consent_refused(refusal, &provider_id, None, audited),
+        Err(StartRefused { refusal, audited }) => {
+            return consent_refused(refusal, &provider_id, None, audited.as_deref());
+        }
     };
     let surface_name = match &state.agent_surface_store {
         Some(store) => store
@@ -578,7 +604,7 @@ fn same_origin_post(
     }
 }
 
-/// POST {oauth_callback_route}/{provider_id}/start
+/// POST {callback_path}/start
 ///
 /// The person confirmed the start page: build the vendor's URL and the
 /// binding cookie, then claim the start state, set the cookie and send the
@@ -601,8 +627,11 @@ pub async fn consent_start(
     .await
     {
         Ok(request) => request,
-        Err(StartRefused { refusal, audited }) => return consent_refused(refusal, &provider_id, None, audited),
+        Err(StartRefused { refusal, audited }) => {
+            return consent_refused(refusal, &provider_id, None, audited.as_deref());
+        }
     };
+    let audited = Some(refused_provider(&provider_id, &start));
     if !same_origin_post(&headers, &redirect_uri) {
         return consent_refused(
             ConsentRefusal {
@@ -611,7 +640,7 @@ pub async fn consent_start(
             },
             &provider_id,
             None,
-            true,
+            audited,
         );
     }
     let begun = match oauth::begin_consent(&provider, &start, &redirect_uri, &state.secrets_store).await {
@@ -628,7 +657,7 @@ pub async fn consent_start(
                 error = %e,
                 "Could not begin OAuth consent"
             );
-            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, true);
+            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited);
         }
     };
     let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
@@ -636,7 +665,7 @@ pub async fn consent_start(
             ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
             &provider_id,
             None,
-            true,
+            audited,
         );
     };
     let max_age = (begun.expires_at - Utc::now())
@@ -652,7 +681,7 @@ pub async fn consent_start(
             ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
             &provider_id,
             None,
-            true,
+            audited,
         );
     };
     if !oauth::claim_oauth_state(&start).await {
@@ -660,7 +689,7 @@ pub async fn consent_start(
             ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused),
             &provider_id,
             None,
-            true,
+            audited,
         );
     }
     info!(
@@ -678,11 +707,11 @@ pub async fn consent_start(
     response
 }
 
-/// GET /v1/identity/oauth/callback/{provider_id}
+/// GET {callback_path}
 ///
 /// Handles the OAuth provider redirect after user consent. Every check runs
 /// before the code is exchanged: the state is a callback state of this
-/// gateway, the path names its provider, the provider is unchanged, the
+/// gateway, the path's segment ends its provider's `callback_path`, the provider is unchanged, the
 /// browser holds the binding cookie the start POST set, and the `iss` is the
 /// one the operator recorded. The tokens are then stored in the vault.
 pub async fn oauth_callback(
@@ -696,7 +725,7 @@ pub async fn oauth_callback(
             ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid),
             &provider_id,
             None,
-            false,
+            None,
         );
     };
     let callback_state = query
@@ -706,11 +735,17 @@ pub async fn oauth_callback(
     let cookie_name = callback_state
         .as_ref()
         .and_then(oauth::binding_cookie_name);
-    let audited = callback_state.is_some();
-    let refuse = |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref(), audited);
+    let audited = callback_state
+        .as_ref()
+        .map(|sealed| refused_provider(&provider_id, sealed).to_string());
+    let named = audited
+        .as_deref()
+        .unwrap_or(&provider_id);
+    let refuse =
+        |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref(), audited.as_deref());
     info!(
         target: "credential_delegation",
-        provider_id = plain_slug(&provider_id),
+        provider_id = plain_slug(named),
         has_code = %query.code.is_some(),
         has_error = %query.error.is_some(),
         action = "oauth_callback",
@@ -725,7 +760,7 @@ pub async fn oauth_callback(
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         warn!(
             target: "credential_delegation",
-            provider_id = plain_slug(&provider_id),
+            provider_id = plain_slug(named),
             oauth_error = %if valid { error.as_str() } else { oauth::UNRECOGNIZED_ERROR },
             "OAuth provider returned an error"
         );

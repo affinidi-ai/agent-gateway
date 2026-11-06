@@ -38,6 +38,17 @@ Feature: MCP credential delegation
     And OAuth provider "calendar" received the authorization code exchange
     And the delegation audit trail contains event "consent_granted" for OAuth provider "calendar"
 
+  Scenario: OAuth consent completes at a callback path ending in the id the gateway gave the provider
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And OAuth provider "calendar" has a callback path ending in the id the gateway gave it
+    And the surface has an explicit inbound identity slot for MCP
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And OAuth provider "calendar" is ready to exchange an authorization code for delegated credentials
+    When OAuth provider "calendar" redirects the caller back with a valid authorization code
+    Then the OAuth callback response status is 200
+    And OAuth provider "calendar" received the authorization code exchange
+    And the delegation audit trail contains event "consent_granted" for OAuth provider "calendar"
+
   Scenario Outline: OAuth callback shows an authorization failure page without exchanging credentials
     Given the surface requires delegated credentials from OAuth provider "calendar"
     And caller "alice" has started OAuth consent for provider "calendar"

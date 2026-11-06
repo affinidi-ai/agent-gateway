@@ -168,8 +168,10 @@ claim other than `sub`; see _Credentials audit tab_ in
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
 while its host is unchanged and it conforms (`https`, path ending in the stored `callback_path`)
-and otherwise builds it from the stored `callback_path` (or, when
-creating, the lowercased provider id), and target
+and otherwise builds it from the stored `callback_path` (when creating, it saves the
+Callback URL in a second request once the gateway returns the path it built from the id it
+generated for the provider, then opens that provider, also when the second request fails; a
+stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).

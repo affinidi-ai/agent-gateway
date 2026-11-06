@@ -237,8 +237,10 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .surface_config
             .credential_delegation
         {
-            oauth_endpoint_allowlist
-                .push(format!("{callback_base_url}/v1/identity/oauth/callback/{}", delegation.provider_id));
+            let segment = world
+                .surface_config
+                .oauth_provider_record_id(&delegation.provider_id);
+            oauth_endpoint_allowlist.push(format!("{callback_base_url}/v1/identity/oauth/callback/{segment}"));
         }
         world
             .surface_config
@@ -3371,7 +3373,10 @@ async fn send_oauth_callback_and_record(
 ) {
     ensure_gateway_running(world).await;
     let infra = world.infra.as_ref().unwrap();
-    let url = format!("http://127.0.0.1:{}/v1/identity/oauth/callback/{provider}?{query}", infra.gateway_port);
+    let segment = world
+        .surface_config
+        .oauth_provider_record_id(provider);
+    let url = format!("http://127.0.0.1:{}/v1/identity/oauth/callback/{segment}?{query}", infra.gateway_port);
     let mut request = reqwest::Client::new().get(&url);
     if let Some(cookie) = cookie {
         request = request.header("cookie", cookie);

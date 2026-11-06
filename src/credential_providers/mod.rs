@@ -274,12 +274,14 @@ pub struct CredentialProvider {
     #[serde(default)]
     pub default_scopes: Vec<String>,
 
-    /// Auto-generated callback path for authorization code flow
-    /// Format: /v1/identity/oauth/callback/{provider_id}
+    /// Auto-generated callback path for authorization code flow:
+    /// `{oauth_callback_route}/{id}`, or `{oauth_callback_route}/{provider_id}`
+    /// for a provider created before paths ended in its id.
     #[serde(default)]
     pub callback_path: String,
 
-    /// Full callback URL including host (e.g. "https://gw.example.com/v1/identity/oauth/callback/github")
+    /// Full callback URL including host, ending in `callback_path` (e.g.
+    /// "https://gw.example.com/v1/identity/oauth/callback/{id}").
     /// User-configurable; used as redirect_uri in OAuth authorization requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_url: Option<String>,
@@ -729,7 +731,7 @@ pub fn log_redirect_uri_conflicts<'provider>(
                     provider_id = %id,
                     other_provider_id = %other_id,
                     "Two credential providers share a redirect URI, so consent for both is refused; give one a \
-                     callback_url on a distinct host, or recreate it with a distinct provider_id"
+                     callback_url on a distinct host, or recreate it, which gives it a callback path of its own"
                 );
                 conflicts.push((*id, *other_id));
             }
@@ -797,7 +799,9 @@ pub struct CreateCredentialProviderRequest {
     pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
-    /// Full callback URL (host + path) — overrides auto-generated callback URL
+    /// Full callback URL (host + path). Refused for an authorization code
+    /// provider without an `issuer`, whose `callback_path` is known only once it
+    /// is created; an update sets it.
     #[serde(default)]
     pub callback_url: Option<String>,
     #[serde(default)]
@@ -849,7 +853,8 @@ pub struct UpdateCredentialProviderRequest {
     pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
-    /// Full callback URL (host + path) — overrides auto-generated callback URL
+    /// Full callback URL (host + path), ending in the stored `callback_path`;
+    /// used as the redirect URI in place of the gateway's own URL.
     #[serde(default)]
     pub callback_url: Option<String>,
     #[serde(default)]
@@ -1413,12 +1418,6 @@ mod tests {
         }"#;
         let req: CreateCredentialProviderRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.provider_type, CredentialProviderType::OAuth2ClientCredentials);
-    }
-
-    #[test]
-    fn test_callback_path_format() {
-        let provider = make_provider("GitHub", "github");
-        assert_eq!(provider.callback_path, "/oauth/callback/github");
     }
 
     #[test]

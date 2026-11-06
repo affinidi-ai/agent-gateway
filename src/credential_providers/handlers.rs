@@ -514,7 +514,9 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
 /// can use and that no other provider, in any tenant, uses. An update that
 /// keeps the `previous` consent provider's endpoint and `additional_params`, or
 /// its redirect URI, is not checked against those rules, so a stored provider
-/// that breaks them can still be edited.
+/// that breaks them can still be edited. Such a provider is created without a
+/// `callback_url`: its `callback_path` ends in its id, so an update sets it,
+/// and no other provider can already hold its redirect URI.
 async fn consent_flow_error(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
@@ -528,6 +530,16 @@ async fn consent_flow_error(
     if !provider.uses_legacy_consent() {
         return None;
     }
+    if previous.is_none()
+        && provider
+            .callback_url
+            .is_some()
+    {
+        return refused(
+            "callback_url is set by an update after create, and must end in the callback_path the create returns",
+        );
+    }
+    let creating = previous.is_none();
     let previous = previous.filter(|previous| previous.uses_legacy_consent());
     let keeps_endpoint = previous.is_some_and(|previous| {
         previous.authorization_endpoint == provider.authorization_endpoint
@@ -549,6 +561,9 @@ async fn consent_flow_error(
     }
     if let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
         return refused(message);
+    }
+    if creating {
+        return None;
     }
     match super::redirect_uri_taken_by(state.store.as_ref(), provider, &state.gateway_base_url).await {
         Ok(None) => None,
@@ -629,7 +644,7 @@ pub async fn create_provider(
             .client_secret_secret_ref
             .map(|s| s.trim().to_string()),
         default_scopes: req.default_scopes,
-        callback_path: format!("{}/{}", state.oauth_callback_route, provider_id_clean),
+        callback_path: format!("{}/{}", state.oauth_callback_route, id),
         callback_url: req
             .callback_url
             .map(|s| s.trim().to_string()),
@@ -1875,46 +1890,50 @@ mod jwt_provider_tests {
     async fn a_consent_providers_callback_url_must_be_https_and_end_in_its_callback_path() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"callback_url": "https://198.51.100.7/x"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "callback_url is set by an update after create, and must end in the callback_path the create returns"
+        );
+
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "without callback_url the gateway's own URL is used: {body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(body["callback_path"], format!("/oauth/callback/{id}"), "the path ends in the provider's id");
+        let upper = id.to_uppercase();
         for (callback_url, error) in [
-            ("http://198.51.100.7/oauth/callback/github", "callback_url must be an https URL with a host"),
+            (format!("http://198.51.100.7/oauth/callback/{id}"), "callback_url must be an https URL with a host"),
             (
-                "https://198.51.100.7/oauth/callback/github?x=1",
+                format!("https://198.51.100.7/oauth/callback/{id}?x=1"),
                 "callback_url must not carry credentials, a query or a fragment",
             ),
             (
-                "https://198.51.100.7/oauth/callback/github#f",
+                format!("https://198.51.100.7/oauth/callback/{id}#f"),
                 "callback_url must not carry credentials, a query or a fragment",
             ),
-            ("https://198.51.100.7/oauth/callback/other", "callback_url path must end in the provider's callback_path"),
             (
-                "https://198.51.100.7/oauth/callback/GitHub",
+                "https://198.51.100.7/oauth/callback/github".to_string(),
+                "callback_url path must end in the provider's callback_path",
+            ),
+            (
+                format!("https://198.51.100.7/oauth/callback/{upper}"),
                 "callback_url path must end in the provider's callback_path",
             ),
         ] {
-            let (status, body) =
-                create(&state, with(authorization_code("github"), json!({"callback_url": callback_url}))).await;
+            let (status, body) = update(&state, &id, json!({"callback_url": callback_url})).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{callback_url}: {body}");
             assert_eq!(body["error"], error, "{callback_url}");
         }
-        let (status, body) = create(
-            &state,
-            with(
-                authorization_code("github"),
-                json!({"callback_url": "https://198.51.100.7/prefix/oauth/callback/github"}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "a reverse proxy prefix is kept: {body}");
-        let (status, body) = update(
-            &state,
-            body["id"].as_str().unwrap(),
-            json!({"callback_url": "http://198.51.100.7/prefix/oauth/callback/github"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": format!("https://198.51.100.7/prefix/oauth/callback/{id}")}))
+                .await;
+        assert_eq!(status, StatusCode::OK, "a reverse proxy prefix is kept: {body}");
 
-        let (status, body) = create(&state, authorization_code("gitlab")).await;
-        assert_eq!(status, StatusCode::CREATED, "without callback_url the gateway's own URL is used: {body}");
         let mut client_credentials = authorization_code("svc");
         client_credentials["provider_type"] = json!("oauth2_client_credentials");
         client_credentials["callback_url"] = json!("http://198.51.100.7/elsewhere");
@@ -2016,10 +2035,13 @@ mod jwt_provider_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"], "callback_url must be an https URL with a host");
         let (status, body) =
-            update(&state, &id, json!({"callback_url": "https://198.51.100.7/oauth/callback/github"})).await;
+            update(&state, &id, json!({"callback_url": format!("https://198.51.100.7/oauth/callback/{id}")})).await;
         assert_eq!(status, StatusCode::OK, "an update may make it conform: {body}");
     }
 
+    /// Each new consent provider's redirect URI ends in its own id, so tenants
+    /// may use the same slug; an update may still not take a stored provider's
+    /// redirect URI, as two providers stored with one slug path could.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_redirect_uri_names_one_consent_provider_across_tenants() {
         let directory = tempfile::tempdir().unwrap();
@@ -2039,30 +2061,34 @@ mod jwt_provider_tests {
                 ),
             )
         };
-        let (status, body) = create(&state, tenant_provider("tenant-a", json!({}))).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = create(&state, tenant_provider("tenant-b", json!({}))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "the same slug in two tenants shares a redirect URI: {body}");
-        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
-        let (status, body) = create(
-            &state,
-            tenant_provider("tenant-b", json!({"callback_url": "https://198.51.100.9/oauth/callback/github"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "an explicit URL equal to another's default: {body}");
-        let (status, body) = create(
-            &state,
-            tenant_provider("tenant-b", json!({"callback_url": "https://203.0.113.8/oauth/callback/github"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = update(
-            &state,
-            body["id"].as_str().unwrap(),
-            json!({"callback_url": "https://198.51.100.9/oauth/callback/github"}),
-        )
-        .await;
+        let (status, first) = create(&state, tenant_provider("tenant-a", json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, second) = create(&state, tenant_provider("tenant-b", json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "the same slug in another tenant: {second}");
+        assert_ne!(first["callback_path"], second["callback_path"]);
+
+        let second_id = second["id"].as_str().unwrap();
+        let mut stored = state
+            .store
+            .get(second_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_path = first["callback_path"]
+            .as_str()
+            .unwrap()
+            .into();
+        stored.callback_url = Some(format!("https://203.0.113.8{}", stored.callback_path));
+        state
+            .store
+            .update(stored.clone())
+            .await
+            .unwrap();
+        let (status, body) =
+            update(&state, second_id, json!({"callback_url": format!("https://198.51.100.9{}", stored.callback_path)}))
+                .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "an update may not take another's redirect URI: {body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

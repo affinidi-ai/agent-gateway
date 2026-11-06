@@ -3784,6 +3784,30 @@ fn oauth_provider_records_authorization_response_issuer(
         .oauth_authorization_response_issuer = Some(issuer);
 }
 
+#[given(expr = "OAuth provider {string} has a callback path ending in the id the gateway gave it")]
+fn oauth_provider_callback_path_ends_in_its_id(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "only the surface's own OAuth provider is stored with a callback path ending in its id"
+    );
+    world
+        .surface_config
+        .oauth_callback_path_ends_in_record_id = true;
+}
+
 #[given(expr = "the gateway has OAuth provider {string}")]
 fn gateway_has_oauth_provider(
     world: &mut SurfaceWorld,

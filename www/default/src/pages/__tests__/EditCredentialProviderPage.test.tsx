@@ -4,6 +4,7 @@ import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import EditCredentialProviderPage from '../EditCredentialProviderPage';
 import { apiClient } from '../../api';
+import { showToast } from '../../utils/toaster';
 
 jest.mock('../../api', () => ({
   apiClient: { get: jest.fn(), put: jest.fn(), post: jest.fn(), fetch: jest.fn() },
@@ -12,8 +13,10 @@ jest.mock('../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: () => true, loading: false }),
 }));
 jest.mock('../../context/PageTitleContext', () => ({ usePageTitle: () => undefined }));
+jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
+const mockShowToast = showToast as jest.Mock;
 
 const ENTRA_V2 = 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token';
 const WARNING = 'credential-provider-entra-resource-warning';
@@ -329,5 +332,192 @@ describe('EditCredentialProviderPage callback URL', () => {
     );
     const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
     expect(JSON.parse(init.body).callback_url).toBe('https://gw.example/old/route/github');
+  });
+
+  const CREATED = {
+    id: 'cp-1',
+    name: 'GitHub',
+    provider_id: 'github',
+    provider_type: 'oauth2_authorization_code',
+    token_endpoint: 'https://github.com/login/oauth/access_token',
+    client_id_secret_ref: 'CLIENT_ID',
+    client_secret_secret_ref: 'CLIENT_SECRET',
+    default_scopes: [],
+    token_refresh_enabled: true,
+    callback_path: '/v1/identity/oauth/callback/cp-1',
+  };
+
+  const renderNewProvider = (putAnswer: { ok: boolean; text?: string }) => {
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/api/v1/config/surface-routing') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              available_listen_addresses: ['https://gw.example', 'http://gw.internal'],
+              oauth_callback_route: '/v1/identity/oauth/callback',
+              gateway_base_url: 'https://gateway.example',
+            }),
+        });
+      }
+      if (url === '/api/v1/secrets/') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve([
+              { id: 's1', secret_id: 'CLIENT_ID', name: 'Client id', tenant_id: null },
+              { id: 's2', secret_id: 'CLIENT_SECRET', name: 'Client secret', tenant_id: null },
+            ]),
+        });
+      }
+      if (url === '/api/v1/credential-providers' && init?.method === 'POST') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(CREATED) });
+      }
+      if (url === '/api/v1/credential-providers/cp-1' && init?.method === 'PUT') {
+        return Promise.resolve({
+          ok: putAnswer.ok,
+          status: putAnswer.ok ? 200 : 400,
+          statusText: putAnswer.ok ? 'OK' : 'Bad Request',
+          json: () => Promise.resolve({}),
+          text: () => Promise.resolve(putAnswer.text ?? ''),
+        });
+      }
+      if (url === '/api/v1/credential-providers/cp-1') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(CREATED) });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/new']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  };
+
+  const fillProvider = async (providerType?: string) => {
+    await screen.findByRole('option', { name: 'https://gw.example' });
+    await screen.findAllByRole('option', { name: /CLIENT_SECRET/ });
+    if (providerType) {
+      fireEvent.change(screen.getByRole('combobox', { name: /^Provider Type/ }), {
+        target: { value: providerType },
+      });
+    }
+    fireEvent.change(screen.getByRole('textbox', { name: /^Name/ }), {
+      target: { value: 'GitHub' },
+    });
+    fireEvent.change(screen.getByRole('textbox', { name: /^Token Endpoint/ }), {
+      target: { value: 'https://github.com/login/oauth/access_token' },
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: /^Client ID Secret/ }), {
+      target: { value: 'CLIENT_ID' },
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: /^Client Secret/ }), {
+      target: { value: 'CLIENT_SECRET' },
+    });
+  };
+
+  const chooseHost = (host = 'https://gw.example') =>
+    fireEvent.change(screen.getByRole('combobox', { name: /^Callback URL Host/ }), {
+      target: { value: host },
+    });
+
+  const calls = (method: string) =>
+    mockFetch.mock.calls.filter(([, options]) => options?.method === method);
+
+  it('creates a provider without a callback URL, then saves the one the created path gives', async () => {
+    renderNewProvider({ ok: true });
+    await fillProvider();
+    chooseHost();
+    expect(
+      await screen.findByTestId('credential-provider-callback-url-after-create')
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() => expect(calls('PUT')).toHaveLength(1));
+    const [[, created]] = calls('POST');
+    expect(JSON.parse(created.body)).not.toHaveProperty('callback_url');
+    const [[url, updated]] = calls('PUT');
+    expect(url).toBe('/api/v1/credential-providers/cp-1');
+    expect(JSON.parse(updated.body)).toEqual({
+      callback_url: 'https://gw.example/v1/identity/oauth/callback/cp-1',
+    });
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith('/api/v1/credential-providers/cp-1')
+    );
+    expect(await screen.findByRole('button', { name: /Save/ })).toBeInTheDocument();
+  });
+
+  it('creates a provider with no host in one request and shows the gateway Callback URL it gets', async () => {
+    renderNewProvider({ ok: true });
+    await fillProvider();
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith('/api/v1/credential-providers/cp-1')
+    );
+    expect(calls('POST')).toHaveLength(1);
+    expect(calls('PUT')).toHaveLength(0);
+    expect(await screen.findByTestId('credential-provider-callback-url')).toHaveTextContent(
+      'https://gateway.example/v1/identity/oauth/callback/cp-1'
+    );
+  });
+
+  it('opens the created provider when its callback URL is refused, so saving again updates it', async () => {
+    renderNewProvider({
+      ok: false,
+      text: JSON.stringify({ error: 'callback_url must be an https URL with a host' }),
+    });
+    await fillProvider();
+    chooseHost();
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    await waitFor(() =>
+      expect(mockShowToast).toHaveBeenCalledWith(
+        'error',
+        expect.stringContaining('Provider created, but its Callback URL was not saved')
+      )
+    );
+    expect(mockShowToast.mock.calls[0][1]).toContain(
+      'callback_url must be an https URL with a host'
+    );
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith('/api/v1/credential-providers/cp-1')
+    );
+    expect(await screen.findByRole('button', { name: /Save/ })).toBeInTheDocument();
+
+    chooseHost();
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() => expect(calls('PUT')).toHaveLength(2));
+    expect(calls('POST')).toHaveLength(1);
+    const [, [, retried]] = calls('PUT');
+    expect(JSON.parse(retried.body).callback_url).toBe(
+      'https://gw.example/v1/identity/oauth/callback/cp-1'
+    );
+  });
+
+  it('refuses an http Callback URL Host before creating anything', async () => {
+    renderNewProvider({ ok: true });
+    await fillProvider();
+    chooseHost('http://gw.internal');
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    expect(
+      await screen.findByText(/The Callback URL Host must be an https address/)
+    ).toBeInTheDocument();
+    expect(calls('POST')).toHaveLength(0);
+    expect(calls('PUT')).toHaveLength(0);
+  });
+
+  it('creates a provider of another type with one request and no callback URL save', async () => {
+    renderNewProvider({ ok: true });
+    await fillProvider('oauth2_client_credentials');
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    await waitFor(() => expect(calls('POST')).toHaveLength(1));
+    await waitFor(() => expect(mockShowToast).toHaveBeenCalledWith('success', 'Provider created'));
+    expect(calls('PUT')).toHaveLength(0);
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/v1/credential-providers/cp-1');
   });
 });
