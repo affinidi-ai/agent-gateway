@@ -1027,9 +1027,9 @@ delete button sends nothing: it opens the confirmation dialog `api-key-delete-di
 like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
 a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
 carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
-client id and key id and says callers presenting the key are refused, and any surface whose
-Identity uses it becomes Unconfigured and stops serving requests until another API key is
-selected. **Delete API key** (`api-key-delete-dialog-confirm`, `btn-danger`) sends the `DELETE`;
+client id and key id and says, in plain words, that callers using the key will be refused,
+surfaces that use it will stop working until another key is picked, and the delete can't be
+undone. **Delete API key** (`api-key-delete-dialog-confirm`, `btn-danger`) sends the `DELETE`;
 it is enabled on open and disabled, with a spinner, only while the delete runs. **Cancel** and the
 close button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
 with the toast "API key deleted", then the tab reloads its keys and the detail page returns to

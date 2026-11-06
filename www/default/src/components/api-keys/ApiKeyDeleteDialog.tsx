@@ -53,9 +53,8 @@ export const ApiKeyDeleteDialog: React.FC<ApiKeyDeleteDialogProps> = ({
                 Delete {clientId ? <strong>{clientId}</strong> : null} <code>{keyId}</code>?
               </p>
               <p className="mb-0">
-                Callers presenting this key are refused. Any surface whose Identity uses this key
-                becomes Unconfigured and stops serving requests until you select another API key for
-                it. This can&apos;t be undone.
+                Callers using this key will be refused. Surfaces that use it will stop working until
+                you pick another key. You can&apos;t undo this.
               </p>
             </div>
             <div className="modal-footer">
