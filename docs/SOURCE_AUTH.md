@@ -422,6 +422,12 @@ Sessions are kept in the `didauth` subdirectory of `[storage_paths] sessions`, a
 from dashboard sessions. At startup the gateway moves any DID Auth session files it
 finds in `sessions` itself into that subdirectory.
 
+DID Auth sessions and dashboard sessions are each stored under the SHA-256 hash of the
+session id or token, in hex. No file name or file holds a value that authenticates;
+a presented session id or token is hashed to find its session. At startup the gateway
+removes every session file not named by its hash, such as one an earlier version named
+by the session id or token, and that caller authenticates or signs in again.
+
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
 presentation with the caller's identity hash as `user_hash` (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callers-identity-hash)).
