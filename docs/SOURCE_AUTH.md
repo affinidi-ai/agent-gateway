@@ -1218,9 +1218,15 @@ another tenant on disk or by another node takes those surfaces out of service un
 
 - Under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
-  tenant, or the key of a surface with no tenant is not ready.
-- A key or owning surface that cannot be found is only reported. The key may exist on another
-  node that shares the storage and not be visible here yet, so the request after
+  tenant, the key of a surface with no tenant, or a key whose owning surface cannot be found
+  (`missing_owner`) is not ready. Deleting a surface revokes its API keys (actor
+  `surface-delete`) and keeps them, so a surface naming the key of a deleted surface stops
+  serving. A new surface cannot take the id of a deleted surface
+  whose keys remain: the create answers `400` "Surface ID '…' is not available".
+- A key or owning surface that cannot be found is checked again later. Under `warn` both are
+  only reported, and a key that cannot be found is only reported under `enforce` too. The key or
+  its owning surface may exist on another node that shares the storage and not be visible here
+  yet, so the request after
   `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
   appeared by then is held to the rules above. Until then the verdict is kept, so a surface
   naming a key that does not exist does not read the API key store on every request. Each read
@@ -1230,8 +1236,15 @@ another tenant on disk or by another node takes those surfaces out of service un
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)).
 - While the API key store cannot be read, a surface naming an `atgk_` id is not ready in either
   mode unless it was checked before the outage and has not gone live again since; a surface that
-  goes live during the outage loses its earlier verdict. The outage is logged once. Each request
-  to an unchecked surface checks again, so it serves once a read succeeds.
+  goes live during the outage loses its earlier verdict. The outage is logged once. The outage
+  verdict is kept like a missing key's, so the request after `cache_refresh_interval_secs` (30
+  seconds when it is `0`) checks again and the surface serves once a read succeeds; requests
+  before then are refused without reading the store.
+- The store counts as unreadable while the keys of any surface's key folder cannot be loaded,
+  for example when the folder cannot be read, so a key in that folder is never mistaken for a
+  missing one. The `GET /v1/api-keys` listing still answers, without that folder's keys.
+- Boot and a configuration reload read the API key store once for all the surfaces they bring
+  live.
 - If the API key store fails to start, the gateway runs without it until it restarts: every
   surface naming an `atgk_` id stays not ready in either mode. Fix the store and restart.
 

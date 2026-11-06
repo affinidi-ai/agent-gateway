@@ -3190,6 +3190,7 @@ pub async fn create_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("Surface with ID '{}' already exists", surface.surface_id)));
     }
+    super::surface_tenancy::refuse_id_owning_api_keys(&state, &surface.surface_id).await?;
 
     // Enforce the appliance surface limit (per-type plus the total) before persisting.
     crate::config::enforce_add("surfaces.agent")
@@ -4408,6 +4409,39 @@ pub async fn patch_variant(
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
+/// The actor a deleted surface's API keys are revoked under.
+const SURFACE_DELETE_ACTOR: &str = "surface-delete";
+
+/// Revokes every active API key of the deleted surface `surface_id`. The keys are kept, so the
+/// surface id still owns them and cannot be taken by a new surface. A key that cannot be revoked
+/// is logged.
+async fn revoke_api_keys_of_deleted_surface(
+    state: &IdentityApiState,
+    surface_id: &str,
+) {
+    let Some(api_keys) = state.api_key_store.as_deref() else {
+        return;
+    };
+    let keys = match api_keys.list_all().await {
+        Ok(keys) => keys,
+        Err(error) => {
+            error!(surface = %surface_id, %error, "Could not list the API keys of a deleted surface to revoke them");
+            return;
+        }
+    };
+    for key in keys
+        .into_iter()
+        .filter(|key| key.agent_id == surface_id && key.status == crate::api_keys::ApiKeyStatus::Active)
+    {
+        if let Err(error) = api_keys
+            .revoke(surface_id, &key.key_id, SURFACE_DELETE_ACTOR)
+            .await
+        {
+            error!(surface = %surface_id, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface");
+        }
+    }
+}
+
 pub async fn delete_surface(
     Path(surface_id): Path<String>,
     State(state): State<IdentityApiState>,
@@ -4454,6 +4488,7 @@ pub async fn delete_surface(
             .await?;
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
+            revoke_api_keys_of_deleted_surface(&state, &surface_id).await;
 
             if let Some(recorder_status) = global_store() {
                 recorder_status

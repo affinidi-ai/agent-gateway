@@ -1,0 +1,39 @@
+branch: fix/provider-key-tenant-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Read the API key store once per boot or reload for the provider key check
+      description: >-
+        Boot and a configuration reload now check every surface that derives a DID from an API
+        key against one listing of the API key store, instead of listing the whole store once
+        per surface.
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Stop re-reading an unreadable API key store on every request
+      description: >-
+        While the API key store cannot be read, a surface naming an API key id keeps its 503
+        verdict until the recheck interval passes, as a missing key's verdict is kept, so a
+        failing disk or share is read at most once per interval per surface.
+  removed: []
+  security:
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Stop surfaces serving the API key DID of a deleted surface under enforce
+      description: >-
+        Under tenant_credential_isolation enforce, a surface naming an API key whose owning
+        surface no longer exists is not ready, as the key's tenant cannot be told. A new surface
+        cannot be created with the id of a deleted surface whose API keys remain, so it cannot
+        take over those keys and the DIDs derived from them.
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Revoke a surface's API keys when the surface is deleted
+      description: >-
+        Deleting a surface now revokes its active API keys and keeps their records, so they
+        no longer authenticate callers and the deleted surface's id stays tied to them.
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Treat an API key folder that fails to load as a key store outage
+      description: >-
+        The provider key tenant check no longer reads the keys of a folder it could not load as
+        missing. Surfaces naming an API key id answer 503 until the folder can be read, so a
+        surface cannot keep serving another tenant's key DID because that key failed to load.
+        The API key listing still answers without the folder's keys.
+  breaking: []

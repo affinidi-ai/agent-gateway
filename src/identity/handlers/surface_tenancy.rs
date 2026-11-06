@@ -1802,8 +1802,9 @@ pub(crate) enum ProviderKeyIssueKind {
     ApplianceKey { enforced: bool },
     /// No key has this id; key ids are never reused, so its DID is no other key's.
     MissingKey,
-    /// The surface owning the key no longer exists.
-    MissingOwner,
+    /// The surface owning the key no longer exists, so its tenant cannot be told; a breach only
+    /// when enforced.
+    MissingOwner { enforced: bool },
     /// The API key store is unavailable, so the key's owner cannot be told.
     StoreUnavailable,
 }
@@ -1814,7 +1815,7 @@ impl ProviderKeyIssueKind {
             Self::OtherTenant { .. } => "other_tenant",
             Self::ApplianceKey { .. } => "appliance_key",
             Self::MissingKey => "missing_key",
-            Self::MissingOwner => "missing_owner",
+            Self::MissingOwner { .. } => "missing_owner",
             Self::StoreUnavailable => "store_unavailable",
         }
     }
@@ -1823,7 +1824,10 @@ impl ProviderKeyIssueKind {
     pub(crate) fn is_breach(self) -> bool {
         matches!(
             self,
-            Self::StoreUnavailable | Self::OtherTenant { enforced: true } | Self::ApplianceKey { enforced: true }
+            Self::StoreUnavailable
+                | Self::OtherTenant { enforced: true }
+                | Self::ApplianceKey { enforced: true }
+                | Self::MissingOwner { enforced: true }
         )
     }
 }
@@ -1894,7 +1898,12 @@ pub(crate) fn judge_provider_keys(
         for owner_id in owner_ids {
             let Some(owner_tenant) = surface_tenants.get(owner_id.as_str()) else {
                 if !legacy {
-                    issue(key_id, ProviderKeyIssueKind::MissingOwner);
+                    issue(
+                        key_id,
+                        ProviderKeyIssueKind::MissingOwner {
+                            enforced: isolation.is_enforced(),
+                        },
+                    );
                 }
                 continue;
             };
@@ -1931,13 +1940,34 @@ pub(crate) async fn provider_key_owners(
     .await
 }
 
-/// [`provider_key_owners`] read from `store`.
+/// Refuses a new surface whose id still owns API keys, kept from a deleted surface of that id, so
+/// a new surface never takes over another surface's keys and the DIDs derived from them.
+pub(crate) async fn refuse_id_owning_api_keys(
+    state: &IdentityApiState,
+    surface_id: &str,
+) -> Result<(), SurfaceApiError> {
+    let Some(store) = state.api_key_store.as_deref() else {
+        return Ok(());
+    };
+    if provider_key_owners_in(store)
+        .await?
+        .values()
+        .flatten()
+        .any(|owner| owner == surface_id)
+    {
+        return Err(SurfaceApiError::BadRequest(format!("Surface ID '{surface_id}' is not available")));
+    }
+    Ok(())
+}
+
+/// [`provider_key_owners`] read from `store`, an error when the keys of an agent could not be
+/// loaded.
 pub(crate) async fn provider_key_owners_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
 ) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
     let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for key in store
-        .list_all()
+        .list_all_complete()
         .await
         .map_err(|error| internal("API key", error))?
     {

@@ -54,6 +54,12 @@ pub trait ApiKeyStore: Send + Sync {
     /// List all keys across all agents (metadata only, no secrets)
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>>;
 
+    /// [`Self::list_all`], failing instead when the keys of an agent could not be loaded, so a
+    /// listing that answers holds every key. The default is [`Self::list_all`].
+    async fn list_all_complete(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        self.list_all().await
+    }
+
     /// Get a specific key's full stored record (includes the secret hash, never
     /// the raw secret). Internal use only — backs revoke/rotate/delete.
     async fn get_record(

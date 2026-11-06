@@ -2399,3 +2399,88 @@ async fn a_key_another_node_created_after_startup_is_checked_on_save() {
     api.assert_create_refused(&naming("/smoke/later-cross", &keys[1]), NOT_ACCESSIBLE_KEY_OWNER)
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_surface_cannot_take_the_id_of_a_deleted_surface_that_still_owns_api_keys() {
+    const DELETED_OWNER: &str = "deleted-key-owner";
+    let mut client = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        seed_api_key(bootstrap, DELETED_OWNER, "atgk_00000000000000000000000000000d01");
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+
+    let mut reused = api.surface("/smoke/reused-id", Some("tenant-a"), json!({}));
+    reused["surface_id"] = json!(DELETED_OWNER);
+    let (status, body) = api.create(&reused).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["details"], format!("Surface ID '{DELETED_OWNER}' is not available"), "{body}");
+    let (status, body) = api
+        .send(
+            api.client
+                .get(api.url(&format!("surfaces/{DELETED_OWNER}"))),
+        )
+        .await;
+    assert_eq!(status, 404, "a refused create stores nothing: {body}");
+
+    let mut fresh = api.surface("/smoke/fresh-id", Some("tenant-a"), json!({}));
+    fresh["surface_id"] = json!("fresh-surface-id");
+    assert_eq!(api.created_id(&fresh).await, "fresh-surface-id");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_surface_revokes_its_api_keys_and_keeps_its_id_taken() {
+    let (_harness, api) = harness(RuleMode::Enforce).await;
+    let surface = api.surface("/smoke/doomed", Some("tenant-a"), json!({}));
+    let surface_id = api.created_id(&surface).await;
+    let (status, created) = api
+        .send(
+            api.client
+                .post(api.url(&format!("api-keys/{surface_id}")))
+                .json(&json!({"client_id": "client"})),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let key_id = created["key_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = api
+        .send(
+            api.client
+                .delete(api.url(&format!("surfaces/{surface_id}"))),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, keys) = api
+        .send(
+            api.client
+                .get(api.url("api-keys")),
+        )
+        .await;
+    assert_eq!(status, 200, "{keys}");
+    let key = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["key_id"] == key_id.as_str())
+        .unwrap_or_else(|| panic!("the key is kept: {keys}"));
+    assert_eq!(key["status"], "revoked", "{key}");
+
+    let mut reused = surface.clone();
+    reused["surface_id"] = json!(surface_id);
+    let (status, body) = api.create(&reused).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["details"], format!("Surface ID '{surface_id}' is not available"), "{body}");
+}

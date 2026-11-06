@@ -93,9 +93,10 @@ impl FileSystemApiKeyStore {
     /// directory, later those another node sharing the storage created since. A
     /// symlink to a directory counts as one; an entry whose type cannot be read is
     /// skipped. A name that is not a valid storage id is no agent's and is
-    /// skipped; an agent whose keys cannot be loaded is logged and skipped. A root
-    /// that cannot be read is an error.
-    async fn load_new_agents(&self) -> ApiKeyResult<()> {
+    /// skipped; an agent whose keys cannot be loaded is logged, skipped, and
+    /// returned. A root that cannot be read is an error.
+    async fn load_new_agents(&self) -> ApiKeyResult<Vec<String>> {
+        let mut skipped = Vec::new();
         let mut entries = fs::read_dir(&self.storage_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
@@ -117,10 +118,32 @@ impl FileSystemApiKeyStore {
                 .await
             {
                 warn!("Failed to load keys for agent {}: {}", agent_id, e);
+                skipped.push(agent_id.to_string());
             }
         }
 
-        Ok(())
+        Ok(skipped)
+    }
+
+    /// Every key of the agents loaded so far.
+    async fn list_loaded(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        let stores: Vec<_> = self
+            .stores
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        let mut all = Vec::new();
+        for store in stores {
+            for record in store.list_all().await? {
+                all.push(ApiKeyMeta::from(record));
+            }
+        }
+        all.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+        });
+        Ok(all)
     }
 
     /// Get (or lazily create) the generic filesystem store backing one agent's
@@ -570,23 +593,18 @@ impl ApiKeyStore for FileSystemApiKeyStore {
 
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
         self.load_new_agents().await?;
-        let stores: Vec<_> = self
-            .stores
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+        self.list_loaded().await
+    }
 
-        let mut all = Vec::new();
-        for store in stores {
-            for record in store.list_all().await? {
-                all.push(ApiKeyMeta::from(record));
-            }
+    async fn list_all_complete(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        let skipped = self.load_new_agents().await?;
+        if !skipped.is_empty() {
+            return Err(ApiKeyError::Storage(anyhow::anyhow!(
+                "the keys of {} agent(s) could not be loaded",
+                skipped.len()
+            )));
         }
-        all.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-        });
-        Ok(all)
+        self.list_loaded().await
     }
 }
 
@@ -781,6 +799,63 @@ mod tests {
             "a deleted agent folder is dropped"
         );
         assert_eq!(validates(created.secret.clone()).await, None);
+    }
+
+    #[tokio::test]
+    async fn only_a_complete_listing_fails_when_an_agents_keys_cannot_be_loaded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (first, temp_dir) = create_test_store().await;
+        let readable = first
+            .create("agent-readable", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        first
+            .create("agent-locked", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let locked = temp_dir
+            .path()
+            .join("agent-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: no read fails, so there is no folder to skip.
+            return;
+        }
+
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .expect("a folder that cannot be loaded does not stop the store from starting");
+        let listed: Vec<String> = second
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|key| key.key_id)
+            .collect();
+        assert_eq!(listed, vec![readable.key_id], "a plain listing leaves the folder out");
+        assert!(
+            second
+                .list_all_complete()
+                .await
+                .is_err(),
+            "a complete listing fails"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            second
+                .list_all_complete()
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the folder is loaded once it can be read"
+        );
     }
 
     #[tokio::test]
