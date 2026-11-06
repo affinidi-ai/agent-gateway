@@ -138,9 +138,9 @@ apply. See [`RBAC.md`](RBAC.md#token-info-endpoint) for the response shape.
 Tenant-owned top-level management records carry an optional `tenant_id`. Its absence
 means appliance-global, for backward compatibility.
 
-A tenant PAT sees same-tenant records plus global ones (except delegation vault tokens and
-audit records, [below](#delegation-vault-tokens)). Dashboard sessions remain
-appliance-wide. A record that belongs to another tenant answers `404` on read and on every
+A tenant PAT sees same-tenant records plus global ones (except agent-keyed vault tokens and the
+records of `/api/v1/delegation-audit` and `/v1/audit`, [below](#delegation-vault-tokens)).
+Dashboard sessions remain appliance-wide. A record that belongs to another tenant answers `404` on read and on every
 write (update, delete, trigger, reconnect, retry and the other record actions), with the same
 body as a missing record, so its ID cannot be probed. A record whose ID falls outside the PAT's
 resource pattern answers `404` on read and `403` on write; secrets, certificates and API keys
@@ -238,20 +238,20 @@ the tokens are kept, whichever tenant they belong to.
 
 ### Delegation audit records
 
-A delegation audit record belongs to the tenant of the credential provider it names, matched
-exactly as for [vault tokens](#delegation-vault-tokens). `GET /api/v1/delegation-audit` and the
-VP Audit Log, `GET /v1/audit`, show a tenant PAT only its own tenant's records. Their `total`,
-`total_pages` and `category_counts` count only those records, and the `filter` text search looks
-only among them. A record that names no provider, such as a policy decision or a revoke through
-the management API, and a record of an appliance-wide, missing or deleted provider, are shown only
-to appliance-wide callers. The OAuth callback's `consent_granted` names its provider's id, as every
-other delegation record does, so the provider's tenant reads it; one written by an earlier release
-names the provider's `provider_id` slug instead and is shown only to appliance-wide callers. A
-provider's slug never decides who reads a record, since two tenants can each have a provider with
-the same slug. A PAT scoped by required headers alone, or by a resource pattern without a tenant,
-reads no record. While the credential providers cannot be read,
-a tenant PAT gets `500` from `/api/v1/delegation-audit` and an empty page from `/v1/audit`. A
-record follows its provider's current tenant, as a vault token does.
+This section covers the two routes that read the VP Audit Log as a delegation audit,
+`GET /api/v1/delegation-audit` and `GET /v1/audit`. On them, a record belongs to the tenant of the
+credential provider it names, matched exactly as for [vault tokens](#delegation-vault-tokens), and a
+tenant PAT sees only its own tenant's records. Their `total`, `total_pages` and `category_counts`
+count only those records, and the `filter` text search looks only among them. A record that names no
+provider, such as a policy decision or a revoke through the management API, and a record of an
+appliance-wide, missing or deleted provider, are shown only to appliance-wide callers. The OAuth
+callback's `consent_granted` names its provider's id, as every other delegation record does, so the
+provider's tenant reads it; one written by an earlier release names the provider's `provider_id`
+slug instead and is shown only to appliance-wide callers. A provider's slug never decides who reads
+a record, since two tenants can each have a provider with the same slug. A PAT scoped by required
+headers alone, or by a resource pattern without a tenant, reads no record. While the credential
+providers cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and an empty page
+from `/v1/audit`. A record follows its provider's current tenant, as a vault token does.
 
 ### Ownership of child records
 
@@ -305,8 +305,9 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 
 Runtime stores, listeners, policy compilation, hot reload, and the data-plane protocols
 are unpartitioned. Tenancy constrains management records, not the running data plane. The
-delegation vault's agent-keyed tokens and the audit log are stored unpartitioned too; their reads
-are filtered by the tenant of each record's credential provider
+delegation vault's agent-keyed tokens and the audit log are stored unpartitioned too; the vault
+reads and the two delegation audit routes filter them by the tenant of each record's credential
+provider
 ([Delegation vault tokens](#delegation-vault-tokens),
 [Delegation audit records](#delegation-audit-records)).
 

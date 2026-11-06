@@ -2169,7 +2169,7 @@ leave out all four.
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |
 | `GET /api/v1/delegation-audit` | The delegation audit log; a tenant's access token reads only its own tenant's records |
 
-A vault entry and an audit record belong to the tenant of their credential provider; see
+On these routes, a vault entry and an audit record belong to the tenant of their credential provider; see
 [Delegation vault tokens](ACCESS_TOKENS.md#delegation-vault-tokens) and
 [Delegation audit records](ACCESS_TOKENS.md#delegation-audit-records) in `ACCESS_TOKENS.md`.
 
