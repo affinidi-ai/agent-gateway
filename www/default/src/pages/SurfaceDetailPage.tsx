@@ -50,6 +50,7 @@ import {
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
 import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
+import { apiKeyStatusMap } from '../components/surface-builder/elements/identity/apiKeyStatus';
 import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
@@ -1498,6 +1499,10 @@ const SurfaceDetailPage: React.FC = () => {
       withoutCanvasLayout(baselineRef.current) !== withoutCanvasLayout(currentSignature),
     [isDirty, currentSignature]
   );
+  const apiKeyStatuses = useMemo(
+    () => apiKeyStatusMap(surface?.api_key_references),
+    [surface?.api_key_references]
+  );
   const { discard, popPendingRestore } = useDiscardWithUndo({
     dirty: isDirty,
     navigateTo: '/surfaces',
@@ -1738,6 +1743,7 @@ const SurfaceDetailPage: React.FC = () => {
         hasVariants={savedHasVariants}
         accessPointNotice={accessPointNotice}
         legacyAccessPoint={legacyAccessPoint}
+        apiKeyStatuses={apiKeyStatuses}
         surfaceId={surface?.surface_id}
         tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={

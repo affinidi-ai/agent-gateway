@@ -1,4 +1,5 @@
 import { scrubVolatileTemplateFields, findDuplicateListenerRoutes } from '../scrubVolatile';
+import { tokenizeSnapshot } from '../tokenizeSnapshot';
 
 describe('scrubVolatileTemplateFields', () => {
   it('drops every API key id an Identity names, keeping the Identity', () => {
@@ -70,6 +71,27 @@ describe('scrubVolatileTemplateFields', () => {
     expect(overrides.canvas.nodes[0].config).toEqual({ type: 'from_api_key' });
     expect(overrides.canvas.nodes[1].config.api_key_id).toBe('kept');
     expect(input.access_point.caller_authentication.methods[0].secret_id).toBe('atgk_own');
+  });
+
+  it('drops the read-only fields the gateway sets on a surface response', () => {
+    const out = scrubVolatileTemplateFields({
+      name: 's',
+      access_point_status: 'not_ready',
+      api_key_references: [{ key_id: 'atgk_own', status: 'revoked' }],
+    });
+    expect(out).toEqual({ name: 's' });
+  });
+
+  it('keeps a template snapshot free of the read-only surface fields', () => {
+    const { surface } = tokenizeSnapshot(
+      {
+        name: 's',
+        access_point_status: 'ready',
+        api_key_references: [{ key_id: 'atgk_own', status: 'active' }],
+      },
+      { tokenizeNamedFields: false }
+    );
+    expect(surface).toEqual({ name: 's' });
   });
 
   it('blanks transit-point listener + identity fields', () => {

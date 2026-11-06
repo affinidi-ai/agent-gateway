@@ -11,6 +11,11 @@ import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping'
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
 import { isInboundIdentity } from './placement';
+import {
+  apiKeyReferenceWarningText,
+  unlistedApiKeyLabel,
+  unusableApiKeyStatus,
+} from './apiKeyStatus';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
 interface ApiKeyOption {
@@ -175,6 +180,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
 
   const storedKeyId: string = config.api_key_id || '';
   const storedKeyListed = !storedKeyId || apiKeys.some(k => k.key_id === storedKeyId);
+  const storedKeyProblem = unusableApiKeyStatus(storedKeyId, meta?.apiKeyStatuses);
 
   useEffect(() => {
     if (extractionType !== 'from_mtls' || certificates.length > 0) return;
@@ -381,7 +387,9 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
           >
             <option value="">{loadingKeys ? 'Loading…' : 'Select an API key'}</option>
             {!loadingKeys && !storedKeyListed && (
-              <option value={storedKeyId}>{storedKeyId} (not an active key of this surface)</option>
+              <option value={storedKeyId}>
+                {unlistedApiKeyLabel(storedKeyId, storedKeyProblem)}
+              </option>
             )}
             {apiKeys.map(k => (
               <option key={k.key_id} value={k.key_id}>
@@ -389,6 +397,15 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
               </option>
             ))}
           </Form.Select>
+          {storedKeyProblem && (
+            <div
+              className="text-danger small mt-1"
+              role="alert"
+              data-testid="identity-api-key-revoked-warning"
+            >
+              {apiKeyReferenceWarningText(storedKeyProblem)}
+            </div>
+          )}
           {!surfaceId && (
             <Form.Text className="text-muted d-block" data-testid="identity-panel-api-key-unsaved">
               A new surface has no API keys yet. Remove this Identity or choose another type, save

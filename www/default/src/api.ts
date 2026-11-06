@@ -1190,6 +1190,8 @@ export interface ApiKeyRecord {
   issuer: { actor: string; method: string };
   rotated_from?: string;
   needs_rotation?: boolean;
+  /** True when the surface the key belongs to was deleted. */
+  surface_deleted?: boolean;
 }
 
 export interface ApiKeyCreated {
@@ -1432,6 +1434,11 @@ export interface AgentSurface {
    * callers get 503 until one is added or Public access is turned on.
    */
   access_point_status?: AccessPointStatus;
+  /**
+   * Read-only, set by the gateway on surface responses: the status of each API
+   * key the surface names. Absent when the surface names none.
+   */
+  api_key_references?: ApiKeyReference[];
 
   /** Non-blocking notes returned by a save; never sent back. */
   warnings?: SurfaceSaveWarning[];
@@ -1443,6 +1450,13 @@ export interface SurfaceSaveWarning {
 }
 
 export type AccessPointStatus = 'ready' | 'not_ready';
+
+export type ApiKeyReferenceStatus = 'active' | 'revoked' | 'missing' | 'unavailable' | 'unknown';
+
+export interface ApiKeyReference {
+  key_id: string;
+  status: ApiKeyReferenceStatus;
+}
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
@@ -1608,14 +1622,15 @@ function withoutServerWrittenCanvases<S extends Partial<AgentSurface>>(surface: 
 
 /**
  * Drops fields the server writes and refuses on input: save `warnings`, the derived
- * `access_point_status`, `transit_point_source_auth` and `manifest_snapshot`, from the
- * policies and from the canvas blobs.
+ * `access_point_status`, `api_key_references` and `transit_point_source_auth`, and
+ * `manifest_snapshot`, from the policies and from the canvas blobs.
  */
 export function stripServerWrittenFields(surface: Partial<AgentSurface>): Partial<AgentSurface> {
   if (!surface || typeof surface !== 'object') return surface;
   const {
     warnings: _warnings,
     access_point_status: _status,
+    api_key_references: _keyReferences,
     ...rest
   } = withoutDerivedMarks(surface);
   const out: Partial<AgentSurface> = withoutServerWrittenCanvases(rest);

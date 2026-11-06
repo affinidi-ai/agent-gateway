@@ -406,7 +406,21 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the picker (`identity-panel-api-key-select`) and need a key. The picker lists only the active
   keys of the surface being edited (`GET /api-keys/{surface_id}`, from `SurfaceMetaContext`), as
   the gateway refuses another surface's key; a stored id that is not among them stays selected as
-  "<id> (not an active key of this surface)". On the create page (`isCreate`, which already has a
+  "<id> (not an active key of this surface)". **Unconfigured Identity**: the surface read and save
+  responses carry `api_key_references` (`key_id` and `status`), passed to the panels and the
+  canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). A
+  protected, external or Transit Point From API Key Identity whose current `api_key_id` is
+  `revoked`, `missing` or `unavailable` gets the red dashed ring (`POLICY_UNCONFIGURED_DASH`, as a
+  missing policy), "API key revoked", "API key deleted" or "API key of another surface" under its
+  label, and the full warning in the ring tooltip ("Unconfigured: …"), and the panel shows the same warning under the picker (`identity-api-key-revoked-warning`) and
+  labels the stored id "<id> (revoked)", "(deleted)" or "(belongs to another surface)". The
+  warnings are "The API key this Identity uses was revoked. Select an active API key of this
+  surface.", "… was deleted. Select an active API key of this surface." and "The API key this
+  Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the
+  list, and the inbound Identity show nothing. The lookup is by key id, so variant canvases use
+  the same list, and picking an active key clears the ring before Save. It is not a Save
+  blocker: it is not part of `configured` or `getIncompleteReason`, since the gateway keeps a
+  reference the stored surface already named. On the create page (`isCreate`, which already has a
   client-made `surfaceId`) it fetches nothing and shows "A new surface has no API keys yet. Remove
   this Identity or choose another type, save the surface, add an API key, then come back and
   select it." (`identity-panel-api-key-unsaved`); the rule is behind
@@ -416,9 +430,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   back and select it." (`SELECT_OWN_API_KEY`). A template capture or apply
   (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
   injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
-  canvas Identity nodes (top-level and in variant overrides), and every `atgk_` Caller Context
-  `secret_id` of the base and the variant overrides, so the new surface's Identity asks for its
-  own key. An error-level dependency blocks
+  canvas Identity nodes (top-level and in variant overrides), every `atgk_` Caller Context
+  `secret_id` of the base and the variant overrides, and the read-only `access_point_status` and
+  `api_key_references`, so the new surface's Identity asks for its own key. A surface write never
+  sends `access_point_status` or `api_key_references` (`toBackendSurface`). An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
@@ -1018,6 +1033,10 @@ The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-key
 <gateway message> (<status>)". The gateway refuses deleting a key a surface still names with
 `409`, and the message names the surfaces the caller may see, so the operator knows which
 Identity to change first. The detail page stays open after a failed delete.
+
+When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
+the detail page shows the info alert "This API key is no longer in use because the associated
+surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
 
 ## Policy definition editor
 

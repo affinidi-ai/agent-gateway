@@ -19,6 +19,16 @@ changes:
         surface no longer exists, instead of 404, and every answer carries surface_deleted, which
         tells whether the key is still in use by a surface. Tenant-, resource- and
         header-gated callers still get 404 for such a key.
+    - timestamp: '2026-11-05T19:00:00Z'
+      title: Flag an Identity whose API key was revoked or deleted in the Surface Builder
+      description: >-
+        The Surface Builder draws a red dashed ring and a warning on a protected, external or
+        Transit Point Identity whose stored API key was revoked, deleted, or belongs to another
+        surface, in the base and every variant, and the Identity panel names that state in the
+        key picker with the same warning. It does not block saving other edits, since the
+        gateway keeps a reference the surface already named. The API key detail page says
+        "This API key is no longer in use because the associated surface has been deleted."
+        for a key whose surface was deleted.
   changed: []
   fixed: []
   removed: []
