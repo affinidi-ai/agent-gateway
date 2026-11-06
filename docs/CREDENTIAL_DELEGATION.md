@@ -1202,8 +1202,9 @@ cannot be obtained is recorded in the VP Audit Log as a `request_rejected` recor
 so is a request refused for leaving the Target base path, with outcome `rejected` whatever the
 `fallback` (a request carrying only a delegated credential is recorded as `target_path_refused`). An
 `a2a-proxy://` Target sends its A2A proxy's Direct Line credential rather than `target.auth`:
-that credential follows `target_source_auth` (withheld with a warning, the request goes on
-without it and no audit record is written), on the direct path and Fabric receive alike, and
+that credential follows `target_source_auth` (withheld, the request goes on
+without it, no audit record is written, and the one warning is the Direct Line runtime's
+"Refusing to attach the Direct Line credential" line per request), on the direct path and Fabric receive alike, and
 `target_https` does not apply to it because it goes to the proxy's own Direct Line endpoint. A
 caller whose authentication failed, including one that carries credentials for more than one
 `caller_authentication` method (`ambiguous_credentials`), and a public discovery read, never get

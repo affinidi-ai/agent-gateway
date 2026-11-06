@@ -910,7 +910,7 @@ pub(crate) fn a2a_proxy_target_caller(
     let mode = crate::config::credential_policy::credential_policy().target_source_auth;
     match withholding_rule(&surface.surface_id, None, broken, |_| mode) {
         Some(rule) => {
-            warn!(surface_id = %surface.surface_id, rule = rule.key(), "Withholding the A2A proxy backend credential");
+            debug!(surface_id = %surface.surface_id, rule = rule.key(), "Withholding the A2A proxy backend credential");
             CallerAssertion::Unauthenticated
         }
         None => caller,
@@ -18094,6 +18094,36 @@ pub(crate) mod target_auth_tests {
             assert_eq!(caller_under(RuleMode::Enforce, two_methods).await, [Authenticated, Unauthenticated]);
             assert_eq!(caller_under(RuleMode::Warn, no_methods.clone()).await, [Authenticated, Unauthenticated]);
             assert_eq!(caller_under(RuleMode::Enforce, no_methods).await, [Unauthenticated, Unauthenticated]);
+        }
+
+        #[tokio::test]
+        async fn an_enforced_a2a_proxy_withhold_logs_no_warning_from_the_handler() {
+            use crate::config::credential_policy::{CredentialPolicyConfig, TEST_CREDENTIAL_POLICY};
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "proxy-surface-log", "name": "proxy-surface-log",
+                "access_point": {"listen_address": "127.0.0.1:8080", "route": "/p", "protocol": "a2a"},
+                "target": {"endpoint": "a2a-proxy://proxy-1"}
+            }))
+            .unwrap();
+            let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+                target_source_auth: RuleMode::Enforce,
+                ..CredentialPolicyConfig::default()
+            }));
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let caller = TEST_CREDENTIAL_POLICY
+                .scope(policy, async {
+                    super::super::a2a_proxy_target_caller(&surface, CallerAssertion::Authenticated)
+                })
+                .await;
+            assert_eq!(caller, CallerAssertion::Unauthenticated);
+            let text = logs.text();
+            let withheld: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("Withholding the A2A proxy backend credential"))
+                .collect();
+            assert_eq!(withheld.len(), 1, "{text}");
+            assert!(withheld[0].contains("DEBUG"), "{}", withheld[0]);
+            assert!(!text.contains("WARN"), "{text}");
         }
     }
 
