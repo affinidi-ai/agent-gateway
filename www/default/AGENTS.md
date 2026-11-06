@@ -405,15 +405,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
   the picker (`identity-panel-api-key-select`) and need a key. The picker lists only the active
   keys of the surface being edited (`GET /api-keys/{surface_id}`, from `SurfaceMetaContext`), as
-  the gateway refuses another surface's key; a stored id that is not among them stays selected as
-  "<id> (not an active key of this surface)". **Unconfigured Identity**: the surface read and save
+  the gateway refuses another surface's key; a stored id that is not among them stays selected,
+  labelled by its status (below), or "<id> (not an active key of this surface)" when that status
+  is not `revoked`, `missing` or `unavailable`. **Unconfigured Identity**: the surface read and save
   responses carry `api_key_references` (`key_id` and `status`), passed to the panels and the
   canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). A
   protected, external or Transit Point From API Key Identity whose current `api_key_id` is
   `revoked`, `missing` or `unavailable` gets the red dashed ring (`POLICY_UNCONFIGURED_DASH`, as a
   missing policy), "API key revoked", "API key deleted" or "API key of another surface" under its
-  label, and the full warning in the ring tooltip ("Unconfigured: …"), and the panel shows the same warning under the picker (`identity-api-key-revoked-warning`) and
-  labels the stored id "<id> (revoked)", "(deleted)" or "(belongs to another surface)". The
+  label, and the full warning in the ring tooltip ("Unconfigured: …"), and the panel shows the
+  same warning under the picker (`identity-api-key-revoked-warning`) and labels the stored id "<id> (revoked)", "(deleted)" or "(belongs to another surface)". The
   warnings are "The API key this Identity uses was revoked. Select an active API key of this
   surface.", "… was deleted. Select an active API key of this surface." and "The API key this
   Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the

@@ -295,7 +295,8 @@ Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
 has one, otherwise the base. Variant responses carry it for that variant. `ready` does not mean
 the surface serves: a surface refused for its API Key Provider keys stays `ready` and answers
-`503`. Look for `rule="provider_key_tenant"` in the gateway log; see
+`503`. Look for `rule="provider_key_tenant"` in the gateway log, or a `revoked` key in
+`api_key_references` below; see
 [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
 
 A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
@@ -1192,7 +1193,9 @@ An API Key Provider key and a plain API Key secret hash the same fields, `creden
 the key id or `secret_id`. A secret named after a provider key id would get that key's identity
 record and DID, so the `atgk_` prefix is reserved for API key ids: `POST /v1/secrets/new`
 refuses a `secret_id` that starts with it with `400`. An update cannot change a secret's id, and
-a secret stored with such an id before the prefix was reserved keeps loading and serving.
+a secret stored with such an id before the prefix was reserved keeps loading, and serves unless
+a key of that id is revoked (see
+[Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live)).
 
 #### Tenant check of provider keys
 
@@ -1234,9 +1237,8 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   Identity is From API Key, when a key of that id belongs to another surface. Such a secret takes
   that key's DID, so it is held to the same rule as naming the key. One the stored surface
   already named is kept under `warn` and refused under `enforce`. An id no key has is a plain
-  secret. A key whose owning surface was deleted is not checked for its owner: such a secret is
-  accepted in either mode, unlike an Identity naming that key, unless the key is revoked (deleting
-  a surface revokes its keys), which the next rule refuses;
+  secret. A key whose owning surface was deleted has no owner to check, but deleting a surface
+  revokes its keys, so the next rule refuses such a new secret;
 - a new reference, in an Identity slot, a Transit Point or such a Caller Context secret, to a
   revoked key of the surface's own: "API key '<key id>' is revoked; name an active API key of this
   surface", in either mode. The rules above run first, so a revoked key the surface may not name
@@ -1368,8 +1370,8 @@ reported like a key id when a key of that id is revoked, or belongs to a surface
 may not reference, or to a surface with no tenant; otherwise it is a plain secret and is not
 reported. A key whose owning surface was deleted is not reported as `missing_owner` for such a
 secret; deleting the surface revokes the key, so it is reported as `revoked_key` and the surface
-is not ready in either mode. Only if the delete could not revoke the key, because its folder
-could not be read, does a surface using it keep that key's DID. Only a secret stored before the
+is not ready in either mode; only a key the delete could not revoke, because its folder could
+not be read, stays usable as such a secret. Only a secret stored before the
 prefix was reserved can reach this, since new secret ids may not start with `atgk_`.
 
 A not-ready surface refuses every request with `503` before source authentication, policy and

@@ -247,6 +247,11 @@ loop and reconcile with disk only at startup; an explicit reload uses their in-m
 store's periodic scans are serialized by a shared per-store lock, so two overlapping refreshes can
 never apply out of order and revert a record to an older on-disk snapshot.
 
+A surface that derives its own DID from API Key Provider keys rereads their status from disk on
+its own schedule, even when the interval is `0`; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+A key a caller presents is checked against the cache only.
+
 Nodes sharing storage must run the same version. A newer node can write a field an older one
 rejects; the older node's refresh then drops that record from its cache while it is still serving.
 Per-surface A2A settings are such a field: a newer node writes `access_point.a2a` into stored A2A
