@@ -11,7 +11,7 @@ use tracing::error;
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
 use crate::auth_manager::pat::PatContext;
 use crate::identity::IdentityStore;
-use crate::identity::display_name::{ManagedDisplayName, resolve_managed_display_name, surfaces_by_did};
+use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
 use crate::identity::filesystem::IdentityOrigin;
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
@@ -21,7 +21,9 @@ use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
     CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
 };
-use crate::trust_registry_verification::recorder_status::{RecorderStatus, TrustRecorderStatusStore, global_store};
+use crate::trust_registry_verification::recorder_status::{
+    RecorderState, RecorderStatus, TrustRecorderStatusStore, global_store,
+};
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
 // Store proxy start time
@@ -309,10 +311,21 @@ pub struct IdentityInfo {
     pub surface_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_principal: Option<CredentialPrincipal>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub name_conflict: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_surfaces: Vec<ManagedSurfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_recorder: Option<RecorderStatus>,
+    /// For a DID managed on several surfaces, the surface whose Trust Recorder outcome
+    /// `trust_recorder` shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
+}
+
+/// A live surface where a DID is the managed agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSurfaceInfo {
+    pub surface_id: String,
+    pub surface_name: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2096,7 +2109,11 @@ pub(crate) async fn build_identity_list_with(
             .entry(s.surface_id.as_str())
             .or_insert(s);
     }
-    let managed_surfaces_by_did = surfaces_by_did(&records);
+    let managed_surfaces_by_did = managed_surfaces_by_did(&records, |id| {
+        surfaces_by_id
+            .get(id)
+            .copied()
+    });
 
     // Get metrics to compute actual usage counts and determine active channels
     let identity_stats = metrics_store
@@ -2148,19 +2165,41 @@ pub(crate) async fn build_identity_list_with(
             let channel_name = surface.map(|s| s.name.clone());
 
             let origin = r.effective_origin();
-            let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
+            let is_managed = origin == Some(IdentityOrigin::Managed);
+            let managed_ids = managed_surfaces_by_did
+                .get(&r.did)
+                .filter(|_| is_managed)
+                .unwrap_or(&no_surfaces);
+            let mut managed_surfaces: Vec<ManagedSurfaceInfo> = managed_ids
+                .iter()
+                .filter_map(|id| surfaces_by_id.get(id.as_str()))
+                .map(|s| ManagedSurfaceInfo {
+                    surface_id: s.surface_id.clone(),
+                    surface_name: s.name.trim().to_string(),
+                })
+                .collect();
+            managed_surfaces.sort_by(|a, b| {
+                (a.surface_name.to_lowercase(), &a.surface_id).cmp(&(b.surface_name.to_lowercase(), &b.surface_id))
+            });
+            let managed_surface = match managed_surfaces.as_slice() {
+                [only] => surfaces_by_id
+                    .get(only.surface_id.as_str())
+                    .copied(),
+                _ => None,
+            };
             let card_name = managed_surface.and_then(|s| {
                 CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
             });
-            let managed_name: Option<ManagedDisplayName> = managed_surface.map(|s| {
-                resolve_managed_display_name(
-                    s,
-                    managed_surfaces_by_did
-                        .get(&r.did)
-                        .unwrap_or(&no_surfaces),
-                    card_name.as_deref(),
-                )
-            });
+            let managed_name: Option<ManagedDisplayName> = match managed_surface {
+                Some(s) => Some(resolve_managed_display_name(s, managed_ids, card_name.as_deref())),
+                None if managed_ids.len() > 1 => Some(ManagedDisplayName::Shared {
+                    surface_ids: managed_ids
+                        .iter()
+                        .cloned()
+                        .collect(),
+                }),
+                None => None,
+            };
             let caller_lookup =
                 (origin == Some(IdentityOrigin::ExternalCaller)).then(|| caller_names.lookup_or_spawn(&r.did));
             let naming = with_target_card_name(
@@ -2168,10 +2207,7 @@ pub(crate) async fn build_identity_list_with(
                 origin,
                 card_name,
             );
-            let is_managed = origin == Some(IdentityOrigin::Managed);
-            let surface_id = channel_config_id
-                .clone()
-                .filter(|_| is_managed);
+            let surface_id = managed_surface.map(|s| s.surface_id.clone());
             let surface_name = managed_surface
                 .map(|s| s.name.trim().to_string())
                 .filter(|name| !name.is_empty());
@@ -2213,8 +2249,9 @@ pub(crate) async fn build_identity_list_with(
                 surface_id,
                 surface_name,
                 credential_principal: principal,
-                name_conflict: naming.name_conflict,
+                managed_surfaces,
                 trust_recorder: None,
+                trust_recorder_surface: None,
             }
         })
         .collect();
@@ -2236,40 +2273,64 @@ pub(crate) async fn build_identity_list_with(
     }
     if let Some(recorder_status) = recorder_status {
         for identity in &mut identities {
-            identity.trust_recorder = recorder_status_for(identity, &surfaces_by_id, recorder_status).await;
+            let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await else {
+                continue;
+            };
+            identity.trust_recorder = Some(status);
+            identity.trust_recorder_surface = (identity
+                .managed_surfaces
+                .len()
+                > 1)
+            .then_some(surface);
         }
     }
     Ok(identities)
 }
 
 /// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
-/// `not_attempted` before the first one. Every other identity carries none.
+/// `not_attempted` before the first one. A DID managed on several such surfaces carries the
+/// worst of their outcomes, with the surface it came from. Every other identity carries none.
 async fn recorder_status_for(
     identity: &IdentityInfo,
     surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
     recorder_status: &TrustRecorderStatusStore,
-) -> Option<RecorderStatus> {
+) -> Option<(RecorderStatus, ManagedSurfaceInfo)> {
     if identity.origin != Some(IdentityOrigin::Managed) {
         return None;
     }
-    let surface = surfaces_by_id.get(
-        identity
-            .surface_id
-            .as_deref()?,
-    )?;
-    if surface
-        .trust_recorder()?
-        .entries
-        .is_empty()
-    {
-        return None;
-    }
-    Some(
-        recorder_status
+    let mut worst: Option<(RecorderStatus, ManagedSurfaceInfo)> = None;
+    for managed in &identity.managed_surfaces {
+        let Some(surface) = surfaces_by_id.get(managed.surface_id.as_str()) else {
+            continue;
+        };
+        if surface
+            .trust_recorder()
+            .is_none_or(|recorder| recorder.entries.is_empty())
+        {
+            continue;
+        }
+        let status = recorder_status
             .status_for(&surface.surface_id, &identity.did)
             .await
-            .unwrap_or_else(RecorderStatus::not_attempted),
-    )
+            .unwrap_or_else(RecorderStatus::not_attempted);
+        if worst
+            .as_ref()
+            .is_none_or(|(w, _)| recorder_severity(status.state) > recorder_severity(w.state))
+        {
+            worst = Some((status, managed.clone()));
+        }
+    }
+    worst
+}
+
+fn recorder_severity(state: RecorderState) -> u8 {
+    match state {
+        RecorderState::Recorded => 0,
+        RecorderState::NotAttempted => 1,
+        RecorderState::Skipped => 2,
+        RecorderState::Partial => 3,
+        RecorderState::Failed => 4,
+    }
 }
 
 /// Helper function to build channel list
@@ -2688,7 +2749,9 @@ mod tests {
         use chrono::Utc;
         use serde_json::{Value, json};
 
-        use super::super::{IdentityInfo, build_identity_list_with, identities_changed_since};
+        use super::super::{
+            IdentityInfo, ManagedSurfaceInfo, build_identity_list_with, identities_changed_since, recorder_severity,
+        };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
         use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
@@ -2729,11 +2792,7 @@ mod tests {
             id: &str,
             name: &str,
         ) -> AgentSurface {
-            AgentSurface {
-                surface_id: id.to_string(),
-                name: name.to_string(),
-                ..Default::default()
-            }
+            crate::identity::test_helpers::test_surface_with_managed_identity(id, name)
         }
 
         fn managed(
@@ -2944,6 +3003,83 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert_eq!(helium.state, RecorderState::Failed);
+            for did in ["did:example:oxygen", "did:example:helium"] {
+                assert_eq!(rows[did].trust_recorder_surface, None, "a single-surface DID names no recorder surface");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_shared_managed_did_carries_the_worst_outcome_of_its_recorder_surfaces() {
+            use crate::trust_registry_verification::recorder_status::{
+                EntryStatus, RecorderState, TrustRecorderStatusStore,
+            };
+            let status_store = TrustRecorderStatusStore::in_memory();
+            for (surface_id, failed) in [("oxygen", 0), ("helium", 1)] {
+                status_store
+                    .record(
+                        surface_id,
+                        "did:example:shared",
+                        vec![EntryStatus::from_counts("tr-1", 1 - failed, 0, failed, None)],
+                        Utc::now(),
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut record = managed("did:example:shared", "oxygen");
+            record
+                .channel_usage
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::Managed));
+            let rows = list_with_recorder(
+                vec![record],
+                &[
+                    surface_with_recorder("oxygen", "OXYGEN"),
+                    surface_with_recorder("helium", "HELIUM"),
+                    surface("argon", "ARGON"),
+                ],
+                &status_store,
+            )
+            .await;
+
+            let row = &rows["did:example:shared"];
+            assert_eq!(row.surface_id, None);
+            assert_eq!(
+                row.trust_recorder
+                    .as_ref()
+                    .map(|status| status.state),
+                Some(RecorderState::Failed)
+            );
+            assert_eq!(
+                row.trust_recorder_surface,
+                Some(ManagedSurfaceInfo {
+                    surface_id: "helium".to_string(),
+                    surface_name: "HELIUM".to_string(),
+                })
+            );
+        }
+
+        #[test]
+        fn test_recorder_severity_ranks_every_state() {
+            use crate::trust_registry_verification::recorder_status::RecorderState;
+            let ranked = [
+                RecorderState::Recorded,
+                RecorderState::NotAttempted,
+                RecorderState::Skipped,
+                RecorderState::Partial,
+                RecorderState::Failed,
+            ];
+
+            for pair in ranked.windows(2) {
+                assert!(
+                    recorder_severity(pair[0]) < recorder_severity(pair[1]),
+                    "{:?} must rank below {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
 
         #[tokio::test]
@@ -3029,25 +3165,74 @@ mod tests {
             assert!(identities_changed_since(rows, since, &HashSet::new(), &HashSet::new(), &changed).is_empty());
         }
 
+        fn usage(
+            surface_id: &str,
+            role: IdentityOrigin,
+        ) -> crate::identity::filesystem::ChannelUsage {
+            crate::identity::test_helpers::test_channel_usage(surface_id, Some(role))
+        }
+
         #[tokio::test]
-        async fn test_conflicting_did_has_conflict_marker_and_no_name() {
+        async fn test_shared_managed_did_lists_its_managed_surfaces_and_has_no_name() {
             let mut record = managed("did:example:shared", "oxygen");
             record
                 .channel_usage
-                .push(crate::identity::filesystem::ChannelUsage {
-                    channel_config_id: "helium".to_string(),
-                    usage_count: 1,
-                    last_used_at: Utc::now(),
-                });
-            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("helium", "HELIUM")], &names()).await;
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            let surfaces = [surface("oxygen", "OXYGEN"), surface("helium", "HELIUM"), surface("argon", "ARGON")];
+            let rows = list(vec![record], &surfaces, &names()).await;
             let row = &rows["did:example:shared"];
-            assert!(row.name_conflict);
             assert_eq!(row.display_name, None);
+            assert_eq!(row.surface_id, None);
+            assert_eq!(row.surface_name, None);
             let json = serde_json::to_value(row).unwrap();
-            assert_eq!(json["name_conflict"], json!(true));
+            assert_eq!(
+                json["managed_surfaces"],
+                json!([
+                    { "surface_id": "helium", "surface_name": "HELIUM" },
+                    { "surface_id": "oxygen", "surface_name": "OXYGEN" }
+                ])
+            );
             assert!(
-                json.get("display_name")
+                json.get("name_conflict")
                     .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_seen_as_caller_elsewhere_is_named_after_its_managed_surface() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            record.channel_config_id = Some("argon".to_string());
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("argon", "ARGON")], &names()).await;
+            let row = &rows["did:example:oxygen"];
+            assert_eq!(row.display_name.as_deref(), Some("OXYGEN"));
+            assert_eq!(row.surface_id.as_deref(), Some("oxygen"));
+            assert_eq!(
+                row.managed_surfaces,
+                vec![crate::observability::dashboard::ManagedSurfaceInfo {
+                    surface_id: "oxygen".to_string(),
+                    surface_name: "OXYGEN".to_string()
+                }]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_whose_other_surface_was_deleted_is_named() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("deleted", IdentityOrigin::Managed));
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN")], &names()).await;
+            assert_eq!(
+                rows["did:example:oxygen"]
+                    .display_name
+                    .as_deref(),
+                Some("OXYGEN")
             );
         }
 
@@ -3058,7 +3243,7 @@ mod tests {
             let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
             assert_eq!(first["origin"], json!("external_caller"));
             assert_eq!(first["display_name_pending"], json!(true));
-            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
+            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "managed_surfaces"] {
                 assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
             }
 
@@ -3147,7 +3332,10 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(info.origin, None);
-            assert!(!info.name_conflict);
+            assert!(
+                info.managed_surfaces
+                    .is_empty()
+            );
         }
 
         #[tokio::test]

@@ -868,47 +868,151 @@ describe('IdentitiesPage', () => {
       expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
     });
 
-    it('filters to unnamed identities, excluding names still resolving', async () => {
+    it('offers no unnamed-only filter and lists unnamed and resolving rows', async () => {
       renderWithStats([managedNew, callerNamed, callerUnnamed, callerPending]);
 
-      const filter = await screen.findByTestId('identities-unnamed-filter-button');
-      expect(filter).toHaveTextContent('Unnamed only (1)');
-      expect(filter).toHaveAttribute('aria-pressed', 'false');
-      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+      expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(4);
+      expect(screen.queryByTestId('identities-unnamed-filter-button')).not.toBeInTheDocument();
+      expect(screen.queryByText(/Unnamed only/)).not.toBeInTheDocument();
       expect(
         within(screen.getByTestId('identities-row-did:web:pending.example')).getByTestId(
           'identities-name-pending'
         )
       ).toHaveTextContent('resolving…');
-
-      fireEvent.click(filter);
-
-      expect(filter).toHaveAttribute('aria-pressed', 'true');
-      const rows = screen.getAllByTestId(/^identities-row-/);
-      expect(rows).toHaveLength(1);
-      expect(rows[0]).toHaveAttribute('data-testid', 'identities-row-did:web:anon.example');
-      expect(within(rows[0]).queryByTestId('identities-name')).not.toBeInTheDocument();
-      expect(within(rows[0]).getByTitle('did:web:anon.example')).toBeInTheDocument();
-      expect(within(rows[0]).queryByText('No name')).not.toBeInTheDocument();
-
-      fireEvent.click(filter);
-      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+      const anonRow = screen.getByTestId('identities-row-did:web:anon.example');
+      expect(within(anonRow).queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(within(anonRow).getByTitle('did:web:anon.example')).toBeInTheDocument();
     });
 
-    it('looks as before when the backend sends no naming fields', async () => {
+    describe('shared managed DID', () => {
+      const sharedManaged = {
+        did: 'did:key:shared',
+        identity_hash: 'hash-shared',
+        created_at: '2026-01-01T00:00:00Z',
+        is_local: true,
+        origin: 'managed',
+        channel_config_id: 'surface-delta',
+        channel_name: 'delta',
+        credential_principal: { kind: 'certificate', id: 'cert-9', name: 'ARGON' },
+        managed_surfaces: [
+          { surface_id: 'surface-alpha', surface_name: 'alpha' },
+          { surface_id: 'surface-bravo', surface_name: 'bravo' },
+          { surface_id: 'surface-charlie', surface_name: 'charlie' },
+        ],
+      };
+
+      it('shows one row named Unnamed Agent with the surface count and DID', async () => {
+        renderWithStats([sharedManaged]);
+
+        const row = await screen.findByTestId('identities-row-did:key:shared');
+        expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(1);
+        expect(within(row).getByTestId('identities-unnamed-agent')).toHaveTextContent(
+          'Unnamed Agent'
+        );
+        expect(within(row).getByTestId('identities-shared-surface-count')).toHaveTextContent(
+          '3 surfaces'
+        );
+        expect(within(row).getByTitle('did:key:shared')).toBeInTheDocument();
+        expect(within(row).queryByText(/name conflict/i)).not.toBeInTheDocument();
+      });
+
+      it('lists every managed surface as a link, with the credential principal beneath', async () => {
+        renderWithStats([sharedManaged], [{ config_id: 'surface-bravo', name: 'bravo renamed' }]);
+
+        const row = await screen.findByTestId('identities-row-did:key:shared');
+        const links = within(row).getAllByTestId('identities-surface-link');
+        expect(links.map(link => link.textContent)).toEqual(['alpha', 'bravo renamed', 'charlie']);
+        expect(within(row).queryByText('delta')).not.toBeInTheDocument();
+        expect(within(row).getByTestId('identities-credential-principal')).toHaveTextContent(
+          'ARGON'
+        );
+
+        fireEvent.click(links[2]);
+        expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
+      });
+
+      it('leaves the Agent Surface entry out of the expanded details', async () => {
+        renderWithStats([sharedManaged]);
+
+        fireEvent.click(await screen.findByTestId('identities-row-did:key:shared'));
+        expect(screen.getByText('Identity Hash:')).toBeInTheDocument();
+        expect(screen.queryByText('Agent Surface:')).not.toBeInTheDocument();
+        expect(screen.queryByText('Channel:')).not.toBeInTheDocument();
+        expect(screen.getAllByText('alpha')).toHaveLength(1);
+      });
+
+      it('keeps the Agent Surface entry for a single-surface DID', async () => {
+        renderWithStats([
+          {
+            ...managedNew,
+            managed_surfaces: [{ surface_id: 'surface-1', surface_name: 'OXYGEN' }],
+          },
+        ]);
+
+        fireEvent.click(await screen.findByTestId('identities-row-did:key:managed-new'));
+        expect(screen.getByText('Agent Surface:')).toBeInTheDocument();
+        expect(screen.getAllByTestId('identities-surface-link')).toHaveLength(1);
+        expect(screen.getByTestId('identities-name')).toHaveTextContent('OXYGEN');
+        expect(screen.queryByTestId('identities-unnamed-agent')).not.toBeInTheDocument();
+      });
+    });
+
+    it('shows the Name and DID columns with Unnamed Agent when the backend sends no naming fields', async () => {
       renderWithStats([
         { did: 'did:key:legacy-a', identity_hash: 'a', created_at: '2026-01-01T00:00:00Z' },
         { did: 'did:key:legacy-b', identity_hash: 'b', created_at: '2026-01-02T00:00:00Z' },
       ]);
 
       expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument();
       expect(screen.getByRole('columnheader', { name: 'DID' })).toBeInTheDocument();
       expect(screen.getByRole('columnheader', { name: 'Origin' })).toBeInTheDocument();
+      expect(screen.queryByRole('columnheader', { name: 'Usage Count' })).not.toBeInTheDocument();
       expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
       expect(screen.queryByTestId('identities-unnamed-filter-button')).not.toBeInTheDocument();
+      expect(screen.getAllByTestId('identities-name-empty')).toHaveLength(2);
+      expect(screen.getAllByTestId('identities-name-empty')[0]).toHaveTextContent('Unnamed Agent');
       expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
       expect(screen.queryByText('No name')).not.toBeInTheDocument();
       expect(screen.queryByTestId(/^identities-origin-/)).not.toBeInTheDocument();
+    });
+
+    it('shows a DID:webvh identity under its metadata agent name', async () => {
+      (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({
+        identities: [
+          {
+            did: 'did:webvh:zLegacy:example.com:agents:legacy',
+            created_at: '2026-01-01T00:00:00Z',
+            metadata: { agent_name: 'legacy' },
+          },
+        ],
+      });
+      renderWithStats([]);
+
+      const row = await screen.findByTestId(
+        'identities-row-did:webvh:zLegacy:example.com:agents:legacy'
+      );
+      expect(within(row).getByTestId('identities-name')).toHaveTextContent('legacy');
+      expect(within(row).queryByTestId('identities-name-empty')).not.toBeInTheDocument();
+    });
+
+    it('shows Unnamed Agent when the metadata agent name is not a string', async () => {
+      (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({
+        identities: [
+          {
+            did: 'did:webvh:zObject:example.com:agents:object',
+            created_at: '2026-01-01T00:00:00Z',
+            metadata: { agent_name: { first: 'not', last: 'text' } },
+          },
+        ],
+      });
+      renderWithStats([]);
+
+      const row = await screen.findByTestId(
+        'identities-row-did:webvh:zObject:example.com:agents:object'
+      );
+      expect(within(row).getByTestId('identities-name-empty')).toHaveTextContent('Unnamed Agent');
+      expect(within(row).queryByTestId('identities-name')).not.toBeInTheDocument();
     });
 
     it('expands rows independently', async () => {

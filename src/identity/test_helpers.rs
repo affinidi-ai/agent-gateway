@@ -50,17 +50,44 @@ pub fn test_surface_identity_record(
         identity_fields: HashMap::new(),
         usage_count: 1,
         last_used_at: Some(now),
-        channel_usage: vec![super::filesystem::ChannelUsage {
-            channel_config_id: surface_id.to_string(),
-            usage_count: 1,
-            last_used_at: now,
-        }],
+        channel_usage: vec![test_channel_usage(surface_id, Some(IdentityOrigin::Managed))],
         private_key: None,
         channel_config_id: Some(surface_id.to_string()),
         is_local: true,
         verified: true,
         origin: None,
     }
+}
+
+/// One use of an identity on `surface_id` in `role`.
+pub fn test_channel_usage(
+    surface_id: &str,
+    role: Option<IdentityOrigin>,
+) -> super::filesystem::ChannelUsage {
+    super::filesystem::ChannelUsage {
+        channel_config_id: surface_id.to_string(),
+        usage_count: 1,
+        last_used_at: chrono::Utc::now(),
+        role,
+    }
+}
+
+/// A surface named `name` that issues a managed agent identity, so a managed DID used on it
+/// counts as its managed agent.
+pub fn test_surface_with_managed_identity(
+    surface_id: &str,
+    name: &str,
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = crate::config::agent_surface::AgentSurface {
+        surface_id: surface_id.to_string(),
+        name: name.to_string(),
+        ..Default::default()
+    };
+    surface
+        .target
+        .identity_injection
+        .identity_type = Some("from_jwt_claim".to_string());
+    surface
 }
 
 pub struct MockIdentityStore {
@@ -119,13 +146,15 @@ impl IdentityStore for MockIdentityStore {
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<IdentityOrigin>,
     ) -> Result<()> {
         let mut records = self.records.write().await;
         if let Some(record) = records.get_mut(identity_hash) {
+            let now = chrono::Utc::now();
             record.usage_count += 1;
-            record.last_used_at = Some(chrono::Utc::now());
+            record.last_used_at = Some(now);
             if let Some(cid) = channel_config_id {
-                record.channel_config_id = Some(cid);
+                record.record_channel_use(&cid, role, now);
             }
         }
         Ok(())
@@ -215,9 +244,10 @@ impl IdentityStore for OriginFailingIdentityStore {
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<IdentityOrigin>,
     ) -> Result<()> {
         self.0
-            .update_usage(identity_hash, channel_config_id)
+            .update_usage(identity_hash, channel_config_id, role)
             .await
     }
 
@@ -281,6 +311,7 @@ impl IdentityStore for FailingIdentityStore {
         &self,
         _identity_hash: &str,
         _channel_config_id: Option<String>,
+        _role: Option<IdentityOrigin>,
     ) -> Result<()> {
         Err(anyhow::anyhow!(Self::DETAIL))
     }
