@@ -128,6 +128,21 @@ show_proxy_info() {
   echo ""
 }
 
+# Prints the [encryption] table of a config.toml: its header and every line up
+# to the next table header. Prints nothing when the file has no such table.
+encryption_table() {
+  awk '/^\[encryption\]/ { on=1; print; next } on && /^\[/ { on=0 } on { print }' "$1"
+}
+
+# Replaces the [encryption] table of a config.toml with the given one.
+# Usage: set_encryption_table <config_toml> <table>
+set_encryption_table() {
+  local file="$1" table="$2"
+  awk '/^\[encryption\]/ { skip=1; next } skip && /^\[/ { skip=0 } !skip { print }' "${file}" > "${file}.tmp"
+  printf '\n%s\n' "${table}" >> "${file}.tmp"
+  mv "${file}.tmp" "${file}"
+}
+
 # Default ports for non-local targets (docker, etc.)
 http_port=${3:-8080}
 https_port=${4:-8443}
@@ -152,6 +167,8 @@ fi
 regenerate_config_toml=false
 config_toml="${target_dir}/config/config.toml"
 previous_auth_mode=""
+previous_config_toml=""
+master_key_file="${envs_dir}/master_encryption_key"
 
 if [[ ! -f "${config_toml}" ]]
 then
@@ -175,12 +192,19 @@ else
     fi
     previous_auth_mode=$(grep -E '^auth_mode[[:space:]]*=' "${config_toml}" | sed -E 's/^auth_mode[[:space:]]*=[[:space:]]*"([^"]+)"/\1/' || true)
     cp "${config_toml}" "${config_toml}.bak"
+    previous_config_toml="${config_toml}.bak"
     regenerate_config_toml=true
   fi
 fi
 
 if [[ "${regenerate_config_toml}" == "true" ]]
 then
+  if [[ -z "${previous_config_toml}" && ! -s "${master_key_file}" ]]
+  then
+    echo "❌ ${master_key_file} is missing. Run 'make config-certs' to generate it."
+    exit 1
+  fi
+
   mkdir -p "${target_dir}/config"
 
   echo "🦀 Building debug binary for bootstrap generation..."
@@ -208,6 +232,33 @@ then
   then
     sedi "s/^auth_mode = \".*\"/auth_mode = \"${previous_auth_mode}\"/" "${config_toml}"
     echo "✅ auth_mode re-applied: ${previous_auth_mode}"
+  fi
+
+  # Encryption at rest. A new environment encrypts its storage with the master
+  # key from scripts/_certs.sh. A regenerated config keeps the [encryption] table
+  # of the config it replaces, because that storage was written under it.
+  if [[ -n "${previous_config_toml}" ]]
+  then
+    previous_encryption="$(encryption_table "${previous_config_toml}")"
+    if [[ -n "${previous_encryption}" ]]
+    then
+      set_encryption_table "${config_toml}" "${previous_encryption}"
+      echo "✅ [encryption] re-applied from config.toml.bak"
+    fi
+  elif [[ "${target_dir}" == *"/local"* || "${target_dir}" == *"/docker"* ]]
+  then
+    if [[ "${target_dir}" == *"/local"* ]]
+    then
+      encryption_key_settings="key_source = \"file\"
+key_file = \"${master_key_file}\""
+    else
+      encryption_key_settings="key_source = \"environment\"
+key_env_var = \"AG_MASTER_KEY\""
+    fi
+    set_encryption_table "${config_toml}" "[encryption]
+enabled = true
+${encryption_key_settings}"
+    echo "🔒 Encryption at rest enabled with ${master_key_file}"
   fi
 fi
 
