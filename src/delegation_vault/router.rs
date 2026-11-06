@@ -376,7 +376,7 @@ mod tests {
     }
 
     /// A callback that is refused before the code is exchanged leaves its state
-    /// unused, so the same callback can be retried once the cause is fixed.
+    /// unused, though the refusal clears the browser's binding cookie.
     #[tokio::test]
     async fn a_callback_refused_before_the_exchange_does_not_use_up_its_state() {
         let fixture = consent::Fixture::new().await;

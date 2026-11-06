@@ -3652,9 +3652,23 @@ async fn oauth_provider_ready_to_exchange_code(
 #[given(expr = "OAuth provider {string} records authorization response issuer {string}")]
 fn oauth_provider_records_authorization_response_issuer(
     world: &mut SurfaceWorld,
-    _provider: String,
+    provider: String,
     issuer: String,
 ) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "an authorization response issuer is recorded only on the surface's own OAuth provider"
+    );
     world
         .surface_config
         .oauth_authorization_response_issuer = Some(issuer);
@@ -3677,9 +3691,8 @@ async fn caller_has_confirmed_consent_start_page(
     _caller: String,
     provider: String,
 ) {
-    let (state, cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
+    let (state, _cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
     world.oauth_confirmed_state = Some(state);
-    world.oauth_binding_cookie = Some(cookie);
 }
 
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]
