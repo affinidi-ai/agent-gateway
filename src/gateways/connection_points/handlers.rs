@@ -1745,6 +1745,18 @@ pub async fn reconnect_connection_point<P: ConnectionPointStore, M: MediatorStor
     Ok(Json(ReconnectConnectionPointResponse { connection_point }))
 }
 
+/// The directory holding the DID artifacts of connection point `cp_id`, refusing
+/// an id that is not a single path segment inside `base`.
+fn connection_point_artifact_dir(
+    base: &std::path::Path,
+    cp_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    crate::storage::validate_storage_id(cp_id)?;
+    let cp_dir = base.join(cp_id);
+    crate::storage::assert_within_storage_dir(base, &cp_dir)?;
+    Ok(cp_dir)
+}
+
 /// Serves the DID document for a connection point (did:web resolution)
 /// Route: /.well-known/connection-points/{cp_id}/did.json
 pub async fn serve_connection_point_did_document<P: ConnectionPointStore>(
@@ -1754,19 +1766,24 @@ pub async fn serve_connection_point_did_document<P: ConnectionPointStore>(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     debug!("Serving DID document for connection point: {}", cp_id);
 
-    let cp_dir = format!(
-        "{}/{}",
-        config
+    let base = std::path::Path::new(
+        &config
             .storage_paths
             .connection_points,
-        cp_id
     );
+    let cp_dir = match connection_point_artifact_dir(base, &cp_id) {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!(error = %e, connection_point_id = %cp_id, "Rejected connection point DID document request");
+            return Err((StatusCode::BAD_REQUEST, "Invalid connection point id".to_string()));
+        }
+    };
 
     // If a did.jsonl log exists for this connection point, serve the
     // parallel did:web document derived from the latest log entry.
     #[cfg(feature = "didwebvh")]
     {
-        if let Some(state_doc) = load_latest_cp_log_state(std::path::Path::new(&cp_dir)).await {
+        if let Some(state_doc) = load_latest_cp_log_state(&cp_dir).await {
             // Extract the DID from the document to build the parallel form
             let webvh_did = state_doc
                 .get("id")
@@ -1782,7 +1799,7 @@ pub async fn serve_connection_point_did_document<P: ConnectionPointStore>(
     }
 
     // Legacy fallback: read did.json from storage
-    let did_doc_content = match crate::storage::did_artifacts::read_did_document(std::path::Path::new(&cp_dir)).await {
+    let did_doc_content = match crate::storage::did_artifacts::read_did_document(&cp_dir).await {
         Ok(Some(content)) => content,
         Ok(None) => {
             return Err((StatusCode::NOT_FOUND, format!("DID document not found for connection point: {}", cp_id)));
@@ -1841,12 +1858,29 @@ pub async fn serve_connection_point_did_jsonl<P: ConnectionPointStore>(
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let cp_dir = std::path::Path::new(
+    let base = std::path::Path::new(
         &config
             .storage_paths
             .connection_points,
-    )
-    .join(&cp_id);
+    );
+    let cp_dir = match connection_point_artifact_dir(base, &cp_id) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!(error = %e, connection_point_id = %cp_id, "Rejected connection point DID log request");
+            let problem = serde_json::json!({
+                "type": "https://identity.foundation/didwebvh/v1.0/#problem-details",
+                "title": "invalidDid",
+                "status": 400,
+                "detail": "Invalid connection point id"
+            });
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/problem+json")],
+                problem.to_string(),
+            )
+                .into_response();
+        }
+    };
 
     match crate::storage::did_artifacts::read_did_log_raw(&cp_dir).await {
         Ok(Some(content)) => (
@@ -1908,6 +1942,98 @@ mod tests {
     use super::{generate_connection_point_identity_webvh, load_connection_point_secrets};
     use axum::http::StatusCode;
     use std::sync::Arc;
+
+    #[test]
+    fn connection_point_artifact_dir_rejects_traversal_and_stays_within_base() {
+        let base = tempfile::tempdir().unwrap();
+        for cp_id in ["../../etc", "../did.json", "..", ".", "", "/etc/passwd", "a/b", "./x"] {
+            assert!(super::connection_point_artifact_dir(base.path(), cp_id).is_err(), "{cp_id:?} must be rejected");
+        }
+        let cp_id = "123e4567-e89b-12d3-a456-426614174000";
+        assert_eq!(super::connection_point_artifact_dir(base.path(), cp_id).unwrap(), base.path().join(cp_id));
+    }
+
+    #[tokio::test]
+    async fn connection_point_did_routes_serve_only_files_inside_the_connection_points_directory() {
+        use axum::Extension;
+        use axum::extract::Path;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root
+            .path()
+            .join("connection_points");
+        let cp_id = "123e4567-e89b-12d3-a456-426614174000";
+        std::fs::create_dir_all(base.join(cp_id)).unwrap();
+        std::fs::write(
+            base.join(cp_id)
+                .join("did.jsonl"),
+            "{\"inside\":true}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join(cp_id)
+                .join("did.json"),
+            r#"{"id":"did:web:inside"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("outside")).unwrap();
+        std::fs::write(
+            root.path()
+                .join("outside")
+                .join("did.jsonl"),
+            "{\"outside\":true}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join("outside")
+                .join("did.json"),
+            r#"{"id":"did:web:outside"}"#,
+        )
+        .unwrap();
+
+        let config: crate::config::BootstrapConfig = toml::from_str(&format!(
+            "backup_encryption_key = \"unused\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n[storage_paths]\nconnection_points = \"{}\"\n",
+            base.display()
+        ))
+        .unwrap();
+        let config = Extension(Arc::new(config));
+        let store = Extension(Arc::new(
+            crate::gateways::connection_points::filesystem::FileSystemConnectionPointStore::new(
+                root.path().join("store"),
+            )
+            .await
+            .unwrap(),
+        ));
+        let log =
+            |id: &str| super::serve_connection_point_did_jsonl(config.clone(), store.clone(), Path(id.to_string()));
+
+        let served = log(cp_id).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(served.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"{\"inside\":true}\n");
+
+        let refused = log("../outside").await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "invalidDid");
+
+        let document =
+            super::serve_connection_point_did_document(config.clone(), store.clone(), Path(cp_id.to_string()))
+                .await
+                .unwrap();
+        assert_eq!(document.0, serde_json::json!({"id": "did:web:inside"}));
+        let refused =
+            super::serve_connection_point_did_document(config.clone(), store.clone(), Path("../outside".to_string()))
+                .await
+                .unwrap_err();
+        assert_eq!(refused, (StatusCode::BAD_REQUEST, "Invalid connection point id".to_string()));
+    }
 
     // === Connection Point Identity Tests ===
     /// key_0.json, key_1.json, key_2.json must be written to the storage directory.

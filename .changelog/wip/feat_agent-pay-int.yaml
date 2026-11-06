@@ -282,6 +282,14 @@ changes:
         asks agent-pay at most once every 10 seconds per manifest, serving the cached one with
         `refresh_throttled` in between, and at most 4 requests wait on payment gateways at once,
         the others getting `429 payment_manifest_busy`.
+    - timestamp: '2026-11-06T00:00:00Z'
+      title: Refuse a connection point DID request whose id is not a single path segment
+      description: >-
+        `GET /.well-known/connection-points/{cp_id}/did.json` and `did.jsonl`, and their
+        `/connection-points/...` forms, now answer `400` when `cp_id` is not a single path segment
+        inside the connection points directory, as the trust registry and issuer DID routes do. An
+        encoded id such as `..%2F..%2F<dir>` could read the `did.json` or `did.jsonl` of another
+        directory without authentication.
   breaking:
     - timestamp: '2026-10-20T00:00:00Z'
       title: Refuse local x402 and MPP payment on surfaces
