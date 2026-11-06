@@ -4,11 +4,12 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-05T08:10:06Z'
-      title: Return 401 when the caller JWT is missing on direct from_jwt_claim surfaces
+      title: Return 401 when the caller JWT is missing on from_jwt_claim surfaces
       description: >-
-        A direct Access Point whose inbound identity is from_jwt_claim answered 500 when a caller
-        sent no bearer token or an invalid one. It now answers 401 with the caller authentication
-        error and never calls the target.
+        An Access Point whose inbound identity is from_jwt_claim answered 500 when a caller sent
+        no bearer token or an invalid one, on direct and fabric paths. It now refuses such a caller
+        with 401 before gateway policy and never calls the target. The body says only that the
+        caller credential is missing or invalid; the reason is logged, not sent.
   removed: []
   security: []
   breaking: []

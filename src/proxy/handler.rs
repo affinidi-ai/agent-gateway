@@ -1829,10 +1829,6 @@ async fn proxy_handler_with_mcp_runtime(
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
-    let mut caller_auth_error: Option<(
-        crate::source_auth::SourceAuthConfig,
-        crate::source_auth::errors::SourceAuthError,
-    )> = None;
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: config_id,
         channel_name: &channel_name,
@@ -2032,8 +2028,9 @@ async fn proxy_handler_with_mcp_runtime(
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
                 // it with its challenge, so the caller can fetch a token and
-                // retry, and one whose caller authentication rejects failures
-                // refuses it. Otherwise record the outcome for the policy layer and
+                // retry. An Access Point that rejects failed callers (closed, `on_failure:
+                // reject`, or `from_jwt_claim` inbound identity) refuses it here,
+                // before policy. Otherwise record the outcome for the policy layer and
                 // continue with no asserted caller identity — do not block here.
                 Err(e) if e.is_caller_attributable() => {
                     // On an Access Point that publishes protected resource
@@ -2091,7 +2088,6 @@ async fn proxy_handler_with_mcp_runtime(
                             .to_string(),
                         reason: e.to_string(),
                     });
-                    caller_auth_error = Some((resolved_auth_config, e));
                     None
                 }
                 // Server-side failure (config not found, internal) — keep
@@ -4989,30 +4985,10 @@ async fn proxy_handler_with_mcp_runtime(
                     .elapsed()
                     .as_secs_f64(),
             );
-            if let Some((auth_config, error)) = caller_auth_error.as_ref()
-                && state
-                    .surface
-                    .has_source_auth()
-            {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    auth_config,
-                    error,
-                ));
-            }
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
@@ -10490,6 +10466,16 @@ fn bind_api_key_caller_did(
     }
 }
 
+/// `from_jwt_claim` needs the validated claims of `jwt_bearer` source auth. A
+/// caller whose credential is missing or invalid is refused before this point,
+/// so reaching it means the surface has no such claims to read.
+fn from_jwt_claim_without_claims() -> Response {
+    create_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "from_jwt_claim requires jwt_bearer source auth on this surface",
+    )
+}
+
 /// The caller identity of an inbound `from_api_key` slot: the DID of the API
 /// key source auth verified on this request. An API Key Provider key is
 /// identified by its key id and reports `source_auth`; a plain API Key by its
@@ -11026,10 +11012,7 @@ async fn handle_fabric_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
@@ -23158,6 +23141,61 @@ mod fabric_extended_card_tests {
             Some("ada@example.com")
         );
     }
+    #[tokio::test]
+    async fn fabric_from_jwt_claim_without_caller_claims_is_not_forwarded() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = sends.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let method = json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let mut surface = (*peer.state.surface).clone();
+        surface.identity_slots.inbound = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: Vec::new(),
+        });
+        surface
+            .access_point
+            .caller_authentication = Some(serde_json::from_value(json!({"methods": [method]})).unwrap());
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let result = super::handle_fabric_request(
+            peer.state.clone(),
+            "Fabric A2A",
+            axum::http::Method::POST,
+            "https://gateway.example/a2a"
+                .parse()
+                .unwrap(),
+            axum::http::HeaderMap::new(),
+            "127.0.0.1:12345".to_string(),
+            std::time::Instant::now(),
+            super::ConnectionGuard::new(None, None),
+            axum::body::Bytes::from(body.to_string()),
+            "trace-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            crate::mcp::meta::McpMetadataContext::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let Err(refused) = result else {
+            panic!("a from_jwt_claim surface forwarded a request with no caller claims");
+        };
+        assert_eq!(refused.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0, "the request reached the peer");
+    }
+
     #[tokio::test]
     async fn fabric_send_target_trust_check_runs_the_surface_target_list_only() {
         let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;

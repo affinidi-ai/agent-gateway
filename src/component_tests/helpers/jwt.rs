@@ -179,16 +179,29 @@ pub fn setup_jwt_claim_managed_identity(
     gw_config.surfaces = vec![serde_json::from_value(json).expect("jwt-claim channel: AgentSurface JSON")];
 }
 
-/// Setup for the **inbound-slot** `from_jwt_claim` E2E test.
+/// Setup for the **inbound-slot** `from_jwt_claim` E2E test on an A2A surface.
+///
+/// See [`setup_jwt_claim_inbound_identity_for`].
+pub fn setup_jwt_claim_inbound_identity(
+    fixture: &JwksFixture,
+    temp_dir: &Path,
+    gw_config: &mut GatewayConfig,
+) {
+    setup_jwt_claim_inbound_identity_for(fixture, temp_dir, gw_config, "a2a");
+}
+
+/// Setup for the **inbound-slot** `from_jwt_claim` E2E test on an Access Point
+/// of the given `protocol`.
 ///
 /// Mirrors [`setup_jwt_claim_managed_identity`] but places the identity on the
 /// request leg (`identity_slots.inbound = from_jwt_claim`) and enables
 /// `inject_vp` on the target so the caller's derived identity VP is injected
 /// into the request forwarded upstream.
-pub fn setup_jwt_claim_inbound_identity(
+pub fn setup_jwt_claim_inbound_identity_for(
     fixture: &JwksFixture,
     temp_dir: &Path,
     gw_config: &mut GatewayConfig,
+    protocol: &str,
 ) {
     write_jwt_strategy(fixture, temp_dir);
 
@@ -198,7 +211,7 @@ pub fn setup_jwt_claim_inbound_identity(
         "access_point": {
             "listen_address": "inbound_port_placeholder",
             "route": "/smoke",
-            "protocol": "a2a",
+            "protocol": protocol,
             "caller_authentication": {
                 "methods": [{
                     "type": "jwt_bearer",

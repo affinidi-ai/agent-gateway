@@ -46,8 +46,9 @@ that method:
 3. A request that carries credentials for more than one method fails source authentication
    as the primary method, audited as `ambiguous_credentials`, and neither credential is
    verified, so a caller can't choose the identity the gateway asserts. Like any failed
-   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
-   protected resource metadata, and otherwise passed to policy as
+   credential, it is refused on a closed Access Point, with `on_failure: reject`, on an inbound
+   `from_jwt_claim` identity, or beside protected resource metadata, and otherwise passed to
+   policy as
    `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
    connection that presents a client certificate, on a surface that also accepts mTLS, and an
    MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
@@ -194,14 +195,14 @@ Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
 has one, otherwise the base. Variant responses carry it for that variant.
 
-On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
+On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
 protects, and repeated wrong credentials aren't throttled by it either. Use high-entropy API keys
 and limit requests per client upstream of the gateway if credential guessing is a concern. MCP callers get a JSON-RPC error carrying the request id; other callers get
-`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only that the credential
-is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
+`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only
+`Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
 Create and update responses are the saved surface plus `access_point_status`. A save warns
@@ -242,9 +243,10 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
-A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
-challenge on a direct request), see
+A request to an Access Point whose inbound identity is `from_jwt_claim`, or to an MCP Access Point that
+publishes protected resource metadata, direct or over Fabric, is the exception: a missing or
+invalid credential is refused with a `401` before policy (the discovery challenge on a direct
+MCP request), see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 ### mTLS
@@ -1044,8 +1046,8 @@ decides, as for a failed key.
 ### `from_jwt_claim`
 
 Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived. On a direct Access Point, a missing or invalid bearer token
-is refused with `401` before the target is called.
+verified before the DID is derived. On a direct or fabric-routed Access Point, a missing or
+invalid bearer token is refused with `401` before the target is called.
 
 | Field | Default | Effect |
 | --- | --- | --- |

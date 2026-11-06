@@ -1547,11 +1547,15 @@ async fn inbound_from_jwt_claim_missing_oid_rejected() {
     assert_eq!(body["code"], "identity_validation_failed", "problem.code mismatch: {body}");
 }
 
-/// Inbound A2A with `identity_slots.inbound = from_jwt_claim` and no caller JWT:
-/// the gateway must answer 401 and never call the target.
-#[tokio::test(flavor = "multi_thread")]
-async fn inbound_from_jwt_claim_missing_jwt_returns_401_without_upstream_call() {
-    use helpers::jwt::{JwksFixture, setup_jwt_claim_inbound_identity};
+/// Sends `body` to an Access Point of `protocol` whose inbound identity is
+/// `from_jwt_claim`, with the given `authorization` header, and returns what the
+/// caller receives. The target must never be called.
+async fn refused_from_jwt_claim_request(
+    protocol: &str,
+    authorization: Option<&str>,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, reqwest::header::HeaderMap, serde_json::Value) {
+    use helpers::jwt::{JwksFixture, setup_jwt_claim_inbound_identity_for};
 
     let fixture = JwksFixture::start().await;
 
@@ -1563,65 +1567,90 @@ async fn inbound_from_jwt_claim_missing_jwt_returns_401_without_upstream_call() 
     let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
 
     let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, _| {
-        setup_jwt_claim_inbound_identity(&fixture, temp_dir, gw_config);
+        setup_jwt_claim_inbound_identity_for(&fixture, temp_dir, gw_config, protocol);
     })
     .await;
 
-    let resp = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&h.gateway_url)
         .header("content-type", "application/json")
-        .json(&a2a_request())
+        .json(&body);
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    let resp = request
         .send()
         .await
         .expect("inbound request failed");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let text = resp
+        .text()
+        .await
+        .expect("response body is readable");
 
-    assert_eq!(resp.status(), 401, "missing caller JWT must be refused with 401, got {}", resp.status());
     assert_eq!(
         h.mock
             .request_count
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "unauthenticated request must not reach target"
+        "refused request must not reach target"
     );
+
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()));
+    assert!(
+        !text.contains("Missing credential") && !text.contains("Invalid credential") && !text.contains("not-a-jwt"),
+        "the refusal reason reached the caller: {text}"
+    );
+    (status, headers, body)
+}
+
+/// Inbound A2A with `identity_slots.inbound = from_jwt_claim` and no caller JWT:
+/// refused before policy with the generic body, and the target is never called.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_jwt_claim_missing_jwt_returns_401_without_upstream_call() {
+    use crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED;
+
+    let (status, headers, body) = refused_from_jwt_claim_request("a2a", None, a2a_request()).await;
+
+    assert_eq!(status, 401, "missing caller JWT must be refused with 401");
+    assert_eq!(headers["content-type"], "application/problem+json");
+    assert_eq!(headers["www-authenticate"], "Bearer");
+    assert_eq!(body["status"], 401);
+    assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED, "{body}");
 }
 
 /// Inbound A2A with `identity_slots.inbound = from_jwt_claim` and a malformed
-/// bearer token: the gateway must answer 401 and never call the target.
+/// bearer token: refused before policy with the same generic body as a missing
+/// credential, and the target is never called.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_from_jwt_claim_invalid_jwt_returns_401_without_upstream_call() {
-    use helpers::jwt::{JwksFixture, setup_jwt_claim_inbound_identity};
+    use crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED;
 
-    let fixture = JwksFixture::start().await;
+    let (status, headers, body) = refused_from_jwt_claim_request("a2a", Some("Bearer not-a-jwt"), a2a_request()).await;
 
-    let agent_response = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": { "kind": "message", "messageId": "msg-001", "role": "agent", "parts": [] }
-    });
-    let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
+    assert_eq!(status, 401, "invalid caller JWT must be refused with 401");
+    assert_eq!(headers["content-type"], "application/problem+json");
+    assert_eq!(headers["www-authenticate"], "Bearer");
+    assert_eq!(body["status"], 401);
+    assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED, "{body}");
+}
 
-    let h = GatewayHarness::start_with_outbound_mock(mock, |temp_dir, gw_config, _| {
-        setup_jwt_claim_inbound_identity(&fixture, temp_dir, gw_config);
-    })
-    .await;
+/// MCP caller of a `from_jwt_claim` surface with no JWT: the refusal is a
+/// JSON-RPC error answering the request id, with the generic message and a
+/// Bearer challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_jwt_claim_mcp_missing_jwt_is_a_json_rpc_refusal() {
+    use crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED;
 
-    let resp = reqwest::Client::new()
-        .post(&h.gateway_url)
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer not-a-jwt")
-        .json(&a2a_request())
-        .send()
-        .await
-        .expect("inbound request failed");
+    let request = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
+    let (status, headers, body) = refused_from_jwt_claim_request("mcp", None, request).await;
 
-    assert_eq!(resp.status(), 401, "invalid caller JWT must be refused with 401, got {}", resp.status());
-    assert_eq!(
-        h.mock
-            .request_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "invalid-token request must not reach target"
-    );
+    assert_eq!(status, 401, "missing caller JWT must be refused with 401");
+    assert_eq!(headers["www-authenticate"], "Bearer realm=\"agent-gateway\"");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["error"]["message"], CALLER_CREDENTIAL_REFUSED, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

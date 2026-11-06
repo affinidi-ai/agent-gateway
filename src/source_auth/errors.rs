@@ -110,6 +110,9 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// (see [`caller_refusal`]), so in practice this builder is reached for
 /// server-side (500) failures.
 ///
+/// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] as its
+/// detail, so the reason the credential failed is never sent to the caller.
+///
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
 /// - **MCP**: JWT Bearer 401s return `application/problem+json` *without*
@@ -124,7 +127,11 @@ pub fn deny_response(
     auth_config: &SourceAuthConfig,
     error: &SourceAuthError,
 ) -> Response {
-    let detail = error.to_string();
+    let detail = if error.is_caller_attributable() {
+        CALLER_CREDENTIAL_REFUSED.to_string()
+    } else {
+        error.to_string()
+    };
     let status = error.http_status();
     let title = error.problem_title();
     // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 500 is a
@@ -145,10 +152,10 @@ pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invali
 const MCP_BEARER_CHALLENGE: &str = "Bearer realm=\"agent-gateway\"";
 
 /// The `401` for a caller whose credential is missing or invalid, on an Access
-/// Point whose caller authentication rejects such callers. An MCP caller gets a
-/// JSON-RPC error answering `mcp_request_id`; any other caller gets
-/// `application/problem+json`. A JWT Bearer refusal carries a
-/// `WWW-Authenticate: Bearer` challenge.
+/// Point whose caller authentication rejects such callers, or whose inbound
+/// identity is `from_jwt_claim`. An MCP caller gets a JSON-RPC error answering
+/// `mcp_request_id`; any other caller gets `application/problem+json`. A JWT
+/// Bearer refusal carries a `WWW-Authenticate: Bearer` challenge.
 pub fn caller_refusal(
     protocol: &SurfaceProtocol,
     auth_config: &SourceAuthConfig,
@@ -325,6 +332,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 401);
         assert_eq!(body["title"], "Unauthorized");
+        assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+        assert!(
+            !body
+                .to_string()
+                .contains("expired"),
+            "the refusal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
