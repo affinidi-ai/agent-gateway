@@ -3442,15 +3442,7 @@ mod jwt_provider_tests {
                 .await
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while futures::FutureExt::now_or_never(crate::identity::handlers::surface_grants::hold_provider_bindings())
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the retype queues for the exclusive bindings lock");
+        crate::identity::handlers::surface_grants::wait_for_queued_bindings_writer().await;
         assert!(!retype.is_finished(), "the retype waits for the surface write that holds the lock");
         drop(writing);
         let (status, response) = retype.await.unwrap();
@@ -3484,8 +3476,11 @@ mod jwt_provider_tests {
             let state = state.clone();
             async move { create(&state, api_key_provider("key", "CLIENT_SECRET")).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &creating,
+            "the create waits for the secret delete that holds the lock",
+        )
+        .await;
         delete_secret_named(&state, "CLIENT_SECRET").await;
         drop(deleting);
 
@@ -3518,8 +3513,11 @@ mod jwt_provider_tests {
             let id = id.clone();
             async move { update(&state, &id, json!({"api_key_secret_ref": "CLIENT_SECRET"})).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!updating.is_finished(), "the update waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &updating,
+            "the update waits for the secret delete that holds the lock",
+        )
+        .await;
         delete_secret_named(&state, "CLIENT_SECRET").await;
         drop(deleting);
 

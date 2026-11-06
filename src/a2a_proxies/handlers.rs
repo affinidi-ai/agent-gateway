@@ -428,9 +428,16 @@ mod tests {
             let store = store.clone();
             async move { update_for_tenant_a(&store, &id, serde_json::json!({"description": "after"})).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!creating.is_finished(), "a create waits for the secret delete that holds the lock");
-        assert!(!updating.is_finished(), "an update waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &creating,
+            "a create waits for the secret delete that holds the lock",
+        )
+        .await;
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &updating,
+            "an update waits for the secret delete that holds the lock",
+        )
+        .await;
         drop(deleting);
         let Json(created) = creating
             .await
@@ -480,8 +487,11 @@ mod tests {
             let secrets = secrets.clone();
             async move { create_for_tenant_a_with(&store, Some(secrets), "tenant-a-direct-line").await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &creating,
+            "the create waits for the secret delete that holds the lock",
+        )
+        .await;
         secrets
             .delete(&secret.id)
             .await
