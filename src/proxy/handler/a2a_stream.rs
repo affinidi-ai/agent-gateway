@@ -696,8 +696,6 @@ allow := false if contains(input.response.body.result.text, "SECRET")
             policy_manager: Some(std::sync::Arc::new(policy_manager)),
             gateway_policy_manager: None,
             didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: None,
             #[cfg(feature = "didwebvh")]

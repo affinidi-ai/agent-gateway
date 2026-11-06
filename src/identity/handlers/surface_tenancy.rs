@@ -1542,6 +1542,9 @@ fn collect_effective_surface_references(
     if let Some(id) = endpoint_id(&surface.target.endpoint, "fabric://") {
         push_reference(references, ResourceKind::Gateways, id);
     }
+    if let Some(policy) = surface.agent_pay_policy() {
+        push_reference(references, ResourceKind::Gateways, &policy.payment_gateway_id);
+    }
 }
 
 /// The Target's and the Access Point's response custom metadata, both returned to the caller.
@@ -3641,6 +3644,16 @@ mod tests {
                     serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
                         "payment_policy": {"type": "mpp", "enabled": true, "realm": "vendor",
                         "secret_key": "$MPP_SECRET_KEY"}}}),
+                ),
+                format!("{binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "an agent-pay payment",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "agent_pay", "payment_gateway_id": "pay-gw",
+                        "payment_surface_id": "pay-1"}}}),
                 ),
                 format!("{binding}consent_mode external charges callers nothing"),
             ),

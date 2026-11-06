@@ -94,8 +94,6 @@ pub(crate) fn router(surface: AgentSurface) -> crate::state::MultiSurfaceProxySt
         policy_manager: None,
         gateway_policy_manager: None,
         didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
-        transaction_store: None,
-        mpp_transaction_store: None,
         trust_registry_listener_manager: None,
         source_auth_middleware: None,
         #[cfg(feature = "didwebvh")]
@@ -780,34 +778,6 @@ fn a_variant_whose_fabric_target_pins_an_alias_sends_it() {
         assert_eq!(sent.channel_id, "orders", "{case}");
         assert_eq!(sent.variant_alias.as_deref(), variant_alias, "{case}");
         assert_eq!(sent.stream_target, stream_target, "{case}");
-    }
-}
-
-#[test]
-fn an_mpp_auto_pay_retry_asks_the_peer_for_the_alias_its_target_pins() {
-    let headers = std::collections::HashMap::from([("AUTHORIZATION".to_string(), "Payment proof".to_string())]);
-    let cases =
-        [("/a2a$beta: the Target pins nothing", "beta", None), ("/a2a$pinned: the Target pins v", "pinned", Some("v"))];
-    for (case, alias, pinned) in cases {
-        let served = fabric_surface()
-            .serve_variant(Some(alias))
-            .unwrap()
-            .surface;
-        let route = super::fabric_send_route(&served).unwrap();
-
-        let body = super::mpp_retry_forward_request_body(
-            &route,
-            &axum::http::Method::POST,
-            "/rpc",
-            &headers,
-            &json!({"jsonrpc": "2.0"}),
-            "trace",
-            0,
-        );
-
-        assert_eq!(body["channel_id"], "orders", "{case}: {body}");
-        assert_eq!(body["virtual_channel_alias"], json!(pinned), "{case}: {body}");
-        assert_eq!(body["active_variant_alias"], json!(pinned), "{case}: {body}");
     }
 }
 

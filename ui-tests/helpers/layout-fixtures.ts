@@ -42,7 +42,8 @@ export const FIXTURE_ID = {
     accessToken: 'layout-access-token-1',
     issuer: 'layout-issuer-1',
     authority: 'layout-authority-1',
-    payment: '0x7d3f9b2c41e8a6d05f1c9e3b7a2d4f6081c3e5a7b9d1f3e5c7a9b1d3f5e7c9a1b3d5f7e9c1a3b5d7f9e1c3a5b7d9f1e3',
+    payment: 'layout-payment-1',
+    legacyPayment: 'layout-payment-correlation-1',
     mediator: 'layout-mediator-1',
     connectionPoint: 'layout-connection-point-1',
     trustRegistry: 'layout-trust-registry-1',
@@ -225,7 +226,24 @@ interface CertificateFixture {
     kind?: CertificateKind;
 }
 
-/** One raw x402 payment record as `PaymentsPage` groups them. */
+/** Mirrors `PaymentLedgerRow` in `www/default/src/types.ts`, list fields only. */
+interface PaymentLedgerFixture {
+    id: string;
+    created_at: number;
+    surface_id: string;
+    payment_gateway_id: string;
+    payment_surface_id: string;
+    outcome: string;
+    rail?: 'x402' | 'mpp';
+    amount?: string;
+    currency?: string;
+    resource?: string;
+    case_id?: string;
+    reason?: string;
+    latency_ms: number;
+}
+
+/** One raw x402 payment record as the Payments page's legacy list merges them. */
 interface PaymentRecordFixture {
     id: string;
     type: 'verification' | 'settlement';
@@ -562,12 +580,32 @@ const authorities: Authority[] = [
     },
 ];
 
+const LEGACY_TX_HASH = '0x7d3f9b2c41e8a6d05f1c9e3b7a2d4f6081c3e5a7b9d1f3e5c7a9b1d3f5e7c9a1b3d5f7e9c1a3b5d7f9e1c3a5b7d9f1e3';
+
+const paymentLedger: PaymentLedgerFixture[] = [
+    {
+        id: FIXTURE_ID.payment,
+        created_at: unix(5),
+        surface_id: FIXTURE_ID.surface,
+        payment_gateway_id: 'layout-payment-gateway-enterprise-procurement-agent-pay-emea-production-0001',
+        payment_surface_id: 'layout-payment-surface-enterprise-procurement-card-and-stablecoin-rails-0001',
+        outcome: 'held',
+        rail: 'x402',
+        amount: '1250.00',
+        currency: 'USDC',
+        resource: 'reconcile_purchase_order_against_supplier_invoice_and_goods_receipt',
+        case_id: 'layout-case-enterprise-procurement-purchase-order-reconciliation-review-0001',
+        reason: `Held for review: ${LONG_DESCRIPTION}`,
+        latency_ms: 412,
+    },
+];
+
 const paymentRecords: PaymentRecordFixture[] = [
     {
         id: 'layout-payment-verification-1',
         type: 'verification',
         status: 'verified',
-        tx_hash: FIXTURE_ID.payment,
+        tx_hash: LEGACY_TX_HASH,
         channel_id: FIXTURE_ID.surface,
         channel_name: LONG_NAME,
         resource_path: '/a2a/enterprise-procurement/purchase-order-reconciliation-assistant/emea-production/tasks',
@@ -578,8 +616,8 @@ const paymentRecords: PaymentRecordFixture[] = [
         asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
         recipient: '0x9a4c1f7e3b8d2a6c0e5f9b1d4a7c3e8f2b6d0a5c',
         recipient_name: `${LONG_NAME} Treasury Wallet`,
-        tx_explorer_url: `https://sepolia.basescan.org/tx/${FIXTURE_ID.payment}`,
-        correlation_id: 'layout-payment-correlation-1',
+        tx_explorer_url: `https://sepolia.basescan.org/tx/${LEGACY_TX_HASH}`,
+        correlation_id: FIXTURE_ID.legacyPayment,
         created_at: unix(20),
         completed_at: unix(19),
         verification_mode: 'Local',
@@ -588,7 +626,7 @@ const paymentRecords: PaymentRecordFixture[] = [
         id: 'layout-payment-settlement-1',
         type: 'settlement',
         status: 'settled',
-        tx_hash: FIXTURE_ID.payment,
+        tx_hash: LEGACY_TX_HASH,
         channel_id: FIXTURE_ID.surface,
         channel_name: LONG_NAME,
         network: 'base-sepolia',
@@ -598,8 +636,8 @@ const paymentRecords: PaymentRecordFixture[] = [
         asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
         recipient: '0x9a4c1f7e3b8d2a6c0e5f9b1d4a7c3e8f2b6d0a5c',
         recipient_name: `${LONG_NAME} Treasury Wallet`,
-        tx_explorer_url: `https://sepolia.basescan.org/tx/${FIXTURE_ID.payment}`,
-        correlation_id: 'layout-payment-correlation-1',
+        tx_explorer_url: `https://sepolia.basescan.org/tx/${LEGACY_TX_HASH}`,
+        correlation_id: FIXTURE_ID.legacyPayment,
         created_at: unix(18),
         completed_at: unix(17),
         settlement_method: 'ExternalFacilitator',
@@ -781,6 +819,7 @@ const API_FIXTURES: Record<string, Body> = {
     '/api/v1/integrations/event-sets': eventSets,
     '/api/v1/dashboard/metrics/hierarchical': hierarchicalMetrics,
     '/api/v1/audit': auditPage,
+    '/api/admin/payments': {payments: paymentLedger, total: paymentLedger.length},
     '/api/admin/x402/payments/all': {payments: paymentRecords, total: paymentRecords.length, chart_data: []},
     '/api/admin/mpp/transactions': {transactions: [], total: 0},
 };

@@ -3257,6 +3257,7 @@ impl FabricCardRead {
                     timeout: self.timeout,
                     trace_id: &trace_id,
                     log_label: &self.log_label,
+                    extra_body: None,
                 },
             )
         };
@@ -6090,6 +6091,7 @@ async fn step_forward_request_fabric(
             timeout,
             trace_id: &ctx.request_id,
             log_label: &ctx.surface.name,
+            extra_body: None,
         },
     )
     .await

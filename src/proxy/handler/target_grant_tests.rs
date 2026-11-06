@@ -1527,9 +1527,10 @@ async fn a_refusal_before_anything_is_sent_is_audited() {
 }
 
 /// A surface that charges its callers never releases the Target's grant, as
-/// one edited by hand might: it is refused `connector_unavailable` before any
-/// payment is asked for or settled, so nobody pays for a request no grant can
-/// serve.
+/// one edited by hand might: an agent-pay surface is refused
+/// `connector_unavailable`, and a local payment, no longer taken, is refused
+/// `payment_unavailable`, both before any payment is asked for or settled, so
+/// nobody pays for a request no grant can serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_payment_is_taken_for_the_targets_grant() {
     let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
@@ -1537,18 +1538,22 @@ async fn no_payment_is_taken_for_the_targets_grant() {
         .store(&owner_key(), "owner-access")
         .await;
     let target = format!("{}/mcp", fixture.vendor.origin());
-    for (case, payment_policy) in [
+    for (case, payment_policy, refusal_at, refusal) in [
         (
-            "a payment this gateway takes",
+            "a local payment",
             json!({"type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
                 "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
                     "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
                 "mcp_payment_triggers": {"mode": "all"}}),
+            "",
+            json!({"error": "payment_unavailable"}),
         ),
         (
-            "a payment another gateway takes",
-            json!({"type": "x402", "enabled": true, "provider": "agent_pay",
-                "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface"}),
+            "a payment agent-pay takes",
+            json!({"type": "agent_pay", "payment_gateway_id": "payment-gateway",
+                "payment_surface_id": "payment-surface"}),
+            "/error/data",
+            json!({"reason": "connector_unavailable"}),
         ),
     ] {
         let mut surface = serde_json::to_value(vendor_surface("mcp", &target, "owner")).unwrap();
@@ -1562,7 +1567,7 @@ async fn no_payment_is_taken_for_the_targets_grant() {
             .send(call_to("POST", "/vendor", Some(call)))
             .await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
-        assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}), "{case}");
+        assert_eq!(body.pointer(refusal_at), Some(&refusal), "{case}: {body}");
         assert!(
             headers
                 .get("payment-required")

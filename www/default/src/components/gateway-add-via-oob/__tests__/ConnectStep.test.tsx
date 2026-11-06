@@ -12,9 +12,10 @@ jest.mock('../../../api', () => ({
 
 const mockedPost = apiClient.post as jest.Mock;
 
-const renderStep = (acceptorMediatorId: string) =>
+const renderStep = (acceptorMediatorId: string, endpoint?: string) =>
   render(
     <ConnectStep
+      endpoint={endpoint}
       oobLink="https://mediator.example.com/oob?_oobid=abc"
       secret="secret"
       name="Partner"
@@ -47,5 +48,19 @@ describe('ConnectStep', () => {
     renderStep('');
 
     expect((await sentBody()).acceptor_mediator_id).toBeUndefined();
+  });
+
+  it('posts to the gateway route by default', async () => {
+    renderStep('');
+
+    await sentBody();
+    expect(mockedPost.mock.calls[0][0]).toBe('/gateways/connect-via-oob');
+  });
+
+  it('posts to the given route', async () => {
+    renderStep('', '/payment-gateways/connect-via-oob');
+
+    await sentBody();
+    expect(mockedPost.mock.calls[0][0]).toBe('/payment-gateways/connect-via-oob');
   });
 });

@@ -80,12 +80,6 @@ impl BootstrapConfig {
                     .to_string_lossy()
                     .to_string();
             }
-            if PathBuf::from(&config.config_files.x402_proxy).is_relative() {
-                config.config_files.x402_proxy = config_dir
-                    .join(&config.config_files.x402_proxy)
-                    .to_string_lossy()
-                    .to_string();
-            }
 
             // Resolve TLS certificate paths
             if config

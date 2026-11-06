@@ -214,22 +214,23 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
           ) : null;
         })()}
 
-      {warnings.length > 0 && shouldShowDependencyWarnings(node.type, hasAttemptedSave) && (
-        <div className="config-section">
-          {warnings.map((w, i) => (
-            <div
-              key={i}
-              className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-1 px-2 mb-1`}
-              style={{ fontSize: '11px' }}
-            >
-              <i
-                className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-1`}
-              />
-              {w.message}
-            </div>
-          ))}
-        </div>
-      )}
+      {warnings.length > 0 &&
+        shouldShowDependencyWarnings(node.type, hasAttemptedSave, node.config) && (
+          <div className="config-section">
+            {warnings.map((w, i) => (
+              <div
+                key={i}
+                className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-1 px-2 mb-1`}
+                style={{ fontSize: '11px' }}
+              >
+                <i
+                  className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-1`}
+                />
+                {w.message}
+              </div>
+            ))}
+          </div>
+        )}
 
       {node.type !== 'surface' && (
         <div className="config-section">

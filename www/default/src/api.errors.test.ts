@@ -27,3 +27,19 @@ test('a failed request throws an ApiError carrying its status', async () => {
   expect(error).toBeInstanceOf(Error);
   expect((error as ApiError).status).toBe(403);
 });
+
+test('a failed request carries the error code of its body', async () => {
+  fetchMock.mockResolvedValue(
+    new Response(JSON.stringify({ error: 'payment_manifest_not_found' }), {
+      status: 404,
+      statusText: 'Not Found',
+      headers: { 'Content-Type': 'application/json' },
+    })
+  );
+
+  const error = await apiClient.get('/surfaces/s-1/payment-manifest').catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(404);
+  expect((error as ApiError).code).toBe('payment_manifest_not_found');
+});

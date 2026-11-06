@@ -3,6 +3,7 @@ import type { SurfaceNodeType } from './nodeTypes';
 import { registry } from './elements';
 import type { NodeDefinition, PaletteCategory } from './elements/types';
 import HelpBalloon from './HelpBalloon';
+import { useAgentPayFlag } from '../../utils/featureFlags';
 
 interface ElementPaletteProps {
   existingNodes: { type: SurfaceNodeType }[];
@@ -40,6 +41,10 @@ const CATEGORY_LABELS: Record<PaletteCategory, string> = {
   actor: 'Actors',
 };
 
+const NOTHING_HIDDEN: ReadonlySet<string> = new Set();
+/** Offered only while `agent_pay_delegation` is on; one already on the canvas stays. */
+const AGENT_PAY_ELEMENTS: ReadonlySet<string> = new Set(['payment']);
+
 const ElementPalette: React.FC<ElementPaletteProps> = ({
   existingNodes,
   protocol,
@@ -60,9 +65,14 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
 
   const toggleSection = (key: string) => setExpanded(prev => ({ ...prev, [key]: !prev[key] }));
 
+  const { enabled: agentPayOn } = useAgentPayFlag();
   const itemsByCategory = useMemo(
-    () => registry.paletteByCategory((protocol as any) || 'http'),
-    [protocol]
+    () =>
+      registry.paletteByCategory(
+        (protocol as any) || 'http',
+        agentPayOn ? NOTHING_HIDDEN : AGENT_PAY_ELEMENTS
+      ),
+    [protocol, agentPayOn]
   );
 
   const [highlightedType, setHighlightedType] = useState<SurfaceNodeType | null>(null);

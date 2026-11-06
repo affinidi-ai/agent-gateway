@@ -170,6 +170,7 @@ pub fn create_mpp_admin_router() -> Router<MppAdminApiState> {
 mod tests {
     use super::*;
     use crate::mpp::MppTransactionStore;
+    use crate::mpp::transaction_store::MppTransactionStatus;
     use axum::extract::{Path, Query, State};
 
     async fn temp_store() -> MppTransactionStore {
@@ -182,20 +183,9 @@ mod tests {
     #[tokio::test]
     async fn list_returns_recorded_transactions() {
         let store = temp_store().await;
-        store
-            .record_verified(
-                "ch-1",
-                "test-channel",
-                "/api/resource",
-                "stripe",
-                "pi_123",
-                Some("did:key:z6Mk..."),
-                Some("5000"),
-                Some("usd"),
-                None,
-            )
-            .await
-            .unwrap();
+        let mut txn = MppTransaction::for_test("ch-1", MppTransactionStatus::Verified);
+        txn.currency = Some("usd".to_string());
+        store.insert(txn).await;
 
         let state = MppAdminApiState {
             transaction_store: Some(Arc::new(store)),
@@ -227,10 +217,10 @@ mod tests {
     #[tokio::test]
     async fn get_returns_full_record() {
         let store = temp_store().await;
-        let id = store
-            .record_failed("ch-1", "test-channel", "/api/resource", "stripe", "card_declined", None, None)
-            .await
-            .unwrap();
+        let mut txn = MppTransaction::for_test("ch-1", MppTransactionStatus::Failed);
+        txn.error = Some("card_declined".to_string());
+        let id = txn.id.clone();
+        store.insert(txn).await;
 
         let state = MppAdminApiState {
             transaction_store: Some(Arc::new(store)),
