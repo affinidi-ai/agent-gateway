@@ -18,10 +18,10 @@ describe('SurfaceLinkButton', () => {
     expect(link).toHaveTextContent('OXYGEN');
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledWith('oxygen');
-    expect(screen.queryByTestId('identities-surface-deleted-badge')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('identities-surface-archived')).not.toBeInTheDocument();
   });
 
-  it('shows the surface of an archived identity by name as plain text marked Deleted', () => {
+  it('shows the surface of an archived identity by name as plain text', () => {
     render(
       <SurfaceLinkButton
         surface={{ id: 'oxygen', name: 'OXYGEN', archived: true }}
@@ -30,8 +30,7 @@ describe('SurfaceLinkButton', () => {
       />
     );
 
-    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent('OXYGEN');
-    expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveTextContent('Deleted');
+    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent(/^OXYGEN$/);
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(screen.queryByTestId('identities-surface-link')).not.toBeInTheDocument();
   });
@@ -44,8 +43,7 @@ describe('SurfaceLinkButton', () => {
       />
     );
 
-    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent('surface-1');
-    expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveTextContent('Deleted');
+    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent(/^surface-1$/);
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
 });

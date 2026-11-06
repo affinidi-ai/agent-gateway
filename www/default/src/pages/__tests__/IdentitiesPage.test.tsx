@@ -885,18 +885,13 @@ describe('IdentitiesPage', () => {
         'Archived'
       );
       const archivedSurface = within(archivedRow).getByTestId('identities-surface-archived');
-      expect(archivedSurface).toHaveTextContent('surface-gone');
-      expect(
-        within(archivedSurface).getByTestId('identities-surface-deleted-badge')
-      ).toHaveTextContent('Deleted');
+      expect(archivedSurface).toHaveTextContent(/^surface-gone$/);
       expect(
         within(archivedSurface).queryByTestId('identities-archived-badge')
       ).not.toBeInTheDocument();
       expect(within(archivedRow).queryByTestId('identities-surface-link')).not.toBeInTheDocument();
       expect(within(liveRow).queryByTestId('identities-archived-badge')).not.toBeInTheDocument();
-      expect(
-        within(liveRow).queryByTestId('identities-surface-deleted-badge')
-      ).not.toBeInTheDocument();
+      expect(within(liveRow).queryByTestId('identities-surface-archived')).not.toBeInTheDocument();
       expect(within(liveRow).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
       expect(screen.queryByTestId('identity-archived-info')).not.toBeInTheDocument();
 

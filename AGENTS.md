@@ -209,7 +209,7 @@ with its surface count and every one of its surfaces; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
 The Identities page marks an identity whose every surface was deleted with an "Archived" badge,
-shows its surface as plain text with a "Deleted" badge and no link, and selecting it says the
+shows its surface as plain text with no link, and selecting it says the
 identity is no longer in use; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
