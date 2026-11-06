@@ -131,8 +131,9 @@ pub fn normalize_principal_claim(claim: Option<&str>) -> Result<Option<String>, 
 /// `aud` binds the token to the service it was issued for. `azp` and
 /// `client_id` bind it only to the client it was issued to, for identity
 /// providers whose access tokens carry no `aud`: a token that client was
-/// issued for another service is accepted too, so no per-user grant is
-/// released to callers it verifies.
+/// issued for another service is accepted too, so callers it verifies get
+/// no grant from a binding with external consent and no delegated
+/// credentials for Fabric callers.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AudienceClaim {

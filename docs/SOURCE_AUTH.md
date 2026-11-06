@@ -243,16 +243,19 @@ the surface or in a variant's overrides. For an identity provider whose access t
 `aud`, such as Amazon Cognito, set `audience_claim` to `client_id` or `azp` and list the clients
 the method accepts in `audiences`: the named claim must then be a string that matches one of
 them, and `aud` is not checked. That binds a token to the client it was issued to, not to the
-gateway, so a token a listed client was issued for another service is accepted too, and no
-per-user grant (a binding with external consent, or delegated credentials for Fabric callers)
-is released to callers it verifies. `audience_claim` is `aud` by default, must be `aud` beside
+gateway, so a token a listed client was issued for another service is accepted too. Callers it
+verifies get no grant from a binding with external consent and no delegated credentials for
+Fabric callers; delegated credentials in the `on_demand`, `pre_authorize` and `elicit` consent
+modes are still released per caller, as for a method stored without audiences. `audience_claim` is `aud` by default, must be `aud` beside
 protected resource metadata, and must be `aud` on a Transit Point.
 
 A method stored without `audiences`, from before that rule, keeps loading and skips the audience
 check, so it accepts a token its identity provider issued for any other service. The gateway
 warns about each one at startup and in a `Warning` header on each save of its surface, and a
 save that keeps the stored method unchanged is accepted, so an unrelated edit still saves; a
-save that changes it must name an audience. Such methods are deprecated and will be refused in
+save that changes it must name an audience. A variant keeps such a method too when it is added,
+copied, renamed or enabled again, as long as the surface or one of its stored variants has the
+same method. Such methods are deprecated and will be refused in
 a future release: list the audiences the method accepts, or set `audience_claim`.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected

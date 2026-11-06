@@ -688,9 +688,12 @@ pub fn validate_source_auth_config(
 /// Each Access Point `jwt_bearer` method must name an audience, so a token
 /// its identity provider issued for another service is refused, unless the
 /// Access Point publishes a protected resource, whose `resource` is then the
-/// audience, matched against `aud`. A method `stored` with the same strategy
-/// and the same audiences, such as an empty list saved before this rule, is
-/// kept, so an unrelated edit still saves; the save warns about it instead.
+/// audience, matched against `aud`. A method stored unchanged, such as an
+/// empty list saved before this rule, is kept, so an unrelated edit still
+/// saves; the save warns about it instead. It is kept when `stored`, or any
+/// variant `stored` holds, disabled ones included, has it beside no protected
+/// resource, so a variant added, copied, renamed or enabled again keeps the
+/// method it inherits.
 fn validate_jwt_bearer_audiences(
     surface: &crate::config::agent_surface::AgentSurface,
     stored: Option<&crate::config::agent_surface::AgentSurface>,
@@ -700,6 +703,25 @@ fn validate_jwt_bearer_audiences(
     let protected_resource = surface
         .protected_resource()
         .is_some();
+    let stored_views: Vec<_> = stored
+        .into_iter()
+        .flat_map(|stored| {
+            std::iter::once(stored.clone()).chain(
+                stored
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        stored
+                            .serve_selected(Some(variant))
+                            .surface
+                    }),
+            )
+        })
+        .filter(|view| {
+            view.protected_resource()
+                .is_none()
+        })
+        .collect();
     for method in surface.source_auth_methods() {
         let SourceAuthConfig::JwtBearer(config) = method else {
             continue;
@@ -722,15 +744,12 @@ fn validate_jwt_bearer_audiences(
             continue;
         }
         let kept = config.audience_claim.is_aud()
-            && stored.is_some_and(|stored| {
-                stored
-                    .protected_resource()
-                    .is_none()
-                    && stored
-                        .source_auth_methods()
-                        .iter()
-                        .any(|stored| stored == method)
-            });
+            && stored_views
+                .iter()
+                .any(|view| {
+                    view.source_auth_methods()
+                        .contains(method)
+                });
         if !kept {
             anyhow::bail!(
                 "Channel '{}': jwt_bearer method (strategy '{}') must name the audiences it accepts, so a token its \
@@ -1173,6 +1192,37 @@ mod tests {
         assert!(
             validate_source_auth_config(&stored, Some(&was_discovery)).is_err(),
             "dropping protected_resource leaves no audience, so it is not kept"
+        );
+    }
+
+    /// A variant with no stored counterpart is checked against the stored
+    /// surface, so it keeps a method stored without audiences on the base or
+    /// on any stored variant, disabled ones included, but not a new one.
+    #[test]
+    fn a_method_stored_without_an_audience_is_kept_from_any_stored_view() {
+        let own_method =
+            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-2", "audiences": []});
+        let mut stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        stored.variants = serde_json::from_value(serde_json::json!([{
+            "id": "v-old", "name": "Old", "alias": "old", "enabled": false,
+            "overrides": {"access_point": {"caller_authentication": {"methods": [own_method.clone()]}}}
+        }]))
+        .unwrap();
+
+        let inherits_base = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        validate_source_auth_config(&inherits_base, Some(&stored)).expect("a new variant keeps the base's method");
+
+        let enabled_again = surface_with_caller_auth(serde_json::json!([own_method]), serde_json::json!({}));
+        validate_source_auth_config(&enabled_again, Some(&stored))
+            .expect("a variant enabled again keeps the method its disabled stored copy has");
+
+        let never_stored = surface_with_caller_auth(
+            serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-3", "audiences": []}]),
+            serde_json::json!({}),
+        );
+        assert!(
+            validate_source_auth_config(&never_stored, Some(&stored)).is_err(),
+            "a method no stored view has is new"
         );
     }
 

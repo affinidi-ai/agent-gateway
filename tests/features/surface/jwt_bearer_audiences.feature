@@ -45,6 +45,13 @@ Feature: JWT Bearer audiences
     Then the admin API response status is 200
     And the admin API response carries a Warning header containing "names no audience"
 
+  Scenario: A new variant keeps the method stored without audiences that it inherits
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    When the operator saves the surface with a new variant "beta"
+    Then the admin API response status is 200
+    And the admin API response carries a Warning header containing "names no audience"
+
   Scenario: A change to a method stored without audiences is refused unless it names one
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
