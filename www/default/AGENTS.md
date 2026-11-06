@@ -1167,8 +1167,9 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 - A surface of an identity marked `surface_deleted` (every surface it is linked to was
   deleted) is shown by `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`), in the **Agent
   Surface** list and the expanded Summary, as muted plain text, the surface name when the
-  identity carries one and otherwise the surface id, with a secondary "Deleted" badge, and never
-  links. A live surface keeps its link and shows no badge.
+  identity carries one and otherwise the surface id, with a solid grey "Deleted" badge
+  (`badge text-bg-secondary`, white text), and never links. A live surface keeps its link and
+  shows no badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
   A shared managed DID carries the worst outcome across those surfaces, ranked Failed >

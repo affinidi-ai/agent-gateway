@@ -90,9 +90,10 @@ test.describe("Identities page revoked identity", () => {
     await expect(row.getByTestId("identities-revoked-badge")).toBeVisible();
     const surface = row.getByTestId("identities-surface-deleted");
     await expect(surface).toContainText("ui-deleted-surface");
-    await expect(
-      surface.getByTestId("identities-surface-deleted-badge"),
-    ).toHaveText("Deleted");
+    const deletedBadge = surface.getByTestId("identities-surface-deleted-badge");
+    await expect(deletedBadge).toHaveText("Deleted");
+    await expect(deletedBadge).toHaveCSS("color", "rgb(255, 255, 255)");
+    await expect(deletedBadge).toHaveClass(/\btext-bg-secondary\b/);
     await expect(row.getByTestId("identities-surface-link")).toHaveCount(0);
   });
 

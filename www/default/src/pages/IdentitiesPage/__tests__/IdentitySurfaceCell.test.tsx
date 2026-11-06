@@ -32,6 +32,10 @@ describe('SurfaceLinkButton', () => {
 
     expect(screen.getByTestId('identities-surface-deleted')).toHaveTextContent('OXYGEN');
     expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveTextContent('Deleted');
+    expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveClass(
+      'badge',
+      'text-bg-secondary'
+    );
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(screen.queryByTestId('identities-surface-link')).not.toBeInTheDocument();
   });
