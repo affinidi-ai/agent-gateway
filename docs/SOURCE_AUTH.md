@@ -490,8 +490,9 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
 blocks such a name at fetch time. The JWT Bearer JWKS client (`src/jwt_bearer/jwks.rs`)
-always uses the Strict pinned client, so a `jwks_uri` discovered under either posture can be
-handed to it; one on a private or loopback host is refused.
+always uses a pinned client that refuses only cloud metadata, loopback and unspecified
+addresses, so a `jwks_uri` discovered under `Strict` must not be handed to it; fetch it with
+`get_bounded` under `Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a

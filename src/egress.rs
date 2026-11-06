@@ -415,28 +415,29 @@ pub(crate) async fn pinned_vendor_client(
     pinned_direct_client(&target, timeout)
 }
 
-/// Vet `raw_url` with the Strict policy and pin it to the addresses it
-/// resolved to. `exact_allowlist` is the BDD allow-list
+/// Vet `raw_url` with the Configured policy, which refuses cloud metadata,
+/// loopback and unspecified addresses and allows private networks, and pin it
+/// to the addresses it resolved to. `exact_allowlist` is the BDD allow-list
 /// ([`bdd_egress_allowlist`] on the production path), which can admit a
 /// loopback fixture but never cloud metadata.
 ///
 /// Resolves DNS (blocking OS resolver); call from a blocking context.
-pub(crate) fn vet_strict(
+pub(crate) fn vet_configured(
     raw_url: &str,
     exact_allowlist: Option<&str>,
 ) -> Result<PinnedTarget, EgressError> {
-    validate_and_pin_inner(raw_url, EgressPolicy::Strict, exact_allowlist)
+    validate_and_pin_inner(raw_url, EgressPolicy::Configured, exact_allowlist)
 }
 
-/// How long a save waits for [`strict_refuses`] to resolve a host.
+/// How long a save waits for [`configured_refuses`] to resolve a host.
 const SAVE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Whether the Strict policy refuses `raw_url` ([`vet_strict`]) when a JWT
-/// verification strategy or credential provider is saved: not an http(s) URL,
-/// or a host that resolves to a refused address. A host that does not resolve,
-/// or not within [`SAVE_RESOLVE_TIMEOUT`], is not refused, since every request
-/// vets it again. The resolve runs on the blocking pool.
-pub(crate) async fn strict_refuses(
+/// Whether the Configured policy refuses `raw_url` ([`vet_configured`]) when a
+/// JWT verification strategy is saved: not an http(s) URL, or a host that
+/// resolves to a refused address. A host that does not resolve, or not within
+/// [`SAVE_RESOLVE_TIMEOUT`], is not refused, since every fetch vets it again.
+/// The resolve runs on the blocking pool.
+pub(crate) async fn configured_refuses(
     raw_url: &str,
     exact_allowlist: Option<&str>,
 ) -> bool {
@@ -444,29 +445,29 @@ pub(crate) async fn strict_refuses(
     let allowlist = exact_allowlist.map(str::to_string);
     let vetted = tokio::time::timeout(
         SAVE_RESOLVE_TIMEOUT,
-        tokio::task::spawn_blocking(move || vet_strict(&raw, allowlist.as_deref())),
+        tokio::task::spawn_blocking(move || vet_configured(&raw, allowlist.as_deref())),
     )
     .await;
     match vetted {
         Ok(Ok(Err(error @ (EgressError::Blocked(_) | EgressError::Parse(_))))) => {
-            tracing::warn!(error = %error, "URL refused by the Strict egress policy");
+            tracing::warn!(error = %error, "URL refused by the Configured egress policy");
             true
         }
         _ => false,
     }
 }
 
-/// [`vet_strict`] and a redirect-off client pinned to the vetted addresses
+/// [`vet_configured`] and a redirect-off client pinned to the vetted addresses
 /// that ignores proxies ([`pinned_direct_client`]), for a JWT verification
 /// strategy's JWKS fetch and a credential provider's token request.
 ///
 /// Resolves DNS (blocking OS resolver); call from a blocking context.
-pub(crate) fn pinned_strict_direct_client(
+pub(crate) fn pinned_configured_direct_client(
     raw_url: &str,
     timeout: Duration,
     exact_allowlist: Option<&str>,
 ) -> Result<(Client, PinnedTarget), EgressError> {
-    let target = vet_strict(raw_url, exact_allowlist)?;
+    let target = vet_configured(raw_url, exact_allowlist)?;
     let client = pinned_direct_client(&target, timeout)?;
     Ok((client, target))
 }
@@ -700,40 +701,46 @@ mod tests {
     }
 
     #[test]
-    fn strict_direct_client_refuses_private_ranges_and_admits_only_an_allow_listed_fixture() {
+    fn configured_direct_client_refuses_metadata_and_loopback_and_admits_private_networks() {
         let timeout = Duration::from_secs(1);
         for raw in [
-            "http://10.0.0.1/jwks.json",
-            "http://172.16.0.1/jwks.json",
-            "http://192.168.1.1/jwks.json",
             "http://127.0.0.1:9/jwks.json",
             "http://[::1]/jwks.json",
-            "http://169.254.1.1/jwks.json",
-            "http://[fd00::1]/jwks.json",
-            "http://[::ffff:10.0.0.1]/jwks.json",
+            "http://0.0.0.0/jwks.json",
+            "http://[::ffff:127.0.0.1]/jwks.json",
+            "http://169.254.169.254/jwks.json",
+            "http://[fd00:ec2::254]/jwks.json",
+            "http://[::ffff:169.254.169.254]/jwks.json",
         ] {
             assert!(
-                matches!(pinned_strict_direct_client(raw, timeout, None), Err(EgressError::Blocked(_))),
-                "strict direct must refuse {raw}"
+                matches!(pinned_configured_direct_client(raw, timeout, None), Err(EgressError::Blocked(_))),
+                "configured direct must refuse {raw}"
             );
         }
-        let (_, target) = pinned_strict_direct_client("https://1.2.3.4/jwks.json", timeout, None)
-            .expect("a public address is admitted");
-        assert_eq!(target.addrs, vec!["1.2.3.4:443".parse().unwrap()]);
+        for (raw, addr) in [
+            ("https://1.2.3.4/jwks.json", "1.2.3.4:443"),
+            ("http://10.0.0.1/jwks.json", "10.0.0.1:80"),
+            ("http://172.16.0.1/jwks.json", "172.16.0.1:80"),
+            ("https://192.168.100.100:11443/jwks.json", "192.168.100.100:11443"),
+        ] {
+            let (_, target) =
+                pinned_configured_direct_client(raw, timeout, None).unwrap_or_else(|e| panic!("{raw} admitted: {e}"));
+            assert_eq!(target.addrs, vec![addr.parse().unwrap()], "{raw}");
+        }
         let (_, fixture) =
-            pinned_strict_direct_client("http://127.0.0.1:9/jwks.json", timeout, Some("http://127.0.0.1:9"))
+            pinned_configured_direct_client("http://127.0.0.1:9/jwks.json", timeout, Some("http://127.0.0.1:9"))
                 .expect("an allow-listed loopback fixture is admitted");
         assert_eq!(fixture.addrs, vec!["127.0.0.1:9".parse().unwrap()]);
         assert!(
             matches!(
-                pinned_strict_direct_client("http://10.0.0.1/jwks.json", timeout, Some("http://127.0.0.1:9")),
+                pinned_configured_direct_client("http://127.0.0.1:10/jwks.json", timeout, Some("http://127.0.0.1:9")),
                 Err(EgressError::Blocked(_))
             ),
             "the allow-list admits only what it names"
         );
         assert!(
             matches!(
-                vet_strict("http://169.254.169.254/latest/", Some("http://169.254.169.254")),
+                vet_configured("http://169.254.169.254/latest/", Some("http://169.254.169.254")),
                 Err(EgressError::Blocked(_))
             ),
             "metadata is never allow-listed"
@@ -741,22 +748,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_save_refuses_only_what_the_strict_policy_refuses() {
+    async fn a_save_refuses_only_what_the_configured_policy_refuses() {
         for raw in [
-            "https://10.0.0.1/token",
-            "https://127.0.0.1/token",
-            "https://[fd00::1]/token",
-            "https://169.254.169.254/token",
+            "https://127.0.0.1/keys",
+            "https://[::1]/keys",
+            "https://169.254.169.254/keys",
             "not a url",
-            "ftp://1.2.3.4/token",
+            "ftp://1.2.3.4/keys",
         ] {
-            assert!(strict_refuses(raw, None).await, "a save must refuse {raw}");
+            assert!(configured_refuses(raw, None).await, "a save must refuse {raw}");
         }
-        for raw in ["https://1.2.3.4/token", "https://nonexistent.host.invalid/token"] {
-            assert!(!strict_refuses(raw, None).await, "a save must accept {raw}");
+        for raw in [
+            "https://1.2.3.4/keys",
+            "https://10.0.0.1/keys",
+            "https://192.168.1.1/keys",
+            "https://nonexistent.host.invalid/keys",
+        ] {
+            assert!(!configured_refuses(raw, None).await, "a save must accept {raw}");
         }
         assert!(
-            !strict_refuses("http://127.0.0.1:9/token", Some("http://127.0.0.1:9")).await,
+            !configured_refuses("http://127.0.0.1:9/keys", Some("http://127.0.0.1:9")).await,
             "an allow-listed fixture is accepted"
         );
     }
@@ -956,9 +967,10 @@ mod tests {
                 assert!(!through_proxy(vendor).await, "a vendor call of external consent connects directly");
                 let (metadata, _) = pinned_metadata_client(&url, false, Duration::from_secs(5)).unwrap();
                 assert!(!through_proxy(metadata).await, "authorization server metadata is read directly");
-                let (strict_direct, _) = pinned_strict_direct_client(&url, Duration::from_secs(5), Some(&url)).unwrap();
+                let (configured_direct, _) =
+                    pinned_configured_direct_client(&url, Duration::from_secs(5), Some(&url)).unwrap();
                 assert!(
-                    !through_proxy(strict_direct).await,
+                    !through_proxy(configured_direct).await,
                     "a JWKS fetch or credential provider token request connects directly"
                 );
 

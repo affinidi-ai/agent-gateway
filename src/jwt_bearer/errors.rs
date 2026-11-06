@@ -33,8 +33,9 @@ pub enum JwtBearerError {
     #[error("JWKS fetch failed: {0}")]
     JwksFetchFailed(String),
 
-    /// The JWKS URI does not resolve to a public address, so the egress policy
-    /// refuses to fetch it.
+    /// The JWKS URI is not an http(s) URL or resolves to loopback, an
+    /// unspecified address or cloud metadata, so the egress policy refuses to
+    /// fetch it.
     #[error("JWKS URI refused by egress policy")]
     JwksUriBlocked,
 

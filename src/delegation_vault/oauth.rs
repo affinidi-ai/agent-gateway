@@ -849,24 +849,10 @@ impl TokenEgress {
         Ok(())
     }
 
-    /// Whether the Strict egress policy refuses `endpoint` when a provider is saved
-    /// ([`crate::egress::strict_refuses`]). A host that does not resolve, or not in time,
-    /// is not refused here; every token request vets it again.
-    pub(crate) async fn refuses_token_endpoint(
-        &self,
-        endpoint: &str,
-    ) -> bool {
-        crate::egress::strict_refuses(
-            endpoint,
-            self.exact_allowlist
-                .as_deref(),
-        )
-        .await
-    }
-
     /// A redirect-off client that ignores proxies, pinned to the addresses `endpoint`
-    /// resolved to when the Strict policy vetted it, and the URL to post to. A blocked
-    /// address is [`TokenEndpointRefused`].
+    /// resolved to when the Configured policy vetted it (cloud metadata, loopback and
+    /// unspecified addresses refused, private networks allowed), and the URL to post to.
+    /// A refused address is [`TokenEndpointRefused`].
     pub(crate) async fn pinned_client(
         &self,
         endpoint: &str,
@@ -875,7 +861,7 @@ impl TokenEgress {
         let timeout = self.timeout;
         let allowlist = self.exact_allowlist.clone();
         let (client, target) = tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_strict_direct_client(&raw, timeout, allowlist.as_deref())
+            crate::egress::pinned_configured_direct_client(&raw, timeout, allowlist.as_deref())
         })
         .await
         .context("Provider token request failed")?

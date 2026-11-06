@@ -173,8 +173,9 @@ async fn discover_with<T>(
 /// A host name that only resolves to such an address cannot be detected without DNS, so
 /// the caller must fetch these URLs with [`get_bounded`], or another pinned client, under
 /// the same posture, which blocks such a name at connect time. The JWT Bearer JWKS
-/// client always uses the Strict pinned client, so a `jwks_uri` discovered under either
-/// posture can be handed to it.
+/// client refuses only cloud metadata, loopback and unspecified addresses, so a
+/// `jwks_uri` discovered under [`EgressPosture::Strict`] must not be handed to it: fetch
+/// it with [`get_bounded`] under `Strict`.
 pub fn parse_metadata(
     body: &[u8],
     issuer: &str,

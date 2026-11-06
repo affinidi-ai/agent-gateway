@@ -21,7 +21,7 @@ use crate::jwt_bearer::errors::{JwtBearerError, JwtBearerResult};
 /// The largest JWKS response the gateway reads.
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 
-/// The exact URLs a JWKS fetch may reach although the Strict policy refuses them:
+/// The exact URLs a JWKS fetch may reach although the Configured policy refuses them:
 /// the BDD egress allow-list under `AG_TEST_MODE`, plus, in unit tests, the
 /// loopback servers [`super::test_utils::start_jwks_server`] started. `None` in
 /// production.
@@ -43,20 +43,20 @@ fn jwks_egress_allowlist() -> Option<String> {
     allowlist
 }
 
-/// Vet `jwks_uri` with the Strict egress policy when a strategy is saved
-/// ([`crate::egress::strict_refuses`]): it must be an http(s) URL resolving to
-/// none of cloud metadata, loopback, RFC 1918, link-local or IPv6 unique-local.
-/// A refusal is [`JwtBearerError::JwksUriBlocked`]. A host that does not
-/// resolve, or not in time, passes, since every fetch vets it again.
+/// Vet `jwks_uri` with the Configured egress policy when a strategy is saved
+/// ([`crate::egress::configured_refuses`]): it must be an http(s) URL resolving
+/// to neither cloud metadata, loopback nor an unspecified address; private
+/// networks are allowed. A refusal is [`JwtBearerError::JwksUriBlocked`]. A host
+/// that does not resolve, or not in time, passes, since every fetch vets it again.
 pub(crate) async fn vet_jwks_uri(jwks_uri: &str) -> JwtBearerResult<()> {
-    if crate::egress::strict_refuses(jwks_uri, jwks_egress_allowlist().as_deref()).await {
+    if crate::egress::configured_refuses(jwks_uri, jwks_egress_allowlist().as_deref()).await {
         return Err(JwtBearerError::JwksUriBlocked);
     }
     Ok(())
 }
 
-/// Build a per-fetch client for a JWKS URI, vetted with the Strict policy
-/// ([`crate::egress::vet_strict`]), pinned to the addresses the host resolved to so it
+/// Build a per-fetch client for a JWKS URI, vetted with the Configured policy
+/// ([`crate::egress::vet_configured`]), pinned to the addresses the host resolved to so it
 /// cannot rebind between validation and connect, with redirects refused and
 /// proxies ignored, since a proxy would resolve the host again. Built per
 /// fetch because JWKS fetches are transient and cached.
@@ -64,7 +64,7 @@ async fn pinned_jwks_client(jwks_uri: &str) -> JwtBearerResult<reqwest::Client> 
     let raw = jwks_uri.to_string();
     let allowlist = jwks_egress_allowlist();
     let pinned = tokio::task::spawn_blocking(move || {
-        crate::egress::pinned_strict_direct_client(
+        crate::egress::pinned_configured_direct_client(
             &raw,
             Duration::from_secs(crate::http_client::SHORT_TIMEOUT_SECS),
             allowlist.as_deref(),
@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_jwks_rejects_loopback() {
-        // The ECS task metadata address, in the link-local range the Strict policy refuses.
+        // The ECS task metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://169.254.170.2/v2/credentials/jwks.json")
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_jwks_rejects_ipv6_loopback() {
-        // The IPv6 AWS metadata address, in the unique-local range the Strict policy refuses.
+        // The IPv6 AWS metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://[fd00:ec2::254]/jwks.json")
@@ -717,19 +717,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_jwks_uri_that_is_not_public_is_refused_without_a_request() {
+    async fn a_loopback_or_metadata_jwks_uri_is_refused_without_a_request() {
         let client = JwksClient::new();
         for uri in [
-            "http://127.0.0.1:1/jwks.json",
-            "http://localhost:1/jwks.json",
-            "http://[::1]:1/jwks.json",
-            "http://10.0.0.1/jwks.json",
-            "http://172.16.0.1/jwks.json",
-            "http://192.168.1.1/jwks.json",
-            "http://169.254.1.1/jwks.json",
-            "http://[fd00::1]/jwks.json",
-            "http://[::ffff:192.168.1.1]/jwks.json",
-            "http://0x7f000001/jwks.json",
+            "https://127.0.0.1:1/jwks.json",
+            "https://localhost:1/jwks.json",
+            "https://[::1]:1/jwks.json",
+            "https://0.0.0.0/jwks.json",
+            "https://0x7f000001/jwks.json",
+            "https://[::ffff:127.0.0.1]/jwks.json",
+            "https://169.254.169.254/jwks.json",
+            "https://[fd00:ec2::254]/jwks.json",
+            "https://metadata.google.internal/jwks.json",
         ] {
             assert!(
                 matches!(client.fetch_jwks(uri).await, Err(JwtBearerError::JwksUriBlocked)),
@@ -745,6 +744,24 @@ mod tests {
                 "a token check must refuse {uri}"
             );
             assert!(matches!(vet_jwks_uri(uri).await, Err(JwtBearerError::JwksUriBlocked)), "save must refuse {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_network_jwks_uri_passes_the_vetting() {
+        for uri in [
+            "https://10.0.0.1/jwks.json",
+            "https://172.16.0.1/jwks.json",
+            "https://192.168.100.100:11443/jwks.json",
+            "https://169.254.1.1/jwks.json",
+            "https://[fd00::1]/jwks.json",
+        ] {
+            assert!(
+                vet_jwks_uri(uri)
+                    .await
+                    .is_ok(),
+                "save must accept {uri}"
+            );
         }
     }
 

@@ -103,8 +103,8 @@ fn reference_scan_failed(error: anyhow::Error) -> Response {
 enum ProviderValidationError {
     #[error("token_endpoint must be an https URL")]
     TokenEndpointNotHttps,
-    #[error("token_endpoint must resolve to public addresses only")]
-    TokenEndpointNotPublic,
+    #[error("token_endpoint must resolve to neither loopback nor cloud metadata")]
+    TokenEndpointBlocked,
     #[error("{0} is required for this provider type")]
     Missing(&'static str),
     #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
@@ -133,7 +133,7 @@ impl IntoResponse for ProviderValidationError {
     fn into_response(self) -> Response {
         match self {
             Self::TokenEndpointNotHttps
-            | Self::TokenEndpointNotPublic
+            | Self::TokenEndpointBlocked
             | Self::Missing(_)
             | Self::ClientSecretNotAllowed
             | Self::UnsupportedAlgorithm
@@ -433,16 +433,6 @@ async fn validate_provider_settings(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
     validate_token_endpoint_scheme(egress, previous, provider)?;
-    if provider.provider_type != CredentialProviderType::ApiKey
-        && let Some(endpoint) = provider
-            .token_endpoint
-            .as_deref()
-        && egress
-            .refuses_token_endpoint(endpoint)
-            .await
-    {
-        return Err(ProviderValidationError::TokenEndpointNotPublic);
-    }
     validate_jwt_provider(provider)?;
     let isolation = egress
         .policy
@@ -1361,7 +1351,7 @@ async fn remove_provider_grants(
 
 /// POST /api/v1/credential-providers/validate
 /// Checks the key material a JWT-signing provider references, with the same tenancy rules
-/// as a save, then that the token endpoint passes the Strict egress policy and is reachable
+/// as a save, then that the token endpoint passes the Configured egress policy and is reachable
 pub async fn validate_provider(
     State(state): State<CredentialProviderState>,
     pat: Option<Extension<PatContext>>,
@@ -1469,7 +1459,7 @@ async fn validate_provider_with(
     {
         Ok(pinned) => pinned,
         Err(error) if error.is::<crate::delegation_vault::oauth::TokenEndpointRefused>() => {
-            return ProviderValidationError::TokenEndpointNotPublic.into_response();
+            return ProviderValidationError::TokenEndpointBlocked.into_response();
         }
         Err(error) => return unreachable(&error),
     };
@@ -2343,33 +2333,30 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_token_endpoint_that_is_not_public_is_refused_on_create_and_update() {
+    async fn a_private_token_endpoint_is_saved_and_a_loopback_or_metadata_one_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         for (index, endpoint) in [
-            "https://10.0.0.1/token",
-            "https://172.16.0.1/token",
-            "https://192.168.1.1/token",
-            "https://169.254.1.1/token",
-            "https://[fd00::1]/token",
-            "https://[::ffff:10.0.0.1]/token",
+            "https://127.0.0.1/token",
+            "https://[::1]/token",
+            "https://169.254.169.254/token",
+            "https://[fd00:ec2::254]/token",
         ]
         .into_iter()
         .enumerate()
         {
             for body in [client_credentials("oauth2_client_credentials"), jwt_bearer("p")] {
                 let (status, response) =
-                    create(&state, with_token_endpoint(body.clone(), &format!("private-{index}"), endpoint)).await;
+                    create(&state, with_token_endpoint(body.clone(), &format!("blocked-{index}"), endpoint)).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
-                assert_eq!(response["error"], "token_endpoint must resolve to public addresses only", "{endpoint}");
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("token_endpoint:")),
+                    "{endpoint}: {response}"
+                );
             }
         }
-        let (status, response) = create(
-            &state,
-            with_token_endpoint(client_credentials("oauth2_client_credentials"), "loopback", "https://127.0.0.1/token"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "loopback is refused too: {response}");
         assert!(
             state
                 .store
@@ -2380,22 +2367,32 @@ mod jwt_provider_tests {
             "nothing is stored"
         );
 
-        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
-        assert_eq!(status, StatusCode::CREATED, "a public address is saved: {created}");
-        let (status, key) = create(
-            &state,
-            json!({"name": "Key", "provider_id": "key", "provider_type": "api_key",
-                   "api_key_secret_ref": "CLIENT_SECRET", "token_endpoint": "https://10.0.0.1/token"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "an API key provider sends nothing to a token endpoint: {key}");
+        for (index, endpoint) in
+            ["https://10.0.0.1/token", "https://192.168.100.100:11443/token", "https://[fd00::1]/token"]
+                .into_iter()
+                .enumerate()
+        {
+            let (status, response) = create(
+                &state,
+                with_token_endpoint(
+                    client_credentials("oauth2_client_credentials"),
+                    &format!("private-{index}"),
+                    endpoint,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "a private network endpoint is saved: {endpoint}: {response}");
+        }
 
+        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
         let id = created["id"]
             .as_str()
             .unwrap();
-        let (status, response) = update(&state, id, json!({"token_endpoint": "https://192.168.1.1/token"})).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(response["error"], "token_endpoint must resolve to public addresses only");
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://172.16.0.1/token"})).await;
+        assert_eq!(status, StatusCode::OK, "an update to a private network endpoint is saved: {response}");
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://127.0.0.1/token"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an update to loopback is refused: {response}");
         let stored = state
             .store
             .get(id)
@@ -2406,7 +2403,7 @@ mod jwt_provider_tests {
             stored
                 .token_endpoint
                 .as_deref(),
-            Some("https://192.0.2.1/token"),
+            Some("https://172.16.0.1/token"),
             "the stored endpoint is kept"
         );
     }
@@ -2538,7 +2535,7 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn validate_refuses_a_token_endpoint_that_is_not_public_without_contacting_it() {
+    async fn validate_refuses_a_loopback_or_metadata_token_endpoint_without_contacting_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         let (endpoint, requests, _server) = token_endpoint_answering_get().await;
@@ -2548,11 +2545,9 @@ mod jwt_provider_tests {
         };
         for token_endpoint in [
             endpoint.replace("http://", "https://"),
-            "https://10.0.0.1/token".to_string(),
-            "https://172.16.0.1/token".to_string(),
-            "https://192.168.1.1/token".to_string(),
+            "https://[::1]/token".to_string(),
             "https://169.254.169.254/token".to_string(),
-            "https://[fd00::1]/token".to_string(),
+            "https://[fd00:ec2::254]/token".to_string(),
         ] {
             let (status, response) = validate_with(
                 &state,
@@ -2562,7 +2557,7 @@ mod jwt_provider_tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{token_endpoint}: {response}");
-            assert_eq!(response["error"], "token_endpoint must resolve to public addresses only");
+            assert_eq!(response["error"], "token_endpoint must resolve to neither loopback nor cloud metadata");
         }
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -2617,7 +2612,7 @@ mod jwt_provider_tests {
     }
 
     /// The egress of an appliance whose test allow-list admits the loopback `endpoint`, which
-    /// the Strict policy otherwise refuses, as an http token endpoint.
+    /// the Configured policy otherwise refuses, as an http token endpoint.
     fn listed_http_egress(endpoint: &str) -> TokenEgress {
         TokenEgress {
             timeout: std::time::Duration::from_secs(5),

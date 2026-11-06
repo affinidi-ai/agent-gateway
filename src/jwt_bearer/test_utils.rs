@@ -121,7 +121,7 @@ pub async fn start_jwks_server(
 }
 
 /// The origins of the running loopback JWKS servers [`start_jwks_server`] started,
-/// which the JWKS client admits although the Strict egress policy refuses loopback.
+/// which the JWKS client admits although the Configured egress policy refuses loopback.
 static JWKS_FIXTURE_ORIGINS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 pub fn jwks_fixture_origins() -> Vec<String> {
