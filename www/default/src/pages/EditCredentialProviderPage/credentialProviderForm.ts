@@ -263,17 +263,26 @@ export function callbackUrlFor(
   return `${host}${path}`;
 }
 
+/** What `callbackUrlToSave` builds the callback URL from, by name. */
+export interface CallbackUrlInputs {
+  storedUrl: string;
+  host: string;
+  route: string;
+  providerId: string;
+  storedPath: string;
+}
+
 /**
  * The callback URL to save: the stored one, reverse proxy prefix and all, while the chosen
  * `host` is still its host; otherwise the URL `callbackUrlFor` builds.
  */
-export function callbackUrlToSave(
-  storedUrl: string,
-  host: string,
-  route: string,
-  providerId: string,
-  storedPath: string
-): string {
+export function callbackUrlToSave({
+  storedUrl,
+  host,
+  route,
+  providerId,
+  storedPath,
+}: CallbackUrlInputs): string {
   try {
     const stored = new URL(storedUrl);
     if (

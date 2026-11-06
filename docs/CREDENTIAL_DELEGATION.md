@@ -95,8 +95,8 @@ See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the r
 An `oauth2_authorization_code` provider without an `issuer` grants its credential through the
 gateway's [consent flow](#consent-flow). Its redirect URI is its `callback_url`, or, without
 one, the gateway's `https://{did.domain}` followed by its `callback_path`, which the gateway
-sets at create to `{oauth_callback_route}/{provider_id}` and never changes. Create and update
-refuse with `400`:
+sets at create to `{oauth_callback_route}/{provider_id}` and never changes. Create, and an
+update that changes the redirect URI, refuse with `400`:
 
 - a `callback_url` that is not an `https` URL with a host, or carries credentials, a query or a
   fragment, or whose path does not end in the provider's `callback_path`; a reverse proxy prefix
@@ -108,11 +108,17 @@ refuse with `400`:
   `provider_id` on the gateway's own host keeps it, and another tenant's provider of that
   `provider_id` needs a `callback_url` on a host of its own.
 
+An update that keeps the stored redirect URI is not checked against these rules, so a stored
+provider that breaks them can still be renamed or otherwise edited before it is fixed.
+
 A stored provider that breaks either rule gets no consent link (the binding is unavailable, see
 [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved)) and is refused at the
 start page with `redirect_uri_invalid` until it is fixed. When two stored providers share a
 redirect URI, both fail closed, and the gateway logs an `ERROR` at startup and on every
-configuration reload naming each such pair by provider id. The remedy is to give one of them a
+configuration reload naming each such pair by provider id. A stored provider whose redirect URI
+or authorization endpoint breaks the rules here or in [The start page](#the-start-page) is
+logged the same way, as an `ERROR` naming its provider id and the rule it breaks, never its
+URLs or parameters. The remedy is to give one of them a
 `callback_url` on a distinct host, or to recreate it with a distinct `provider_id`; either way,
 register the new redirect URI with the vendor. A tenant move changes neither rule's outcome, so
 it is not checked again.
@@ -1489,10 +1495,12 @@ so a link scanner or a chat unfurler may fetch it any number of times. It is sen
 `Cache-Control: no-store`, `Referrer-Policy: same-origin`, `X-Frame-Options: DENY` and a
 `Content-Security-Policy` with `frame-ancestors 'none'`, so another site cannot frame it.
 
-The POST is accepted only from the start page's own origin: the browser's
-`Sec-Fetch-Site: same-origin`, or, from a browser that sends no fetch metadata, an `Origin` equal
-to the redirect URI's origin. Any other POST, including one with neither header or with
-`Origin: null`, is refused with `403`, so another site's form cannot skip the page. The POST then:
+The POST is accepted only as the person's click on the start page: the browser's
+`Sec-Fetch-Site: same-origin`, `Sec-Fetch-User: ?1` and `Sec-Fetch-Dest: document`, or, from a
+browser that sends no fetch metadata, an `Origin` equal to the redirect URI's origin. Any other
+POST, including one with neither header, with `Origin: null`, or without `Sec-Fetch-User: ?1`, is
+refused with `403`, so neither another site's form nor script on the gateway's own origin can
+skip the page. The POST then:
 
 1. makes 32 random bytes and a PKCE verifier, and seals a callback state with a fresh nonce,
    the verifier and the bytes' SHA-256, expiring at the start state's expiry or ten minutes
@@ -1541,13 +1549,15 @@ A provider's `error` answer is refused too, and logged only when it is `[A-Za-z0
 callback, shows the same fixed page, which reflects nothing from the request, the provider or an
 error, with `400` (or `403` as above), `Cache-Control: no-store` and `Referrer-Policy:
 no-referrer`; at the callback, when the state names its cookie, that cookie is cleared, and no
-other cookie is set. It is recorded as a `delegation_failed` audit event
-whose `reason` names the check, and logged with the reason and the provider only, never the
-state, the code, the cookie or `iss`:
+other cookie is set. Every refusal is logged as a `WARN` with the reason and the provider only,
+never the state, the code, the cookie or `iss`. It is also recorded as a `delegation_failed`
+audit event whose `reason` names the check, but only when the request carried a state this
+gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
+only logged, so a stream of such requests cannot flood the audit log or its integrations:
 
 | `reason` | Refused because |
 | --- | --- |
-| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of the other stage |
+| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of the other stage, or the start POST's binding cookie cannot be sent |
 | `consent_state_reused` | The start state or callback state was already used on this process |
 | `consent_provider_mismatch` | The path names another provider, or the state's provider is gone or changed |
 | `browser_binding_mismatch` | The callback has no binding cookie, or another browser's |
@@ -1581,8 +1591,11 @@ the start page first is the one the grant is bound to, and the grant is stored u
 and user the link was made for. The start page names the agent, surface and provider so a
 person can notice a link that is not theirs. Single use of start and callback states is
 remembered per gateway process, for 15 minutes, so a restart or another replica behind the same
-callback URL does not know a state was used. Script served on the gateway's own origin, such as
-the dashboard, could still set a binding cookie, since `__Host-` only keeps other hosts out.
+callback URL does not know a state was used; see
+[Network](DEPLOYMENT_REQUIREMENTS.md#network). Script served on the gateway's own origin, such
+as the dashboard, could still set a binding cookie, since `__Host-` only keeps other hosts out,
+though in a browser that sends fetch metadata it cannot confirm a start page without the
+person's click.
 
 ### State
 

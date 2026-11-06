@@ -293,12 +293,15 @@ impl ConsentRefusal {
 
 /// The fixed refusal page for `refusal`, with `Cache-Control: no-store`,
 /// `Referrer-Policy: no-referrer` and the binding cookie cleared on
-/// `cookie`, audited as `delegation_failed` with its reason and logged
-/// with the reason and the path's provider id only, when that is a plain slug.
+/// `cookie`, logged as a WARN with the reason and the path's provider id only,
+/// when that is a plain slug. It is audited as `delegation_failed` only when
+/// `audited`: the request carried a state this gateway sealed for its stage,
+/// so requests without one cannot flood the audit log or its integrations.
 fn consent_refused(
     refusal: ConsentRefusal,
     provider_id: &str,
     cookie: Option<&str>,
+    audited: bool,
 ) -> Response {
     let ConsentRefusal { status, reason } = refusal;
     let provider_id = plain_slug(provider_id);
@@ -308,22 +311,24 @@ fn consent_refused(
         reason = ?reason,
         "OAuth consent refused"
     );
-    super::audit::emit("delegation_failed", || {
-        super::audit::audit_event(
-            super::audit::DelegationAuditAction::DelegationFailed {
-                reason,
-                provider_id: provider_id.map(str::to_string),
-            },
-            None,
-            None,
-            provider_id,
-            None,
-        )
-    });
+    if audited {
+        super::audit::emit("delegation_failed", || {
+            super::audit::audit_event(
+                super::audit::DelegationAuditAction::DelegationFailed {
+                    reason,
+                    provider_id: provider_id.map(str::to_string),
+                },
+                None,
+                None,
+                provider_id,
+                None,
+            )
+        });
+    }
     let mut response = (status, Html(CONSENT_REFUSED_PAGE)).into_response();
     consent_page_headers(&mut response, "no-referrer");
-    if let Some(name) = cookie {
-        set_binding_cookie(&mut response, name, "", 0);
+    if let Some(cleared) = cookie.and_then(|name| binding_cookie(name, "", 0).ok()) {
+        attach_binding_cookie(&mut response, cleared);
     }
     response
 }
@@ -338,24 +343,29 @@ fn consent_page_headers(
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 }
 
-/// Sets the binding cookie `name`: `__Host-`, `Path=/`, no `Domain`, `Secure`,
-/// `HttpOnly`, `SameSite=Lax`, and marks the response as the gateway's own so
-/// the cookie guard keeps it.
-fn set_binding_cookie(
-    response: &mut Response,
+/// The `Set-Cookie` value of the binding cookie `name`: `Path=/`, no `Domain`,
+/// `Secure`, `HttpOnly`, `SameSite=Lax`, or an error when `name` or `value`
+/// cannot be sent in a header.
+fn binding_cookie(
     name: &str,
     value: &str,
     max_age: i64,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!("{name}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax"))
+}
+
+/// Adds `cookie` to `response` and marks the response as the gateway's own,
+/// so the cookie guard keeps it.
+fn attach_binding_cookie(
+    response: &mut Response,
+    cookie: HeaderValue,
 ) {
-    let cookie = format!("{name}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax");
-    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
-        response
-            .headers_mut()
-            .append(header::SET_COOKIE, cookie);
-        response
-            .extensions_mut()
-            .insert(super::consent_cookie::GatewayConsentCookie);
-    }
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, cookie);
+    response
+        .extensions_mut()
+        .insert(super::consent_cookie::GatewayConsentCookie);
 }
 
 /// `provider_id` when it is 1 to 128 bytes of ASCII letters, digits, `-`, `_`
@@ -400,17 +410,45 @@ async fn consent_provider(
     }
 }
 
-/// The start state's provider and its redirect URI, when the redirect URI
-/// follows the consent rules and no other provider uses it.
-async fn consent_start_provider(
+/// A consent start a start page GET or start POST carries, once decoded and
+/// checked: the encoded start state, the state, its provider and the
+/// provider's redirect URI.
+struct ConsentStartRequest {
+    encoded: String,
+    start: super::OAuthState,
+    provider: crate::credential_providers::CredentialProvider,
+    redirect_uri: url::Url,
+}
+
+/// Decodes the start state `params` carry and resolves its provider, whose
+/// redirect URI must follow the consent rules and be no other provider's;
+/// otherwise the refusal page.
+async fn resolve_consent_start(
     state: &DelegationVaultState,
     path_provider_id: &str,
-    start: &super::OAuthState,
-) -> Result<(crate::credential_providers::CredentialProvider, url::Url), ConsentRefusal> {
-    let provider = consent_provider(state, path_provider_id, start).await?;
+    params: Option<ConsentStartParams>,
+) -> Result<ConsentStartRequest, Response> {
+    let (encoded, start) = params
+        .and_then(|params| {
+            oauth::decode_start_state(&params.state)
+                .ok()
+                .map(|start| (params.state, start))
+        })
+        .ok_or_else(|| {
+            consent_refused(
+                ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+                path_provider_id,
+                None,
+                false,
+            )
+        })?;
+    let refuse = |refusal| consent_refused(refusal, path_provider_id, None, true);
+    let provider = consent_provider(state, path_provider_id, &start)
+        .await
+        .map_err(refuse)?;
     let redirect_uri = provider
         .consent_redirect_uri(&state.gateway_base_url)
-        .map_err(|_| ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid))?;
+        .map_err(|_| refuse(ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid)))?;
     match crate::credential_providers::redirect_uri_taken_by(
         state.provider_store.as_ref(),
         &provider,
@@ -418,11 +456,16 @@ async fn consent_start_provider(
     )
     .await
     {
-        Ok(None) => Ok((provider, redirect_uri)),
-        Ok(Some(_)) => Err(ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid)),
+        Ok(None) => Ok(ConsentStartRequest {
+            encoded,
+            start,
+            provider,
+            redirect_uri,
+        }),
+        Ok(Some(_)) => Err(refuse(ConsentRefusal::bad_request(DelegationFailureReason::RedirectUriInvalid))),
         Err(e) => {
             error!(target: "credential_delegation", error = %e, "Failed to list credential providers for consent");
-            Err(ConsentRefusal::bad_request(DelegationFailureReason::CredentialsUnavailable))
+            Err(refuse(ConsentRefusal::bad_request(DelegationFailureReason::CredentialsUnavailable)))
         }
     }
 }
@@ -437,23 +480,17 @@ pub async fn consent_start_page(
     Path(provider_id): Path<String>,
     query: Result<Query<ConsentStartParams>, QueryRejection>,
 ) -> Response {
-    let Ok(Query(params)) = query else {
-        return consent_refused(
-            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-            &provider_id,
-            None,
-        );
-    };
-    let Ok(start) = oauth::decode_start_state(&params.state) else {
-        return consent_refused(
-            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-            &provider_id,
-            None,
-        );
-    };
-    let provider = match consent_start_provider(&state, &provider_id, &start).await {
-        Ok((provider, _)) => provider,
-        Err(refusal) => return consent_refused(refusal, &provider_id, None),
+    let ConsentStartRequest { encoded, start, provider, .. } = match resolve_consent_start(
+        &state,
+        &provider_id,
+        query
+            .ok()
+            .map(|Query(params)| params),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(refused) => return refused,
     };
     let surface_name = match &state.agent_surface_store {
         Some(store) => store
@@ -492,7 +529,7 @@ pub async fn consent_start_page(
         agent = html_escape(&start.agent_did),
         surface = html_escape(&surface_name),
         scopes = html_escape(&scopes),
-        state = html_escape(&params.state),
+        state = html_escape(&encoded),
     );
     let mut response = Html(page).into_response();
     consent_page_headers(&mut response, "same-origin");
@@ -507,9 +544,12 @@ pub async fn consent_start_page(
     response
 }
 
-/// Whether a start POST came from a page of `redirect_uri`'s origin: the
-/// browser says `Sec-Fetch-Site: same-origin`, or, when it sends no fetch
-/// metadata, an `Origin` of that origin. Any `Origin` sent must be that origin.
+/// Whether a start POST is the person's click on a page of `redirect_uri`'s
+/// origin: the browser says `Sec-Fetch-Site: same-origin`, `Sec-Fetch-User: ?1`
+/// and `Sec-Fetch-Dest: document`, a navigation the person started, so script
+/// on that origin cannot submit the page without a click; or, when it sends no
+/// fetch metadata, an `Origin` of that origin. Any `Origin` sent must be that
+/// origin.
 fn same_origin_post(
     headers: &HeaderMap,
     redirect_uri: &url::Url,
@@ -520,40 +560,46 @@ fn same_origin_post(
     let origin = headers
         .get(header::ORIGIN)
         .map(|value| value.as_bytes() == expected.as_bytes());
+    let says = |name: &str, value: &[u8]| {
+        headers
+            .get(name)
+            .is_some_and(|header| header.as_bytes() == value)
+    };
     match headers.get("sec-fetch-site") {
-        Some(site) => site.as_bytes() == b"same-origin" && origin != Some(false),
+        Some(_) => {
+            says("sec-fetch-site", b"same-origin")
+                && says("sec-fetch-user", b"?1")
+                && says("sec-fetch-dest", b"document")
+                && origin != Some(false)
+        }
         None => origin == Some(true),
     }
 }
 
 /// POST {oauth_callback_route}/{provider_id}/start
 ///
-/// The person confirmed the start page: claim the start state, set the
-/// binding cookie on the callback's path and send the browser to the vendor.
-/// A start state is used once on this process.
+/// The person confirmed the start page: build the vendor's URL and the
+/// binding cookie, then claim the start state, set the cookie and send the
+/// browser to the vendor. A start state is used once on this process, and a
+/// POST refused before the claim leaves it unused.
 pub async fn consent_start(
     State(state): State<DelegationVaultState>,
     Path(provider_id): Path<String>,
     headers: HeaderMap,
     form: Result<Form<ConsentStartParams>, FormRejection>,
 ) -> Response {
-    let Ok(Form(params)) = form else {
-        return consent_refused(
-            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-            &provider_id,
-            None,
-        );
-    };
-    let Ok(start) = oauth::decode_start_state(&params.state) else {
-        return consent_refused(
-            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
-            &provider_id,
-            None,
-        );
-    };
-    let (provider, redirect_uri) = match consent_start_provider(&state, &provider_id, &start).await {
-        Ok(found) => found,
-        Err(refusal) => return consent_refused(refusal, &provider_id, None),
+    let ConsentStartRequest {
+        start, provider, redirect_uri, ..
+    } = match resolve_consent_start(
+        &state,
+        &provider_id,
+        form.ok()
+            .map(|Form(params)| params),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(refused) => return refused,
     };
     if !same_origin_post(&headers, &redirect_uri) {
         return consent_refused(
@@ -563,6 +609,7 @@ pub async fn consent_start(
             },
             &provider_id,
             None,
+            true,
         );
     }
     let begun = match oauth::begin_consent(&provider, &start, &redirect_uri, &state.secrets_store).await {
@@ -579,23 +626,41 @@ pub async fn consent_start(
                 error = %e,
                 "Could not begin OAuth consent"
             );
-            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None);
+            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, true);
         }
+    };
+    let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
+            &provider_id,
+            None,
+            true,
+        );
+    };
+    let max_age = (begun.expires_at - Utc::now())
+        .num_seconds()
+        .max(0);
+    let Ok(cookie) = binding_cookie(&begun.cookie_name, &begun.cookie_value, max_age) else {
+        error!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            "The consent binding cookie cannot be sent in a header"
+        );
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
+            &provider_id,
+            None,
+            true,
+        );
     };
     if !oauth::claim_oauth_state(&start).await {
         return consent_refused(
             ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused),
             &provider_id,
             None,
+            true,
         );
     }
-    let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
-        return consent_refused(
-            ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
-            &provider_id,
-            None,
-        );
-    };
     info!(
         target: "credential_delegation",
         provider_id = %provider.provider_id,
@@ -607,10 +672,7 @@ pub async fn consent_start(
         .headers_mut()
         .insert(header::LOCATION, location);
     consent_page_headers(&mut response, "no-referrer");
-    let max_age = (begun.expires_at - Utc::now())
-        .num_seconds()
-        .max(0);
-    set_binding_cookie(&mut response, &begun.cookie_name, &begun.cookie_value, max_age);
+    attach_binding_cookie(&mut response, cookie);
     response
 }
 
@@ -632,6 +694,7 @@ pub async fn oauth_callback(
             ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid),
             &provider_id,
             None,
+            false,
         );
     };
     let callback_state = query
@@ -641,7 +704,8 @@ pub async fn oauth_callback(
     let cookie_name = callback_state
         .as_ref()
         .and_then(oauth::binding_cookie_name);
-    let refuse = |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref());
+    let audited = callback_state.is_some();
+    let refuse = |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref(), audited);
     info!(
         target: "credential_delegation",
         provider_id = plain_slug(&provider_id),
@@ -981,7 +1045,9 @@ setTimeout(function() {{ window.close(); }}, 3000);
     ))
     .into_response();
     consent_page_headers(&mut response, "no-referrer");
-    set_binding_cookie(&mut response, cookie_name, "", 0);
+    if let Ok(cleared) = binding_cookie(cookie_name, "", 0) {
+        attach_binding_cookie(&mut response, cleared);
+    }
     response
 }
 
@@ -1091,5 +1157,21 @@ mod audit_response_tests {
         assert_eq!(body["truncated"], serde_json::json!(true));
         assert_eq!(body["total"], serde_json::json!(0));
         assert_eq!(body["total_pages"], serde_json::json!(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The binding cookie carries the attributes that keep it on the gateway's
+    /// own host, and a name or value that cannot be sent in a header is an
+    /// error rather than a missing cookie.
+    #[test]
+    fn a_binding_cookie_has_its_attributes_or_is_an_error() {
+        let cookie = binding_cookie("__Host-ag_consent_abc", "value", 60).unwrap();
+        assert_eq!(cookie, "__Host-ag_consent_abc=value; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax");
+        assert!(binding_cookie("__Host-ag_consent_abc", "line\nbreak", 60).is_err());
+        assert!(binding_cookie("__Host-ag_consent_\r", "value", 60).is_err());
     }
 }
