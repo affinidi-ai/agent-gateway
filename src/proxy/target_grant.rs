@@ -621,9 +621,7 @@ pub(crate) async fn route(
                 TargetGrantRefusal::CallerNotIdentified => RejectionReason::ConsentIdentityRequired,
                 TargetGrantRefusal::Grant(_)
                 | TargetGrantRefusal::RetryNotSent
-                | TargetGrantRefusal::RequestNotBuilt => {
-                    RejectionReason::ConnectorUnavailable
-                }
+                | TargetGrantRefusal::RequestNotBuilt => RejectionReason::ConnectorUnavailable,
             };
             request_rejected(
                 request_facts,
@@ -692,10 +690,10 @@ async fn route_unaudited(
         return Err(unavailable(surface, "no_subject"));
     };
     if let Some(unchecked) = unchecked_callers(surface, subject) {
-        return Err(unavailable(surface,unchecked.reason()));
+        return Err(unavailable(surface, unchecked.reason()));
     }
     if let Some(violation) = target_binding_violation(surface, binding) {
-        return Err(unavailable(surface,violation.reason()));
+        return Err(unavailable(surface, violation.reason()));
     }
     let (Some(_), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
         return Err(unavailable(surface, "stores_unavailable"));

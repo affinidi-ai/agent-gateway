@@ -1233,8 +1233,12 @@ impl IntoResponse for ProviderDeleteError {
                 }
                 (StatusCode::CONFLICT, Json(body)).into_response()
             }
-            Self::SurfacesUnavailable | Self::VaultUnavailable | Self::UnreadableGrant { .. } | Self::PepperMismatch => {
-                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+            Self::SurfacesUnavailable
+            | Self::VaultUnavailable
+            | Self::UnreadableGrant { .. }
+            | Self::PepperMismatch => {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": self.to_string() })))
+                    .into_response()
             }
         }
     }
@@ -4275,10 +4279,7 @@ mod external_provider_tests {
             ),
             (
                 "no delegation vault",
-                CredentialProviderState {
-                    vault: None,
-                    ..state.clone()
-                },
+                CredentialProviderState { vault: None, ..state.clone() },
                 "The delegation vault is unavailable, so the provider's grants cannot be removed",
             ),
         ] {
