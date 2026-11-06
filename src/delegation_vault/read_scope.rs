@@ -29,6 +29,18 @@ impl VaultReader {
             delegation: extensions.get().cloned(),
         }
     }
+
+    /// Whether the caller reads appliance-wide: a session, or an access token
+    /// with neither a tenant, a resource pattern nor required headers. Only
+    /// such a caller may change or export records of every tenant.
+    pub fn is_appliance_wide(&self) -> bool {
+        self.tenant.is_none()
+            && self.resource_scope.is_none()
+            && !self
+                .delegation
+                .as_ref()
+                .is_some_and(|delegation| delegation.resource_scoped)
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for VaultReader {
@@ -62,12 +74,7 @@ impl VaultReadScope {
         providers: Option<&dyn CredentialProviderStorage>,
         reader: &VaultReader,
     ) -> anyhow::Result<Self> {
-        let VaultReader {
-            tenant,
-            resource_scope,
-            delegation,
-        } = reader;
-        if let Some(tenant) = tenant {
+        if let Some(tenant) = &reader.tenant {
             let Some(providers) = providers else {
                 return Ok(Self::Tenant(HashSet::new()));
             };
@@ -80,14 +87,11 @@ impl VaultReadScope {
                 .collect();
             return Ok(Self::Tenant(owned));
         }
-        if resource_scope.is_some()
-            || delegation
-                .as_ref()
-                .is_some_and(|delegation| delegation.resource_scoped)
-        {
-            return Ok(Self::Nothing);
+        if reader.is_appliance_wide() {
+            Ok(Self::Appliance)
+        } else {
+            Ok(Self::Nothing)
         }
-        Ok(Self::Appliance)
     }
 
     /// Whether the caller may read a record of the credential provider

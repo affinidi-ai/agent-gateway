@@ -1058,6 +1058,27 @@ mod tests {
         }
     }
 
+    /// Only an appliance-wide caller revokes. A tenant's token, which the
+    /// middleware refuses before the handler, and a token scoped by required
+    /// headers alone, which the middleware lets through, both get a bare 403
+    /// here, and the vault keeps every token.
+    #[tokio::test]
+    async fn only_an_appliance_wide_caller_revokes_vault_tokens() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        for (caller, scoped) in [
+            ("a tenant token", as_tenant(app.clone(), "tenant-a")),
+            ("a token scoped by required headers alone", as_header_scoped(app.clone())),
+        ] {
+            for uri in ["/api/v1/delegation-vault/t-a", "/api/v1/delegation-vault/by-user/sha256:user-1"] {
+                let (status, body) = response_of(scoped.clone(), "DELETE", uri).await;
+                assert_eq!((status, body.as_str()), (StatusCode::FORBIDDEN.as_u16(), ""), "{caller} {uri}");
+            }
+        }
+        let (status, body) = response_of(app, "GET", "/api/v1/delegation-vault").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        assert_eq!(listed_ids(&body), ["t-a", "t-b", "t-deleted", "t-global"]);
+    }
+
     #[tokio::test]
     async fn an_appliance_wide_admin_session_reads_every_vault_token() {
         let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;

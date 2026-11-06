@@ -203,21 +203,39 @@ async fn tenant_has_tried_to_revoke_vault_token(
     tenant: String,
     provider: String,
 ) {
-    revoke_as_tenant(world, &tenant, &provider).await;
+    revoke_vault_token(world, TokenScope::Tenant(&tenant), &provider).await;
 }
 
-async fn revoke_as_tenant(
+async fn revoke_vault_token(
     world: &mut SurfaceWorld,
-    tenant: &str,
+    scope: TokenScope<'_>,
     provider: &str,
 ) {
-    send_with_token(
-        world,
-        TokenScope::Tenant(tenant),
-        Method::DELETE,
-        &format!("/v1/delegation-vault/{}", vault_token_id(provider)),
-    )
-    .await;
+    let path = format!("/v1/delegation-vault/{}", vault_token_id(provider));
+    send_with_token(world, scope, Method::DELETE, &path).await;
+}
+
+/// Revokes every vault token the user of the seeded tokens granted.
+async fn revoke_user_tokens(
+    world: &mut SurfaceWorld,
+    scope: TokenScope<'_>,
+) {
+    send_with_token(world, scope, Method::DELETE, &format!("/v1/delegation-vault/by-user/{USER}")).await;
+}
+
+#[given(
+    expr = "an access token scoped by required headers alone has tried to revoke the vault token of credential provider {string}"
+)]
+async fn header_scoped_token_has_tried_to_revoke_vault_token(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    revoke_vault_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), &provider).await;
+}
+
+#[given("an access token scoped by required headers alone has tried to revoke every vault token the user granted")]
+async fn header_scoped_token_has_tried_to_revoke_user_tokens(world: &mut SurfaceWorld) {
+    revoke_user_tokens(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT)).await;
 }
 
 /// The gateway rereads its VP Audit Log on every read, so records appended to
@@ -352,7 +370,30 @@ async fn tenant_revokes_vault_token(
     tenant: String,
     provider: String,
 ) {
-    revoke_as_tenant(world, &tenant, &provider).await;
+    revoke_vault_token(world, TokenScope::Tenant(&tenant), &provider).await;
+}
+
+#[when(expr = "a token of tenant {string} revokes every vault token the user granted")]
+async fn tenant_revokes_user_tokens(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    revoke_user_tokens(world, TokenScope::Tenant(&tenant)).await;
+}
+
+#[when(
+    expr = "an access token scoped by required headers alone revokes the vault token of credential provider {string}"
+)]
+async fn header_scoped_token_revokes_vault_token(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    revoke_vault_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), &provider).await;
+}
+
+#[when("an access token scoped by required headers alone revokes every vault token the user granted")]
+async fn header_scoped_token_revokes_user_tokens(world: &mut SurfaceWorld) {
+    revoke_user_tokens(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT)).await;
 }
 
 #[when("an access token scoped by required headers alone lists the delegation vault")]

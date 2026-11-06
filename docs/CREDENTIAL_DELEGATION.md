@@ -2162,8 +2162,8 @@ leave out all four.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens; a tenant's access token lists only its own tenant's |
-| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's |
-| `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
+| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's, and only an appliance-wide caller revokes |
+| `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted; only an appliance-wide caller revokes |
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
 | `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |

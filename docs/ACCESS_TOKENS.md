@@ -231,6 +231,11 @@ credential providers cannot be read, a tenant PAT's read answers `500` and shows
 token follows its provider's current tenant, so moving a provider to another tenant moves its
 tokens with it.
 
+Only an appliance-wide caller revokes agent-keyed tokens, with
+`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`.
+A tenant PAT, and a PAT scoped by required headers alone or by a resource pattern, gets `403` and
+the tokens are kept, whichever tenant they belong to.
+
 ### Delegation audit records
 
 A delegation audit record belongs to the tenant of the credential provider it names, matched

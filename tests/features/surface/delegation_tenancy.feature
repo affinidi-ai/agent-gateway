@@ -4,9 +4,9 @@ Feature: Tenant reads of delegation vault tokens and audit records
   tenant's, in the Credential Delegation Audit Log, the VP Audit Log and the
   delegation vault, and another tenant's vault token, or one of an
   appliance-wide provider, answers like a missing one. An access token scoped
-  by required headers alone reads none, and a tenant's access token revokes
-  none. An administrator, and an appliance-wide access token, reads every
-  tenant's.
+  by required headers alone reads none, and neither it nor a tenant's access
+  token revokes any. An administrator, and an appliance-wide access token,
+  reads every tenant's.
 
   Background:
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -102,9 +102,28 @@ Feature: Tenant reads of delegation vault tokens and audit records
       | calendar-a |
       | calendar-b |
 
+  Scenario: A tenant token cannot revoke a user's vault tokens
+    When a token of tenant "tenant-a" revokes every vault token the user granted
+    Then the admin API response status is 403
+
   Scenario: The delegation vault keeps the tokens a tenant token tried to revoke
     Given a token of tenant "tenant-a" has tried to revoke the vault token of credential provider "calendar-a"
     And a token of tenant "tenant-a" has tried to revoke the vault token of credential provider "calendar-b"
+    When the operator lists the delegation vault
+    Then the admin API response status is 200
+    And the vault list shows the token of every credential provider
+
+  Scenario: An access token scoped by required headers alone cannot revoke a vault token
+    When an access token scoped by required headers alone revokes the vault token of credential provider "calendar-a"
+    Then the admin API response status is 403
+
+  Scenario: An access token scoped by required headers alone cannot revoke a user's vault tokens
+    When an access token scoped by required headers alone revokes every vault token the user granted
+    Then the admin API response status is 403
+
+  Scenario: The delegation vault keeps the tokens an access token scoped by required headers alone tried to revoke
+    Given an access token scoped by required headers alone has tried to revoke the vault token of credential provider "calendar-a"
+    And an access token scoped by required headers alone has tried to revoke every vault token the user granted
     When the operator lists the delegation vault
     Then the admin API response status is 200
     And the vault list shows the token of every credential provider

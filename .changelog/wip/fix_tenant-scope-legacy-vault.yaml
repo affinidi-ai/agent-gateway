@@ -22,9 +22,8 @@ changes:
         its credential provider's tenant: a tenant's access token lists only its own tenant's, and
         reading another answers 404 like a missing token. Tokens of an appliance-wide, missing or
         deleted provider are shown only to appliance-wide callers, since an appliance-wide provider
-        can hold any tenant's callers' tokens. An access token scoped by required headers alone, or
-        by a resource pattern without a tenant, reads none. Sessions and appliance-wide access
-        tokens still read every token.
+        can hold any tenant's callers' tokens. Sessions and appliance-wide access tokens still read
+        every token.
     - timestamp: '2026-11-04T13:10:56Z'
       title: Show a tenant's access token only its own tenant's delegation audit records
       description: >-
@@ -32,9 +31,8 @@ changes:
         access token. It now gets only records whose credential provider belongs to its tenant,
         and totals, category counts and the text filter cover only those. Records without a
         provider, such as policy decisions, and records of an appliance-wide, missing or deleted
-        provider are shown only to appliance-wide callers. An access token scoped by required
-        headers alone, or by a resource pattern without a tenant, reads none. Dashboard sessions
-        and appliance-wide access tokens still read the whole log.
+        provider are shown only to appliance-wide callers. Dashboard sessions and appliance-wide
+        access tokens still read the whole log.
     - timestamp: '2026-11-05T15:38:38Z'
       title: Keep store error detail out of delegation vault and audit error answers
       description: >-
@@ -43,4 +41,17 @@ changes:
         text, which can quote storage file paths. They now answer a fixed body, such as
         {"error":"Failed to revoke"}, and log the detail instead. The revokes log it escaped,
         since it can quote the id the caller sent.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-06T15:01:09Z'
+      title: ⭐ Refuse delegation records to access tokens scoped by required headers alone
+      description: >-
+        An access token scoped by required headers alone, or by a resource pattern without a
+        tenant, read every tenant's agent-keyed vault tokens and delegation audit records on
+        GET /api/v1/delegation-vault, GET /api/v1/delegation-vault/{id}, GET
+        /api/v1/delegation-audit and GET /v1/audit, and one scoped by required headers alone could
+        revoke any tenant's tokens. Such a token now reads none of them: lists and audit pages are
+        empty and every token answers 404. DELETE /api/v1/delegation-vault/{id} and DELETE
+        /api/v1/delegation-vault/by-user/{user_hash} now answer 403 to every caller but a session or
+        an appliance-wide access token, and keep the tokens. Automation that read or revoked these
+        records with such a token needs an appliance-wide access token, or a tenant's token to
+        read its own tenant's.

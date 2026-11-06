@@ -174,6 +174,7 @@ pub async fn revoke_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a revoke must be attributable to an authenticated actor.
@@ -190,6 +191,15 @@ pub async fn revoke_token(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "revoke",
+            "Delegation token revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
@@ -239,6 +249,7 @@ pub async fn revoke_user_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(user_hash): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a mass-revoke must be attributable to an authenticated actor.
@@ -255,6 +266,15 @@ pub async fn revoke_user_tokens(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            user_hash = %loggable::untrusted(&user_hash),
+            action = "revoke_all",
+            "Delegation mass-revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
