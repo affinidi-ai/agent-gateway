@@ -372,7 +372,7 @@ impl GatewayConfig {
 /// Validate a loaded surface's `source_auth` at boot: every rule of a save but
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
 /// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
-/// `from_jwt_claim` identity beside a method other than `jwt_bearer`, and an
+/// `from_jwt_claim` identity without `jwt_bearer` as its only method, and an
 /// inbound `from_api_key` identity beside a method other than an API key, are
 /// only warned about here: stored surfaces predating the rule booted with
 /// them, and saving them enforces it.
@@ -837,14 +837,14 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
     .flatten()
     .chain(transit_identities)
     .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
-    if uses_jwt_claim
-        && surface
-            .source_auth_methods()
+    let methods = surface.source_auth_methods();
+    let jwt_bearer_only = !methods.is_empty()
+        && methods
             .iter()
-            .any(|method| !matches!(method, SourceAuthConfig::JwtBearer(_)))
-    {
+            .all(|method| matches!(method, SourceAuthConfig::JwtBearer(_)));
+    if uses_jwt_claim && !jwt_bearer_only {
         anyhow::bail!(
-            "Channel '{}': from_jwt_claim identity requires every source authentication method to be jwt_bearer",
+            "Channel '{}': from_jwt_claim identity requires jwt_bearer as the only source authentication method",
             surface.name
         );
     }
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn from_jwt_claim_identity_requires_every_method_to_be_jwt_bearer() {
+    fn from_jwt_claim_identity_requires_jwt_bearer_as_the_only_method() {
         let inbound = serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}});
         let mixed =
             surface_with_caller_auth(serde_json::json!([jwt_method(), api_key_method("X-API-Key")]), inbound.clone());
@@ -1109,8 +1109,14 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "Channel 'multi': from_jwt_claim identity requires every source authentication method to be jwt_bearer"
+            "Channel 'multi': from_jwt_claim identity requires jwt_bearer as the only source authentication method"
         );
+
+        let none = surface_with_caller_auth(serde_json::json!([]), inbound.clone());
+        let error = validate_source_auth_config(&none, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from_jwt_claim identity requires"), "{error}");
 
         let jwt_only = surface_with_caller_auth(serde_json::json!([jwt_method()]), inbound);
         validate_source_auth_config(&jwt_only, None).unwrap();

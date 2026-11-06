@@ -2784,10 +2784,22 @@ async fn closed_access_point_fabric_flow() {
         }))
         .unwrap()
     };
+    let from_jwt_claim = |id: &str, protocol: &str| {
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}]}},
+            "target": {"endpoint": format!("http://{}", target.addr)},
+            "identity_slots": {"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}}
+        }))
+        .unwrap()
+    };
     for stored in [
         surface("closed-mcp", "mcp", Some("reject")),
         surface("closed-a2a", "a2a", Some("reject")),
         surface("legacy-mcp", "mcp", None),
+        from_jwt_claim("jwt-claim-mcp", "mcp"),
+        from_jwt_claim("jwt-claim-a2a", "a2a"),
         not_ready("unready-mcp", "mcp"),
         not_ready("unready-a2a", "a2a"),
     ] {
@@ -2859,23 +2871,25 @@ async fn closed_access_point_fabric_flow() {
         .unwrap()
     };
 
-    for token in [None, Some(foreign_token.clone())] {
-        let refused = send("closed-mcp", token.clone()).await;
-        assert_eq!(refused["status"], 401, "{refused}");
-        assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
-        assert_eq!(
-            body(&refused),
-            json!({"jsonrpc": "2.0", "id": "call", "error": {
-                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
-                "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
-            }})
-        );
+    for (mcp_channel, a2a_channel) in [("closed-mcp", "closed-a2a"), ("jwt-claim-mcp", "jwt-claim-a2a")] {
+        for token in [None, Some(foreign_token.clone())] {
+            let refused = send(mcp_channel, token.clone()).await;
+            assert_eq!(refused["status"], 401, "{refused}");
+            assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
+            assert_eq!(
+                body(&refused),
+                json!({"jsonrpc": "2.0", "id": "call", "error": {
+                    "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                    "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
+                }})
+            );
 
-        let refused = send("closed-a2a", token).await;
-        assert_eq!(refused["status"], 401, "{refused}");
-        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
-        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
-        assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+            let refused = send(a2a_channel, token).await;
+            assert_eq!(refused["status"], 401, "{refused}");
+            assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+            assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
+            assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+        }
     }
 
     let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
