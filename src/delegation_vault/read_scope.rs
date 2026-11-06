@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use axum::extract::FromRequestParts;
+use axum::http::Extensions;
 use axum::http::request::Parts;
 
 use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
@@ -19,6 +20,17 @@ pub struct VaultReader {
     delegation: Option<PatDelegationContext>,
 }
 
+impl VaultReader {
+    /// The caller `extensions` describe, taken whole.
+    pub(crate) fn from_extensions(extensions: &Extensions) -> Self {
+        Self {
+            tenant: extensions.get().cloned(),
+            resource_scope: extensions.get().cloned(),
+            delegation: extensions.get().cloned(),
+        }
+    }
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for VaultReader {
     type Rejection = std::convert::Infallible;
 
@@ -26,20 +38,7 @@ impl<S: Send + Sync> FromRequestParts<S> for VaultReader {
         parts: &mut Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self {
-            tenant: parts
-                .extensions
-                .get()
-                .cloned(),
-            resource_scope: parts
-                .extensions
-                .get()
-                .cloned(),
-            delegation: parts
-                .extensions
-                .get()
-                .cloned(),
-        })
+        Ok(Self::from_extensions(&parts.extensions))
     }
 }
 
@@ -108,181 +107,9 @@ impl VaultReadScope {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::credential_providers::CredentialProvider;
-    use std::sync::Arc;
-
-    pub(crate) fn provider(
-        id: &str,
-        tenant_id: Option<&str>,
-    ) -> CredentialProvider {
-        serde_json::from_value(serde_json::json!({
-            "id": id, "tenant_id": tenant_id, "name": "GitHub", "provider_id": "github",
-            "provider_type": "oauth2_client_credentials", "token_endpoint": "https://github.example/token",
-            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
-        }))
-        .unwrap()
-    }
-
-    /// A VP Audit Log in `directory` holding, oldest first, a
-    /// `consent_granted` of `cp-a`, a `token_injected` of each of `cp-b`,
-    /// `cp-global` and the deleted `cp-deleted`, a `token_revoked` naming no
-    /// provider, a `consent_granted` naming the slug `github`, and a
-    /// `policy_decision`.
-    pub(crate) async fn audit_log_of_two_tenants(directory: &std::path::Path) -> std::path::PathBuf {
-        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event, audit_policy_decision};
-        let event = |action, provider_id| {
-            audit_event(action, Some("did:web:agent.example"), Some("sha256:user-1"), provider_id, Some("surface-1"))
-        };
-        let mut events = vec![
-            event(DelegationAuditAction::ConsentGranted, Some("cp-a")),
-            event(DelegationAuditAction::TokenInjected, Some("cp-b")),
-            event(DelegationAuditAction::TokenInjected, Some("cp-global")),
-            event(DelegationAuditAction::TokenInjected, Some("cp-deleted")),
-            event(DelegationAuditAction::TokenRevoked, None),
-            event(DelegationAuditAction::ConsentGranted, Some("github")),
-        ];
-        let ((), decisions) = crate::audit::producer::capture(async {
-            audit_policy_decision(
-                "gateway",
-                "allow",
-                "policy-1",
-                None,
-                None,
-                None,
-                Some("surface-1"),
-                None,
-                Some("did:web:caller.example"),
-                Some("POST"),
-                Some("/"),
-                None,
-                "access_point",
-                None,
-                None,
-                None,
-                None,
-            )
-        })
-        .await;
-        assert_eq!(decisions.len(), 1);
-        events.extend(decisions);
-        let path = directory.join("delegation-audit.jsonl");
-        let lines: String = events
-            .iter()
-            .map(|event| serde_json::to_string(event).unwrap() + "\n")
-            .collect();
-        std::fs::write(&path, lines).unwrap();
-        path
-    }
-
-    /// Credential providers held in memory: `cp-a` of `tenant-a`, `cp-b` of
-    /// `tenant-b` and the appliance-wide `cp-global`, all with the slug
-    /// `github`; or a store that cannot be read.
-    pub(crate) struct InMemoryProviders {
-        providers: Option<Vec<CredentialProvider>>,
-    }
-
-    impl InMemoryProviders {
-        pub(crate) fn of_two_tenants() -> Self {
-            Self {
-                providers: Some(vec![
-                    provider("cp-a", Some("tenant-a")),
-                    provider("cp-b", Some("tenant-b")),
-                    provider("cp-global", None),
-                ]),
-            }
-        }
-
-        pub(crate) fn unreadable() -> Self {
-            Self { providers: None }
-        }
-
-        fn providers(&self) -> anyhow::Result<&[CredentialProvider]> {
-            self.providers
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("credential providers unreadable"))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CredentialProviderStorage for InMemoryProviders {
-        async fn create(
-            &self,
-            _provider: CredentialProvider,
-        ) -> anyhow::Result<CredentialProvider> {
-            unimplemented!("the management routes never write a provider")
-        }
-
-        async fn get(
-            &self,
-            id: &str,
-        ) -> anyhow::Result<Option<CredentialProvider>> {
-            Ok(self
-                .providers()?
-                .iter()
-                .find(|provider| provider.id == id)
-                .cloned())
-        }
-
-        async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
-            Ok(self.providers()?.to_vec())
-        }
-
-        async fn update(
-            &self,
-            _provider: CredentialProvider,
-        ) -> anyhow::Result<CredentialProvider> {
-            unimplemented!("the management routes never write a provider")
-        }
-
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<bool> {
-            unimplemented!("the management routes never write a provider")
-        }
-
-        async fn find_by_provider_id(
-            &self,
-            _tenant_id: Option<&str>,
-            _provider_id: &str,
-        ) -> anyhow::Result<Option<CredentialProvider>> {
-            unimplemented!("the management routes look providers up by id")
-        }
-    }
-
-    pub(crate) fn tenant(tenant_id: &str) -> PatTenantContext {
-        PatTenantContext {
-            token_id: "pat-t".to_string(),
-            tenant_id: tenant_id.to_string(),
-        }
-    }
-
-    pub(crate) fn pattern(tenant_id: &str) -> PatResourceScope {
-        PatResourceScope(Arc::new(regex::Regex::new(&format!("^TENANT:{tenant_id}:credential-providers:.*$")).unwrap()))
-    }
-
-    pub(crate) fn delegation(resource_scoped: bool) -> PatDelegationContext {
-        PatDelegationContext {
-            token_id: "pat-t".to_string(),
-            delegation_depth: 0,
-            resource_scoped,
-        }
-    }
-
-    /// The caller a request with these extensions describes.
-    pub(crate) fn reader(
-        tenant: Option<PatTenantContext>,
-        resource_scope: Option<PatResourceScope>,
-        delegation: Option<PatDelegationContext>,
-    ) -> VaultReader {
-        VaultReader {
-            tenant,
-            resource_scope,
-            delegation,
-        }
-    }
+    use crate::delegation_vault::test_support::{InMemoryProviders, delegation, pattern, reader, tenant};
 
     async fn tenant_scope(
         providers: &InMemoryProviders,

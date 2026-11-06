@@ -122,7 +122,7 @@ mod tests {
     use super::*;
     use crate::auth_manager::pat::PatDelegationContext;
     use crate::delegation_vault::audit::reading_audit_log_from;
-    use crate::delegation_vault::read_scope::tests::{
+    use crate::delegation_vault::test_support::{
         InMemoryProviders, audit_log_of_two_tenants, delegation, reader, tenant,
     };
     use crate::tenancy::PatTenantContext;

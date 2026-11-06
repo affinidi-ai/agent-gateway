@@ -21,10 +21,10 @@ use crate::delegation_vault::DelegationToken;
 use crate::delegation_vault::audit::{DelegationAuditEvent, reading_audit_log_from};
 use crate::delegation_vault::handlers::DelegationVaultState;
 use crate::delegation_vault::oauth::{TokenEgress, build_authorization_url};
-use crate::delegation_vault::read_scope::tests::{audit_log_of_two_tenants, provider};
 use crate::delegation_vault::read_scope::{VaultReadScope, VaultReader};
 use crate::delegation_vault::router::{create_delegation_vault_oauth_router, create_delegation_vault_router};
 use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+use crate::delegation_vault::test_support::{audit_log_of_two_tenants, provider};
 use crate::secrets::{CreateSecretRequest, SecretsStore};
 
 const TENANT_HEADER: &str = "x-external-account";

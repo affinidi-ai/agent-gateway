@@ -90,8 +90,8 @@ mod tests {
     use crate::auth_manager::middleware::AuthGuardOk;
     use crate::auth_manager::pat::{PatContext, PatDelegationContext};
     use crate::delegation_vault::audit::{DelegationAuditAction, reading_audit_log_from, without_an_audit_log};
-    use crate::delegation_vault::read_scope::tests::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::storage::DelegationVaultStorage;
+    use crate::delegation_vault::test_support::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
     use crate::rbac::RbacConfig;
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, SecretsStore, UpdateSecretRequest};
@@ -1076,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn a_resource_scope_without_a_tenant_reads_no_vault_token() {
         let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
-        let app = app.layer(Extension(crate::delegation_vault::read_scope::tests::pattern("tenant-a")));
+        let app = app.layer(Extension(crate::delegation_vault::test_support::pattern("tenant-a")));
         let (status, body) = response_of(app.clone(), "GET", "/api/v1/delegation-vault").await;
         assert_eq!((status, body.as_str()), (StatusCode::OK.as_u16(), "[]"));
         let missing = response_of(app.clone(), "GET", "/api/v1/delegation-vault/no-such-token").await;
