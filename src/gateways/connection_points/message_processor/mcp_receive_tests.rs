@@ -4416,7 +4416,7 @@ fn fabric_receive_refuses_a_surface_naming_another_tenants_provider_key_when_enf
 
 /// Over Fabric, a surface stored naming another tenant's API Key Provider key is not ready
 /// under `tenant_credential_isolation: enforce` and refuses with `503` before the Target; one
-/// naming its own tenant's key is served. The verdict is taken on the first request, as no
+/// naming its own key is served. The verdict is taken on the first request, as no
 /// apply ran for the surfaces.
 async fn provider_key_fabric_flow() {
     use std::sync::Arc;
@@ -4465,17 +4465,16 @@ async fn provider_key_fabric_flow() {
         serde_json::from_value::<AgentSurface>(surface).unwrap()
     };
     for stored in [
-        surface("owner-a", "tenant-a", None),
+        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
         surface("owner-b", "tenant-b", None),
         surface("names-cross", "tenant-a", Some("atgk_fabric_b")),
-        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
     ] {
         store
             .save(&stored)
             .await
             .unwrap();
     }
-    for (owner, key_id) in [("owner-a", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
+    for (owner, key_id) in [("names-own", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
         api_keys
             .create_with_material(owner, key_id.to_string(), format!("atgs_{key_id}"), "client", None, "test")
             .await

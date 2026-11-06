@@ -1,6 +1,35 @@
 import { scrubVolatileTemplateFields, findDuplicateListenerRoutes } from '../scrubVolatile';
 
 describe('scrubVolatileTemplateFields', () => {
+  it('drops every API key id an Identity names, keeping the Identity', () => {
+    const key = { type: 'from_api_key', api_key_id: 'atgk_own' };
+    const input = {
+      identity_slots: { inbound: { type: 'from_api_key' }, protected: key, external: key },
+      target: { endpoint: 'https://upstream', identity_injection: key },
+      transit: { points: [{ target_endpoint: 'https://tp', managed_identity: key }] },
+      variants: [{ alias: 'v', overrides: { identity_slots: { protected: key } } }],
+      canvas: {
+        nodes: [
+          { id: 'identity-protected', type: 'identity', config: key },
+          { id: 'ma', type: 'managed-agent', config: { api_key_id: 'kept' } },
+        ],
+      },
+    };
+    const out = scrubVolatileTemplateFields(input) as any;
+    const fromApiKey = { type: 'from_api_key' };
+    expect(out.identity_slots).toEqual({
+      inbound: fromApiKey,
+      protected: fromApiKey,
+      external: fromApiKey,
+    });
+    expect(out.target).toEqual({ endpoint: 'https://upstream', identity_injection: fromApiKey });
+    expect(out.transit.points[0].managed_identity).toEqual(fromApiKey);
+    expect(out.variants[0].overrides.identity_slots.protected).toEqual(fromApiKey);
+    expect(out.canvas.nodes[0].config).toEqual(fromApiKey);
+    expect(out.canvas.nodes[1].config.api_key_id).toBe('kept');
+    expect(input.identity_slots.protected.api_key_id).toBe('atgk_own');
+  });
+
   it('blanks transit-point listener + identity fields', () => {
     const out = scrubVolatileTemplateFields({
       access_point: { listen_address: '$HOST', route: '$ROUTE' },

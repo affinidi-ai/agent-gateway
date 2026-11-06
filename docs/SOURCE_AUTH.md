@@ -1194,6 +1194,11 @@ the base and in every variant:
 A Transit Point's own `identity_injection.api_key_id` is not collected: the request path reads
 only its `inject_vp`.
 
+A surface names only its own keys: the keys of its own surface id
+(`POST /v1/api-keys/{surface_id}`). A new surface owns no keys (see the create rule under
+[Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live)), so a create
+can name no `atgk_` id; create the surface, add its key, then save the surface naming it.
+
 A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
 
 - another tenant's key, or a tenant's key named by a surface with no tenant: "API-key parent
@@ -1204,19 +1209,26 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
 - a key id that names no key: "API key reference is not accessible", and a key whose owning
   surface was deleted: "API-key parent Surface reference is not accessible". Either is kept when
   the stored surface already named it, so a GET→PUT of that surface saves;
+- the key of another surface that passes the rules above, of the same tenant or, between
+  surfaces with no tenant, appliance-wide: "API key '<key id>' belongs to another surface; a
+  surface names only its own API keys". A new reference is refused; one the stored surface
+  already named is kept under `warn` and refused under `enforce`. The other tenant cases above
+  answer with their own message, which names no surface;
 - a key id outside a resource-scoped token's pattern (`api-keys:<key id>`), also when the stored
   surface already named it;
 - a new Caller Context API Key `secret_id` that starts with `atgk_`, on a view whose inbound
-  Identity is From API Key, when a key of that id belongs to a surface this one may not
-  reference or to a surface with no tenant. One the stored surface already named is kept under
-  `warn` and refused under `enforce`. An id no key has is a plain secret.
+  Identity is From API Key, when a key of that id belongs to another surface. Such a secret takes
+  that key's DID, so it is held to the same rule as naming the key. One the stored surface
+  already named is kept under `warn` and refused under `enforce`. An id no key has is a plain
+  secret.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
 inbound Identity is From API Key counts. A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
 when it would leave a surface naming a key whose owning surface it may not reference, or would
 make a tenant surface name the key of a surface with no tenant. Under `warn`, a tenant surface
-that already names such a key may still move. A reassignment whose surface then fails any
+that already names such a key may still move. A surface that names only its own keys moves with them, so
+its own keys never block its reassignment. A reassignment whose surface then fails any
 reference check is a `409` too, never a `500`. While a surface names an `atgk_` id, such a
 secret included, and no API key store is configured, every reassignment and every ownership
 impact read (`GET /v1/tenant-ownership/{kind}/{id}/impact`) answers `409` "API key store is
@@ -1241,15 +1253,18 @@ scan or another node's write changes it, and on the first request to a version n
 Each time, the gateway checks its key ids against their owning surfaces and logs one `WARN` line
 per surface that names a key it may not use, or whose key or owning surface is gone. The line
 names the `surface`, its `tenant`, `rule="provider_key_tenant"`, each key id with its issue
-(`other_tenant`, `appliance_key`, `missing_key` or `missing_owner`) and `not_ready`. It carries
-no secret. When a surface that owns keys changes the same ways, or by a save, or is deleted, every
-surface naming one of its keys is checked again on its next request, so an owner moved to
-another tenant on disk or by another node takes those surfaces out of service under `enforce`.
+(`other_tenant`, `appliance_key`, `other_surface`, `missing_key` or `missing_owner`) and
+`not_ready`. A key of another tenant is reported as `other_tenant` only; `other_surface` is a key
+of another surface the surface may otherwise reference. It carries no secret. When a surface that
+owns keys changes the same ways, or by a save, or is deleted, every surface naming one of its
+keys is checked again on its next request.
 
 - Under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
-  tenant, the key of a surface with no tenant, or a key whose owning surface cannot be found
-  (`missing_owner`) is not ready. Deleting a surface revokes its API keys (actor
+  tenant, the key of a surface with no tenant, the key of any other surface (`other_surface`), or
+  a key whose owning surface cannot be found (`missing_owner`) is not ready. A surface stored
+  before a surface named only its own keys, naming another surface's key of its tenant, is
+  therefore not ready under `enforce` and serves, logged, under `warn`. Deleting a surface revokes its API keys (actor
   `surface-delete`) and keeps them, so a surface naming the key of a deleted surface stops
   serving. The delete reads the surface's key folder from disk, so keys another node created
   are revoked too; a folder that cannot be read is logged as an error naming the surface and

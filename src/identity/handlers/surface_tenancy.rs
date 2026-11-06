@@ -1291,7 +1291,9 @@ impl ReferenceAuthorizer<'_> {
     /// A provider key a surface derives a DID from must exist and have an owning surface, unless
     /// the stored surface already named it, and that owning surface must be one this surface may
     /// reference. A tenant surface names a key of a surface with no tenant only as it sends an
-    /// appliance-wide secret upstream. The token's API key pattern must match every key id.
+    /// appliance-wide secret upstream. A surface names only its own keys: another surface's key
+    /// the stored surface already named is kept under `warn`. The token's API key pattern must
+    /// match every key id.
     async fn provider_keys(
         &self,
         ids: &ProviderKeyIds,
@@ -1315,6 +1317,7 @@ impl ReferenceAuthorizer<'_> {
                 }
                 return Err(inaccessible("API key"));
             };
+            let rule = self.rule_for(ResourceKind::ApiKeys, key_id);
             for surface_id in surface_ids {
                 let Some(tenant_id) = self
                     .api_key_parent_tenant(surface_id)
@@ -1325,12 +1328,11 @@ impl ReferenceAuthorizer<'_> {
                     }
                     return Err(inaccessible("API-key parent Surface"));
                 };
-                if !can_reference_with_rule(
-                    self.owner_tenant_id,
-                    tenant_id.as_deref(),
-                    self.rule_for(ResourceKind::ApiKeys, key_id),
-                ) {
+                if !can_reference_with_rule(self.owner_tenant_id, tenant_id.as_deref(), rule) {
                     return Err(inaccessible("API-key parent Surface"));
+                }
+                if surface_id != self.current_surface_id && rule.is_enforced() {
+                    return Err(another_surfaces_key(key_id));
                 }
             }
         }
@@ -1339,9 +1341,8 @@ impl ReferenceAuthorizer<'_> {
 
     /// A Caller Context API Key `secret_id` shaped like a key id, on a view whose inbound
     /// Identity is From API Key, shares the DID of a key of that id. A new one is refused when
-    /// that key belongs to a surface this one may not reference, or to a surface with no tenant;
-    /// one the stored surface already named is kept under `warn`. An id no key has stays a
-    /// plain secret.
+    /// that key belongs to another surface; one the stored surface already named is kept under
+    /// `warn`. An id no key has stays a plain secret.
     async fn legacy_secret(
         &self,
         secret_id: &str,
@@ -1363,6 +1364,9 @@ impl ReferenceAuthorizer<'_> {
                 || crate::tenancy::breaks_tenant_isolation(self.owner_tenant_id, tenant_id.as_deref());
             if breaks && rule.is_enforced() {
                 return Err(inaccessible("API-key parent Surface"));
+            }
+            if surface_id != self.current_surface_id && rule.is_enforced() {
+                return Err(another_surfaces_key(secret_id));
             }
         }
         Ok(())
@@ -1800,6 +1804,9 @@ pub(crate) enum ProviderKeyIssueKind {
     OtherTenant { enforced: bool },
     /// A tenant surface names the key of a surface with no tenant; a breach only when enforced.
     ApplianceKey { enforced: bool },
+    /// The key belongs to another surface the surface may reference: a surface names only its
+    /// own keys. A breach only when enforced.
+    OtherSurface { enforced: bool },
     /// No key has this id; key ids are never reused, so its DID is no other key's.
     MissingKey,
     /// The surface owning the key no longer exists, so its tenant cannot be told; a breach only
@@ -1814,6 +1821,7 @@ impl ProviderKeyIssueKind {
         match self {
             Self::OtherTenant { .. } => "other_tenant",
             Self::ApplianceKey { .. } => "appliance_key",
+            Self::OtherSurface { .. } => "other_surface",
             Self::MissingKey => "missing_key",
             Self::MissingOwner { .. } => "missing_owner",
             Self::StoreUnavailable => "store_unavailable",
@@ -1827,6 +1835,7 @@ impl ProviderKeyIssueKind {
             Self::StoreUnavailable
                 | Self::OtherTenant { enforced: true }
                 | Self::ApplianceKey { enforced: true }
+                | Self::OtherSurface { enforced: true }
                 | Self::MissingOwner { enforced: true }
         )
     }
@@ -1847,6 +1856,7 @@ pub(crate) fn provider_key_verdict(
     isolation: RuleMode,
 ) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
     Ok(judge_provider_keys(
+        &surface.surface_id,
         surface.tenant_id.as_deref(),
         &provider_key_ids(surface)?,
         owners,
@@ -1855,11 +1865,13 @@ pub(crate) fn provider_key_verdict(
     ))
 }
 
-/// The issues of the key ids `ids` a surface of `tenant_id` names. A legacy secret is reported
-/// only when a key of that id belongs to a surface the surface may not reference, or to a
-/// surface with no tenant. `owners` is `None` when the API key store is unavailable;
-/// `surface_tenants` maps every stored surface id to its tenant.
+/// The issues of the key ids `ids` the surface `surface_id` of `tenant_id` names. A key the
+/// surface owns itself has none, whatever tenant the stores read for it. A key of another
+/// tenant is reported as that, not also as another surface's. A legacy secret is
+/// reported only when a key of that id belongs to another surface. `owners` is `None` when the
+/// API key store is unavailable; `surface_tenants` maps every stored surface id to its tenant.
 pub(crate) fn judge_provider_keys(
+    surface_id: &str,
     tenant_id: Option<&str>,
     ids: &ProviderKeyIds,
     owners: Option<&std::collections::HashMap<String, Vec<String>>>,
@@ -1896,6 +1908,9 @@ pub(crate) fn judge_provider_keys(
             continue;
         };
         for owner_id in owner_ids {
+            if owner_id == surface_id {
+                continue;
+            }
             let Some(owner_tenant) = surface_tenants.get(owner_id.as_str()) else {
                 if !legacy {
                     issue(
@@ -1918,6 +1933,13 @@ pub(crate) fn judge_provider_keys(
                 issue(
                     key_id,
                     ProviderKeyIssueKind::ApplianceKey {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
+            } else {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::OtherSurface {
                         enforced: isolation.is_enforced(),
                     },
                 );
@@ -2125,6 +2147,12 @@ fn endpoint_id<'a>(
 
 pub(super) fn inaccessible(label: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!("{label} reference is not accessible"))
+}
+
+fn another_surfaces_key(key_id: &str) -> SurfaceApiError {
+    SurfaceApiError::BadRequest(format!(
+        "API key '{key_id}' belongs to another surface; a surface names only its own API keys"
+    ))
 }
 
 fn unavailable(label: &str) -> SurfaceApiError {

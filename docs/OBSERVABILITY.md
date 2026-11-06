@@ -367,7 +367,8 @@ endpoint URL.
 A surface that derives a DID from an API Key Provider key it may not use, or whose key or
 owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
 `subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
-`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+`appliance_key`, `other_surface`, `missing_key`, `missing_owner` or `store_unavailable`) and
+`not_ready`, which
 is `true` when the surface is refused at runtime; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 

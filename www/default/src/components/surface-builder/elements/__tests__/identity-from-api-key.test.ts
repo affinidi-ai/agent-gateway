@@ -1,6 +1,6 @@
 import { buildCanvasBlob, registry } from '../index';
 import { buildSurfaceContext } from '../surfaceContext';
-import { INBOUND_API_KEY_NEEDS_API_KEY_CALLER } from '../identity/definition';
+import { INBOUND_API_KEY_NEEDS_API_KEY_CALLER, SELECT_OWN_API_KEY } from '../identity/definition';
 import type { CanvasNode, PayloadContext } from '../types';
 
 const inboundNode = { id: 'identity-inbound', slotId: 'request:identity-inbound' };
@@ -110,7 +110,7 @@ describe('identity From API Key — completeness', () => {
 
   it('requires a key on the protected node', () => {
     expect(registry.getIncompleteReason('identity', { type: 'from_api_key' }, protectedNode)).toBe(
-      'Select an API key'
+      SELECT_OWN_API_KEY
     );
     expect(registry.isConfigured('identity', { type: 'from_api_key' }, protectedNode)).toBe(false);
     expect(
@@ -124,7 +124,7 @@ describe('identity From API Key — completeness', () => {
 
   it('requires a key when the caller has no node to place it', () => {
     expect(registry.getIncompleteReason('identity', { type: 'from_api_key' })).toBe(
-      'Select an API key'
+      SELECT_OWN_API_KEY
     );
   });
 

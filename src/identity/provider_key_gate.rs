@@ -448,7 +448,7 @@ impl ProviderKeyGate {
         let tenant_id = surface.tenant_id.as_deref();
         let Owners { keys: owners, surfaces } = match listing {
             Ok(owners) => owners,
-            Err(cause) => return self.store_outage(tenant_id, ids, isolation, cause),
+            Err(cause) => return self.store_outage(surface, ids, isolation, cause),
         };
         let mut owner_ids: Vec<String> = Vec::new();
         for id in ids.all() {
@@ -467,7 +467,7 @@ impl ProviderKeyGate {
             match surfaces.get(owner_id).await {
                 Ok(Some(owner)) => owner_tenants.push((owner_id.clone(), owner.tenant_id)),
                 Ok(None) => {}
-                Err(_) => return self.store_outage(tenant_id, ids, isolation, "reading a key's surface failed"),
+                Err(_) => return self.store_outage(surface, ids, isolation, "reading a key's surface failed"),
             }
         }
         if self
@@ -480,7 +480,7 @@ impl ProviderKeyGate {
             .iter()
             .map(|(id, tenant)| (id.as_str(), tenant.as_deref()))
             .collect();
-        let issues = judge_provider_keys(tenant_id, ids, Some(owners), &owner_tenants, isolation);
+        let issues = judge_provider_keys(&surface.surface_id, tenant_id, ids, Some(owners), &owner_tenants, isolation);
         log(surface, &issues);
         Verdict {
             issues,
@@ -495,7 +495,7 @@ impl ProviderKeyGate {
     /// ready. The outage is logged once, until the stores can be read again.
     fn store_outage(
         &self,
-        tenant_id: Option<&str>,
+        surface: &AgentSurface,
         ids: &ProviderKeyIds,
         isolation: crate::config::credential_policy::RuleMode,
         cause: &'static str,
@@ -512,7 +512,14 @@ impl ProviderKeyGate {
             );
         }
         Verdict {
-            issues: judge_provider_keys(tenant_id, ids, None, &HashMap::new(), isolation),
+            issues: judge_provider_keys(
+                &surface.surface_id,
+                surface.tenant_id.as_deref(),
+                ids,
+                None,
+                &HashMap::new(),
+                isolation,
+            ),
             owners: HashSet::new(),
             store_unavailable: true,
         }
@@ -699,8 +706,8 @@ mod tests {
         use crate::surfaces::AgentSurfaceStore as _;
 
         let enforced = gate().await;
-        let names_a = naming("names-a", "tenant-a", external(KEY_A));
-        let names_b = naming("names-b", "tenant-b", external(KEY_B));
+        let names_a = naming("owner-a", "tenant-a", external(KEY_A));
+        let names_b = naming("owner-b", "tenant-b", external(KEY_B));
         enforced
             .gate
             .admit(&names_a)
@@ -744,12 +751,12 @@ mod tests {
         assert!(
             !enforced
                 .gate
-                .has_verdict("names-a")
+                .has_verdict("owner-a")
         );
         assert!(
             enforced
                 .gate
-                .has_verdict("names-b"),
+                .has_verdict("owner-b"),
             "a verdict that read another owner is kept"
         );
         assert_eq!(
@@ -757,7 +764,13 @@ mod tests {
                 .gate
                 .refuses(&names_a)
                 .await,
-            Some(NotReadyReason::ProviderKeyTenant)
+            None,
+            "judged again: a surface's own key is its own in any tenant"
+        );
+        assert!(
+            enforced
+                .gate
+                .has_verdict("owner-a")
         );
     }
 
@@ -771,7 +784,7 @@ mod tests {
             })),
             Some(enforced.surfaces.clone()),
         );
-        let names_a = naming("names-a", "tenant-a", external(KEY_A));
+        let names_a = naming("owner-a", "tenant-a", external(KEY_A));
 
         assert_eq!(
             enforced
@@ -784,7 +797,7 @@ mod tests {
         assert!(
             !enforced
                 .gate
-                .has_verdict("names-a"),
+                .has_verdict("owner-a"),
             "a request's verdict that an owner change overtook is not kept"
         );
 
@@ -795,7 +808,7 @@ mod tests {
         assert!(
             !enforced
                 .gate
-                .has_verdict("names-a"),
+                .has_verdict("owner-a"),
             "nor is an admission's"
         );
 
@@ -809,15 +822,15 @@ mod tests {
         assert!(
             enforced
                 .gate
-                .has_verdict("names-a")
+                .has_verdict("owner-a")
         );
     }
 
     #[tokio::test]
     async fn a_request_adds_what_it_judges_to_the_surfaces_verdict() {
         let enforced = gate().await;
-        let own = naming("names", "tenant-a", external(KEY_A));
-        let cross = naming("names", "tenant-a", external(KEY_B));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let cross = naming("owner-a", "tenant-a", external(KEY_B));
 
         assert_eq!(
             enforced
@@ -836,7 +849,7 @@ mod tests {
         let entry = enforced
             .gate
             .entries
-            .get("names")
+            .get("owner-a")
             .unwrap();
         assert_eq!(entry.judged, [KEY_A.to_string(), KEY_B.to_string()].into());
         assert_eq!(entry.refused, [KEY_B.to_string()].into());
@@ -850,20 +863,20 @@ mod tests {
             "its own key stays served"
         );
 
-        let moved = naming("names", "tenant-b", external(KEY_B));
+        let moved = naming("owner-a", "tenant-b", external(KEY_A));
         assert_eq!(
             enforced
                 .gate
                 .refuses(&moved)
                 .await,
             None,
-            "a tenant change is judged afresh"
+            "a tenant change is judged afresh, and its own key is its own in any tenant"
         );
         assert_eq!(
             enforced
                 .gate
                 .entries
-                .get("names")
+                .get("owner-a")
                 .unwrap()
                 .tenant_id
                 .as_deref(),
@@ -874,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn a_variant_naming_a_key_the_base_does_not_is_refused_only_where_it_serves() {
         let enforced = gate().await;
-        let mut surface = naming("variants", "tenant-a", external(KEY_A));
+        let mut surface = naming("owner-a", "tenant-a", external(KEY_A));
         surface.variants = serde_json::from_value(serde_json::json!([{
             "id": "cross-id", "alias": "cross", "name": "Cross", "enabled": true,
             "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": KEY_B}}}
@@ -912,11 +925,11 @@ mod tests {
         );
         enforced
             .gate
-            .forget("variants");
+            .forget("owner-a");
         assert!(
             !enforced
                 .gate
-                .has_verdict("variants")
+                .has_verdict("owner-a")
         );
     }
 
@@ -1057,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn an_outage_is_reported_only_for_a_view_it_left_unchecked() {
         let enforced = gate().await;
-        let mut surface = naming("partly", "tenant-a", external(KEY_A));
+        let mut surface = naming("owner-a", "tenant-a", external(KEY_A));
         surface.variants = serde_json::from_value(serde_json::json!([{
             "id": "late-id", "alias": "late", "name": "Late", "enabled": true,
             "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_gate_late"}}}
@@ -1160,7 +1173,7 @@ mod tests {
         enforced
             .gate
             .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
-        let own = naming("outage", "tenant-a", external(KEY_A));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
 
         enforced
             .gate
@@ -1187,7 +1200,7 @@ mod tests {
             "requests within the recheck answer from the outage verdict without reading the store"
         );
 
-        expire_rechecks(enforced.gate, "outage");
+        expire_rechecks(enforced.gate, "owner-a");
         assert_eq!(
             enforced
                 .gate
@@ -1220,7 +1233,7 @@ mod tests {
         enforced
             .gate
             .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
-        let own = naming("own", "tenant-a", external(KEY_A));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
         let cross = naming("cross", "tenant-a", external(KEY_B));
         let missing = naming("missing", "tenant-a", external("atgk_gate_missing"));
         let plain = naming("plain", "tenant-a", serde_json::json!({}));
@@ -1275,7 +1288,7 @@ mod tests {
         assert_eq!(
             enforced
                 .gate
-                .refuses(&naming("own", "tenant-a", external(KEY_A)))
+                .refuses(&naming("owner-a", "tenant-a", external(KEY_A)))
                 .await,
             None
         );
@@ -1295,6 +1308,100 @@ mod tests {
             None,
             "under warn it is only logged"
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_of_another_surface_of_the_same_tenant_is_refused_only_when_enforced() {
+        let enforced = gate().await;
+        let borrower = naming("borrower", "tenant-a", external(KEY_A));
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&borrower)
+                .await,
+            Some(NotReadyReason::ProviderKeyTenant)
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&borrower),
+            Some(PROVIDER_KEY_TENANT_RULE)
+        );
+
+        crate::config::credential_policy::use_thread_credential_policy(
+            crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: crate::config::credential_policy::RuleMode::Warn,
+                ..Default::default()
+            },
+        );
+        enforced
+            .gate
+            .forget("borrower");
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&borrower)
+                .await,
+            None,
+            "under warn it is only logged"
+        );
+    }
+
+    #[test]
+    fn another_surfaces_key_is_judged_other_surface_and_another_tenants_only_other_tenant() {
+        let owners: HashMap<String, Vec<String>> =
+            [(KEY_A.to_string(), vec!["owner-a".to_string()]), (KEY_B.to_string(), vec!["owner-b".to_string()])].into();
+        let tenants: HashMap<&str, Option<&str>> =
+            [("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))].into();
+        let judge = |surface_id: &str, ids: &ProviderKeyIds, isolation| {
+            judge_provider_keys(surface_id, Some("tenant-a"), ids, Some(&owners), &tenants, isolation)
+                .into_iter()
+                .map(|issue| (issue.key_id, issue.kind))
+                .collect::<Vec<_>>()
+        };
+        let enforce = crate::config::credential_policy::RuleMode::Enforce;
+        let warn = crate::config::credential_policy::RuleMode::Warn;
+
+        assert_eq!(judge("owner-a", &ids(&[KEY_A]), enforce), vec![]);
+        assert_eq!(
+            judge("borrower", &ids(&[KEY_A, KEY_B]), enforce),
+            vec![
+                (KEY_A.to_string(), ProviderKeyIssueKind::OtherSurface { enforced: true }),
+                (KEY_B.to_string(), ProviderKeyIssueKind::OtherTenant { enforced: true }),
+            ]
+        );
+        assert_eq!(
+            judge("borrower", &ids(&[KEY_A]), warn),
+            vec![(KEY_A.to_string(), ProviderKeyIssueKind::OtherSurface { enforced: false })]
+        );
+        let legacy = ProviderKeyIds {
+            keys: Vec::new(),
+            legacy_secrets: vec![KEY_A.to_string()],
+        };
+        assert_eq!(
+            judge("borrower", &legacy, enforce),
+            vec![(KEY_A.to_string(), ProviderKeyIssueKind::OtherSurface { enforced: true })]
+        );
+        assert_eq!(judge("owner-a", &legacy, enforce), vec![]);
+        let mistenanted: HashMap<&str, Option<&str>> = [("owner-a", Some("tenant-b"))].into();
+        for surface_tenants in [&mistenanted, &HashMap::new()] {
+            assert_eq!(
+                judge_provider_keys(
+                    "owner-a",
+                    Some("tenant-a"),
+                    &ids(&[KEY_A]),
+                    Some(&owners),
+                    surface_tenants,
+                    enforce
+                ),
+                vec![],
+                "its own key, whatever tenant the stores read for it or none"
+            );
+        }
+        assert!(ProviderKeyIssueKind::OtherSurface { enforced: true }.is_breach());
+        assert!(!ProviderKeyIssueKind::OtherSurface { enforced: false }.is_breach());
+        assert_eq!(ProviderKeyIssueKind::OtherSurface { enforced: true }.as_str(), "other_surface");
     }
 
     #[tokio::test]

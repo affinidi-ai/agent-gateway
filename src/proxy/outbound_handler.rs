@@ -10561,6 +10561,7 @@ mod tests {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
             let mut surface = (*ctx.surface).clone();
+            surface.surface_id = "owner-a".into();
             surface.tenant_id = Some("tenant-a".into());
             let mut point = ctx.virtual_channel.clone();
             point.managed_identity =
@@ -10594,7 +10595,7 @@ mod tests {
             step_provider_key_gate(&mut own)
                 .await
                 .is_ok(),
-            "its own tenant's key is served"
+            "its own key is served"
         );
     }
 
