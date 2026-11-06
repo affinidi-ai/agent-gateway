@@ -4,7 +4,8 @@
 //! is unavailable, its Access Point is not ready: every request is refused with `503`. A surface
 //! names only its own keys: one naming its own key serves in both modes, one naming another
 //! surface's key of its own tenant is held back like one naming another tenant's. Revoking a
-//! surface's own key takes it out of service on the next request in both modes.
+//! surface's own key takes it out of service on the next request in both modes. A surface naming
+//! an active key whose owning surface is gone is not ready under `enforce` and serves under `warn`.
 
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -618,5 +619,45 @@ async fn a_key_another_node_deleted_is_missing_at_the_next_full_judgment_in_both
         let reached = gate.reached();
         assert_not_ready(gate.call(NAMES_OWN).await, "its own key deleted by another node, after a reload");
         assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a deleted key never reaches the Target");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_naming_an_active_key_whose_surface_is_gone_is_not_ready_only_under_enforce() {
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        std::fs::remove_file(gate.stored_path("owner-b")).unwrap();
+        gate.reload().await;
+        let (status, body) = gate
+            .call_until("owner-b", 404)
+            .await;
+        assert_ne!(status, 200, "{mode:?}: the removed surface no longer serves: {body}");
+
+        let keys: Value = gate
+            .admin
+            .get(format!("{}/api/v1/api-keys", gate.h.gateway_base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let key = keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["key_id"] == KEY_B)
+            .unwrap_or_else(|| panic!("{mode:?}: the key outlives its surface: {keys}"));
+        assert_eq!(key["status"], "active", "{mode:?}: a removed surface file revokes nothing: {key}");
+
+        let reached = gate.reached();
+        let answer = gate.call(NAMES_CROSS).await;
+        if mode.is_enforced() {
+            assert_not_ready(answer, "an active key whose owning surface is gone, under enforce");
+            assert_eq!(gate.reached(), reached, "a not-ready Access Point never reaches the Target");
+        } else {
+            assert_eq!(answer.0, 200, "under warn it keeps serving: {}", answer.1);
+            assert_eq!(gate.reached(), reached + 1);
+        }
     }
 }
