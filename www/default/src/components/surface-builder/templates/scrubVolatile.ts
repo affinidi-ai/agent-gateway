@@ -39,6 +39,18 @@ function dropApiKeyId(value: unknown): void {
 
 function dropApiKeyIds(view: unknown): void {
   if (!isObject(view)) return;
+  const auth = isObject(view.access_point) ? view.access_point.caller_authentication : undefined;
+  if (isObject(auth) && Array.isArray(auth.methods)) {
+    for (const method of auth.methods) {
+      if (
+        isObject(method) &&
+        typeof method.secret_id === 'string' &&
+        method.secret_id.startsWith('atgk_')
+      ) {
+        delete method.secret_id;
+      }
+    }
+  }
   const slots = view.identity_slots;
   if (isObject(slots)) {
     for (const slot of ['inbound', 'protected', 'external']) dropApiKeyId(slots[slot]);
@@ -54,14 +66,24 @@ function dropApiKeyIds(view: unknown): void {
   }
 }
 
+function dropCanvasApiKeyIds(canvas: unknown): void {
+  if (!isObject(canvas) || !Array.isArray(canvas.nodes)) return;
+  for (const node of canvas.nodes) {
+    if (isObject(node) && node.type === 'identity') dropApiKeyId(node.config);
+  }
+}
+
 export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
   if (!isObject(payload)) return payload;
   const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
 
   dropApiKeyIds(out);
+  dropCanvasApiKeyIds(out.canvas);
   if (Array.isArray(out.variants)) {
     for (const variant of out.variants) {
-      if (isObject(variant)) dropApiKeyIds(variant.overrides);
+      if (!isObject(variant) || !isObject(variant.overrides)) continue;
+      dropApiKeyIds(variant.overrides);
+      dropCanvasApiKeyIds(variant.overrides.canvas);
     }
   }
 
@@ -87,7 +109,6 @@ export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
         const cfg = (n as Record<string, unknown>).config;
         if (!isObject(cfg)) continue;
         const type = (n as Record<string, unknown>).type;
-        if (type === 'identity') dropApiKeyId(cfg);
         if (typeof type === 'string' && type.startsWith('transit-point-')) {
           for (const f of VOLATILE_TP_CANVAS_FIELDS) {
             if (f in cfg) delete (cfg as Record<string, unknown>)[f];

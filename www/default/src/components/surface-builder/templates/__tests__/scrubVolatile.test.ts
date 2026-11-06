@@ -30,6 +30,48 @@ describe('scrubVolatileTemplateFields', () => {
     expect(input.identity_slots.protected.api_key_id).toBe('atgk_own');
   });
 
+  it('drops an API key shaped Caller Context secret and variant canvas key ids', () => {
+    const apiKeyMethod = {
+      type: 'api_key',
+      secret_id: 'atgk_own',
+      extraction: { field: 'x-api-key' },
+    };
+    const plainMethod = { type: 'api_key', secret_id: 'plain-secret' };
+    const input = {
+      access_point: { caller_authentication: { methods: [apiKeyMethod, plainMethod] } },
+      variants: [
+        {
+          alias: 'v',
+          overrides: {
+            access_point: { caller_authentication: { methods: [apiKeyMethod] } },
+            canvas: {
+              nodes: [
+                {
+                  id: 'identity-protected',
+                  type: 'identity',
+                  config: { type: 'from_api_key', api_key_id: 'atgk_own' },
+                },
+                { id: 'ma', type: 'managed-agent', config: { api_key_id: 'kept' } },
+              ],
+            },
+          },
+        },
+      ],
+    };
+    const out = scrubVolatileTemplateFields(input) as any;
+    expect(out.access_point.caller_authentication.methods).toEqual([
+      { type: 'api_key', extraction: { field: 'x-api-key' } },
+      plainMethod,
+    ]);
+    const overrides = out.variants[0].overrides;
+    expect(overrides.access_point.caller_authentication.methods).toEqual([
+      { type: 'api_key', extraction: { field: 'x-api-key' } },
+    ]);
+    expect(overrides.canvas.nodes[0].config).toEqual({ type: 'from_api_key' });
+    expect(overrides.canvas.nodes[1].config.api_key_id).toBe('kept');
+    expect(input.access_point.caller_authentication.methods[0].secret_id).toBe('atgk_own');
+  });
+
   it('blanks transit-point listener + identity fields', () => {
     const out = scrubVolatileTemplateFields({
       access_point: { listen_address: '$HOST', route: '$ROUTE' },

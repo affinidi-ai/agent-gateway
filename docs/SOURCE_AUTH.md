@@ -1268,15 +1268,19 @@ not configured". A key a surface names as such a secret counts as named, so movi
 surface is checked like moving the owner of any named key.
 
 Deleting an API key (`DELETE /v1/api-keys/{agent_id}/{key_id}`), also the cleanup of a key whose
-owning surface is gone, answers `409` while any stored surface names the key id, in its base or
-any variant: the ids collected above, and a Caller Context API Key `secret_id` of that id on a
-view whose inbound Identity is From API Key. Deleting such a key would turn a `missing_owner`
-verdict, which takes the surface out of service under `enforce`, into a `missing_key` one, which
-does not, and would turn such a secret that names another tenant's key into a plain secret with
-the same DID. The `error` names the naming surfaces the caller may see and counts the others. A
-surface store that cannot be listed answers `500` and deletes nothing. Revoking a named key is
-allowed. A save on another node that names the key while it is being deleted is not seen by the
-check.
+owning surface is gone, first looks the key up under `agent_id`: a key that is not there answers
+`404` "API key not found: <key id>", before any surface is read. A key that is there answers `409` while any
+stored surface names its id, in its base or any variant: the ids collected above, and a Caller
+Context API Key `secret_id` of that id on a view whose inbound Identity is From API Key. Deleting
+such a key would turn a `missing_owner` verdict, which takes the surface out of service under
+`enforce`, into a `missing_key` one, which does not, and would turn such a secret that names
+another tenant's key into a plain secret with the same DID. The `error` names the naming surfaces
+the caller may see and counts the others; the dashboard shows it in the delete error toast. A
+stored surface whose variants cannot be resolved is read without resolving them: it names the
+key when the id appears anywhere in its base or variant overrides, so it blocks only the deletes
+of keys it holds. A surface store that cannot be listed answers `500` and deletes nothing.
+Revoking a named key is allowed. A save that names the key while it is being deleted, on this
+node or another, is not seen by the check.
 
 #### Provider keys when a surface goes live
 

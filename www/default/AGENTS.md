@@ -416,7 +416,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   back and select it." (`SELECT_OWN_API_KEY`). A template capture or apply
   (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
   injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
-  canvas Identity nodes, so the new surface's Identity asks for its own key. An error-level dependency blocks
+  canvas Identity nodes (top-level and in variant overrides), and every `atgk_` Caller Context
+  `secret_id` of the base and the variant overrides, so the new surface's Identity asks for its
+  own key. An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
@@ -1008,6 +1010,14 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
+
+## API key delete
+
+The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
+(**Delete**) show a failed delete in an error toast that stays until dismissed: "Delete failed:
+<gateway message> (<status>)". The gateway refuses deleting a key a surface still names with
+`409`, and the message names the surfaces the caller may see, so the operator knows which
+Identity to change first. The detail page stays open after a failed delete.
 
 ## Policy definition editor
 
