@@ -4234,6 +4234,48 @@ mod external_provider_tests {
         assert_eq!(status, StatusCode::NO_CONTENT, "another provider's unreadable grant blocks nothing: {body}");
     }
 
+    /// A provider whose bindings or grants cannot be checked is kept: without
+    /// the surface store, or without the delegation vault, its delete answers
+    /// `503`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_bindings_or_grants_cannot_be_checked_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        for (case, state, error) in [
+            (
+                "no surface store",
+                CredentialProviderState {
+                    surfaces: None,
+                    ..state.clone()
+                },
+                "Agent surfaces are unavailable, so the provider's bindings cannot be checked",
+            ),
+            (
+                "no delegation vault",
+                CredentialProviderState {
+                    vault: None,
+                    ..state.clone()
+                },
+                "The delegation vault is unavailable, so the provider's grants cannot be removed",
+            ),
+        ] {
+            let (status, body) = delete(&state, "provider").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+            assert_eq!(body, serde_json::json!({ "error": error }), "{case}");
+            assert!(
+                state
+                    .store
+                    .get("provider")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{case}: the provider is kept"
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_providers_revocations_name_the_caller_that_deleted_it() {
         use crate::delegation_vault::grants::GrantKey;
