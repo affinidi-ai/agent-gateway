@@ -161,8 +161,8 @@ The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
-says surfaces using the key become Unconfigured and stop serving, and deletes only after a
-checkbox and **Delete API key**; see _API key delete_ in
+says surfaces using the key become Unconfigured and stop serving, and deletes only after
+**Delete API key** in that dialog; see _API key delete_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;

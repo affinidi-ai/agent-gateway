@@ -211,13 +211,12 @@ describe('SecretsPage API key delete', () => {
     const dialog = screen.getByTestId('api-key-delete-dialog');
     expect(dialog).toHaveTextContent('client-a');
     expect(dialog).toHaveTextContent('stops serving requests until you select another API key');
+    expect(screen.getByRole('dialog', { name: 'Delete API key' })).toBe(dialog);
     const confirm = screen.getByTestId('api-key-delete-dialog-confirm');
-    expect(confirm).toBeDisabled();
-    await userEvent.click(confirm);
+    expect(confirm).toBeEnabled();
     expect(apiClient.deleteApiKey).not.toHaveBeenCalled();
 
     const listings = (apiClient.listAllApiKeys as jest.Mock).mock.calls.length;
-    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
     await userEvent.click(confirm);
 
     await waitFor(() =>
@@ -242,6 +241,17 @@ describe('SecretsPage API key delete', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
+  it('deletes nothing when the dialog is closed', async () => {
+    (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([key]);
+    renderAt('/secrets?tab=api-keys');
+
+    await userEvent.click(await screen.findByTestId('api-keys-delete-button-atgk_named'));
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    expect(screen.queryByTestId('api-key-delete-dialog')).toBeNull();
+    expect(apiClient.deleteApiKey).not.toHaveBeenCalled();
+  });
+
   it('shows why a delete failed', async () => {
     const message = 'Internal server error (500)';
     (apiClient.listAllApiKeys as jest.Mock).mockResolvedValue([key]);
@@ -249,7 +259,6 @@ describe('SecretsPage API key delete', () => {
     renderAt('/secrets?tab=api-keys');
 
     await userEvent.click(await screen.findByTestId('api-keys-delete-button-atgk_named'));
-    await userEvent.click(screen.getByTestId('api-key-delete-dialog-understood'));
     await userEvent.click(screen.getByTestId('api-key-delete-dialog-confirm'));
 
     await waitFor(() =>
