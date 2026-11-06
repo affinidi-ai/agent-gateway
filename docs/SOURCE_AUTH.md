@@ -1293,12 +1293,13 @@ keys is checked again on its next request.
   before then are refused without reading the store.
 - When a surface goes live, the store counts as unreadable while the keys of any surface's key
   folder cannot be loaded, for example when the folder cannot be read, so a key in that folder
-  is never mistaken for a missing one. Saves, tenant reassignment, the credential policy report
-  and the `GET /v1/api-keys` listing still answer, without that folder's keys: a save naming a
-  key in that folder is refused as `API key reference is not accessible` unless the stored
-  surface already named it.
+  is never mistaken for a missing one. Saves, tenant reassignment and the `GET /v1/api-keys`
+  listing still answer, without that folder's keys: a save naming a key in that folder is
+  refused as `API key reference is not accessible` unless the stored surface already named it.
 - Boot and a configuration reload read the API key store once for all the surfaces they bring
-  live.
+  live, and their credential policy report judges from that same listing. While that listing
+  fails, the report logs one warning and lists every surface naming a key id as
+  `store_unavailable`, never as `missing_key`.
 - If the API key store fails to start, the gateway runs without it until it restarts: every
   surface naming an `atgk_` id stays not ready in either mode. Fix the store and restart.
 

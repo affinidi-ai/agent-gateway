@@ -1500,10 +1500,11 @@ pub async fn run_axum_proxy(
                 .clone()
                 .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
         );
+        let mut provider_key_listing = None;
         if let Some(ref surface_store) = agent_surface_store {
             match surface_store.list_all().await {
                 Ok(surfaces) => {
-                    provider_key_gate
+                    provider_key_listing = provider_key_gate
                         .admit_all(
                             surfaces
                                 .iter()
@@ -3398,7 +3399,7 @@ pub async fn run_axum_proxy(
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
         identity_state.jwt_verification_strategy_store = Some(source_auth_middleware.provider_store());
-        crate::identity::handlers::report_credential_policy(&identity_state).await;
+        crate::identity::handlers::report_credential_policy(&identity_state, provider_key_listing).await;
 
         // Register with the GW2 message processor (global singleton).
         crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(network_config.clone()));

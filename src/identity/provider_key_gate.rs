@@ -6,7 +6,8 @@
 //! request that finds none for the key ids the served surface names, and kept per surface id; a
 //! key id judged while the store could not be read, like one found missing, is judged again once
 //! its recheck is due, and the verdicts that read a surface as a key's owner are dropped when that
-//! surface changes. Admitting the surfaces of a boot or reload reads the API key store once.
+//! surface changes. Admitting the surfaces of a boot or reload reads the API key store once, and
+//! the credential policy report of that boot or reload judges from the same listing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +29,18 @@ pub const PROVIDER_KEY_TENANT_RULE: &str = "provider_key_tenant";
 
 /// The reason a surface naming a key id is not ready while the API key store cannot be read.
 pub const API_KEY_STORE_UNAVAILABLE: &str = "api_key_store_unavailable";
+
+/// The surfaces owning each API key, by key id, from one listing of the API key store that
+/// loaded every key folder, or why the store could not be read.
+pub type KeyOwnersListing = Result<HashMap<String, Vec<String>>, &'static str>;
+
+/// Lists the owners of every key of `api_keys`; an error when there is no store or the keys of a
+/// key folder could not be loaded.
+pub(crate) async fn list_key_owners(api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>) -> KeyOwnersListing {
+    complete_provider_key_owners_in(api_keys.ok_or("the API key store is not configured")?)
+        .await
+        .map_err(|_| "listing API keys failed")
+}
 
 /// How long a key id found missing, whose owning surface was missing, or judged while the API
 /// key store could not be read, is kept as judged without `cache_refresh_interval_secs`. A key
@@ -257,11 +270,12 @@ impl ProviderKeyGate {
     }
 
     /// [`Self::admit`] for every surface of `surfaces`, all judged from one listing of the API
-    /// key store, which is read only when one of them names a key id.
+    /// key store, which is read only when one of them names a key id. Returns that listing's key
+    /// owners, `None` when the store was not read.
     pub async fn admit_all<'a>(
         &self,
         surfaces: impl IntoIterator<Item = &'a AgentSurface>,
-    ) {
+    ) -> Option<KeyOwnersListing> {
         let mut naming = Vec::new();
         for surface in surfaces {
             let ids = ids_of(surface);
@@ -273,7 +287,7 @@ impl ProviderKeyGate {
             }
         }
         if naming.is_empty() {
-            return;
+            return None;
         }
         let owner_changes = self.owner_changes();
         let listing = self.list_owners().await;
@@ -296,6 +310,7 @@ impl ProviderKeyGate {
                 dashmap::Entry::Vacant(_) => {}
             }
         }
+        Some(listing.map(|owners| owners.keys))
     }
 
     /// Drops the verdict of a surface that no longer serves.
@@ -422,9 +437,7 @@ impl ProviderKeyGate {
         let (Some(api_keys), Some(surfaces)) = (sources.api_keys, sources.surfaces) else {
             return Err("the API key store is not configured");
         };
-        let keys = complete_provider_key_owners_in(api_keys.as_ref())
-            .await
-            .map_err(|_| "listing API keys failed")?;
+        let keys = list_key_owners(Some(api_keys.as_ref())).await?;
         Ok(Owners { keys, surfaces })
     }
 
@@ -1269,6 +1282,125 @@ mod tests {
         );
     }
 
+    /// The provider key rows the credential policy report gives `surfaces` from `owners`.
+    fn report_rows(
+        surfaces: &[AgentSurface],
+        owners: Option<&HashMap<String, Vec<String>>>,
+    ) -> Vec<(String, &'static str, bool)> {
+        crate::identity::handlers::credential_policy_report::find_breaches(
+            &[],
+            surfaces,
+            &HashMap::new(),
+            owners,
+            &crate::delegation_vault::oauth::TokenEgress::from_environment(),
+            &crate::config::target_auth_rules::HttpsMcpProxies::default(),
+        )
+        .provider_keys
+        .into_iter()
+        .map(|finding| (finding.surface_id, finding.issue.kind.as_str(), finding.issue.kind.is_breach()))
+        .collect()
+    }
+
+    const REPORT_OUTAGE: &str = "Credential policy report: the API key store cannot be read";
+
+    #[tokio::test]
+    async fn the_credential_policy_report_judges_from_the_listing_the_admission_read() {
+        use crate::identity::handlers::credential_policy_report::report_key_owners;
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky.clone()), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let cross = naming("cross", "tenant-a", external(KEY_B));
+        let stored = [own.clone(), cross.clone(), naming("owner-b", "tenant-b", serde_json::json!({}))];
+
+        let listed = enforced
+            .gate
+            .admit_all([&own, &cross])
+            .await;
+        let owners = report_key_owners(listed, Some(flaky.as_ref()), &stored).await;
+
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "one listing for the admission and the report");
+        assert_eq!(report_rows(&stored, owners.as_ref()), vec![("cross".to_string(), "other_tenant", true)]);
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&cross),
+            Some(PROVIDER_KEY_TENANT_RULE),
+            "the gate refuses the surface the report lists"
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&own),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_policy_report_reads_the_store_once_only_when_the_admission_did_not() {
+        use crate::identity::handlers::credential_policy_report::report_key_owners;
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky.clone()), Some(enforced.surfaces.clone()));
+        let plain = naming("plain", "tenant-a", serde_json::json!({}));
+        let mut inactive = naming("inactive", "tenant-a", external(KEY_B));
+        inactive.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+
+        let listed = enforced
+            .gate
+            .admit_all([&plain])
+            .await;
+        assert!(listed.is_none());
+        let owners = report_key_owners(listed, Some(flaky.as_ref()), &[plain.clone(), inactive.clone()]).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "the report reads for a stored surface naming a key id");
+        assert_eq!(owners.unwrap().get(KEY_B), Some(&vec!["owner-b".to_string()]));
+
+        assert_eq!(report_key_owners(None, Some(flaky.as_ref()), &[plain]).await, None);
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "no surface names a key id: no listing");
+    }
+
+    #[tokio::test]
+    async fn the_credential_policy_report_lists_an_outage_as_store_unavailable_and_logs_it_once() {
+        use crate::identity::handlers::credential_policy_report::report_key_owners;
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 1));
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky.clone()), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let cross = naming("cross", "tenant-a", external(KEY_B));
+        let stored = [own.clone(), cross.clone(), naming("owner-b", "tenant-b", serde_json::json!({}))];
+
+        let listed = enforced
+            .gate
+            .admit_all([&own, &cross])
+            .await;
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let owners = report_key_owners(listed, Some(flaky.as_ref()), &stored).await;
+        let text = logs.text();
+
+        assert_eq!(owners, None);
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "the report does not read the store again");
+        assert_eq!(
+            text.matches(REPORT_OUTAGE)
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("listing API keys failed") && !text.contains("atgs_"), "{text}");
+        assert_eq!(
+            report_rows(&stored, owners.as_ref()),
+            vec![("owner-a".to_string(), "store_unavailable", true), ("cross".to_string(), "store_unavailable", true),]
+        );
+    }
+
     #[tokio::test]
     async fn a_key_whose_owning_surface_is_gone_is_refused_when_enforced() {
         let enforced = enforced_gate(
@@ -1433,9 +1565,21 @@ mod tests {
             .await;
         let lenient = crate::identity::handlers::surface_tenancy::provider_key_owners_in(other_node.as_ref()).await;
         let strict = complete_provider_key_owners_in(other_node.as_ref()).await;
+        let cross = [naming("cross", "tenant-a", external(KEY_B))];
+        let reported = crate::identity::handlers::credential_policy_report::report_key_owners(
+            None,
+            Some(other_node.as_ref()),
+            &cross,
+        )
+        .await;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(refused, Some(NotReadyReason::ApiKeyStoreUnavailable));
+        assert_eq!(
+            report_rows(&cross, reported.as_ref()),
+            vec![("cross".to_string(), "store_unavailable", true)],
+            "the report does not read a key in the folder as missing"
+        );
         assert_eq!(
             lenient.unwrap(),
             HashMap::from([(KEY_A.to_string(), vec!["owner-a".to_string()])]),
