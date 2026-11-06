@@ -158,17 +158,6 @@ impl AgentSurface {
             .any(|method| method.is_presented(&single, false))
     }
 
-    /// Whether `name` is a header a caller-authentication method reads.
-    pub fn is_source_credential_header(
-        &self,
-        name: &str,
-    ) -> bool {
-        self.source_auth_methods()
-            .iter()
-            .filter_map(|method| method.credential_header_name())
-            .any(|header| name.eq_ignore_ascii_case(header))
-    }
-
     /// The DID Auth configurations that mint sessions: the Access Point's DID
     /// Auth caller-authentication method, of which there is at most one, on the
     /// surface and in each variant whose overrides set the Access Point's caller
@@ -308,8 +297,8 @@ impl AgentSurface {
 
     /// Why this surface's caller authentication cannot tell apart the users a
     /// paired gateway sends requests for over Fabric, or `None` when it can.
-    /// Delegated per-user credentials for Fabric callers on its Transit Points
-    /// are keyed by the caller it verifies, so
+    /// Delegated per-user credentials for Fabric callers, on its Target and on
+    /// its Transit Points, are keyed by the caller it verifies, so
     /// only a credential that names the end user keeps one user's grant from
     /// another's: a resource token (`mcp_http.authorization`), or a
     /// `jwt_bearer` method with an audience (its own, or the one
@@ -374,6 +363,45 @@ impl AgentSurface {
                 }
                 SourceAuthConfig::Mtls(_) => None,
             })
+    }
+
+    /// Whether this view's Target is an `http://` or `https://` URL exactly as
+    /// written ([`crate::config::agent_surface::endpoint_is_http_url`]), the
+    /// only Target Fabric receive dials through a client pinned to the address
+    /// it vetted, and so the only one it sends a delegated credential.
+    pub fn target_is_http_url(&self) -> bool {
+        crate::config::agent_surface::endpoint_is_http_url(&self.target.endpoint)
+    }
+
+    /// Whether this view releases its Target's per-user grants to legacy
+    /// Fabric requests: its Target is an HTTP or HTTPS URL
+    /// ([`Self::target_is_http_url`]) that sets
+    /// `delegated_credentials_for_fabric_callers`, and its caller
+    /// authentication tells a partner's users apart
+    /// ([`Self::fabric_caller_authentication_gap`]).
+    pub fn releases_target_grants_to_fabric_callers(&self) -> bool {
+        self.target
+            .delegated_credentials_for_fabric_callers
+            && self.target_is_http_url()
+            && self
+                .fabric_caller_authentication_gap()
+                .is_none()
+    }
+
+    /// The agent half of the vault key of this view's Target grants: the
+    /// surface on a view that releases them to Fabric callers, so one grant
+    /// serves a person whichever agent acts for them, directly or through a
+    /// partner; otherwise the agent a direct caller's request names, else the
+    /// surface. Fabric receive passes `None`, so nothing a partner names is
+    /// ever the agent half.
+    pub fn target_grant_agent_did<'a>(
+        &'a self,
+        caller_agent_did: Option<&'a str>,
+    ) -> &'a str {
+        if self.releases_target_grants_to_fabric_callers() {
+            return &self.surface_id;
+        }
+        caller_agent_did.unwrap_or(&self.surface_id)
     }
 
     /// Slot 1 — caller identity extracted from inbound request (CA → AP).
@@ -1128,9 +1156,6 @@ mod tests {
             {"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}
         ]));
         assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
-        assert!(surface.is_source_credential_header("authorization"));
-        assert!(surface.is_source_credential_header("x-api-key"));
-        assert!(!surface.is_source_credential_header("x-trace"));
         assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
         assert!(surface.has_source_auth());
     }
@@ -1192,6 +1217,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -1435,6 +1461,124 @@ mod tests {
         assert_eq!(
             surface.validate_outbound(),
             vec![format!("variant 'staging': {}", crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED)]
+        );
+    }
+
+    /// A view releases its Target's per-user grants to Fabric callers only when
+    /// its Target is an HTTP or HTTPS URL that sets the switch and its caller
+    /// authentication tells a partner's users apart: a JWT naming an audience
+    /// or a resource token, with an mTLS method beside one of them, and no
+    /// method that names every user alike. On any other Target, including one
+    /// written with an upper-case scheme or a leading space, which Fabric
+    /// receive would not dial through its pinned client, the view keeps its
+    /// grants per agent, as with the switch off.
+    #[test]
+    fn releases_target_grants_to_fabric_callers_needs_the_switch_and_callers_told_apart() {
+        use serde_json::json;
+        let jwt = |audiences: serde_json::Value| json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": audiences });
+        let api_key = json!({ "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "keys" });
+        let mtls = json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["c1"] },
+            "identity_binding": { "type": "fingerprint" } });
+        let mut resource_tokens = surface_with_methods(json!([mtls.clone()]));
+        resource_tokens.mcp_http = Some(
+            serde_json::from_value(json!({ "authorization": { "resource": "https://gateway.example/mcp" } })).unwrap(),
+        );
+
+        for (case, view, tells_users_apart) in [
+            ("a JWT naming an audience", surface_with_methods(json!([jwt(json!(["api://agent"]))])), true),
+            ("a resource token beside mTLS", resource_tokens, true),
+            (
+                "mTLS beside a JWT naming an audience",
+                surface_with_methods(json!([mtls.clone(), jwt(json!(["api://agent"]))])),
+                true,
+            ),
+            ("an API key", surface_with_methods(json!([api_key.clone()])), false),
+            (
+                "an API Key Provider key",
+                surface_with_methods(json!([{ "type": "api_key_provider", "agent_id": "keys",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" } }])),
+                false,
+            ),
+            (
+                "DID Auth",
+                surface_with_methods(
+                    json!([{ "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session-Token" } }]),
+                ),
+                false,
+            ),
+            ("a JWT naming no audience", surface_with_methods(json!([jwt(json!([]))])), false),
+            ("mTLS only", surface_with_methods(json!([mtls.clone()])), false),
+            (
+                "an API key beside a JWT naming an audience",
+                surface_with_methods(json!([jwt(json!(["api://agent"])), api_key])),
+                false,
+            ),
+            ("no caller authentication", surface(SurfaceProtocol::A2a), false),
+        ] {
+            for switch in [false, true] {
+                let mut view = view.clone();
+                view.target
+                    .delegated_credentials_for_fabric_callers = switch;
+                assert_eq!(
+                    view.releases_target_grants_to_fabric_callers(),
+                    switch && tells_users_apart,
+                    "{case}, switch {switch}"
+                );
+            }
+        }
+
+        for (endpoint, releases) in [
+            ("fabric://peer-gateway/peer-surface", false),
+            ("proxy://tools", false),
+            ("a2a-proxy://worker", false),
+            ("HTTPS://upstream:9000", false),
+            ("HTTP://upstream:9000", false),
+            (" https://upstream:9000", false),
+            ("http://upstream:9000", true),
+            ("https://upstream:9000", true),
+        ] {
+            let mut view = surface_with_methods(json!([jwt(json!(["api://agent"]))]));
+            view.target
+                .delegated_credentials_for_fabric_callers = true;
+            view.target.endpoint = endpoint.to_string();
+            assert_eq!(view.target_is_http_url(), releases, "{endpoint}");
+            assert_eq!(view.releases_target_grants_to_fabric_callers(), releases, "{endpoint}");
+            assert_eq!(
+                view.target_grant_agent_did(Some("did:web:planner.example")),
+                if releases {
+                    "surf-1"
+                } else {
+                    "did:web:planner.example"
+                },
+                "{endpoint}"
+            );
+        }
+    }
+
+    /// On a view that releases its Target's grants to Fabric callers the agent
+    /// half of their key is the surface, whatever agent a caller names;
+    /// otherwise it is the agent a direct caller names, else the surface.
+    #[test]
+    fn target_grant_agent_did_is_the_surface_once_the_target_releases_grants_to_partners() {
+        let mut view = surface_with_methods(serde_json::json!([{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] }]));
+        assert_eq!(view.target_grant_agent_did(Some("did:web:planner.example")), "did:web:planner.example");
+        assert_eq!(view.target_grant_agent_did(None), "surf-1");
+
+        view.target
+            .delegated_credentials_for_fabric_callers = true;
+        assert_eq!(view.target_grant_agent_did(Some("did:web:planner.example")), "surf-1");
+        assert_eq!(view.target_grant_agent_did(None), "surf-1");
+
+        let mut shared_key = surface_with_methods(serde_json::json!([{ "type": "api_key",
+            "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "keys" }]));
+        shared_key
+            .target
+            .delegated_credentials_for_fabric_callers = true;
+        assert_eq!(
+            shared_key.target_grant_agent_did(Some("did:web:planner.example")),
+            "did:web:planner.example",
+            "a view that cannot release grants to partners keeps them per agent"
         );
     }
 }

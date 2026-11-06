@@ -255,7 +255,9 @@ Per-connection controls:
   be created before the surface it will target exists. Appliance-global
   connections are administrator-created and unrestricted. Ownership reads the
   network configuration loaded at startup, so restart after changing listener
-  `external_urls`.
+  `external_urls`. Every grant runs this ownership check: token exchange,
+  ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
+  empty or lists the resource.
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.

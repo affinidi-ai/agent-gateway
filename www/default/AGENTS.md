@@ -111,6 +111,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Release per-user grants to Fabric callers** is the Managed Agent panel's
+  `managed-agent/PartnerGrantReleaseSection.tsx`, under a **Fabric Callers** label. It writes
+  `target.delegated_credentials_for_fabric_callers` and appears only when the Target is an HTTP
+  or HTTPS URL and the surface has a Credential Delegation row; a save drops the field for any
+  other Target. It defaults to off, its explanation sits behind `FieldHelp`, and while on an
+  always-visible warning says a paired gateway that sends a person's own token gets that
+  person's grant. A variant carries it in `overrides.target`. Test ids:
+  `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -138,8 +146,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
-  ready: it saves, and callers get 503 until a save adds a Caller Context or turns Public access
-  on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
+  ready: it saves (unless it sends a Target credential, or has an `a2a-proxy://` Target, while
+  `credential_policy.target_source_auth` is `enforce`, which refuses the save with 400), and callers get 503 until a save adds a Caller
+  Context or turns Public access on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
   (`access-point/readiness.ts`) is the one copy of that rule, and the notice uses it. Every
   surface response carries a read-only `access_point_status`, which `toBackendSurface`
   (`src/api.ts`) leaves out of writes.

@@ -1470,12 +1470,7 @@ fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundP
                 "Refusing a Transit Point call that would pass the Fabric hop limit"
             );
             crate::audit::request_events::request_rejected(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: false,
-                },
+                &transit_audit_facts(ctx),
                 crate::audit::request_events::RejectionStage::Forward,
                 crate::audit::request_events::RejectionReason::FabricChainTooLong,
                 refusal.status_code().as_u16(),
@@ -1686,12 +1681,7 @@ async fn authenticate_transit_caller(
                 "Transit Point caller authentication failed"
             );
             crate::audit::request_events::auth_failed(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &ctx.surface.surface_id,
-                    channel_name: &ctx.surface.name,
-                    trace_id: Some(&ctx.request_id),
-                    via_fabric: false,
-                },
+                &transit_audit_facts(ctx),
                 crate::audit::request_events::source_auth_scheme(&config),
                 crate::audit::request_events::source_auth_reason(&error),
                 true,
@@ -2500,12 +2490,7 @@ async fn step_extract_protocol_context_with_versions(
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &crate::audit::request_events::RequestFacts {
-                surface_id: &ctx.surface.surface_id,
-                channel_name: &ctx.surface.name,
-                trace_id: Some(&ctx.request_id),
-                via_fabric: false,
-            },
+            &transit_audit_facts(ctx),
             None,
         )
         .await
@@ -2721,15 +2706,51 @@ pub(crate) fn should_forward_outbound_request_header(
     true
 }
 
-/// Whether `name` is a header a proxy sets to tell the next hop who connected to
-/// it, for which host and over what: `Forwarded`, `X-Real-IP` and every
-/// `X-Forwarded-*` header, also spelled with `_` for `-`, which CGI-style servers
-/// read as the same header.
+/// The proxy and CDN headers, other than `X-Forwarded-*`, that claim the client's
+/// address, the host or path it asked for or the scheme it used.
+const PROXY_FORWARDING_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-real-ip",
+    "true-client-ip",
+    "client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "cf-connecting-ip",
+    "cf-connecting-ipv6",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "x-arr-clientip",
+    "x-azure-clientip",
+    "x-proxyuser-ip",
+    "x-original-forwarded-for",
+    "proxy-client-ip",
+    "wl-proxy-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "x-envoy-external-address",
+    "cloudfront-viewer-address",
+    "x-original-host",
+    "x-host",
+    "x-original-url",
+    "x-original-uri",
+    "x-rewrite-url",
+    "x-scheme",
+    "x-url-scheme",
+    "x-arr-ssl",
+    "front-end-https",
+];
+
+/// Whether `name` is a header a proxy or CDN sets to tell the next hop who
+/// connected to it, for which host and path and over what: [`PROXY_FORWARDING_HEADERS`]
+/// and every `X-Forwarded-*` header, also spelled with `_` for `-`, which
+/// CGI-style servers read as the same header.
 fn is_proxy_forwarding_header(name: &str) -> bool {
     const X_FORWARDED: &str = "x-forwarded-";
     let name = name.replace('_', "-");
-    name.eq_ignore_ascii_case("forwarded")
-        || name.eq_ignore_ascii_case("x-real-ip")
+    PROXY_FORWARDING_HEADERS
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
         || name
             .get(..X_FORWARDED.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(X_FORWARDED))
@@ -2754,12 +2775,7 @@ async fn transit_request_headers(
     let mut headers = HeaderMap::new();
     for (name, value) in &ctx.original_headers {
         if should_forward_outbound_request_header(name.as_str(), mapping)
-            && !credential_headers
-                .iter()
-                .any(|credential| {
-                    name.as_str()
-                        .eq_ignore_ascii_case(credential)
-                })
+            && !crate::proxy::handler::is_credential_header(name.as_str(), &credential_headers)
         {
             headers.append(name.clone(), value.clone());
         }
@@ -2791,12 +2807,11 @@ fn transit_credential_header_names(ctx: &OutboundPipelineContext) -> Vec<String>
         .surface
         .transit_point_outbound_credentials(&ctx.virtual_channel)
         .into_iter()
-        .filter_map(|binding| match binding.inject_as {
-            crate::config::types::CredentialInjection::BearerHeader => {
-                Some(axum::http::header::AUTHORIZATION.to_string())
-            }
-            crate::config::types::CredentialInjection::CustomHeader { name, .. } => Some(name),
-            crate::config::types::CredentialInjection::Meta { .. } => None,
+        .filter_map(|binding| {
+            binding
+                .inject_as
+                .header_name()
+                .map(str::to_string)
         });
     target_auth
         .into_iter()
@@ -2829,24 +2844,49 @@ async fn transit_target_auth_header(
             state
                 .delegation_vault_store
                 .as_ref(),
-        ),
+        )
+        .for_transit_point(&ctx.virtual_channel),
         &ctx.surface.name,
         transit_caller_assertion(ctx),
     )
     .await
     {
-        Ok(Some((name, value))) => Ok(Some((
-            axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| target_auth_unavailable(ctx))?,
-            axum::http::HeaderValue::from_str(&value).map_err(|_| target_auth_unavailable(ctx))?,
-        ))),
+        Ok(Some((name, value))) => {
+            match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(&value)) {
+                (Ok(name), Ok(value)) => Ok(Some((name, value))),
+                _ => {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                    Err(target_auth_unavailable(ctx))
+                }
+            }
+        }
         Ok(None) => Ok(None),
         Err(error) => {
             warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
+            crate::proxy::handler::record_target_auth_failure(
+                &transit_audit_facts(ctx),
+                Some(&ctx.virtual_channel.alias),
+                target_auth,
+                &error,
+            );
             if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
                 return Err(target_auth_unavailable(ctx));
             }
             Ok(None)
         }
+    }
+}
+
+fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_events::RequestFacts<'_> {
+    crate::audit::request_events::RequestFacts {
+        surface_id: &ctx.surface.surface_id,
+        channel_name: &ctx.surface.name,
+        trace_id: Some(&ctx.request_id),
+        via_fabric: false,
     }
 }
 
@@ -3132,26 +3172,147 @@ async fn step_inject_custom_metadata(
     Ok(())
 }
 
-/// Resolve the agent card fetch URL for a transit point.
-///
-/// For `fabric://` targets the endpoint is a virtual routing address (not
-/// HTTP-resolvable). This helper resolves the URL from the transit point's
-/// own `listen_address` + `listen_path` instead — hitting the gateway
-/// itself on a public path (bypasses auth) and proxying through to the
-/// real upstream agent card. For non-fabric targets the endpoint and
-/// optional `agent_card_path` are returned as-is.
-fn resolve_agent_card_url(tp: &TransitPoint) -> (String, Option<String>) {
-    if tp
-        .target_endpoint
+/// Fetch the agent card of the routed Transit Point's target: over Fabric for
+/// a `fabric://` target, never through the Transit Point's own listener, whose
+/// caller authentication the gateway's own read would not pass.
+fn fetch_target_agent_card<'s>(
+    state: &'s OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+) -> impl std::future::Future<Output = Option<serde_json::Value>> + Send + 's {
+    let (target, agent_card_path) = agent_card_location(&ctx.virtual_channel);
+    let request_id = ctx.request_id.clone();
+    let timeout = resolve_outbound_timeout(ctx);
+    let fabric_read = target
         .starts_with("fabric://")
-    {
-        if let (Some(addr), Some(path)) = (tp.listen_address.as_deref(), tp.listen_path.as_deref()) {
-            (format!("{}{}", addr.trim_end_matches('/'), path), None)
-        } else {
-            (tp.target_endpoint.clone(), tp.agent_card_path.clone())
+        .then(|| FabricCardRead {
+            target: target.clone(),
+            request_id: request_id.clone(),
+            log_label: ctx.surface.name.clone(),
+            timeout,
+            max_bytes: state.max_response_bytes,
+        });
+    let limits = agent_card_limits(state, ctx);
+    async move {
+        match fabric_read {
+            Some(read) => {
+                read.fetch(&state.listener_manager)
+                    .await
+            }
+            None => fetch_agent_card(&target, agent_card_path.as_deref(), &request_id, timeout, limits).await,
         }
-    } else {
-        (tp.target_endpoint.clone(), tp.agent_card_path.clone())
+    }
+}
+
+/// Where a Transit Point's target card is read, which also keys the card
+/// cache: the target and its `agent_card_path`, which does not apply to a
+/// `fabric://` target.
+fn agent_card_location(tp: &TransitPoint) -> (String, Option<String>) {
+    let path = tp
+        .agent_card_path
+        .clone()
+        .filter(|_| {
+            !tp.target_endpoint
+                .starts_with("fabric://")
+        });
+    (tp.target_endpoint.clone(), path)
+}
+
+/// The paths a `fabric://` target's card is asked for, in order: discovery
+/// paths, which the remote gateway answers as public card reads, with its
+/// surface's card and identity credential. Any other path, such as a Transit
+/// Point's `agent_card_path`, is an ordinary request through its Access Point,
+/// so it is not used.
+const FABRIC_AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
+
+/// The gateway's own read of a `fabric://` target's agent card. It is a
+/// discovery read, so it counts as the first Fabric crossing and has a trace id
+/// of its own, as a discovery read through the Transit Point does.
+struct FabricCardRead {
+    target: String,
+    request_id: String,
+    log_label: String,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+}
+
+impl FabricCardRead {
+    async fn fetch(
+        &self,
+        listener_manager: &Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
+    ) -> Option<serde_json::Value> {
+        use crate::proxy::fabric_forward::{FabricForwardRequest, forward_via_fabric};
+
+        let trace_id = Uuid::new_v4().to_string();
+        let send = |path: &'static str| {
+            let mut headers = std::collections::HashMap::new();
+            crate::proxy::fabric_hops::set_fabric_hops(&mut headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
+            forward_via_fabric(
+                listener_manager,
+                FabricForwardRequest {
+                    fabric_target: &self.target,
+                    method: &Method::GET,
+                    path,
+                    headers,
+                    body: Bytes::new(),
+                    timeout: self.timeout,
+                    trace_id: &trace_id,
+                    log_label: &self.log_label,
+                },
+            )
+        };
+        self.fetch_with(&trace_id, send)
+            .await
+    }
+
+    /// The first JSON card within bounds that a path answers with `2xx`; a
+    /// transport failure ends the read.
+    async fn fetch_with<F, Fut>(
+        &self,
+        trace_id: &str,
+        send: F,
+    ) -> Option<serde_json::Value>
+    where
+        F: Fn(&'static str) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    crate::proxy::fabric_forward::FabricForwardResponse,
+                    crate::proxy::fabric_forward::FabricForwardError,
+                >,
+            >,
+    {
+        for path in FABRIC_AGENT_CARD_PATHS {
+            match send(path).await {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    if response.body.len() > self.max_bytes {
+                        debug!(request_id = %self.request_id, card_trace_id = %trace_id, path, "Fabric agent card exceeded its bounds, trying next");
+                    } else if let Ok(card) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+                        return Some(card);
+                    } else {
+                        debug!(request_id = %self.request_id, card_trace_id = %trace_id, path, "Fabric agent card is not JSON, trying next");
+                    }
+                }
+                Ok(response) => {
+                    debug!(
+                        request_id = %self.request_id,
+                        card_trace_id = %trace_id,
+                        status = response.status,
+                        path,
+                        "Fabric agent card read returned non-success status, trying next"
+                    );
+                }
+                Err(error) => {
+                    debug!(request_id = %self.request_id, card_trace_id = %trace_id, error = %error, path, "Failed to read agent card over Fabric");
+                    break;
+                }
+            }
+        }
+        warn!(
+            request_id = %self.request_id,
+            card_trace_id = %trace_id,
+            target = %self.target,
+            "Failed to fetch agent card over Fabric"
+        );
+        None
     }
 }
 
@@ -3267,35 +3428,23 @@ async fn step_collect_trust_context(
         return Ok(());
     }
 
-    let (target_url, agent_card_path) = resolve_agent_card_url(&ctx.virtual_channel);
+    let (target_url, agent_card_path) = agent_card_location(&ctx.virtual_channel);
 
     // Consult the process-global card cache before touching the network.
-    let cached = crate::proxy::agent_card_cache::lookup(&target_url, agent_card_path.as_deref());
-    let card_json = match cached {
+    let card_json = match crate::proxy::agent_card_cache::lookup(&target_url, agent_card_path.as_deref()) {
         Some(payload) => payload,
         None => {
-            let fetched = fetch_agent_card(
-                &target_url,
-                agent_card_path.as_deref(),
-                &ctx.request_id,
-                resolve_outbound_timeout(ctx),
-                agent_card_limits(state, ctx),
-            )
-            .await;
+            let fetched = fetch_target_agent_card(state, ctx).await;
             crate::proxy::agent_card_cache::insert(&target_url, agent_card_path.as_deref(), fetched.clone());
             fetched
         }
     };
-
-    let card_json = match card_json {
-        Some(card) => card,
-        None => {
-            // Trust-Check-only path: leave target_agent_context unpopulated
-            // and let `step_trust_check` synthesize AGENT_CARD_UNAVAILABLE
-            // results per configured element.
-            ctx.target_agent_card_unavailable = true;
-            return Ok(());
-        }
+    let Some(card_json) = card_json else {
+        // Trust-Check-only path: leave target_agent_context unpopulated
+        // and let `step_trust_check` synthesize AGENT_CARD_UNAVAILABLE
+        // results per configured element.
+        ctx.target_agent_card_unavailable = true;
+        return Ok(());
     };
 
     // Build AgentContext from body + optional agent card + trust registry.
@@ -3928,16 +4077,11 @@ async fn step_transit_point_opa_policy(
             .target_agent_context
             .is_none()
     {
-        let (resolved_url, resolved_card_path) = resolve_agent_card_url(&ctx.virtual_channel);
-
-        let card_json = fetch_agent_card(
-            &resolved_url,
-            resolved_card_path.as_deref(),
-            &ctx.request_id,
-            resolve_outbound_timeout(ctx),
-            agent_card_limits(state, ctx),
-        )
-        .await;
+        let card_json = if ctx.target_agent_card_unavailable {
+            None
+        } else {
+            fetch_target_agent_card(state, ctx).await
+        };
 
         let body_json: Option<serde_json::Value> = ctx
             .body_bytes
@@ -5036,12 +5180,7 @@ fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
          partner - refusing the request"
     );
     crate::audit::request_events::request_rejected(
-        &crate::audit::request_events::RequestFacts {
-            surface_id: &ctx.surface.surface_id,
-            channel_name: &ctx.surface.name,
-            trace_id: Some(&ctx.request_id),
-            via_fabric: false,
-        },
+        &transit_audit_facts(ctx),
         crate::audit::request_events::RejectionStage::Admission,
         crate::audit::request_events::RejectionReason::ConsentNotAvailableForPartners,
         refusal.status_code().as_u16(),
@@ -5796,6 +5935,26 @@ async fn fabric_forward_headers(
                 })
             {
                 warn!(request_id = %ctx.request_id, header = %key, "Target authentication header is not a string Fabric can carry - refusing the request");
+                if let Some(target_auth) = ctx
+                    .virtual_channel
+                    .target_auth
+                    .as_ref()
+                    .filter(|target_auth| {
+                        target_auth
+                            .method
+                            .header_name()
+                            .is_some_and(|name| {
+                                key.as_str()
+                                    .eq_ignore_ascii_case(name)
+                            })
+                    })
+                {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                }
                 return Err(target_auth_unavailable(ctx));
             }
             continue;
@@ -5851,6 +6010,20 @@ async fn step_forward_request_fabric(
     } else {
         format!("/{}", remainder)
     };
+    if let Some(target_auth) = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+        && !crate::proxy::paths::appended_path_stays_below_base(&path)
+    {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
+        crate::proxy::handler::record_target_auth_refusal(
+            &transit_audit_facts(ctx),
+            Some(&ctx.virtual_channel.alias),
+            target_auth,
+        );
+        return Err(target_auth_unavailable(ctx));
+    }
 
     let is_modern = matches!(
         ctx.mcp_classification
@@ -5997,6 +6170,35 @@ async fn step_forward_request_http(
             .agent_card_path
             .as_deref(),
     );
+
+    if ctx
+        .virtual_channel
+        .target_auth
+        .is_some()
+        && !crate::proxy::paths::is_target_credential_destination(
+            &ctx.virtual_channel
+                .target_endpoint,
+            ctx.original_method.as_str(),
+            &target_url,
+            ctx.virtual_channel
+                .agent_card_path
+                .as_deref(),
+        )
+    {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
+        if let Some(target_auth) = ctx
+            .virtual_channel
+            .target_auth
+            .as_ref()
+        {
+            crate::proxy::handler::record_target_auth_refusal(
+                &transit_audit_facts(ctx),
+                Some(&ctx.virtual_channel.alias),
+                target_auth,
+            );
+        }
+        return Err(target_auth_unavailable(ctx));
+    }
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
     // fails closed on an unparseable URL, resolves DNS once to block a host that
@@ -10002,6 +10204,7 @@ mod tests {
                         http_status,
                         rpc_error_code,
                         requested_variant,
+                        ..
                     } => Some((*stage, *reason, *http_status, *rpc_error_code, requested_variant.clone())),
                     _ => None,
                 })
@@ -11769,11 +11972,56 @@ mod tests {
             "X-Forwarded_For",
             "x_forwarded_host",
             "X-Real_IP",
+            "True-Client-IP",
+            "true_client_ip",
+            "Client-IP",
+            "X-Client-IP",
+            "X-Cluster-Client-IP",
+            "CF-Connecting-IP",
+            "CF-Connecting-IPv6",
+            "Fastly-Client-IP",
+            "X-Original-Forwarded-For",
+            "X-Original-Host",
+            "x_original_host",
+            "X-Host",
+            "X-Url-Scheme",
+            "Front-End-Https",
+            "Fly-Client-IP",
+            "X-ARR-ClientIP",
+            "X-Azure-ClientIP",
+            "X-ProxyUser-Ip",
+            "X-Original-URL",
+            "x_original_url",
+            "X-Original-URI",
+            "X-Rewrite-URL",
+            "X-Scheme",
+            "X-ARR-SSL",
+            "Proxy-Client-IP",
+            "WL-Proxy-Client-IP",
+            "wl_proxy_client_ip",
+            "X-Originating-IP",
+            "X-Remote-IP",
+            "X-Remote-Addr",
+            "X-Envoy-External-Address",
+            "CloudFront-Viewer-Address",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in ["x-forwarded", "x-forwardedfor", "forwarded-for", "x-real-ip-note", "x-vendor-forwarded-for"]
-        {
+        for forwarded in [
+            "x-forwarded",
+            "x-forwardedfor",
+            "forwarded-for",
+            "x-real-ip-note",
+            "x-vendor-forwarded-for",
+            "x-client-ip-hint",
+            "x-hostname",
+            "x-original-hosts",
+            "client-ipaddress",
+            "x-original-urls",
+            "x-schemes",
+            "x-remote-address",
+            "x-envoy-external-addresses",
+        ] {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
     }
@@ -15407,6 +15655,242 @@ mod tests {
                 .as_ref()
                 .map(|f| f.code),
             Some(crate::trust_registry_verification::TARGET_AGENT_IDENTITY_UNAVAILABLE)
+        );
+    }
+
+    /// The card of a `fabric://` Transit Point's target is read over Fabric,
+    /// never through the Transit Point's own listener, which may require a
+    /// caller credential the gateway does not hold.
+    #[tokio::test]
+    async fn a_fabric_transit_points_trust_check_never_reads_the_card_through_the_transit_point_itself() {
+        let (own_listener, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "partner".to_string();
+        ctx.virtual_channel
+            .target_endpoint = format!("fabric://partner-gateway/{}", Uuid::new_v4());
+        ctx.virtual_channel
+            .agent_card_path = Some("/cards/agent.json".to_string());
+        ctx.virtual_channel
+            .listen_address = Some(own_listener);
+        ctx.virtual_channel
+            .listen_path = Some("/partner".to_string());
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("partner-a")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the card must not be read through the Transit Point's own listener"
+        );
+        assert!(ctx.target_agent_card_unavailable, "with no Fabric connection the card is unavailable");
+    }
+
+    /// A card is read at, and cached under, the target and its
+    /// `agent_card_path`, except that the path does not apply over Fabric.
+    #[test]
+    fn a_card_location_keeps_the_agent_card_path_except_over_fabric() {
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .agent_card_path = Some("/cards/agent.json".to_string());
+        for (target, path) in [
+            ("https://partner.example/a2a", Some("/cards/agent.json".to_string())),
+            ("fabric://partner-gateway/partner-surface", None),
+        ] {
+            ctx.virtual_channel
+                .target_endpoint = target.to_string();
+            assert_eq!(agent_card_location(&ctx.virtual_channel), (target.to_string(), path), "{target}");
+        }
+    }
+
+    fn fabric_card_read(max_bytes: usize) -> FabricCardRead {
+        FabricCardRead {
+            target: "fabric://partner-gateway/partner-surface".to_string(),
+            request_id: "card-read-test".to_string(),
+            log_label: "card-read-test".to_string(),
+            timeout: std::time::Duration::from_secs(1),
+            max_bytes,
+        }
+    }
+
+    /// What one Fabric card read asks for and returns, given the remote
+    /// gateway's answer at each well-known path in turn.
+    async fn read_fabric_card(
+        max_bytes: usize,
+        answers: Vec<Result<(u16, &'static str), ()>>,
+    ) -> (Option<serde_json::Value>, Vec<&'static str>) {
+        use crate::proxy::fabric_forward::{FabricForwardError, FabricForwardResponse};
+        let asked = std::sync::Mutex::new(Vec::new());
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        let card = fabric_card_read(max_bytes)
+            .fetch_with("trace", |path| {
+                asked
+                    .lock()
+                    .unwrap()
+                    .push(path);
+                let answer = answers
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("no more answers");
+                async move {
+                    answer
+                        .map(|(status, body)| FabricForwardResponse {
+                            status,
+                            headers: Default::default(),
+                            body: body.as_bytes().to_vec(),
+                        })
+                        .map_err(|()| FabricForwardError::GatewayNotConnected("partner-gateway".to_string()))
+                }
+            })
+            .await;
+        (card, asked.into_inner().unwrap())
+    }
+
+    /// A case name, the size bound, the remote's answers, the card read and the
+    /// paths asked for.
+    type FabricCardCase =
+        (&'static str, usize, Vec<Result<(u16, &'static str), ()>>, Option<serde_json::Value>, Vec<&'static str>);
+
+    #[tokio::test]
+    async fn a_fabric_card_read_takes_the_first_good_card_and_stops_on_a_transport_failure() {
+        const CARD: &str = r#"{"name":"partner"}"#;
+        const BOTH: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
+        let cases: Vec<FabricCardCase> = vec![
+            ("card at the first path", 1024, vec![Ok((200, CARD))], Some(json!({"name": "partner"})), vec![BOTH[0]]),
+            (
+                "not found, then the card",
+                1024,
+                vec![Ok((404, "")), Ok((200, CARD))],
+                Some(json!({"name": "partner"})),
+                BOTH.to_vec(),
+            ),
+            (
+                "oversized, then the card",
+                20,
+                vec![Ok((200, r#"{"name":"far too large a card"}"#)), Ok((200, CARD))],
+                Some(json!({"name": "partner"})),
+                BOTH.to_vec(),
+            ),
+            (
+                "not JSON, then the card",
+                1024,
+                vec![Ok((200, "<html>")), Ok((200, CARD))],
+                Some(json!({"name": "partner"})),
+                BOTH.to_vec(),
+            ),
+            ("refused at both paths", 1024, vec![Ok((502, "")), Ok((404, ""))], None, BOTH.to_vec()),
+            ("transport failure", 1024, vec![Err(())], None, vec![BOTH[0]]),
+        ];
+        for (case, max_bytes, answers, expected, expected_asked) in cases {
+            let (card, asked) = read_fabric_card(max_bytes, answers).await;
+            assert_eq!(card, expected, "{case}");
+            assert_eq!(asked, expected_asked, "{case}");
+        }
+    }
+
+    /// A Transit Point policy that needs agent context reads a `fabric://`
+    /// target's card over Fabric too, not through the Transit Point itself.
+    #[tokio::test]
+    async fn a_fabric_transit_points_policy_never_reads_the_card_through_the_transit_point_itself() {
+        let (own_listener, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = "fabric://partner-gateway/partner-surface".to_string();
+        ctx.virtual_channel
+            .listen_address = Some(own_listener);
+        ctx.virtual_channel
+            .listen_path = Some("/partner".to_string());
+        require_agent_context(&mut ctx);
+
+        let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the card must not be read through the Transit Point's own listener"
+        );
+        assert!(
+            ctx.target_agent_context
+                .is_some(),
+            "agent context is still built without the card"
+        );
+    }
+
+    fn require_agent_context(ctx: &mut OutboundPipelineContext) {
+        ctx.virtual_channel.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: "needs-agent-context".to_string(),
+            require_agent_context: true,
+        });
+    }
+
+    /// A Transit Point policy that needs agent context reads the card when no
+    /// earlier stage did, and does not read it again when this request
+    /// already found it unavailable.
+    #[tokio::test]
+    async fn a_transit_point_policy_reads_the_card_once_per_request() {
+        for (already_unavailable, expected_reads) in [(false, 1), (true, 0)] {
+            let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+            let state = test_outbound_state();
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .target_endpoint = endpoint;
+            ctx.target_agent_card_unavailable = already_unavailable;
+            require_agent_context(&mut ctx);
+
+            let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::SeqCst),
+                expected_reads,
+                "card already unavailable: {already_unavailable}"
+            );
+            assert!(
+                ctx.target_agent_context
+                    .is_some()
+            );
+        }
+    }
+
+    /// An `http(s)` Transit Point's Trust Check reads the card at its
+    /// `agent_card_path` on the target's origin.
+    #[tokio::test]
+    async fn an_http_transit_points_trust_check_reads_the_card_at_its_agent_card_path() {
+        use axum::Router;
+        use axum::routing::get;
+        let app = Router::new().route(
+            "/cards/agent.json",
+            get(|| async { ([("Content-Type", "application/json")], r#"{"name":"custom-path-card"}"#) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        let _server = TrustCheckTestServer(tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        }));
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = format!("http://{addr}/base");
+        ctx.virtual_channel
+            .agent_card_path = Some("cards/agent.json".to_string());
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("custom-path")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert!(!ctx.target_agent_card_unavailable, "the card is read at the custom path");
+        assert!(
+            ctx.target_agent_context
+                .is_some()
         );
     }
 
@@ -20157,6 +20641,7 @@ mod tests {
                         http_status,
                         rpc_error_code,
                         requested_variant: None,
+                        ..
                     } => Some((
                         stage,
                         reason,
@@ -20327,6 +20812,7 @@ mod tests {
             ("x-forwarded-for", "203.0.113.9"),
             ("x_forwarded_host", "agent.example"),
             ("forwarded", "for=203.0.113.9"),
+            ("true-client-ip", "203.0.113.9"),
         ] {
             ctx.original_headers
                 .insert(name, HeaderValue::from_static(value));
@@ -20460,6 +20946,232 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_credential_that_cannot_be_read_is_recorded_once_with_what_the_fallback_did() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (fallback, refused, outcome) in
+            [("reject", true, TargetAuthOutcome::Rejected), ("passthrough", false, TargetAuthOutcome::Passthrough)]
+        {
+            let mut ctx = credential_header_case(
+                &state,
+                None,
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/message/send",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_auth = Some(
+                serde_json::from_value(json!({
+                    "method": {"static_secret": {"secret_id": "absent", "header_name": "X-Vendor-Key"}},
+                    "fallback": fallback
+                }))
+                .unwrap(),
+            );
+            let request_id = ctx.request_id.clone();
+            let (sent, events) = crate::audit::producer::capture(transit_request_headers(&state, &mut ctx)).await;
+            assert_eq!(sent.is_err(), refused, "{fallback}");
+            let records: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        target_auth,
+                        ..
+                    } => Some((
+                        *stage,
+                        *reason,
+                        *http_status,
+                        target_auth
+                            .as_ref()
+                            .map(|detail| detail.outcome),
+                        event.trace_id.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                records,
+                vec![(
+                    RejectionStage::Forward,
+                    RejectionReason::TargetAuthFailed,
+                    refused.then_some(502),
+                    Some(outcome),
+                    Some(request_id)
+                )],
+                "{fallback}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_request_outside_its_base_path_is_recorded_as_rejected_on_either_leg_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (fallback, endpoint) in [
+            ("reject", "http://127.0.0.1:9/base"),
+            ("passthrough", "http://127.0.0.1:9/base"),
+            ("reject", "fabric://peer-gateway/partner"),
+            ("passthrough", "fabric://peer-gateway/partner"),
+        ] {
+            let mut ctx = credential_header_case(
+                &state,
+                None,
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_endpoint = endpoint.to_string();
+            ctx.virtual_channel
+                .target_auth = Some(
+                serde_json::from_value(json!({
+                    "method": {"static_secret": {"secret_id": "target-key", "header_name": "X-Vendor-Key"}},
+                    "fallback": fallback
+                }))
+                .unwrap(),
+            );
+            let alias = ctx
+                .virtual_channel
+                .alias
+                .clone();
+            let (refused, events) = crate::audit::producer::capture(async {
+                if endpoint.starts_with("fabric://") {
+                    step_forward_request_fabric(&state, &mut ctx)
+                        .await
+                        .is_err()
+                } else {
+                    step_forward_request_http(&state, &mut ctx)
+                        .await
+                        .is_err()
+                }
+            })
+            .await;
+            assert!(refused, "{fallback} {endpoint}");
+            let records: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(records, vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_credential_that_cannot_be_sent_as_a_header_is_recorded_as_rejected_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let records = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| -> Vec<_> {
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for fabric in [false, true] {
+            for fallback in ["reject", "passthrough"] {
+                let header_format = if fabric {
+                    "Key {value}\u{e9}"
+                } else {
+                    "Key {value}\u{7f}"
+                };
+                let mut ctx = credential_header_case(
+                    &state,
+                    Some("X-Vendor-Key"),
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/message/send",
+                )
+                .await;
+                if fabric {
+                    ctx.virtual_channel
+                        .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+                }
+                ctx.virtual_channel
+                    .target_auth = Some(
+                    serde_json::from_value(json!({
+                        "method": {"static_secret": {
+                            "secret_id": "target-key", "header_name": "X-Vendor-Key", "header_format": header_format}},
+                        "fallback": fallback
+                    }))
+                    .unwrap(),
+                );
+                let alias = ctx
+                    .virtual_channel
+                    .alias
+                    .clone();
+                let (refused, events) = crate::audit::producer::capture(async {
+                    if fabric {
+                        fabric_forward_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    } else {
+                        transit_request_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    }
+                })
+                .await;
+                assert!(refused, "{fallback} fabric={fabric}");
+                assert_eq!(
+                    records(&events),
+                    vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))],
+                    "{fallback} fabric={fabric}"
+                );
+            }
+
+            let mut ctx = credential_header_case(
+                &state,
+                Some("X-Vendor-Key"),
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/message/send",
+            )
+            .await;
+            if fabric {
+                ctx.virtual_channel
+                    .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            }
+            let (sent, events) = crate::audit::producer::capture(async {
+                if fabric {
+                    fabric_forward_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                } else {
+                    transit_request_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            assert!(sent, "fabric={fabric}");
+            assert_eq!(records(&events), vec![], "a credential that can be sent writes no record, fabric={fabric}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20655,7 +21367,7 @@ mod tests {
             let sent = received.last().unwrap();
             assert_eq!(header_values(sent, "authorization"), authorization, "{alias}: {sent:?}");
             assert_eq!(header_values(sent, "x-vendor-key"), vendor_key, "{alias}: {sent:?}");
-            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded"] {
+            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded", "true-client-ip"] {
                 assert!(header_values(sent, withheld).is_empty(), "{alias} sent {withheld}: {sent:?}");
             }
         }

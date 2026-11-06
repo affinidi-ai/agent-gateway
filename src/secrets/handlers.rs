@@ -3,12 +3,12 @@
 use super::{CreateSecretRequest, SecretListItem, SecretsStore, UpdateSecretRequest};
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::integrations::definitions::DefinitionStores;
@@ -256,15 +256,32 @@ pub async fn update_secret(
     }
 }
 
-/// Delete a secret, unless an integration endpoint references it
+const SECRET_IN_USE: &str = "The secret is in use; remove its references first, or delete it with force=true";
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteSecretQuery {
+    /// Delete the secret although surfaces, credential providers, A2A proxies or STS clients
+    /// still reference it. An integration endpoint that references it still blocks the delete.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Delete a secret, unless an integration endpoint references it, or, without `force`,
+/// another record does
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_secret(
     State(store): State<Arc<dyn SecretsStore>>,
     Extension(notification_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(secrets_cache): Extension<Option<crate::a2a::auth::SecretsCache>>,
     Extension(definitions): Extension<Option<Arc<DefinitionStores>>>,
+    Extension(references): Extension<crate::credential_providers::references::ReferenceStores>,
+    Extension(rbac): Extension<Option<crate::auth_manager::middleware::RbacGuard>>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteSecretQuery>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<crate::auth_manager::middleware::AuthGuardOk>>,
+    pat: Option<Extension<PatContext>>,
 ) -> impl IntoResponse {
     let secret = match store.get(&id).await {
         Ok(Some(secret)) => secret,
@@ -307,9 +324,54 @@ pub async fn delete_secret(
             }
         }
     }
+    let bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+    let referrers = match references
+        .referrers_of_secret(&secret.secret_id)
+        .await
+    {
+        Ok(referrers) => referrers,
+        Err(e) => {
+            error!("Failed to find the records using secret {}: {}", id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+        }
+    };
+    if !referrers.is_empty() {
+        if !query.force {
+            let viewable = crate::credential_providers::references::ViewableKinds::of_caller(
+                rbac.as_ref(),
+                caller
+                    .as_ref()
+                    .map(|Extension(caller)| caller),
+                pat.as_ref()
+                    .map(|Extension(pat)| pat),
+            )
+            .await;
+            return crate::credential_providers::references::conflict_response(
+                SECRET_IN_USE,
+                &referrers,
+                &viewable,
+                tenant_context(&context),
+                resource_scope(&scope),
+            );
+        }
+        let referrer_ids: Vec<&str> = referrers
+            .iter()
+            .map(|referrer| referrer.id.as_str())
+            .collect();
+        warn!(
+            secret_id = %secret.secret_id,
+            referrers = ?referrer_ids,
+            "Secret deleted with force while still referenced"
+        );
+    }
 
-    match store.delete(&id).await {
+    let deleted = store.delete(&id).await;
+    drop(bindings);
+    match deleted {
         Ok(_) => {
+            if query.force {
+                crate::audit::secret_force_deletes::secret_force_deleted(&secret.secret_id, &referrers);
+            }
             let trigger_secret = crate::integrations::secrets_integration_triggers::Secret {
                 id: secret.id.clone(),
                 name: secret.name.clone(),
@@ -636,9 +698,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(Default::default()),
+            Extension(None),
             Path("internal-1".to_string()),
+            Query(DeleteSecretQuery::default()),
             tenant_a(),
             scope,
+            None,
+            None,
         )
         .await
         .into_response();
@@ -760,18 +827,331 @@ mod tests {
         store: Arc<dyn SecretsStore>,
         definitions: Arc<DefinitionStores>,
     ) -> (StatusCode, String) {
+        delete_with(store, Some(definitions), Default::default(), None, false).await
+    }
+
+    async fn delete_with(
+        store: Arc<dyn SecretsStore>,
+        definitions: Option<Arc<DefinitionStores>>,
+        references: crate::credential_providers::references::ReferenceStores,
+        context: Option<Extension<PatTenantContext>>,
+        force: bool,
+    ) -> (StatusCode, String) {
+        delete_as(store, definitions, references, context, force, None).await
+    }
+
+    /// Deletes as an administrator, through an access token limited to `scopes` if given.
+    async fn delete_as(
+        store: Arc<dyn SecretsStore>,
+        definitions: Option<Arc<DefinitionStores>>,
+        references: crate::credential_providers::references::ReferenceStores,
+        context: Option<Extension<PatTenantContext>>,
+        force: bool,
+        scopes: Option<Vec<&str>>,
+    ) -> (StatusCode, String) {
+        let admin = crate::credential_providers::references::test_support::administrator().await;
         let response = delete_secret(
             State(store),
             Extension(None),
             Extension(None),
-            Extension(Some(definitions)),
+            Extension(definitions),
+            Extension(references),
+            Extension(Some(admin.rbac.clone())),
             Path("internal-1".to_string()),
+            Query(DeleteSecretQuery { force }),
+            context,
             None,
-            None,
+            Some(Extension(admin.caller.clone())),
+            scopes.map(|scopes| {
+                Extension(PatContext(Some(
+                    scopes
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                )))
+            }),
         )
         .await
         .into_response();
         status_and_body(response).await
+    }
+
+    /// Stores in which a credential provider of `provider_tenant` and a surface of
+    /// `surface_tenant` reference `billing_api_key`.
+    async fn referenced_by_a_provider_and_a_surface(
+        dir: &std::path::Path,
+        provider_tenant: Option<&str>,
+        surface_tenant: Option<&str>,
+    ) -> crate::credential_providers::references::ReferenceStores {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        let providers = FileSystemCredentialProviderStore::new(dir.join("providers"))
+            .await
+            .expect("provider store");
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "billing-provider", "name": "Billing", "provider_id": "billing",
+                    "tenant_id": provider_tenant, "provider_type": "api_key",
+                    "api_key_secret_ref": "billing_api_key",
+                    "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+                }))
+                .expect("provider"),
+            )
+            .await
+            .expect("create provider");
+        let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(dir.join("surfaces"))
+            .await
+            .expect("surface store");
+        save_billing_surface(&surfaces, surface_tenant).await;
+        crate::credential_providers::references::ReferenceStores {
+            surfaces: Some(Arc::new(surfaces)),
+            credential_providers: Some(Arc::new(providers)),
+            ..Default::default()
+        }
+    }
+
+    /// Save a surface of `tenant` whose Target authentication sends `billing_api_key`.
+    async fn save_billing_surface(
+        surfaces: &dyn crate::surfaces::AgentSurfaceStore,
+        tenant: Option<&str>,
+    ) {
+        surfaces
+            .save(
+                &serde_json::from_value(serde_json::json!({
+                    "surface_id": "billing-surface", "name": "Billing surface", "tenant_id": tenant,
+                    "access_point": {"listen_address": "0.0.0.0:8443", "route": "/billing", "protocol": "a2a"},
+                    "target": {"endpoint": "https://billing.example", "auth": {"method": {"static_secret": {
+                        "secret_id": "billing_api_key", "header_name": "X-Api-Key"
+                    }}}}
+                }))
+                .expect("surface"),
+            )
+            .await
+            .expect("save surface");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_secret_waits_for_a_write_that_may_reference_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().join("surfaces"))
+                .await
+                .expect("surface store"),
+        );
+        let references = crate::credential_providers::references::ReferenceStores {
+            surfaces: Some(surfaces.clone()),
+            ..Default::default()
+        };
+        let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+        let delete = tokio::spawn(delete_with(recording.clone(), None, references, None, false));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!delete.is_finished(), "the delete waits for the write that holds the lock");
+        save_billing_surface(surfaces.as_ref(), None).await;
+        drop(writing);
+
+        let (status, body) = delete.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_other_records_reference_is_deleted_only_with_force() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+
+        let (status, body) = delete_with(recording.clone(), None, references.clone(), None, false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["message"], SECRET_IN_USE);
+        let mut listed: Vec<_> = body["references"]
+            .as_array()
+            .unwrap()
+            .clone();
+        listed.sort_by_key(|reference| reference["kind"].to_string());
+        assert_eq!(
+            listed,
+            vec![
+                serde_json::json!({"kind": "credential_provider", "id": "billing-provider", "name": "Billing"}),
+                serde_json::json!({"kind": "surface", "id": "billing-surface", "name": "Billing surface"}),
+            ]
+        );
+        assert_eq!(body["hidden_references"], 0);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let (status, _) = delete_with(recording.clone(), None, references, None, true).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_referrer_is_named_only_with_the_view_permission_of_its_kind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+
+        let (status, body) =
+            delete_as(recording.clone(), None, references.clone(), None, false, Some(vec!["secrets.delete"])).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["references"], serde_json::json!([]));
+        assert_eq!(body["hidden_references"], 2);
+
+        let (_, body) =
+            delete_as(recording, None, references, None, false, Some(vec!["secrets.delete", "surfaces.view"])).await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["references"],
+            serde_json::json!([{"kind": "surface", "id": "billing-surface", "name": "Billing surface"}])
+        );
+        assert_eq!(body["hidden_references"], 1);
+    }
+
+    async fn delete_recorded(
+        store: Arc<dyn SecretsStore>,
+        references: crate::credential_providers::references::ReferenceStores,
+        force: bool,
+    ) -> (StatusCode, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
+        let ((status, _), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("u-1"),
+            delete_with(store, None, references, None, force),
+        ))
+        .await;
+        (status, records)
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_of_a_secret_in_use_is_recorded_with_its_actor_and_referrers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+
+        let (status, records) = delete_recorded(recording_store(None), references, true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].event.is_vp_audit());
+        assert_eq!(crate::delegation_vault::audit::action_category(&records[0].event), "secret_force_deleted");
+        let written = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(
+            written["event"]["secret_force_deleted"],
+            serde_json::json!({
+                "actor": {"kind": "user", "id": "u-1"},
+                "secret_id": "billing_api_key",
+                "force": true,
+                "referrers": [
+                    {"kind": "credential_provider", "id": "billing-provider"},
+                    {"kind": "surface", "id": "billing-surface"},
+                ],
+            })
+        );
+        let text = written.to_string();
+        for hidden in [PLAINTEXT, "Billing surface", "Billing API key"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_of_a_secret_nothing_uses_is_recorded_without_referrers() {
+        let (status, records) = delete_recorded(recording_store(None), Default::default(), true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let written = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(written["event"]["secret_force_deleted"]["force"], true);
+        assert_eq!(written["event"]["secret_force_deleted"]["referrers"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_force_and_a_refused_forced_delete_record_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), None, None).await;
+        let (status, records) = delete_recorded(recording_store(None), references.clone(), false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(records.is_empty(), "{records:?}");
+
+        let (status, records) = delete_recorded(recording_store(None), Default::default(), false).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(records.is_empty(), "{records:?}");
+
+        let ((status, _), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("u-1"),
+            delete_with(
+                recording_store(None),
+                Some(endpoint_referencing(dir.path(), "billing_api_key").await),
+                references,
+                None,
+                true,
+            ),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[tokio::test]
+    async fn force_does_not_delete_a_secret_an_endpoint_references() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+        let (status, body) = delete_with(
+            recording.clone(),
+            Some(endpoint_referencing(dir.path(), "billing_api_key").await),
+            Default::default(),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("Ops webhook"), "{body}");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_sees_the_references_it_may_view_and_a_count_of_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(Some("tenant-a"));
+        let references = referenced_by_a_provider_and_a_surface(dir.path(), Some("tenant-a"), Some("tenant-b")).await;
+
+        let (status, body) = delete_with(recording.clone(), None, references, tenant_a(), false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["references"],
+            serde_json::json!([{"kind": "credential_provider", "id": "billing-provider", "name": "Billing"}])
+        );
+        assert_eq!(body["hidden_references"], 1);
+        assert!(
+            !body
+                .to_string()
+                .contains("billing-surface"),
+            "{body}"
+        );
+        assert!(
+            !body
+                .to_string()
+                .contains(PLAINTEXT),
+            "{body}"
+        );
     }
 
     #[tokio::test]

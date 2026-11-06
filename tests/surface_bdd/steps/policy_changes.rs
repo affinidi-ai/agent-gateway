@@ -31,7 +31,7 @@ fn definition(
 }
 
 /// The client of `operator`, or of the default operator when `None`.
-async fn client(
+pub(crate) async fn client(
     world: &mut SurfaceWorld,
     operator: Option<&str>,
 ) -> AdminApiClient {
@@ -156,7 +156,7 @@ async fn operator_deletes_policy(world: &mut SurfaceWorld) {
 }
 
 /// The user id of `operator` (the default operator when `None`), as the gateway records it.
-async fn user_id(
+pub(crate) async fn user_id(
     world: &mut SurfaceWorld,
     operator: Option<&str>,
 ) -> String {

@@ -293,7 +293,7 @@ endpoint URL.
 | `subject` | `credential_provider` or `surface` |
 | `id` | The provider's `id` or the surface's `surface_id` |
 | `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
-| `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
 A surface that derives a DID from an API Key Provider key it may not use, or whose key or
@@ -314,6 +314,14 @@ or provider that no longer exists is not reported.
 An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
 signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
 for this rule.
+A surface breaks `target_https` when its Target, or one of its Transit Points, sends a static secret
+or credential provider token to an endpoint that is not `https` (`http://`, `fabric://` and
+`a2a-proxy://` count as not https; a `proxy://` Target counts as its MCP proxy's `base_url`). It breaks `target_source_auth` when its Target sends a
+credential, or is an `a2a-proxy://` Target of an A2A or AP2 surface (its A2A proxy sends its
+Direct Line credential), and its Access Point has neither a source authentication method nor
+`mcp_http.authorization`, or a Transit Point sends one and requires no transit token and sets
+neither `mcp_http.authorization` nor its own `source_auth`. Both checks cover every surface
+variant as it resolves, and use the same predicates as the request path.
 
 ## Governance audit forwarding
 
@@ -332,6 +340,17 @@ next to any other events. Both take event names from the audit event catalog
 unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalog in order, each
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
+
+**Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
+delegated credential events name the agent half of the credential's vault key as `agent_did`.
+For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving
+surface's id (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
+record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp_tool_name`, with
+the caller the receiving surface verified as `caller` and the paired gateway that sent the
+request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
+`vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
+agent its presentation is for as `agent_did`.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
@@ -423,8 +442,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
     ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
     and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
-    binding applies, which a partner's request never gets); the peer is answered `403` with that
-    reason (see
+    binding applies and the view that serves the request does not release its Target's grants
+    to partners) and `consent_not_available_for_partners` (the caller has no grant for a
+    per-user binding that applies); the peer is answered `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
@@ -435,6 +455,31 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
+    `target_auth`) was not sent, because it could not be obtained (a secret or provider that
+    cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`
+    withheld it, its stored `header_name` or `header_format` breaks a header rule (an invalid
+    or reserved header name, or a format without exactly one `{value}` or with CR, LF or NUL;
+    `outcome` follows the `fallback`), the request would have carried it outside the Target
+    base path, or a Transit
+    Point's resolved credential cannot be sent as a header (the last two always `rejected`,
+    whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
+    Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
+    fetch and its preview. The record carries the request's trace id, except on the gateway's
+    own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
+    fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
+    trace id. The record carries `provider_id` for a credential provider and a
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
+    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `transit_point` names the Transit Point by alias when the credential was a Transit Point's
+    `target_auth` (absent for the Target), and
+    `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the
+    code itself when RFC 6749 section 5.2 or RFC 6750 section 3.1 registers it
+    (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`,
+    `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`), otherwise
+    `other`, so a token endpoint cannot write its own text into the record. A token, an
+    assertion, a secret, the token endpoint's body and its `error_description` are never
+    recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.
@@ -494,6 +539,32 @@ so a change joins to the decisions it causes. No record carries the Rego text, t
 or a request body. Writes made outside a management request (startup migrations, replication)
 record nothing, and neither do writes a configuration reload makes, though the reload is asked
 for through the management API: it is the gateway's own work, not the user's change.
+
+**Target authentication change events.** Raised by management API writes to a surface (group
+Auth); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-target-authentication-changes)
+for which writes.
+
+- `target_auth_changed`: the Target authentication of one leg was added, changed or removed, one
+  record per leg. `leg` is `target` or `transit_point`, with `transit_point_id` and
+  `transit_point` (its alias) for a Transit Point; `surface_variant` is the variant's alias, with
+  `variant_id`, or `_base_`. `previous_method` and `method` are `static_secret`,
+  `credential_provider`, `credential_lookup` or `none`; `previous_provider_id` and `provider_id`
+  name the credential provider on either side. `changed` lists the parts a change to an existing
+  setting replaced (`method`, `secret_id`, `provider_id`, `header_name`, `header_format`,
+  `scopes`, `fallback`, `target_identifier`), by name only. `actor` names the management caller
+  as on policy change events, and the top level carries `surface_id` and `channel_name`. No
+  record carries a secret id, header name, header format or value.
+
+**Secret force-delete events.** Raised by `DELETE /secrets/{id}?force=true` (group Auth); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-a-forced-secret-delete).
+
+- `secret_force_deleted`: a secret was deleted with force, with or without records still using
+  it. `secret_id` is the secret's id, `force` is `true`, and `referrers` lists each record that
+  used it as `{kind, id}` (`surface`, `credential_provider`, `a2a_proxy` or `sts_client`). `actor`
+  names the management caller as on policy change events. The record carries no secret value and
+  no record name, and sets no `surface_id`.
+
+A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before

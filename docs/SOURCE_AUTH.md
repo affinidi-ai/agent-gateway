@@ -205,9 +205,17 @@ method's credential, such as a partner's `X-API-Key`, to the Target.
 
 The credential headers of every method are stripped before a request is forwarded, on each
 inbound, mirror, Fabric and agent-card path. A JWT bearer method with `forward_header`
-forwards its header only when it was the method selected for that request, so a request
-carrying several credentials forwards none. A `forward_header` method whose `token_header` is
-`Cookie` forwards nothing, since an Access Point never forwards `Cookie`.
+forwards its header only when it was the method selected for that request and its token
+verified, so a request carrying several credentials forwards none, and a token that failed
+verification never reaches the Target, even when policy lets the request through. A public
+discovery read verifies no caller, so it forwards no token either. A Target that checks tokens
+itself therefore gets no token the method's strategy rejects, such as one from another issuer
+or for another audience: make the strategy and `audiences` accept the tokens it needs, or give
+it its credential through target authentication instead. A `forward_header` method whose
+`token_header` is `Cookie` forwards nothing, since an Access Point never forwards `Cookie`.
+The token header is matched without regard to case or to `_` against `-`: a token is read only
+from the header spelled as `token_header`, every other spelling is stripped, and a second token
+under any spelling fails the caller.
 
 An Access Point never forwards its caller's `Cookie` to the managed agent, directly or over
 Fabric, a gateway receiving a Fabric request drops a `Cookie` its peer sent, and an MCP Proxy
@@ -224,7 +232,10 @@ ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's 
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
 each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
 list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called.
+metadata, where `aud` must name the resource of the route called. A request whose token header
+carries more than one value in the method's `token_scheme` fails, whatever the values, on an
+Access Point, a Transit Point and over Fabric. A value in another scheme, such as an MPP
+`Payment` credential beside the `Bearer` token, does not count.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
@@ -315,13 +326,19 @@ That includes an mTLS certificate that lacks the configured binding field. The r
 continues with no caller identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
-([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
+([`errors.rs`](../src/source_auth/errors.rs)). Such a request, including one that carries
+credentials for more than one method (`ambiguous_credentials`), is forwarded without the
 surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
 and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
 Fabric send and Fabric receive. A Transit Point refuses such a caller itself (see
-[Transit Point callers](#transit-point-callers)). To reject unauthenticated callers at such an
-Access Point, close it (`public: false` with caller authentication), or attach a policy that
-denies them:
+[Transit Point callers](#transit-point-callers)). A surface with no caller authentication at
+all sends that credential for every caller, and is held to
+[`target_source_auth`](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path):
+in `warn` a warning is logged once, in `enforce` the credential is withheld and a new or
+changed Target authentication, or a new `a2a-proxy://` Target, on such a surface is refused on
+save. To reject
+unauthenticated callers at such an Access Point, close it (`public: false` with caller
+authentication), or attach a policy that denies them:
 
 ```rego
 package surface.policy
@@ -703,6 +720,11 @@ refused request reaches the target. The credential's header is removed from an a
 request, so the target never receives the caller's key or token. A Transit Point that also
 requires a transit token needs both: `source_auth` first, then the token.
 
+A discovery read through a Transit Point, such as an agent card fetch, needs the caller's
+credential too. The gateway's own read of a `fabric://` target's agent card, for the Transit
+Point's Trust Checks or a policy with `require_agent_context`, goes straight over Fabric and
+not through the Transit Point, so `source_auth` and a Trust Check work together.
+
 A request that reaches a Transit Point through an inbound listener's `/outbound` route (see
 [Reachable from other hosts](#reachable-from-other-hosts)) carries no client
 certificate: that route never passes on the forwarded-client-cert header, because the
@@ -831,10 +853,16 @@ caller as `verification: fabric_peer`, verified only with a `fabric.principal_ha
 even when a presentation carried it, so policy sees it as the peer's (`fabric.caller_did`),
 never as the caller's `did`. Static `target_auth`
 credentials are added as for any caller. Delegated per-user credentials are released for it
-only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true`, which the
-admin API accepts only on a surface whose caller authentication tells a partner's users apart,
-and only for the caller in `fabric.principal_hash` (see
-[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+only on a Transit Point that sets `delegated_credentials_for_fabric_callers: true` on a surface
+whose caller authentication tells a partner's users apart (a save elsewhere answers with a
+`Warning`, and the Transit Point releases nothing there), and only for the caller in
+`fabric.principal_hash` (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)). The
+receiving surface's own Target follows the same rule with its own switch,
+`target.delegated_credentials_for_fabric_callers`: it is sent the grant of the caller the surface
+verified on the request, kept under the surface, only on a view whose HTTP or HTTPS Target sets
+it beside caller authentication that tells a partner's users apart (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
 A Transit Point's audit records name a caller in `fabric.principal_hash` with
 `auth_method: fabric_verified`, that hash as `user_identity_hash`, which is all that names a
 caller verified by an API key, and the allowlisted `sub`, `email` and `name` the receiving
@@ -1035,16 +1063,26 @@ to give each caller a bucket of their own, so one caller cannot spend the allowa
 A Transit Point forwards its caller's request headers to its target, over HTTP or Fabric,
 except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
-`Authorization` and its `Cookie`, its `Forwarded`, `X-Real-IP` and every `X-Forwarded-*`
-header, the caller-info and `did:webvh` identity headers
-(`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`,
-`x-did-identity`, `x-did-signed-identity`), the header its `source_auth` reads, a header named
-like the Transit Point's `target_auth` header or like the `custom_header` of a credential
-binding that can apply on it, and any header a Header Metadata Mapping is set to strip. Other
-headers, such as an API key header the agent sends for the target itself under another name,
-pass. The gateway sets none of the forwarding headers either, so a target that trusts it as its
-proxy never takes a caller's claim about its address, host or scheme. The credentials the gateway
-adds are described in
+`Authorization` and its `Cookie`, its proxy forwarding headers, the caller-info and
+`did:webvh` identity headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`,
+`x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the header its `source_auth`
+reads, a header named like the Transit Point's `target_auth` header or like the
+`custom_header` of a credential binding that can apply on it, and any header a Header
+Metadata Mapping is set to strip. Other headers, such as an API key header the agent sends for
+the target itself under another name, pass.
+
+The proxy forwarding headers are every `X-Forwarded-*` header and `Forwarded`, `X-Real-IP`,
+`True-Client-IP`, `Client-IP`, `X-Client-IP`, `X-Cluster-Client-IP`, `CF-Connecting-IP`,
+`CF-Connecting-IPv6`, `Fastly-Client-IP`, `Fly-Client-IP`, `X-ARR-ClientIP`,
+`X-Azure-ClientIP`, `X-ProxyUser-Ip`, `X-Original-Forwarded-For`, `Proxy-Client-IP`,
+`WL-Proxy-Client-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Remote-Addr`,
+`X-Envoy-External-Address`, `CloudFront-Viewer-Address`, `X-Original-Host`, `X-Host`,
+`X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Scheme`, `X-Url-Scheme`, `X-ARR-SSL`
+and `Front-End-Https`, matched case-insensitively and also spelled with `_` for `-`
+([`is_proxy_forwarding_header`](../src/proxy/outbound_handler.rs)). The gateway sets none of
+them either, so a target that trusts it as its proxy never takes a caller's claim about its
+address, host, path or scheme in one of these headers, though it does in a header of any other
+name. The credentials the gateway adds are described in
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point).
 
 The target's response headers go back to the agent except hop-by-hop headers, `Set-Cookie`,

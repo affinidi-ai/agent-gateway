@@ -526,10 +526,12 @@ pub(crate) async fn remove_changed_binding_grants(
     })
 }
 
-/// Serialises the writes that bind credential providers with the deletes and
-/// tenant moves of providers: a surface write holds it shared, a provider
-/// delete or move exclusively, for the whole of its check and change, so no
-/// write binds a provider that a delete has checked is unbound.
+/// Serialises the writes that bind credential providers or name secrets with the
+/// deletes and tenant moves of providers and the deletes of secrets: a surface,
+/// credential provider, A2A proxy or STS client write holds it shared, a provider
+/// delete or move or a secret delete exclusively, for the whole of its check and
+/// change, so no write binds a provider, or names a secret, that a delete has
+/// checked is unused.
 static PROVIDER_BINDINGS: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(Default::default);
 
 /// Hold [`PROVIDER_BINDINGS`] shared, as a surface write does.
@@ -550,7 +552,9 @@ pub(crate) async fn hold_provider_bindings_exclusively() -> tokio::sync::RwLockW
 /// `current`, does not bind already: its references were checked before the
 /// write took the provider lock, so a provider deleted or moved to another
 /// tenant in between is caught here. Both answer alike, so the refusal never
-/// says another tenant has the provider.
+/// says another tenant has the provider. A provider of the Target authentication of `after`,
+/// stored already or not, that has been retyped to need a user's consent since the write
+/// checked it is refused as well.
 async fn refuse_gone_providers(
     removal: &GrantRemoval<'_>,
     current: Option<&AgentSurface>,
@@ -559,6 +563,18 @@ async fn refuse_gone_providers(
     let Some(store) = removal.providers else {
         return Ok(());
     };
+    for id in crate::credential_providers::references::target_auth_provider_ids(after) {
+        let needs_consent = store
+            .get(&id)
+            .await
+            .map_err(|_| unavailable())?
+            .is_some_and(|provider| {
+                provider.provider_type == crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode
+            });
+        if needs_consent {
+            return Err(SurfaceApiError::BadRequest(super::surface_tenancy::TARGET_AUTH_NEEDS_CONSENT.into()));
+        }
+    }
     let kept = current
         .map(super::surface_tenancy::bound_credential_provider_ids)
         .unwrap_or_default();
@@ -575,6 +591,37 @@ async fn refuse_gone_providers(
             });
         if !referenceable {
             return Err(SurfaceApiError::BadRequest(format!("Credential provider '{id}' does not exist")));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `after` when it names a secret that no longer exists, one the surface
+/// stored now, `current`, does not name already: its references were checked
+/// before the write took the provider lock, so a secret deleted in between is
+/// caught here.
+async fn refuse_gone_secrets(
+    removal: &GrantRemoval<'_>,
+    current: Option<&AgentSurface>,
+    after: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    let Some(store) = removal.secrets else {
+        return Ok(());
+    };
+    let kept = current
+        .and_then(|current| super::surface_tenancy::checked_secret_ids(current).ok())
+        .unwrap_or_default();
+    for id in super::surface_tenancy::checked_secret_ids(after)? {
+        if kept.contains(&id) {
+            continue;
+        }
+        if store
+            .get_by_secret_id(&id)
+            .await
+            .map_err(|error| super::surface_tenancy::internal("Secret", error))?
+            .is_none()
+        {
+            return Err(super::surface_tenancy::inaccessible("Secret"));
         }
     }
     Ok(())
@@ -627,8 +674,8 @@ pub(crate) enum Stored {
 /// the lock is released. When the write is dropped, the surface stored is
 /// read again under the lock ([`written`]): the grants are revoked when the
 /// write was saved all the same, and put back otherwise. A write that binds a
-/// provider deleted, or moved to a tenant the surface may not reference,
-/// since its references were checked is refused.
+/// provider deleted, or moved to a tenant the surface may not reference, or
+/// names a secret deleted, since its references were checked is refused.
 pub(crate) async fn write_surface<T, Write, Pending>(
     removal: &GrantRemoval<'_>,
     surfaces: Arc<dyn AgentSurfaceStore>,
@@ -652,6 +699,7 @@ where
     }
     if let Some(after) = after {
         refuse_gone_providers(removal, current.as_ref(), after).await?;
+        refuse_gone_secrets(removal, current.as_ref(), after).await?;
     }
     let (saved, outcome) = tokio::sync::oneshot::channel();
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
@@ -1549,6 +1597,115 @@ mod tests {
         .expect("a provider of the surface's tenant is bound");
     }
 
+    async fn add_provider(
+        fixture: &Fixture,
+        id: &str,
+        provider_type: crate::credential_providers::CredentialProviderType,
+    ) {
+        let mut provider = fixture
+            .providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.id = id.to_string();
+        provider.provider_id = id.to_string();
+        provider.provider_type = provider_type;
+        fixture
+            .providers
+            .create(provider)
+            .await
+            .unwrap();
+    }
+
+    fn authenticating_with(
+        provider: &str,
+        on_transit_point: bool,
+    ) -> AgentSurface {
+        let mut surface = surface(json!([point("owner-hop", None)]));
+        let authentication = json!({"method": {"credential_provider": {"provider_id": provider}}});
+        if on_transit_point {
+            surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .points[0]
+                .target_auth = serde_json::from_value(authentication).unwrap();
+        } else {
+            surface.target.auth = serde_json::from_value(authentication).unwrap();
+        }
+        surface
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_whose_target_auth_provider_sends_a_gateway_credential_is_saved() {
+        use crate::credential_providers::CredentialProviderType;
+        let fixture = Fixture::new().await;
+        add_provider(&fixture, "machine", CredentialProviderType::OAuth2ClientCredentials).await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        for on_transit_point in [false, true] {
+            let saved = write_surface(
+                &removal,
+                surfaces.clone(),
+                "surface",
+                Stored::Any,
+                Some(&authenticating_with("machine", on_transit_point)),
+                || async { Ok::<_, SurfaceApiError>("saved") },
+            )
+            .await;
+            assert_eq!(saved.unwrap(), "saved");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_whose_target_auth_provider_was_retyped_to_need_consent_is_refused() {
+        use crate::credential_providers::CredentialProviderType;
+        let fixture = Fixture::new().await;
+        add_provider(&fixture, "machine", CredentialProviderType::OAuth2ClientCredentials).await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        let after = authenticating_with("machine", false);
+        write_surface(&removal, surfaces.clone(), "surface", Stored::Any, Some(&after), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .unwrap();
+        let mut retyped = fixture
+            .providers
+            .get("machine")
+            .await
+            .unwrap()
+            .unwrap();
+        retyped.provider_type = CredentialProviderType::OAuth2AuthorizationCode;
+        fixture
+            .providers
+            .update(retyped)
+            .await
+            .unwrap();
+        let saved = std::sync::atomic::AtomicBool::new(false);
+        for on_transit_point in [false, true] {
+            let refused = write_surface(
+                &removal,
+                surfaces.clone(),
+                "surface",
+                Stored::Any,
+                Some(&authenticating_with("machine", on_transit_point)),
+                || async {
+                    saved.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<(), SurfaceApiError>(())
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(SurfaceApiError::BadRequest(ref message))
+                    if message == super::super::surface_tenancy::TARGET_AUTH_NEEDS_CONSENT),
+                "{refused:?}"
+            );
+        }
+        assert!(!saved.load(std::sync::atomic::Ordering::SeqCst), "nothing is saved");
+    }
+
     /// A write binds a provider only while it exists: one deleted since the
     /// write's references were checked is refused under the provider lock,
     /// which a provider delete holds for its whole check and delete.
@@ -1602,6 +1759,72 @@ mod tests {
             .await
             .unwrap()
             .expect("and goes on once it ends");
+    }
+
+    /// A surface whose Target authentication sends secret `secret_id`.
+    fn sending_secret(secret_id: &str) -> AgentSurface {
+        let mut surface = surface(json!([]));
+        surface.target.auth = Some(
+            serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": secret_id, "header_name": "X-Api-Key"
+            }}}))
+            .unwrap(),
+        );
+        surface
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_naming_a_secret_deleted_since_it_was_checked_is_refused() {
+        let fixture = Fixture::new().await;
+        let surfaces = fixture.surfaces().await;
+        let removal = fixture.removal();
+        let saved = std::sync::atomic::AtomicBool::new(false);
+        let refused = write_surface(
+            &removal,
+            surfaces.clone(),
+            "surface",
+            Stored::Absent,
+            Some(&sending_secret("gone")),
+            || async {
+                saved.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(), SurfaceApiError>(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(SurfaceApiError::BadRequest(ref message)) if message == "Secret reference is not accessible"),
+            "{refused:?}"
+        );
+        assert!(!saved.load(std::sync::atomic::Ordering::SeqCst), "nothing is saved");
+
+        fixture
+            .secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-a".to_string()),
+                name: "Kept".to_string(),
+                secret_id: "kept".to_string(),
+                description: None,
+                value: "value".to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        write_surface(&removal, surfaces.clone(), "surface", Stored::Absent, Some(&sending_secret("kept")), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .expect("a secret that exists is named");
+
+        surfaces
+            .save(&sending_secret("gone"))
+            .await
+            .unwrap();
+        write_surface(&removal, surfaces.clone(), "surface", Stored::Any, Some(&sending_secret("gone")), || async {
+            Ok::<(), SurfaceApiError>(())
+        })
+        .await
+        .expect("a surface still saves with the missing secret it stored already");
     }
 
     /// The provider's default scopes in these tests.

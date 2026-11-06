@@ -221,7 +221,23 @@ impl SourceAuthMiddleware {
         headers: &HeaderMap,
         channel_name: &str,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
-        // 1. Extract bearer token from the configured header / scheme
+        // 1. Extract bearer token from the configured header / scheme. A value in
+        // another scheme, such as an MPP `Payment` credential, is not a token. A
+        // value under another spelling of the header, `_` for `-`, counts as a
+        // second token, since some servers read both spellings as one.
+        if headers
+            .iter()
+            .filter(|(name, value)| {
+                crate::config::target_auth_rules::same_header_name(name.as_str(), &config.token_header)
+                    && in_token_scheme(value.as_bytes(), &config.token_scheme)
+            })
+            .count()
+            > 1
+        {
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "More than one bearer token".to_string(),
+            });
+        }
         let header_value = headers
             .get(config.token_header.as_str())
             .and_then(|v| v.to_str().ok());
@@ -665,6 +681,19 @@ fn extract_credential(
         // helper does not perform.
         CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
     }
+}
+
+/// Whether a token header value is in `scheme`, compared ignoring case as HTTP
+/// authentication schemes are. With no scheme, every value is a token.
+fn in_token_scheme(
+    value: &[u8],
+    scheme: &str,
+) -> bool {
+    scheme.is_empty()
+        || value
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(scheme.as_bytes()))
 }
 
 fn constant_time_compare(
@@ -1903,6 +1932,98 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_value_in_the_token_scheme_fails_and_one_in_another_scheme_does_not() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+
+        for (case, second, verifies) in [
+            ("a second Bearer value", format!("Bearer {token}"), false),
+            ("a lower-case bearer value", "bearer other".to_string(), false),
+            ("a Payment value", "Payment credential".to_string(), true),
+        ] {
+            let mut headers = bearer(&token);
+            headers.append(axum::http::header::AUTHORIZATION, HeaderValue::from_str(&second).unwrap());
+            let result = mw
+                .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                .await;
+            if verifies {
+                assert!(
+                    matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+                    "{case}"
+                );
+            } else {
+                assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_token_under_another_spelling_of_the_token_header_fails() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            token_header: "X-User-Token".to_string(),
+            forward_header: true,
+            ..Default::default()
+        });
+        let authenticate = |headers: HeaderMap| {
+            let mw = &mw;
+            let config = &config;
+            async move {
+                mw.authenticate(config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                    .await
+            }
+        };
+        let valid = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid.clone());
+        headers.insert("x_user_token", HeaderValue::from_static("Bearer other"));
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x_user_token", valid.clone());
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::MissingCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid);
+        let result = authenticate(headers).await;
+        assert!(
+            matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

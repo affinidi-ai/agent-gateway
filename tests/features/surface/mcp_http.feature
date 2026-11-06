@@ -17,20 +17,20 @@ Feature: HTTP MCP surface forwarding
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
 
   Scenario: MCP target authentication injects the configured header
-    Given the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller asks the MCP surface for available tools
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
   Scenario: Missing MCP target authentication secret rejects the request when fallback is reject
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "reject"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller asks the MCP surface for available tools
     Then the response status is 502
     And MCP server "bravo" was not called
 
   Scenario: Missing MCP target authentication secret passes through when fallback is passthrough
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "passthrough"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "passthrough"
     When the caller asks the MCP surface for available tools
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request

@@ -155,7 +155,7 @@ The bootstrap file. Startup only; changes need a restart.
 | --- | --- |
 | top level | `channel_config_source`, AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
-| `[credential_policy]` | How strictly credential providers are held to two rules. `token_endpoint_https` and `tenant_credential_isolation` are each `"warn"` (default) or `"enforce"`; any other value fails startup. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty); an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. Absent section means both rules are `warn`. The report also names a stored JWT Bearer provider without a subject under a third rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
+| `[credential_policy]` | How strictly credential providers and Target credentials are held to four rules. `token_endpoint_https`, `tenant_credential_isolation`, `target_https` and `target_source_auth` are each `"warn"` (default) or `"enforce"`; any other value fails startup. In `"enforce"`, `target_https` and `target_source_auth` also refuse a new or changed Target authentication that breaks them on save (for `target_source_auth`, also a new `a2a-proxy://` Target whose A2A proxy would send its Direct Line credential for unchecked callers); in `"warn"` such a save succeeds with a warning. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty); an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. Absent section means every rule is `warn`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
 | `[config_files]` | Where the other configuration files are |
 | `[storage_paths]` | Where each record kind is persisted under `_storage/`. The Trust Recorder status store has no key: it sits beside the identities directory as `trust_recorder_status/`. |
@@ -228,7 +228,9 @@ included), makes them so, and so does the same on an inbound listener that share
 with it, because that inbound listener passes `/outbound/...` requests on to it. Two external
 URLs share a host name when their hosts match, ignoring case and port; an IPv6 address matches
 only the same address, however it is written (`[2001:db8::1]` and `[2001:DB8:0::1]` match,
-`[2001:db8::1]` and `[2001:db8::2]` do not). The inbound listener streams
+`[2001:db8::1]` and `[2001:db8::2]` do not). An external URL that does not parse, or has no
+host, shares a host name with none, and startup names it once in a `WARN` by its listener's
+`id` and its zero-based `external_url_index`. The inbound listener streams
 the request and the response, so the outbound listener authenticates the caller before the
 body is read and an event stream arrives as it is sent. It sets no overall timeout, leaving
 the stream deadlines to the outbound listener, and keeps the request method. A Transit Point

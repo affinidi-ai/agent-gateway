@@ -1,16 +1,19 @@
 //! Startup and reload report of the credential providers and surfaces that break a
-//! `[credential_policy]` rule. Log lines only: ids, tenants and rule names, never a secret value.
+//! `[credential_policy]` rule or a Target authentication header rule. Log lines only: ids,
+//! tenants and rule names, never a secret value.
 
 use std::collections::HashMap;
 
 use tracing::{info, warn};
 
+use super::surface_target_auth::BrokenTargetRule;
 use super::surface_tenancy::{
     ProviderKeyIssue, collect_surface_reference_keys, provider_key_owners, provider_key_verdict,
 };
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+use crate::config::target_auth_rules::{HttpsMcpProxies, TargetCredentialRule};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
 use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
@@ -21,6 +24,12 @@ use crate::tenancy::ResourceKind;
 const RULE_TOKEN_ENDPOINT_HTTPS: &str = "token_endpoint_https";
 const RULE_TENANT_CREDENTIAL_ISOLATION: &str = "tenant_credential_isolation";
 const RULE_JWT_SUBJECT: &str = "jwt_subject";
+const RULE_TARGET_HTTPS: &str = TargetCredentialRule::Https.key();
+const RULE_TARGET_SOURCE_AUTH: &str = TargetCredentialRule::SourceAuth.key();
+/// The header rules a Target authentication meets at every save and on every request: a header
+/// name it may set, a header no other credential on the leg sends, and a value format with one
+/// `{value}` and no CR, LF or NUL. They have no `[credential_policy]` setting and always apply.
+const RULE_TARGET_AUTH_HEADER: &str = "target_auth_header";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicyBreach {
@@ -102,6 +111,7 @@ pub(crate) fn find_breaches(
     secret_tenants: &HashMap<&str, Option<&str>>,
     key_owners: Option<&HashMap<String, Vec<String>>>,
     egress: &TokenEgress,
+    https_proxies: &HttpsMcpProxies,
 ) -> Findings {
     let surface_tenants: HashMap<&str, Option<&str>> = surfaces
         .iter()
@@ -134,6 +144,7 @@ pub(crate) fn find_breaches(
         }
     }
     for surface in surfaces {
+        let mut rules = Vec::new();
         let verdict = surface_breaks_isolation(surface, secret_tenants, &by_id).and_then(|breaks| {
             provider_key_verdict(
                 surface,
@@ -145,28 +156,34 @@ pub(crate) fn find_breaches(
             )
             .map(|issues| (breaks, issues))
         });
-        let breaks = verdict.map(|(breaks, issues)| {
-            findings.provider_keys.extend(
-                issues
-                    .into_iter()
-                    .map(|issue| ProviderKeyFinding {
-                        surface_id: surface.surface_id.clone(),
-                        tenant_id: surface.tenant_id.clone(),
-                        issue,
-                    }),
-            );
-            breaks
+        let verdict = verdict.and_then(|(breaks, issues)| {
+            super::surface_target_auth::broken_target_rules(surface, https_proxies)
+                .map(|target_rules| (breaks, issues, target_rules))
         });
-        match breaks {
-            Ok(true) => findings
-                .breaches
-                .push(PolicyBreach {
-                    subject: "surface",
-                    id: surface.surface_id.clone(),
-                    tenant_id: surface.tenant_id.clone(),
-                    rule: RULE_TENANT_CREDENTIAL_ISOLATION,
-                }),
-            Ok(false) => {}
+        match verdict {
+            Ok((breaks, issues, target_rules)) => {
+                findings.provider_keys.extend(
+                    issues
+                        .into_iter()
+                        .map(|issue| ProviderKeyFinding {
+                            surface_id: surface.surface_id.clone(),
+                            tenant_id: surface.tenant_id.clone(),
+                            issue,
+                        }),
+                );
+                if breaks {
+                    rules.push(RULE_TENANT_CREDENTIAL_ISOLATION);
+                }
+                for (rule, key) in [
+                    (BrokenTargetRule::Policy(TargetCredentialRule::Https), RULE_TARGET_HTTPS),
+                    (BrokenTargetRule::Policy(TargetCredentialRule::SourceAuth), RULE_TARGET_SOURCE_AUTH),
+                    (BrokenTargetRule::Header, RULE_TARGET_AUTH_HEADER),
+                ] {
+                    if target_rules.contains(&rule) {
+                        rules.push(key);
+                    }
+                }
+            }
             Err(error) => findings
                 .skipped
                 .push(SkippedSurface {
@@ -175,6 +192,16 @@ pub(crate) fn find_breaches(
                     error: format!("{error:?}"),
                 }),
         }
+        findings.breaches.extend(
+            rules
+                .into_iter()
+                .map(|rule| PolicyBreach {
+                    subject: "surface",
+                    id: surface.surface_id.clone(),
+                    tenant_id: surface.tenant_id.clone(),
+                    rule,
+                }),
+        );
     }
     findings
 }
@@ -220,8 +247,12 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
     let key_owners = provider_key_owners(state)
         .await
         .ok();
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
 
-    log_findings(&find_breaches(&providers, &surfaces, &secret_tenants, key_owners.as_ref(), &egress), policy);
+    log_findings(
+        &find_breaches(&providers, &surfaces, &secret_tenants, key_owners.as_ref(), &egress, &https_proxies),
+        policy,
+    );
 }
 
 /// The mode a rule runs in; `jwt_subject` has no setting and only warns.
@@ -232,6 +263,9 @@ fn rule_mode(
     match rule {
         RULE_TOKEN_ENDPOINT_HTTPS => policy.token_endpoint_https,
         RULE_JWT_SUBJECT => RuleMode::Warn,
+        RULE_TARGET_AUTH_HEADER => RuleMode::Enforce,
+        RULE_TARGET_HTTPS => policy.target_https,
+        RULE_TARGET_SOURCE_AUTH => policy.target_source_auth,
         _ => policy.tenant_credential_isolation,
     }
 }
@@ -345,7 +379,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        find_breaches(providers, &[], &secret_tenants, None, &egress(policy))
+        find_breaches(providers, &[], &secret_tenants, None, &egress(policy), &HttpsMcpProxies::default())
             .breaches
             .into_iter()
             .map(|breach| (breach.id, breach.rule))
@@ -478,10 +512,11 @@ mod tests {
                     &secret_tenants,
                     None,
                     &egress(CredentialPolicyConfig::default()),
+                    &HttpsMcpProxies::default(),
                 )
                 .breaches
                 .iter()
-                .filter(|breach| breach.subject == "surface")
+                .filter(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
                 .collect::<Vec<_>>()
                 .is_empty()
             })
@@ -493,10 +528,11 @@ mod tests {
             &secret_tenants,
             None,
             &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
         )
         .breaches
         .into_iter()
-        .find(|breach| breach.subject == "surface")
+        .find(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
         .unwrap();
         assert_eq!(breach.id, "s");
         assert_eq!(breach.tenant_id.as_deref(), Some("t1"));
@@ -524,7 +560,14 @@ mod tests {
             ..Default::default()
         };
         let surfaces = [surface_that_cannot_be_inspected("broken"), healthy];
-        let findings = find_breaches(&[], &surfaces, &secret_tenants, None, &egress(CredentialPolicyConfig::default()));
+        let findings = find_breaches(
+            &[],
+            &surfaces,
+            &secret_tenants,
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        );
         assert_eq!(findings.breaches, vec![]);
         assert_eq!(findings.skipped.len(), 1);
         assert_eq!(findings.skipped[0].id, "broken");
@@ -609,16 +652,303 @@ mod tests {
                 serde_json::from_value(serde_json::json!({"payload": {"key": format!("$SECRET:{secret_id}")}}))
                     .unwrap(),
             );
-            find_breaches(&[], &[surface], &secret_tenants, None, &egress(CredentialPolicyConfig::default()))
-                .breaches
-                .iter()
-                .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
+            find_breaches(
+                &[],
+                &[surface],
+                &secret_tenants,
+                None,
+                &egress(CredentialPolicyConfig::default()),
+                &HttpsMcpProxies::default(),
+            )
+            .breaches
+            .iter()
+            .any(|breach| breach.subject == "surface" && breach.rule == RULE_TENANT_CREDENTIAL_ISOLATION)
         };
 
         assert!(reported(Some("t1"), "S_WIDE"));
         assert!(!reported(Some("t1"), "S_OWN"));
         assert!(!reported(Some("t1"), "S_GONE"));
         assert!(!reported(None, "S_WIDE"));
+    }
+
+    fn target_surface(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+        source_auth: bool,
+    ) -> AgentSurface {
+        let mut surface = AgentSurface {
+            surface_id: "s".to_string(),
+            ..Default::default()
+        };
+        surface.target.endpoint = endpoint.to_string();
+        surface.target.auth = method.map(|method| TargetAuthConfig {
+            method,
+            auth_type: None,
+            target_identifier: None,
+            fallback: Default::default(),
+        });
+        if source_auth {
+            surface
+                .access_point
+                .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+                methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(
+                    crate::source_auth::models::ApiKeyAuthConfig {
+                        extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
+                            field: "X-Caller".to_string(),
+                        },
+                        secret_id: "caller-keys".to_string(),
+                    },
+                )],
+                protected_resource: None,
+                on_failure: Default::default(),
+            });
+        }
+        surface
+    }
+
+    fn static_secret() -> TargetAuthMethod {
+        TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "Authorization".to_string(),
+            header_format: "{value}".to_string(),
+        }
+    }
+
+    fn provider_method() -> TargetAuthMethod {
+        TargetAuthMethod::CredentialProvider {
+            provider_id: "p".to_string(),
+            header_name: "Authorization".to_string(),
+            header_format: "{value}".to_string(),
+            scopes: Vec::new(),
+        }
+    }
+
+    fn surface_rules(surface: &AgentSurface) -> Vec<&'static str> {
+        find_breaches(
+            &[],
+            std::slice::from_ref(surface),
+            &HashMap::new(),
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        )
+        .breaches
+        .into_iter()
+        .map(|breach| breach.rule)
+        .collect()
+    }
+
+    fn transit_point(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+        require_transit_token: bool,
+    ) -> crate::config::agent_surface::TransitPoint {
+        serde_json::from_value(serde_json::json!({
+            "alias": "tp",
+            "target_endpoint": endpoint,
+            "require_transit_token": require_transit_token,
+            "target_auth": method.map(|method| serde_json::to_value(TargetAuthConfig {
+                method,
+                auth_type: None,
+                target_identifier: None,
+                fallback: Default::default(),
+            }).unwrap()),
+        }))
+        .unwrap()
+    }
+
+    fn transit_config(
+        points: Vec<crate::config::agent_surface::TransitPoint>
+    ) -> crate::config::agent_surface::TransitConfig {
+        serde_json::from_value(serde_json::json!({ "points": points })).unwrap()
+    }
+
+    #[test]
+    fn a_target_credential_on_a_non_https_target_is_reported() {
+        for method in [static_secret, provider_method] {
+            for (endpoint, reported) in [
+                ("http://upstream.internal/mcp", true),
+                ("fabric://gw/surface", true),
+                ("a2a-proxy://agent", true),
+                ("https://upstream.example/mcp", false),
+                ("HTTPS://upstream.example/mcp", false),
+            ] {
+                let rules = surface_rules(&target_surface(endpoint, Some(method()), true));
+                assert_eq!(rules.contains(&RULE_TARGET_HTTPS), reported, "{endpoint}");
+            }
+        }
+        assert!(surface_rules(&target_surface("http://upstream.internal", None, true)).is_empty());
+    }
+
+    #[test]
+    fn a_target_credential_whose_header_breaks_a_header_rule_is_reported_as_enforced() {
+        let reserved = TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "X-Transit-Token".to_string(),
+            header_format: "{value}".to_string(),
+        };
+        let surface = target_surface("https://upstream.example", Some(reserved), true);
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_AUTH_HEADER]);
+        assert!(rule_mode(RULE_TARGET_AUTH_HEADER, &CredentialPolicyConfig::default()).is_enforced());
+
+        let mut on_transit_point = target_surface("https://upstream.example", None, true);
+        let unformatted = TargetAuthMethod::StaticSecret {
+            secret_id: "S".to_string(),
+            header_name: "X-Api-Key".to_string(),
+            header_format: "Bearer".to_string(),
+        };
+        on_transit_point.transit =
+            Some(transit_config(vec![transit_point("https://tp.example", Some(unformatted), true)]));
+        assert_eq!(surface_rules(&on_transit_point), vec![RULE_TARGET_AUTH_HEADER]);
+
+        let both = target_surface(
+            "http://upstream.internal",
+            Some(TargetAuthMethod::StaticSecret {
+                secret_id: "S".to_string(),
+                header_name: "Host".to_string(),
+                header_format: "{value}{value}".to_string(),
+            }),
+            true,
+        );
+        assert_eq!(surface_rules(&both), vec![RULE_TARGET_HTTPS, RULE_TARGET_AUTH_HEADER]);
+    }
+
+    #[test]
+    fn a_transit_point_credential_on_a_non_https_endpoint_is_reported() {
+        let mut surface = target_surface("https://upstream.example", None, true);
+        surface.transit = Some(transit_config(vec![transit_point("http://tp.internal", Some(static_secret()), true)]));
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_HTTPS]);
+        surface.transit = Some(transit_config(vec![transit_point("https://tp.example", Some(static_secret()), true)]));
+        assert!(surface_rules(&surface).is_empty());
+    }
+
+    #[test]
+    fn a_target_credential_without_access_point_source_auth_is_reported() {
+        let without = surface_rules(&target_surface("https://upstream.example", Some(static_secret()), false));
+        assert_eq!(without, vec![RULE_TARGET_SOURCE_AUTH]);
+        let with = surface_rules(&target_surface("https://upstream.example", Some(provider_method()), true));
+        assert!(with.is_empty());
+        let no_credential = surface_rules(&target_surface("https://upstream.example", None, false));
+        assert!(no_credential.is_empty());
+    }
+
+    #[test]
+    fn a_transit_point_credential_needs_a_transit_point_that_checks_its_callers() {
+        let with_points = |access_point_checks: bool, token: bool| {
+            let mut surface = target_surface("https://upstream.example", None, access_point_checks);
+            surface.transit =
+                Some(transit_config(vec![transit_point("https://tp.example", Some(static_secret()), token)]));
+            surface
+        };
+        assert_eq!(surface_rules(&with_points(false, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert_eq!(surface_rules(&with_points(true, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert!(surface_rules(&with_points(false, true)).is_empty());
+    }
+
+    #[test]
+    fn an_a2a_proxy_target_is_held_to_target_source_auth_only() {
+        assert_eq!(surface_rules(&target_surface("a2a-proxy://agent", None, false)), vec![RULE_TARGET_SOURCE_AUTH]);
+        assert!(surface_rules(&target_surface("a2a-proxy://agent", None, true)).is_empty());
+        let mut mcp = target_surface("a2a-proxy://agent", None, false);
+        mcp.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+        assert!(surface_rules(&mcp).is_empty(), "only an A2A or AP2 surface dispatches to an A2A proxy");
+        assert!(surface_rules(&target_surface("https://upstream.example", None, false)).is_empty());
+    }
+
+    /// `target_surface` whose Access Point has an API key and a JWT Bearer method.
+    fn two_method_surface(
+        endpoint: &str,
+        method: Option<TargetAuthMethod>,
+    ) -> AgentSurface {
+        let mut surface = target_surface(endpoint, method, false);
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "secret_id": "caller-keys",
+                 "extraction": {"source": "http_header", "field": "X-Caller"}},
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []}
+            ]}))
+            .unwrap(),
+        );
+        surface
+    }
+
+    #[test]
+    fn an_access_point_with_several_methods_checks_the_targets_callers_but_not_a_transit_points() {
+        assert!(surface_rules(&two_method_surface("https://upstream.example", Some(static_secret()))).is_empty());
+        assert!(surface_rules(&two_method_surface("a2a-proxy://agent", None)).is_empty());
+
+        let mut variant = two_method_surface("https://upstream.example", Some(provider_method()));
+        variant.variants = serde_json::from_value(serde_json::json!([{
+            "id": "open-id", "alias": "open", "name": "Open",
+            "overrides": {"access_point": {"caller_authentication": {"methods": []}}}
+        }]))
+        .unwrap();
+        assert_eq!(surface_rules(&variant), vec![RULE_TARGET_SOURCE_AUTH], "a variant without a method");
+
+        let mut open_point = two_method_surface("https://upstream.example", None);
+        let mut point = transit_point("https://tp.example", Some(static_secret()), false);
+        point.allow_unauthenticated_callers = true;
+        open_point.transit = Some(transit_config(vec![point]));
+        assert_eq!(surface_rules(&open_point), vec![RULE_TARGET_SOURCE_AUTH]);
+    }
+
+    #[test]
+    fn a_proxy_target_is_reported_for_target_https_unless_its_mcp_proxy_base_url_is_https() {
+        let surface = target_surface("proxy://weather", Some(static_secret()), true);
+        let rules = |base_url: &str| {
+            find_breaches(
+                &[],
+                std::slice::from_ref(&surface),
+                &HashMap::new(),
+                None,
+                &egress(CredentialPolicyConfig::default()),
+                &HttpsMcpProxies::from_base_urls([("weather", base_url)]),
+            )
+            .breaches
+            .into_iter()
+            .map(|breach| breach.rule)
+            .collect::<Vec<_>>()
+        };
+        assert!(rules("https://rest.example.com/api").is_empty());
+        assert_eq!(rules("http://rest.example.com"), vec![RULE_TARGET_HTTPS]);
+        assert_eq!(surface_rules(&surface), vec![RULE_TARGET_HTTPS], "a missing MCP proxy");
+    }
+
+    #[test]
+    fn a_surface_that_cannot_be_inspected_is_not_reported_for_the_target_rules_of_its_other_views() {
+        let mut surface = surface_that_cannot_be_inspected("broken");
+        surface.target = target_surface("http://upstream.example", Some(static_secret()), false).target;
+        let healthy = target_surface("http://upstream.example", Some(static_secret()), true);
+        let findings = find_breaches(
+            &[],
+            &[surface, healthy],
+            &HashMap::new(),
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        );
+        assert_eq!(
+            findings
+                .breaches
+                .iter()
+                .map(|breach| (breach.id.as_str(), breach.rule))
+                .collect::<Vec<_>>(),
+            vec![("s", RULE_TARGET_HTTPS)]
+        );
+        assert_eq!(findings.skipped.len(), 1);
+        assert_eq!(findings.skipped[0].id, "broken");
+    }
+
+    #[test]
+    fn a_resource_access_token_counts_as_checking_the_targets_callers() {
+        let mut surface = target_surface("https://upstream.example", Some(static_secret()), false);
+        surface.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({"authorization": {"resource": "https://gateway.example/s"}}))
+                .unwrap(),
+        );
+        assert!(surface_rules(&surface).is_empty());
     }
 
     fn key_surface(
@@ -680,7 +1010,7 @@ mod tests {
             tenant_credential_isolation: isolation,
             ..Default::default()
         };
-        find_breaches(&[], &surfaces, &HashMap::new(), owners, &egress(policy))
+        find_breaches(&[], &surfaces, &HashMap::new(), owners, &egress(policy), &HttpsMcpProxies::default())
             .provider_keys
             .into_iter()
             .map(|finding| (finding.surface_id, finding.issue.kind.as_str(), finding.issue.kind.is_breach()))
@@ -799,6 +1129,7 @@ mod tests {
                 .collect(),
             Some(&owners),
             &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
         );
         log_findings(&findings, &CredentialPolicyConfig::default());
         let text = logs.text();

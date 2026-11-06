@@ -10,7 +10,8 @@
 use crate::audit::events::{
     Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
     PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetKind,
+    RejectionStage, RequestFailureOutcome, TargetAuthField, TargetAuthLeg, TargetAuthMethodKind, TargetAuthRejection,
+    TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -70,8 +71,9 @@ pub struct AuditCallerContext {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_identity_hash: Option<String>,
     /// The paired gateway that sent the request over Fabric, for a
-    /// `fabric_verified` or `fabric_asserted` caller: its issuer DID, else its
-    /// Remote gateway record id.
+    /// `fabric_verified` or `fabric_asserted` caller, and for the caller of a
+    /// delegated credential released on Fabric receive: its issuer DID, else
+    /// its Remote gateway record id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub peer_gateway: Option<String>,
     /// Raw caller email captured for administrator-only audit evidence.
@@ -383,6 +385,53 @@ impl PolicyChangeDetails {
     }
 }
 
+/// A management change to the Target Authentication of one leg of a surface: the Target or a
+/// Transit Point, of the base surface or of a variant as it resolves. Names the method and
+/// credential provider before and after; never a secret id, header name, header format or value.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TargetAuthChangeDetails {
+    pub actor: Actor,
+    /// The variant's alias, or `_base_` for the base surface.
+    pub surface_variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    pub leg: TargetAuthLeg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point_id: Option<String>,
+    /// The Transit Point's alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    pub previous_method: TargetAuthMethodKind,
+    pub method: TargetAuthMethodKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// The parts a change to an existing setting replaced; empty when the setting was added or
+    /// removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<TargetAuthField>,
+}
+
+/// A secret deleted with `force=true` through the management API. Names the secret by its id
+/// and each record that still used it by kind and id; never the secret's value or a record's
+/// name.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SecretForceDeleteDetails {
+    pub actor: Actor,
+    pub secret_id: String,
+    pub force: bool,
+    #[serde(default)]
+    pub referrers: Vec<SecretReferrerDetails>,
+}
+
+/// A record that used a secret when it was force-deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SecretReferrerDetails {
+    pub kind: String,
+    pub id: String,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -520,6 +569,10 @@ pub enum DelegationAuditAction {
         /// longest alias a variant can have. Caller-chosen text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_variant: Option<String>,
+        /// On `target_auth_failed` only: whether the request was refused or forwarded
+        /// without the credential, and the token endpoint's OAuth `error` code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_auth: Option<TargetAuthRejection>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -574,6 +627,10 @@ pub enum DelegationAuditAction {
     PolicyAttachmentChanged(Box<PolicyChangeDetails>),
     /// A policy change was refused; `action` names the change attempted.
     PolicyChangeRefused(Box<PolicyChangeDetails>),
+    /// The Target Authentication of one leg of a surface was added, changed or removed.
+    TargetAuthChanged(Box<TargetAuthChangeDetails>),
+    /// A secret was deleted with `force=true`, with or without records still using it.
+    SecretForceDeleted(Box<SecretForceDeleteDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,6 +684,8 @@ impl DelegationAuditAction {
                 | Self::PolicyDetached(_)
                 | Self::PolicyAttachmentChanged(_)
                 | Self::PolicyChangeRefused(_)
+                | Self::TargetAuthChanged(_)
+                | Self::SecretForceDeleted(_)
         )
     }
 }
@@ -1221,6 +1280,26 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
     }
 }
 
+/// Build the `AuditCallerContext` of a delegated credential released on Fabric
+/// receive: the caller the receiving surface's own `source_auth` or resource
+/// token verified on the request ([`build_caller_context`]), with the paired
+/// gateway that sent it as `peer_gateway`: its issuer DID, else its Remote
+/// gateway record id.
+pub fn fabric_receive_caller_context(
+    identity: &crate::source_auth::AuthenticatedIdentity,
+    peer_issuer_did: Option<&str>,
+    peer_gateway_id: &str,
+) -> AuditCallerContext {
+    AuditCallerContext {
+        peer_gateway: Some(
+            peer_issuer_did
+                .unwrap_or(peer_gateway_id)
+                .to_string(),
+        ),
+        ..build_caller_context(identity)
+    }
+}
+
 /// Build an `AuditCallerContext` from the caller context a transit token
 /// carries onto a Transit Point: the allowlisted `sub`, `email` and `name`
 /// claims captured for Workload Binding, with the inbound caller's DID as the
@@ -1442,6 +1521,8 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyDetached(_) => "policy_detached",
         DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
+        DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
+        DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
     }
 }
 
@@ -1848,6 +1929,37 @@ mod tests {
         assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
     }
 
+    /// The caller of a credential released on Fabric receive is the one the
+    /// receiving surface verified, with the peer gateway that sent the request:
+    /// its issuer DID, else its record id. A direct caller names no peer.
+    #[test]
+    fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
+            principal_claim: "sub".to_string(),
+        };
+
+        let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
+        assert_eq!(
+            (received.auth_method.as_str(), received.iss.as_deref(), received.sub.as_deref()),
+            ("jwt_bearer", Some("https://issuer.example"), Some("alice"))
+        );
+        assert_eq!(
+            received
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(
+            fabric_receive_caller_context(&identity, None, "partner-record")
+                .peer_gateway
+                .as_deref(),
+            Some("partner-record")
+        );
+        assert_eq!(build_caller_context(&identity).peer_gateway, None);
+    }
+
     #[test]
     fn test_audit_event_builder_with_none_fields() {
         let evt = audit_event(DelegationAuditAction::ConsentRequired, None, None, None, None);
@@ -2217,6 +2329,7 @@ mod tests {
                     http_status: Some(413),
                     rpc_error_code: Some(-32600),
                     requested_variant: None,
+                    target_auth: None,
                 },
                 "request_rejected",
             ),
@@ -2292,6 +2405,7 @@ mod tests {
             http_status: Some(403),
             rpc_error_code: None,
             requested_variant: None,
+            target_auth: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");

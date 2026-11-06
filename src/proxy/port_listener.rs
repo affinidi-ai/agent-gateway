@@ -1,0 +1,465 @@
+//! Port listeners that stay bound while the routes they serve change.
+
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::{Arc, PoisonError, RwLock};
+
+use axum::Router;
+use axum::extract::Request;
+use axum::http::{StatusCode, header};
+use axum::response::Response;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use rustls::ServerConfig;
+use tokio::task::AbortHandle;
+use tower::ServiceExt;
+use tracing::error;
+
+use crate::config::GatewayConfig;
+use crate::server::DirectClientAuth;
+
+/// The router a bound listener serves. Each request runs on the router current
+/// when it arrives, so a swap takes effect on the next request of every
+/// connection, including one kept alive across the swap.
+#[derive(Clone)]
+pub struct SwappableRouter(Arc<RwLock<Router>>);
+
+impl SwappableRouter {
+    pub fn new(router: Router) -> Self {
+        Self(Arc::new(RwLock::new(router)))
+    }
+
+    pub fn swap(
+        &self,
+        router: Router,
+    ) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = router;
+    }
+
+    fn current(&self) -> Router {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The router to serve on a listener: it hands every request to the
+    /// current router.
+    pub fn entry(&self) -> Router {
+        let routers = self.clone();
+        Router::new().fallback(move |request: Request| {
+            let router = routers.current();
+            async move {
+                let response: Result<Response, Infallible> = router.oneshot(request).await;
+                response.unwrap_or_else(|never| match never {})
+            }
+        })
+    }
+}
+
+/// What a port listener binds: its socket addresses and whether it speaks TLS.
+/// A listener is bound again only when this changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortBinding {
+    pub addresses: Vec<SocketAddr>,
+    pub tls: bool,
+}
+
+/// A bound, serving port listener. Dropping it stops the listener, and a
+/// connection it accepted before then is refused with `503` and closed, so its
+/// client reconnects instead of keeping the routes the listener had.
+pub struct BoundPort {
+    binding: PortBinding,
+    router: SwappableRouter,
+    tls: Option<RustlsConfig>,
+    handle: AbortHandle,
+}
+
+impl BoundPort {
+    /// Bind `binding` and serve `router` on it. A TLS binding needs
+    /// `tls_config`; `capture_peer_certs` passes direct-TLS client certificates
+    /// on to each request.
+    pub async fn bind(
+        port: u16,
+        binding: PortBinding,
+        router: Router,
+        tls_config: Option<Arc<ServerConfig>>,
+        capture_peer_certs: bool,
+    ) -> anyhow::Result<Self> {
+        let tls = match (binding.tls, tls_config) {
+            (true, Some(tls_config)) => Some(RustlsConfig::from_config(tls_config)),
+            (true, None) => anyhow::bail!("Port {port} speaks TLS but has no TLS configuration"),
+            (false, _) => None,
+        };
+        let listeners = super::server::bind_inbound_listeners(&binding.addresses).await?;
+        let router = SwappableRouter::new(router);
+        let app = router.entry();
+        let serve_tls = tls.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = serve(listeners, app, serve_tls, capture_peer_certs).await {
+                error!("Port listener error for port {port}: {e}");
+            }
+        })
+        .abort_handle();
+        Ok(Self { binding, router, tls, handle })
+    }
+
+    /// Whether this listener is still serving and bound as `binding` asks.
+    pub fn serves(
+        &self,
+        binding: &PortBinding,
+    ) -> bool {
+        self.binding == *binding && !self.handle.is_finished()
+    }
+
+    pub fn speaks_tls(&self) -> bool {
+        self.binding.tls
+    }
+
+    /// Serve `router` from the next request on, and `tls_config`, when given,
+    /// from the next TLS handshake on, without unbinding the port.
+    pub fn swap(
+        &self,
+        router: Router,
+        tls_config: Option<Arc<ServerConfig>>,
+    ) {
+        self.router.swap(router);
+        if let (Some(tls), Some(tls_config)) = (&self.tls, tls_config) {
+            tls.reload_from_config(tls_config);
+        }
+    }
+}
+
+impl Drop for BoundPort {
+    fn drop(&mut self) {
+        self.router
+            .swap(stopped_router());
+        self.handle.abort();
+    }
+}
+
+fn stopped_router() -> Router {
+    Router::new().fallback(|| async { (StatusCode::SERVICE_UNAVAILABLE, [(header::CONNECTION, "close")]) })
+}
+
+/// The TLS configuration of a port listener, from the gateway certificate.
+/// `None`, logged, when it cannot be loaded: a listener already bound keeps
+/// the configuration it has, and a new one is not bound.
+pub fn listener_tls_config(
+    port: u16,
+    config: &GatewayConfig,
+    direct_client_auth: Option<&Arc<DirectClientAuth>>,
+) -> Option<Arc<ServerConfig>> {
+    crate::server::load_server_config(
+        &config.tls.cert_path,
+        &config.tls.key_path,
+        direct_client_auth
+            .map(|auth| auth.as_ref())
+            .cloned(),
+    )
+    .inspect_err(|e| error!("Could not load the TLS configuration of port {port}: {e}"))
+    .ok()
+}
+
+async fn serve(
+    listeners: Vec<tokio::net::TcpListener>,
+    app: Router,
+    tls: Option<RustlsConfig>,
+    capture_peer_certs: bool,
+) -> anyhow::Result<()> {
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    match tls {
+        Some(tls) => {
+            let acceptor = RustlsAcceptor::new(tls);
+            let servers = listeners
+                .into_iter()
+                .map(axum_server::Server::<SocketAddr>::from_listener);
+            if capture_peer_certs {
+                futures::future::try_join_all(servers.map(|server| {
+                    server
+                        .acceptor(crate::source_auth::peer_cert::PeerCertAcceptor::new(acceptor.clone()))
+                        .serve(make_service.clone())
+                }))
+                .await?;
+            } else {
+                futures::future::try_join_all(servers.map(|server| {
+                    server
+                        .acceptor(acceptor.clone())
+                        .serve(make_service.clone())
+                }))
+                .await?;
+            }
+        }
+        None => {
+            futures::future::try_join_all(
+                listeners
+                    .into_iter()
+                    .map(|listener| axum::serve(listener, make_service.clone()).into_future()),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+
+    fn router_answering(path: &'static str) -> Router {
+        Router::new().route(path, get(move || async move { path }))
+    }
+
+    async fn status_of(
+        router: &SwappableRouter,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        router
+            .entry()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_swapped_router_serves_its_routes_and_drops_the_old_ones() {
+        let router = SwappableRouter::new(router_answering("/old"));
+        assert_eq!(status_of(&router, "/old").await, axum::http::StatusCode::OK);
+
+        router.swap(router_answering("/new"));
+
+        assert_eq!(status_of(&router, "/new").await, axum::http::StatusCode::OK);
+        assert_eq!(status_of(&router, "/old").await, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    fn loopback_binding() -> PortBinding {
+        PortBinding {
+            addresses: vec![SocketAddr::from(([127, 0, 0, 1], 0))],
+            tls: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listener_serves_another_binding_only_when_it_is_the_same() {
+        let bound = BoundPort::bind(0, loopback_binding(), router_answering("/"), None, false)
+            .await
+            .unwrap();
+
+        assert!(bound.serves(&loopback_binding()));
+        assert!(!bound.serves(&PortBinding {
+            tls: true,
+            ..loopback_binding()
+        }));
+        assert!(!bound.serves(&PortBinding {
+            addresses: vec![SocketAddr::from(([127, 0, 0, 2], 0))],
+            tls: false,
+        }));
+    }
+
+    /// Send `GET /` on `connection` and return the response head, lower-cased,
+    /// or `None` when the connection is closed instead.
+    async fn get_on<S>(connection: &mut tokio::io::BufReader<S>) -> Option<String>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        connection
+            .get_mut()
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .ok()?;
+        let mut head = String::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            if connection
+                .read_line(&mut line)
+                .await
+                .ok()?
+                == 0
+            {
+                return None;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            let line = line.to_ascii_lowercase();
+            if let Some(value) = line.strip_prefix("content-length:") {
+                content_length = value.trim().parse().ok()?;
+            }
+            head.push_str(&line);
+        }
+        let mut body = vec![0; content_length];
+        connection
+            .read_exact(&mut body)
+            .await
+            .ok()?;
+        Some(head)
+    }
+
+    fn free_loopback_binding(tls: bool) -> PortBinding {
+        PortBinding {
+            addresses: vec![
+                std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap(),
+            ],
+            tls,
+        }
+    }
+
+    /// A server configuration for a self-signed `localhost` certificate, and
+    /// a client that trusts it.
+    fn localhost_tls() -> (Arc<ServerConfig>, tokio_rustls::TlsConnector) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(certificate.der().clone())
+            .unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (Arc::new(server), tokio_rustls::TlsConnector::from(Arc::new(client)))
+    }
+
+    /// Whether a new TLS connection to `address` completes its handshake
+    /// with a client trusting only the certificate `connector` trusts.
+    async fn handshakes(
+        address: SocketAddr,
+        connector: &tokio_rustls::TlsConnector,
+    ) -> bool {
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .unwrap();
+        connector
+            .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_swapped_tls_configuration_serves_its_certificate_from_the_next_handshake() {
+        let (first, trusts_first) = localhost_tls();
+        let (rotated, trusts_rotated) = localhost_tls();
+        let binding = free_loopback_binding(true);
+        let address = binding.addresses[0];
+        let bound = BoundPort::bind(address.port(), binding, router_answering("/"), Some(first), false)
+            .await
+            .unwrap();
+        assert!(handshakes(address, &trusts_first).await);
+        assert!(!handshakes(address, &trusts_rotated).await);
+
+        bound.swap(router_answering("/"), Some(rotated));
+
+        assert!(handshakes(address, &trusts_rotated).await, "the rotated certificate is served");
+        assert!(!handshakes(address, &trusts_first).await, "the previous certificate is no longer served");
+
+        bound.swap(router_answering("/"), None);
+
+        assert!(
+            handshakes(address, &trusts_rotated).await,
+            "a swap without a TLS configuration keeps the certificate served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tls_connection_kept_alive_past_its_listener_is_refused_and_closed() {
+        let (server, connector) = localhost_tls();
+        let binding = free_loopback_binding(true);
+        let address = binding.addresses[0];
+        let bound = BoundPort::bind(address.port(), binding, router_answering("/"), Some(server), false)
+            .await
+            .unwrap();
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .unwrap();
+        let stream = connector
+            .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        let mut connection = tokio::io::BufReader::new(stream);
+        let before = get_on(&mut connection).await;
+        assert!(
+            before
+                .as_deref()
+                .is_some_and(|head| head.starts_with("http/1.1 200")),
+            "{before:?}"
+        );
+
+        drop(bound);
+
+        let head = get_on(&mut connection)
+            .await
+            .expect("a TLS connection outlives its listener and is answered");
+        assert!(head.starts_with("http/1.1 503"), "{head}");
+        assert!(head.contains("connection: close"), "{head}");
+        assert_eq!(get_on(&mut connection).await, None, "the connection is closed");
+    }
+
+    #[tokio::test]
+    async fn a_plain_connection_kept_alive_past_its_listener_is_closed() {
+        let binding = free_loopback_binding(false);
+        let address = binding.addresses[0];
+        let bound = BoundPort::bind(address.port(), binding, router_answering("/"), None, false)
+            .await
+            .unwrap();
+        let mut connection = tokio::io::BufReader::new(
+            tokio::net::TcpStream::connect(address)
+                .await
+                .unwrap(),
+        );
+        let before = get_on(&mut connection).await;
+        assert!(
+            before
+                .as_deref()
+                .is_some_and(|head| head.starts_with("http/1.1 200")),
+            "{before:?}"
+        );
+
+        drop(bound);
+
+        assert_eq!(get_on(&mut connection).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_tls_binding_without_a_tls_configuration_is_not_bound() {
+        let error = BoundPort::bind(
+            0,
+            PortBinding {
+                tls: true,
+                ..loopback_binding()
+            },
+            router_answering("/"),
+            None,
+            false,
+        )
+        .await
+        .err()
+        .expect("a TLS binding needs a TLS configuration");
+
+        assert_eq!(error.to_string(), "Port 0 speaks TLS but has no TLS configuration");
+    }
+}

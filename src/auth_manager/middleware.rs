@@ -98,21 +98,7 @@ pub fn extract_session_token_from_headers(headers: &axum::http::HeaderMap) -> Op
     }
 
     // 2. Fall back to cookie (SAML mode sets HttpOnly __Host-session_token cookie)
-    if let Some(cookie_header) = headers.get(axum::http::header::COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        for cookie in cookie_str.split(';') {
-            let parts: Vec<&str> = cookie
-                .trim()
-                .splitn(2, '=')
-                .collect();
-            if parts.len() == 2 && parts[0] == session_cookie::SESSION_COOKIE_NAME && !parts[1].is_empty() {
-                return Some(parts[1].to_string());
-            }
-        }
-    }
-
-    None
+    session_cookie::session_cookie_value(headers).map(str::to_string)
 }
 
 /// Combined state required by the global session-auth middleware.

@@ -1,4 +1,5 @@
 pub mod agent_card_preview;
+pub mod credential_references;
 pub mod credential_save;
 pub mod given;
 pub mod identities;
@@ -6,7 +7,11 @@ pub mod management_routes;
 pub mod names;
 pub mod policy_changes;
 pub mod provider_token;
+pub mod secret_force_delete_audit;
 pub mod sts;
+pub mod target_auth_audit;
+pub mod target_auth_save;
+pub mod target_credential;
 pub mod terms;
 pub mod then;
 pub mod when;
