@@ -457,6 +457,14 @@ pub(crate) fn loggable_id<T: StorableEntity>(id: &str) -> Cow<'_, str> {
     }
 }
 
+/// The id that stores a record keyed by a bearer token, such as a session token: the
+/// token's SHA-256 in hex. Neither the file name nor the record holds the token, and a
+/// presented token finds its record by this hash.
+pub(crate) fn token_storage_id(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
 /// `path`, the file of the record `id`, as it may appear in logs and errors. For a
 /// secret id the file name is rebuilt from [`loggable_id`] and the rest of the file
 /// name; a file name that does not start with `id` is redacted as by [`loggable::record_path`].
@@ -1599,33 +1607,96 @@ pub async fn move_entities_to_dir<T: StorableEntity>(
     Ok(moved)
 }
 
+/// Removes every record file in `storage_dir` that holds a `T` under another name than
+/// its id, such as a record an earlier version named by a session token that is now
+/// stored under the token's hash. Encrypted files are decrypted with the global
+/// storage config only to read their id; a file that cannot be read stays in place.
+/// Returns the number of files removed.
+pub async fn remove_entities_not_named_by_id<T: StorableEntity>(
+    storage_dir: &Path,
+    entity_name: &str,
+) -> Result<usize> {
+    if !storage_dir.is_dir() {
+        return Ok(0);
+    }
+    let config = get_global_storage_config();
+    let mut entries = fs::read_dir(storage_dir)
+        .await
+        .context("Failed to read storage directory")?;
+
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let (id, encrypted) = match file_name.strip_suffix(".json.enc") {
+            Some(id) => (id, true),
+            None => match file_name.strip_suffix(".json") {
+                Some(id) => (id, false),
+                None => continue,
+            },
+        };
+        let Some(mut entity) = load_file_as::<T>(&path, encrypted, &config).await else {
+            continue;
+        };
+        entity.on_load();
+        if entity.id() == id {
+            continue;
+        }
+        match fs::remove_file(&path).await {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(
+                "Failed to remove {} file {:?} not named by its id: {}",
+                entity_name,
+                loggable_path::<T>(&path, id),
+                e
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    if removed > 0 {
+        sync_directory(storage_dir).await?;
+    }
+    Ok(removed)
+}
+
 /// Whether the record file at `path` holds a `T`.
 async fn file_loads_as<T: StorableEntity>(
     path: &Path,
     encrypted: bool,
     config: &StorageConfig,
 ) -> bool {
-    let Ok(content) = fs::read(path).await else {
-        return false;
-    };
+    load_file_as::<T>(path, encrypted, config)
+        .await
+        .is_some()
+}
+
+/// The `T` the record file at `path` holds, if it holds one.
+async fn load_file_as<T: StorableEntity>(
+    path: &Path,
+    encrypted: bool,
+    config: &StorageConfig,
+) -> Option<T> {
+    let content = fs::read(path).await.ok()?;
     let json = if encrypted {
-        let Some(encryption_service) = config
+        let envelope = String::from_utf8(content).ok()?;
+        config
             .encryption_service
-            .as_ref()
-        else {
-            return false;
-        };
-        let Ok(envelope) = String::from_utf8(content) else {
-            return false;
-        };
-        match encryption_service.decrypt_string(envelope) {
-            Ok(decrypted) => decrypted.into_bytes(),
-            Err(_) => return false,
-        }
+            .as_ref()?
+            .decrypt_string(envelope)
+            .ok()?
+            .into_bytes()
     } else {
         content
     };
-    deserialize_migrated::<T>(&json).is_ok()
+    deserialize_migrated::<T>(&json)
+        .ok()
+        .map(|(entity, _)| entity)
 }
 
 // ============================================================================
@@ -3228,6 +3299,13 @@ mod tests {
     }
 
     #[test]
+    fn a_tokens_storage_id_is_its_sha256_in_hex() {
+        assert_eq!(token_storage_id("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_ne!(token_storage_id(SECRET_ID), token_storage_id("0f2c9d7e"));
+        assert!(!token_storage_id(SECRET_ID).contains(SECRET_ID));
+    }
+
+    #[test]
     fn loggable_id_counts_characters_of_a_non_ascii_secret_id() {
         assert_eq!(loggable_id::<SecretIdEntity>("ключ-ключ-ключ-ключ"), "ключ-клю...");
         assert_eq!(loggable_id::<SecretIdEntity>("ключ-ключ"), loggable::REDACTED);
@@ -3451,6 +3529,54 @@ mod tests {
                 .await
                 .unwrap(),
             Some(secret_id_entity())
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_entities_not_named_by_id_removes_only_misnamed_records_of_the_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let (encryption_service, _) = test_encryption_service();
+        let config = StorageConfig::default().with_encryption_service(encryption_service);
+        set_test_storage_config(config.clone());
+        let other = TestEntity {
+            id: "member-1".to_string(),
+            name: "Member".to_string(),
+            value: 1,
+        };
+        save_entity_to_disk(dir, "secret_entity", &config, &secret_id_entity())
+            .await
+            .unwrap();
+        save_entity_to_disk(dir, "test_entity", &config, &other)
+            .await
+            .unwrap();
+        let encrypted_misnamed = dir.join("misnamed-encrypted.json.enc");
+        std::fs::copy(get_encrypted_path(dir, SECRET_ID), &encrypted_misnamed).unwrap();
+        let plaintext_misnamed = dir.join("misnamed-plaintext.json");
+        std::fs::write(&plaintext_misnamed, serde_json::to_vec(&secret_id_entity()).unwrap()).unwrap();
+        let other_misnamed = dir.join("member-2.json");
+        std::fs::write(&other_misnamed, serde_json::to_vec(&other).unwrap()).unwrap();
+        std::fs::write(dir.join("unreadable.json.enc"), "not an envelope").unwrap();
+
+        let removed = remove_entities_not_named_by_id::<SecretIdEntity>(dir, "secret_entity")
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!encrypted_misnamed.exists());
+        assert!(!plaintext_misnamed.exists());
+        assert!(get_encrypted_path(dir, SECRET_ID).exists());
+        assert!(get_encrypted_path(dir, "member-1").exists());
+        assert!(other_misnamed.exists());
+        assert!(
+            dir.join("unreadable.json.enc")
+                .exists()
+        );
+        assert_eq!(
+            remove_entities_not_named_by_id::<SecretIdEntity>(&dir.join("missing"), "secret_entity")
+                .await
+                .unwrap(),
+            0
         );
     }
 
