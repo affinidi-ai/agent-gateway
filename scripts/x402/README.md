@@ -1,13 +1,12 @@
-# X402 Payment Verification Configuration
+# X402 Settlement Configuration
 
-This directory contains configuration and utilities for X402 payment verification using the embedded facilitator.
+This directory contains configuration and utilities for settling stored x402 payments using the embedded facilitator.
 
 ## Overview
 
-The agent-gateway embeds the x402 facilitator functionality directly, eliminating the need for a separate Docker service. The facilitator handles:
-
-- **Verification**: Validates EIP-3009 and Permit2 payment signatures on-chain
-- **Settlement**: Executes payment settlements to the treasury address
+The agent-gateway no longer verifies x402 payments: a surface charges through agent-pay. The embedded
+facilitator only settles x402 payments that were verified locally before that change, executing
+them to the treasury address.
 
 ## Configuration Files
 
@@ -258,23 +257,14 @@ generated configuration with embedded keys is not committed. Keep it that way in
 Located at `src/x402/embedded_facilitator.rs`, the embedded facilitator:
 
 - Uses `x402-facilitator-local` crate (same implementation as standalone service)
-- Initializes lazily on first payment verification
+- Initializes lazily on first settlement
 - Detects configuration changes via hash validation and auto-reinitializes
-- Supports both verification and settlement operations
-- Single implementation serves both local verification and fabric facilitator modes
 
 ### Integration Points
 
-**Local Verification (`verification_mode: "local"`):**
-
-1. Payment received with EIP-3009/Permit2 signature
-2. `verify_local_payment()` calls embedded facilitator
-3. Facilitator verifies signature and on-chain state via RPC
-4. Returns success/failure to request handler
-
 **Settlement (when enabled):**
 
-1. Verified payment stored for settlement
+1. A stored, verified payment is picked up by the settlement worker or startup recovery
 2. Facilitator uses private key to execute on-chain settlement
 3. Transaction sent via configured RPC endpoint
 4. Settlement status tracked and logged

@@ -1,10 +1,38 @@
-/** Shape of a gateway record as returned by `GET /gateways`. */
+import type { ConnectionRuntimeStatus } from './connectionHealth';
+
+/** What a remote gateway is for: a Fabric peer, or an agent-pay gateway that takes payments. */
+export type GatewayRole = 'peer' | 'payment';
+
+export type GatewayStatus = 'active' | 'pending' | 'awaiting-approval' | 'disabled' | 'failed';
+
+/** Shape of a gateway record as returned by `GET /gateways` and `GET /payment-gateways`. */
 export interface GatewayRecord {
   id: string;
   name: string;
   gateway_type: string;
   status?: string;
   creation_type?: string;
+  role?: GatewayRole;
+}
+
+/** A full gateway list item, with its runtime health. */
+export interface GatewayListItem extends GatewayRecord {
+  description: string;
+  did: string;
+  gateway_type: 'self' | 'remote';
+  status: GatewayStatus;
+  created_at: string;
+  updated_at: string;
+  runtime_status?: ConnectionRuntimeStatus;
+  /** Remote gateways: when a listener last heard from the peer; absent until it has. */
+  peer_last_seen_at?: string | null;
+  exposure_mode?: ExposureMode | null;
+  exposed_channels?: string[];
+}
+
+/** Whether a gateway is still waiting to be connected or approved. */
+export function isGatewayPending(gw: { status?: string }): boolean {
+  return gw.status === 'pending' || gw.status === 'awaiting-approval';
 }
 
 /**
@@ -13,13 +41,18 @@ export interface GatewayRecord {
  *
  * Filters to `gateway_type === 'remote'` (excludes the self gateway) and
  * `status === 'active'` (excludes pending / awaiting-approval / failed /
- * disabled peers). Deliberately independent of `creation_type`: the fabric
+ * disabled peers) and never a payment gateway, which is not a Fabric routing
+ * target. Deliberately independent of `creation_type`: the fabric
  * link is bidirectional, so a peer auto-created by accepting an inbound
  * connection (`creation_type: 'system'`) is just as routable as one created
  * locally via the OOB wizard (`creation_type: 'user'`).
  */
-export function isSelectableRemoteGateway(gw: { gateway_type?: string; status?: string }): boolean {
-  return gw.gateway_type === 'remote' && gw.status === 'active';
+export function isSelectableRemoteGateway(gw: {
+  gateway_type?: string;
+  status?: string;
+  role?: string;
+}): boolean {
+  return gw.gateway_type === 'remote' && gw.status === 'active' && gw.role !== 'payment';
 }
 
 /**
@@ -27,9 +60,9 @@ export function isSelectableRemoteGateway(gw: { gateway_type?: string; status?: 
  * fabric routing target (see {@link isSelectableRemoteGateway}). Tolerates a
  * missing / non-array payload by returning an empty list.
  */
-export function filterSelectableGateways<T extends { gateway_type?: string; status?: string }>(
-  gateways: T[] | null | undefined
-): T[] {
+export function filterSelectableGateways<
+  T extends { gateway_type?: string; status?: string; role?: string },
+>(gateways: T[] | null | undefined): T[] {
   return Array.isArray(gateways) ? gateways.filter(isSelectableRemoteGateway) : [];
 }
 

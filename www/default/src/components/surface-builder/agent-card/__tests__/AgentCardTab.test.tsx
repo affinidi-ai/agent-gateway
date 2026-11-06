@@ -542,19 +542,15 @@ describe('AgentCardTab, header facts and notes', () => {
     );
   });
 
-  it('notes payment and surface variants', async () => {
-    await showBody(previewBody({ payment_required: true }), { hasVariants: true });
-    expect(screen.getByTestId('agent-card-payment')).toHaveTextContent(
-      'Callers pay before they get this card.'
-    );
+  it('notes surface variants', async () => {
+    await showBody(previewBody(), { hasVariants: true });
     expect(screen.getByTestId('agent-card-variant-note')).toHaveTextContent(
       'This shows the base route. A Surface Variant may serve a different card.'
     );
   });
 
-  it('omits those notes when they do not apply', async () => {
+  it('omits the variant note when the surface has none', async () => {
     await showBody(previewBody());
-    expect(screen.queryByTestId('agent-card-payment')).not.toBeInTheDocument();
     expect(screen.queryByTestId('agent-card-variant-note')).not.toBeInTheDocument();
   });
 

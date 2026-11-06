@@ -118,22 +118,6 @@ pub fn origin(url: &str) -> String {
     }
 }
 
-/// `error`'s text with every rendering of `url` replaced by its [`origin`], for client
-/// errors that quote the endpoint they failed to reach.
-pub fn error_without_url(
-    error: &impl std::fmt::Display,
-    url: &str,
-) -> String {
-    let origin = origin(url);
-    let normalized = url::Url::parse(url)
-        .map(String::from)
-        .unwrap_or_default();
-    [url, normalized.as_str()]
-        .into_iter()
-        .filter(|rendering| !rendering.is_empty())
-        .fold(error.to_string(), |text, rendering| text.replace(rendering, &origin))
-}
-
 /// The directory of a storage file whose name can be a credential, with the file name
 /// replaced by [`REDACTED`].
 pub fn record_path(path: &Path) -> PathBuf {
@@ -247,20 +231,6 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(uri(&onboarding), "/onboard/0f2c9d7e.../rpc?code=<redacted>");
-    }
-
-    #[test]
-    fn test_error_without_url_keeps_only_the_origin() {
-        let error = "error sending request for url (https://rpc.example.com/v2/provider-key/)";
-        assert_eq!(
-            error_without_url(&error, "https://rpc.example.com/v2/provider-key"),
-            "error sending request for url (https://rpc.example.com/)"
-        );
-        assert_eq!(
-            error_without_url(&"error for url (https://host.example/key)", "https://HOST.example/key"),
-            "error for url (https://host.example)"
-        );
-        assert_eq!(error_without_url(&"connection refused", "https://rpc.example.com/v2/key"), "connection refused");
     }
 
     #[test]

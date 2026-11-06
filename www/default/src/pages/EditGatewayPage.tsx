@@ -14,6 +14,7 @@ import IssuerDidsCard, {
   issuerDidsFromGateway,
 } from './EditGatewayPage/IssuerDidsCard';
 import GlobalPolicyTab from './EditGatewayPage/GlobalPolicyTab';
+import UseAsPaymentGatewayButton from '../components/gateways/UseAsPaymentGatewayButton';
 
 interface GatewayForm {
   name: string;
@@ -28,6 +29,8 @@ interface GatewayForm {
 interface GatewayMetadata {
   created_at: string;
   updated_at: string;
+  /** The stored status, which the Enabled checkbox does not change until saved. */
+  status: string;
 }
 
 interface RemoteChannel {
@@ -134,6 +137,7 @@ const EditGatewayPage: React.FC = () => {
       setGatewayMetadata({
         created_at: response.data.created_at,
         updated_at: response.data.updated_at,
+        status: response.data.status,
       });
       setRuntimeStatus(response.data.runtime_status ?? null);
       setIssuerDids(issuerDidsFromGateway(response.data));
@@ -364,6 +368,19 @@ const EditGatewayPage: React.FC = () => {
             </h6>
           </div>
           <div>
+            {isEditMode && id && gatewayMetadata && (
+              <UseAsPaymentGatewayButton
+                gateway={{
+                  id,
+                  name: form.name,
+                  gateway_type: form.gateway_type,
+                  status: gatewayMetadata.status,
+                }}
+                onError={setError}
+                testId="gateway-use-as-payment-button"
+                className="me-2"
+              />
+            )}
             {isEditMode && (
               <button
                 className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}

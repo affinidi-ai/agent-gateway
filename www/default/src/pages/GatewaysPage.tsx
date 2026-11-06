@@ -6,17 +6,15 @@ import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
 import { usePermissions } from '../context/PermissionsContext';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
-import {
-  ConnectionHealthBadge,
-  ConnectionRuntimeStatus,
-  errorCodeLabel,
-  reconnectAtLabel,
-} from '../utils/connectionHealth';
+import { ConnectionHealthBadge, ConnectionRuntimeStatus } from '../utils/connectionHealth';
+import type { GatewayListItem } from '../utils/gateways';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { EmptyState } from '../components/shared/EmptyState';
 import FieldHelp from '../components/shared/FieldHelp';
+import GatewayStatusCell from '../components/gateways/GatewayStatusCell';
+import UseAsPaymentGatewayButton from '../components/gateways/UseAsPaymentGatewayButton';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 
@@ -27,16 +25,7 @@ const LOADING_STYLE: React.CSSProperties = {
   minHeight: '60vh',
 };
 
-interface Gateway {
-  id: string;
-  name: string;
-  description: string;
-  did: string;
-  gateway_type: 'self' | 'remote';
-  status: 'active' | 'disabled' | 'pending' | 'failed' | 'awaiting-approval';
-  created_at: string;
-  updated_at: string;
-  runtime_status?: ConnectionRuntimeStatus;
+interface Gateway extends GatewayListItem {
   /** Remote gateways: the issuer DID the peer attested; null until established. */
   issuer_did?: string | null;
   trusted_issuer_dids?: string[];
@@ -58,6 +47,7 @@ interface ConnectionPoint {
   exposed_channels?: string[]; // List of channel config IDs to expose
   enabled?: boolean; // Whether the connection point is enabled
   did_method?: string;
+  runtime_status?: ConnectionRuntimeStatus;
 }
 
 interface Mediator {
@@ -282,17 +272,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
     [fetchConnectionPoints]
   );
 
-  // Tooltip for a FAILED gateway badge, taken from a broken connection point.
-  // Tooltip / reason for a FAILED gateway badge, from its derived runtime health.
-  const gatewayFailureTooltip = useCallback((gateway: Gateway): string | undefined => {
-    const rt = gateway.runtime_status;
-    if (!rt || rt.status === 'connected') return undefined;
-    const parts = [rt.error_message || errorCodeLabel(rt.error_code), reconnectAtLabel(rt)].filter(
-      Boolean
-    );
-    return parts.length ? parts.join('; ') : undefined;
-  }, []);
-
   const clearPingStatus = useCallback((id: string) => {
     setPingStatus(prev => {
       const next = { ...prev };
@@ -497,39 +476,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                           <small>{formatDateTime(gateway.updated_at, true)}</small>
                         </td>
                         <td>
-                          <span
-                            className={`badge ${
-                              gateway.status === 'active'
-                                ? 'text-bg-success'
-                                : gateway.status === 'failed'
-                                  ? 'text-bg-danger'
-                                  : gateway.status === 'awaiting-approval'
-                                    ? 'text-bg-warning'
-                                    : gateway.status === 'pending'
-                                      ? 'text-bg-warning'
-                                      : 'text-bg-secondary'
-                            }`}
-                            title={
-                              gateway.status === 'failed'
-                                ? gatewayFailureTooltip(gateway)
-                                : undefined
-                            }
-                          >
-                            {gateway.status === 'awaiting-approval'
-                              ? 'AWAITING APPROVAL'
-                              : gateway.status === 'pending'
-                                ? 'PENDING'
-                                : gateway.status.toUpperCase()}
-                          </span>
-                          {gateway.status === 'failed' && gateway.runtime_status && (
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                              {gateway.runtime_status.error_message ||
-                                errorCodeLabel(gateway.runtime_status.error_code)}
-                              {reconnectAtLabel(gateway.runtime_status)
-                                ? `; ${reconnectAtLabel(gateway.runtime_status)}`
-                                : ''}
-                            </div>
-                          )}
+                          <GatewayStatusCell gateway={gateway} />
                           {gateway.gateway_type === 'remote' &&
                             gateway.status === 'active' &&
                             !gateway.issuer_did &&
@@ -616,6 +563,13 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   )}
                               </>
                             )}
+                            <UseAsPaymentGatewayButton
+                              gateway={gateway}
+                              onError={setError}
+                              testId={`gateways-use-as-payment-button-${gateway.id}`}
+                              iconOnly
+                              className="me-1"
+                            />
                             {hasPermission('gateways.delete') &&
                               gateway.gateway_type !== 'self' && (
                                 <DeleteButton

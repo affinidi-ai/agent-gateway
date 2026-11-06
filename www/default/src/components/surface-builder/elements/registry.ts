@@ -76,12 +76,12 @@ class ElementRegistry {
 
   /**
    * Elements available in the palette for a given protocol.
-   * Excludes core elements (auto-created) and protocol-locked items
-   * that don't match the current protocol.
+   * Excludes core elements (auto-created), protocol-locked items
+   * that don't match the current protocol, and the `hidden` types.
    */
-  paletteItems(protocol: Protocol): NodeDefinition[] {
+  paletteItems(protocol: Protocol, hidden: ReadonlySet<string> = new Set()): NodeDefinition[] {
     return this.all()
-      .filter(d => !d.hiddenFromPalette)
+      .filter(d => !d.hiddenFromPalette && !hidden.has(d.type))
       .filter(d => !d.protocols || d.protocols.includes(protocol))
       .sort((a, b) => {
         if (a.paletteCategory !== b.paletteCategory) {
@@ -93,10 +93,11 @@ class ElementRegistry {
 
   /** Group palette items by category. */
   paletteByCategory(
-    protocol: Protocol
+    protocol: Protocol,
+    hidden: ReadonlySet<string> = new Set()
   ): Partial<Record<import('./types').PaletteCategory, NodeDefinition[]>> {
     const out: Partial<Record<import('./types').PaletteCategory, NodeDefinition[]>> = {};
-    for (const def of this.paletteItems(protocol)) {
+    for (const def of this.paletteItems(protocol, hidden)) {
       const list = out[def.paletteCategory] ?? [];
       list.push(def);
       out[def.paletteCategory] = list;
@@ -686,11 +687,8 @@ class ElementRegistry {
       : payload?.target?.default_variant_id;
     const variantList = variants.map((v, idx) => {
       const id = v?.id || `target-variant-${idx + 1}`;
-      // Identity-only shape for the panel. Legacy override fields
-      // (endpoint, policy_definition_id, mpp_*, agent_card_*,
-      // extensions, …) are no longer surfaced here — they live on
-      // `surface.variants[].overrides` and are produced by the
-      // (forthcoming) per-element `VariantEditingContext`.
+      // Identity-only shape for the panel; override fields live on
+      // `surface.variants[].overrides`.
       return {
         id,
         alias: typeof v?.alias === 'string' ? v.alias : '',

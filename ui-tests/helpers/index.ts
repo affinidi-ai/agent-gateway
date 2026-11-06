@@ -7,3 +7,4 @@
 export * from './test-auth';
 export * from './screenshots';
 export * from './wait';
+export * from './featureFlags';

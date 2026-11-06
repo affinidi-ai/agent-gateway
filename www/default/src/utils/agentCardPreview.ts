@@ -80,7 +80,6 @@ export interface SupportedAgentCardPreview {
   cached: boolean;
   fetch: CardFetch;
   auth: CardAuthReport;
-  payment_required: boolean;
   before: CardJson | null;
   after: CardJson | null;
   before_bytes: number | null;
@@ -169,7 +168,6 @@ export function parseAgentCardPreview(body: unknown): AgentCardPreview | null {
     cached: asBool(body.cached),
     fetch,
     auth,
-    payment_required: asBool(body.payment_required),
     before: isRecord(body.before) ? body.before : null,
     after: isRecord(body.after) ? body.after : null,
     before_bytes: asNumber(body.before_bytes),

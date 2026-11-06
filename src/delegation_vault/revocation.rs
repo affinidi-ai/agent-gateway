@@ -1336,6 +1336,8 @@ pub(crate) mod tests {
         /// Sent only once the gate has a permit, after the request is
         /// recorded, so a test can act while a request waits for its answer.
         pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// The request is recorded, then the connection is closed without a response.
+        pub(crate) hang_up: bool,
     }
 
     impl Answer {
@@ -1348,6 +1350,7 @@ pub(crate) mod tests {
                 headers: vec![("Content-Type".into(), "application/json".into())],
                 body: body.to_string(),
                 gate: None,
+                hang_up: false,
             }
         }
 
@@ -1357,6 +1360,15 @@ pub(crate) mod tests {
                 headers: Vec::new(),
                 body: String::new(),
                 gate: None,
+                hang_up: false,
+            }
+        }
+
+        /// No answer: the connection is closed once the request is recorded.
+        pub(crate) fn hung_up() -> Self {
+            Self {
+                hang_up: true,
+                ..Self::status(0)
             }
         }
 
@@ -1464,6 +1476,9 @@ pub(crate) mod tests {
                                 .await
                                 .expect("an open gate")
                                 .forget();
+                        }
+                        if answer.hang_up {
+                            return;
                         }
                         tokio::time::sleep(delay).await;
                         let mut response = format!("HTTP/1.1 {} Status\r\n", answer.status);

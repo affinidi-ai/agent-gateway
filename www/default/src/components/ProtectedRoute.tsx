@@ -5,7 +5,8 @@ import { ROUTES } from '../routes';
 
 interface ProtectedRouteProps {
   children: React.ReactElement;
-  permission: string;
+  /** One permission, or several of which any one is enough. */
+  permission: string | readonly string[];
 }
 
 const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, permission }) => {
@@ -16,8 +17,8 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, permission })
     return null;
   }
 
-  // Check if user has the required permission
-  if (!hasPermission(permission)) {
+  const permissions = typeof permission === 'string' ? [permission] : permission;
+  if (!permissions.some(p => hasPermission(p))) {
     return <Navigate to={ROUTES.DASHBOARD} replace />;
   }
 

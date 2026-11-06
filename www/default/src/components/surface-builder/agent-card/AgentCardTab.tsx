@@ -213,9 +213,6 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({
           refreshing={refreshing}
           onRefresh={handleRefresh}
         />
-        {preview.payment_required && (
-          <Notice testId="agent-card-payment">Callers pay before they get this card.</Notice>
-        )}
         {hasVariants && (
           <Notice testId="agent-card-variant-note">
             This shows the base route. A Surface Variant may serve a different card.

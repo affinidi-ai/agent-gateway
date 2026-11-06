@@ -110,6 +110,9 @@ impl Default for RbacConfig {
         // Trust Registry Management - Admin only (gateway-wide trust source; HIGH severity finding H13)
         permissions.insert("trust_registries.edit".to_string(), "administrator".to_string());
         permissions.insert("trust_registries.delete".to_string(), "administrator".to_string());
+        // Payment Gateway Management - Admin only (decides where every surface's payments are taken)
+        permissions.insert("payment_gateways.edit".to_string(), "administrator".to_string());
+        permissions.insert("payment_gateways.delete".to_string(), "administrator".to_string());
         // Surface Management - Admin only (rewriting a surface redirects traffic and bypasses OPA / auth strategy; HIGH severity findings H1, H6, H16)
         permissions.insert("surfaces.edit".to_string(), "administrator".to_string());
         permissions.insert("surfaces.delete".to_string(), "administrator".to_string());
@@ -158,6 +161,7 @@ impl Default for RbacConfig {
         permissions.insert("gateways.view".to_string(), "user".to_string());
         permissions.insert("mediators.view".to_string(), "poweruser".to_string());
         permissions.insert("trust_registries.view".to_string(), "user".to_string());
+        permissions.insert("payment_gateways.view".to_string(), "user".to_string());
         permissions.insert("surfaces.view".to_string(), "user".to_string());
         // Secrets - Admin only for all operations. There is no per-record owner, so a
         // read grant is a read of every credential the appliance holds.
@@ -228,6 +232,11 @@ pub enum Feature {
     TrustRegistriesView,
     TrustRegistriesEdit,
     TrustRegistriesDelete,
+
+    // Payment Gateway Management
+    PaymentGatewaysView,
+    PaymentGatewaysEdit,
+    PaymentGatewaysDelete,
 
     // Vault Management
     SecretsView,
@@ -353,6 +362,9 @@ impl Feature {
             Feature::TrustRegistriesView => "trust_registries.view",
             Feature::TrustRegistriesEdit => "trust_registries.edit",
             Feature::TrustRegistriesDelete => "trust_registries.delete",
+            Feature::PaymentGatewaysView => "payment_gateways.view",
+            Feature::PaymentGatewaysEdit => "payment_gateways.edit",
+            Feature::PaymentGatewaysDelete => "payment_gateways.delete",
             Feature::SecretsView => "secrets.view",
             Feature::SecretsEdit => "secrets.edit",
             Feature::SecretsDelete => "secrets.delete",
@@ -549,6 +561,8 @@ mod tests {
             // H2, H8
             Feature::GatewaysEdit,
             Feature::GatewaysDelete,
+            Feature::PaymentGatewaysEdit,
+            Feature::PaymentGatewaysDelete,
             Feature::PaymentsEdit,
             Feature::PaymentsDelete,
             // H4

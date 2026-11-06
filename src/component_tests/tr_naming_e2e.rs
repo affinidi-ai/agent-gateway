@@ -9,7 +9,6 @@ use crate::authorities::handlers::{
     CreateAuthorityRequest, UpdateAuthorityRequest, create_authority, update_authority,
 };
 use crate::authorities::{AuthorityStore, FileSystemAuthorityStore};
-use crate::config::agent_surface::AgentSurface;
 use crate::identity::IdentityStore;
 use crate::identity::filesystem::{FilesystemIdentityStore, IdentityOrigin};
 use crate::issuers::types::Issuer;
@@ -154,11 +153,7 @@ async fn surface_rename_republishes_managed_agent_name() {
         .create(managed)
         .await
         .unwrap();
-    let mut surface = AgentSurface {
-        surface_id: "s1".to_string(),
-        name: "OXYGEN".to_string(),
-        ..Default::default()
-    };
+    let mut surface = crate::identity::test_helpers::test_surface_with_managed_identity("s1", "OXYGEN");
     let publisher = ReferenceFieldPublisher::default();
     let client = FakeClient::with_replies(vec![Ok(()), conflict()], vec![]);
     let registries = BTreeSet::from([TR_DID.to_string()]);
@@ -167,12 +162,12 @@ async fn surface_rename_republishes_managed_agent_name() {
         .await
         .unwrap();
     publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, &[]))
         .await;
 
     surface.name = "HELIUM".to_string();
     let outcomes = publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, &[]))
         .await;
 
     assert_eq!(outcomes, vec![PublishOutcome::Updated]);

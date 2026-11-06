@@ -37,6 +37,27 @@ pub enum GatewayCreationType {
     System,
 }
 
+/// What a remote gateway is used for. A payment gateway (agent-pay) takes this
+/// gateway's payments and is never a Fabric routing target; it is managed
+/// under the `payment_gateways.*` features instead of `gateways.*`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayRole {
+    #[default]
+    Peer,
+    Payment,
+}
+
+impl GatewayRole {
+    /// The appliance limit (`limits.json`) a remote gateway of this role counts toward.
+    pub fn limit_dimension(self) -> &'static str {
+        match self {
+            Self::Peer => "connections.gateways",
+            Self::Payment => "connections.paymentgateways",
+        }
+    }
+}
+
 /// Gateway-level OPA policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GatewayOpaPolicyConfig {
@@ -167,6 +188,9 @@ pub struct Gateway {
     #[serde(default)]
     pub creation_type: GatewayCreationType,
 
+    #[serde(default)]
+    pub role: GatewayRole,
+
     /// Timestamp when this record was created
     pub created_at: chrono::DateTime<chrono::Utc>,
 
@@ -227,6 +251,7 @@ impl Gateway {
             trusted_issuer_dids: Vec::new(),
             status: GatewayStatus::Active,
             creation_type,
+            role: GatewayRole::Peer,
             created_at: now,
             updated_at: now,
             exposed_channels: Vec::new(),
@@ -260,6 +285,10 @@ impl Gateway {
     /// holds Fabric streams.
     pub fn is_active_remote_peer(&self) -> bool {
         self.is_active() && self.gateway_type == GatewayType::Remote
+    }
+
+    pub fn is_payment_gateway(&self) -> bool {
+        self.gateway_type == GatewayType::Remote && self.role == GatewayRole::Payment
     }
 
     /// Whether this peer's exposure admits `surface_id`. The tenant rule is

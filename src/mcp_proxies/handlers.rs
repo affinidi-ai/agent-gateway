@@ -565,6 +565,8 @@ pub struct DiscoverMcpToolsRequest {
     pub target_endpoint: Option<String>,
     pub mcp_proxy_id: Option<String>,
     pub target_auth: Option<DiscoverTargetAuthConfig>,
+    #[serde(default)]
+    pub surface_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,9 +579,13 @@ pub struct DiscoverTargetAuthConfig {
     pub fallback: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct DiscoverMcpTool {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -591,11 +597,50 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
     Extension(store): Extension<Arc<S>>,
     Extension(manager): Extension<Arc<McpServerManager>>,
     Extension(secrets_store): Extension<Option<Arc<dyn crate::secrets::SecretsStore>>>,
+    Extension(surface_store): Extension<Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(request): Json<DiscoverMcpToolsRequest>,
 ) -> Result<Json<DiscoverMcpToolsResponse>, (StatusCode, String)> {
-    let tools = if let Some(proxy_id) = resolve_proxy_id(&request) {
+    let tools = if let Some(surface_id) = non_blank(request.surface_id.as_deref()) {
+        let surface =
+            authorized_mcp_surface(&surface_store, surface_id, tenant_context(&context), resource_scope(&scope))
+                .await?;
+        let endpoint = surface
+            .target_endpoint()
+            .trim();
+        if non_blank(
+            request
+                .target_endpoint
+                .as_deref(),
+        )
+        .is_some_and(|draft| draft != endpoint)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "The Target differs from the saved surface. Save the surface to discover its tools.".to_string(),
+            ));
+        }
+        if let Some(proxy_id) = non_blank(endpoint.strip_prefix("proxy://")) {
+            discover_proxy_tools(&store, &manager, proxy_id, tenant_context(&context), resource_scope(&scope)).await?
+        } else if endpoint.starts_with("fabric://") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Tool discovery is not supported for fabric:// MCP targets".to_string(),
+            ));
+        } else {
+            let pinned_client = pin_discovery_client(endpoint, crate::egress::pinned_forward_client).await?;
+            discover_remote_tools(
+                &pinned_client,
+                endpoint,
+                surface.target_auth(),
+                &secrets_store,
+                tenant_context(&context),
+                resource_scope(&scope),
+            )
+            .await?
+        }
+    } else if let Some(proxy_id) = resolve_proxy_id(&request) {
         discover_proxy_tools(&store, &manager, &proxy_id, tenant_context(&context), resource_scope(&scope)).await?
     } else {
         if scope.is_some() {
@@ -622,12 +667,18 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
         let target_endpoint = crate::url_validation::validate_resolved_url(target_endpoint)
             .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid MCP target endpoint: {error}")))?;
 
-        let pinned_client = pin_discovery_client(target_endpoint.as_str()).await?;
+        let pinned_client = pin_discovery_client(target_endpoint.as_str(), crate::egress::pinned_strict_client).await?;
+        let target_auth = request
+            .target_auth
+            .as_ref()
+            .filter(|auth| auth.enabled)
+            .map(to_backend_target_auth_config)
+            .transpose()?;
 
         discover_remote_tools(
             &pinned_client,
             target_endpoint.as_str(),
-            request.target_auth.as_ref(),
+            target_auth.as_ref(),
             &secrets_store,
             tenant_context(&context),
             resource_scope(&scope),
@@ -638,20 +689,60 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
     Ok(Json(DiscoverMcpToolsResponse { tools }))
 }
 
-/// Build a per-request Strict-pinned, redirect-disabled client for MCP tool
-/// discovery against a caller-supplied `target_endpoint`.
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The saved MCP surface `surface_id`, when the caller may read it. A surface
+/// the caller cannot see answers the same `404` as a missing one.
+async fn authorized_mcp_surface(
+    surface_store: &Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    surface_id: &str,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Result<crate::config::agent_surface::AgentSurface, (StatusCode, String)> {
+    let store = surface_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Agent surface store is not configured".to_string()))?;
+    let surface = store
+        .get(surface_id)
+        .await
+        .map_err(|error| {
+            error!(%error, "Failed to load surface for MCP tool discovery");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load surface".to_string())
+        })?
+        .filter(|surface| {
+            can_access(surface.tenant_id.as_deref(), context)
+                && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
+        })
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Surface not found".to_string()))?;
+    if surface.channel_protocol() != crate::config::ChannelProtocol::Mcp {
+        return Err((StatusCode::BAD_REQUEST, "Tool discovery needs an MCP surface".to_string()));
+    }
+    Ok(surface)
+}
+
+type PinDiscoveryTarget =
+    fn(&str, std::time::Duration) -> Result<(reqwest::Client, crate::egress::PinnedTarget), crate::egress::EgressError>;
+
+/// Build a per-request pinned, redirect-disabled client for MCP tool discovery.
 ///
-/// Resolves DNS once and pins the connection to the vetted address so the host
-/// cannot rebind to an internal/metadata IP between validation and connect
-/// (SSRF rebinding TOCTOU). The resolved IP stays log-only; the caller-facing
-/// error keeps the generic "Invalid MCP target endpoint" message.
-async fn pin_discovery_client(target_endpoint: &str) -> Result<reqwest::Client, (StatusCode, String)> {
+/// A caller-supplied `target_endpoint` is pinned with the Strict policy; a
+/// saved surface's Target with the forward step's policy, so discovery reaches
+/// exactly what the surface forwards to. Resolves DNS once and pins the
+/// connection to the vetted address so the host cannot rebind to an
+/// internal/metadata IP between validation and connect (SSRF rebinding TOCTOU).
+/// The resolved IP stays log-only; the caller-facing error keeps the generic
+/// "Invalid MCP target endpoint" message.
+async fn pin_discovery_client(
+    target_endpoint: &str,
+    pin: PinDiscoveryTarget,
+) -> Result<reqwest::Client, (StatusCode, String)> {
     let raw = target_endpoint.to_string();
     let pinned = tokio::task::spawn_blocking(move || {
-        crate::egress::pinned_strict_client(
-            &raw,
-            std::time::Duration::from_secs(crate::http_client::EXTERNAL_TIMEOUT_SECS),
-        )
+        pin(&raw, std::time::Duration::from_secs(crate::http_client::EXTERNAL_TIMEOUT_SECS))
     })
     .await
     .map_err(|error| {
@@ -728,7 +819,11 @@ async fn discover_proxy_tools<S: McpProxyStore>(
         .filter_map(|tool_name| {
             server
                 .get_tool_metadata(&tool_name)
-                .map(|metadata| DiscoverMcpTool { name: metadata.name.clone() })
+                .map(|metadata| DiscoverMcpTool {
+                    name: metadata.name.clone(),
+                    description: metadata.description.clone(),
+                    read_only: None,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -739,7 +834,7 @@ async fn discover_proxy_tools<S: McpProxyStore>(
 async fn discover_remote_tools(
     client: &reqwest::Client,
     target_endpoint: &str,
-    target_auth: Option<&DiscoverTargetAuthConfig>,
+    target_auth: Option<&crate::config::TargetAuthConfig>,
     secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
@@ -786,9 +881,11 @@ async fn discover_remote_tools(
         extra_headers.as_ref(),
     )
     .await?;
-    let response_json = ensure_jsonrpc_success(&tool_list_response)?;
+    tools_from_list_response(&ensure_jsonrpc_success(&tool_list_response)?)
+}
 
-    let mut tools = response_json
+fn tools_from_list_response(response: &serde_json::Value) -> Result<Vec<DiscoverMcpTool>, (StatusCode, String)> {
+    let mut tools = response
         .get("result")
         .and_then(|result| result.get("tools"))
         .and_then(|tools| tools.as_array())
@@ -797,7 +894,16 @@ async fn discover_remote_tools(
         .filter_map(|tool| {
             tool.get("name")
                 .and_then(|name| name.as_str())
-                .map(|name| DiscoverMcpTool { name: name.to_string() })
+                .map(|name| DiscoverMcpTool {
+                    name: name.to_string(),
+                    description: tool
+                        .get("description")
+                        .and_then(|description| description.as_str())
+                        .map(ToOwned::to_owned),
+                    read_only: tool
+                        .pointer("/annotations/readOnlyHint")
+                        .and_then(|hint| hint.as_bool()),
+                })
         })
         .collect::<Vec<_>>();
 
@@ -875,17 +981,15 @@ async fn send_discovery_request(
 }
 
 async fn build_discovery_headers(
-    target_auth: Option<&DiscoverTargetAuthConfig>,
+    target_auth: Option<&crate::config::TargetAuthConfig>,
     secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
     channel_name: &str,
 ) -> Result<Option<ReqwestHeaderMap>, (StatusCode, String)> {
-    let Some(target_auth) = target_auth.filter(|auth| auth.enabled) else {
+    let Some(backend_target_auth) = target_auth else {
         return Ok(None);
     };
-
-    let backend_target_auth = to_backend_target_auth_config(target_auth)?;
 
     let crate::config::TargetAuthMethod::StaticSecret {
         secret_id,
@@ -905,14 +1009,14 @@ async fn build_discovery_headers(
         Ok(Some(secret)) => secret,
         Ok(None) => {
             return discovery_auth_resolution_failure(
-                &backend_target_auth,
+                backend_target_auth,
                 channel_name,
                 format!("Secret with secret_id '{secret_id}' not found"),
             );
         }
         Err(error) => {
             return discovery_auth_resolution_failure(
-                &backend_target_auth,
+                backend_target_auth,
                 channel_name,
                 format!("Failed to load secret '{secret_id}': {error}"),
             );
@@ -2513,7 +2617,7 @@ pub(crate) fn owned_modern_subscription(
     )
 }
 
-/// Why [`handle_mcp_request_with_policies`] answered no MCP result.
+/// Why [`prepare_mcp_request`] refused a request or [`execute_mcp_request`] answered no MCP result.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum McpProxyCallError {
     /// A tool call that carries the Target credential would leave the MCP proxy's base path.
@@ -2652,23 +2756,37 @@ async fn call_legacy_tool(
     .map_err(|error| error.to_string())
 }
 
-/// Handle MCP request with full surface policy support (timeout, retry, circuit breaker, mirroring)
-/// This version applies all network policies for feature parity with A2A channels
-pub async fn handle_mcp_request_with_policies(
+/// An MCP request a proxy can serve, checked and with its MCP server built:
+/// everything that can be refused without calling the backend has been.
+pub struct PreparedMcpRequest {
+    server: McpServer,
+    request: serde_json::Value,
+    call: McpCall,
+}
+
+enum McpCall {
+    Initialize,
+    ToolsList,
+    ToolsCall {
+        tool_name: String,
+        arguments: serde_json::Value,
+        credentialed: Option<Box<(StoredToolCall, ReqwestHeaderMap)>>,
+    },
+}
+
+/// Checks that `proxy` can serve `request` and builds its MCP server: an
+/// active proxy, a readable OpenAPI spec and base URL, a known method and, for a
+/// `tools/call`, a tool the spec defines that, when it carries the Target
+/// credential, stays under the proxy's base path. Nothing is sent to the
+/// backend, so a refusal here can be given before the request is charged.
+pub fn prepare_mcp_request(
     proxy: &super::types::McpProxy,
     request: serde_json::Value,
-    surface: &crate::config::agent_surface::AgentSurface,
-    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
-    client: &reqwest::Client,
-    channel_name: &str,
     target_auth_header: Option<(String, String)>,
-    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
-) -> Result<serde_json::Value, McpProxyCallError> {
+    config_id: &str,
+) -> Result<PreparedMcpRequest, McpProxyCallError> {
     // Check if proxy is active
     if proxy.status != super::types::McpProxyStatus::Active {
-        let config_id = surface
-            .config_id()
-            .unwrap_or("unknown");
         channel_warn!(config_id, "❌ Proxy '{}' is disabled", proxy.name);
         return Err("MCP proxy is disabled"
             .to_string()
@@ -2676,9 +2794,6 @@ pub async fn handle_mcp_request_with_policies(
     }
 
     // Create MCP server from proxy config
-    let config_id = surface
-        .config_id()
-        .unwrap_or("unknown");
     channel_info!(config_id, "Creating MCP server for proxy '{}' at {}", proxy.name, loggable::url(&proxy.base_url));
 
     // Parse the OpenAPI spec from YAML to JSON
@@ -2722,31 +2837,110 @@ pub async fn handle_mcp_request_with_policies(
         .get("method")
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
-    let request_id = request.get("id").cloned();
 
     channel_info!(config_id, "🔧 Handling MCP method: {}", method);
 
-    // Get circuit breaker if configured
-    let circuit_breaker = if surface
-        .circuit_breaker()
-        .is_some()
-    {
-        if let Some(pm) = policy_manager {
-            if let Some(config_id) = surface.config_id() {
-                pm.get_circuit_breaker(config_id)
-                    .await
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let call = match method {
+        "initialize" => McpCall::Initialize,
+        "tools/list" => McpCall::ToolsList,
+        "tools/call" => {
+            let params = request
+                .get("params")
+                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
 
-    match method {
-        "initialize" => {
+            let tool_name = params
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| "Missing tool 'name' in params".to_string())?
+                .to_string();
+
+            let raw_arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+
+            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
+            let arguments = if proxy.flatten_post_params {
+                wrap_request_body_if_needed(&server, &tool_name, raw_arguments)
+            } else {
+                raw_arguments
+            };
+
+            let tool = server
+                .get_tool(&tool_name)
+                .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+            if default_headers.is_some() && tool_call_leaves_base(&base_url, &tool.metadata, &arguments) {
+                channel_warn!(
+                    config_id,
+                    "Refusing a tool call outside the MCP proxy base path: it would carry the Target credential"
+                );
+                return Err(McpProxyCallError::OutsideTargetBase);
+            }
+            let stored_call = default_headers
+                .as_ref()
+                .map(|_| StoredToolCall::prepare(proxy, &server.openapi_spec, tool))
+                .transpose()
+                .map_err(|error| format!("Tool execution failed: {error}"))?;
+            McpCall::ToolsCall {
+                tool_name,
+                arguments,
+                credentialed: stored_call
+                    .zip(default_headers)
+                    .map(Box::new),
+            }
+        }
+        _ => {
+            warn!("❌ Unknown MCP method: {}", method);
+            return Err(format!("Unknown MCP method: {}", method).into());
+        }
+    };
+    Ok(PreparedMcpRequest { server, request, call })
+}
+
+const CIRCUIT_OPEN_ERROR: &str = "Circuit breaker open";
+
+/// Whether `error`, from [`execute_mcp_request`], says the circuit breaker
+/// refused the call, so the request never reached the proxy's backend.
+pub fn is_circuit_open_error(error: &McpProxyCallError) -> bool {
+    matches!(error, McpProxyCallError::Failed(message) if message.starts_with(CIRCUIT_OPEN_ERROR))
+}
+
+/// The circuit breaker of `surface`, when it has one configured.
+pub async fn surface_circuit_breaker(
+    surface: &crate::config::agent_surface::AgentSurface,
+    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+) -> Option<std::sync::Arc<crate::policies::CircuitBreaker>> {
+    surface.circuit_breaker()?;
+    policy_manager?
+        .get_circuit_breaker(surface.config_id()?)
+        .await
+}
+
+/// Handle a prepared MCP request with full surface policy support (timeout,
+/// retry, circuit breaker, mirroring). This applies all network policies for
+/// feature parity with A2A channels. A tool call that carries the Target
+/// credential drops `sent_token`, the issued service token behind it, when the
+/// backend refuses it as invalid.
+pub async fn execute_mcp_request(
+    proxy: &super::types::McpProxy,
+    prepared: PreparedMcpRequest,
+    surface: &crate::config::agent_surface::AgentSurface,
+    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+    client: &reqwest::Client,
+    channel_name: &str,
+    sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+) -> Result<serde_json::Value, McpProxyCallError> {
+    let PreparedMcpRequest { server, request, call } = prepared;
+    let request_id = request.get("id").cloned();
+    let config_id = surface
+        .config_id()
+        .unwrap_or("unknown");
+
+    // Get circuit breaker if configured
+    let circuit_breaker = surface_circuit_breaker(surface, policy_manager).await;
+
+    match call {
+        McpCall::Initialize => {
             channel_info!(config_id, "✓ Returning initialize response for '{}'", proxy.name);
 
             Ok(serde_json::json!({
@@ -2764,7 +2958,7 @@ pub async fn handle_mcp_request_with_policies(
                 }
             }))
         }
-        "tools/list" => {
+        McpCall::ToolsList => {
             let tool_names = server.get_tool_names();
             info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
 
@@ -2792,40 +2986,16 @@ pub async fn handle_mcp_request_with_policies(
                 }
             }))
         }
-        "tools/call" => {
-            let params = request
-                .get("params")
-                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
-
-            let tool_name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| "Missing tool 'name' in params".to_string())?;
-
-            let raw_arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
-            let arguments = if proxy.flatten_post_params {
-                wrap_request_body_if_needed(&server, tool_name, raw_arguments)
-            } else {
-                raw_arguments
-            };
-
-            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
-
+        McpCall::ToolsCall {
+            tool_name,
+            arguments,
+            credentialed,
+        } => {
+            let tool_name = tool_name.as_str();
             let tool = server
                 .get_tool(tool_name)
                 .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
-            if target_auth_header.is_some() && tool_call_leaves_base(&base_url, &tool.metadata, &arguments) {
-                channel_warn!(
-                    config_id,
-                    "Refusing a tool call outside the MCP proxy base path: it would carry the Target credential"
-                );
-                return Err(McpProxyCallError::OutsideTargetBase);
-            }
+            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
 
             let default_limits;
             let limits = match surface.mcp_http.as_ref() {
@@ -2835,16 +3005,10 @@ pub async fn handle_mcp_request_with_policies(
                     &default_limits
                 }
             };
-            let stored_call = default_headers
-                .as_ref()
-                .map(|_| StoredToolCall::prepare(proxy, &server.openapi_spec, tool))
-                .transpose()
-                .map_err(|error| format!("Tool execution failed: {error}"))?;
-            let credentialed = stored_call
-                .as_ref()
-                .zip(default_headers.as_ref());
+            let credentialed = credentialed
+                .as_deref()
+                .map(|(stored, headers)| (stored, headers));
             let call_tool = || call_legacy_tool(tool, &arguments, credentialed, limits, sent_token);
-
             // Apply timeout if configured
             let timeout_duration = surface
                 .timeout()
@@ -2923,7 +3087,7 @@ pub async fn handle_mcp_request_with_policies(
                     Ok(r) => r,
                     Err(crate::policies::CircuitBreakerError::Open { retry_after }) => {
                         error!("Circuit breaker is open for channel '{}', retry after {:?}", channel_name, retry_after);
-                        return Err(format!("Circuit breaker open, retry after {:?}", retry_after).into());
+                        return Err(format!("{CIRCUIT_OPEN_ERROR}, retry after {:?}", retry_after).into());
                     }
                     Err(crate::policies::CircuitBreakerError::Inner(e)) => {
                         return Err(e.into());
@@ -2999,18 +3163,14 @@ pub async fn handle_mcp_request_with_policies(
                 }
             }))
         }
-        _ => {
-            warn!("❌ Unknown MCP method: {}", method);
-            Err(format!("Unknown MCP method: {}", method).into())
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoverMcpToolsRequest, discovery_secret_allowed, ensure_jsonrpc_success, mcp_proxy_allowed,
-        pin_discovery_client, resolve_proxy_id, tool_call_failure,
+        DiscoverMcpTool, DiscoverMcpToolsRequest, discovery_secret_allowed, ensure_jsonrpc_success, mcp_proxy_allowed,
+        pin_discovery_client, resolve_proxy_id, tool_call_failure, tools_from_list_response,
     };
     use crate::mcp_proxies::McpProxyStore;
     use axum::http::StatusCode;
@@ -3021,6 +3181,22 @@ mod tests {
     use crate::auth_manager::pat::PatResourceScope;
     use crate::mcp_proxies::types::McpProxy;
     use crate::tenancy::PatTenantContext;
+
+    /// `request` prepared and, when it can be served, executed, as a surface's
+    /// MCP proxy Target runs it.
+    async fn handle_mcp_request_with_policies(
+        proxy: &super::super::types::McpProxy,
+        request: serde_json::Value,
+        surface: &crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+        client: &reqwest::Client,
+        channel_name: &str,
+        target_auth_header: Option<(String, String)>,
+        sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+    ) -> Result<serde_json::Value, super::McpProxyCallError> {
+        let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name)?;
+        super::execute_mcp_request(proxy, prepared, surface, policy_manager, client, channel_name, sent_token).await
+    }
 
     #[test]
     fn tool_call_failure_names_the_kind_without_url_arguments_or_body() {
@@ -3140,7 +3316,7 @@ mod tests {
                 "{path}"
             );
 
-            let error = super::handle_mcp_request_with_policies(
+            let error = handle_mcp_request_with_policies(
                 &proxy,
                 request.clone(),
                 &surface,
@@ -3230,7 +3406,7 @@ mod tests {
             "params": {"name": "getItem", "arguments": {"id": id}}
         });
         let credential = credential.then(|| ("X-Api-Key".to_string(), "gateway-value".to_string()));
-        super::handle_mcp_request_with_policies(
+        handle_mcp_request_with_policies(
             proxy,
             request,
             &surface,
@@ -3467,7 +3643,7 @@ mod tests {
         });
         let client = reqwest::Client::new();
 
-        let refused = super::handle_mcp_request_with_policies(
+        let refused = handle_mcp_request_with_policies(
             &proxy,
             request.clone(),
             &surface,
@@ -3487,7 +3663,7 @@ mod tests {
         );
         assert_eq!(followed.load(Ordering::SeqCst), 0);
 
-        super::handle_mcp_request_with_policies(&proxy, request, &surface, None, &client, "redirect", None, None)
+        handle_mcp_request_with_policies(&proxy, request, &surface, None, &client, "redirect", None, None)
             .await
             .expect("without a credential the redirect is followed");
         assert_eq!(followed.load(Ordering::SeqCst), 1);
@@ -5354,6 +5530,7 @@ mod tests {
             target_endpoint: Some("proxy://from-target".to_string()),
             mcp_proxy_id: Some("from-field".to_string()),
             target_auth: None,
+            surface_id: None,
         };
 
         assert_eq!(resolve_proxy_id(&request), Some("from-field".to_string()));
@@ -5365,6 +5542,7 @@ mod tests {
             target_endpoint: Some("proxy://weather-tools".to_string()),
             mcp_proxy_id: None,
             target_auth: None,
+            surface_id: None,
         };
 
         assert_eq!(resolve_proxy_id(&request), Some("weather-tools".to_string()));
@@ -5400,7 +5578,7 @@ mod tests {
     #[tokio::test]
     async fn pin_discovery_client_rejects_metadata_and_loopback_without_leaking_ip() {
         for raw in ["http://169.254.169.254/latest/meta-data", "http://127.0.0.1:8080/mcp"] {
-            let err = pin_discovery_client(raw)
+            let err = pin_discovery_client(raw, crate::egress::pinned_strict_client)
                 .await
                 .expect_err("strict pin must reject internal/metadata target");
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -5468,13 +5646,16 @@ mod tests {
                 ("appliance-secret", None, "appliance-value"),
                 ("secret-a", Some("tenant-a"), "tenant-value"),
             ])));
-        let auth = |secret_id: &str| super::DiscoverTargetAuthConfig {
-            enabled: true,
-            method: Some("static_secret".to_string()),
-            secret_id: Some(secret_id.to_string()),
-            header_name: Some("Authorization".to_string()),
-            header_format: Some("Bearer {value}".to_string()),
-            fallback: None,
+        let auth = |secret_id: &str| {
+            super::to_backend_target_auth_config(&super::DiscoverTargetAuthConfig {
+                enabled: true,
+                method: Some("static_secret".to_string()),
+                secret_id: Some(secret_id.to_string()),
+                header_name: Some("Authorization".to_string()),
+                header_format: Some("Bearer {value}".to_string()),
+                fallback: None,
+            })
+            .expect("target auth")
         };
         let context = tenant_a();
         let headers = |result: Result<Option<super::ReqwestHeaderMap>, (StatusCode, String)>| {
@@ -6142,12 +6323,14 @@ mod tests {
             Extension(store.clone()),
             Extension(manager.clone()),
             Extension(None),
+            Extension(None),
             None,
             None,
             Json(DiscoverMcpToolsRequest {
                 mcp_proxy_id: Some(proxy_id.to_string()),
                 target_endpoint: None,
                 target_auth: None,
+                surface_id: None,
             }),
         )
         .await?;
@@ -6156,6 +6339,192 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect())
+    }
+
+    struct SurfaceStore(Vec<crate::config::agent_surface::AgentSurface>);
+
+    #[async_trait::async_trait]
+    impl crate::surfaces::AgentSurfaceStore for SurfaceStore {
+        async fn save(
+            &self,
+            _surface: &crate::config::agent_surface::AgentSurface,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            Ok(self
+                .0
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .cloned())
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+            Ok(self.0.clone())
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn saved_surface(
+        protocol: &str,
+        endpoint: &str,
+        tenant_id: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "local-mcp", "name": "Local MCP",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": protocol},
+            "target": {"endpoint": endpoint}
+        }))
+        .unwrap();
+        surface.tenant_id = tenant_id.map(ToOwned::to_owned);
+        surface
+    }
+
+    async fn discover_with_surfaces(
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+        request: serde_json::Value,
+        context: Option<PatTenantContext>,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(SurfaceStore(surfaces));
+        let Json(response) = super::discover_mcp_tools(
+            Extension(store_with(vec![])),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(None),
+            Extension(Some(surface_store)),
+            context.map(Extension),
+            None,
+            Json(serde_json::from_value(request).unwrap()),
+        )
+        .await?;
+        Ok(response
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    const LOCAL_TOOLS: &str = r#"{"jsonrpc":"2.0","id":"x","result":{"tools":[{"name":"local_tool"}]}}"#;
+
+    #[tokio::test]
+    async fn tool_discovery_reaches_a_saved_surface_loopback_target_it_refuses_by_url() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(LOCAL_TOOLS).await;
+        let surfaces = vec![saved_surface("mcp", &target.url(), None)];
+
+        assert_eq!(
+            discover_with_surfaces(surfaces.clone(), serde_json::json!({"surface_id": "local-mcp"}), None)
+                .await
+                .unwrap(),
+            vec!["local_tool".to_string()]
+        );
+        assert_eq!(
+            discover_with_surfaces(
+                surfaces.clone(),
+                serde_json::json!({"surface_id": "local-mcp", "target_endpoint": format!(" {} ", target.url())}),
+                None
+            )
+            .await
+            .unwrap(),
+            vec!["local_tool".to_string()]
+        );
+
+        let requests_before = target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let refused = discover_with_surfaces(surfaces, serde_json::json!({"target_endpoint": target.url()}), None)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert!(
+            refused
+                .1
+                .starts_with("Invalid MCP target endpoint")
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            requests_before
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_an_unsaved_target_without_dialing_it() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(LOCAL_TOOLS).await;
+        let error = discover_with_surfaces(
+            vec![saved_surface("mcp", &target.url(), None)],
+            serde_json::json!({"surface_id": "local-mcp", "target_endpoint": "http://127.0.0.1:1/other"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            (
+                StatusCode::CONFLICT,
+                "The Target differs from the saved surface. Save the surface to discover its tools.".to_string()
+            )
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_hidden_missing_non_mcp_fabric_and_metadata_targets() {
+        let context = PatTenantContext {
+            token_id: "token-a".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        };
+        let cases = [
+            (saved_surface("mcp", "https://tools.example/mcp", Some("tenant-b")), "local-mcp", Some(context.clone())),
+            (saved_surface("mcp", "https://tools.example/mcp", None), "other", None),
+            (saved_surface("a2a", "https://tools.example/a2a", None), "local-mcp", None),
+            (saved_surface("mcp", "fabric://gw/surface", None), "local-mcp", None),
+            (saved_surface("mcp", "http://169.254.169.254/latest/meta-data", None), "local-mcp", None),
+        ];
+        let expected = [
+            (StatusCode::NOT_FOUND, "Surface not found"),
+            (StatusCode::NOT_FOUND, "Surface not found"),
+            (StatusCode::BAD_REQUEST, "Tool discovery needs an MCP surface"),
+            (StatusCode::BAD_REQUEST, "Tool discovery is not supported for fabric:// MCP targets"),
+            (StatusCode::BAD_REQUEST, "Invalid MCP target endpoint"),
+        ];
+        for ((surface, surface_id, context), (status, message)) in cases
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(
+                discover_with_surfaces(vec![surface], serde_json::json!({"surface_id": surface_id}), context)
+                    .await
+                    .unwrap_err(),
+                (status, message.to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_lists_its_mcp_proxy_target() {
+        let error = discover_with_surfaces(
+            vec![saved_surface("mcp", "proxy://missing-api", None)],
+            serde_json::json!({"surface_id": "local-mcp"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, (StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()));
     }
 
     #[tokio::test]
@@ -6219,6 +6588,54 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn remote_tool_discovery_returns_sorted_tools_with_description_and_read_only_hint() {
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": "tools-list", "result": {"tools": [
+            {"name": "write_note", "annotations": {"readOnlyHint": false}},
+            {"name": "search", "description": "Search the index", "annotations": {"readOnlyHint": true}},
+            {"name": 7},
+            {"description": "nameless"},
+            {"name": "audit", "description": 3, "annotations": {"readOnlyHint": "yes"}}
+        ]}});
+        assert_eq!(
+            tools_from_list_response(&response).unwrap(),
+            vec![
+                DiscoverMcpTool {
+                    name: "audit".to_string(),
+                    description: None,
+                    read_only: None
+                },
+                DiscoverMcpTool {
+                    name: "search".to_string(),
+                    description: Some("Search the index".to_string()),
+                    read_only: Some(true),
+                },
+                DiscoverMcpTool {
+                    name: "write_note".to_string(),
+                    description: None,
+                    read_only: Some(false)
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&tools_from_list_response(&response).unwrap()[0]).unwrap(),
+            serde_json::json!({"name": "audit"})
+        );
+    }
+
+    #[test]
+    fn remote_tool_discovery_rejects_a_response_without_a_tool_list() {
+        for response in [
+            serde_json::json!({"jsonrpc": "2.0", "id": "tools-list", "result": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "tools-list", "result": {"tools": {"name": "x"}}}),
+        ] {
+            assert_eq!(
+                tools_from_list_response(&response).unwrap_err(),
+                (StatusCode::BAD_GATEWAY, "MCP server returned an invalid tools/list response".to_string())
+            );
+        }
     }
 
     #[tokio::test]

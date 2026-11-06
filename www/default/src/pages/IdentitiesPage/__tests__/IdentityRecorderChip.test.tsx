@@ -111,6 +111,33 @@ describe('IdentityRecorderChip', () => {
     );
   });
 
+  it('names the surface whose outcome a shared managed DID shows', async () => {
+    render(
+      <IdentityRecorderChip
+        status={status('failed')}
+        surface={{ surface_id: 's-bravo', surface_name: 'bravo' }}
+      />
+    );
+
+    expect(
+      screen.getByRole('button', { name: 'Trust Recorder status on bravo: Failed' })
+    ).toBeInTheDocument();
+    await userEvent.tab();
+
+    expect(await screen.findByTestId('identities-recorder-surface')).toHaveTextContent(
+      'Recorder on bravo'
+    );
+  });
+
+  it('names no surface when the outcome has none', async () => {
+    render(<IdentityRecorderChip status={status('recorded')} />);
+
+    await userEvent.tab();
+
+    expect(await screen.findByTestId('identities-recorder-tooltip')).toBeInTheDocument();
+    expect(screen.queryByTestId('identities-recorder-surface')).not.toBeInTheDocument();
+  });
+
   it('says No attempt yet when there is no attempt time and no entries', async () => {
     render(<IdentityRecorderChip status={status('not_attempted')} />);
 

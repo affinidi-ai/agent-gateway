@@ -1,0 +1,15 @@
+branch: increase-rust-version
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-06T13:18:18Z'
+      title: Build the gateway with Rust 1.99.1, now the minimum version
+      description: >-
+        Building from source now needs Rust 1.99.1 or newer; Cargo refuses older
+        toolchains. CI, release builds and the Docker image build on 1.99.1 instead of
+        1.95.0, which brings the compiler miscompilation fixes and the Cargo and libssh2
+        security fixes released since 1.95.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

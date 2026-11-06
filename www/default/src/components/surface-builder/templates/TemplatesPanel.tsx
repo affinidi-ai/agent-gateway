@@ -19,7 +19,12 @@ import React, { useState } from 'react';
 import type { CanvasNode } from '../SurfaceCanvas';
 import type { Protocol } from '../elements/types';
 import type { SurfaceTemplate, SurfaceTemplateItem } from '../../../api';
-import { sortTemplatesForDisplay, templateMatchesProtocol } from './templateSort';
+import {
+  sortTemplatesForDisplay,
+  templateMatchesProtocol,
+  templateTakesPayments,
+} from './templateSort';
+import { useAgentPayFlag } from '../../../utils/featureFlags';
 import { useSurfaceTemplates } from './useSurfaceTemplates';
 import CreateTemplateForm from './CreateTemplateForm';
 import { DeleteButton } from '../../shared/DeleteButton';
@@ -69,6 +74,7 @@ const TemplatesPanel: React.FC<TemplatesPanelProps> = ({
 }) => {
   const { templates, loading, error, refresh, create, update, remove, importTemplate } =
     useSurfaceTemplates();
+  const { enabled: agentPayOn } = useAgentPayFlag();
   const [filter, setFilter] = useState('');
   const [kindTab, setKindTab] = useState<'full' | 'partial'>('partial');
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -147,9 +153,10 @@ const TemplatesPanel: React.FC<TemplatesPanelProps> = ({
   // Each tab is sorted by the optional `sort_priority` field (lower
   // first; ties on name) so authored builtins appear in a stable,
   // curated order regardless of API insertion order.
-  const fullTemplates = sortTemplatesForDisplay(templates.filter(t => t.kind === 'full'));
+  const offered = agentPayOn ? templates : templates.filter(t => !templateTakesPayments(t));
+  const fullTemplates = sortTemplatesForDisplay(offered.filter(t => t.kind === 'full'));
   const partialTemplates = sortTemplatesForDisplay(
-    templates.filter(t => t.kind !== 'full' && templateMatchesProtocol(t, protocol))
+    offered.filter(t => t.kind !== 'full' && templateMatchesProtocol(t, protocol))
   );
   const visibleTemplates = kindTab === 'full' ? fullTemplates : partialTemplates;
   const lowered = filter.trim().toLowerCase();

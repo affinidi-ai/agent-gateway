@@ -16,8 +16,8 @@ use crate::observability::loggable;
 use crate::state::{MultiSurfaceProxyState, SurfaceInfo};
 
 // ── Credential delegation global stores ──────────────────────────────────────
-// Follows the same OnceLock pattern used for mpp_transaction_store and
-// trust_registry_listener_manager in gateways/connection_points/message_processor.rs
+// Follows the same OnceLock pattern used for trust_registry_listener_manager
+// in gateways/connection_points/message_processor.rs
 
 static GLOBAL_CREDENTIAL_PROVIDER_STORE: OnceLock<
     Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>,
@@ -915,20 +915,6 @@ pub async fn build_port_router(
 
     let channel_infos_arc = Arc::new(RwLock::new(channel_infos));
 
-    // Use the global transaction store (created unconditionally in orchestrator.rs)
-    // This single store handles ALL x402 operations:
-    // - HTTP payment middleware (GW1 role: create payment, send to facilitator)
-    // - DIDComm message handlers (GW2 role: receive verify/settle requests)
-    // - Admin API (serves UI data)
-    // - Settlement worker (processes transactions where facilitator_gateway_id == this gateway)
-    let transaction_store = crate::gateways::connection_points::message_processor::get_transaction_store();
-    if transaction_store.is_none() {
-        warn!("Transaction store not initialized - x402 payment processing will fail");
-    }
-
-    // Transaction store workers (cleanup, crash recovery, settlement) are spawned in orchestrator.rs
-    // No duplicate workers needed here - all x402 operations use the single global store
-
     let state = Arc::new(MultiSurfaceProxyState {
         config: Arc::clone(&config),
         network_config: Arc::clone(&network_config),
@@ -944,8 +930,6 @@ pub async fn build_port_router(
         policy_manager: policy_manager.clone(),
         gateway_policy_manager: gateway_policy_manager.clone(),
         didauth_session_store: Arc::clone(&didauth_session_store),
-        transaction_store: transaction_store.clone(),
-        mpp_transaction_store: crate::gateways::connection_points::message_processor::get_mpp_transaction_store(),
         trust_registry_listener_manager:
             crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
         source_auth_middleware: source_auth_middleware.clone(),
@@ -1336,39 +1320,11 @@ pub async fn build_port_router(
         }
     }
 
-    // x402 e2e test endpoints — gated on `facilitator_mode.enable_test_endpoints`.
-    // These are unauthenticated conformance surfaces (incl. POST /close) and
-    // must stay off in non-test deployments.
     if config
         .facilitator_mode
         .enable_test_endpoints
     {
-        info!("Adding x402 multi-chain test endpoints: /protected (EVM + Solana), /health, /close");
-
-        let test_endpoints_config = match bootstrap_config.load_test_endpoints_config() {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                warn!("Failed to load test endpoints config: {}. Test endpoints will use default values.", e);
-                Arc::new(crate::config::TestEndpointsConfig {
-                    evm: None,
-                    solana_devnet: None,
-                    solana_mainnet: None,
-                })
-            }
-        };
-
-        let x402_test_router = axum::Router::new()
-            .route("/protected", axum::routing::get(crate::x402::protected_eip3009))
-            .route("/protected-permit2", axum::routing::get(crate::x402::protected_permit2))
-            .route("/protected-solana-devnet", axum::routing::get(crate::x402::protected_solana_devnet))
-            .route("/protected-solana-mainnet", axum::routing::get(crate::x402::protected_solana_mainnet))
-            .route("/health", axum::routing::get(crate::x402::test_health))
-            .route("/close", axum::routing::post(crate::x402::test_close))
-            .with_state(test_endpoints_config);
-
-        app = app.merge(x402_test_router);
-    } else {
-        info!("x402 test endpoints disabled (facilitator_mode.enable_test_endpoints=false)");
+        warn!("facilitator_mode.enable_test_endpoints is ignored: the x402 test endpoints are no longer served");
     }
 
     // Proxy {TP_OUTBOUND_PATH_PREFIX}/* to the outbound listener when inbound and outbound share a hostname.
@@ -1420,17 +1376,11 @@ pub async fn build_port_router(
         app = app.merge(secrets_router_ref.clone());
     }
 
-    // Merge x402 HTTP Facilitator API router if enabled in gateway config
     if config
         .facilitator_mode
         .facilitator_via_http
     {
-        info!("Merging x402 HTTP Facilitator API router at /api/x402 (standard spec endpoints)");
-        let http_facilitator_state = crate::x402::HttpFacilitatorState {
-            channels: state.channels.clone(),
-        };
-        let http_facilitator_router = crate::x402::create_http_facilitator_router().with_state(http_facilitator_state);
-        app = app.nest("/api/x402", http_facilitator_router);
+        warn!("facilitator_mode.facilitator_via_http is ignored: the /api/x402 facilitator is no longer served");
     }
 
     // Process fallback routes last so they don't override specific routes

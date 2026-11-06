@@ -4,8 +4,17 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::types::{Gateway, GatewayType};
+use super::types::{ExposureMode, Gateway, GatewayRole, GatewayType};
 use crate::storage::filesystem::{StorageBackend, cached_storage};
+
+/// What [`FileSystemGatewayStore::migrate_payment_roles`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentRoleMigration {
+    /// Peers made payment gateways.
+    pub migrated: usize,
+    /// Peers left peers because a surface routes to them over `fabric://`.
+    pub skipped: usize,
+}
 
 /// Filesystem-based implementation of GatewayStore with in-memory cache
 ///
@@ -73,6 +82,71 @@ impl FileSystemGatewayStore {
             }
         }
         Ok(migrated)
+    }
+
+    /// Makes a payment gateway reaching no local surface of every remote peer
+    /// that an `agent_pay` policy of a surface it may serve names, so those
+    /// surfaces keep charging through it. Like turning a peer into a payment
+    /// gateway through the API, a peer that a surface routes to over `fabric://`
+    /// is left a peer with a warning; the payment gate refuses the surfaces
+    /// charging through it until it is made a payment gateway.
+    pub async fn migrate_payment_roles(
+        &self,
+        surfaces: &[crate::config::agent_surface::AgentSurface],
+    ) -> Result<PaymentRoleMigration> {
+        let mut migration = PaymentRoleMigration::default();
+        for mut gateway in self.list_all().await? {
+            if gateway.gateway_type != GatewayType::Remote || gateway.role != GatewayRole::Peer {
+                continue;
+            }
+            let named = surfaces
+                .iter()
+                .filter(|surface| {
+                    crate::tenancy::can_reference(surface.tenant_id.as_deref(), gateway.tenant_id.as_deref())
+                })
+                .any(|surface| {
+                    surface
+                        .payment_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                });
+            if !named {
+                continue;
+            }
+            let fabric_routes = surfaces
+                .iter()
+                .filter(|surface| {
+                    surface
+                        .fabric_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                })
+                .count();
+            if fabric_routes > 0 {
+                tracing::warn!(
+                    gateway_id = %gateway.id,
+                    gateway_name = %gateway.name,
+                    fabric_routes,
+                    "Not migrating a gateway that takes payments to a payment gateway: {fabric_routes} surface(s) \
+                     route to it over fabric://. The surfaces charging through it answer 503 payment_unavailable \
+                     until those routes point elsewhere and it is turned into a payment gateway (Use as payment \
+                     gateway, which needs the agent_pay_delegation feature flag)"
+                );
+                migration.skipped += 1;
+                continue;
+            }
+            tracing::info!(
+                gateway_id = %gateway.id,
+                exposure_mode = ?gateway.exposure_mode,
+                "Migrating a gateway that takes payments to a payment gateway reaching no local surface"
+            );
+            gateway.role = GatewayRole::Payment;
+            gateway.exposure_mode = Some(ExposureMode::None);
+            gateway
+                .exposed_channels
+                .clear();
+            self.update(&gateway).await?;
+            migration.migrated += 1;
+        }
+        Ok(migration)
     }
 
     /// Reconcile the in-memory cache with the shared-storage directory, so a
@@ -242,6 +316,124 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn surface(
+        tenant_id: Option<&str>,
+        endpoint: &str,
+        payment_gateway_id: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": format!("{payment_gateway_id}-{endpoint}"),
+            "name": payment_gateway_id,
+            "tenant_id": tenant_id,
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/x", "protocol": "mcp"},
+            "target": {
+                "endpoint": endpoint,
+                "payment_policy": {
+                    "type": "agent_pay",
+                    "payment_gateway_id": payment_gateway_id,
+                    "payment_surface_id": "pay-1",
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrate_payment_roles_turns_only_named_remote_peers_into_payment_gateways() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
+            .await
+            .expect("store");
+        let remote = |id: &str, tenant_id: Option<&str>, exposure_mode: ExposureMode| {
+            let mut gateway =
+                Gateway::new(id.into(), String::new(), format!("did:web:{id}.example"), GatewayType::Remote);
+            gateway.id = id.into();
+            gateway.tenant_id = tenant_id.map(str::to_string);
+            gateway.exposure_mode = Some(exposure_mode);
+            gateway
+        };
+        let mut agent_pay = remote("agent-pay", None, ExposureMode::None);
+        agent_pay.exposed_channels = vec!["s1".to_string()];
+        for gateway in [
+            agent_pay,
+            remote("exposed", None, ExposureMode::List),
+            remote("routed", None, ExposureMode::None),
+            remote("tenant-b", Some("b"), ExposureMode::None),
+            remote("routing-peer", None, ExposureMode::None),
+        ] {
+            store
+                .create(&gateway)
+                .await
+                .expect("create");
+        }
+        let self_id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::SelfGateway)
+            .unwrap()
+            .id;
+        let surfaces = [
+            surface(Some("a"), "https://up.example", "agent-pay"),
+            surface(None, "https://up.example", "exposed"),
+            surface(None, "https://up.example", "routed"),
+            surface(None, "fabric://routed/s", "gone"),
+            surface(Some("a"), "https://up.example", "tenant-b"),
+            surface(None, "https://up.example", &self_id),
+        ];
+
+        assert_eq!(
+            store
+                .migrate_payment_roles(&surfaces)
+                .await
+                .unwrap(),
+            PaymentRoleMigration { migrated: 2, skipped: 1 }
+        );
+        let role_of = |id: String| {
+            let store = &store;
+            async move {
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .role
+            }
+        };
+        for id in ["agent-pay", "exposed"] {
+            let migrated = store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(migrated.role, GatewayRole::Payment, "{id}");
+            assert_eq!(migrated.exposure_mode, Some(ExposureMode::None), "{id} reaches no local surface");
+            assert!(
+                migrated
+                    .exposed_channels
+                    .is_empty(),
+                "{id}"
+            );
+        }
+        for (id, why) in [
+            ("routed", "a fabric:// route stays a peer"),
+            ("tenant-b", "another tenant's surface cannot name it"),
+            ("routing-peer", "no surface names it"),
+        ] {
+            assert_eq!(role_of(id.into()).await, GatewayRole::Peer, "{why}");
+        }
+        assert_eq!(role_of(self_id).await, GatewayRole::Peer);
+        assert_eq!(
+            store
+                .migrate_payment_roles(&surfaces)
+                .await
+                .unwrap(),
+            PaymentRoleMigration { migrated: 0, skipped: 1 },
+            "a migrated gateway is not migrated again, and a skipped one is reported every time"
+        );
+    }
 
     #[tokio::test]
     async fn a_management_request_records_the_gateway_policies_its_writes_attach_and_detach() {

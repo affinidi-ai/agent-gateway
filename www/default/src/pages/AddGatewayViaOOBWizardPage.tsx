@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './OnboardWizard.css';
+import WizardProgress from '../components/shared/WizardProgress';
 
 // Import step components
 import EnterDetailsStep from '../components/gateway-add-via-oob/EnterDetailsStep';
@@ -138,13 +139,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
           />
         );
       case 'complete':
-        return (
-          <CompleteStep
-            gateway={wizardState.gateway}
-            onFinish={handleFinish}
-            onViewGateway={handleViewGateway}
-          />
-        );
+        return <CompleteStep onFinish={handleFinish} onViewGateway={handleViewGateway} />;
       default:
         return null;
     }
@@ -177,37 +172,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
         </div>
       )}
 
-      {/* Progress Bar */}
-      <div className="card shadow mb-4">
-        <div className="card-body">
-          <div className="wizard-progress">
-            <div className="wizard-steps">
-              {steps.map((step, index) => (
-                <div
-                  key={step.key}
-                  className={`wizard-step ${
-                    index === currentStepIndex
-                      ? 'active'
-                      : index < currentStepIndex
-                        ? 'completed'
-                        : ''
-                  }`}
-                >
-                  <div className="wizard-step-circle">
-                    {index < currentStepIndex ? (
-                      <i className="fas fa-check  me-1"></i>
-                    ) : (
-                      <span>{index + 1}</span>
-                    )}
-                  </div>
-                  <div className="wizard-step-label">{step.label}</div>
-                  {index < steps.length - 1 && <div className="wizard-step-line"></div>}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
+      <WizardProgress steps={steps} currentIndex={currentStepIndex} />
 
       {/* Step Content */}
       <div className="wizard-content">{renderStep()}</div>

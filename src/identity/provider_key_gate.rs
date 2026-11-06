@@ -893,7 +893,7 @@ mod tests {
         async fn list_all(&self) -> crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>> {
             if self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_ok()
             {
                 return Err(std::io::Error::other("store offline").into());

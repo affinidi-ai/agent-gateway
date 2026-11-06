@@ -12,6 +12,9 @@ interface ConnectStepProps {
   onConnected: (gateway: any) => void;
   onBack: () => void;
   onCancel: () => void;
+  /** The connect-via-OOB route that creates the record. */
+  endpoint?: string;
+  title?: string;
 }
 
 const ConnectStep: React.FC<ConnectStepProps> = ({
@@ -24,6 +27,8 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   onConnected,
   onBack,
   onCancel,
+  endpoint = '/gateways/connect-via-oob',
+  title = 'Connecting to Gateway',
 }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -50,7 +55,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
       setStatusMessage('Establishing DIDComm connection...');
 
       // Call the backend API to accept the OOB invitation and connect to the gateway
-      const response = await apiClient.post('/gateways/connect-via-oob', {
+      const response = await apiClient.post(endpoint, {
         oob_url: oobLink,
         secret: secret,
         name: name,
@@ -86,16 +91,16 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   };
 
   return (
-    <div className="card shadow">
+    <div className="card shadow" data-testid="wizard-step-connect">
       <div className="card-header py-3">
         <h6 className="m-0 font-weight-bold text-primary">
-          <i className="fas fa-plug me-2"></i> Connecting to Gateway
+          <i className="fas fa-plug me-2"></i> {title}
         </h6>
       </div>
       <div className="card-body">
         {error ? (
           <>
-            <div className="alert alert-danger" role="alert">
+            <div className="alert alert-danger" role="alert" data-testid="wizard-oob-connect-error">
               <i className="fas fa-exclamation-circle me-2"></i>
               <strong>Connection Failed</strong>
               <p className="mb-0 mt-2">{error}</p>
@@ -119,6 +124,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                 size="md"
                 onClick={onCancel}
                 iconStart={<i className="fas fa-times"></i>}
+                data-testid="wizard-cancel"
               >
                 Cancel
               </AppButton>
@@ -129,6 +135,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                   size="md"
                   onClick={onBack}
                   iconStart={<i className="fas fa-arrow-left"></i>}
+                  data-testid="wizard-back"
                 >
                   Back
                 </AppButton>
@@ -138,6 +145,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                   size="md"
                   onClick={handleRetry}
                   iconStart={<i className="fas fa-redo"></i>}
+                  data-testid="wizard-oob-connect-retry-button"
                 >
                   Retry
                 </AppButton>

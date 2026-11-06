@@ -45,6 +45,7 @@ fn gateway_values(
             ("GATEWAY_DESCRIPTION".to_string(), gateway.description.clone()),
             ("GATEWAY_DID".to_string(), gateway.did.clone()),
             ("GATEWAY_TYPE".to_string(), format!("{:?}", gateway.gateway_type)),
+            ("GATEWAY_ROLE".to_string(), format!("{:?}", gateway.role)),
             ("GATEWAY_STATUS".to_string(), format!("{:?}", gateway.status)),
         ]);
     }
@@ -78,6 +79,7 @@ mod tests {
         let new_state: serde_json::Value = serde_json::from_str(&values["NEW_STATE"]).expect("json");
         assert_eq!(new_state["name"], "edge");
         assert_eq!(values["GATEWAY_ID"], created.id);
+        assert_eq!(values["GATEWAY_ROLE"], "Peer");
         assert_eq!(values["GATEWAY_NAME"], "edge");
         assert_eq!(values["GATEWAY_DESCRIPTION"], "Edge gateway");
         assert_eq!(values["GATEWAY_DID"], "did:web:edge.example");
