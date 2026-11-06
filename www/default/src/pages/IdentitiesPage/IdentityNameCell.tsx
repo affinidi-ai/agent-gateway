@@ -18,6 +18,8 @@ interface IdentityNameCellProps {
   identity: NamedIdentity;
   liveSurfaceName?: string;
   showName?: boolean;
+  showDid?: boolean;
+  fallbackName?: string;
 }
 
 export const parseAgentName = (name: string): { host: string; local: string } | null => {
@@ -76,11 +78,14 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
   identity,
   liveSurfaceName,
   showName = true,
+  showDid = true,
+  fallbackName,
 }) => {
   const shared = showName && isSharedManagedDid(identity);
   const displayName = showName && !shared ? identity.display_name : undefined;
   const pending = showName && !shared && !displayName && identity.display_name_pending === true;
   const didIsPrimary = !shared && !displayName && !pending;
+  const nameOnlyFallback = !showDid && didIsPrimary;
 
   return (
     <div className="d-inline-flex flex-column">
@@ -116,15 +121,29 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
           resolving…
         </small>
       )}
-      <div className="d-inline-flex align-items-center flex-nowrap">
-        <code
-          style={{ fontSize: didIsPrimary ? undefined : '0.75rem', whiteSpace: 'nowrap' }}
-          title={identity.did}
-        >
-          {topAndTail(identity.did, 20, 16)}
-        </code>
-        <CopyButton text={identity.did} title="Copy DID" data-testid="identities-copy-did-button" />
-      </div>
+      {nameOnlyFallback &&
+        (fallbackName ? (
+          <strong data-testid="identities-name">{fallbackName}</strong>
+        ) : (
+          <span className="text-muted" data-testid="identities-name-empty">
+            -
+          </span>
+        ))}
+      {showDid && (
+        <div className="d-inline-flex align-items-center flex-nowrap">
+          <code
+            style={{ fontSize: didIsPrimary ? undefined : '0.75rem', whiteSpace: 'nowrap' }}
+            title={identity.did}
+          >
+            {topAndTail(identity.did, 20, 16)}
+          </code>
+          <CopyButton
+            text={identity.did}
+            title="Copy DID"
+            data-testid="identities-copy-did-button"
+          />
+        </div>
+      )}
     </div>
   );
 };

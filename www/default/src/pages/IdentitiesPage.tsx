@@ -486,13 +486,14 @@ const IdentitiesPage: React.FC = () => {
                         <table className="table table-hover table-sm identities-table">
                           <thead>
                             <tr>
-                              <th>{hasNamingMetadata ? 'Identity' : 'DID'}</th>
+                              <th>Agent Name</th>
+                              <th>DID</th>
                               <th>Agent Surface</th>
                               <th>Trust Score</th>
                               <th>Attestation</th>
                               <th title="Universal Agent Identifier">UAI</th>
                               <th>Created</th>
-                              <th>Usage Count</th>
+                              {/* <th>Usage Count</th> */}
                               <th>Last Used</th>
                               <th>Origin</th>
                               {hasRecorderStatus && <th>Recorder</th>}
@@ -523,6 +524,8 @@ const IdentitiesPage: React.FC = () => {
                                         <IdentityNameCell
                                           identity={identity}
                                           showName={hasNamingMetadata}
+                                          showDid={false}
+                                          fallbackName={identity.metadata?.agent_name}
                                           liveSurfaceName={
                                             identity.surface_id
                                               ? liveSurfaceNames.get(identity.surface_id)
@@ -530,6 +533,9 @@ const IdentitiesPage: React.FC = () => {
                                           }
                                         />
                                       </div>
+                                    </td>
+                                    <td>
+                                      <IdentityNameCell identity={identity} showName={false} />
                                       {identity.version !== undefined &&
                                         identity.version !== null && (
                                           <span className="badge badge-primary ml-2">
@@ -639,11 +645,11 @@ const IdentitiesPage: React.FC = () => {
                                           : 'Never'}
                                       </small>
                                     </td>
-                                    <td>
+                                    {/* <td>
                                       <small>
                                         {identity.usage_count || identity.use_count || 0}
                                       </small>
-                                    </td>
+                                    </td> */}
                                     <td>
                                       <small>
                                         {identity.last_used_at || identity.last_used
@@ -744,7 +750,7 @@ const IdentitiesPage: React.FC = () => {
                                   </tr>
                                   {isExpanded && (
                                     <tr className="expanded-detail-row">
-                                      <td colSpan={hasRecorderStatus ? 11 : 10} className="p-0">
+                                      <td colSpan={hasRecorderStatus ? 12 : 11} className="p-0">
                                         <div className="p-3">
                                           <div
                                             className="accordion"
