@@ -2355,7 +2355,7 @@ mod tests {
             .gate
             .refuses(&naming("own", "tenant-a", external(KEY_A)))
             .await;
-        let lenient = crate::identity::handlers::surface_tenancy::provider_key_owners_in(other_node.as_ref()).await;
+        let lenient = crate::identity::handlers::surface_tenancy::provider_key_listing_in(other_node.as_ref()).await;
         let strict = complete_provider_key_listing_in(other_node.as_ref()).await;
         let cross = [naming("cross", "tenant-a", external(KEY_B))];
         let reported = crate::identity::handlers::credential_policy_report::report_key_owners(
@@ -2373,7 +2373,7 @@ mod tests {
             "the report does not read a key in the folder as missing"
         );
         assert_eq!(
-            lenient.unwrap(),
+            lenient.unwrap().owners,
             HashMap::from([(KEY_A.to_string(), vec!["owner-a".to_string()])]),
             "the save rule's listing leaves the folder out"
         );

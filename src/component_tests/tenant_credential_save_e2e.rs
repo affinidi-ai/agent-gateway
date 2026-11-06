@@ -1630,6 +1630,10 @@ fn another_surfaces_key(key_id: &str) -> String {
     format!("API key '{key_id}' belongs to another surface; a surface names only its own API keys")
 }
 
+fn revoked_key(key_id: &str) -> String {
+    format!("API key '{key_id}' is revoked; name an active API key of this surface")
+}
+
 impl Api {
     async fn api_key(
         &self,
@@ -1647,6 +1651,21 @@ impl Api {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    async fn revoke_api_key(
+        &self,
+        surface_id: &str,
+        key_id: &str,
+    ) {
+        let (status, body) = self
+            .send(
+                self.client
+                    .post(self.url(&format!("api-keys/{surface_id}/{key_id}/revoke")))
+                    .json(&json!({})),
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
     }
 
     async fn assert_create_refused(
@@ -2284,6 +2303,115 @@ async fn a_new_legacy_secret_named_like_another_surfaces_key_is_refused() {
         &another_surfaces_key(NAMED_KEY),
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_reference_to_an_own_revoked_key_is_refused_and_an_active_one_saved() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let owner = api
+        .created_id(&api.surface("/smoke/revoked-own", Some("tenant-a"), json!({})))
+        .await;
+    let active = api.api_key(&owner).await;
+    let revoked = api.api_key(&owner).await;
+    api.revoke_api_key(&owner, &revoked)
+        .await;
+
+    let mut named = api.stored(&owner).await;
+    named["identity_slots"] = json!({"protected": from_api_key(&revoked)});
+    api.assert_put_refused(&owner, &named, &revoked_key(&revoked))
+        .await;
+    api.assert_patch_refused(
+        &owner,
+        &json!({"identity_slots": {"external": from_api_key(&revoked)}}),
+        &revoked_key(&revoked),
+    )
+    .await;
+    let mut point = api.stored(&owner).await;
+    point["transit"] = transit_point_identity(&revoked);
+    api.assert_put_refused(&owner, &point, &revoked_key(&revoked))
+        .await;
+    let mut variant = api.stored(&owner).await;
+    variant["variants"] = json!([{
+        "id": "variant-id", "alias": "variant", "name": "Variant", "enabled": true,
+        "overrides": {"identity_slots": {"protected": from_api_key(&revoked)}}
+    }]);
+    api.assert_put_refused(&owner, &variant, &revoked_key(&revoked))
+        .await;
+    let mut injected = api.stored(&owner).await;
+    injected["target"]["identity_injection"] = from_api_key(&revoked);
+    api.assert_put_refused(&owner, &injected, &revoked_key(&revoked))
+        .await;
+
+    assert_saved(
+        api.put_with(&owner, json!({"identity_slots": {"protected": from_api_key(&active)}}))
+            .await,
+    );
+    assert_eq!(api.stored(&owner).await["identity_slots"]["protected"]["api_key_id"], json!(active));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_reference_to_an_own_key_revoked_later_is_kept_on_save() {
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let (_harness, api) = harness(mode).await;
+        let owner = api
+            .created_id(&api.surface("/smoke/revoked-later", Some("tenant-a"), json!({})))
+            .await;
+        let key_id = api.api_key(&owner).await;
+        assert_saved(
+            api.put_with(&owner, json!({"identity_slots": {"protected": from_api_key(&key_id)}}))
+                .await,
+        );
+        api.revoke_api_key(&owner, &key_id)
+            .await;
+
+        let stored = api.stored(&owner).await;
+        assert_saved(api.put(&owner, &stored).await);
+        assert_eq!(api.stored(&owner).await["identity_slots"]["protected"]["api_key_id"], json!(key_id), "{mode:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_tenants_revoked_key_is_refused_without_naming_its_status() {
+    let (_harness, api) = harness(RuleMode::Warn).await;
+    let other = api
+        .created_id(&api.surface("/smoke/revoked-other-tenant", Some("tenant-b"), json!({})))
+        .await;
+    let key_id = api.api_key(&other).await;
+    api.revoke_api_key(&other, &key_id)
+        .await;
+    let plain = api
+        .created_id(&api.surface("/smoke/revoked-other-user", Some("tenant-a"), json!({})))
+        .await;
+
+    let mut named = api.stored(&plain).await;
+    named["identity_slots"] = json!({"protected": from_api_key(&key_id)});
+    api.assert_put_refused(&plain, &named, NOT_ACCESSIBLE_KEY_OWNER)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_legacy_secret_named_like_an_own_revoked_key_is_refused() {
+    let (_harness, api) = harness_seeded(RuleMode::Warn, |bootstrap| {
+        seed_named_key(bootstrap);
+        super::helpers::write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            NAMED_KEY,
+            "legacy-secret-value",
+        );
+    })
+    .await;
+    api.revoke_api_key(NAMED_KEY_OWNER, NAMED_KEY)
+        .await;
+
+    let mut legacy = api
+        .stored(NAMED_KEY_OWNER)
+        .await;
+    legacy["identity_slots"] = json!({"inbound": {"type": "from_api_key"}});
+    legacy["access_point"]["caller_authentication"] = legacy_caller(NAMED_KEY);
+    api.assert_put_refused(NAMED_KEY_OWNER, &legacy, &revoked_key(NAMED_KEY))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
