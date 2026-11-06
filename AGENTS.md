@@ -63,7 +63,11 @@ changes:
 ## Tests
 
 - **Unit**: `#[cfg(test)] mod tests` inline in each module.
-- **Component**: `src/component_tests/` (helpers in `src/component_tests/helpers/`). Cross-module flows without Docker.
+- **Behaviour**: the acceptance layer. Gherkin scenarios under `tests/features/surface/` (`surface_bdd`, one gateway) and `tests/features/g2g/` (`g2g_bdd`, two gateways over the fabric). Every new behaviour an operator or caller can observe gets a scenario here; behaviour seen in the dashboard goes to Playwright in `ui-tests/`. After adding or changing a `.feature` file or a step binding, run `python3 scripts/bdd-gherkin.py --lint`; errors block, and CI runs the same check.
+  - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
+  - Exercise the real gateway through its public interfaces.
+  - Assert what the caller or operator observes, not internal state.
+- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
 ## Frontend conventions
@@ -321,9 +325,10 @@ Do not summarise these here. Update the owning document in the same change as th
 
 1. Clarify requirements first — one question at a time. Capture durable decisions in stable repo docs only when they truly belong there.
 2. Design interfaces/structure before code.
-3. Incremental steps validated by unit tests.
-4. Keep stable docs in sync, but do not treat temporary implementation or design plans as source of truth.
-5. Unit tests must assert returned values, not just no-error.
+3. Prepare Gherkin scenarios for each observable feature behaviour.
+4. Incremental steps, each test-first: write the unit test, watch it fail for the reason the step exists, then make it pass. A test that was never red proves nothing.
+5. Keep stable docs in sync, but do not treat temporary implementation or design plans as source of truth.
+6. Unit tests must assert returned values, not just no-error.
 
 ## Commands to run
 
@@ -356,3 +361,4 @@ directly.
 3. `cargo test --no-fail-fast --all-targets --all-features`
 4. If `www/default/` files changed: `cd www/default && npx prettier --write src && npm run lint`
 5. If MCP admission, forwarding or owned dispatch changed: `make mcp-conformance`
+6. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`

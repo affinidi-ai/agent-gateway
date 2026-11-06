@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::observability::loggable;
 use crate::storage::filesystem::{
-    StorableEntity, StorageBackend, in_memory_storage_with_timeout, loggable_id, move_entities_to_dir, rwlock_storage,
+    StorableEntity, StorageBackend, in_memory_storage_with_timeout, loggable_id, move_entities_to_dir,
+    remove_entities_not_named_by_id, rwlock_storage, token_storage_id,
 };
 
 /// Storage entity name of DID Auth sessions.
@@ -22,10 +22,13 @@ const ENTITY_NAME: &str = "didauth_session";
 const STORAGE_SUBDIRECTORY: &str = "didauth";
 
 /// Session information for an authenticated DID
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DidAuthSession {
-    /// The session ID (token) given to the client
-    pub session_id: String,
+    /// [`token_storage_id`] of the session id given to the client, and the record's
+    /// storage key. The session id itself is never stored. Empty in a record an
+    /// earlier version stored under the session id.
+    #[serde(default)]
+    pub session_id_hash: String,
 
     /// The DID that was authenticated
     pub did: String,
@@ -61,30 +64,13 @@ pub struct DidAuthSession {
     pub challenge: Option<String>,
 }
 
-impl std::fmt::Debug for DidAuthSession {
-    fn fmt(
-        &self,
-        formatter: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        formatter
-            .debug_struct("DidAuthSession")
-            .field("session_id", &loggable::secret(&self.session_id))
-            .field("did", &self.did)
-            .field("channel_name", &self.channel_name)
-            .field("surface_id", &self.surface_id)
-            .field("variant_id", &self.variant_id)
-            .field("created_at", &self.created_at)
-            .field("expires_at", &self.expires_at)
-            .field("challenge", &self.challenge)
-            .finish()
-    }
-}
-
 impl StorableEntity for DidAuthSession {
+    /// A record an earlier version stored is keyed by the session id itself until
+    /// startup removes it.
     const ID_IS_SECRET: bool = true;
 
     fn id(&self) -> &str {
-        &self.session_id
+        &self.session_id_hash
     }
 }
 
@@ -154,11 +140,21 @@ impl DidAuthSessionStore {
     /// Create a new session store with filesystem persistence in the `didauth`
     /// subdirectory of `sessions_path`, which holds the dashboard sessions. DID Auth
     /// sessions found in `sessions_path` itself are moved into the subdirectory first.
+    /// Then a session file not named by its session id hash, such as one an earlier
+    /// version named by the session id itself, is removed, and its caller
+    /// authenticates again.
     pub async fn with_storage(sessions_path: PathBuf) -> Result<Self> {
         let storage_path = sessions_path.join(STORAGE_SUBDIRECTORY);
         let moved = move_entities_to_dir::<DidAuthSession>(&sessions_path, &storage_path, ENTITY_NAME).await?;
         if moved > 0 {
             tracing::info!("Moved {} DID auth session file(s) into {}", moved, storage_path.display());
+        }
+        let unhashed = remove_entities_not_named_by_id::<DidAuthSession>(&storage_path, ENTITY_NAME).await?;
+        if unhashed > 0 {
+            tracing::info!(
+                "Removed {} DID auth session(s) not stored under their session id hash; their callers authenticate again",
+                unhashed
+            );
         }
         let storage: Box<dyn StorageBackend<DidAuthSession>> = rwlock_storage(storage_path, ENTITY_NAME).await?;
 
@@ -226,7 +222,12 @@ impl DidAuthSessionStore {
         self.sessions()
             .write()
             .await
-            .insert(session.session_id.clone(), session);
+            .insert(
+                session
+                    .session_id_hash
+                    .clone(),
+                session,
+            );
     }
 
     /// Create a new challenge for a DID
@@ -320,7 +321,8 @@ impl DidAuthSessionStore {
         pending.pop()
     }
 
-    /// Create a new session bound to the view it was minted on.
+    /// Create a new session bound to the view it was minted on. Returns the session
+    /// id to give the client, which is stored only as its hash, and the session.
     ///
     /// `view` must come from server-side state (the authenticating surface's
     /// own `surface_id` and the variant serving the request), never from a
@@ -331,12 +333,12 @@ impl DidAuthSessionStore {
         channel_name: String,
         view: SessionView<'_>,
         ttl_seconds: u64,
-    ) -> DidAuthSession {
+    ) -> (String, DidAuthSession) {
         let session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
 
         let session = DidAuthSession {
-            session_id: session_id.clone(),
+            session_id_hash: token_storage_id(&session_id),
             did,
             channel_name,
             surface_id: view.surface_id.to_string(),
@@ -356,17 +358,17 @@ impl DidAuthSessionStore {
             tracing::error!("Failed to persist DID auth session: {}", e);
         }
 
-        session
+        (session_id, session)
     }
 
-    /// Get a session by session_id
+    /// Get a session by the session id given to the client
     pub async fn get_session(
         &self,
         session_id: &str,
     ) -> Option<DidAuthSession> {
         let sessions = self.sessions().read().await;
 
-        if let Some(session) = sessions.get(session_id) {
+        if let Some(session) = sessions.get(&token_storage_id(session_id)) {
             // Check if expired
             if chrono::Utc::now() > session.expires_at {
                 return None;
@@ -443,6 +445,7 @@ impl Default for DidAuthSessionStore {
 mod tests {
     use super::*;
     use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::observability::loggable;
 
     const SESSION_ID: &str = "7c1e5a90-2d4b-4f6e-9a8c-b1d2e3f4a5b6";
 
@@ -452,7 +455,7 @@ mod tests {
     ) -> DidAuthSession {
         let now = chrono::Utc::now();
         DidAuthSession {
-            session_id: session_id.to_string(),
+            session_id_hash: token_storage_id(session_id),
             did: "did:example:alice".to_string(),
             channel_name: "surface-1".to_string(),
             surface_id: "surface-1".to_string(),
@@ -463,17 +466,128 @@ mod tests {
         }
     }
 
-    #[test]
-    fn did_auth_session_debug_shows_only_a_session_id_prefix() {
-        let rendered = format!("{:?}", did_auth_session(SESSION_ID, 60));
-
-        assert!(rendered.contains(r#"session_id: "7c1e5a90...""#), "{rendered}");
-        assert!(rendered.contains(r#"did: "did:example:alice""#), "{rendered}");
-        assert!(!rendered.contains(SESSION_ID), "{rendered}");
+    fn file_names(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .into_string()
+                    .unwrap()
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     #[tokio::test]
-    async fn session_save_startup_scan_and_delete_log_only_a_session_id_prefix() {
+    async fn a_session_is_stored_under_its_session_id_hash_and_never_holds_the_session_id() {
+        let sessions_directory = tempfile::tempdir().unwrap();
+        let store = DidAuthSessionStore::with_storage(
+            sessions_directory
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let (session_id, session) = store
+            .create_session("did:example:alice".into(), "surface-1".into(), SessionView::base("surface-1"), 60)
+            .await;
+
+        let hash = token_storage_id(&session_id);
+        assert_eq!(session.session_id_hash, hash);
+        let storage_path = sessions_directory
+            .path()
+            .join(STORAGE_SUBDIRECTORY);
+        assert_eq!(file_names(&storage_path), vec![format!("{hash}.json")]);
+        let record = std::fs::read_to_string(storage_path.join(format!("{hash}.json"))).unwrap();
+        assert!(!record.contains(&session_id), "{record}");
+        assert_eq!(
+            store
+                .get_session(&session_id)
+                .await
+                .map(|session| session.did),
+            Some("did:example:alice".to_string())
+        );
+        assert!(
+            store
+                .get_session(&hash)
+                .await
+                .is_none(),
+            "the stored hash is not a session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_removes_a_session_not_stored_under_its_session_id_hash() {
+        let sessions_directory = tempfile::tempdir().unwrap();
+        let sessions_path = sessions_directory.path();
+        let (current, _) = DidAuthSessionStore::with_storage(sessions_path.to_path_buf())
+            .await
+            .unwrap()
+            .create_session("did:example:bob".into(), "surface-1".into(), SessionView::base("surface-1"), 3600)
+            .await;
+        let now = chrono::Utc::now();
+        let stored_under_its_session_id = |session_id: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "session_id": session_id,
+                "did": "did:example:alice",
+                "channel_name": "surface-1",
+                "surface_id": "surface-1",
+                "created_at": now,
+                "expires_at": now + chrono::Duration::hours(1),
+                "challenge": null,
+            }))
+            .unwrap()
+        };
+        let in_the_sessions_directory = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        std::fs::write(
+            sessions_path.join(format!("{in_the_sessions_directory}.json")),
+            stored_under_its_session_id(in_the_sessions_directory),
+        )
+        .unwrap();
+        let storage_path = sessions_path.join(STORAGE_SUBDIRECTORY);
+        std::fs::write(storage_path.join(format!("{SESSION_ID}.json")), stored_under_its_session_id(SESSION_ID))
+            .unwrap();
+        let logs = FormattedLogs::capture();
+
+        let store = DidAuthSessionStore::with_storage(sessions_path.to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(file_names(sessions_path), vec![STORAGE_SUBDIRECTORY.to_string()]);
+        assert_eq!(file_names(&storage_path), vec![format!("{}.json", token_storage_id(&current))]);
+        for session_id in [in_the_sessions_directory, SESSION_ID] {
+            assert!(
+                store
+                    .get_session(session_id)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .get_session(&current)
+                .await
+                .is_some()
+        );
+        let text = logs.text();
+        assert!(text.contains("Moved 1 DID auth session file(s) into"), "{text}");
+        assert!(
+            text.contains(
+                "Removed 2 DID auth session(s) not stored under their session id hash; their callers authenticate again"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Loaded 1 DID auth session(s) from disk"), "{text}");
+        assert!(!text.contains(SESSION_ID), "{text}");
+        assert!(!text.contains(in_the_sessions_directory), "{text}");
+    }
+
+    #[tokio::test]
+    async fn session_save_startup_scan_and_delete_never_log_the_session_id() {
         let sessions_directory = tempfile::tempdir().unwrap();
         let logs = FormattedLogs::capture();
 
@@ -484,13 +598,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let session = store
+        let (session_id, _) = store
             .create_session("did:example:alice".into(), "surface-1".into(), SessionView::base("surface-1"), 0)
             .await;
+        let hash = token_storage_id(&session_id);
         let session_file = sessions_directory
             .path()
             .join(STORAGE_SUBDIRECTORY)
-            .join(format!("{}.json", session.session_id));
+            .join(format!("{hash}.json"));
         assert!(session_file.exists());
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let reloaded = DidAuthSessionStore::with_storage(
@@ -503,17 +618,17 @@ mod tests {
 
         assert!(
             reloaded
-                .get_session(&session.session_id)
+                .get_session(&session_id)
                 .await
                 .is_none()
         );
         assert!(!session_file.exists());
         let text = logs.text();
-        let prefix = loggable::secret(&session.session_id);
+        let prefix = loggable::secret(&hash);
         assert!(text.contains(&format!("Saved didauth_session {prefix} to")), "{text}");
         assert!(text.contains("Loaded didauth_session from"), "{text}");
         assert!(text.contains(&format!("Deleted didauth_session {prefix}")), "{text}");
-        assert!(!text.contains(&session.session_id), "{text}");
+        assert!(!text.contains(&session_id), "{text}");
     }
 
     #[tokio::test]
@@ -528,8 +643,10 @@ mod tests {
         .unwrap();
         let session_id = "expired/0123456789-did-auth-session";
         store
-            .insert_for_test(did_auth_session(session_id, -60))
-            .await;
+            .sessions()
+            .write()
+            .await
+            .insert(session_id.to_string(), did_auth_session(session_id, -60));
         let logs = FormattedLogs::capture();
 
         store.cleanup_expired().await;
@@ -543,13 +660,14 @@ mod tests {
     async fn startup_moves_did_auth_sessions_out_of_the_shared_sessions_directory() {
         let sessions_directory = tempfile::tempdir().unwrap();
         let sessions_path = sessions_directory.path();
-        let did_auth_file = sessions_path.join(format!("{SESSION_ID}.json"));
+        let did_auth_file_name = format!("{}.json", token_storage_id(SESSION_ID));
+        let did_auth_file = sessions_path.join(&did_auth_file_name);
         std::fs::write(&did_auth_file, serde_json::to_vec(&did_auth_session(SESSION_ID, 3600)).unwrap()).unwrap();
         let dashboard_token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
-        let dashboard_file = sessions_path.join(format!("{dashboard_token}.json"));
+        let dashboard_file = sessions_path.join(format!("{}.json", token_storage_id(dashboard_token)));
         let now = chrono::Utc::now();
         let dashboard_session = crate::auth::session::Session {
-            token: dashboard_token.to_string(),
+            token_hash: token_storage_id(dashboard_token),
             username: "alice@example.com".to_string(),
             user_id: "user-a".to_string(),
             created_at: now,
@@ -582,7 +700,7 @@ mod tests {
         assert!(
             sessions_path
                 .join(STORAGE_SUBDIRECTORY)
-                .join(format!("{SESSION_ID}.json"))
+                .join(&did_auth_file_name)
                 .exists()
         );
         assert!(dashboard_file.exists());

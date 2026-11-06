@@ -260,7 +260,7 @@ make lint         # fmt-check + clippy + eslint + shellcheck
 
 ```mermaid
 flowchart LR
-    U["Unit<br/>one function"] --> C["Component<br/>several modules"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
+    U["Unit<br/>one function"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
 ```
 
 [`TESTING.md`](TESTING.md) explains what belongs in each layer.
@@ -284,7 +284,7 @@ Other available targets include:
 
 | Command | Purpose |
 | --- | --- |
-| `make test-unit` | Unit and component tests compiled into the `agent-gateway` binary test target |
+| `make test-unit` | Unit tests and the frozen legacy component tests compiled into the `agent-gateway` binary test target |
 | `make test-bins` | Binary tests |
 | `make test-policies` | Focused policy-engine tests |
 | `make test-coverage` | Coverage and JUnit output |

@@ -1061,8 +1061,9 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         "created_at": now, "updated_at": now
     }))
     .unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
     let session = crate::auth::session::Session {
-        token: uuid::Uuid::new_v4().to_string(),
+        token_hash: crate::storage::filesystem::token_storage_id(&token),
         username: user.username.clone(),
         user_id: user.user_id.clone(),
         created_at: now,
@@ -1081,7 +1082,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
             &bootstrap
                 .storage_paths
                 .sessions,
-            &session.token,
+            &session.token_hash,
             serde_json::to_value(&session).unwrap(),
         ),
     ] {
@@ -1092,7 +1093,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         )
         .unwrap();
     }
-    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", session.token)).unwrap();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
     authorization.set_sensitive(true);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::AUTHORIZATION, authorization);
