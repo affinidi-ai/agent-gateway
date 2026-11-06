@@ -33,6 +33,30 @@ pub fn init_start_time() {
     PROXY_START_TIME.get_or_init(SystemTime::now);
 }
 
+static DELETED_SURFACES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Notes that this node deleted `surface_id`, so the next dashboard delta re-sends the
+/// identities linked to it.
+pub(crate) fn record_surface_deleted(surface_id: &str) {
+    if let Ok(mut deleted) = DELETED_SURFACES.lock() {
+        deleted.insert(surface_id.to_string(), Utc::now());
+    }
+}
+
+fn surfaces_deleted_since(since: DateTime<Utc>) -> std::collections::HashSet<String> {
+    DELETED_SURFACES
+        .lock()
+        .map(|deleted| {
+            deleted
+                .iter()
+                .filter(|(_, at)| **at > since)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct DashboardState {
     pub config: Arc<GatewayConfig>,
@@ -309,6 +333,8 @@ pub struct IdentityInfo {
     pub surface_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_principal: Option<CredentialPrincipal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2025,8 +2051,26 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Identities created, last used, whose caller or target Agent Card name changed, or whose
-/// Trust Recorder status changed after `since`.
+fn archived_surfaces_changed(
+    identity: &IdentityInfo,
+    deleted_surfaces: &std::collections::HashSet<String>,
+) -> bool {
+    identity
+        .channel_config_id
+        .as_deref()
+        .into_iter()
+        .chain(
+            identity
+                .channel_usage
+                .iter()
+                .filter_map(|usage| usage["channel_config_id"].as_str()),
+        )
+        .any(|id| deleted_surfaces.contains(id))
+}
+
+/// Identities created, last used, whose caller or target Agent Card name changed, whose
+/// Trust Recorder status changed, or archived when this node deleted one of their surfaces,
+/// after `since`.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -2037,6 +2081,7 @@ pub(crate) fn identities_changed_since(
     renamed_surfaces: &std::collections::HashSet<String>,
     recorder_changed_dids: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
+    let deleted_surfaces = &surfaces_deleted_since(since);
     identities
         .into_iter()
         .filter(|id| {
@@ -2050,12 +2095,45 @@ pub(crate) fn identities_changed_since(
                     .surface_id
                     .as_ref()
                     .is_some_and(|surface_id| renamed_surfaces.contains(surface_id))
+                || (id.archived && archived_surfaces_changed(id, deleted_surfaces))
                 || DateTime::parse_from_rfc3339(ts)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc) > since)
                     .unwrap_or(false)
         })
         .collect()
+}
+
+/// An identity is archived when it is linked to at least one surface and none of its linked
+/// surfaces exists. Nothing is archived when the surfaces could not be listed, so a failed
+/// listing never reads as a deletion.
+fn is_archived<'a>(
+    surfaces_listed: bool,
+    linked_surface_ids: impl Iterator<Item = &'a str>,
+    surface_exists: impl Fn(&str) -> bool,
+) -> bool {
+    let mut linked = linked_surface_ids.peekable();
+    surfaces_listed && linked.peek().is_some() && linked.all(|id| !surface_exists(id))
+}
+
+/// The live surface an identity most recently used, ties broken by surface id, shown in place of
+/// a deleted primary surface.
+fn live_usage_surface(
+    usage: &[crate::identity::filesystem::ChannelUsage],
+    surface_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    usage
+        .iter()
+        .filter(|cu| surface_exists(&cu.channel_config_id))
+        .max_by(|a, b| {
+            a.last_used_at
+                .cmp(&b.last_used_at)
+                .then_with(|| {
+                    b.channel_config_id
+                        .cmp(&a.channel_config_id)
+                })
+        })
+        .map(|cu| cu.channel_config_id.clone())
 }
 
 async fn build_identity_list(
@@ -2093,11 +2171,15 @@ pub(crate) async fn build_identity_list_with(
 
     // Includes both config surfaces and stored agent surfaces so identities
     // bound to a surface display the surface name instead of an empty cell.
-    let stored_surfaces = match agent_surface_store {
-        Some(store) => crate::surfaces::AgentSurfaceStore::list_all(store.as_ref())
-            .await
-            .unwrap_or_default(),
-        None => vec![],
+    let (stored_surfaces, surfaces_listed) = match agent_surface_store {
+        Some(store) => match crate::surfaces::AgentSurfaceStore::list_all(store.as_ref()).await {
+            Ok(surfaces) => (surfaces, true),
+            Err(e) => {
+                tracing::warn!("Failed to list agent surfaces for the identity list: {}", e);
+                (vec![], false)
+            }
+        },
+        None => (vec![], true),
     };
     let mut surfaces_by_id: std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface> =
         config_surfaces
@@ -2151,10 +2233,29 @@ pub(crate) async fn build_identity_list_with(
                 .map(|(count, chan)| (*count as u64, chan.clone()))
                 .unwrap_or((r.usage_count, None));
 
-            let channel_config_id = r
+            let primary_channel_id = r
                 .channel_config_id
                 .clone()
                 .or(metrics_channel_id);
+            let surface_exists = |id: &str| surfaces_by_id.contains_key(id);
+            let archived = is_archived(
+                surfaces_listed,
+                primary_channel_id
+                    .as_deref()
+                    .into_iter()
+                    .chain(
+                        r.channel_usage
+                            .iter()
+                            .map(|cu| cu.channel_config_id.as_str()),
+                    ),
+                surface_exists,
+            );
+            let channel_config_id = match primary_channel_id {
+                Some(id) if surfaces_listed && !surface_exists(&id) => {
+                    live_usage_surface(&r.channel_usage, surface_exists).or(Some(id))
+                }
+                other => other,
+            };
             let surface = channel_config_id
                 .as_deref()
                 .and_then(|id| {
@@ -2207,7 +2308,13 @@ pub(crate) async fn build_identity_list_with(
                 origin,
                 card_name,
             );
-            let surface_id = managed_surface.map(|s| s.surface_id.clone());
+            let surface_id = managed_surface
+                .map(|s| s.surface_id.clone())
+                .or_else(|| {
+                    channel_config_id
+                        .clone()
+                        .filter(|_| is_managed && archived)
+                });
             let surface_name = managed_surface
                 .map(|s| s.name.trim().to_string())
                 .filter(|name| !name.is_empty());
@@ -2248,6 +2355,7 @@ pub(crate) async fn build_identity_list_with(
                 display_name_pending: naming.display_name_pending,
                 surface_id,
                 surface_name,
+                archived,
                 credential_principal: principal,
                 managed_surfaces,
                 trust_recorder: None,
@@ -2883,6 +2991,115 @@ mod tests {
                 row.get("name_conflict")
                     .is_none()
             );
+            assert!(row.get("archived").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_whose_every_surface_is_deleted_is_archived_and_keeps_the_surface_id() {
+            let rows = list(
+                vec![managed("did:example:oxygen", "oxygen"), caller(CALLER_DID)],
+                &[surface("nitrogen", "NITROGEN")],
+                &names(),
+            )
+            .await;
+
+            let managed_row = serde_json::to_value(&rows["did:example:oxygen"]).unwrap();
+            assert_eq!(managed_row["archived"], json!(true));
+            assert_eq!(managed_row["surface_id"], json!("oxygen"));
+            assert_eq!(managed_row["channel_config_id"], json!("oxygen"));
+            assert!(
+                managed_row
+                    .get("surface_name")
+                    .is_none()
+            );
+
+            let caller_row = serde_json::to_value(&rows[CALLER_DID]).unwrap();
+            assert_eq!(caller_row["archived"], json!(true));
+            assert_eq!(caller_row["channel_config_id"], json!("oxygen"));
+            assert!(
+                caller_row
+                    .get("surface_id")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_with_one_live_surface_left_is_not_archived() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(crate::identity::filesystem::ChannelUsage {
+                    channel_config_id: "nitrogen".to_string(),
+                    usage_count: 1,
+                    last_used_at: Utc::now(),
+                    role: None,
+                });
+            let rows = list(vec![record], &[surface("nitrogen", "NITROGEN")], &names()).await;
+
+            let row = &rows["did:example:oxygen"];
+            assert!(!row.archived);
+            assert_eq!(row.surface_id.as_deref(), Some("nitrogen"));
+            assert_eq!(row.surface_name.as_deref(), Some("NITROGEN"));
+            assert_eq!(
+                row.channel_config_id
+                    .as_deref(),
+                Some("nitrogen")
+            );
+        }
+
+        #[test]
+        fn test_the_most_recently_used_live_surface_replaces_a_deleted_one() {
+            use crate::identity::filesystem::ChannelUsage;
+            let at = Utc::now();
+            let usage = |id: &str, minutes_ago: i64| ChannelUsage {
+                channel_config_id: id.to_string(),
+                usage_count: 1,
+                last_used_at: at - chrono::Duration::minutes(minutes_ago),
+                role: None,
+            };
+            let usages = [usage("gone", 0), usage("older", 10), usage("newer", 5), usage("tie-b", 5)];
+            let live = |id: &str| id != "gone";
+
+            assert_eq!(super::super::live_usage_surface(&usages, live).as_deref(), Some("newer"));
+            assert_eq!(super::super::live_usage_surface(&usages[..1], live), None);
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_without_a_surface_link_is_not_archived() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record.channel_config_id = None;
+            record.channel_usage.clear();
+            let rows = list(vec![record], &[], &names()).await;
+
+            assert!(!rows["did:example:oxygen"].archived);
+        }
+
+        #[test]
+        fn test_a_failed_surface_listing_archives_nothing() {
+            assert!(!super::super::is_archived(false, ["oxygen"].into_iter(), |_| false));
+            assert!(super::super::is_archived(true, ["oxygen"].into_iter(), |_| false));
+            assert!(!super::super::is_archived(true, ["oxygen", "nitrogen"].into_iter(), |id| id == "nitrogen"));
+            assert!(!super::super::is_archived(true, std::iter::empty(), |_| false));
+        }
+
+        #[tokio::test]
+        async fn test_the_delta_resends_identities_archived_by_a_surface_this_node_deleted() {
+            let since = Utc::now();
+            let mut old = managed("did:example:argon", "argon-deleted-in-delta");
+            old.last_used_at = Some(since - chrono::Duration::hours(1));
+            let rows = || async {
+                list(vec![old.clone()], &[], &names())
+                    .await
+                    .into_values()
+                    .collect::<Vec<_>>()
+            };
+            let none = HashSet::new();
+            assert!(identities_changed_since(rows().await, since, &none, &none, &none).is_empty());
+
+            super::super::record_surface_deleted("argon-deleted-in-delta");
+            let delta = identities_changed_since(rows().await, since, &none, &none, &none);
+            assert_eq!(delta.len(), 1);
+            assert!(delta[0].archived);
         }
 
         fn surface_with_recorder(
@@ -3300,7 +3517,12 @@ mod tests {
 
         #[tokio::test]
         async fn test_legacy_row_json_omits_new_fields() {
-            let rows = list(vec![test_surface_identity_record("did:example:legacy", "gone")], &[], &names()).await;
+            let rows = list(
+                vec![test_surface_identity_record("did:example:legacy", "neon")],
+                &[surface("neon", "NEON")],
+                &names(),
+            )
+            .await;
             let json = serde_json::to_value(&rows["did:example:legacy"]).unwrap();
             let keys: HashSet<&str> = json
                 .as_object()
@@ -3316,6 +3538,7 @@ mod tests {
                 "usage_count",
                 "last_used_at",
                 "channel_config_id",
+                "channel_name",
                 "is_local",
                 "verified",
                 "channel_usage",

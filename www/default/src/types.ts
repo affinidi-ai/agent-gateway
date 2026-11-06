@@ -203,6 +203,7 @@ export interface Identity {
   display_name_pending?: boolean;
   surface_id?: string;
   surface_name?: string;
+  archived?: boolean;
   credential_principal?: CredentialPrincipal;
   // Every live surface where this DID is the managed agent, sorted by name; omitted when empty.
   managed_surfaces?: ManagedSurfaceRef[];

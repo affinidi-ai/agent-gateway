@@ -868,6 +868,48 @@ describe('IdentitiesPage', () => {
       expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
     });
 
+    it('shows an archived identity with an Archived badge and explains it when selected', async () => {
+      const archived = {
+        ...managedOld,
+        surface_id: 'surface-gone',
+        surface_name: undefined,
+        display_name: undefined,
+        display_name_source: undefined,
+        archived: true,
+      };
+      renderWithStats([archived, managedNew], [{ config_id: 'surface-1', name: 'OXYGEN' }]);
+
+      const archivedRow = await screen.findByTestId('identities-row-did:key:managed-old');
+      const liveRow = screen.getByTestId('identities-row-did:key:managed-new');
+      expect(within(archivedRow).getByTestId('identities-archived-badge')).toHaveTextContent(
+        'Archived'
+      );
+      const archivedSurface = within(archivedRow).getByTestId('identities-surface-archived');
+      expect(archivedSurface).toHaveTextContent('surface-gone');
+      expect(
+        within(archivedSurface).getByTestId('identities-surface-deleted-badge')
+      ).toHaveTextContent('Deleted');
+      expect(
+        within(archivedSurface).queryByTestId('identities-archived-badge')
+      ).not.toBeInTheDocument();
+      expect(within(archivedRow).queryByTestId('identities-surface-link')).not.toBeInTheDocument();
+      expect(within(liveRow).queryByTestId('identities-archived-badge')).not.toBeInTheDocument();
+      expect(
+        within(liveRow).queryByTestId('identities-surface-deleted-badge')
+      ).not.toBeInTheDocument();
+      expect(within(liveRow).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+      expect(screen.queryByTestId('identity-archived-info')).not.toBeInTheDocument();
+
+      fireEvent.click(liveRow);
+      expect(screen.queryByTestId('identity-archived-info')).not.toBeInTheDocument();
+
+      fireEvent.click(archivedRow);
+      expect(await screen.findByTestId('identity-archived-info')).toHaveTextContent(
+        'This identity is no longer in use because the associated surface has been deleted.'
+      );
+      expect(screen.getAllByTestId('identity-archived-info')).toHaveLength(1);
+    });
+
     it('offers no unnamed-only filter and lists unnamed and resolving rows', async () => {
       renderWithStats([managedNew, callerNamed, callerUnnamed, callerPending]);
 

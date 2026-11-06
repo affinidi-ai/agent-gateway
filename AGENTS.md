@@ -224,6 +224,11 @@ Count column, and lists a managed agent DID shared by several surfaces once, as 
 with its surface count and every one of its surfaces; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities page marks an identity whose every surface was deleted with an "Archived" badge,
+shows its surface as plain text with a "Deleted" badge and no link, and selecting it says the
+identity is no longer in use; see _Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).

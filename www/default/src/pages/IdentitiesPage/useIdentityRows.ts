@@ -5,12 +5,13 @@ import { isSharedManagedDid } from './sharedManagedDid';
 
 type SurfaceRef = Pick<
   Identity,
-  'surface_id' | 'surface_name' | 'channel_name' | 'channel_config_id' | 'origin'
+  'surface_id' | 'surface_name' | 'archived' | 'channel_name' | 'channel_config_id' | 'origin'
 >;
 
 export interface SurfaceLink {
   id: string;
   name: string;
+  archived: boolean;
 }
 
 interface UseIdentityRowsOptions<T extends Identity> {
@@ -58,16 +59,23 @@ export function useIdentityRows<T extends Identity>({
 
   const surfaceLinkFor = useCallback(
     (identity: SurfaceRef): SurfaceLink | null => {
+      const archivedId = identity.archived
+        ? identity.surface_id || identity.channel_config_id
+        : undefined;
+      if (archivedId) {
+        const name = identity.surface_name || identity.channel_name || archivedId;
+        return { id: archivedId, name, archived: true };
+      }
       if (identity.surface_id) {
         const name =
           liveSurfaceNames.get(identity.surface_id) ||
           identity.surface_name ||
           identity.channel_name ||
           identity.surface_id;
-        return { id: identity.surface_id, name };
+        return { id: identity.surface_id, name, archived: false };
       }
       if (identity.origin !== 'managed' && identity.channel_name && identity.channel_config_id) {
-        return { id: identity.channel_config_id, name: identity.channel_name };
+        return { id: identity.channel_config_id, name: identity.channel_name, archived: false };
       }
       return null;
     },
@@ -81,6 +89,7 @@ export function useIdentityRows<T extends Identity>({
           id: surface.surface_id,
           name:
             liveSurfaceNames.get(surface.surface_id) || surface.surface_name || surface.surface_id,
+          archived: false,
         }));
       }
       const link = surfaceLinkFor(identity);
