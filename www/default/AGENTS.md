@@ -557,10 +557,27 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
   Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
   `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
+- **Transit Point secret picker.** For Bearer Token, API Key Header and Custom Header, the Transit
+  Point panel picks the secret from the secrets store (`transit-point/TargetAuthSecretField.tsx`,
+  labelled **Secret Reference**) and saves its `secret_id` as `method.static_secret.secret_id`. Options come
+  from the shared `components/shared/SecretOptions.tsx` (`Name (secret_id)`, tenant-aware, all
+  secret types). A refresh icon button beside the select reloads only the list
+  (`useTargetAuthSecrets`); it uses the Managed Agent panel's sync icon and spin but sits beside
+  the field, not on the label line, so it isn't missed. **Add secret** below opens `/secrets/new`
+  in a new tab, and the help text never changes. A stored secret that no longer exists stays
+  selected as `<secret_id> (not found)` with a warning; an out-of-tenant one keeps its
+  `outOfTenantLabel` and is explained in full below the field. A list that can't load says
+  "Couldn't load secrets." with **Try again**, or, when the request is refused (403), "You don't
+  have access to secrets. Ask an administrator."; both keep the stored value and show no refresh
+  button. The element's `validate` blocks Save while no secret is picked
+  (`targetAuthSecretProblem`, field `auth_secret`), since an empty secret would otherwise drop
+  target authentication. Test ids: `transit-point-target-auth-secret`, with `-refresh`,
+  `-add-link`, `-error`, `-missing`, `-outside-tenant`, `-load-error`, `-retry` and `-denied`.
 - **Tenant-aware pickers.** A surface's tenant (`tenantId` in `SurfaceMetaContext`, from the stored
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
-  `OutboundCredentialsListSection`) and the Custom Metadata secret menu offer: only items with the
+  `OutboundCredentialsListSection`), the Transit Point secret picker (`TargetAuthSecretField`) and
+  the Custom Metadata secret menu offer: only items with the
   same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). The delegation pickers
   (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
   appliance-wide authorization code providers, which send the user's own token and which the gateway
