@@ -121,6 +121,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .delete(surface_id)
             .await?;
+        crate::observability::dashboard::record_surface_deleted(surface_id);
         policy_changes::surface_written(before.as_ref(), None).await;
         target_auth_changes::surface_written(before.as_ref(), None);
         drop(write);

@@ -403,7 +403,44 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the panel shows the one line "Each caller is identified by the API key it presents."
   (`identity-panel-inbound-api-key-note`);
   `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
-  the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
+  the picker (`identity-panel-api-key-select`) and need a key. The picker lists only the active
+  keys of the surface being edited (`GET /api-keys/{surface_id}`, from `SurfaceMetaContext`), as
+  the gateway refuses another surface's key; a stored id that is not among them stays selected
+  as a disabled option, so it cannot be picked again once changed, labelled by its status
+  (below), or "<id> (not an active key of this surface)" when that status is not `revoked`,
+  `missing` or `unavailable`. **Unconfigured Identity**: the surface read and save
+  responses carry `api_key_references` (`key_id` and `status`), passed to the panels and the
+  canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). A
+  protected, external or Transit Point From API Key Identity whose current `api_key_id` is
+  `revoked`, `missing` or `unavailable` gets the canvas's red `unconfigured-ring` (red, dashed
+  and animated by the `.surface-builder-canvas .unconfigured-ring` rule, like every other ring)
+  with "API key revoked", "API key deleted" or "API key of another surface" under its label, and
+  the panel shows the full warning under the picker (`identity-api-key-revoked-warning`) and
+  labels the stored key "<client id> (revoked)" (the revoked key's name from the surface's key
+  list, or its id when that list does not have it), "<id> (deleted)" or "<id> (belongs to
+  another surface)". The
+  warnings are "The API key this Identity uses was revoked. Select an active API key of this
+  surface.", "… was deleted. Select an active API key of this surface." and "The API key this
+  Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the
+  list, and the inbound Identity show nothing. The lookup is by key id, so variant canvases use
+  the same list, and picking an active key clears the ring before Save. It blocks Save on the
+  surface page, in the base and every variant, with "Identity: " and the full warning
+  (`firstUnusableApiKeyIdentity` in `computeBlockingReason`), and the toast's "Show me" selects
+  the Identity. It is not part of `configured` or `getIncompleteReason`, since the statuses come
+  from the stored surface, not the node. On the create page (`isCreate`, which already has a
+  client-made `surfaceId`) it fetches nothing and shows "A new surface has no API keys yet. Remove
+  this Identity or choose another type, save the surface, add an API key, then come back and
+  select it." (`identity-panel-api-key-unsaved`); the rule is behind
+  `field-help-identity-api-key`. A protected or external From API Key Identity without a key is
+  incomplete and blocks Save with "Select an API key of this surface. A new surface has no API keys
+  yet: remove this Identity or choose another type, save the surface, add an API key, then come
+  back and select it." (`SELECT_OWN_API_KEY`). A template capture or apply
+  (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
+  injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
+  canvas Identity nodes (top-level and in variant overrides), every `atgk_` Caller Context
+  `secret_id` of the base and the variant overrides, and the read-only `access_point_status` and
+  `api_key_references`, so the new surface's Identity asks for its own key. A surface write never
+  sends `access_point_status` or `api_key_references` (`toBackendSurface`). An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
@@ -987,6 +1024,27 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
 
+## API key delete
+
+The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
+(**Delete**) share `useApiKeyDelete` (`src/components/api-keys/ApiKeyDeleteDialog.tsx`). The
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
+like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
+a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
+carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
+client id and key id and says, in plain words, that callers using the key will be refused,
+surfaces that use it will stop working until another key is picked, and the delete can't be
+undone. **Delete API key** (`api-key-delete-dialog-confirm`, `btn-danger`) sends the `DELETE`;
+it is enabled on open and disabled, with a spinner, only while the delete runs. **Cancel** and the
+close button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
+with the toast "API key deleted", then the tab reloads its keys and the detail page returns to
+`/secrets`. A failed delete shows an error toast that stays until dismissed: "Delete failed:
+<gateway message> (<status>)", and the detail page stays open.
+
+When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
+the detail page shows the info alert "This API key is no longer in use because the associated
+surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
 ## Policy definition editor
 
 The **Policy Instructions & Examples** panel on the Create Policy Definition page is collapsed
@@ -1098,6 +1156,20 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   caller.
 - When the backend sends none of the naming fields, the Name column still shows, with
   `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
+- A **revoked** identity (`revoked` on the identity: the API key its DID comes from is revoked
+  or deleted, or every surface it is linked to was deleted) gets a "Revoked" badge beside its
+  name cell (`components/IdentityRevoked.tsx`): a plain Bootstrap `badge text-bg-danger`, solid
+  red with white text like the Revoked status on the API key table, not the shared `Badge`.
+  Expanding the row, or opening it in the
+  Dashboard's `IdentityDetailsModal`, shows the `alert-danger` "This identity is no longer in
+  use: its API key was revoked or deleted, or its surface was deleted." The page has no
+  Revoked filter.
+- A surface of an identity marked `surface_deleted` (every surface it is linked to was
+  deleted) is shown by `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`), in the **Agent
+  Surface** list and the expanded Summary, as muted plain text, the surface name when the
+  identity carries one and otherwise the surface id, with a solid grey "Deleted" badge
+  (`badge text-bg-secondary`, white text), and never links. A live surface keeps its link and
+  shows no badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
   A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
@@ -1136,6 +1208,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Origin badge                   | `identities-origin-<origin>`                                             |
 | Surface list, surface link     | `identities-surface-list`, `identities-surface-link`                     |
 | Credential principal           | `identities-credential-principal`                                        |
+| Revoked badge, message         | `identities-revoked-badge`, `identity-revoked-info`                      |
+| Deleted surface, its badge     | `identities-surface-deleted`, `identities-surface-deleted-badge`         |
 | Recorder filter                | `identities-recorder-filter`                                             |
 | Recorder chip                  | `identities-recorder-chip-<state>`                                       |
 | Recorder tooltip               | `identities-recorder-tooltip`                                            |

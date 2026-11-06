@@ -119,7 +119,8 @@ fn collection_key_allowed(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParentAuthorization {
     Existing,
-    OrphanCleanup,
+    /// The parent surface no longer exists; only an unrestricted caller is let through.
+    Orphaned,
 }
 
 #[allow(clippy::result_large_err)] // FIXME: Response is not an error
@@ -130,7 +131,7 @@ async fn authorize_agent(
     _scope: &Option<Extension<PatResourceScope>>,
     access: CallerAccess,
     mutation: bool,
-    allow_orphan_cleanup: bool,
+    allow_orphaned: bool,
 ) -> Result<ParentAuthorization, axum::response::Response> {
     match surface_store
         .get(agent_id)
@@ -141,9 +142,7 @@ async fn authorize_agent(
             Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "Agent not accessible" }))).into_response())
         }
         Ok(Some(_)) => Err(ApiKeyError::AgentNotFound { agent_id: agent_id.to_string() }.into_response()),
-        Ok(None) if allow_orphan_cleanup && access == CallerAccess::Unrestricted => {
-            Ok(ParentAuthorization::OrphanCleanup)
-        }
+        Ok(None) if allow_orphaned && access == CallerAccess::Unrestricted => Ok(ParentAuthorization::Orphaned),
         Ok(None) => Err(ApiKeyError::AgentNotFound { agent_id: agent_id.to_string() }.into_response()),
         Err(error) => {
             error!(agent_id = %agent_id, %error, "Failed to resolve API-key parent surface");
@@ -222,7 +221,10 @@ pub async fn list_all_keys(
         .filter(|surface| surface_allows_api_keys(surface, &context, false))
         .map(|surface| surface.surface_id.clone())
         .collect();
-    match store.list_all().await {
+    match store
+        .list_all_with_last_use()
+        .await
+    {
         Ok(mut keys) => {
             keys.retain(|key| {
                 collection_key_allowed(&key.agent_id, &key.key_id, &allowed_agents, access, &context, &scope)
@@ -282,7 +284,17 @@ pub async fn create_key(
     }
 }
 
-/// Get a specific API key's metadata (never the secret)
+/// An API key's metadata as `GET /api/v1/api-keys/{agent_id}/{key_id}` returns it, with whether
+/// the surface owning the key no longer exists.
+#[derive(Debug, serde::Serialize)]
+struct ApiKeyDetail {
+    #[serde(flatten)]
+    meta: super::types::ApiKeyMeta,
+    surface_deleted: bool,
+}
+
+/// Get a specific API key's metadata (never the secret). An unrestricted caller also reads a key
+/// whose surface is gone; a restricted one gets `404` for it.
 ///
 /// GET /api/v1/api-keys/{agent_id}/{key_id}
 pub async fn get_key(
@@ -291,12 +303,13 @@ pub async fn get_key(
     Path(KeyPath { agent_id, key_id }): Path<KeyPath>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
 ) -> impl IntoResponse {
-    if let Err(response) =
-        authorize_agent(&surface_store, &agent_id, &context, &scope, CallerAccess::Restricted, false, false).await
-    {
-        return response;
-    }
+    let access = caller_access(&delegation, &context, &scope);
+    let parent = match authorize_agent(&surface_store, &agent_id, &context, &scope, access, false, true).await {
+        Ok(parent) => parent,
+        Err(response) => return response,
+    };
     if !api_key_allowed(&key_id, &context, &scope) {
         return ApiKeyError::not_found(&key_id).into_response();
     }
@@ -304,7 +317,14 @@ pub async fn get_key(
         .get_record(&agent_id, &key_id)
         .await
     {
-        Ok(Some(key)) => (StatusCode::OK, Json(super::types::ApiKeyMeta::from(key))).into_response(),
+        Ok(Some(key)) => (
+            StatusCode::OK,
+            Json(ApiKeyDetail {
+                meta: key.into(),
+                surface_deleted: parent == ParentAuthorization::Orphaned,
+            }),
+        )
+            .into_response(),
         Ok(None) => ApiKeyError::not_found(&key_id).into_response(),
         Err(e) => e.into_response(),
     }
@@ -337,7 +357,11 @@ pub async fn revoke_key(
         .revoke(&agent_id, &key_id, &request.actor)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            crate::identity::provider_key_gate::gate().key_changed(&key_id);
+            crate::observability::dashboard::record_api_key_withdrawn(&key_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -374,7 +398,8 @@ pub async fn rotate_key(
     }
 }
 
-/// Delete an API key permanently
+/// Delete an API key. A surface still naming it stops serving, as the go-live provider key check
+/// refuses a key id no key has; the dashboard asks the operator to confirm first.
 ///
 /// DELETE /api/v1/api-keys/{agent_id}/{key_id}
 pub async fn delete_key(
@@ -394,7 +419,7 @@ pub async fn delete_key(
         Ok(parent) => parent,
         Err(response) => return response,
     };
-    let orphan_cleanup = parent == ParentAuthorization::OrphanCleanup;
+    let orphan_cleanup = parent == ParentAuthorization::Orphaned;
     if orphan_cleanup {
         info!(
             actor = %actor,
@@ -416,6 +441,8 @@ pub async fn delete_key(
         .await
     {
         Ok(()) => {
+            crate::identity::provider_key_gate::gate().key_changed(&key_id);
+            crate::observability::dashboard::record_api_key_withdrawn(&key_id);
             info!(
                 actor = %actor,
                 agent_id = %agent_id,
@@ -444,6 +471,19 @@ mod tests {
         creates: AtomicUsize,
         deletes: AtomicUsize,
         delete_actors: std::sync::Mutex<Vec<String>>,
+        keys: Vec<(String, String)>,
+    }
+
+    impl CountingKeyStore {
+        fn holds(
+            &self,
+            agent_id: &str,
+            key_id: &str,
+        ) -> bool {
+            self.keys
+                .iter()
+                .any(|(agent, key)| agent == agent_id && key == key_id)
+        }
     }
 
     #[async_trait]
@@ -475,10 +515,18 @@ mod tests {
 
         async fn get_record(
             &self,
-            _agent_id: &str,
-            _key_id: &str,
+            agent_id: &str,
+            key_id: &str,
         ) -> ApiKeyResult<Option<crate::api_keys::types::ApiKeyRecord>> {
-            Ok(None)
+            Ok(self
+                .holds(agent_id, key_id)
+                .then(|| {
+                    serde_json::from_value(serde_json::json!({
+                        "key_id": key_id, "agent_id": agent_id, "client_id": "client",
+                        "created_at": "2026-01-01T00:00:00Z", "issuer": {"actor": "test", "method": "api"}
+                    }))
+                    .unwrap()
+                }))
         }
 
         async fn revoke(
@@ -501,10 +549,13 @@ mod tests {
 
         async fn delete(
             &self,
-            _agent_id: &str,
-            _key_id: &str,
+            agent_id: &str,
+            key_id: &str,
             actor: &str,
         ) -> ApiKeyResult<()> {
+            if !self.holds(agent_id, key_id) {
+                return Err(ApiKeyError::not_found(key_id));
+            }
             self.deletes
                 .fetch_add(1, Ordering::SeqCst);
             self.delete_actors
@@ -555,6 +606,182 @@ mod tests {
         }
     }
 
+    struct SurfacesStore {
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+    }
+
+    #[async_trait]
+    impl AgentSurfaceStore for SurfacesStore {
+        async fn save(
+            &self,
+            _surface: &crate::config::agent_surface::AgentSurface,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        async fn get(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            Ok(self
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .cloned())
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+            Ok(self.surfaces.clone())
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn counting_key_store(keys: &[(&str, &str)]) -> Arc<CountingKeyStore> {
+        Arc::new(CountingKeyStore {
+            creates: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+            delete_actors: std::sync::Mutex::new(Vec::new()),
+            keys: keys
+                .iter()
+                .map(|(agent, key)| (agent.to_string(), key.to_string()))
+                .collect(),
+        })
+    }
+
+    fn surface(
+        surface_id: &str,
+        tenant_id: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        crate::config::agent_surface::AgentSurface {
+            surface_id: surface_id.into(),
+            tenant_id: tenant_id.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    fn naming(
+        surface_id: &str,
+        tenant_id: Option<&str>,
+        key_id: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = surface(surface_id, tenant_id);
+        surface.identity_slots =
+            serde_json::from_value(serde_json::json!({"protected": {"type": "from_api_key", "api_key_id": key_id}}))
+                .unwrap();
+        surface
+    }
+
+    async fn delete_as(
+        key_store: &Arc<CountingKeyStore>,
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+        agent_id: &str,
+        key_id: &str,
+    ) -> StatusCode {
+        delete_by(key_store, surfaces, agent_id, key_id, None)
+            .await
+            .0
+    }
+
+    async fn delete_by(
+        key_store: &Arc<CountingKeyStore>,
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+        agent_id: &str,
+        key_id: &str,
+        tenant: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let context = tenant.map(|tenant_id| {
+            Extension(PatTenantContext {
+                token_id: "atgat-test".into(),
+                tenant_id: tenant_id.into(),
+            })
+        });
+        let response = delete_key(
+            State(key_store.clone() as ApiKeyState),
+            Extension(Arc::new(SurfacesStore { surfaces }) as ApiKeySurfaceState),
+            Path(KeyPath {
+                agent_id: agent_id.into(),
+                key_id: key_id.into(),
+            }),
+            context,
+            None,
+            None,
+            Some(Extension(AuthGuardOk("admin-user".into()))),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn deleting_another_surfaces_key_through_an_own_surface_is_not_found() {
+        let key_store = counting_key_store(&[("owner-a", "atgk_a"), ("owner-b", "atgk_b")]);
+        let surfaces = vec![
+            surface("owner-a", Some("tenant-a")),
+            surface("owner-b", Some("tenant-b")),
+            naming("user-b", Some("tenant-b"), "atgk_b"),
+        ];
+
+        let (status, body) = delete_by(&key_store, surfaces, "owner-a", "atgk_b", Some("tenant-a")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], ApiKeyError::not_found("atgk_b").to_string());
+        assert!(
+            !body
+                .to_string()
+                .contains("surface"),
+            "{body}"
+        );
+        assert_eq!(deletes(&key_store), 0);
+    }
+
+    fn deletes(key_store: &CountingKeyStore) -> usize {
+        key_store
+            .deletes
+            .load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn deleting_a_key_a_surface_names_deletes_it() {
+        let key_store = counting_key_store(&[("owner", "atgk_named"), ("gone", "atgk_orphan_named")]);
+        let surfaces = || vec![naming("owner", None, "atgk_named"), naming("user", None, "atgk_orphan_named")];
+
+        assert_eq!(delete_as(&key_store, surfaces(), "owner", "atgk_named").await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            delete_as(&key_store, surfaces(), "gone", "atgk_orphan_named").await,
+            StatusCode::NO_CONTENT,
+            "orphan cleanup deletes a named key too"
+        );
+        assert_eq!(deletes(&key_store), 2);
+        assert_eq!(
+            key_store
+                .delete_actors
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["admin-user", "admin-user"]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_key_that_is_not_there_is_not_found() {
+        let key_store = counting_key_store(&[("owner", "atgk_other")]);
+
+        let status = delete_as(&key_store, vec![surface("owner", None)], "owner", "atgk_absent").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(deletes(&key_store), 0);
+    }
+
     #[test]
     fn api_key_scope_checks_child_id_separately_from_parent_ownership() {
         let context = Some(Extension(PatTenantContext {
@@ -599,11 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_key_writes_on_global_surface_are_forbidden_before_store_write() {
-        let key_store = Arc::new(CountingKeyStore {
-            creates: AtomicUsize::new(0),
-            deletes: AtomicUsize::new(0),
-            delete_actors: std::sync::Mutex::new(Vec::new()),
-        });
+        let key_store = counting_key_store(&[]);
         let surface_store: ApiKeySurfaceState = Arc::new(OneSurfaceStore {
             surface: crate::config::agent_surface::AgentSurface {
                 surface_id: "surface-global".into(),
@@ -701,11 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn another_tenants_surface_answers_exactly_like_a_missing_surface() {
-        let key_store = Arc::new(CountingKeyStore {
-            creates: AtomicUsize::new(0),
-            deletes: AtomicUsize::new(0),
-            delete_actors: std::sync::Mutex::new(Vec::new()),
-        });
+        let key_store = counting_key_store(&[]);
         let store_with = |surface_id: &str| -> ApiKeySurfaceState {
             Arc::new(OneSurfaceStore {
                 surface: crate::config::agent_surface::AgentSurface {
@@ -751,11 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_key_writes_on_another_tenants_surface_are_not_found_before_store_write() {
-        let key_store = Arc::new(CountingKeyStore {
-            creates: AtomicUsize::new(0),
-            deletes: AtomicUsize::new(0),
-            delete_actors: std::sync::Mutex::new(Vec::new()),
-        });
+        let key_store = counting_key_store(&[]);
         let surface_store: ApiKeySurfaceState = Arc::new(OneSurfaceStore {
             surface: crate::config::agent_surface::AgentSurface {
                 surface_id: "surface-global".into(),
@@ -914,11 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_unrestricted_callers_can_delete_orphaned_keys() {
-        let key_store = Arc::new(CountingKeyStore {
-            creates: AtomicUsize::new(0),
-            deletes: AtomicUsize::new(0),
-            delete_actors: std::sync::Mutex::new(Vec::new()),
-        });
+        let key_store = counting_key_store(&[("orphaned-surface", "atgk_orphan")]);
         let surface_store: ApiKeySurfaceState = Arc::new(OneSurfaceStore {
             surface: crate::config::agent_surface::AgentSurface {
                 surface_id: "surface-a".into(),
@@ -1025,13 +1236,77 @@ mod tests {
         );
     }
 
+    async fn get_as(
+        key_store: &Arc<CountingKeyStore>,
+        agent_id: &str,
+        key_id: &str,
+        tenant: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let surface_store: ApiKeySurfaceState = Arc::new(SurfacesStore {
+            surfaces: vec![surface("live", tenant)],
+        });
+        let context = tenant.map(|tenant_id| {
+            Extension(PatTenantContext {
+                token_id: "atgat-test".into(),
+                tenant_id: tenant_id.into(),
+            })
+        });
+        let response = get_key(
+            State(key_store.clone() as ApiKeyState),
+            Extension(surface_store),
+            Path(KeyPath {
+                agent_id: agent_id.into(),
+                key_id: key_id.into(),
+            }),
+            context,
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_caller_reads_an_orphaned_key_as_surface_deleted() {
+        let key_store = counting_key_store(&[("gone", "atgk_orphan"), ("live", "atgk_live")]);
+
+        let (orphan_status, orphan) = get_as(&key_store, "gone", "atgk_orphan", None).await;
+        let (live_status, live) = get_as(&key_store, "live", "atgk_live", None).await;
+
+        assert_eq!(orphan_status, StatusCode::OK);
+        assert_eq!(orphan["key_id"], "atgk_orphan");
+        assert_eq!(orphan["surface_deleted"], true);
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(live["key_id"], "atgk_live");
+        assert_eq!(live["surface_deleted"], false);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_caller_gets_not_found_for_an_orphaned_key() {
+        let key_store = counting_key_store(&[("gone", "atgk_orphan"), ("live", "atgk_live")]);
+
+        let (orphan_status, orphan) = get_as(&key_store, "gone", "atgk_orphan", Some("tenant-a")).await;
+        let (live_status, live) = get_as(&key_store, "live", "atgk_live", Some("tenant-a")).await;
+
+        assert_eq!(orphan_status, StatusCode::NOT_FOUND);
+        assert!(
+            orphan
+                .get("surface_deleted")
+                .is_none(),
+            "{orphan}"
+        );
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(live["surface_deleted"], false);
+    }
+
     #[tokio::test]
     async fn out_of_scope_generated_key_is_rejected_before_store_write() {
-        let key_store = Arc::new(CountingKeyStore {
-            creates: AtomicUsize::new(0),
-            deletes: AtomicUsize::new(0),
-            delete_actors: std::sync::Mutex::new(Vec::new()),
-        });
+        let key_store = counting_key_store(&[]);
         let surface = crate::config::agent_surface::AgentSurface {
             surface_id: "surface-a".into(),
             ..Default::default()

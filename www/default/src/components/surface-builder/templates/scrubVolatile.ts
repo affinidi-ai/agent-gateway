@@ -24,13 +24,73 @@ const VOLATILE_TP_CANVAS_FIELDS = [
   'alias',
 ] as const;
 
+// Read-only fields the gateway sets on a surface response; they describe the
+// stored surface, not the configuration a template carries.
+const DERIVED_SURFACE_FIELDS = ['access_point_status', 'api_key_references'] as const;
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * A surface names only its own API keys, and a new surface has none, so
+ * every API key id a template carries is dropped: the Identity is left
+ * without a key, to be chosen once the new surface has one.
+ */
+function dropApiKeyId(value: unknown): void {
+  if (isObject(value) && 'api_key_id' in value) delete value.api_key_id;
+}
+
+function dropApiKeyIds(view: unknown): void {
+  if (!isObject(view)) return;
+  const auth = isObject(view.access_point) ? view.access_point.caller_authentication : undefined;
+  if (isObject(auth) && Array.isArray(auth.methods)) {
+    for (const method of auth.methods) {
+      if (
+        isObject(method) &&
+        typeof method.secret_id === 'string' &&
+        method.secret_id.startsWith('atgk_')
+      ) {
+        delete method.secret_id;
+      }
+    }
+  }
+  const slots = view.identity_slots;
+  if (isObject(slots)) {
+    for (const slot of ['inbound', 'protected', 'external']) dropApiKeyId(slots[slot]);
+  }
+  if (isObject(view.target)) dropApiKeyId(view.target.identity_injection);
+  const transit = view.transit;
+  if (isObject(transit) && Array.isArray(transit.points)) {
+    for (const tp of transit.points) {
+      if (!isObject(tp)) continue;
+      dropApiKeyId(tp.managed_identity);
+      dropApiKeyId(tp.identity_injection);
+    }
+  }
+}
+
+function dropCanvasApiKeyIds(canvas: unknown): void {
+  if (!isObject(canvas) || !Array.isArray(canvas.nodes)) return;
+  for (const node of canvas.nodes) {
+    if (isObject(node) && node.type === 'identity') dropApiKeyId(node.config);
+  }
 }
 
 export function scrubVolatileTemplateFields<T = unknown>(payload: T): T {
   if (!isObject(payload)) return payload;
   const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+
+  for (const derived of DERIVED_SURFACE_FIELDS) delete out[derived];
+  dropApiKeyIds(out);
+  dropCanvasApiKeyIds(out.canvas);
+  if (Array.isArray(out.variants)) {
+    for (const variant of out.variants) {
+      if (!isObject(variant) || !isObject(variant.overrides)) continue;
+      dropApiKeyIds(variant.overrides);
+      dropCanvasApiKeyIds(variant.overrides.canvas);
+    }
+  }
 
   const transit = out.transit;
   if (isObject(transit)) {

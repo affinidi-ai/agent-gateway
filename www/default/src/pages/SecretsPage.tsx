@@ -5,6 +5,7 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
+import { useApiKeyDelete } from '../components/api-keys/ApiKeyDeleteDialog';
 import { EmptyState } from '../components/shared/EmptyState';
 import { DOCS_URL } from '../config/docs';
 import AddResourceLink from '../components/shared/AddResourceLink';
@@ -176,14 +177,8 @@ const SecretsPage: React.FC = () => {
     }
   };
 
-  const handleDeleteApiKey = async (agentId: string, keyId: string) => {
-    try {
-      await apiClient.deleteApiKey(agentId, keyId);
-      loadApiKeys();
-    } catch (error) {
-      console.error('Failed to delete API key:', error);
-    }
-  };
+  const { requestDelete: handleDeleteApiKey, dialog: apiKeyDeleteDialog } =
+    useApiKeyDelete(loadApiKeys);
 
   const handleRevokeApiKey = async (agentId: string, keyId: string) => {
     try {
@@ -633,12 +628,18 @@ const SecretsPage: React.FC = () => {
                                 </AppButton>
                               </>
                             )}
-                            <DeleteButton
-                              data-testid={`api-keys-delete-button-${apiKey.key_id}`}
-                              onDelete={() => handleDeleteApiKey(apiKey.agent_id, apiKey.key_id)}
-                              className="btn-sm"
+                            <AppButton
+                              variant="danger"
+                              size="sm"
                               title="Delete API key"
-                            />
+                              aria-label={`Delete API key ${apiKey.key_id}`}
+                              data-testid={`api-keys-delete-button-${apiKey.key_id}`}
+                              onClick={() =>
+                                handleDeleteApiKey(apiKey.agent_id, apiKey.key_id, apiKey.client_id)
+                              }
+                            >
+                              <i className="fas fa-trash" aria-hidden="true"></i>
+                            </AppButton>
                           </td>
                         </tr>
                       ))}
@@ -648,6 +649,8 @@ const SecretsPage: React.FC = () => {
               )}
             </div>
           </div>
+
+          {apiKeyDeleteDialog}
 
           {/* Create API Key Modal */}
           {showCreateModal && (

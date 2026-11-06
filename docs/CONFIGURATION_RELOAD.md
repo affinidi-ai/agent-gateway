@@ -228,7 +228,9 @@ Also on becoming Active, before it reloads its configuration, a node reconciles 
 policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
 created, rotated or revoked while this node was Standby therefore authenticate, or stop
 authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
-held.
+held. The node then revokes the API keys of surfaces that no longer exist, as it does when it
+boots Active; a Standby node and a configuration reload revoke none (see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)).
 
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
@@ -246,6 +248,11 @@ interval; the RwLock-backed policy-definition and global-policy stores are **not
 loop and reconcile with disk only at startup; an explicit reload uses their in-memory state. Each
 store's periodic scans are serialized by a shared per-store lock, so two overlapping refreshes can
 never apply out of order and revert a record to an older on-disk snapshot.
+
+A surface that derives its own DID from API Key Provider keys rereads their status from disk on
+its own schedule, even when the interval is `0`; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+A key a caller presents is checked against the cache only.
 
 Nodes sharing storage must run the same version. A newer node can write a field an older one
 rejects; the older node's refresh then drops that record from its cache while it is still serving.
@@ -280,8 +287,11 @@ out without it or is refused, as `target.auth.fallback` says (see
 [Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A
 reference to another tenant's is refused in both modes (see
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). A
-stored surface that derives a DID from another tenant's API Key Provider key, or from the key of
-a surface with no tenant, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
+stored surface that derives a DID from another tenant's API Key Provider key, from the key of a
+surface with no tenant, from another surface's key of its own tenant, or from a key whose owning
+surface is gone, keeps serving under `"warn"` and answers `503` under `"enforce"`; one deriving
+it from a revoked key or from a key id no key has, such as a deleted key, answers `503` in both
+modes; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
 those surfaces, then restart with `"enforce"`. An
