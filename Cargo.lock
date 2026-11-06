@@ -691,7 +691,7 @@ dependencies = [
  "futures",
  "governor 0.10.4",
  "hex",
- "hkdf 0.12.4",
+ "hkdf 0.13.0",
  "hmac 0.12.1",
  "http-body-util",
  "hyper",
