@@ -1257,7 +1257,7 @@ mod tests {
     async fn valid_session_returns_didauth_identity() {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
-        let session = didauth_store
+        let (session_id, _) = didauth_store
             .create_session(
                 "did:example:123".to_string(),
                 "test-channel".to_string(),
@@ -1271,7 +1271,7 @@ mod tests {
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_id).unwrap());
 
         let result = mw
             .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
@@ -1324,7 +1324,7 @@ mod tests {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
         // Create a session with 0 second TTL — it expires immediately
-        let session = didauth_store
+        let (session_id, _) = didauth_store
             .create_session(
                 "did:example:expired".to_string(),
                 "test-channel".to_string(),
@@ -1341,7 +1341,7 @@ mod tests {
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_id).unwrap());
 
         let result = mw
             .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
@@ -1357,7 +1357,7 @@ mod tests {
     async fn session_bound_to_other_surface_is_rejected() {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
-        let session_on_a = didauth_store
+        let (session_on_a, _) = didauth_store
             .create_session(
                 "did:example:alice".to_string(),
                 "surface-a".to_string(),
@@ -1370,7 +1370,7 @@ mod tests {
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session_on_a.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_on_a).unwrap());
 
         // Presenting A's session token against surface B must fail closed.
         let result = mw
@@ -1405,16 +1405,16 @@ mod tests {
     async fn a_session_authenticates_only_while_the_allow_list_names_its_did() {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
         let view = SessionView::base("surface-a-id");
-        let mallory = didauth_store
+        let (mallory, _) = didauth_store
             .create_session("did:example:mallory".into(), "surface-a".into(), view, 3600)
             .await;
-        let bob = didauth_store
+        let (bob, _) = didauth_store
             .create_session("did:example:bob".into(), "surface-a".into(), view, 3600)
             .await;
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
-        let presenting = |session: &crate::didauth::sessions::DidAuthSession| {
+        let presenting = |session_id: &str| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+            headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
             headers
         };
 
@@ -1462,17 +1462,17 @@ mod tests {
             surface_id: "surface-a-id",
             variant_id: Some("variant-2"),
         };
-        let on_the_variant = didauth_store
+        let (on_the_variant, _) = didauth_store
             .create_session("did:example:mallory".into(), "surface-a".into(), variant, 3600)
             .await;
-        let on_the_base = didauth_store
+        let (on_the_base, _) = didauth_store
             .create_session("did:example:mallory".into(), "surface-a".into(), base, 3600)
             .await;
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
         let config = listing(&["did:example:mallory"]);
-        let presenting = |session: &crate::didauth::sessions::DidAuthSession| {
+        let presenting = |session_id: &str| {
             let mut headers = HeaderMap::new();
-            headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+            headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
             headers
         };
 
@@ -1507,8 +1507,9 @@ mod tests {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
         let minted =
             chrono::Utc::now() - chrono::Duration::seconds(DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS as i64 + 60);
+        let session_id = "long-lived-token";
         let session = DidAuthSession {
-            session_id: "long-lived-token".to_string(),
+            session_id_hash: crate::storage::filesystem::token_storage_id(session_id),
             did: "did:example:alice".to_string(),
             channel_name: "surface-a".to_string(),
             surface_id: "surface-a-id".to_string(),
@@ -1518,11 +1519,11 @@ mod tests {
             challenge: None,
         };
         didauth_store
-            .insert_for_test(session.clone())
+            .insert_for_test(session)
             .await;
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
 
         let err = mw
             .authenticate(&listing(&[]), &headers, "surface-a", SessionView::base("surface-a-id"), None)
@@ -1541,8 +1542,9 @@ mod tests {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
         // Fabricate a legacy session record (surface_id empty).
+        let session_id = "legacy-token-xyz";
         let legacy = DidAuthSession {
-            session_id: "legacy-token-xyz".to_string(),
+            session_id_hash: crate::storage::filesystem::token_storage_id(session_id),
             did: "did:example:legacy".to_string(),
             channel_name: "some-old-channel".to_string(),
             surface_id: String::new(),
@@ -1552,14 +1554,14 @@ mod tests {
             challenge: None,
         };
         didauth_store
-            .insert_for_test(legacy.clone())
+            .insert_for_test(legacy)
             .await;
 
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&legacy.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
 
         let result = mw
             .authenticate(&config, &headers, "any-surface", SessionView::base("any-surface-id"), None)

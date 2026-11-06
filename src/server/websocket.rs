@@ -628,7 +628,7 @@ mod tests {
 
     fn session(terms_gate: crate::auth::session::TermsSessionGate) -> crate::auth::session::Session {
         crate::auth::session::Session {
-            token: "token".to_string(),
+            token_hash: crate::storage::filesystem::token_storage_id("token"),
             username: "user".to_string(),
             user_id: "user-1".to_string(),
             created_at: Utc::now(),

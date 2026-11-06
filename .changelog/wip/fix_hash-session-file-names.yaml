@@ -1,0 +1,21 @@
+branch: fix/hash-session-file-names
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: ⭐ Store sessions under a hash of their token; everyone signs in again once
+      description: >-
+        After upgrading, every dashboard user signs in again and every DID Auth caller
+        authenticates again: startup deletes the session files earlier versions saved.
+        Dashboard sessions and DID Auth sessions were saved as files named by their
+        bearer token, with the token also inside the file, so anyone who could list the
+        sessions directory, a backup or a copy of it could use any live session, an
+        administrator's included. Encryption at rest did not help, since it encrypts what
+        a file holds, not its name. Each session is now stored under the SHA-256 hash of
+        its token, which cannot be used to sign in, and a presented token is hashed to
+        find its session. An earlier version cannot use the new files, so rolling back
+        also signs everyone out. See docs/SOURCE_AUTH.md.
+  breaking: []

@@ -250,14 +250,14 @@ pub async fn authenticate_handler(
                 surface_id: &state.surface_id,
                 variant_id: state.variant_id.as_deref(),
             };
-            let session = state
+            let (session_id, session) = state
                 .session_store
                 .create_session(verified.did.clone(), channel_name, view, session_ttl)
                 .await;
             info!(
                 surface = %state.surface_id,
                 did = %verified.did,
-                session_id = %loggable::secret(&session.session_id),
+                session_id = %loggable::secret(&session_id),
                 expires_at = %session.expires_at,
                 "Minted DID Auth session"
             );
@@ -265,7 +265,7 @@ pub async fn authenticate_handler(
             (
                 StatusCode::OK,
                 Json(AuthenticateResponse {
-                    session_id: session.session_id,
+                    session_id,
                     expires_at: session
                         .expires_at
                         .to_rfc3339(),
