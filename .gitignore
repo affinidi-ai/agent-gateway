@@ -70,6 +70,7 @@ tmp/
 !.github/
 .github/*
 !.github/dependabot.yml
+!.github/codeql-config.yml
 !.github/workflows/
 !.github/workflows/**
 !.github/scripts/
