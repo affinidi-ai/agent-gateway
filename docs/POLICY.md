@@ -608,6 +608,14 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   inbound forward step. Without `target.auth` the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
+- An Access Point with a `fabric://` Target gives its surface policy the card
+  it serves, built in process the way the preview builds it, never requested
+  through its own listener. Payment gating, rate limits, metrics and the Trust
+  Recorder do not see that read. The card is read from the remote gateway over
+  Fabric within `a2a.timeout_seconds`, or the surface's shorter request
+  timeout, and a card larger than `a2a.max_body_size` is refused, like a card
+  fetched over HTTP. The card the Access Point serves over Fabric is read the
+  same way.
 - The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
   but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
   or without `target.auth`, and records nothing; a blocked target reports
@@ -634,11 +642,19 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   without that credential, so a remote Target that serves its card only at the
   legacy path and requires its credential there is reported as
   `AGENT_CARD_UNAVAILABLE`. Any other path is an ordinary request through the
-  remote Access Point, so `agent_card_path` is not used. An oversized or
-  non-JSON answer at one path is skipped for the next, and a Fabric transport
-  failure ends the read with no card. A Transit Point policy
-  with `require_agent_context` does not read a card the request's Trust Checks
-  already found unavailable.
+  remote Access Point, so `agent_card_path` is not used, and the Surface Builder
+  does not offer it on a `fabric://` Transit Point. A `404` or `503` the
+  remote gateway answers itself (an unknown or inactive surface) and a Fabric
+  transport failure end the read with no card; any other answer without a
+  usable card moves on to the next path, which the remote reads with different
+  credentials. Trust Checks and a
+  Transit Point policy with `require_agent_context` share the agent card cache,
+  so a card is read once a minute and a missing one, for any target, is
+  remembered for 10 seconds. A read that failed on this gateway's side (no
+  Fabric connection yet, the mediator refusing the message, or the reply not
+  picked up) and a `503` from the briefly unavailable remote are not cached, so
+  the next request reads again. The policy does not read a card the request's Trust Checks already
+  found unavailable.
 - The **managed agent Agent Card fetch** for display names
   (`src/identity/target_card_names.rs`) reads the card of an A2A or AP2
   surface's operator-configured HTTP(S) target through the same

@@ -128,6 +128,22 @@ deny_reason := sprintf("fabric source_id %v did not match expected %v", [input.g
     )
 }
 
+/// A surface policy that admits a request only when the agent card of the
+/// surface's Target names `agent_did`, which it reads into `input.agent.did`.
+pub fn build_surface_require_agent_did_policy(agent_did: &str) -> String {
+    let did_literal = serde_json::to_string(agent_did).expect("DID should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if input.agent.did == {did_literal}
+
+deny_reason := "the agent card did not name the expected agent DID" if not allow
+"#
+    )
+}
+
 /// Surface policy that allows only requests whose verified identity binding
 /// was issued by `issuer_did`. The receiving gateway sets
 /// `input.identity_binding` only when the binding VP verified against the

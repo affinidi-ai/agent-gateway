@@ -3172,37 +3172,6 @@ async fn step_inject_custom_metadata(
     Ok(())
 }
 
-/// Fetch the agent card of the routed Transit Point's target: over Fabric for
-/// a `fabric://` target, never through the Transit Point's own listener, whose
-/// caller authentication the gateway's own read would not pass.
-fn fetch_target_agent_card<'s>(
-    state: &'s OutboundProxyState,
-    ctx: &OutboundPipelineContext,
-) -> impl std::future::Future<Output = Option<serde_json::Value>> + Send + 's {
-    let (target, agent_card_path) = agent_card_location(&ctx.virtual_channel);
-    let request_id = ctx.request_id.clone();
-    let timeout = resolve_outbound_timeout(ctx);
-    let fabric_read = target
-        .starts_with("fabric://")
-        .then(|| FabricCardRead {
-            target: target.clone(),
-            request_id: request_id.clone(),
-            log_label: ctx.surface.name.clone(),
-            timeout,
-            max_bytes: state.max_response_bytes,
-        });
-    let limits = agent_card_limits(state, ctx);
-    async move {
-        match fabric_read {
-            Some(read) => {
-                read.fetch(&state.listener_manager)
-                    .await
-            }
-            None => fetch_agent_card(&target, agent_card_path.as_deref(), &request_id, timeout, limits).await,
-        }
-    }
-}
-
 /// Where a Transit Point's target card is read, which also keys the card
 /// cache: the target and its `agent_card_path`, which does not apply to a
 /// `fabric://` target.
@@ -3217,103 +3186,98 @@ fn agent_card_location(tp: &TransitPoint) -> (String, Option<String>) {
     (tp.target_endpoint.clone(), path)
 }
 
-/// The paths a `fabric://` target's card is asked for, in order: discovery
-/// paths, which the remote gateway answers as public card reads, with its
-/// surface's card and identity credential. Any other path, such as a Transit
-/// Point's `agent_card_path`, is an ordinary request through its Access Point,
-/// so it is not used.
-const FABRIC_AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
-
-/// The gateway's own read of a `fabric://` target's agent card. It is a
-/// discovery read, so it counts as the first Fabric crossing and has a trace id
-/// of its own, as a discovery read through the Transit Point does.
-struct FabricCardRead {
+/// The read of a Transit Point target's agent card, taken from the request so
+/// that it can run without borrowing the pipeline context.
+struct TargetCardRead {
     target: String,
+    agent_card_path: Option<String>,
     request_id: String,
     log_label: String,
     timeout: std::time::Duration,
-    max_bytes: usize,
+    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
 }
 
-impl FabricCardRead {
-    async fn fetch(
-        &self,
-        listener_manager: &Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
-    ) -> Option<serde_json::Value> {
-        use crate::proxy::fabric_forward::{FabricForwardRequest, forward_via_fabric};
-
-        let trace_id = Uuid::new_v4().to_string();
-        let send = |path: &'static str| {
-            let mut headers = std::collections::HashMap::new();
-            crate::proxy::fabric_hops::set_fabric_hops(&mut headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
-            forward_via_fabric(
-                listener_manager,
-                FabricForwardRequest {
-                    fabric_target: &self.target,
-                    method: &Method::GET,
-                    path,
-                    headers,
-                    body: Bytes::new(),
-                    timeout: self.timeout,
-                    trace_id: &trace_id,
-                    log_label: &self.log_label,
-                    extra_body: None,
-                },
-            )
-        };
-        self.fetch_with(&trace_id, send)
-            .await
+impl TargetCardRead {
+    fn of(
+        state: &OutboundProxyState,
+        ctx: &OutboundPipelineContext,
+    ) -> Self {
+        let (target, agent_card_path) = agent_card_location(&ctx.virtual_channel);
+        Self {
+            target,
+            agent_card_path,
+            request_id: ctx.request_id.clone(),
+            log_label: ctx.surface.name.clone(),
+            timeout: resolve_outbound_timeout(ctx),
+            limits: agent_card_limits(state, ctx),
+        }
     }
 
-    /// The first JSON card within bounds that a path answers with `2xx`; a
-    /// transport failure ends the read.
-    async fn fetch_with<F, Fut>(
+    /// The card from the card cache, or read and cached. A read that never
+    /// reached a `fabric://` target's gateway is not cached, so the next
+    /// request tries again.
+    async fn cached(
         &self,
-        trace_id: &str,
-        send: F,
-    ) -> Option<serde_json::Value>
-    where
-        F: Fn(&'static str) -> Fut,
-        Fut: std::future::Future<
-                Output = Result<
-                    crate::proxy::fabric_forward::FabricForwardResponse,
-                    crate::proxy::fabric_forward::FabricForwardError,
-                >,
-            >,
-    {
-        for path in FABRIC_AGENT_CARD_PATHS {
-            match send(path).await {
-                Ok(response) if (200..300).contains(&response.status) => {
-                    if response.body.len() > self.max_bytes {
-                        debug!(request_id = %self.request_id, card_trace_id = %trace_id, path, "Fabric agent card exceeded its bounds, trying next");
-                    } else if let Ok(card) = serde_json::from_slice::<serde_json::Value>(&response.body) {
-                        return Some(card);
-                    } else {
-                        debug!(request_id = %self.request_id, card_trace_id = %trace_id, path, "Fabric agent card is not JSON, trying next");
-                    }
-                }
-                Ok(response) => {
-                    debug!(
-                        request_id = %self.request_id,
-                        card_trace_id = %trace_id,
-                        status = response.status,
-                        path,
-                        "Fabric agent card read returned non-success status, trying next"
-                    );
-                }
-                Err(error) => {
-                    debug!(request_id = %self.request_id, card_trace_id = %trace_id, error = %error, path, "Failed to read agent card over Fabric");
-                    break;
-                }
-            }
+        state: &OutboundProxyState,
+    ) -> Option<serde_json::Value> {
+        let path = self
+            .agent_card_path
+            .as_deref();
+        if let Some(card) = crate::proxy::agent_card_cache::lookup(&self.target, path) {
+            return card;
         }
-        warn!(
-            request_id = %self.request_id,
-            card_trace_id = %trace_id,
-            target = %self.target,
-            "Failed to fetch agent card over Fabric"
-        );
-        None
+        let (card, cacheable) = self.fetch(state).await;
+        if cacheable {
+            crate::proxy::agent_card_cache::insert(&self.target, path, card.clone());
+        }
+        card
+    }
+
+    /// The card, and whether the result may be cached.
+    async fn fetch(
+        &self,
+        state: &OutboundProxyState,
+    ) -> (Option<serde_json::Value>, bool) {
+        if !self
+            .target
+            .starts_with("fabric://")
+        {
+            let card = fetch_agent_card(
+                &self.target,
+                self.agent_card_path
+                    .as_deref(),
+                &self.request_id,
+                self.timeout,
+                self.limits,
+            )
+            .await;
+            return (card, true);
+        }
+        let trace_id = Uuid::new_v4().to_string();
+        let outcome = crate::proxy::fabric_forward::read_fabric_card(
+            &state.listener_manager,
+            &crate::proxy::fabric_forward::FabricCardRequest {
+                fabric_target: &self.target,
+                paths: &crate::proxy::fabric_forward::FABRIC_AGENT_CARD_PATHS,
+                headers: std::collections::HashMap::new(),
+                timeout: self.timeout,
+                max_bytes: self.limits.max_bytes(),
+                trace_id: &trace_id,
+                log_label: &self.log_label,
+            },
+        )
+        .await;
+        let cacheable = outcome.describes_the_remote();
+        let card = outcome.into_card();
+        if card.is_none() {
+            warn!(
+                request_id = %self.request_id,
+                card_trace_id = %trace_id,
+                target = %self.target,
+                "Failed to fetch agent card over Fabric"
+            );
+        }
+        (card, cacheable)
     }
 }
 
@@ -3429,18 +3393,10 @@ async fn step_collect_trust_context(
         return Ok(());
     }
 
-    let (target_url, agent_card_path) = agent_card_location(&ctx.virtual_channel);
-
-    // Consult the process-global card cache before touching the network.
-    let card_json = match crate::proxy::agent_card_cache::lookup(&target_url, agent_card_path.as_deref()) {
-        Some(payload) => payload,
-        None => {
-            let fetched = fetch_target_agent_card(state, ctx).await;
-            crate::proxy::agent_card_cache::insert(&target_url, agent_card_path.as_deref(), fetched.clone());
-            fetched
-        }
-    };
-    let Some(card_json) = card_json else {
+    let Some(card_json) = TargetCardRead::of(state, ctx)
+        .cached(state)
+        .await
+    else {
         // Trust-Check-only path: leave target_agent_context unpopulated
         // and let `step_trust_check` synthesize AGENT_CARD_UNAVAILABLE
         // results per configured element.
@@ -4081,7 +4037,9 @@ async fn step_transit_point_opa_policy(
         let card_json = if ctx.target_agent_card_unavailable {
             None
         } else {
-            fetch_target_agent_card(state, ctx).await
+            TargetCardRead::of(state, ctx)
+                .cached(state)
+                .await
         };
 
         let body_json: Option<serde_json::Value> = ctx
@@ -6098,7 +6056,9 @@ async fn step_forward_request_fabric(
     .map_err(|e| {
         error!(request_id = %ctx.request_id, error = %e, "Outbound fabric forward failed");
         match e {
-            FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
+            FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_) => {
+                OutboundPipelineError::UpstreamTimeout
+            }
             other => OutboundPipelineError::UpstreamConnectionFailed(other.to_string()),
         }
     })?;
@@ -7246,7 +7206,9 @@ fn modern_fabric_failure(
 ) -> OutboundPipelineError {
     use crate::proxy::fabric_forward::FabricForwardError;
     match error {
-        FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
+        FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_) => {
+            OutboundPipelineError::UpstreamTimeout
+        }
         FabricForwardError::RemoteLegacyOnly => OutboundPipelineError::McpValidation(
             crate::mcp::request_validation::McpRequestValidationError::legacy_only(request_id),
         ),
@@ -7275,6 +7237,10 @@ mod tests {
         ));
         assert!(matches!(
             modern_fabric_failure(FabricForwardError::NoResponse("gw".into()), None),
+            OutboundPipelineError::UpstreamTimeout
+        ));
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::ReplyNotReceived("gw".into()), None),
             OutboundPipelineError::UpstreamTimeout
         ));
         assert!(matches!(
@@ -15689,6 +15655,15 @@ mod tests {
             "the card must not be read through the Transit Point's own listener"
         );
         assert!(ctx.target_agent_card_unavailable, "with no Fabric connection the card is unavailable");
+        assert_eq!(
+            crate::proxy::agent_card_cache::lookup(
+                &ctx.virtual_channel
+                    .target_endpoint,
+                None
+            ),
+            None,
+            "a read that never reached the partner gateway is not cached"
+        );
     }
 
     /// A card is read at, and cached under, the target and its
@@ -15705,92 +15680,6 @@ mod tests {
             ctx.virtual_channel
                 .target_endpoint = target.to_string();
             assert_eq!(agent_card_location(&ctx.virtual_channel), (target.to_string(), path), "{target}");
-        }
-    }
-
-    fn fabric_card_read(max_bytes: usize) -> FabricCardRead {
-        FabricCardRead {
-            target: "fabric://partner-gateway/partner-surface".to_string(),
-            request_id: "card-read-test".to_string(),
-            log_label: "card-read-test".to_string(),
-            timeout: std::time::Duration::from_secs(1),
-            max_bytes,
-        }
-    }
-
-    /// What one Fabric card read asks for and returns, given the remote
-    /// gateway's answer at each well-known path in turn.
-    async fn read_fabric_card(
-        max_bytes: usize,
-        answers: Vec<Result<(u16, &'static str), ()>>,
-    ) -> (Option<serde_json::Value>, Vec<&'static str>) {
-        use crate::proxy::fabric_forward::{FabricForwardError, FabricForwardResponse};
-        let asked = std::sync::Mutex::new(Vec::new());
-        let answers = std::sync::Mutex::new(answers.into_iter());
-        let card = fabric_card_read(max_bytes)
-            .fetch_with("trace", |path| {
-                asked
-                    .lock()
-                    .unwrap()
-                    .push(path);
-                let answer = answers
-                    .lock()
-                    .unwrap()
-                    .next()
-                    .expect("no more answers");
-                async move {
-                    answer
-                        .map(|(status, body)| FabricForwardResponse {
-                            status,
-                            headers: Default::default(),
-                            body: body.as_bytes().to_vec(),
-                        })
-                        .map_err(|()| FabricForwardError::GatewayNotConnected("partner-gateway".to_string()))
-                }
-            })
-            .await;
-        (card, asked.into_inner().unwrap())
-    }
-
-    /// A case name, the size bound, the remote's answers, the card read and the
-    /// paths asked for.
-    type FabricCardCase =
-        (&'static str, usize, Vec<Result<(u16, &'static str), ()>>, Option<serde_json::Value>, Vec<&'static str>);
-
-    #[tokio::test]
-    async fn a_fabric_card_read_takes_the_first_good_card_and_stops_on_a_transport_failure() {
-        const CARD: &str = r#"{"name":"partner"}"#;
-        const BOTH: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
-        let cases: Vec<FabricCardCase> = vec![
-            ("card at the first path", 1024, vec![Ok((200, CARD))], Some(json!({"name": "partner"})), vec![BOTH[0]]),
-            (
-                "not found, then the card",
-                1024,
-                vec![Ok((404, "")), Ok((200, CARD))],
-                Some(json!({"name": "partner"})),
-                BOTH.to_vec(),
-            ),
-            (
-                "oversized, then the card",
-                20,
-                vec![Ok((200, r#"{"name":"far too large a card"}"#)), Ok((200, CARD))],
-                Some(json!({"name": "partner"})),
-                BOTH.to_vec(),
-            ),
-            (
-                "not JSON, then the card",
-                1024,
-                vec![Ok((200, "<html>")), Ok((200, CARD))],
-                Some(json!({"name": "partner"})),
-                BOTH.to_vec(),
-            ),
-            ("refused at both paths", 1024, vec![Ok((502, "")), Ok((404, ""))], None, BOTH.to_vec()),
-            ("transport failure", 1024, vec![Err(())], None, vec![BOTH[0]]),
-        ];
-        for (case, max_bytes, answers, expected, expected_asked) in cases {
-            let (card, asked) = read_fabric_card(max_bytes, answers).await;
-            assert_eq!(card, expected, "{case}");
-            assert_eq!(asked, expected_asked, "{case}");
         }
     }
 
@@ -15856,6 +15745,30 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    /// A Transit Point policy that needs agent context takes a cached card
+    /// rather than reading it again. Other tests clear the process-wide cache
+    /// at any time, so an attempt whose entry was cleared is retried.
+    #[tokio::test]
+    async fn a_transit_point_policy_takes_a_cached_card() {
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut used_the_cache = false;
+        for _ in 0..20 {
+            crate::proxy::agent_card_cache::insert(&endpoint, None, Some(json!({"name": "cached"})));
+            let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .target_endpoint = endpoint.clone();
+            require_agent_context(&mut ctx);
+            let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+            if hits.load(std::sync::atomic::Ordering::SeqCst) == before {
+                used_the_cache = true;
+                break;
+            }
+        }
+        assert!(used_the_cache, "the policy step read the card despite a cached one");
     }
 
     /// An `http(s)` Transit Point's Trust Check reads the card at its

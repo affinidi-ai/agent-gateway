@@ -340,6 +340,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Neither the panel, its canvas summary, the
   Transit Point factory nor a variant's overrides set `sign_requests`, which the gateway
   ignores.
+- The Transit Point panel's **Agent Card** section (**Override Agent Card Location**) is shown
+  for an A2A or AP2 Transit Point with a URL destination only. A gateway destination
+  (`fabric://`) reads the card at the remote gateway's discovery paths, so the section is
+  hidden there; a stored `agent_card_path` is kept and ignored.
 - The Transit Point panel's **Who can call this Transit Point** section
   (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
   (`transit-point-require-transit-token-switch`), the **Caller authentication** select

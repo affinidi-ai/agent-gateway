@@ -10380,88 +10380,6 @@ async fn handle_onboarding_request(
     Ok(response)
 }
 
-/// Fetch an agent card from `<base_url>/.well-known/agent-card.json` (then
-/// `/.well-known/agent.json` as fallback).
-///
-/// `base_url` must include the scheme (e.g. `https://gw.example.com/route`).
-/// A non-2xx status or a JSON parse error is treated as final — only
-/// **transport-level** failures (connection error, TLS handshake) on the
-/// first well-known path trigger the fallback to the second path.
-///
-/// Returns `Some(card)` on success or `None` on failure.
-async fn fetch_agent_card(
-    client: &reqwest::Client,
-    base_url: &str,
-    channel_id: &str,
-    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
-) -> Option<serde_json::Value> {
-    let base = base_url.trim_end_matches('/');
-    let urls = [format!("{}/.well-known/agent-card.json", base), format!("{}/.well-known/agent.json", base)];
-
-    for url in &urls {
-        let logged_url = loggable::url(url);
-        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", logged_url);
-        match client.get(url).send().await {
-            Ok(resp) => {
-                info!(channel = channel_id, "GW1 fabric: Agent card fetch HTTP status: {}", resp.status());
-                if resp.status().is_success() {
-                    let body = match crate::proxy::upstream_body::read_bounded(resp, limits).await {
-                        Ok(body) => body,
-                        Err(e) => {
-                            warn!(
-                                channel = channel_id,
-                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", logged_url, e
-                            );
-                            return None;
-                        }
-                    };
-                    match serde_json::from_slice::<serde_json::Value>(&body) {
-                        Ok(card) => {
-                            info!(
-                                channel = channel_id,
-                                "GW1 fabric: Agent card fetched successfully (url={}): name={:?} endpoint={:?}",
-                                logged_url,
-                                card.get("name"),
-                                // Reads either era: a pure-1.0 card has no top-level
-                                // `url`, only `supportedInterfaces[]`.
-                                crate::a2a::url_rewriter::primary_endpoint_url(&card)
-                            );
-                            return Some(card);
-                        }
-                        Err(e) => {
-                            // JSON parse failure — no value in retrying with http
-                            warn!(
-                                channel = channel_id,
-                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", logged_url, e
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    // HTTP-level error — no value in retrying with http
-                    warn!(
-                        channel = channel_id,
-                        "GW1 fabric: Agent card fetch non-success status (url={}): {}",
-                        logged_url,
-                        resp.status()
-                    );
-                    return None;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    channel = channel_id,
-                    "GW1 fabric: Agent card fetch request failed (url={}): {}",
-                    logged_url,
-                    e.without_url()
-                );
-                // Transport-level failure — try the next well-known path
-            }
-        }
-    }
-    None
-}
-
 /// Resolves the caller identity configured on the surface's inbound (or
 /// managed) identity slot for the modes whose DID comes from a stored
 /// credential (cert / API key) or a configured static DID rather than the
@@ -10806,7 +10724,8 @@ fn modern_fabric_failure_response(
             );
             return crate::proxy::fabric_forward::capacity_response(id);
         }
-        crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
+        crate::proxy::fabric_forward::FabricForwardError::NoResponse(_)
+        | crate::proxy::fabric_forward::FabricForwardError::ReplyNotReceived(_) => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
     create_error_response(status, "Modern Fabric transport is unavailable")
@@ -11629,43 +11548,13 @@ async fn handle_fabric_request_inner(
         let body_json: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
         let body_ref = body_json.as_ref();
         info!("GW1 fabric: Surface-level OPA policy, body JSON parse success: {}", body_json.is_some());
-        // For fabric:// targets, fetch the agent card via the surface's
-        // own access point URL (public path, bypasses auth) instead of
-        // the unresolvable fabric:// target endpoint.
-        let fabric_card_json = {
-            let card_url = format!(
-                "{}{}",
-                state
-                    .surface
-                    .access_point
-                    .listen_address
-                    .trim_end_matches('/'),
-                state
-                    .surface
-                    .access_point
-                    .route,
-            );
-            info!(
-                channel = config_id_str,
-                fabric_target = %loggable::url(&state.surface.target.endpoint),
-                resolved_url = %loggable::url(&card_url),
-                "GW1 fabric: resolving agent card via access point listen address"
-            );
-            fetch_agent_card(
-                &state.client,
-                &card_url,
-                config_id_str,
-                crate::proxy::upstream_body::UpstreamBodyLimits::new(
-                    state.config.a2a.max_body_size,
-                    state.surface.timeout(),
-                    state
-                        .config
-                        .a2a
-                        .timeout_seconds,
-                ),
-            )
-            .await
-        };
+        // The card this Access Point serves, built in process without the
+        // effects of serving it.
+        let fabric_card_json =
+            agent_card::build_public_card(&state, &HeaderMap::new(), &source_addr, agent_card::CardMode::Preview, None)
+                .await
+                .map(|card| card.served)
+                .ok();
 
         let agent_ctx = if fabric_card_json.is_some() {
             let agent_ctx = crate::policies::build_agent_context(
@@ -22626,6 +22515,7 @@ allow if {
         for (error, status) in [
             (FabricForwardError::StreamingUnavailable, axum::http::StatusCode::BAD_GATEWAY),
             (FabricForwardError::NoResponse("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
+            (FabricForwardError::ReplyNotReceived("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
         ] {
             let (response, audit) = crate::audit::producer::capture(async {
                 modern_fabric_failure_response(error, Some(serde_json::json!("call-1")), &facts)
@@ -23753,6 +23643,35 @@ mod fabric_send_tests {
         }
     }
 
+    /// The peer's `ForwardResponse` to `request`, with `status` and `body`.
+    fn forward_response(
+        request: &affinidi_messaging_didcomm::Message,
+        responder_did: &str,
+        status: u16,
+        body: &str,
+    ) -> crate::gateways::connection_points::messages::ReceivedMessage {
+        crate::gateways::connection_points::messages::ReceivedMessage::new(
+            "cp-1".into(),
+            "peer".into(),
+            crate::messages::MessageType::ForwardResponse
+                .as_str()
+                .into(),
+            uuid::Uuid::new_v4().to_string(),
+            Some(request.id.clone()),
+            Some(responder_did.to_string()),
+            vec!["did:example:connection-point".into()],
+            None,
+            None,
+            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+            crate::gateways::connection_points::messages::MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: json!({}),
+            },
+        )
+    }
+
     /// A gateway whose A2A surface targets a Fabric peer that answers every
     /// ForwardRequest with `status` and `body`.
     async fn fabric_peer_answering(
@@ -23807,32 +23726,19 @@ mod fabric_send_tests {
         let reply_body = body.to_string();
         let forwards = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = forwards.clone();
+        // A card read over Fabric waits on the mediator's live stream, which this
+        // peer cannot answer; every other forward has registered a waiter.
         crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
             recorded
                 .lock()
                 .unwrap()
                 .push(request.body.clone());
-            let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
-                "cp-1".into(),
-                "peer".into(),
-                crate::messages::MessageType::ForwardResponse
-                    .as_str()
-                    .into(),
-                uuid::Uuid::new_v4().to_string(),
-                Some(request.id.clone()),
-                Some(responder_did.clone()),
-                vec!["did:example:connection-point".into()],
-                None,
-                None,
-                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
-                crate::gateways::connection_points::messages::MessageMetadata {
-                    encrypted: true,
-                    authenticated: true,
-                    from_key: None,
-                    extra: json!({}),
-                },
-            );
-            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+            let reply = forward_response(request, &responder_did, status, &reply_body);
+            let answered = crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply);
+            let card_read = request.body["path"]
+                .as_str()
+                .is_some_and(crate::proxy::paths::is_well_known_agent_card_path);
+            assert!(answered || card_read, "an unanswered forward: {}", request.body);
         });
 
         let surface = serde_json::from_value(surface(&peer.id)).unwrap();
@@ -24915,6 +24821,119 @@ mod fabric_send_tests {
         );
     }
 
+    /// A surface policy on the Fabric path gets the agent card this Access Point
+    /// serves by building it in process, which reads it from the peer over Fabric.
+    /// The Access Point's own address is never asked for it.
+    #[tokio::test]
+    async fn a_fabric_surface_policy_never_reads_the_card_through_its_own_access_point() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let responder_did = peer.peer_did.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((request.body["method"].to_string(), request.body["path"].to_string()));
+            let reply = forward_response(request, &responder_did, 200, "{}");
+            let _ = crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply);
+        });
+        let own_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = own_reads.clone();
+        let own_access_point = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let own_address = own_access_point
+            .local_addr()
+            .unwrap();
+        let own_app = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { axum::Json(json!({"name": "own"})) }
+        });
+        tokio::spawn(async move { axum::serve(own_access_point, own_app).await });
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .access_point
+            .listen_address = format!("http://{own_address}");
+        let policy_dir = tempfile::tempdir().unwrap();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                policy_dir
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+            "id": "allow-all", "name": "Allow all", "policy_type": "agent_surface",
+            "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        policies
+            .save(policy.clone())
+            .await
+            .unwrap();
+        surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: policy.id,
+            require_agent_context: false,
+        });
+        let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        policy_manager.set_policy_definition_store(policies);
+        policy_manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        peer.state.policy_manager = Some(policy_manager);
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let _ = Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        ))
+        .await;
+
+        assert_eq!(
+            own_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Access Point asked itself for its card"
+        );
+        assert!(
+            sent.lock()
+                .unwrap()
+                .contains(&(r#""GET""#.to_string(), r#""/.well-known/agent-card.json""#.to_string())),
+            "the card is read from the peer over Fabric: {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
     struct FabricPolicyCase {
         name: &'static str,
         inbound: String,
@@ -24926,32 +24945,17 @@ mod fabric_send_tests {
     #[tokio::test]
     async fn fabric_send_gives_the_presented_key_did_to_the_inbound_policy_only() {
         const KEY_ID: &str = "atgk_pak_fabric_caller";
-        const CARD_DID: &str = "did:web:target.example";
         let key = crate::source_auth::AuthenticatedIdentity::ApiKey {
             key_name: KEY_ID.to_string(),
             provider_agent_id: Some("provider-agent".to_string()),
         };
         let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let vc_issuer = Arc::new(vc_issuer);
-        let card_server = crate::component_tests::helpers::MockServer::start_with_response(
-            json!({
-                "name": "target agent",
-                "capabilities": {"extensions": [{
-                    "uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
-                    "did": CARD_DID
-                }]}
-            })
-            .to_string(),
-        )
-        .await;
         let key_surface = |peer: &mut FabricPeer| {
             peer.state.vc_issuer = Some(vc_issuer.clone());
             let mut surface = (*peer.state.surface).clone();
             surface.identity_slots.inbound =
                 Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: None });
-            surface
-                .access_point
-                .listen_address = card_server.url();
             surface
         };
         let mut setup = fabric_peer_answering(200, json!({})).await;
@@ -24969,28 +24973,27 @@ mod fabric_send_tests {
         .unwrap()
         .expect("an API Key Provider key resolves a caller DID")
         .did;
-        assert_ne!(key_did, CARD_DID);
         let inbound_rule = |did: &str| {
             format!(
                 "package surface.policy\ndefault allow = false\nallow if {{\n    input.extension_identity.did == \"{did}\"\n    input.extension_identity.verification == \"source_auth\"\n}}"
             )
         };
-        let card_and_body_target_rule = format!(
-            "package surface.policy\ndefault allow = false\nallow if {{\n    input.agent.did == \"{CARD_DID}\"\n    not input.extension_identity\n    input.source_auth.key_name == \"{KEY_ID}\"\n}}"
+        let no_caller_identity_target_rule = format!(
+            "package surface.policy\ndefault allow = false\nallow if {{\n    not input.agent\n    not input.extension_identity\n    input.source_auth.key_name == \"{KEY_ID}\"\n}}"
         );
         let failed_key_rule = "package surface.policy\ndefault allow = false\nallow if {\n    input.source_auth.method == \"failed\"\n    not input.extension_identity\n}";
         let cases = [
             FabricPolicyCase {
-                name: "inbound sees the key DID, target sees the card DID",
+                name: "inbound sees the key DID, target sees no caller identity",
                 inbound: inbound_rule(&key_did),
-                target: card_and_body_target_rule.clone(),
+                target: no_caller_identity_target_rule.clone(),
                 key_failed: false,
                 expected: axum::http::StatusCode::OK,
             },
             FabricPolicyCase {
                 name: "inbound rule naming another DID denies",
                 inbound: inbound_rule("did:example:other"),
-                target: card_and_body_target_rule,
+                target: no_caller_identity_target_rule,
                 key_failed: false,
                 expected: axum::http::StatusCode::FORBIDDEN,
             },
