@@ -1070,6 +1070,8 @@ fn transit_point_injects_delegated_credentials_from_an_unknown_provider(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::Unknown,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
@@ -2653,6 +2655,8 @@ fn surface_requires_client_credentials_delegated_credentials(world: &mut Surface
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_ID.to_string(),
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::ClientCredentials,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
@@ -3388,11 +3392,27 @@ fn surface_requires_oauth_delegated_credentials(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::OAuth2AuthorizationCode,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
         scopes: vec!["calendar.read".to_string(), "calendar.write".to_string()],
     });
+}
+
+/// The provider keeps `provider` as its `provider_id` slug and name, and
+/// takes a record id of its own, so its id and slug differ.
+#[given(expr = "OAuth provider {string} belongs to tenant {string}")]
+fn oauth_provider_belongs_to_tenant(
+    world: &mut SurfaceWorld,
+    provider: String,
+    tenant: String,
+) {
+    let delegation = delegation_config_mut(world);
+    assert_eq!(delegation.provider_id, provider, "the surface's delegated provider");
+    delegation.record_id = Some(format!("{provider}-of-{tenant}"));
+    delegation.tenant_id = Some(tenant);
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string} only for MCP tool {string}")]
@@ -3414,6 +3434,8 @@ fn surface_requires_api_key_delegated_credentials(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider.clone(),
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::ApiKey {
             secret_id: format!("bdd-{provider}-api-key"),
             secret_value: "bdd-delegated-api-key".to_string(),
@@ -3435,6 +3457,8 @@ fn surface_requires_delegated_credentials_from_an_unknown_provider(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::Unknown,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,

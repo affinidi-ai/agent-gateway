@@ -99,6 +99,8 @@ pub struct ApiKeyProviderFixture {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CredentialProviderFixture {
     pub id: String,
+    /// The tenant that owns the provider; appliance-wide when `None`.
+    pub tenant_id: Option<String>,
     pub name: String,
     pub provider_id: String,
     pub provider_type: String,
@@ -484,6 +486,9 @@ fn write_credential_provider_fixture(
         "created_at": provider.created_at.to_rfc3339(),
         "updated_at": provider.updated_at.to_rfc3339(),
     });
+    if let Some(tenant_id) = &provider.tenant_id {
+        value["tenant_id"] = serde_json::json!(tenant_id);
+    }
     if let Some(endpoint) = &provider.authorization_endpoint {
         value["authorization_endpoint"] = serde_json::json!(endpoint);
     }

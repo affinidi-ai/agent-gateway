@@ -353,7 +353,7 @@ fn write_single_surface_config_inner(
                 DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
             };
             serde_json::json!({
-                "credential_provider_id": delegation.provider_id,
+                "credential_provider_id": delegation.record_id(),
                 "scopes": delegation.scopes,
                 "required_for": required_for,
                 "consent_mode": "on_demand",
@@ -800,6 +800,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
     let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
     CredentialProviderFixture {
         id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        tenant_id: None,
         name: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_type: if client_credentials {
@@ -849,7 +850,10 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
                 .as_ref()
                 .expect("OAuth provider base URL must be configured before writing credential provider fixture");
             CredentialProviderFixture {
-                id: provider_id.clone(),
+                id: delegation
+                    .record_id()
+                    .to_string(),
+                tenant_id: delegation.tenant_id.clone(),
                 name: provider_id.clone(),
                 provider_id: provider_id.clone(),
                 provider_type: "oauth2_authorization_code".to_string(),
@@ -871,7 +875,10 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             }
         }
         CredentialProviderKind::ApiKey { secret_id, .. } => CredentialProviderFixture {
-            id: provider_id.clone(),
+            id: delegation
+                .record_id()
+                .to_string(),
+            tenant_id: delegation.tenant_id.clone(),
             name: provider_id.clone(),
             provider_id: provider_id.clone(),
             provider_type: "api_key".to_string(),

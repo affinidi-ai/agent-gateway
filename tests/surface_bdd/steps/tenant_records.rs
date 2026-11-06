@@ -254,6 +254,40 @@ fn audit_log_holds_token_injections_and_a_revoke(world: &mut SurfaceWorld) {
 }
 
 /// The vault is read from disk on every request.
+/// Audit records reach the log shortly after the request that produced them,
+/// so this reads the operator's view of the Credential Delegation Audit Log
+/// again until it holds a `consent_granted`, for up to five seconds.
+#[given(expr = "the Credential Delegation Audit Log holds the consent granted for OAuth provider {string}")]
+async fn audit_log_holds_consent_granted(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    ensure_admin_session(world).await;
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist");
+    let mut page = Value::Null;
+    for _ in 0..50 {
+        page = client
+            .send_recorded_json::<Value>(Method::GET, "/v1/delegation-audit?page_size=100", None)
+            .await
+            .expect("reading the Credential Delegation Audit Log")
+            .body;
+        let consents = page["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|event| event["event"] == "consent_granted")
+            .count();
+        if consents > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no consent granted for OAuth provider {provider} reached the audit log: {page}");
+}
+
 #[given("the delegation vault holds a token of each credential provider")]
 fn delegation_vault_holds_a_token_of_each_provider(world: &mut SurfaceWorld) {
     let directory = storage(world).join("delegation_vault");
@@ -415,6 +449,46 @@ fn audit_read_shows_every_record(world: &mut SurfaceWorld) {
                     .is_none()
         }),
         "no revoke naming no provider: {page}"
+    );
+    assert_eq!(page["total"], json!(events.len()), "{page}");
+}
+
+#[then(expr = "the audit read shows the consent granted for OAuth provider {string} of tenant {string}")]
+fn audit_read_shows_consent_granted_for(
+    world: &mut SurfaceWorld,
+    provider: String,
+    tenant: String,
+) {
+    let delegation = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .expect("the surface requires delegated credentials");
+    assert_eq!(
+        (
+            delegation
+                .provider_id
+                .as_str(),
+            delegation
+                .tenant_id
+                .as_deref()
+        ),
+        (provider.as_str(), Some(tenant.as_str())),
+        "the surface's delegated provider"
+    );
+    let id = json!(delegation.record_id());
+    let (page, events) = audit_page(world);
+    let consents: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == "consent_granted")
+        .map(|event| &event["provider_id"])
+        .collect();
+    assert_eq!(consents, [&id], "{page}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["provider_id"] == id),
+        "a record of another provider: {page}"
     );
     assert_eq!(page["total"], json!(events.len()), "{page}");
 }
