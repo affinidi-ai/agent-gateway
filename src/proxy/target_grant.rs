@@ -833,6 +833,15 @@ pub(crate) struct Caller<'a> {
     pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
 }
 
+/// What the gateway answers its caller with, given the Target's response to a
+/// request that carried the Target's grant.
+pub(crate) enum TargetAnswer {
+    /// The Target's response, passed on.
+    Pass(reqwest::Response),
+    /// The gateway's own answer, in place of the Target's.
+    Answered(Response),
+}
+
 impl TargetGrantRoute {
     /// The Strict client pinned to the provider's resource, which every
     /// request on this route is sent with.
@@ -1061,28 +1070,30 @@ impl TargetGrantRoute {
         response: reqwest::Response,
         retry: Option<reqwest::RequestBuilder>,
         body: &[u8],
-    ) -> Result<reqwest::Response, Response> {
+    ) -> TargetAnswer {
         use crate::delegation_vault::release::{VendorAnswer, vendor_answer, vendor_answer_to_a_retry};
         let surface = &state.surface;
         match vendor_answer(response.status(), response.headers()) {
-            VendorAnswer::Pass => return Ok(response),
+            VendorAnswer::Pass => return TargetAnswer::Pass(response),
             VendorAnswer::Refuse(refused) => {
-                return Err(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+                return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
             }
             VendorAnswer::TokenRejected => drop(response),
         }
         let Some(release) = self.release_context(state) else {
-            return Err(unavailable(surface, self.mcp, body, "stores_unavailable"));
+            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "stores_unavailable"));
         };
         let fresh = match release
             .retry_grant(&self.provider, &released.key, self.subject, &released.grant, retry.is_some())
             .await
         {
             Ok(fresh) => fresh,
-            Err(refused) => return Err(refuse(surface, self.mcp, body, &refused.refusal, refused.reason)),
+            Err(refused) => {
+                return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+            }
         };
         let Some(retry) = retry else {
-            return Err(unavailable(
+            return TargetAnswer::Answered(unavailable(
                 surface,
                 self.mcp,
                 body,
@@ -1090,11 +1101,11 @@ impl TargetGrantRoute {
             ));
         };
         let Some(headers) = self.headers_for(&fresh) else {
-            return Err(unavailable(surface, self.mcp, body, "grant_not_a_header_value"));
+            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "grant_not_a_header_value"));
         };
         let (client, request) = retry.build_split();
         let Ok(mut request) = request else {
-            return Err(unavailable(surface, self.mcp, body, "retry_not_rebuilt"));
+            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "retry_not_rebuilt"));
         };
         for (name, value) in &headers {
             request
@@ -1112,14 +1123,17 @@ impl TargetGrantRoute {
                     error = %error.without_url(),
                     "The retry of a request whose grant the Target refused failed"
                 );
-                return Err(crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, "Upstream request failed"));
+                return TargetAnswer::Answered(crate::a2a::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream request failed",
+                ));
             }
         };
         if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
             drop(retried);
-            return Err(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+            return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
         }
-        Ok(retried)
+        TargetAnswer::Pass(retried)
     }
 }
 

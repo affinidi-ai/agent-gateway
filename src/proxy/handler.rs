@@ -8122,8 +8122,8 @@ async fn proxy_handler_with_mcp_runtime(
             .answer(&state, released, upstream_response, target_grant_retry, &body_bytes)
             .await
         {
-            Ok(response) => response,
-            Err(refused) => {
+            crate::proxy::target_grant::TargetAnswer::Pass(response) => response,
+            crate::proxy::target_grant::TargetAnswer::Answered(refused) => {
                 connection_guard
                     .decrement()
                     .await;
