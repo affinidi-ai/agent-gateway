@@ -3759,6 +3759,39 @@ async fn oauth_provider_ready_to_exchange_code(
         .await;
 }
 
+#[given(expr = "OAuth provider {string} records authorization response issuer {string}")]
+fn oauth_provider_records_authorization_response_issuer(
+    world: &mut SurfaceWorld,
+    _provider: String,
+    issuer: String,
+) {
+    world
+        .surface_config
+        .oauth_authorization_response_issuer = Some(issuer);
+}
+
+#[given(expr = "the gateway has OAuth provider {string}")]
+fn gateway_has_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    world
+        .surface_config
+        .additional_oauth_providers
+        .push(provider);
+}
+
+#[given(expr = "caller {string} has confirmed the consent start page for provider {string}")]
+async fn caller_has_confirmed_consent_start_page(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let (state, cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
+    world.oauth_confirmed_state = Some(state);
+    world.oauth_binding_cookie = Some(cookie);
+}
+
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]
 async fn caller_has_been_asked_to_complete_oauth_consent(
     world: &mut SurfaceWorld,

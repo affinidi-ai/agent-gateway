@@ -750,11 +750,12 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
             CredentialProviderKind::OAuth2AuthorizationCode => {
-                secrets.push(SecretFixture::new(format!("bdd-{}-client-id", delegation.provider_id), "bdd-client-id"));
-                secrets.push(SecretFixture::new(
-                    format!("bdd-{}-client-secret", delegation.provider_id),
-                    "bdd-client-secret",
-                ));
+                for provider_id in
+                    std::iter::once(&delegation.provider_id).chain(&surface_config.additional_oauth_providers)
+                {
+                    secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-id"), "bdd-client-id"));
+                    secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-secret"), "bdd-client-secret"));
+                }
             }
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
@@ -822,6 +823,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
         callback_url: None,
         token_refresh_enabled: false,
         api_key_secret_ref: None,
+        authorization_response_issuer: None,
         jwt_settings: (!client_credentials).then(|| {
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
@@ -841,36 +843,26 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
     };
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
-    let provider = match &delegation.provider_kind {
-        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => return Vec::new(),
+    match &delegation.provider_kind {
+        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
-            let base_url = surface_config
-                .oauth_provider_base_url
-                .as_ref()
-                .expect("OAuth provider base URL must be configured before writing credential provider fixture");
-            CredentialProviderFixture {
-                id: provider_id.clone(),
-                name: provider_id.clone(),
-                provider_id: provider_id.clone(),
-                provider_type: "oauth2_authorization_code".to_string(),
-                authorization_endpoint: Some(format!("{base_url}/authorize")),
-                token_endpoint: Some(format!("{base_url}/token")),
-                client_id_secret_ref: Some(format!("bdd-{provider_id}-client-id")),
-                client_secret_secret_ref: Some(format!("bdd-{provider_id}-client-secret")),
-                default_scopes: delegation.scopes.clone(),
-                callback_path: format!("/v1/identity/oauth/callback/{provider_id}"),
-                callback_url: surface_config
-                    .oauth_callback_base_url
-                    .as_ref()
-                    .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
-                token_refresh_enabled: true,
-                api_key_secret_ref: None,
-                jwt_settings: None,
-                created_at: now,
-                updated_at: now,
-            }
+            let mut providers = vec![oauth_provider_fixture(
+                surface_config,
+                &provider_id,
+                delegation.scopes.clone(),
+                surface_config
+                    .oauth_authorization_response_issuer
+                    .clone(),
+            )];
+            providers.extend(
+                surface_config
+                    .additional_oauth_providers
+                    .iter()
+                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None)),
+            );
+            providers
         }
-        CredentialProviderKind::ApiKey { secret_id, .. } => CredentialProviderFixture {
+        CredentialProviderKind::ApiKey { secret_id, .. } => vec![CredentialProviderFixture {
             id: provider_id.clone(),
             name: provider_id.clone(),
             provider_id: provider_id.clone(),
@@ -884,12 +876,47 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             callback_url: None,
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
+            authorization_response_issuer: None,
             jwt_settings: None,
             created_at: now,
             updated_at: now,
-        },
-    };
-    vec![provider]
+        }],
+    }
+}
+
+fn oauth_provider_fixture(
+    surface_config: &SurfaceConfigBuilder,
+    provider_id: &str,
+    default_scopes: Vec<String>,
+    authorization_response_issuer: Option<String>,
+) -> CredentialProviderFixture {
+    let now = chrono::Utc::now();
+    let base_url = surface_config
+        .oauth_provider_base_url
+        .as_ref()
+        .expect("OAuth provider base URL must be configured before writing credential provider fixture");
+    CredentialProviderFixture {
+        id: provider_id.to_string(),
+        name: provider_id.to_string(),
+        provider_id: provider_id.to_string(),
+        provider_type: "oauth2_authorization_code".to_string(),
+        authorization_endpoint: Some(format!("{base_url}/authorize")),
+        token_endpoint: Some(format!("{base_url}/token")),
+        client_id_secret_ref: Some(format!("bdd-{provider_id}-client-id")),
+        client_secret_secret_ref: Some(format!("bdd-{provider_id}-client-secret")),
+        default_scopes,
+        callback_path: format!("/v1/identity/oauth/callback/{provider_id}"),
+        callback_url: surface_config
+            .oauth_callback_base_url
+            .as_ref()
+            .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
+        token_refresh_enabled: true,
+        api_key_secret_ref: None,
+        authorization_response_issuer,
+        jwt_settings: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitionFixture> {

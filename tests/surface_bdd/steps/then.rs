@@ -1431,19 +1431,50 @@ fn response_body_is_error(
 
 #[then("the OAuth callback response shows an authorization failure page")]
 fn oauth_callback_response_shows_authorization_failure_page(world: &mut SurfaceWorld) {
-    assert_content_type_contains(get_response_headers_value(world), "text/html", "OAuth callback response");
+    assert_authorization_failure_page(world, "OAuth callback response");
+}
+
+#[then(expr = "the consent start response status is {int}")]
+fn consent_start_response_status_is(
+    world: &mut SurfaceWorld,
+    expected: u16,
+) {
+    assert_response_status(Some(get_response_status_value(world)), expected);
+}
+
+#[then("the consent start response shows an authorization failure page")]
+fn consent_start_response_shows_authorization_failure_page(world: &mut SurfaceWorld) {
+    assert_authorization_failure_page(world, "consent start response");
+}
+
+#[then(expr = "the consent start response does not send the browser to OAuth provider {string}")]
+fn consent_start_response_does_not_send_browser_to_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let headers = get_response_headers_value(world);
+    assert_eq!(
+        headers.get("location"),
+        None,
+        "expected the consent start response not to send the browser to OAuth provider '{provider}'"
+    );
+    assert_eq!(headers.get("set-cookie"), None, "expected the consent start response to set no consent binding cookie");
+}
+
+fn assert_authorization_failure_page(
+    world: &SurfaceWorld,
+    what: &str,
+) {
+    assert_content_type_contains(get_response_headers_value(world), "text/html", what);
     let body = get_response_body_value(world)
         .get("text")
         .and_then(|value| value.as_str())
         .unwrap_or_else(|| {
-            panic!(
-                "expected OAuth callback response body to be captured as HTML text, got {}",
-                get_response_body_value(world)
-            )
+            panic!("expected the {what} body to be captured as HTML text, got {}", get_response_body_value(world))
         });
     assert!(
         body.contains("Authorization Failed"),
-        "expected OAuth callback response to show an authorization failure page, got {body}"
+        "expected the {what} to show an authorization failure page, got {body}"
     );
 }
 
@@ -3410,6 +3441,32 @@ async fn delegation_audit_trail_contains_event(
     })
     .await;
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+}
+
+#[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]
+async fn delegation_audit_trail_records_refused_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    reason: String,
+) {
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events.iter().any(|entry| {
+            let failure = entry.pointer("/event/delegation_failed");
+            failure
+                .and_then(|failure| failure.get("reason"))
+                .and_then(|value| value.as_str())
+                == Some(reason.as_str())
+                && failure
+                    .and_then(|failure| failure.get("provider_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(provider.as_str())
+        })
+    })
+    .await;
+    assert!(
+        found,
+        "expected a refused consent for provider '{provider}' with reason '{reason}' in the delegation audit trail, got {events:?}"
+    );
 }
 
 /// Audit records reach the log shortly after the request that produced them,

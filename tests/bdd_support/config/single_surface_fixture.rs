@@ -48,6 +48,10 @@ pub struct SurfaceConfigBuilder {
     pub credential_delegation: Option<SurfaceCredentialDelegationConfig>,
     pub oauth_provider_base_url: Option<String>,
     pub oauth_callback_base_url: Option<String>,
+    /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
+    pub oauth_authorization_response_issuer: Option<String>,
+    /// OAuth providers the gateway has besides the surface's own, by provider id.
+    pub additional_oauth_providers: Vec<String>,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -125,6 +129,8 @@ impl Default for SurfaceConfigBuilder {
             credential_delegation: None,
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
+            oauth_authorization_response_issuer: None,
+            additional_oauth_providers: Vec::new(),
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
