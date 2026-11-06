@@ -729,7 +729,7 @@ fn validate_jwt_bearer_audiences(
         if protected_resource {
             if !config.audience_claim.is_aud() {
                 anyhow::bail!(
-                    "Channel '{}': jwt_bearer audience_claim must be aud beside caller_authentication.protected_resource, \
+                    "Surface '{}': jwt_bearer audience_claim must be aud beside caller_authentication.protected_resource, \
                      whose resource is the audience",
                     surface.name
                 );
@@ -752,7 +752,7 @@ fn validate_jwt_bearer_audiences(
                 });
         if !kept {
             anyhow::bail!(
-                "Channel '{}': jwt_bearer method (strategy '{}') must name the audiences it accepts, so a token its \
+                "Surface '{}': jwt_bearer method (strategy '{}') must name the audiences it accepts, so a token its \
                  identity provider issued for another service is refused; for an identity provider that issues no \
                  aud, set audience_claim to client_id or azp and list the clients it accepts",
                 surface.name,
