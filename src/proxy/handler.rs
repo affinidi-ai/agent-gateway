@@ -12,6 +12,7 @@ use axum::{
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -1603,17 +1604,17 @@ struct InboundPayment<'a> {
 
 impl InboundPayment<'_> {
     /// Puts the request through the gate, just before it is forwarded.
-    /// `Ok(None)` when it is free and `Ok(Some(receipt))` when it was paid for;
-    /// the receipt holds the payment's claim until [`agent_pay_gate::Receipt::commit`].
-    /// `Err(response)` is the gate's answer when it was not, already recorded in
-    /// the connection metrics.
+    /// `Continue(None)` when it is free and `Continue(Some(receipt))` when it was
+    /// paid for; the receipt holds the payment's claim until
+    /// [`agent_pay_gate::Receipt::commit`]. `Break(answer)` is what the caller is
+    /// answered instead, already recorded in the connection metrics.
     async fn charge(
         &self,
         state: &ProxyState,
         evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
-    ) -> Result<Option<agent_pay_gate::Receipt>, Response> {
+    ) -> ControlFlow<agent_pay_gate::Answer, Option<agent_pay_gate::Receipt>> {
         let Some(intake) = self.intake else {
-            return Ok(None);
+            return ControlFlow::Continue(None);
         };
         match agent_pay_gate::charge(
             intake,
@@ -1636,11 +1637,11 @@ impl InboundPayment<'_> {
         )
         .await
         {
-            agent_pay_gate::GateOutcome::Free => Ok(None),
-            agent_pay_gate::GateOutcome::Paid(paid) => Ok(Some(paid.receipt)),
-            agent_pay_gate::GateOutcome::Refused(response) => {
-                record_payment_refusal(state, self.source_addr, self.start_time, self.trace_id, response.status());
-                Err(response)
+            agent_pay_gate::GateOutcome::Free => ControlFlow::Continue(None),
+            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Answered(answer) => {
+                record_payment_refusal(state, self.source_addr, self.start_time, self.trace_id, answer.status());
+                ControlFlow::Break(answer)
             }
         }
     }
@@ -6218,15 +6219,12 @@ async fn proxy_charged_request(
             &state.surface,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         );
-        let dispatched: Result<Response, Response> = 'dispatch: {
+        let dispatched = 'dispatch: {
             let adapter =
                 match crate::a2a_proxies::A2aProxyTargetAdapter::from_optional_store(state.a2a_proxy_store.clone()) {
                     Ok(adapter) => adapter,
                     Err(err) => {
-                        break 'dispatch Ok(crate::a2a_proxies::target_adapter::json_rpc_target_error(
-                            &body_bytes,
-                            err,
-                        ));
+                        break 'dispatch crate::a2a_proxies::target_adapter::json_rpc_target_error(&body_bytes, err);
                     }
                 };
             let proxy = match adapter
@@ -6235,7 +6233,7 @@ async fn proxy_charged_request(
             {
                 Ok(proxy) => proxy,
                 Err(err) => {
-                    break 'dispatch Ok(crate::a2a_proxies::target_adapter::json_rpc_target_error(&body_bytes, err));
+                    break 'dispatch crate::a2a_proxies::target_adapter::json_rpc_target_error(&body_bytes, err);
                 }
             };
             let prepared = match crate::a2a_proxies::A2aProxyTargetAdapter::prepare_message_send(
@@ -6244,22 +6242,27 @@ async fn proxy_charged_request(
                 &channel_name,
             ) {
                 Ok(prepared) => prepared,
-                Err(refusal) => break 'dispatch Ok(*refusal),
+                Err(refusal) => break 'dispatch *refusal,
             };
             match inbound_payment
                 .charge(&state, None)
                 .await
             {
-                Ok(receipt) => {
+                ControlFlow::Continue(receipt) => {
                     gate_receipt = receipt;
                     *receipt_out = gate_receipt.clone();
                 }
-                Err(refusal) => break 'dispatch Err(refusal),
+                ControlFlow::Break(answer) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(answer.into_response());
+                }
             }
             if let Some(receipt) = &gate_receipt {
                 receipt.commit().await;
             }
-            Ok(crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
+            crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
                 &proxy,
                 prepared,
                 state.secrets_store.as_ref(),
@@ -6272,23 +6275,18 @@ async fn proxy_charged_request(
                         .as_deref(),
                 ),
             )
-            .await)
+            .await
         };
-        let response = match dispatched {
-            Ok(response) => {
-                record_a2a_proxy_connection_metric(
-                    &state,
-                    proxy_id,
-                    response,
-                    &source_addr,
-                    start_time,
-                    &trace_id,
-                    body_bytes.len() as u64,
-                )
-                .await
-            }
-            Err(refusal) => refusal,
-        };
+        let response = record_a2a_proxy_connection_metric(
+            &state,
+            proxy_id,
+            dispatched,
+            &source_addr,
+            start_time,
+            &trace_id,
+            body_bytes.len() as u64,
+        )
+        .await;
         connection_guard
             .decrement()
             .await;
@@ -6346,8 +6344,8 @@ async fn proxy_charged_request(
                     .charge(&state, None)
                     .await
                 {
-                    Err(response) => return Ok(response),
-                    Ok(receipt) => *receipt_out = receipt,
+                    ControlFlow::Break(answer) => return Ok(answer.into_response()),
+                    ControlFlow::Continue(receipt) => *receipt_out = receipt,
                 }
                 return Err(ModernDelegationError::Unpaid.response(request));
             }
@@ -7398,7 +7396,7 @@ async fn proxy_charged_request(
         )
         .await
     {
-        Ok(Some(receipt)) => {
+        ControlFlow::Continue(Some(receipt)) => {
             *receipt_out = Some(receipt.clone());
             if let Some(prepared) = modern_delegation.as_mut() {
                 let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
@@ -7418,12 +7416,12 @@ async fn proxy_charged_request(
             }
             gate_receipt = Some(receipt);
         }
-        Ok(None) => {}
-        Err(response) => {
+        ControlFlow::Continue(None) => {}
+        ControlFlow::Break(answer) => {
             connection_guard
                 .decrement()
                 .await;
-            return Ok(response);
+            return Ok(answer.into_response());
         }
     }
     if let Some(receipt) = &gate_receipt {
@@ -11946,8 +11944,8 @@ async fn handle_fabric_request_inner(
                         .charge(&state, None)
                         .await
                     {
-                        Err(response) => return Ok(response),
-                        Ok(receipt) => *gate_receipt = receipt,
+                        ControlFlow::Break(answer) => return Ok(answer.into_response()),
+                        ControlFlow::Continue(receipt) => *gate_receipt = receipt,
                     }
                     return Err(ModernDelegationError::Unpaid.response(request));
                 }
@@ -12588,7 +12586,7 @@ async fn handle_fabric_request_inner(
         )
         .await
     {
-        Ok(Some(receipt)) => {
+        ControlFlow::Continue(Some(receipt)) => {
             receipt.apply(&mut modern_payment_headers);
             *gate_receipt = Some(receipt.clone());
             if let Some(prepared) = modern_delegation.as_mut() {
@@ -12608,12 +12606,12 @@ async fn handle_fabric_request_inner(
                     })?;
             }
         }
-        Ok(None) => {}
-        Err(response) => {
+        ControlFlow::Continue(None) => {}
+        ControlFlow::Break(answer) => {
             connection_guard
                 .decrement()
                 .await;
-            return Ok(response);
+            return Ok(answer.into_response());
         }
     }
 
@@ -15633,8 +15631,8 @@ async fn handle_mcp_proxy_request_inner(
                 .charge(state, None)
                 .await
             {
-                Ok(receipt) => *receipt_out = receipt,
-                Err(response) => return Ok(response),
+                ControlFlow::Continue(receipt) => *receipt_out = receipt,
+                ControlFlow::Break(answer) => return Ok(answer.into_response()),
             }
             if let Some(receipt) = receipt_out.as_ref() {
                 receipt.commit().await;
@@ -24373,6 +24371,75 @@ mod fabric_send_tests {
         assert!(status.is_server_error(), "{status}");
         assert_eq!(headers["payment-response"], RECEIPT, "an error answer carries it too");
         assert_eq!(gate.calls(), 2);
+    }
+
+    #[test]
+    fn a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered() {
+        run_on_large_stack(a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered_flow());
+    }
+
+    async fn a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered_flow() {
+        use crate::mcp::errors::{application_error_codes, error_codes};
+
+        let cases = [
+            (
+                "held-gate",
+                MockGate::answering(
+                    202,
+                    &[],
+                    json!({"status": "held_for_oversight", "case_id": "case-7", "reason": "limit"}),
+                ),
+                axum::http::StatusCode::OK,
+                None,
+                json!({"code": application_error_codes::PAYMENT_PENDING, "message": "Payment pending review",
+                    "data": {"httpStatus": 202, "case_id": "case-7", "reason": "limit"}}),
+            ),
+            (
+                "rate-limited-gate",
+                MockGate::answering(429, &[("retry-after", "9")], json!({"error": "rate_limited"})),
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Some("9"),
+                json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment gateway rate limit reached",
+                    "data": {"httpStatus": 429, "retryAfter": "9"}}),
+            ),
+            (
+                "in-progress-gate",
+                MockGate::answering(409, &[], json!({"error": "idempotency_key_in_use"})),
+                axum::http::StatusCode::CONFLICT,
+                Some("1"),
+                json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment in progress",
+                    "data": {"httpStatus": 409, "error": "payment_in_progress", "retryAfter": "1"}}),
+            ),
+        ];
+        for (gate_id, gate, expected_status, retry_after, error) in cases {
+            install_test_transport(gate_id, gate.clone());
+            let peer =
+                fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
+                    paid_mcp_surface(id, gate_id)
+                })
+                .await;
+
+            let (status, headers, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), None).await).await;
+            assert_eq!(status, expected_status, "{gate_id}: {body}");
+            assert_eq!(
+                headers
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+                retry_after,
+                "{gate_id}"
+            );
+            assert_eq!(headers["cache-control"], "no-store", "{gate_id}");
+            assert_eq!(body, json!({"jsonrpc": "2.0", "id": 7, "error": error}), "{gate_id}");
+            assert_eq!(gate.calls(), 1, "{gate_id}");
+            assert!(
+                peer.forwards
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "{gate_id}: an unpaid call is never sent"
+            );
+        }
     }
 
     /// The next event of a legacy SSE stream: its name and data.

@@ -2074,8 +2074,59 @@ pub(crate) enum GateOutcome {
     /// Not chargeable: no fabric hop was made.
     Free,
     Paid(Paid),
-    /// The caller's response: a challenge, a hold or a refusal.
-    Refused(Response),
+    /// Not forwarded: the caller is answered instead.
+    Answered(Answer),
+}
+
+/// What the gate answers a request it does not forward: a challenge, a hold, a
+/// retry or a refusal. The handler renders it for the caller.
+#[derive(Debug)]
+pub(crate) struct Answer {
+    shape: Shape,
+    kind: AnswerKind,
+}
+
+#[derive(Debug)]
+enum AnswerKind {
+    Decision { decision: PaymentDelegationDecision, retry_after: Option<u64> },
+    Batch,
+}
+
+impl Answer {
+    fn decision(
+        decision: PaymentDelegationDecision,
+        shape: &Shape,
+        retry_after: Option<u64>,
+    ) -> Self {
+        Self {
+            shape: shape.clone(),
+            kind: AnswerKind::Decision { decision, retry_after },
+        }
+    }
+
+    fn batch(shape: &Shape) -> Self {
+        Self {
+            shape: shape.clone(),
+            kind: AnswerKind::Batch,
+        }
+    }
+
+    /// The status the caller is answered with.
+    pub(crate) fn status(&self) -> StatusCode {
+        match &self.kind {
+            AnswerKind::Decision { decision, .. } => answer_status(decision, &self.shape),
+            AnswerKind::Batch => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Response {
+        match self.kind {
+            AnswerKind::Decision { decision, retry_after } => {
+                render_with_retry_after(&decision, &self.shape, retry_after)
+            }
+            AnswerKind::Batch => batch_refusal(),
+        }
+    }
 }
 
 /// The circumstances of one call to the gate.
@@ -2326,6 +2377,29 @@ fn retry_after_header(retry_after: Option<&str>) -> Vec<(HeaderName, HeaderValue
         .unwrap_or_default()
 }
 
+/// The status a decision that is not `Proceed` is answered with.
+fn answer_status(
+    decision: &PaymentDelegationDecision,
+    shape: &Shape,
+) -> StatusCode {
+    match decision {
+        PaymentDelegationDecision::Proceed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        PaymentDelegationDecision::Challenge { .. } | PaymentDelegationDecision::VerificationFailed { .. } => {
+            StatusCode::PAYMENT_REQUIRED
+        }
+        PaymentDelegationDecision::Held { .. } if matches!(shape, Shape::JsonRpc { .. }) => StatusCode::OK,
+        PaymentDelegationDecision::Held { .. } => StatusCode::ACCEPTED,
+        PaymentDelegationDecision::Rejected { status, .. } => {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN)
+        }
+        PaymentDelegationDecision::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        PaymentDelegationDecision::InProgress { .. } => StatusCode::CONFLICT,
+        PaymentDelegationDecision::Unconfirmed { status, .. } | PaymentDelegationDecision::Deny { status, .. } => {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
 /// The caller's response for a decision that is not `Proceed`.
 fn render(
     decision: &PaymentDelegationDecision,
@@ -2340,6 +2414,7 @@ fn render(
         };
         json_response(status, &crate::mcp::errors::create_mcp_error_envelope(id, code, message, Some(data)), headers)
     };
+    let status = answer_status(decision, shape);
     let is_jsonrpc = matches!(shape, Shape::JsonRpc { .. });
     let legacy = matches!(shape, Shape::JsonRpc { legacy_mcp: true, .. });
     let (required, rejected) = if legacy {
@@ -2354,20 +2429,14 @@ fn render(
         )
     };
     match decision {
-        PaymentDelegationDecision::Proceed { .. } => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        PaymentDelegationDecision::Proceed { .. } => status.into_response(),
         PaymentDelegationDecision::Challenge { headers, body, .. } => {
             let relayed = header_pairs(headers);
             if is_jsonrpc {
-                return jsonrpc(
-                    StatusCode::PAYMENT_REQUIRED,
-                    required.0,
-                    required.1,
-                    challenge_data(headers, body),
-                    &relayed,
-                );
+                return jsonrpc(status, required.0, required.1, challenge_data(headers, body), &relayed);
             }
             let mut response = Response::new(axum::body::Body::from(body.clone()));
-            *response.status_mut() = StatusCode::PAYMENT_REQUIRED;
+            *response.status_mut() = status;
             let content_type = first_header(headers, "content-type")
                 .and_then(|value| HeaderValue::from_str(value).ok())
                 .unwrap_or(HeaderValue::from_static("application/json"));
@@ -2384,7 +2453,7 @@ fn render(
             if is_jsonrpc {
                 let mut data = challenge_data(headers, body);
                 data["failure"] = json!({"reason": reason, "detail": detail});
-                return jsonrpc(StatusCode::PAYMENT_REQUIRED, rejected.0, rejected.1, data, &relayed);
+                return jsonrpc(status, rejected.0, rejected.1, data, &relayed);
             }
             let mut body = serde_json::from_slice::<Value>(body)
                 .ok()
@@ -2393,26 +2462,21 @@ fn render(
             if reason == ALREADY_USED {
                 body["error"] = json!(reason);
             }
-            json_response(StatusCode::PAYMENT_REQUIRED, &body, &relayed)
+            json_response(status, &body, &relayed)
         }
         PaymentDelegationDecision::Held { case_id, reason } => {
             if is_jsonrpc {
                 return jsonrpc(
-                    StatusCode::OK,
+                    status,
                     application_error_codes::PAYMENT_PENDING,
                     "Payment pending review",
                     json!({"httpStatus": 202, "case_id": case_id, "reason": reason}),
                     &[],
                 );
             }
-            json_response(
-                StatusCode::ACCEPTED,
-                &json!({"status": "held_for_oversight", "case_id": case_id, "reason": reason}),
-                &[],
-            )
+            json_response(status, &json!({"status": "held_for_oversight", "case_id": case_id, "reason": reason}), &[])
         }
-        PaymentDelegationDecision::Rejected { status, reason } => {
-            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN);
+        PaymentDelegationDecision::Rejected { reason, .. } => {
             if is_jsonrpc {
                 return jsonrpc(
                     status,
@@ -2428,30 +2492,29 @@ fn render(
             let headers = retry_after_header(retry_after.as_deref());
             if is_jsonrpc {
                 return jsonrpc(
-                    StatusCode::TOO_MANY_REQUESTS,
+                    status,
                     error_codes::INTERNAL_ERROR,
                     "Payment gateway rate limit reached",
                     json!({"httpStatus": 429, "retryAfter": retry_after}),
                     &headers,
                 );
             }
-            json_response(StatusCode::TOO_MANY_REQUESTS, &json!({"error": "rate_limited"}), &headers)
+            json_response(status, &json!({"error": "rate_limited"}), &headers)
         }
         PaymentDelegationDecision::InProgress { retry_after } => {
             let headers = retry_after_header(retry_after.as_deref());
             if is_jsonrpc {
                 return jsonrpc(
-                    StatusCode::CONFLICT,
+                    status,
                     error_codes::INTERNAL_ERROR,
                     "Payment in progress",
                     json!({"httpStatus": 409, "error": IN_PROGRESS, "retryAfter": retry_after}),
                     &headers,
                 );
             }
-            json_response(StatusCode::CONFLICT, &json!({"error": IN_PROGRESS, "retry_same_request": true}), &headers)
+            json_response(status, &json!({"error": IN_PROGRESS, "retry_same_request": true}), &headers)
         }
-        PaymentDelegationDecision::Unconfirmed { status, message } => {
-            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        PaymentDelegationDecision::Unconfirmed { message, .. } => {
             let headers = retry_after_header(Some(&UNCONFIRMED_RETRY_AFTER_SECS.to_string()));
             if is_jsonrpc {
                 return jsonrpc(
@@ -2474,8 +2537,7 @@ fn render(
                 &headers,
             )
         }
-        PaymentDelegationDecision::Deny { status, message } => {
-            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        PaymentDelegationDecision::Deny { message, .. } => {
             if is_jsonrpc {
                 return jsonrpc(
                     status,
@@ -2998,13 +3060,14 @@ pub(crate) fn record_legacy_refusal(
     );
 }
 
-fn continuation_refusal(shape: &Shape) -> Response {
-    render(
-        &PaymentDelegationDecision::Rejected {
+fn continuation_refusal(shape: &Shape) -> Answer {
+    Answer::decision(
+        PaymentDelegationDecision::Rejected {
             status: 403,
             reason: "payment_continuation_invalid".to_string(),
         },
         shape,
+        None,
     )
 }
 
@@ -3035,9 +3098,9 @@ fn evidence_outcome(
                     authorization: None,
                 },
             }),
-            None => GateOutcome::Refused(continuation_refusal(&intake.shape)),
+            None => GateOutcome::Answered(continuation_refusal(&intake.shape)),
         },
-        _ => GateOutcome::Refused(continuation_refusal(&intake.shape)),
+        _ => GateOutcome::Answered(continuation_refusal(&intake.shape)),
     }
 }
 
@@ -3315,7 +3378,7 @@ pub(crate) async fn charge(
         return evidence_outcome(intake, evidence);
     }
     if intake.batch && matches!(intake.protocol, ChannelProtocol::Mcp | ChannelProtocol::A2a | ChannelProtocol::Ap2) {
-        return GateOutcome::Refused(batch_refusal());
+        return GateOutcome::Answered(Answer::batch(&intake.shape));
     }
 
     let started = Instant::now();
@@ -3445,7 +3508,7 @@ pub(crate) async fn charge(
                 PaymentDelegationDecision::Unconfirmed { .. } => None,
                 _ => answer.retry_after,
             };
-            GateOutcome::Refused(render_with_retry_after(&decision, &intake.shape, retry_after))
+            GateOutcome::Answered(Answer::decision(decision, &intake.shape, retry_after))
         }
     }
 }
@@ -3456,6 +3519,20 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type Fabric = Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>;
+
+    impl GateOutcome {
+        /// The caller's response when the request was not forwarded, whose
+        /// status is the one the refusal metric records.
+        fn answered(self) -> Option<Response> {
+            let GateOutcome::Answered(answer) = self else {
+                return None;
+            };
+            let status = answer.status();
+            let response = answer.into_response();
+            assert_eq!(response.status(), status);
+            Some(response)
+        }
+    }
 
     /// A payment gate that answers every request with a fixed response (a
     /// request without a credential with its own, once one is set) and remembers
@@ -5814,7 +5891,10 @@ pub(crate) mod tests {
         let body = tool_call("t", json!({}));
         let intake = read(&surface, &x402_headers(&unique("proof")), &body);
         install_test_transport("gw-no-receipt", MockGate::answering(200, &[], json!({})));
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a receipt-less 200 must not pass")
         };
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -5824,7 +5904,10 @@ pub(crate) mod tests {
             "gw-large",
             MockGate::answering(402, &[], json!({"padding": "x".repeat(MAX_RESPONSE_BODY_BYTES)})),
         );
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("an oversized answer must not pass")
         };
         let (status, _, envelope) = body_json(response).await;
@@ -5852,7 +5935,10 @@ pub(crate) mod tests {
         install_test_transport("gw-peer", gate.clone());
         let fabric = no_fabric();
         let intake = read(&surface, &HeaderMap::new(), &tool_call("t", json!({})));
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a peer that is not a payment gateway must refuse")
         };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -5867,13 +5953,19 @@ pub(crate) mod tests {
         let fabric = no_fabric();
         let intake = read(&surface, &HeaderMap::new(), &tool_call("t", json!({})));
         for attempt in 1..=DEFAULT_BREAKER_FAILURES {
-            let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+            let Some(response) = charge(&intake, call(&surface, &fabric))
+                .await
+                .answered()
+            else {
                 panic!("an unreachable gate must refuse")
             };
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "attempt {attempt}");
         }
         assert_eq!(gate.calls(), DEFAULT_BREAKER_FAILURES as usize);
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("an open breaker must refuse")
         };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -5912,7 +6004,12 @@ pub(crate) mod tests {
         for _ in 0..(DEFAULT_BREAKER_FAILURES * 2) {
             let mut short = call(&surface, &fabric);
             short.deadline_ms = Some(now_ms() + 1_500);
-            let GateOutcome::Refused(response) = charge(&intake, short).await else { panic!("a timeout must refuse") };
+            let Some(response) = charge(&intake, short)
+                .await
+                .answered()
+            else {
+                panic!("a timeout must refuse")
+            };
             assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         }
         assert_eq!(gate.calls(), (DEFAULT_BREAKER_FAILURES * 2) as usize, "short deadlines never opened the breaker");
@@ -5928,7 +6025,10 @@ pub(crate) mod tests {
             (DEFAULT_BREAKER_FAILURES * 3) as usize,
             "a short wait does not reset the count either"
         );
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("the gate's own timeouts count")
         };
         assert_eq!(
@@ -5936,7 +6036,12 @@ pub(crate) mod tests {
             StatusCode::GATEWAY_TIMEOUT,
             "the fifth own timeout trips the breaker after it answers"
         );
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else { panic!("open") };
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
+            panic!("open")
+        };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -5950,7 +6055,12 @@ pub(crate) mod tests {
         for remaining in [0, 400, 990] {
             let mut short = call(&surface, &fabric);
             short.deadline_ms = Some(now_ms() + remaining);
-            let GateOutcome::Refused(response) = charge(&intake, short).await else { panic!("too short") };
+            let Some(response) = charge(&intake, short)
+                .await
+                .answered()
+            else {
+                panic!("too short")
+            };
             let (status, _, body) = body_json(response).await;
             assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{remaining} ms");
             assert_eq!(body["error"]["data"]["detail"], "caller deadline too short for payment");
@@ -5969,7 +6079,10 @@ pub(crate) mod tests {
         let surface = mcp_surface("gw-slow", json!({"require_all": true}));
         install_test_transport("gw-slow", MockGate::failing("timeout"));
         let intake = read(&surface, &HeaderMap::new(), &body);
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a timeout must refuse")
         };
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -5977,7 +6090,10 @@ pub(crate) mod tests {
         let mut misconfigured = mcp_surface("", json!({"require_all": true}));
         misconfigured.surface_id = "misconfigured".into();
         let intake = read(&misconfigured, &HeaderMap::new(), &body);
-        let GateOutcome::Refused(response) = charge(&intake, call(&misconfigured, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&misconfigured, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a misconfigured policy must refuse")
         };
         let (status, _, envelope) = body_json(response).await;
@@ -6042,7 +6158,7 @@ pub(crate) mod tests {
 
             let paying = read(&surface, &x402_headers(&credential), &body);
             let (outcome, events) = crate::audit::producer::capture(charge(&paying, call(&surface, &fabric))).await;
-            let GateOutcome::Refused(response) = outcome else { panic!("{label}: nothing was confirmed") };
+            let Some(response) = outcome.answered() else { panic!("{label}: nothing was confirmed") };
             let (answered, headers, envelope) = body_json(response).await;
             assert_eq!(answered, status, "{label}");
             assert_eq!(headers["retry-after"], "2", "{label}");
@@ -6056,7 +6172,10 @@ pub(crate) mod tests {
             assert_eq!(ledger_outcome_count(&surface.surface_id, "unconfirmed"), 1, "{label}");
 
             let asking = read(&surface, &HeaderMap::new(), &body);
-            let GateOutcome::Refused(response) = charge(&asking, call(&surface, &fabric)).await else {
+            let Some(response) = charge(&asking, call(&surface, &fabric))
+                .await
+                .answered()
+            else {
                 panic!("{label}: nothing was presented")
             };
             let (_, headers, envelope) = body_json(response).await;
@@ -6077,7 +6196,12 @@ pub(crate) mod tests {
         surface.surface_id = unique("never-sent");
         install_test_transport("gw-never-sent", MockGate::failing("down"));
         let intake = read(&surface, &x402_headers(&unique("proof")), &body);
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else { panic!("refused") };
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
+            panic!("refused")
+        };
         let (status, _, envelope) = body_json(response).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(envelope["error"]["data"]["error"], "payment_unavailable");
@@ -6089,7 +6213,7 @@ pub(crate) mod tests {
         let mut misconfigured = mcp_surface("", json!({"require_all": true}));
         misconfigured.surface_id = unique("misconfigured");
         let intake = read(&misconfigured, &x402_headers(&unique("proof")), &body);
-        assert!(matches!(charge(&intake, call(&misconfigured, &fabric)).await, GateOutcome::Refused(_)));
+        assert!(matches!(charge(&intake, call(&misconfigured, &fabric)).await, GateOutcome::Answered(_)));
         assert_eq!(ledger_outcome_count(&misconfigured.surface_id, "unavailable"), 1);
         let latency = crate::metrics::backends::prometheus::PAYMENT_GATE_LATENCY.with_label_values(&[misconfigured
             .surface_id
@@ -6206,7 +6330,10 @@ pub(crate) mod tests {
             a2a_surface("gw-batch-refused", json!({"require_all": true})),
         ] {
             let intake = read(&surface, &x402_headers(&unique("proof")), &batch);
-            let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+            let Some(response) = charge(&intake, call(&surface, &fabric))
+                .await
+                .answered()
+            else {
                 panic!("a batch is not charged")
             };
             let (status, _, envelope) = body_json(response).await;
@@ -6374,7 +6501,10 @@ pub(crate) mod tests {
         ] {
             let mut request = call(&surface, &fabric);
             request.evidence = Some(&invalid);
-            let GateOutcome::Refused(response) = charge(&intake, request).await else {
+            let Some(response) = charge(&intake, request)
+                .await
+                .answered()
+            else {
                 panic!("mismatched or expired evidence is refused")
             };
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -6473,7 +6603,10 @@ pub(crate) mod tests {
 
         let mut after = call(&surface, &fabric);
         after.evidence = Some(&evidence);
-        let GateOutcome::Refused(response) = charge(&intake, after).await else {
+        let Some(response) = charge(&intake, after)
+            .await
+            .answered()
+        else {
             panic!("evidence of a voided authorization is refused")
         };
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -6505,7 +6638,7 @@ pub(crate) mod tests {
         let retry = read(&surface, &x402_headers(&credential), &retry_body);
         assert_eq!(retry.key, first.key);
         let (outcome, events) = crate::audit::producer::capture(charge(&retry, call(&surface, &fabric))).await;
-        let GateOutcome::Refused(response) = outcome else { panic!("a consumed payment is not forwarded again") };
+        let Some(response) = outcome.answered() else { panic!("a consumed payment is not forwarded again") };
         let (status, headers, body) = body_json(response).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body["error"]["code"], -32043, "a request with no protocol version is a legacy caller");
@@ -6545,7 +6678,12 @@ pub(crate) mod tests {
         let a2a_first = read(&http, &x402_headers(&a2a_credential), br#"{"order":1}"#);
         dispatched(&a2a_first, call(&http, &fabric)).await;
         let a2a_retry = read(&http, &x402_headers(&a2a_credential), br#"{"order":1}"#);
-        let GateOutcome::Refused(response) = charge(&a2a_retry, call(&http, &fabric)).await else { panic!("replay") };
+        let Some(response) = charge(&a2a_retry, call(&http, &fabric))
+            .await
+            .answered()
+        else {
+            panic!("replay")
+        };
         let (status, headers, body) = body_json(response).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body["error"], "payment_already_used");
@@ -6585,7 +6723,7 @@ pub(crate) mod tests {
             .count();
         assert_eq!(paid, 1, "one payment buys one forwarded request");
         for outcome in outcomes {
-            if let GateOutcome::Refused(response) = outcome {
+            if let Some(response) = outcome.answered() {
                 let (status, headers, envelope) = body_json(response).await;
                 assert_eq!(status, StatusCode::CONFLICT, "the claim is held by the one being dispatched");
                 assert_eq!(envelope["error"]["data"]["error"], "payment_in_progress");
@@ -6605,7 +6743,10 @@ pub(crate) mod tests {
         let intake = read(&surface, &x402_headers(&credential), &body);
 
         let GateOutcome::Paid(first) = charge(&intake, call(&surface, &fabric)).await else { panic!("paid") };
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("the claim is held")
         };
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -6616,13 +6757,19 @@ pub(crate) mod tests {
         };
         let held = second.receipt.clone();
         drop(second);
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a copy of the receipt still holds the claim")
         };
         assert_eq!(response.status(), StatusCode::CONFLICT);
         held.commit().await;
         drop(held);
-        let GateOutcome::Refused(response) = charge(&intake, call(&surface, &fabric)).await else {
+        let Some(response) = charge(&intake, call(&surface, &fabric))
+            .await
+            .answered()
+        else {
             panic!("a dispatched request is not dispatched again")
         };
         let (status, _, envelope) = body_json(response).await;
@@ -6754,7 +6901,7 @@ pub(crate) mod tests {
             "a manifest offering both rails names none"
         );
         let (outcome, events) = crate::audit::producer::capture(charge(&both, call(&surface, &fabric))).await;
-        assert!(matches!(outcome, GateOutcome::Refused(_)));
+        assert!(matches!(outcome, GateOutcome::Answered(_)));
         let events = payment_events(&events);
         assert_eq!(events[0].0.stage, crate::delegation_vault::audit::PaymentStage::ChallengeIssued);
         assert_eq!(

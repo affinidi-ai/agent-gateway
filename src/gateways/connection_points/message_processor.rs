@@ -3,6 +3,7 @@
 use hyper::Method;
 use serde_json::Value;
 use std::error::Error as StdError;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, instrument, warn};
@@ -4321,15 +4322,20 @@ struct FabricPayment<'a> {
 }
 
 impl FabricPayment<'_> {
-    /// Puts the request through the agent-pay payment gate. `Ok(None)` when it
-    /// is free and `Ok(Some(receipt))` when it was paid for. `Err(result)` is
-    /// the gate's answer when it was not, already recorded in the connection
-    /// metrics.
-    async fn charge(&self) -> Result<Option<crate::proxy::handler::agent_pay_gate::Receipt>, ProcessingResult> {
+    /// Puts the request through the agent-pay payment gate. `Continue(None)`
+    /// when it is free and `Continue(Some(receipt))` when it was paid for.
+    /// `Break(answer)` is what the caller is answered instead, already recorded
+    /// in the connection metrics.
+    async fn charge(
+        &self
+    ) -> ControlFlow<
+        crate::proxy::handler::agent_pay_gate::Answer,
+        Option<crate::proxy::handler::agent_pay_gate::Receipt>,
+    > {
         use crate::proxy::handler::agent_pay_gate;
 
         let Some(intake) = self.intake else {
-            return Ok(None);
+            return ControlFlow::Continue(None);
         };
         let trace_id = self
             .trace_id
@@ -4367,9 +4373,9 @@ impl FabricPayment<'_> {
         )
         .await
         {
-            agent_pay_gate::GateOutcome::Free => Ok(None),
-            agent_pay_gate::GateOutcome::Paid(paid) => Ok(Some(paid.receipt)),
-            agent_pay_gate::GateOutcome::Refused(response) => {
+            agent_pay_gate::GateOutcome::Free => ControlFlow::Continue(None),
+            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Answered(answer) => {
                 crate::proxy::handler::record_payment_refusal_metric(
                     GLOBAL_METRICS_STORE
                         .get()
@@ -4381,9 +4387,9 @@ impl FabricPayment<'_> {
                         .unwrap_or("unknown"),
                     self.received_at,
                     &trace_id,
-                    response.status(),
+                    answer.status(),
                 );
-                Err(axum_response_to_forward_result(response).await)
+                ControlFlow::Break(answer)
             }
         }
     }
@@ -5550,8 +5556,10 @@ async fn process_charged_forward_request(
             }
             Err(ModernDelegationError::Unpaid) => {
                 match (FabricPayment { evidence: None, ..fabric_payment }).charge().await {
-                    Err(refused) => return refused,
-                    Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
+                    ControlFlow::Break(answer) => return axum_response_to_forward_result(answer.into_response()).await,
+                    ControlFlow::Continue(receipt) => {
+                        *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
+                    }
                 }
                 return axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await;
             }
@@ -6347,7 +6355,7 @@ async fn process_charged_forward_request(
     .charge()
     .await;
     match charged {
-        Ok(Some(receipt)) => {
+        ControlFlow::Continue(Some(receipt)) => {
             *gate_receipt = Some((receipt.clone(), surface_protocol.clone()));
             if let Some(prepared) = modern_delegation.as_mut() {
                 let recorded = crate::proxy::credential_delegation::modern::now_secs().and_then(|now| {
@@ -6365,8 +6373,8 @@ async fn process_charged_forward_request(
                 }
             }
         }
-        Ok(None) => {}
-        Err(refused) => return refused,
+        ControlFlow::Continue(None) => {}
+        ControlFlow::Break(answer) => return axum_response_to_forward_result(answer.into_response()).await,
     }
     if let Some((receipt, _)) = gate_receipt.as_ref() {
         receipt.commit().await;
@@ -8418,8 +8426,12 @@ async fn handle_a2a_proxy_forward(
                 Err(refusal) => *refusal,
                 Ok(prepared) => {
                     match payment.charge().await {
-                        Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
-                        Err(refused) => return refused,
+                        ControlFlow::Continue(receipt) => {
+                            *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
+                        }
+                        ControlFlow::Break(answer) => {
+                            return axum_response_to_forward_result(answer.into_response()).await;
+                        }
                     }
                     if let Some((receipt, _)) = gate_receipt.as_ref() {
                         receipt.commit().await;
@@ -8890,8 +8902,10 @@ async fn handle_mcp_proxy_forward(
                 Err(format!("Circuit breaker open, retry after {:?}", retry_after).into())
             } else {
                 match payment.charge().await {
-                    Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
-                    Err(refused) => return refused,
+                    ControlFlow::Continue(receipt) => {
+                        *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
+                    }
+                    ControlFlow::Break(answer) => return axum_response_to_forward_result(answer.into_response()).await,
                 }
                 if let Some((receipt, _)) = gate_receipt.as_ref() {
                     receipt.commit().await;
