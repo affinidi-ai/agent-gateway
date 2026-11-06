@@ -1,0 +1,38 @@
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_ac3a646cacd862 115-116,118-119,125-133
+  s_09d9fb08a24a2a::t_7b4795f07a114d 134-137
+.changelog/wip/feat_ci_security_hardening.yaml
+  s_09d9fb08a24a2a::t_ac3a646cacd862 1-21
+  s_09d9fb08a24a2a::t_e117199464e49a 22-23
+scripts/ci/boot-probe.sh
+  s_09d9fb08a24a2a::t_665323f7a7b2c5 5-6,12-20
+Dockerfile
+  s_09d9fb08a24a2a::t_fdacd4d2d48e99 67,149,151-154,158-172
+.github/workflows/docker.yml
+  s_09d9fb08a24a2a::t_08cc86f9f3cf6a 60-63,81-84,113-117
+  s_09d9fb08a24a2a::t_79102ed52d765c 33,118
+.github/dependabot.yml
+  s_09d9fb08a24a2a::t_08cc86f9f3cf6a 22-28
+scripts/ci/publish-manifest.sh
+  s_09d9fb08a24a2a::t_b0e1b58229827a 20-23
+  s_09d9fb08a24a2a::t_665323f7a7b2c5 19,25-36
+scripts/ci/trivy-scan.sh
+  s_09d9fb08a24a2a::t_9dcc5efbd16bbf 5,7-11,15,19-47,49-60,63,68-70,75,77-81,84
+  s_09d9fb08a24a2a::t_665323f7a7b2c5 1-4,6,12-14,16-18,48,61-62,64-67,71-74,76,82-83,85-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1993bc9f5126d11fbead515feb1e1967ec7ca6eb",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
