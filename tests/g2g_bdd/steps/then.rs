@@ -762,18 +762,20 @@ pub async fn the_relay_was_refused_after_calls(
     assert_eq!(world.response_status, Some(status), "body={:?}", world.response_body);
 }
 
-#[then(expr = "managed agent {string} served its agent card")]
-pub async fn managed_agent_served_its_agent_card(
+#[then(expr = "managed agent {string} served its agent card once")]
+pub async fn managed_agent_served_its_agent_card_once(
     world: &mut G2gWorld,
     target_name: String,
 ) {
     let (_, _, mock) = mock_for(world, &target_name);
     let requests = mock.requests().await;
-    assert!(
+    assert_eq!(
         requests
             .iter()
-            .any(is_discovery_request),
-        "managed agent '{target_name}' received no agent card fetch: {requests:?}; caller_status={:?}; caller_body={:?}",
+            .filter(|request| is_discovery_request(request))
+            .count(),
+        1,
+        "managed agent '{target_name}' should receive one agent card fetch: {requests:?}; caller_status={:?}; caller_body={:?}",
         world.response_status,
         world.response_body
     );
