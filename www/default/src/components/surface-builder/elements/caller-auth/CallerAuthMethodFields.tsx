@@ -209,7 +209,8 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 tokens whose audience is the resource URL.
               </div>
             ) : (
-              audiences.length === 0 && (
+              audiences.length === 0 &&
+              audienceClaim === 'aud' && (
                 <div
                   className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2"
                   data-testid={`${idPrefix}-audiences-missing-warning`}
@@ -253,8 +254,9 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 <i className="fas fa-exclamation-triangle"></i>
                 <span>
                   Only for identity providers whose access tokens carry no <code>aud</code>. A token
-                  a listed client was issued for another service is accepted too, so per-user grants
-                  are not released to these callers.
+                  a listed client was issued for another service is accepted too, so a binding with
+                  external consent and delegated credentials for Fabric callers are not released to
+                  these callers.
                 </span>
               </div>
             )}

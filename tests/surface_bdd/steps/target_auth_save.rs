@@ -360,6 +360,19 @@ async fn operator_saves_surface_reading_jwt_from_header(
     save_surface(world, &surface).await;
 }
 
+/// The new variant overrides nothing, so it inherits the surface's caller authentication.
+#[when(expr = "the operator saves the surface with a new variant {string}")]
+async fn operator_saves_surface_with_new_variant(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    let mut surface = stored_surface(world).await;
+    surface["variants"] = json!([{
+        "id": format!("variant-{alias}"), "alias": alias, "name": alias, "enabled": true, "overrides": {}
+    }]);
+    save_surface(world, &surface).await;
+}
+
 #[when("the operator saves the surface without its Access Point's caller check")]
 async fn operator_saves_surface_without_caller_check(world: &mut SurfaceWorld) {
     let mut surface = stored_surface(world).await;

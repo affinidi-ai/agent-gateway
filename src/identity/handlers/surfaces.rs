@@ -852,7 +852,9 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 ///
 /// Each enabled variant is validated as resolved, against the stored variant
 /// of the same alias, since it can override the caller authentication methods
-/// and the identity slots.
+/// and the identity slots. A variant with no enabled stored counterpart, one
+/// added, renamed or enabled again, is validated against the stored surface,
+/// whose settings it inherits.
 fn validate_source_auth(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -863,11 +865,13 @@ fn validate_source_auth(
         let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
             continue;
         };
-        let stored_resolved = stored.and_then(|stored| {
-            stored
-                .resolve_variant(Some(&variant.alias))
-                .ok()
-        });
+        let stored_resolved = stored
+            .and_then(|stored| {
+                stored
+                    .resolve_variant(Some(&variant.alias))
+                    .ok()
+            })
+            .or_else(|| stored.cloned());
         crate::config::validate_source_auth_config(&resolved, stored_resolved.as_ref())
             .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
     }

@@ -275,12 +275,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
   unconfigured as `Method <n>: <reason>`.
-- **JWT Bearer audiences**: Accepted Audiences is required; with none listed and discovery off
-  the method shows `caller-auth-audiences-missing-warning`. Save is not blocked for it, since the
-  gateway keeps a method stored without audiences unchanged and refuses a new or changed one
-  with a message the page shows. **Audience Claim** (`caller-auth-jwt-audience-claim`) writes
-  `audience_claim` (`aud`, `client_id` or `azp`, saved only when not `aud`); a value other than
-  `aud` shows `caller-auth-jwt-audience-claim-warning` (grants are withheld) and blocks Save
+- **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
+  Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
+  blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses
+  a new or changed one with a message the page shows. **Audience Claim**
+  (`caller-auth-jwt-audience-claim`) writes `audience_claim` (`aud`, `client_id` or `azp`, saved
+  only when not `aud`); a value other than `aud` shows `caller-auth-jwt-audience-claim-warning`
+  (no external-consent binding and no delegated credentials for Fabric callers) and blocks Save
   until a value is listed. Transit Points have no Audience Claim control: they match `aud`. Loading a surface always replaces `methods`, so a stale
   canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits

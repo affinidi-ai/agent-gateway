@@ -362,7 +362,7 @@ describe('Caller Context editor: audience claim', () => {
     expect(screen.queryByTestId('caller-auth-jwt-audience-claim-warning')).toBeNull();
   });
 
-  it('switches to client_id with a warning that grants are withheld', async () => {
+  it('switches to client_id with a warning naming the grants it withholds', async () => {
     const latest = await openEditor({
       initial: jwtConfig({ audiences: ['app-1'] }),
       protocol: 'a2a',
@@ -374,8 +374,18 @@ describe('Caller Context editor: audience claim', () => {
 
     expect(firstMethod(latest)).toMatchObject({ jwt_audience_claim: 'client_id' });
     expect(screen.getByTestId('caller-auth-jwt-audience-claim-warning')).toHaveTextContent(
-      'per-user grants are not released'
+      'a binding with external consent and delegated credentials for Fabric callers are not released'
     );
+    expect(screen.queryByTestId('caller-auth-audiences-missing-warning')).toBeNull();
+  });
+
+  it('does not warn that any audience is accepted when client_id lists no clients', async () => {
+    await openEditor({
+      initial: jwtConfig({ audiences: [], jwt_audience_claim: 'client_id' }),
+      protocol: 'a2a',
+    });
+
+    expect(screen.getByTestId('caller-auth-jwt-audience-claim-warning')).toBeInTheDocument();
     expect(screen.queryByTestId('caller-auth-audiences-missing-warning')).toBeNull();
   });
 });
