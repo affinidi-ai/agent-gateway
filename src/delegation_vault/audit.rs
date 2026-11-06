@@ -163,9 +163,10 @@ pub struct DelegationAuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
     /// The id of the credential provider involved. A tenant's access token
-    /// reads the record only when that provider is its tenant's. The OAuth
-    /// callback's `consent_granted` records the provider's `provider_id` slug
-    /// instead.
+    /// reads the record only when that provider is its tenant's. A
+    /// `consent_granted` the OAuth callback wrote in earlier releases holds
+    /// the provider's `provider_id` slug instead, so only appliance-wide
+    /// callers read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     /// Human-readable provider name

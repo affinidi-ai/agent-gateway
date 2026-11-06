@@ -634,7 +634,7 @@ pub async fn oauth_callback(
                     super::audit::DelegationAuditAction::ConsentGranted,
                     Some(&oauth_state.agent_did),
                     Some(&oauth_state.user_identity_hash),
-                    Some(&oauth_state.provider_id),
+                    Some(&provider.id),
                     Some(&oauth_state.surface_id),
                 );
                 evt.scopes = Some(granted_scopes.clone());

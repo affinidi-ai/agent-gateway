@@ -2,7 +2,16 @@ branch: fix/tenant-scope-legacy-vault
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-05T15:59:31Z'
+      title: Name the provider's id in the OAuth callback's consent_granted audit record
+      description: >-
+        The OAuth callback's consent_granted record named the credential provider's provider_id
+        slug, while every other delegation audit record names the provider's id. A tenant's access
+        token therefore never read its own tenant's consents, and the dashboard's link from such a
+        record to its provider looked the slug up as an id. The record now names the provider's
+        id, in the VP Audit Log and in what Governance Audit integrations receive. Records written
+        by earlier releases keep the slug and are shown only to appliance-wide callers.
   removed: []
   security:
     - timestamp: '2026-11-04T12:55:20Z'

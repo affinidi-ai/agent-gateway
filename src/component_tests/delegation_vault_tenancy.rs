@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Router, middleware};
 use chrono::Utc;
 use tower::ServiceExt;
 
 use crate::access_tokens::store::hash_secret;
 use crate::access_tokens::{AccessToken, FsAccessTokenStore, generate_token};
+use crate::audit::producer::capture;
 use crate::auth::session::SessionManager;
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
@@ -17,12 +18,14 @@ use crate::auth_manager::middleware::{AuthGuardState, RbacGuard, require_session
 use crate::auth_manager::resource_scope::RequiredHeader;
 use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
 use crate::delegation_vault::DelegationToken;
-use crate::delegation_vault::audit::reading_audit_log_from;
+use crate::delegation_vault::audit::{DelegationAuditEvent, reading_audit_log_from};
 use crate::delegation_vault::handlers::DelegationVaultState;
+use crate::delegation_vault::oauth::{TokenEgress, build_authorization_url};
 use crate::delegation_vault::read_scope::tests::{audit_log_of_two_tenants, provider};
 use crate::delegation_vault::read_scope::{VaultReadScope, VaultReader};
-use crate::delegation_vault::router::create_delegation_vault_router;
+use crate::delegation_vault::router::{create_delegation_vault_oauth_router, create_delegation_vault_router};
 use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+use crate::secrets::{CreateSecretRequest, SecretsStore};
 
 const TENANT_HEADER: &str = "x-external-account";
 
@@ -32,8 +35,11 @@ const TENANT_HEADER: &str = "x-external-account";
 /// `cp-global`, and a vault token of each, `t-a`, `t-b` and `t-global`.
 struct Vault {
     app: Router,
+    /// The public OAuth callback route, on the same stores.
+    callback: Router,
     auth: AuthGuardState,
     providers: Arc<dyn CredentialProviderStorage>,
+    secrets: Arc<dyn SecretsStore>,
     tokens: Arc<FsAccessTokenStore>,
     vault: Arc<dyn DelegationVaultStorage>,
     admin_session: String,
@@ -77,17 +83,19 @@ async fn vault() -> Vault {
             .await
             .unwrap();
     }
-    let secrets = crate::secrets::FilesystemSecretsStore::new_async(
-        path("secrets")
-            .to_str()
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            path("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
     let state = DelegationVaultState {
         vault_store: vault.clone(),
         provider_store: providers.clone(),
-        secrets_store: Arc::new(secrets),
+        secrets_store: secrets.clone(),
         gateway_base_url: "https://gw.example".to_string(),
         agent_surface_store: None,
         oauth_callback_route: "/v1/identity/oauth/callback".to_string(),
@@ -147,17 +155,43 @@ async fn vault() -> Vault {
     let rbac = Arc::new(crate::rbac::RbacConfig::default());
     let auth = AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
         .with_pat_authenticator(Some(tokens.clone()));
+    let callback = create_delegation_vault_oauth_router(state.clone());
     let app = create_delegation_vault_router(state, Some(RbacGuard::new(users, rbac)))
         .layer(middleware::from_fn_with_state(auth.clone(), require_session_auth));
     Vault {
         app,
+        callback,
         auth,
         providers,
+        secrets,
         tokens,
         vault,
         admin_session,
         directory,
     }
+}
+
+/// A token endpoint on the loopback that exchanges any authorization code for
+/// an access token. Returns its URL.
+async fn token_endpoint() -> String {
+    let app = Router::new().route(
+        "/token",
+        post(|| async {
+            axum::Json(serde_json::json!({
+                "access_token": "consent-access", "token_type": "Bearer", "expires_in": 3600
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .ok();
+    });
+    endpoint
 }
 
 impl Vault {
@@ -188,6 +222,109 @@ impl Vault {
             .unwrap()
             .take()
             .expect("the probe saw the request")
+    }
+
+    /// Stores the OAuth authorization code provider `id` of `tenant_id`, with
+    /// the slug `calendar`, its token endpoint at `token_endpoint` and its
+    /// client secrets in its tenant.
+    async fn oauth_provider(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        token_endpoint: &str,
+    ) {
+        for secret_id in [format!("{id}-client-id"), format!("{id}-client-secret")] {
+            self.secrets
+                .create(CreateSecretRequest {
+                    tenant_id: Some(tenant_id.to_string()),
+                    name: secret_id.clone(),
+                    secret_id: secret_id.clone(),
+                    description: None,
+                    value: format!("{secret_id}-value"),
+                    secret_type: "ApiKey".to_string(),
+                    tags: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        self.providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "tenant_id": tenant_id, "name": "Calendar", "provider_id": "calendar",
+                    "provider_type": "oauth2_authorization_code",
+                    "authorization_endpoint": "https://calendar.example/authorize", "token_endpoint": token_endpoint,
+                    "client_id_secret_ref": format!("{id}-client-id"),
+                    "client_secret_secret_ref": format!("{id}-client-secret"),
+                    "callback_url": "https://203.0.113.20/v1/identity/oauth/callback/calendar",
+                    "default_scopes": ["calendar.read"],
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Completes a user's consent to the provider `credential_provider_id`
+    /// through the OAuth callback, with the state its authorization URL
+    /// carries, and returns the audit records the callback submitted.
+    async fn grant_consent(
+        &self,
+        credential_provider_id: &str,
+        token_endpoint: &str,
+    ) -> Vec<DelegationAuditEvent> {
+        let provider = self
+            .providers
+            .get(credential_provider_id)
+            .await
+            .unwrap()
+            .expect("the provider exists");
+        let authorization_url = build_authorization_url(
+            &provider,
+            "did:web:agent.example",
+            "sha256:user",
+            "surface-1",
+            &[],
+            "https://gw.example",
+            &self.secrets,
+        )
+        .await
+        .unwrap();
+        let state = url::Url::parse(&authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .expect("the authorization URL carries a state");
+        let uri = format!(
+            "/v1/identity/oauth/callback/{}?code=code-1&state={}",
+            provider.provider_id,
+            urlencoding::encode(&state)
+        );
+        let egress = TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint.to_string()),
+            policy: Default::default(),
+        };
+        let (page, events) = capture(egress.scope(async {
+            let response = self
+                .callback
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }))
+        .await;
+        assert!(page.contains("Authorization Successful"), "{page}");
+        events
     }
 }
 
@@ -413,4 +550,44 @@ async fn a_tenant_access_token_reads_only_its_tenants_delegation_audit() {
     let (status, page) = read_audit(&fixture, &log, &fixture.admin_session, None).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(page["total"], 6);
+}
+
+/// The OAuth callback's `consent_granted` names its provider's id, so the
+/// provider's tenant reads it. Another tenant does not, though its own
+/// provider has the same `provider_id` slug.
+#[tokio::test]
+async fn a_tenant_access_token_reads_the_consent_its_tenants_provider_recorded() {
+    let fixture = vault().await;
+    let token_endpoint = token_endpoint().await;
+    for (id, tenant_id) in [("cp-calendar-a", "tenant-a"), ("cp-calendar-b", "tenant-b")] {
+        fixture
+            .oauth_provider(id, tenant_id, &token_endpoint)
+            .await;
+    }
+    let events = fixture
+        .grant_consent("cp-calendar-a", &token_endpoint)
+        .await;
+    let log = fixture
+        .directory
+        .path()
+        .join("consent-audit.jsonl");
+    let lines: String = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap() + "\n")
+        .collect();
+    std::fs::write(&log, lines).unwrap();
+
+    let tenant_a = tenant_access_token(&fixture.tokens, "tenant-a").await;
+    let (status, page) = read_audit(&fixture, &log, &tenant_a, Some("tenant-a")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1, "{page}");
+    assert_eq!(
+        (&page["events"][0]["event"], &page["events"][0]["provider_id"]),
+        (&serde_json::json!("consent_granted"), &serde_json::json!("cp-calendar-a")),
+        "{page}"
+    );
+
+    let tenant_b = tenant_access_token(&fixture.tokens, "tenant-b").await;
+    let (status, page) = read_audit(&fixture, &log, &tenant_b, Some("tenant-b")).await;
+    assert_eq!((status, &page["total"]), (StatusCode::OK, &serde_json::json!(0)), "{page}");
 }
