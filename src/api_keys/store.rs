@@ -60,8 +60,27 @@ pub trait ApiKeyStore: Send + Sync {
         self.list(agent_id).await
     }
 
+    /// Whether storage holds any key record for the agent, whether or not it can be read; an
+    /// error when the agent's keys cannot be listed. The default is whether
+    /// [`Self::list_from_disk`] lists any key.
+    async fn holds_key_records(
+        &self,
+        agent_id: &str,
+    ) -> ApiKeyResult<bool> {
+        Ok(!self
+            .list_from_disk(agent_id)
+            .await?
+            .is_empty())
+    }
+
     /// List all keys across all agents (metadata only, no secrets)
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>>;
+
+    /// [`Self::list_all`] with each key's latest recorded use, for listings shown to an
+    /// operator. The default is [`Self::list_all`].
+    async fn list_all_with_last_use(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        self.list_all().await
+    }
 
     /// [`Self::list_all`], failing instead when the keys of an agent could not be loaded, so a
     /// listing that answers holds every key. The default is [`Self::list_all`].

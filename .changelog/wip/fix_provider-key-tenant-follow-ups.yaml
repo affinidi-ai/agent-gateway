@@ -22,8 +22,9 @@ changes:
       description: >-
         Under tenant_credential_isolation enforce, a surface naming an API key whose owning
         surface no longer exists is not ready, as the key's tenant cannot be told. A new surface
-        cannot be created with the id of a deleted surface whose API keys remain, so it cannot
-        take over those keys and the DIDs derived from them.
+        cannot be created with an id whose API key folder holds any key record, readable or
+        not and whatever owner it names, such as the kept keys of a deleted surface, so it
+        cannot take over those keys and the DIDs derived from them.
     - timestamp: '2026-11-05T09:35:33Z'
       title: Revoke a surface's API keys when the surface is deleted
       description: >-
@@ -39,4 +40,15 @@ changes:
         because that key failed to load. Surface saves, tenant reassignment, the credential
         policy report and the API key listing still answer without the folder's keys, and
         creating a surface with the id of that folder answers 503.
+    - timestamp: '2026-11-05T10:40:17Z'
+      title: Keep API key usage apart from the key record so it cannot undo a revoke
+      description: >-
+        An API key's last use is now written to its own file beside the key record, at most
+        once a minute per key and node, and never into the record, so recording a key's use
+        on one node can no longer write a revoked key back as active on any node. A failed
+        usage write is logged and the caller is still accepted. The API key list and detail
+        show the usage file's time, or a record's own last use from before this change. A key
+        revoked on another node stops authenticating at this node's next cache refresh. A
+        rotation re-reads the key from disk and refuses one another node revoked, and key
+        records are replaced atomically so concurrent writes cannot leave a partial record.
   breaking: []

@@ -1940,10 +1940,10 @@ pub(crate) async fn provider_key_owners(
     .await
 }
 
-/// Refuses a new surface whose id still owns API keys, kept from a deleted surface of that id, so
-/// a new surface never takes over another surface's keys and the DIDs derived from them. Only the
-/// key folder of `surface_id` is read, from disk; when it cannot be read the create is refused as
-/// unavailable.
+/// Refuses a new surface whose id's key folder holds any API key record, readable or not, such
+/// as the keys kept from a deleted surface of that id, so a new surface never takes over another
+/// surface's keys and the DIDs derived from them. Only the key folder of `surface_id` is read,
+/// from disk; when it cannot be read the create is refused as unavailable.
 pub(crate) async fn refuse_id_owning_api_keys(
     state: &IdentityApiState,
     surface_id: &str,
@@ -1951,17 +1951,14 @@ pub(crate) async fn refuse_id_owning_api_keys(
     let Some(store) = state.api_key_store.as_deref() else {
         return Ok(());
     };
-    let keys = store
-        .list_from_disk(surface_id)
+    let holds_keys = store
+        .holds_key_records(surface_id)
         .await
         .map_err(|error| {
             tracing::error!(surface = %surface_id, %error, "Could not read the API keys of a new surface's id");
             SurfaceApiError::Unavailable("API key store is unavailable".to_string())
         })?;
-    if keys
-        .iter()
-        .any(|key| key.agent_id == surface_id)
-    {
+    if holds_keys {
         return Err(SurfaceApiError::BadRequest(format!("Surface ID '{surface_id}' is not available")));
     }
     Ok(())

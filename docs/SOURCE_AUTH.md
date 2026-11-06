@@ -1165,6 +1165,25 @@ Per-key caller identity therefore needs an API Key Provider.
   with `on_failure: reject`, the request is refused with `401` before policy; otherwise policy
   sees `input.source_auth.method == "failed"` and decides; see
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
+- A key is checked against this node's cached copy of its record; validation reads and writes
+  no key record. A key another node revoked, rotated or deleted stops authenticating here at
+  this node's next cache refresh (`cache_refresh_interval_secs`, see
+  [Configuration reload](CONFIGURATION_RELOAD.md)), or when this node becomes Active. With the
+  default `cache_refresh_interval_secs` of 0 there is no periodic refresh: a key revoked on
+  another node keeps authenticating here until restart or promotion to Active. A record the
+  refresh cannot read is dropped from the cache, and its key resolves no caller identity.
+- A key's last use is kept apart from its record, in `.<key id>.last_used` beside it in the
+  surface's key folder, holding an RFC 3339 time in plain text even with encryption at rest:
+  the time is not secret, and a plain file costs no key service call. A node writes it at most
+  once every 60 seconds per key; a write that fails is logged and the caller is still accepted.
+  A usage write never touches the key record, so it cannot undo a revocation on any node. The
+  API key list and detail show the time in that file, or the record's own `last_used_at` for a
+  key last used before usage files existed. Rotating or deleting a key removes its usage file,
+  and a usage write that finds the key deleted or rotated once written removes it again. A key
+  whose id is not a valid storage id gets no usage file.
+- On one node, revoking, rotating and deleting a key are serialized. A rotation re-reads only
+  that key's record from disk and refuses a key another node revoked before the rotation
+  started.
 - On a direct request, the key's DID replaces any identity the request body asserts, such as
   an identity presentation or a credential extension. [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)
   describes what that does to `input.agent`. On a `fabric://` target only
@@ -1255,10 +1274,12 @@ another tenant on disk or by another node takes those surfaces out of service un
   `surface-delete`) and keeps them, so a surface naming the key of a deleted surface stops
   serving. The delete reads the surface's key folder from disk, so keys another node created
   are revoked too; a folder that cannot be read is logged as an error naming the surface and
-  its keys stay active. A new surface cannot take the id of a deleted surface
-  whose keys remain: the create answers `400` "Surface ID '…' is not available". The create
-  reads only the key folder of that id, from disk; when that folder cannot be read it answers
-  `503` "API key store is unavailable".
+  its keys stay active. A key record in the folder that names another surface as its owner is
+  not revoked by the delete, and keeps the id taken. A new surface cannot take an id whose key
+  folder holds any key record, readable or not, such as the kept keys of a deleted surface: the
+  create answers `400` "Surface ID '…' is not available". The create reads only the key folder
+  of that id, from disk; when that folder
+  cannot be read it answers `503` "API key store is unavailable".
 - A key or owning surface that cannot be found is checked again later. Under `warn` both are
   only reported, and a key that cannot be found is only reported under `enforce` too. The key or
   its owning surface may exist on another node that shares the storage and not be visible here
