@@ -733,6 +733,84 @@ async fn a_refusal_a_new_connect_would_not_fix_keeps_the_grant() {
     assert_eq!(kept.access_token, "fresh", "the grant is refreshed for the next call");
 }
 
+/// A refresh token the authorization server refuses, after the Target refused
+/// the token, ends the connection: the grant is removed and revoked, nothing
+/// is sent again, and the caller is told to connect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_refresh_after_the_targets_refusal_removes_the_grant() {
+    let fixture = Fixture::new(
+        vec![Answer::json(400, json!({"error": "invalid_grant"})), Answer::status(200)],
+        vec![rejected_token()],
+    )
+    .await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"]["reason"], "connect_required");
+    assert_eq!(body["error"]["data"]["subject"], "owner");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        headers
+            .get("www-authenticate")
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        1,
+        "nothing is sent again"
+    );
+    assert!(
+        !fixture
+            .kept(&owner_key())
+            .await,
+        "a refused refresh removes the grant"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        fixture
+            .authorization_server
+            .revoked_tokens(),
+        ["first", "first-refresh"]
+    );
+}
+
+/// A retry with the refreshed token that cannot be sent answers `502`, and
+/// keeps the refreshed grant for the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_that_cannot_be_sent_answers_bad_gateway() {
+    let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), Answer::hung_up()]).await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["detail"], "Upstream request failed");
+    let bearers: Vec<_> = fixture
+        .vendor_saw()
+        .into_iter()
+        .map(|(bearer, _)| bearer.unwrap())
+        .collect();
+    assert_eq!(bearers, ["Bearer first", "Bearer second"]);
+    let kept = fixture
+        .vault
+        .grant(&owner_key())
+        .await
+        .unwrap()
+        .expect("the refreshed grant is kept");
+    assert_eq!(kept.access_token, "second");
+}
+
 /// A public discovery read carries no caller, and so no grant, and nothing of
 /// the caller's but its request: not its cookies or credentials. The agent
 /// card is fetched from the Target's own card URL, whatever path the caller
