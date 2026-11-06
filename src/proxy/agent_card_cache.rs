@@ -190,6 +190,8 @@ pub fn insert_surface_card(
 /// memoized VP-verification outcomes). Wired into the reload seams so a
 /// config redeploy never serves a stale card or a stale identity verdict.
 pub fn invalidate_all() {
+    #[cfg(test)]
+    let _serialized = tests::wait_for_cache_test();
     cache().clear();
     surface_card_cache().clear();
     verified_vp_cache().clear();
@@ -207,15 +209,42 @@ mod tests {
     use std::sync::Mutex;
 
     // Serialize every test in this module — they all share the same
-    // process-global `CACHE`.
+    // process-global `CACHE` — and hold off a clear from any other test,
+    // such as a surface save, until the running one ends.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn setup() -> std::sync::MutexGuard<'static, ()> {
+    thread_local! {
+        static RUNS_CACHE_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Waits for a running test of this module, so a clear from elsewhere never
+    /// empties the cache between its insert and lookup; the test itself clears
+    /// without waiting.
+    pub(super) fn wait_for_cache_test() -> Option<std::sync::MutexGuard<'static, ()>> {
+        (!RUNS_CACHE_TEST.get()).then(|| {
+            TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+    }
+
+    struct CacheTest {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for CacheTest {
+        fn drop(&mut self) {
+            RUNS_CACHE_TEST.set(false);
+        }
+    }
+
+    fn setup() -> CacheTest {
         let guard = TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        RUNS_CACHE_TEST.set(true);
         invalidate_all();
-        guard
+        CacheTest { _guard: guard }
     }
 
     #[test]
@@ -252,6 +281,22 @@ mod tests {
         invalidate_all();
         assert_eq!(entry_count(), 0);
         assert!(lookup("https://a.example.com", None).is_none());
+    }
+
+    #[test]
+    fn a_clear_from_another_thread_waits_for_the_running_cache_test() {
+        let running = setup();
+        insert("https://held.example.com", None, Some(json!({"held": true})));
+        let clear = std::thread::spawn(invalidate_all);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            lookup("https://held.example.com", None),
+            Some(Some(json!({"held": true}))),
+            "a clear from another thread ran during the test"
+        );
+        drop(running);
+        clear.join().unwrap();
+        assert!(lookup("https://held.example.com", None).is_none(), "the clear ran once the test ended");
     }
 
     #[test]
