@@ -1147,7 +1147,9 @@ Per-key caller identity therefore needs an API Key Provider.
   A usage write never touches the key record, so it cannot undo a revocation on any node. The
   API key list and detail show the time in that file, or the record's own `last_used_at` for a
   key last used before usage files existed. Rotating or deleting a key removes its usage file,
-  and a usage write that finds the key deleted or rotated once written removes it again. A key
+  and a usage write that finds the key deleted or rotated in this node's cache once written
+  removes it again; a node whose cache has not yet seen a delete or rotation made on another
+  node can leave a usage file behind, which holds only a time and is ignored. A key
   whose id is not a valid storage id gets no usage file.
 - On one node, revoking, rotating and deleting a key are serialized. A rotation re-reads only
   that key's record from disk and refuses a key another node revoked before the rotation
@@ -1220,7 +1222,8 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   Identity is From API Key, when a key of that id belongs to another surface. Such a secret takes
   that key's DID, so it is held to the same rule as naming the key. One the stored surface
   already named is kept under `warn` and refused under `enforce`. An id no key has is a plain
-  secret.
+  secret. A key whose owning surface was deleted is not checked: such a secret is accepted in
+  either mode, unlike an Identity naming that key.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
@@ -1237,7 +1240,7 @@ surface is checked like moving the owner of any named key.
 
 Deleting an API key (`DELETE /v1/api-keys/{agent_id}/{key_id}`), also the cleanup of a key whose
 owning surface is gone, first looks the key up under `agent_id`: a key that is not there answers
-`404` "API key not found: <key id>", before any surface is read. A key that is there answers `409` while any
+`404` "API key not found: <key id>", before any naming surface is checked. A key that is there answers `409` while any
 stored surface names its id, in its base or any variant: the ids collected above, and a Caller
 Context API Key `secret_id` of that id on a view whose inbound Identity is From API Key. Deleting
 such a key would turn a `missing_owner` verdict, which takes the surface out of service under
@@ -1323,6 +1326,9 @@ The check also covers a Caller Context API Key `secret_id` that starts with `atg
 whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is
 reported like a key id when a key of that id belongs to a surface the surface may not
 reference, or to a surface with no tenant; otherwise it is a plain secret and is not reported.
+A key whose owning surface was deleted is not reported for such a secret, so a surface using it
+keeps that key's DID in either mode. Only a secret stored before the prefix was reserved can
+reach this, since new secret ids may not start with `atgk_`.
 
 A not-ready surface refuses every request with `503` before source authentication, policy and
 the target, on direct inbound, Fabric receive and its Transit Points, as a [not ready Access
