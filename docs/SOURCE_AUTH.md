@@ -330,6 +330,17 @@ the surface serves: a surface refused for its API Key Provider keys stays `ready
 `503`. Look for `rule="provider_key_tenant"` in the gateway log; see
 [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
 
+A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
+surface that names an API Key Provider key id, in its base or any variant, also carry a
+read-only `api_key_references`: one `{ "key_id", "status" }` per distinct id, sorted by id,
+with the ids the gate checks (a legacy Caller Context secret only when a key of that id
+exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
+has the id, `unavailable` for a key of any other surface, whose status is never reported,
+and `unknown` for every id when the API key store cannot be read in full, as the gate's
+`store_unavailable`. A same-tenant key of another surface that still serves under `warn` is
+`unavailable` too: a surface names only its own keys. The field is absent when the surface
+names no key id, and on the surface list and variant responses.
+
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
@@ -340,12 +351,13 @@ and limit requests per client upstream of the gateway if credential guessing is 
 is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
-Create and update responses are the saved surface plus `access_point_status`. A save warns
+Create and update responses are the saved surface plus `access_point_status` and, when it
+names a key id, `api_key_references`. A save warns
 in `Warning` headers (code 299), before the Transit Point warnings described below, when the
 Access Point is public, when it or an enabled variant is not ready (a variant's warning is
 prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
 admits every caller. A write request that sends a response back unchanged has its top-level
-`access_point_status` dropped before parsing.
+`access_point_status` and `api_key_references` dropped before parsing.
 
 A gateway rolled back to a release without these fields cannot load the surfaces that store
 them, which is every surface created after the upgrade; see
