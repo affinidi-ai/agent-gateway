@@ -83,13 +83,15 @@ describe('useIdentityRows managed surfaces', () => {
 
   it('links every managed surface of a shared managed DID, not its last-used surface', () => {
     expect(rows([shared]).surfaceLinksFor(shared)).toEqual([
-      { id: 's-alpha', name: 'alpha' },
-      { id: 's-bravo', name: 'bravo' },
+      { id: 's-alpha', name: 'alpha', archived: false },
+      { id: 's-bravo', name: 'bravo', archived: false },
     ]);
   });
 
   it('links the one surface of a single-surface DID', () => {
-    expect(rows([single]).surfaceLinksFor(single)).toEqual([{ id: 's-charlie', name: 'charlie' }]);
+    expect(rows([single]).surfaceLinksFor(single)).toEqual([
+      { id: 's-charlie', name: 'charlie', archived: false },
+    ]);
   });
 
   it('links no surface for a managed DID without a live managed surface', () => {
@@ -109,7 +111,9 @@ describe('useIdentityRows managed surfaces', () => {
       channel_config_id: 's-delta',
       channel_name: 'delta',
     };
-    expect(rows([legacy]).surfaceLinksFor(legacy)).toEqual([{ id: 's-delta', name: 'delta' }]);
+    expect(rows([legacy]).surfaceLinksFor(legacy)).toEqual([
+      { id: 's-delta', name: 'delta', archived: false },
+    ]);
   });
 
   it('finds a shared managed DID by any of its surface names', () => {
@@ -129,5 +133,45 @@ describe('useIdentityRows managed surfaces', () => {
     const view = rows([shared, identity('did:anon')]);
     expect(view).not.toHaveProperty('unnamedCount');
     expect(dids(view)).toEqual(['did:shared', 'did:anon']);
+  });
+});
+
+describe('useIdentityRows surface link', () => {
+  const surfaceLinkFor = (ref: Partial<Identity>) =>
+    renderHook(() =>
+      useIdentityRows({
+        identities: [],
+        channels: [{ config_id: 'oxygen', name: 'OXYGEN' }],
+        searchTerm: '',
+      })
+    ).result.current.surfaceLinkFor(ref);
+
+  it('links a live surface by its current name', () => {
+    expect(surfaceLinkFor({ surface_id: 'oxygen', surface_name: 'Old' })).toEqual({
+      id: 'oxygen',
+      name: 'OXYGEN',
+      archived: false,
+    });
+  });
+
+  it('marks the surface of an archived identity and keeps its last known name', () => {
+    expect(surfaceLinkFor({ surface_id: 'gone', surface_name: 'GONE', archived: true })).toEqual({
+      id: 'gone',
+      name: 'GONE',
+      archived: true,
+    });
+  });
+
+  it('falls back to the surface id of an archived identity without a name', () => {
+    expect(surfaceLinkFor({ surface_id: 'gone', archived: true })).toEqual({
+      id: 'gone',
+      name: 'gone',
+      archived: true,
+    });
+    expect(surfaceLinkFor({ channel_config_id: 'gone', archived: true })).toEqual({
+      id: 'gone',
+      name: 'gone',
+      archived: true,
+    });
   });
 });

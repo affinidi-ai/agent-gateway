@@ -1655,6 +1655,21 @@ issuing a managed identity. A DID first issued
 to a caller keeps its External Caller origin when the same key later becomes a Managed
 Agent's key, so it is never named; issue that Managed Agent a new key.
 
+#### Archived identities
+
+The dashboard identity list marks an identity `archived` when it is linked to at least one
+surface, through the surface it was created or last used on or any surface in its usage, and
+none of those surfaces exists any more. The flag is computed on every list and never stored, so
+an identity whose surface id comes back is no longer archived. An identity with no surface link
+is never archived, and when the surface store cannot be listed nothing is archived. When the
+surface an identity was created or last used on is deleted but another surface in its usage
+is live, the list shows the most recently used live surface (ties broken by surface id) as the
+identity's surface, so a deleted surface is never linked. The
+identity record keeps no surface name, so the Identities page shows the surface id of an
+archived identity, as plain text marked Deleted, beside an Archived badge on the identity. A dashboard update re-sends the
+identities a surface delete on this node archived; one deleted on another node shows on the
+next full load.
+
 #### Agent Card names
 
 The Agent Card name ([`target_card_names.rs`](../src/identity/target_card_names.rs))

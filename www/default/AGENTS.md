@@ -1151,6 +1151,16 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   caller.
 - When the backend sends none of the naming fields, the Name column still shows, with
   `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
+- An **archived** identity (`archived` on the identity: every surface it is linked to was
+  deleted) gets a secondary "Archived" badge beside its name cell
+  (`components/IdentityArchived.tsx`). `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`)
+  shows its surface, in the **Agent Surface** list and the expanded Summary, as muted plain
+  text, the surface name when
+  the identity carries one and otherwise the surface id, with a secondary "Deleted" badge, and
+  never links. A live surface keeps its link and shows neither badge. Expanding the row, or
+  opening it in the Dashboard's `IdentityDetailsModal`, shows the `alert-info` "This identity
+  is no longer in use because the associated surface has been deleted." The page has no
+  Archived filter.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
   A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
@@ -1189,6 +1199,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Origin badge                   | `identities-origin-<origin>`                                             |
 | Surface list, surface link     | `identities-surface-list`, `identities-surface-link`                     |
 | Credential principal           | `identities-credential-principal`                                        |
+| Archived badge, message        | `identities-archived-badge`, `identity-archived-info`                    |
+| Deleted surface, its badge     | `identities-surface-archived`, `identities-surface-deleted-badge`        |
 | Recorder filter                | `identities-recorder-filter`                                             |
 | Recorder chip                  | `identities-recorder-chip-<state>`                                       |
 | Recorder tooltip               | `identities-recorder-tooltip`                                            |
