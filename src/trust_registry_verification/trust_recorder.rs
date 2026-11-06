@@ -892,13 +892,13 @@ mod tests {
     }
 
     #[test]
-    fn conflict_yields_records_without_context() {
+    fn shared_managed_did_yields_records_without_context() {
         let mut e = base_entry();
         e.include_owned_agent = true;
-        let conflict = ManagedDisplayName::Conflict {
+        let shared = ManagedDisplayName::Shared {
             surface_ids: vec!["s1".into(), "s2".into()],
         };
-        let context = conflict
+        let context = shared
             .publishable("did:example:agent")
             .map(record_context);
 

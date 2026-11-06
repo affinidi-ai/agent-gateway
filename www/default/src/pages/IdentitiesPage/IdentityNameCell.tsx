@@ -1,8 +1,8 @@
 import React from 'react';
-import { Badge } from '../../components/shared/Badge';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { topAndTail } from '../../utils/stringUtils';
 import type { CredentialPrincipal, Identity } from '../../types';
+import { isSharedManagedDid, surfaceCountLabel } from './sharedManagedDid';
 
 export type NamedIdentity = Pick<
   Identity,
@@ -11,13 +11,15 @@ export type NamedIdentity = Pick<
   | 'display_name_source'
   | 'display_name_verified'
   | 'display_name_pending'
-  | 'name_conflict'
+  | 'managed_surfaces'
 >;
 
 interface IdentityNameCellProps {
   identity: NamedIdentity;
   liveSurfaceName?: string;
   showName?: boolean;
+  showDid?: boolean;
+  fallbackName?: string;
 }
 
 export const parseAgentName = (name: string): { host: string; local: string } | null => {
@@ -76,14 +78,31 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
   identity,
   liveSurfaceName,
   showName = true,
+  showDid = true,
+  fallbackName,
 }) => {
-  const displayName = showName ? identity.display_name : undefined;
-  const pending = showName && !displayName && identity.display_name_pending === true;
-  const conflict = showName && !displayName && identity.name_conflict === true;
-  const didIsPrimary = !displayName && !pending;
+  const shared = showName && isSharedManagedDid(identity);
+  const displayName = showName && !shared ? identity.display_name : undefined;
+  const pending = showName && !shared && !displayName && identity.display_name_pending === true;
+  const didIsPrimary = !shared && !displayName && !pending;
+  const nameOnlyFallback = !showDid && didIsPrimary;
 
   return (
     <div className="d-inline-flex flex-column">
+      {shared && (
+        <>
+          <span
+            className="text-muted fst-italic"
+            title="This DID is the managed agent on more than one surface, so no single name is shown"
+            data-testid="identities-unnamed-agent"
+          >
+            Unnamed Agent
+          </span>
+          <small className="text-muted" data-testid="identities-shared-surface-count">
+            {surfaceCountLabel(identity.managed_surfaces?.length ?? 0)}
+          </small>
+        </>
+      )}
       {displayName && (
         <div className="d-flex align-items-center" data-testid="identities-name">
           <NameLine
@@ -102,25 +121,29 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
           resolving…
         </small>
       )}
-      <div className="d-inline-flex align-items-center flex-nowrap">
-        <code
-          style={{ fontSize: didIsPrimary ? undefined : '0.75rem', whiteSpace: 'nowrap' }}
-          title={identity.did}
-        >
-          {topAndTail(identity.did, 20, 16)}
-        </code>
-        <CopyButton text={identity.did} title="Copy DID" data-testid="identities-copy-did-button" />
-        {conflict && (
-          <Badge
-            tone="warning"
-            size="sm"
-            value="name conflict"
-            className="ms-1"
-            title="This DID is used by more than one surface, so no single name is shown"
-            data-testid="identities-name-conflict"
+      {nameOnlyFallback &&
+        (fallbackName ? (
+          <strong data-testid="identities-name">{fallbackName}</strong>
+        ) : (
+          <span className="text-muted fst-italic" data-testid="identities-name-empty">
+            Unnamed Agent
+          </span>
+        ))}
+      {showDid && (
+        <div className="d-inline-flex align-items-center flex-nowrap">
+          <code
+            style={{ fontSize: didIsPrimary ? undefined : '0.75rem', whiteSpace: 'nowrap' }}
+            title={identity.did}
+          >
+            {topAndTail(identity.did, 20, 16)}
+          </code>
+          <CopyButton
+            text={identity.did}
+            title="Copy DID"
+            data-testid="identities-copy-did-button"
           />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 };

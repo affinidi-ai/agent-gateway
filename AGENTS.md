@@ -186,6 +186,11 @@ The Identities page shows a Trust Recorder status chip and a Recorder filter, an
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
 
+The Identities page shows the name and the DID in separate Name and DID columns, with no Usage
+Count column, and lists a managed agent DID shared by several surfaces once, as "Unnamed Agent"
+with its surface count and every one of its surfaces; see _Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).

@@ -1304,9 +1304,9 @@ no name, and Agent Identities lists it as an External Caller with no surface and
 Recorder chip. Trust Recorder writes are unaffected. Issue the Managed Agent a new API key to
 give it a Managed Agent record.
 
-A caller using a Managed Agent's key on another surface that accepts it counts as a use of that
-surface. The Managed Agent is then treated as shared by several surfaces, and its name is not
-published (see [Managed agents](#managed-agents)).
+A caller using a Managed Agent's key on another surface that accepts it is recorded as a caller
+use of that surface. It does not make that surface one of the Managed Agent's managed surfaces,
+so the Managed Agent keeps its name (see [Managed agents](#managed-agents)).
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`, whose `channel_id`
@@ -1461,8 +1461,35 @@ stored as local records linked to the surface, so a link does not prove a manage
 Credential principals (the name of the backing certificate or secret) appear only in
 the dashboard and are never published.
 
-If one DID is managed on more than one surface, no name is published and the dashboard
-shows a name conflict.
+Each surface a DID is used on is recorded with the role the request gave it there: the
+managed agent, or a caller. A DID's managed surfaces are the live surfaces where it is the
+managed agent and that still issue a managed identity: an `a2a-proxy://` target, or a managed
+identity configured on its target or a Transit Point. Surfaces where it was only a caller,
+deleted surfaces, and surfaces whose managed identity was moved away or removed are left
+out. An entry recorded before roles follows the same rule. The
+dashboard, the VC name and trust-registry reference fields all read managed surfaces from
+one function, `managed_surfaces_by_did`
+([`display_name.rs`](../src/identity/display_name.rs)), so the three agree.
+
+A DID with one managed surface is named after that surface, not after the surface it was
+last used on. A DID with more than one is a shared managed DID: no name is signed or
+published for it. The dashboard identity list (`GET /v1/dashboard/stats`, its delta and the
+dashboard WebSocket) lists it once, with its surfaces in `managed_surfaces`
+(`{ surface_id, surface_name }`, sorted by name) and no `display_name`, `surface_id` or
+`surface_name`; those two are set only for a DID with exactly one managed surface. Its
+`trust_recorder` is the worst outcome across its managed surfaces that have a Trust
+Recorder, ranked Failed, Partial, Skipped, Not attempted, then Recorded, and
+`trust_recorder_surface` (`{ surface_id, surface_name }`) names the surface that outcome
+came from. A surface whose recorder has not run yet therefore outranks one that recorded the
+DID. The Identities page shows it as "Unnamed Agent" with "N surfaces" beneath, and lists its
+surfaces in the Agent Surface column.
+
+A surface that switches its managed identity to another credential still issues a managed
+identity, so the DID it used before stays one of its managed surfaces and stays shared if it
+is managed elsewhere too. It gets its name back when that surface is deleted or stops
+issuing a managed identity. A DID first issued
+to a caller keeps its External Caller origin when the same key later becomes a Managed
+Agent's key, so it is never named; issue that Managed Agent a new key.
 
 #### Agent Card names
 
@@ -1485,8 +1512,8 @@ after the cache period; with no earlier name, it shows the surface name.
 The card name is self-asserted by the target and never verified. The target is trusted
 to serve traffic, not to choose what the gateway's Issuer signs, so the card name never
 reaches the VC, Trust Recorder context, or trust-registry reference fields, and card
-lookups never sit on the request path. A name conflict shows no name, whatever the card
-says.
+lookups never sit on the request path. A shared managed DID shows no name, whatever the
+card says.
 
 The agent identity VC carries the surface name as `credentialSubject.name` on both the
 legacy and SSI paths. VCs are signed on each issuance, so the next VC after a surface

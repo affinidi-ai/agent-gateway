@@ -40,11 +40,13 @@ pub trait IdentityStore: Send + Sync {
     async fn list_all(&self) -> Result<Vec<filesystem::AgentIdentityRecord>>;
 
     /// Update usage tracking for an identity
-    /// If channel_config_id is provided, updates the last-used channel
+    /// If channel_config_id is provided, updates the last-used channel and records `role`,
+    /// whether the identity was the managed agent or a caller there
     async fn update_usage(
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<filesystem::IdentityOrigin>,
     ) -> Result<()>;
 
     /// Find an identity by DID
