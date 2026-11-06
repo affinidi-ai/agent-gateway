@@ -306,15 +306,14 @@ fn register_resource_limit_counters(
     });
 }
 
-/// Keeps the agent-pay UI visible on an appliance that already has a payment
-/// gateway, so an upgrade never hides one that is taking payments. An operator's
-/// explicit setting, on or off, is kept.
-/// Turns `agent_pay_delegation` on, unless an operator set it, when a payment
-/// gateway exists or `peer_awaits_payment_role`: a peer that `agent_pay`
+/// Turns `agent_pay_delegation` on, unless an operator set it either way, when
+/// a payment gateway exists, so an upgrade never hides one that is taking
+/// payments, or when `peer_awaits_payment_role`: a peer that `agent_pay`
 /// policies name but the migration left a peer, which only the flag-gated
 /// payment-role action can fix.
 async fn enable_agent_pay_ui_in_use(
     store: &crate::gateways::FileSystemGatewayStore,
+    settings: &crate::storage::settings_store::SettingsStore,
     peer_awaits_payment_role: bool,
 ) {
     use crate::gateways::GatewayStore;
@@ -327,9 +326,6 @@ async fn enable_agent_pay_ui_in_use(
             warn!("Failed to list gateways for the agent-pay flag: {}", e);
             return;
         }
-    };
-    let Some(settings) = crate::storage::settings_store::global_settings_store() else {
-        return;
     };
     if !has_payment_gateway && !peer_awaits_payment_role {
         return;
@@ -1730,7 +1726,9 @@ pub async fn run_axum_proxy(
                             Default::default()
                         }
                     };
-                    enable_agent_pay_ui_in_use(&store, migration.skipped > 0).await;
+                    if let Some(settings) = crate::storage::settings_store::global_settings_store() {
+                        enable_agent_pay_ui_in_use(&store, settings, migration.skipped > 0).await;
+                    }
                     info!("Gateway store initialized");
                     Some(Arc::new(store))
                 }
@@ -4885,5 +4883,73 @@ mod tests {
             ),
             "error should name the storage path: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_pay_ui_is_turned_on_only_when_payments_need_it_and_no_operator_set_it() {
+        use super::enable_agent_pay_ui_in_use;
+        use crate::gateways::FileSystemGatewayStore;
+        use crate::gateways::GatewayStore;
+        use crate::gateways::agent_pay_flag::FLAG_AGENT_PAY;
+        use crate::storage::settings_store::{DashboardSettings, SettingsStore};
+
+        let gateways = |with_payment_gateway: bool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
+                .await
+                .unwrap();
+            if with_payment_gateway {
+                let mut payment = Gateway::new(
+                    "agent-pay".to_string(),
+                    String::new(),
+                    "did:web:pay.example".to_string(),
+                    GatewayType::Remote,
+                );
+                payment.role = GatewayRole::Payment;
+                store
+                    .create(&payment)
+                    .await
+                    .unwrap();
+            }
+            (dir, store)
+        };
+        let settings_dir = || tempfile::tempdir().unwrap();
+
+        let (_g, store) = gateways(false).await;
+        let dir = settings_dir();
+        let settings = SettingsStore::new(dir.path());
+        enable_agent_pay_ui_in_use(&store, &settings, true).await;
+        assert!(settings.flag_enabled(FLAG_AGENT_PAY), "a skipped peer turns the flag on");
+
+        let (_g, store) = gateways(true).await;
+        let dir = settings_dir();
+        let settings = SettingsStore::new(dir.path());
+        enable_agent_pay_ui_in_use(&store, &settings, false).await;
+        assert!(settings.flag_enabled(FLAG_AGENT_PAY), "a payment gateway turns the flag on");
+
+        let (_g, store) = gateways(false).await;
+        let dir = settings_dir();
+        let settings = SettingsStore::new(dir.path());
+        enable_agent_pay_ui_in_use(&store, &settings, false).await;
+        assert!(!settings.flag_enabled(FLAG_AGENT_PAY));
+        assert!(
+            settings
+                .enable_flag_if_unset(FLAG_AGENT_PAY)
+                .await
+                .unwrap(),
+            "without a payment gateway or a skipped peer the flag stays unset"
+        );
+
+        let (_g, store) = gateways(true).await;
+        let dir = settings_dir();
+        let settings = SettingsStore::new(dir.path());
+        settings
+            .update(DashboardSettings {
+                feature_flags: std::collections::HashMap::from([(FLAG_AGENT_PAY.to_string(), false)]),
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        enable_agent_pay_ui_in_use(&store, &settings, true).await;
+        assert!(!settings.flag_enabled(FLAG_AGENT_PAY), "an operator's off is kept");
     }
 }
