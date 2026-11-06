@@ -240,7 +240,6 @@ pub struct AgentCardPreview {
     pub cached: bool,
     pub fetch: Option<CardFetchReport>,
     pub auth: Option<CardAuthReport>,
-    pub payment_required: bool,
     outcome: (),
     pub before: Option<serde_json::Value>,
     pub after: Option<serde_json::Value>,
@@ -269,7 +268,6 @@ impl AgentCardPreview {
             cached: false,
             fetch: None,
             auth: None,
-            payment_required: false,
             outcome: (),
             before: None,
             after: None,
@@ -681,7 +679,6 @@ async fn fetch_preview(
         fetched_at: Some(timestamp(fetched_at)),
         fetch: Some(fetch),
         auth: Some(auth),
-        payment_required: crate::proxy::handler::card_payment_gates(surface).any(),
         before,
         after,
         before_bytes,
@@ -814,8 +811,8 @@ mod tests {
             json!({
                 "surface_id": "s-1", "supported": false, "unsupported_reason": "not_a2a", "variant": null,
                 "generated": false, "served_url": null, "source_url": null, "source_url_query_hidden": false,
-                "fetched_at": null, "cached": false, "fetch": null, "auth": null, "payment_required": false,
-                "outcome": null, "before": null, "after": null, "before_bytes": null, "after_bytes": null,
+                "fetched_at": null, "cached": false, "fetch": null, "auth": null, "outcome": null,
+                "before": null, "after": null, "before_bytes": null, "after_bytes": null,
                 "display_limit_bytes": 0, "last_caller_fetch": null
             })
         );
@@ -1120,31 +1117,6 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_reports_a_payment_only_when_the_card_route_asks_for_one() {
-        let paid = |payment_policy: serde_json::Value| {
-            crate::proxy::handler::card_payment_gates(&surface_with(
-                "s",
-                json!({"endpoint": "https://agent.example", "payment_policy": payment_policy}),
-            ))
-            .any()
-        };
-        assert!(paid(json!({"type": "x402", "enabled": true})));
-        assert!(!paid(json!({"type": "x402", "enabled": false})));
-        assert!(
-            !paid(json!({"type": "x402", "enabled": true, "provider": "agent_pay",
-                "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface"})),
-            "a delegated x402 policy does not paywall the card"
-        );
-        assert!(
-            !crate::proxy::handler::card_payment_gates(&surface_with(
-                "s",
-                json!({"endpoint": "https://agent.example"})
-            ))
-            .any()
-        );
-    }
-
-    #[test]
     fn the_digest_changes_with_the_surface() {
         let surface = |endpoint: &str| surface_with("s", json!({"endpoint": endpoint}));
         assert_eq!(surface_digest(&surface("https://a.example")), surface_digest(&surface("https://a.example")));
@@ -1163,7 +1135,7 @@ mod tests {
 
         assert_eq!(fetch_of(&preview), (CardFetchStatus::Ok, None, None));
         assert_eq!(auth_of(&preview), (CardAuthKind::None, CardAuthResult::NotConfigured, None));
-        assert!(preview.supported && !preview.cached && !preview.generated && !preview.payment_required);
+        assert!(preview.supported && !preview.cached && !preview.generated);
         assert_eq!(preview.before, Some(agent_card()));
         assert_eq!(preview.before_bytes, Some(serialized_len(&agent_card())));
         let after = preview.after.clone().unwrap();

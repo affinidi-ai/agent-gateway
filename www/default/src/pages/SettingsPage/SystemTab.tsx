@@ -408,15 +408,16 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   disabled={isSubmitting}
                   description={
                     <>
-                      Adds the <code>Agent Pay (delegate payment)</code> provider option to the{' '}
-                      <code>Payment</code> element in the surface builder. UI-only: surfaces already
-                      configured to delegate payment to a connected Agent-Pay gateway continue to
-                      work regardless of this toggle.
+                      Shows the agent-pay UI: the <code>Payment Gateways</code> tab under{' '}
+                      <code>Connections</code>, the <code>Payment</code> element and payment
+                      templates in the surface builder, and <code>Use as payment gateway</code>.
+                      While off, no payment gateway can be added; surfaces that already take
+                      payments keep their Payment element and keep working.
                     </>
                   }
                   onChangeMessages={{
-                    on: 'Agent-Pay delegation shown in the Payment element.',
-                    off: 'Agent-Pay delegation hidden from the Payment element.',
+                    on: 'Agent-pay shown.',
+                    off: 'Agent-pay hidden.',
                   }}
                   featureFlags={featureFlags}
                   updateSettings={updateSettings}

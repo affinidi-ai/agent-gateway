@@ -2,12 +2,27 @@ import React, { useState } from 'react';
 import { validateUrl } from '../../utils/urlValidation';
 import { AppButton } from '../shared/AppButton';
 
+export interface LinkStepWording {
+  intro: string;
+  helpTitle: string;
+  helpBody: string;
+}
+
+const DEFAULT_WORDING: LinkStepWording = {
+  intro:
+    'Enter the Connection Point Link provided by the administrator of the Agent Gateway you wish to connect to. This link allows you to establish a secure DIDComm connection to your Agent Gateway.',
+  helpTitle: 'What is a Connection Point Link?',
+  helpBody:
+    'A Connection Point Link is a URL created by an Agent Gateway administrator that allows another Agent Gateway to connect to their Agent Gateway via a Connection Point. The gateway administrator creates this link and shares it with you securely. Once you enter the link, the system will use it to establish a secure DIDComm connection to the Agent Gateway and allow you to configure a channel to route agent traffic through it.',
+};
+
 interface EnterOOBLinkStepProps {
   onNext: (link: string, secret: string) => void;
   onBack?: () => void;
   onCancel: () => void;
   initialLink?: string;
   initialSecret?: string;
+  wording?: Partial<LinkStepWording>;
 }
 
 const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
@@ -16,7 +31,9 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
   onCancel,
   initialLink = '',
   initialSecret = '',
+  wording: wordingOverrides,
 }) => {
+  const wording = { ...DEFAULT_WORDING, ...wordingOverrides };
   const [link, setLink] = useState(initialLink);
   const [secret, setSecret] = useState(initialSecret);
   const [showSecret, setShowSecret] = useState(false);
@@ -60,22 +77,18 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
   };
 
   return (
-    <div className="card shadow">
+    <div className="card shadow" data-testid="wizard-step-link">
       <div className="card-header py-3">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-link me-2"></i> Enter Connection Point Link
         </h6>
       </div>
       <div className="card-body">
-        <p className="text-muted">
-          Enter the Connection Point Link provided by the administrator of the Agent Gateway you
-          wish to connect to. This link allows you to establish a secure DIDComm connection to your
-          Agent Gateway.
-        </p>
+        <p className="text-muted">{wording.intro}</p>
 
         <form onSubmit={handleSubmit}>
           {error && (
-            <div className="alert alert-danger" role="alert">
+            <div className="alert alert-danger" role="alert" data-testid="wizard-oob-link-error">
               <i className="fas fa-exclamation-circle me-2"></i>
               {error}
             </div>
@@ -94,6 +107,7 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
               placeholder="https://example.mediator.com/oob?_oobid=..."
               required
               autoFocus
+              data-testid="wizard-oob-link-input"
             />
             <small className="form-text text-muted">
               Example: https://apse1.mediator.affinidi.io/oob?_oobid=abc123...
@@ -113,6 +127,7 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
                 onChange={e => setSecret(e.target.value)}
                 placeholder="Enter the connection secret..."
                 required
+                data-testid="wizard-oob-secret-input"
               />
               <button
                 type="button"
@@ -133,15 +148,9 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
           <div className="alert alert-info" role="alert">
             <i className="fas fa-info-circle me-3"></i>
             <strong style={{ whiteSpace: 'nowrap', marginRight: '20px' }}>
-              What is a Connection Point Link?
+              {wording.helpTitle}
             </strong>
-            <p className="mb-0 mt-2">
-              A Connection Point Link is a URL created by an Agent Gateway administrator that allows
-              another Agent Gateway to connect to their Agent Gateway via a Connection Point. The
-              gateway administrator creates this link and shares it with you securely. Once you
-              enter the link, the system will use it to establish a secure DIDComm connection to the
-              Agent Gateway and allow you to configure a channel to route agent traffic through it.
-            </p>
+            <p className="mb-0 mt-2">{wording.helpBody}</p>
           </div>
 
           <div className="d-flex justify-content-between mt-4">
@@ -151,6 +160,7 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
               size="md"
               onClick={onCancel}
               iconStart={<i className="fas fa-times"></i>}
+              data-testid="wizard-cancel"
             >
               Cancel
             </AppButton>
@@ -162,6 +172,7 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
                   size="md"
                   onClick={onBack}
                   iconStart={<i className="fas fa-arrow-left"></i>}
+                  data-testid="wizard-back"
                 >
                   Back
                 </AppButton>
@@ -171,6 +182,7 @@ const EnterOOBLinkStep: React.FC<EnterOOBLinkStepProps> = ({
                 variant="primary"
                 size="md"
                 iconEnd={<i className="fas fa-arrow-right"></i>}
+                data-testid="wizard-next"
               >
                 Next
               </AppButton>

@@ -109,3 +109,43 @@ describe('EnterDetailsStep mediator picker', () => {
     await waitFor(() => expect(onNext).toHaveBeenCalledWith('Partner', '', 'web', 'm-ok'));
   });
 });
+
+describe('EnterDetailsStep wording', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    withFlag(undefined);
+  });
+
+  it('keeps the gateway wording by default', () => {
+    renderStep();
+
+    expect(screen.getByText('Enter Gateway Details')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('wizard-next'));
+    expect(screen.getByTestId('wizard-oob-details-error')).toHaveTextContent(
+      'Gateway name is required'
+    );
+  });
+
+  it('uses the wording it is given and still refuses an empty name', () => {
+    const onNext = jest.fn();
+    render(
+      <EnterDetailsStep
+        onNext={onNext}
+        onCancel={jest.fn()}
+        wording={{
+          title: 'Enter Payment Gateway Details',
+          nameLabel: 'Payment Gateway Name',
+          nameRequired: 'Payment gateway name is required',
+        }}
+      />
+    );
+
+    expect(screen.getByText('Enter Payment Gateway Details')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Payment Gateway Name/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('wizard-next'));
+    expect(screen.getByTestId('wizard-oob-details-error')).toHaveTextContent(
+      'Payment gateway name is required'
+    );
+    expect(onNext).not.toHaveBeenCalled();
+  });
+});

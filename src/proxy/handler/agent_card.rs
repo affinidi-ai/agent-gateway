@@ -558,6 +558,7 @@ impl TargetCardFetch<'_> {
                 timeout: std::time::Duration::from_secs(30),
                 trace_id: &trace_id,
                 log_label: channel_name,
+                extra_body: None,
             },
         )
         .await

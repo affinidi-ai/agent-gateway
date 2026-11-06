@@ -49,6 +49,7 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
 import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
@@ -1287,12 +1288,17 @@ const SurfaceDetailPage: React.FC = () => {
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
       payload = withCallerAccessSettled(payload);
       let headerWarnings: string[] = [];
-      const updated = await apiClient.updateSurface(surfaceId, payload, {
-        onWarnings: received => {
-          headerWarnings = received;
-        },
-      });
-      setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(headerWarnings) });
+      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(
+        surfaceId,
+        payload,
+        {
+          onWarnings: received => {
+            headerWarnings = received;
+          },
+        }
+      );
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(serverWarnings) });
       setSurface(updated);
       setSaveCount(count => count + 1);
       setJsonOverride(null);
@@ -1383,7 +1389,9 @@ const SurfaceDetailPage: React.FC = () => {
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving.
-      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
+        headerWarnings: serverWarnings,
+      });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1675,7 +1683,11 @@ const SurfaceDetailPage: React.FC = () => {
           error || (saveWarnings && saveWarnings.length > 0) ? (
             <>
               {error && (
-                <div className="alert alert-danger surface-page-alert mb-2" role="alert">
+                <div
+                  className="alert alert-danger surface-page-alert mb-2"
+                  role="alert"
+                  data-testid="surface-error-alert"
+                >
                   <i className="fas fa-exclamation-circle me-2" />
                   {error}
                 </div>

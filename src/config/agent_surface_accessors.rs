@@ -141,23 +141,6 @@ impl AgentSurface {
             .collect()
     }
 
-    /// Whether a caller-authentication method would take `value`, sent in
-    /// header `name`, as its credential: the test method selection applies,
-    /// so another scheme on a method's header, such as an MPP
-    /// `Authorization: Payment` credential beside a JWT bearer method, is not
-    /// one.
-    pub fn takes_source_credential(
-        &self,
-        name: &axum::http::HeaderName,
-        value: &axum::http::HeaderValue,
-    ) -> bool {
-        let mut single = axum::http::HeaderMap::new();
-        single.insert(name.clone(), value.clone());
-        self.source_auth_methods()
-            .iter()
-            .any(|method| method.is_presented(&single, false))
-    }
-
     /// The DID Auth configurations that mint sessions: the Access Point's DID
     /// Auth caller-authentication method, of which there is at most one, on the
     /// surface and in each variant whose overrides set the Access Point's caller
@@ -591,12 +574,6 @@ impl AgentSurface {
             .as_ref()
     }
 
-    /// Auto-pay MPP challenges for fabric:// targets.
-    #[inline]
-    pub fn mpp_auto_pay(&self) -> bool {
-        self.target.mpp_auto_pay
-    }
-
     // ── Networking shorthands ───────────────────────────────────────────────
 
     #[inline]
@@ -726,16 +703,106 @@ impl AgentSurface {
         {
             Some(crate::config::agent_surface::PaymentPolicy::X402(config)) => config.enabled,
             Some(crate::config::agent_surface::PaymentPolicy::Mpp(config)) => config.enabled,
+            Some(crate::config::agent_surface::PaymentPolicy::AgentPay(_)) => true,
             None => false,
         }
     }
 
-    /// Mirrors legacy `channel.mpp_auto_pay_max_amount`.
+    /// The target's agent-pay payment policy, if any.
     #[inline]
-    pub fn mpp_auto_pay_max_amount(&self) -> Option<&str> {
+    pub fn agent_pay_policy(&self) -> Option<&crate::config::agent_surface::AgentPayPolicy> {
+        match self
+            .target
+            .payment_policy
+            .as_ref()?
+        {
+            crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(policy),
+            _ => None,
+        }
+    }
+
+    /// Gateways the `agent_pay` policies of the Target and of every variant name.
+    pub fn payment_gateway_ids(&self) -> Vec<&str> {
+        let variant_policies = self
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .target
+                    .as_ref()?
+                    .payment_policy
+                    .as_ref()
+            });
         self.target
-            .mpp_auto_pay_max_amount
-            .as_deref()
+            .payment_policy
+            .iter()
+            .chain(variant_policies)
+            .filter_map(|policy| match policy {
+                crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(
+                    policy
+                        .payment_gateway_id
+                        .trim(),
+                ),
+                _ => None,
+            })
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Gateways reached over `fabric://` by the Target, the Transit Points and
+    /// every variant's overrides of them.
+    pub fn fabric_gateway_ids(&self) -> Vec<&str> {
+        let variant_targets = self
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .target
+                    .as_ref()?
+                    .endpoint
+                    .as_deref()
+            });
+        let transit_points = self
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .chain(
+                self.variants
+                    .iter()
+                    .filter_map(|variant| {
+                        variant
+                            .overrides
+                            .transit
+                            .as_ref()?
+                            .points
+                            .as_ref()
+                    })
+                    .flatten(),
+            )
+            .map(|point| point.target_endpoint.as_str());
+        std::iter::once(self.target.endpoint.as_str())
+            .chain(variant_targets)
+            .chain(transit_points)
+            .filter_map(|endpoint| {
+                endpoint
+                    .strip_prefix("fabric://")?
+                    .split('/')
+                    .next()
+                    .filter(|id| !id.is_empty())
+            })
+            .collect()
+    }
+
+    /// Whether the target carries an enabled local x402 or MPP policy, which
+    /// is no longer supported. Requests to such a surface fail closed.
+    #[inline]
+    pub fn payment_policy_unsupported(&self) -> bool {
+        self.target
+            .payment_policy
+            .as_ref()
+            .is_some_and(crate::config::agent_surface::PaymentPolicy::is_unsupported_legacy)
     }
 
     // ── Access-point shorthands ─────────────────────────────────────────────
@@ -1120,6 +1187,70 @@ impl super::agent_surface::CredentialInjection {
 mod tests {
     use super::*;
     use crate::config::agent_surface::{AccessPoint, IdentityInjectionConfig, SurfaceStatus};
+
+    fn agent_pay(gateway_id: &str) -> crate::config::agent_surface::PaymentPolicy {
+        serde_json::from_value(serde_json::json!({
+            "type": "agent_pay",
+            "payment_gateway_id": gateway_id,
+            "payment_surface_id": "pay-1",
+        }))
+        .unwrap()
+    }
+
+    fn variant(overrides: serde_json::Value) -> crate::config::agent_surface_variants::SurfaceVariant {
+        serde_json::from_value(serde_json::json!({
+            "id": "v-1",
+            "alias": "pro",
+            "name": "Pro",
+            "overrides": overrides,
+        }))
+        .unwrap()
+    }
+
+    fn transit(endpoints: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "points": endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, endpoint)| serde_json::json!({"alias": format!("tp-{i}"), "target_endpoint": endpoint}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn payment_gateway_ids_come_from_the_target_and_every_variant() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        assert!(
+            s.payment_gateway_ids()
+                .is_empty()
+        );
+        s.target.payment_policy = Some(agent_pay("pay-gw"));
+        s.variants.push(variant(
+            serde_json::json!({"target": {"payment_policy": serde_json::to_value(agent_pay("pay-gw-2")).unwrap()}}),
+        ));
+        s.variants.push(variant(
+            serde_json::json!({"target": {"payment_policy": serde_json::to_value(agent_pay(" ")).unwrap()}}),
+        ));
+        assert_eq!(s.payment_gateway_ids(), vec!["pay-gw", "pay-gw-2"]);
+    }
+
+    #[test]
+    fn fabric_gateway_ids_come_from_targets_and_transit_points() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        s.target.endpoint = "https://upstream.example/mcp".to_string();
+        assert!(
+            s.fabric_gateway_ids()
+                .is_empty()
+        );
+        s.target.endpoint = "fabric://gw-target/surface".to_string();
+        s.transit = Some(serde_json::from_value(transit(&["fabric://gw-transit/s", "https://x.example"])).unwrap());
+        s.variants
+            .push(variant(serde_json::json!({
+                "target": {"endpoint": "fabric://gw-variant/s"},
+                "transit": transit(&["fabric://gw-variant-transit/s", "fabric:///nothing"]),
+            })));
+        assert_eq!(s.fabric_gateway_ids(), vec!["gw-target", "gw-variant", "gw-transit", "gw-variant-transit"]);
+    }
 
     fn surface_with_methods(methods: serde_json::Value) -> AgentSurface {
         let mut surface = surface(SurfaceProtocol::A2a);

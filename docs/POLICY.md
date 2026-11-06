@@ -34,6 +34,24 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+### Payment context (`input.payment`)
+
+On a surface with an `agent_pay` payment policy, every policy that runs for it gets
+`input.payment`: the appliance-wide and per-gateway gateway policies as well as the surface
+policies, on the direct Access Point and on Fabric receive alike. A surface without an
+`agent_pay` policy has no `input.payment`.
+
+```json
+{"required": true, "rail": "x402", "amount": "0.25", "currency": "USD"}
+```
+
+`required` says whether the request is chargeable under the policy's triggers. `rail` is the
+rail of the credential the caller presented, or the only rail the payment surface's manifest
+offers; `amount` and `currency` come from the manifest snapshot. Each is omitted when unknown.
+Payment is taken only after policy allows the request, so a denied request is never charged,
+and policy never sees whether a payment succeeded: the older `input.payment.verified` field is
+gone, and a rule that reads it no longer matches.
+
 ## Versioned policy definitions
 
 Policy definitions are immutable and versioned
@@ -541,6 +559,14 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   **origin-locked** to the SSE host via
   `mcp::sse_transport::resolve_session_post_url`, so a cross-origin `endpoint`
   event can't redirect the POST to an internal address).
+- `egress::pinned_forward_client` (the forward step's policy) pins **MCP tool
+  discovery of a saved surface** (`surface_id`): the gateway reads the surface's
+  stored Target and `target.auth` itself, so it reaches exactly what the
+  surface already forwards to (loopback and RFC 1918 allowed, cloud metadata
+  blocked) and the caller cannot choose the host. The caller must be able to
+  read the surface (tenant and resource scope, else `404`), and a
+  `target_endpoint` sent with it that differs from the saved one is refused
+  with `409` before any dial.
 - `egress::pinned_configured_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, allows RFC 1918) pins the
   modern owned **MCP Proxy `tools/call`** to its REST backend

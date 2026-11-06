@@ -65,17 +65,6 @@ pub async fn get_or_load_x402_config() -> anyhow::Result<Arc<X402Config>> {
     anyhow::bail!("x402 configuration not in cache - should have been loaded at startup")
 }
 
-/// Clear the x402 configuration cache. Test-only helper for isolating cached
-/// config state between tests.
-#[cfg(test)]
-pub async fn clear_x402_config_cache() {
-    let mut cache = X402_CONFIG_CACHE
-        .write()
-        .await;
-    *cache = None;
-    info!("x402 configuration cache cleared");
-}
-
 /// Store x402 metadata (network/token info) in cache
 /// Should be called during application startup with the parsed X402ConfigResponse
 pub async fn set_x402_metadata(metadata: X402ConfigResponse) {

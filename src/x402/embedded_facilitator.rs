@@ -669,40 +669,6 @@ impl EmbeddedFacilitator {
         })
     }
 
-    /// Verify a payment authorization
-    ///
-    /// This performs:
-    /// - Signature verification (EIP-712)
-    /// - On-chain nonce checking
-    /// - Balance validation
-    /// - Timestamp validation
-    #[instrument(skip(self, request), fields(scheme = %payment_scheme(&request)))]
-    pub async fn verify(
-        &self,
-        request: proto::VerifyRequest,
-    ) -> Result<proto::VerifyResponse, String> {
-        debug!("Verifying payment via embedded facilitator");
-
-        let result = self
-            .facilitator
-            .verify(&request)
-            .await
-            .map_err(|e| {
-                let error_msg = format!("Facilitator verification failed: {}", e);
-                error!("[x402 Facilitator] SDK Error type: {:?}", std::any::type_name_of_val(&e));
-                error!("[x402 Facilitator] SDK Error message: {}", e);
-                error!("[x402 Facilitator] SDK Error debug: {:?}", e);
-                error_msg
-            });
-
-        if result.is_err() {
-            error!("[x402 Facilitator] ========== SDK VERIFICATION FAILED ==========");
-            error!("[x402 Facilitator] Payment verification failed");
-        }
-
-        result
-    }
-
     /// Settle a payment on-chain
     ///
     /// This submits the signed authorization to the blockchain
@@ -844,12 +810,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_records_scheme_without_signature_or_authorization() {
+    async fn settle_records_scheme_without_signature_or_authorization() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let _guard = set_thread_default(tracing_subscriber::registry().with(RecordedTelemetry(recorded.clone())));
 
         let result = facilitator_without_chains()
-            .verify(signed_verify_request())
+            .settle(signed_verify_request())
             .await;
 
         let telemetry = recorded
@@ -857,7 +823,7 @@ mod tests {
             .unwrap()
             .join("\n");
         assert!(result.is_err());
-        assert!(telemetry.contains("verify{scheme=eip155:8453:v2:exact }"), "{telemetry}");
+        assert!(telemetry.contains("settle{scheme=eip155:8453:v2:exact }"), "{telemetry}");
         assert!(!telemetry.contains(SIGNATURE_MARKER), "{telemetry}");
         assert!(!telemetry.contains(NONCE_MARKER), "{telemetry}");
     }
