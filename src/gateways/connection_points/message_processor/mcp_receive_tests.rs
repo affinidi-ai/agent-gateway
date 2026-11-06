@@ -3679,12 +3679,12 @@ async fn a_paid_surface_reached_over_the_fabric_is_charged() {
 }
 
 #[test]
-fn a_hold_a_rate_limit_and_a_payment_in_progress_reach_a_fabric_caller_as_the_gate_answered() {
+fn a_hold_a_retry_or_a_refusal_reaches_a_fabric_caller_as_the_gate_answered() {
     run_in_own_process(gate_answers_over_fabric_flow);
 }
 
 async fn gate_answers_over_fabric_flow() {
-    use crate::mcp::errors::{application_error_codes, error_codes};
+    use crate::mcp::errors::{application_error_codes, error_codes, payment_transport_error_codes};
     use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
 
     let target =
@@ -3701,6 +3701,7 @@ async fn gate_answers_over_fabric_flow() {
     let cases = [
         (
             "fabric-held-gate",
+            None,
             MockGate::answering(
                 202,
                 &[],
@@ -3713,6 +3714,7 @@ async fn gate_answers_over_fabric_flow() {
         ),
         (
             "fabric-rate-limited-gate",
+            None,
             MockGate::answering(429, &[("retry-after", "9")], json!({"error": "rate_limited"})),
             429,
             Some("9"),
@@ -3721,14 +3723,36 @@ async fn gate_answers_over_fabric_flow() {
         ),
         (
             "fabric-in-progress-gate",
+            None,
             MockGate::answering(409, &[], json!({"error": "idempotency_key_in_use"})),
             409,
             Some("1"),
             json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment in progress",
                 "data": {"httpStatus": 409, "error": "payment_in_progress", "retryAfter": "1"}}),
         ),
+        (
+            "fabric-unconfirmed-gate",
+            Some("unconfirmed-proof"),
+            MockGate::answering(500, &[], json!({})),
+            502,
+            Some("2"),
+            json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment not confirmed",
+                "data": {"httpStatus": 502, "error": "payment_unconfirmed",
+                    "detail": "payment gateway returned unexpected status 500",
+                    "retryAfter": 2, "replayWindowSecs": 120}}),
+        ),
+        (
+            "fabric-rejected-gate",
+            Some("rejected-proof"),
+            MockGate::answering(403, &[], json!({"status": "rejected_by_oversight"})),
+            403,
+            None,
+            json!({"code": payment_transport_error_codes::PAYMENT_VERIFICATION_FAILED,
+                "message": "Payment Verification Failed",
+                "data": {"httpStatus": 403, "failure": {"reason": "rejected_by_oversight"}}}),
+        ),
     ];
-    for (gate_id, gate, ..) in &cases {
+    for (gate_id, _, gate, ..) in &cases {
         let surface: AgentSurface = serde_json::from_value(json!({
             "surface_id": gate_id, "name": gate_id,
             "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
@@ -3746,7 +3770,11 @@ async fn gate_answers_over_fabric_flow() {
     }
     let now_secs = super::super::envelope_replay::now_secs();
 
-    for (gate_id, gate, expected_status, retry_after, error) in cases {
+    for (gate_id, credential, gate, expected_status, retry_after, error) in cases {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(credential) = credential {
+            headers["PAYMENT-SIGNATURE"] = json!(credential);
+        }
         let message = ReceivedMessage::new(
             "receiver-connection".to_string(),
             "receiver-gateway".to_string(),
@@ -3758,7 +3786,7 @@ async fn gate_answers_over_fabric_flow() {
             None,
             Some(now_secs + 60),
             json!({"channel_id": gate_id, "method": "POST", "path": "/mcp",
-                "headers": {"MCP-Protocol-Version": MCP_LEGACY_VERSION},
+                "headers": headers,
                 "body": {"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {"name": "paid_tool"}}}),
             MessageMetadata {
                 encrypted: true,

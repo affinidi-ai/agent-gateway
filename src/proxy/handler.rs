@@ -24374,16 +24374,17 @@ mod fabric_send_tests {
     }
 
     #[test]
-    fn a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered() {
-        run_on_large_stack(a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered_flow());
+    fn a_hold_a_retry_or_a_refusal_reaches_the_caller_as_the_gate_answered() {
+        run_on_large_stack(a_hold_a_retry_or_a_refusal_reaches_the_caller_as_the_gate_answered_flow());
     }
 
-    async fn a_hold_a_rate_limit_and_a_payment_in_progress_reach_the_caller_as_the_gate_answered_flow() {
-        use crate::mcp::errors::{application_error_codes, error_codes};
+    async fn a_hold_a_retry_or_a_refusal_reaches_the_caller_as_the_gate_answered_flow() {
+        use crate::mcp::errors::{application_error_codes, error_codes, payment_transport_error_codes};
 
         let cases = [
             (
                 "held-gate",
+                None,
                 MockGate::answering(
                     202,
                     &[],
@@ -24396,6 +24397,7 @@ mod fabric_send_tests {
             ),
             (
                 "rate-limited-gate",
+                None,
                 MockGate::answering(429, &[("retry-after", "9")], json!({"error": "rate_limited"})),
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 Some("9"),
@@ -24404,14 +24406,36 @@ mod fabric_send_tests {
             ),
             (
                 "in-progress-gate",
+                None,
                 MockGate::answering(409, &[], json!({"error": "idempotency_key_in_use"})),
                 axum::http::StatusCode::CONFLICT,
                 Some("1"),
                 json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment in progress",
                     "data": {"httpStatus": 409, "error": "payment_in_progress", "retryAfter": "1"}}),
             ),
+            (
+                "unconfirmed-gate",
+                Some("unconfirmed-proof"),
+                MockGate::answering(500, &[], json!({})),
+                axum::http::StatusCode::BAD_GATEWAY,
+                Some("2"),
+                json!({"code": error_codes::INTERNAL_ERROR, "message": "Payment not confirmed",
+                    "data": {"httpStatus": 502, "error": "payment_unconfirmed",
+                        "detail": "payment gateway returned unexpected status 500",
+                        "retryAfter": 2, "replayWindowSecs": 120}}),
+            ),
+            (
+                "rejected-gate",
+                Some("rejected-proof"),
+                MockGate::answering(403, &[], json!({"status": "rejected_by_oversight"})),
+                axum::http::StatusCode::FORBIDDEN,
+                None,
+                json!({"code": payment_transport_error_codes::PAYMENT_VERIFICATION_FAILED,
+                    "message": "Payment Verification Failed",
+                    "data": {"httpStatus": 403, "failure": {"reason": "rejected_by_oversight"}}}),
+            ),
         ];
-        for (gate_id, gate, expected_status, retry_after, error) in cases {
+        for (gate_id, credential, gate, expected_status, retry_after, error) in cases {
             install_test_transport(gate_id, gate.clone());
             let peer =
                 fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
@@ -24420,7 +24444,8 @@ mod fabric_send_tests {
                 .await;
 
             let (status, headers, body) =
-                answer(post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), None).await).await;
+                answer(post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), credential).await)
+                    .await;
             assert_eq!(status, expected_status, "{gate_id}: {body}");
             assert_eq!(
                 headers
