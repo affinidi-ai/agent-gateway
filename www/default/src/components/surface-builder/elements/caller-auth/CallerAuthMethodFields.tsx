@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { useParams } from 'react-router-dom';
 import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
@@ -76,6 +77,13 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
   const discoveryOn = allowDiscovery && method === 'jwt_bearer' && hasDiscovery;
   const showsDiscovery =
     allowDiscovery && method === 'jwt_bearer' && (protocol === 'mcp' || hasDiscovery);
+  const commitAudienceInput = () => {
+    const value = audienceInput.trim();
+    if (!discoveryOn && value && !audiences.includes(value)) {
+      updateField('audiences', [...audiences, value]);
+    }
+    setAudienceInput('');
+  };
   // While discovery is on, each control the gateway constrains is locked once
   // it holds the required value, and stays editable until then.
   const tokenHeaderLocked = discoveryOn && readsAuthorizationHeader(config);
@@ -175,14 +183,18 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 disabled={discoveryOn}
                 value={audienceInput}
                 onChange={e => setAudienceInput(e.target.value)}
+                onBlur={() => {
+                  if (document.hasFocus()) commitAudienceInput();
+                }}
                 onKeyDown={e => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+                    e.preventDefault();
+                    flushSync(commitAudienceInput);
+                    return;
+                  }
                   if (e.key === 'Enter' || e.key === ',') {
                     e.preventDefault();
-                    const val = audienceInput.trim();
-                    if (val && !audiences.includes(val)) {
-                      updateField('audiences', [...audiences, val]);
-                    }
-                    setAudienceInput('');
+                    commitAudienceInput();
                   }
                 }}
               />
@@ -190,13 +202,7 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 type="button"
                 className="btn btn-outline-secondary"
                 disabled={discoveryOn}
-                onClick={() => {
-                  const val = audienceInput.trim();
-                  if (val && !audiences.includes(val)) {
-                    updateField('audiences', [...audiences, val]);
-                  }
-                  setAudienceInput('');
-                }}
+                onClick={commitAudienceInput}
               >
                 Add
               </button>
@@ -220,7 +226,8 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
             )}
             <small className="form-text text-muted">
               Optional. When set, the token's <code>aud</code> claim must match at least one of
-              these values. Press <kbd>Enter</kbd> or <kbd>,</kbd> to add.
+              these values. Press <kbd>Enter</kbd> or <kbd>,</kbd>, or click Add; a value left in
+              the field is also added when it loses focus or you save.
             </small>
           </div>
 
