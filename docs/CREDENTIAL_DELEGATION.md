@@ -914,8 +914,8 @@ it vetted. On any other Target the view behaves as with the switch off: a `fabri
 non-HTTP Target refuses a per-user binding with `delegation_not_enabled_for_partners`; a legacy
 request to a `proxy://` Target, and a request to an A2A or AP2 surface's `a2a-proxy://` Target, is
 handed to the MCP or A2A proxy before any binding applies, so Fabric receive sends it no
-delegated credential at all; an `a2a-proxy://` Target on an MCP or HTTP surface is not handed to
-the A2A proxy on Fabric receive and is treated as the other non-HTTP Targets above. A released
+delegated credential at all; an `a2a-proxy://` Target on any other surface is not handed to
+the A2A proxy on Fabric receive (`dispatches_to_a2a_proxy` is false) and is treated as the other non-HTTP Targets above. A released
 grant goes only under the Target base path: a partner's request whose path climbs out is refused
 with `400 target_path_refused` before any grant is read, ahead of the refusals above (see
 [Target base path](#target-base-path)). The served view is checked on
