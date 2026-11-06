@@ -19,6 +19,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # Keep the digest-pinned runtime base image in the Dockerfile current.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   # Keep the SHA-pinned actions in .github/workflows/* current. Dependabot bumps
   # each pin and rewrites the trailing `# vX.Y.Z` comment, so pins stay both
   # immutable (SHA) and readable. Grouped into a single weekly PR rather than one

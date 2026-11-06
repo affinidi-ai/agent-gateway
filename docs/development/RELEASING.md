@@ -112,13 +112,28 @@ registry.
 - **Pull requests** that touch the `Dockerfile`, the Rust or dashboard sources, `Cargo.toml`,
   `Cargo.lock`, or `scripts/ci/` build the `linux/amd64` image and boot-probe it
   (`scripts/ci/boot-probe.sh` runs the entrypoint with `--help` and requires a clean exit). Nothing
-  is pushed.
+  is pushed. The boot probe also fails if the binary links a shared library the image lacks, or
+  if the `xmlsec1` CLI cannot run.
 - **A `v*` tag**, created by "Publish release", builds `linux/amd64` and `linux/arm64` natively and
-  pushes each by digest. Each pushed image is pulled back and boot-probed. Then a `publish` job
+  pushes each by digest. Each pushed image is pulled back, boot-probed and scanned, so a blocking
+  scan stops the build job before the `publish` job can create a version tag. Then a `publish` job
   merges the digests into one multi-arch manifest (`scripts/ci/publish-manifest.sh`) tagged
   `X.Y.Z`, `X.Y` and, for a release that is not a pre-release, `latest`, and attests the manifest's
   build provenance. Verify an image with
   `gh attestation verify oci://ghcr.io/affinidi-ai/agent-gateway:X.Y.Z --repo affinidi-ai/agent-gateway`.
+
+Every run scans the `Dockerfile` for misconfigurations and the built image for vulnerabilities and
+embedded secrets with a pinned Trivy container (`scripts/ci/trivy-scan.sh`). The image is passed to
+the scanner as a tarball, so no Docker socket or registry credential reaches it. HIGH and CRITICAL
+findings, ignoring vulnerabilities that have no fix yet, are listed in the run's job summary and
+raised as warnings. They block the run only when the repository variable `TRIVY_ENFORCE` is set to
+`true`, so the rollout can start warn-only and be switched to blocking after a grace period. A
+fixable finding in the base image clears by rebuilding, because the runtime stage runs
+`apt-get upgrade`. The image runs as the non-root `lowPrivUser`.
+
+The runtime image is built from a digest-pinned `debian:bookworm-slim` and carries only the shared
+libraries the binary links, `xmlsec1`, and the bootstrap CLIs, with no compilers, `-dev` packages
+or `git`. Dependabot proposes updates to the pinned base image.
 
 A manual run of the workflow (**Run workflow** on the Actions tab) builds both architectures and
 boot-probes them without pushing anything. Setting `push_test_image` also runs the publish path
