@@ -288,6 +288,13 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
   also covers the stored mediator record created for the offer: its generated id is not matched
   against the pattern. The Connection Point itself must still match, so a token that matches only
   Connection Points cannot create one on a directory offer.
+- A secret that another record uses is not deleted: `DELETE /v1/secrets/{id}` answers `409`
+  while one does, as does a provider type change that a surface's Target authentication refuses
+  (see [Records that are still in use](CREDENTIAL_DELEGATION.md#records-that-are-still-in-use)). The
+  body lists, under `references`, only the referrers the caller may read (a kind whose view
+  permission its role and token scopes hold, its tenant's records and appliance-wide ones,
+  within its resource pattern), and counts the rest in `hidden_references`, so a tenant PAT
+  learns that another tenant's record uses its secret without learning which.
 
 ### What tenancy does not partition
 

@@ -28,7 +28,11 @@ resolved on those paths either, on the direct or fabric send leg, so a credentia
 resolved does not fail discovery.
 
 Forwarded requests on those public paths never carry the surface's `target.auth`: that
-credential vouches that the gateway vetted the caller, and discovery vetted nobody.
+credential vouches that the gateway vetted the caller, and discovery vetted nobody. On the
+receiving gateway of a Fabric route, only a `GET` of exactly `/.well-known/agent-card.json` or
+the surface's configured card location, the path a sending gateway's own card fetch uses, is
+treated as that fetch and carries `target.auth`. A `HEAD` of it, a query on it, `/discovery` or
+any other discovery read is a caller's and carries none.
 
 ### Agent card fetch
 
@@ -60,7 +64,7 @@ sequenceDiagram
 
 | Aspect | Behaviour |
 | --- | --- |
-| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read or the provider's token request fails. The cause is logged only. |
+| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
 | Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
@@ -117,8 +121,10 @@ could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3x
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
 `identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
-`token_unavailable` or `unsupported`; `forbidden`, `invalid_header`, `outside_target_base` and
-`header_conflict` are never sent and keep the spellings the dashboard accepts.
+`token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
+withholds the credential), or `invalid_header` (a stored Target authentication whose header
+breaks a header rule, which is never sent); `outside_target_base` and `header_conflict` are
+never sent and keep the spellings the dashboard accepts.
 
 When a fetch fails, `after` is the last good card the preview built for the same running surface
 on this replica, for up to 10 minutes after that fetch, and `null` once the surface changed.
@@ -776,6 +782,77 @@ Relevant implementation:
   `ROLE_AGENT`, parts without `kind`), and `message/send` gets the v0.3 shape (the message itself as
   `result`, `kind: "message"`, `role: "agent"`, `kind: "text"` parts), whatever `A2A-Version` the
   caller sent.
+
+## Target Credential Scope
+
+A Target credential (`target.auth`, or a Transit Point's `target_auth`) is sent only to URLs
+under its Target or Transit Point destination. Before the credential
+is attached to a forwarded request, the gateway checks the outbound URL against the Target
+endpoint: the scheme, host and port must match (a default port matches an explicit one), and the
+path must equal the Target's path or continue below it after a `/`. Both paths are compared after
+decoding percent-encoded unreserved characters (`A`-`Z`, `a`-`z`, `0`-`9`, `-`, `.`, `_`, `~`)
+and removing `.` and `..` segments (RFC 3986 sections 2.3 and 5.2.4). `%2F` is never decoded, so
+`/base/%2Fx` stays under `/base` and `/base%2Fx` does not. A `;` parameter is part of its segment:
+`/base;v=1/x` is not under `/base`. Below a non-root base path, a segment that a server could
+still resolve as `.` or `..` is refused too, since some servers strip `;` parameters, decode `%2F`,
+treat `\` as a separator or decode more than once: a dot segment with `;` parameters (`..;`,
+`.;x`), a `.` or `..` beside an encoded slash or backslash (`..%2F`, `..%5C`, `%2F..`), and the
+same spelled with escapes that decode into them (`%252e`, `..%252F`, `..%255C`, `..%3B`, `%u002e`,
+overlong, fullwidth or other look-alike dots such as `%C0%AE` and `%E2%80%A5`), and a segment
+with `%00`, a `%u` escape, or a `%25` left after three rounds of decoding. `%2F` and
+`%5C` elsewhere in a segment (`/base/a%2Fb`) and `;` parameters on other segments
+(`/base/x;v=1`) stay allowed. The query is ignored, and a Target with an empty or `/` path allows
+every path on its origin. A `GET` or `HEAD` of the configured agent card location
+(`access_point.agent_card_path`, or the Transit Point's `agent_card_path`) on the destination's
+origin is also allowed; any other method there is refused.
+
+| Path | Checked URL | Refusal |
+| --- | --- | --- |
+| Direct forward | The Target endpoint joined with the request path | 502 "Target authentication failed" |
+| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | 502 "Target authentication failed" |
+| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse 502, detail "Target authentication failed" |
+| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | 502 "Target authentication failed" |
+| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | 502 "Target authentication credentials unavailable" |
+| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | 502 "Target authentication credentials unavailable" |
+
+On the MCP proxy, a path parameter value containing another path parameter's `{name}`
+placeholder is also refused while the credential is attached, because the OpenAPI client
+substitutes parameters one at a time and the value would be rewritten into another parameter's
+place. It is refused as leaving the base: a 502 "Target authentication failed" and a
+`target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
+Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
+which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`
+segment, and checks the base path after substitution. A refused request reaches neither the Target
+nor any other host. A surface without `target.auth`, or a
+Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
+each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
+below a non-root `base_url` path, one that makes an ambiguous segment above (for example
+`../admin`, sent as `..%2Fadmin`), with or without the credential. The refusal is an HTTP `400` with JSON-RPC error `-32602` and the message "Invalid tool arguments", answered before any request is sent; it writes no VP Audit Log record.
+
+The forward clients do not follow redirects: a Target's 3xx is returned to the caller with its
+`Location`, so the credential never follows it to another URL. This holds for the pinned direct
+forward client, the pooled client used for `proxy://` surfaces, and the Fabric receive client.
+A legacy MCP proxy `tools/call` that carries the Target credential, direct or over Fabric, is
+sent by the gateway's REST client (the one the 2026-07-28 path uses) instead of `rmcp-openapi`'s
+client, which follows redirects. It resolves the tool against the proxy's `base_url` with a
+trailing `/` added when missing, as `rmcp-openapi` does (`/api/v4` reaches `/api/v4/pets/1`), and
+returns the same tool result (`content` and `isError`; a legacy tool result carries no
+`structuredContent`) for a JSON response, a failure status included, except as listed here. A 3xx
+fails the call with "Tool execution failed: REST tool redirects are not permitted", and the
+redirect target receives nothing. That client also applies the `mcp_http` size limits, encodes
+each path parameter as one segment, and refuses a `base_url` with user info. It checks a 2xx
+response against the tool's output schema, so a response the schema does not admit is a tool
+error, "REST response does not match the tool output schema", where `rmcp-openapi`'s client
+returns it as a success. The result text of a response that is not JSON leaves out the response
+headers and the request body, a response body other than an image that is not UTF-8 text fails
+the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
+rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
+vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud
+metadata refused, private ranges allowed) and pins the connection to the vetted address, so a host
+that later resolves to a refused address fails the call with "Tool execution failed: REST tool
+target is not permitted" before any request, and the credential is not sent. A tool call without
+the credential still runs on `rmcp-openapi`'s client and is unchanged.
 
 ## Upstream Response Bounds
 

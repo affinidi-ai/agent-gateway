@@ -36,6 +36,60 @@ A provider carries its authorization and token endpoints and its default scopes.
 client ID, client secret, signing key and certificate are **references** into the secrets
 store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
 
+### Records that are still in use
+
+A credential provider or secret is not deleted while another record uses it, so a surface does
+not fail on its next request.
+
+| Request | Refused with `409` while | Override |
+| --- | --- | --- |
+| `DELETE /api/v1/credential-providers/{id}` | A surface binds the provider or uses it for Target authentication; the answer is the `provider_in_use` one described in [Deleting a provider](#deleting-a-provider), not the body below | None: remove the references first |
+| `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
+| `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
+
+The other refusals answer a `409` body that keeps the `message` field current clients show:
+
+```json
+{
+  "message": "The secret is in use; remove its references first, or delete it with force=true",
+  "references": [{"kind": "surface", "id": "<surface_id>", "name": "Orders"}],
+  "hidden_references": 0
+}
+```
+
+`kind` is `surface`, `credential_provider`, `a2a_proxy` or `sts_client`. `references` lists
+only the referrers the caller may read: its role, and an access token's scopes if it lists
+any, hold the view permission of that kind (`surfaces.view`, `credential_providers.view`,
+`a2a_proxies.view` or `sts_clients.view`, see [`RBAC.md`](RBAC.md)), and the record is in the
+caller's tenant or appliance-wide and within its resource pattern. The rest are counted in
+`hidden_references` (see [Access tokens](ACCESS_TOKENS.md#references-between-records)). The messages are:
+
+- provider type change: `The credential provider is used for Target authentication, which cannot use a provider that needs a user's consent`
+- secret delete: `The secret is in use; remove its references first, or delete it with force=true`
+
+The scan reads every surface, provider, A2A proxy and STS client at the time of the request
+([`credential_providers/references.rs`](../src/credential_providers/references.rs)); a lookup
+that fails answers `500` and deletes nothing. A secret delete and a save of a surface,
+credential provider, A2A proxy or STS client that names the secret do not overlap on the node
+that serves the admin API, which serialises them with an in-process lock: a save stored first
+makes the delete answer `409` unless the delete adds `force=true`, and a save whose check found
+the secret before the delete removed it is refused with `400`, as a reference to a missing
+secret is.
+
+### Auditing a forced secret delete
+
+A `DELETE /api/v1/secrets/{id}?force=true` that deletes the secret records a
+`secret_force_deleted` event in the VP Audit Log, whether or not a record still used the
+secret: every forced delete is recorded, so a forced delete is never missing from the log. The
+record names the management caller as `actor`, the secret's `secret_id`, `force` (`true`) and
+`referrers`, each record that used it as `{kind, id}` with `kind` one of `surface`,
+`credential_provider`, `a2a_proxy` or `sts_client`, in kind and id order (an empty list when
+nothing used it). It carries the referrers of every kind, not only the kinds the caller may
+view, and never the secret's value or a referrer's name. A delete without `force`, a forced
+delete the gateway refuses (an integration endpoint that references the secret, a secret outside
+the token's scope, a failed lookup) and a delete outside a management request record nothing.
+See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the record.
+
 ### https token endpoints
 
 Every type except `api_key` sends its client secret, assertion or code to the token endpoint,
@@ -152,7 +206,8 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
   renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the
   others keep using the cached token. When the renewal fails at the token endpoint
-  (`TokenRequestFailed`, `ScopeMismatch`) or is held back by the retry backoff, the cached token
+  (`TokenRequestFailed`, `TokenRequestRejected`, `ScopeMismatch`) or is held back by the retry
+  backoff, the cached token
   is still used, marked stale, until 60 seconds before it expires; after that the request fails.
   A legacy binding's audit detail then reads `<grant>_stale` (for example
   `client_credentials_stale`) in place of `<grant>_cached` or `<grant>_fresh`, and each use
@@ -200,7 +255,7 @@ surfaces do not wait. A key's place in this queue is kept while any request hold
 however many keys are in use. Replicas do not coordinate, so each may request one token for the same key.
 
 After a token request fails, or its issued scopes do not match (`TokenRequestFailed`,
-`ScopeMismatch`), the next request for the same cache key (surface, provider, scopes and secret
+`TokenRequestRejected`, `ScopeMismatch`), the next request for the same cache key (surface, provider, scopes and secret
 versions) waits 1 second from the end of the failed request, doubling after each further failure
 up to 60 seconds. A request arriving before then fails at once with `TokenRequestFailed`, without
 contacting the provider. A successful request clears the wait, and editing the provider or
@@ -211,6 +266,37 @@ missing or refused secret (`SecretUnavailable`), a secrets store or vault error
 unsupported provider type. The wait is kept in memory on each replica and resets on restart, and the
 count of failures is forgotten 10 minutes after the retry time, so the next failure waits 1 second again.
 
+A Target that answers a request carrying a Target authentication service token as
+`Authorization: Bearer <token>` with `401` and a Bearer challenge whose `error` is
+`invalid_token` (RFC 6750 section 3.1; quoted or not, in any `WWW-Authenticate` header) has
+refused that token before it expired, for example after the issuer revoked it. The gateway deletes the token's vault row
+([`service_token::invalidate`](../src/delegation_vault/service_token.rs)), so the next request
+asks the provider for a new token, with these limits:
+
+- The row is deleted only while it still holds the token that was sent (same row id and token
+  value), checked and deleted in one step under the vault's mutation lock, so a gateway sharing
+  the vault that renews the row meanwhile keeps its new token. A renewal keeps the row id, so a
+  late refusal of a token already renewed or dropped changes nothing.
+- Only that row and its refresh claim are removed. Unlike a revocation, it revokes no staged
+  consent, leaves the revocation epoch as it is and ends no MCP subscription.
+- A token issued less than 30 seconds ago (`MIN_INVALIDATION_AGE_SECS`) is kept: a Target that
+  refuses a token just issued refuses every token, and dropping each one would send the
+  provider a token request per call.
+- Nothing is deleted while a renewal of that token is running.
+- The retry wait of the cache key is kept, so a failing token endpoint is still held back.
+
+The refused request is answered as the Target answered it and is not retried. A `401` without
+`invalid_token`, a `403`, a static secret or `api_key` credential, and a provider token sent in
+another header or scheme change nothing: a Bearer challenge speaks only about the `Authorization`
+Bearer token, which in that case may be the caller's. The direct path, Fabric receive and the
+agent card fetch check the answer, and so does a `proxy://` MCP Target, direct or on Fabric
+receive, legacy or `2026-07-28`: its tool call's REST backend answers the token, while the
+caller gets that answer as a tool result with `isError` set. A Transit Point and the Fabric send
+leg do not: their refusals leave the token in place until it is renewed. The Target and a Transit
+Point that use the same provider and scopes on one surface share one cached token, so only the
+Target's own answers can drop it. To keep a Transit Point's token unusable at the Target, give the
+Transit Point a provider whose `resource` names its own server.
+
 ### Logging token endpoint errors
 
 A credential provider's token endpoint can answer an error response that echoes the request or
@@ -220,6 +306,11 @@ breaks that rule. `error_description`, `error_uri` and the rest of the body are 
 returned in an error message or written to a delegation audit detail. This holds for code
 exchange, refresh, service token grants, the Microsoft Graph API token used for SAML avatars and
 the `error` an authorization callback carries.
+
+A service token request the token endpoint answers with an error status and an OAuth `error`
+code reports `TokenRequestRejected` carrying that code, which the
+[VP Audit Log](OBSERVABILITY.md#governance-audit-forwarding) records as `oauth_error` when it is a
+registered code and as `other` otherwise; any other failed answer reports `TokenRequestFailed`.
 
 Logs about a token request may name the provider id, the surface id, the HTTP status and the
 OAuth error code. They never carry a secret, a client assertion, a token, the response body or
@@ -446,7 +537,7 @@ with `outbound_credentials` ignores `transit_credentials`.
 A Transit Point sends its target at most one value of each credential header, by the same
 rule over HTTP and Fabric. It starts from the managed agent's headers, without the agent's
 `Authorization` and `Cookie`, and without any header, every value of it, compared without
-regard to case, named like the Transit Point's `target_auth` header or like the
+regard to case or to `_` against `-`, named like the Transit Point's `target_auth` header or like the
 `custom_header` of any credential binding that can apply on it: every binding in the
 surface's `outbound_credentials`, `tools` bindings included, or else its own
 `transit_credentials`. Those headers are withheld whether or not the gateway adds a value to
@@ -463,10 +554,20 @@ target can carry only text header values, so a Transit Point refuses a Fabric re
 cannot be carried with `503`, rather than forwarding it without the credential.
 
 An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
-header named like the Target's `target_auth` header is never forwarded, including
-`Authorization` kept by `forward_source_auth_header`, and the `target_auth` header and each
-delegated credential header the gateway adds replace every value of that header already on
-the request, so the target receives one value of each, the gateway's.
+header named like the Target's `target_auth` header, or like the `bearer_header`
+(`Authorization`) or `custom_header` of any credential binding in the surface's
+`outbound_credentials` other than an external-consent one, is never forwarded, including
+`Authorization` kept by `forward_source_auth_header`, whether or not the gateway adds a value
+to this request. The `target_auth` header and each delegated credential header the gateway
+adds replace every value of that header already on the request, so the target receives one
+value of each, the gateway's. When the credential
+cannot be resolved and `fallback` is `passthrough`, the Target receives no value of that
+name. This holds on the direct Target path, the agent card fetch, an Access Point's Fabric
+send to a `fabric://` Target and the Fabric receiving gateway's forward to its Target. An MCP
+Proxy (`proxy://`) never forwards caller headers to its upstream, so it has nothing to strip.
+
+Every one of these comparisons, on a Transit Point too, treats `_` and `-` as the same
+character, since some servers read `X_Api_Key` as `X-Api-Key`.
 
 ### The caller on a Transit Point
 
@@ -698,7 +799,12 @@ to the provider's default scopes. The provider can be any type but
 provider the surface's tenant cannot reference, and the never-implemented `credential_lookup`
 method, which still loads from storage. The provider is a reference of the surface, so it
 cannot be deleted, or moved to another tenant, while a surface uses it ([Deleting a
-provider](#deleting-a-provider)).
+provider](#deleting-a-provider)), nor changed to a type that needs consent while a surface uses
+it for Target authentication ([Records that are still in use](#records-that-are-still-in-use)).
+That type change holds the provider bindings lock from its last check of the surfaces until the
+provider is stored, and a surface save checks under the same lock that no provider of its
+Target authentication (the Target and every Transit Point, in the base surface and each variant)
+needs consent, so of a type change and a save that overlap, one is refused.
 
 The token is a service token (see above), cached in the vault under the agent half
 `surface:<surface_id>` and the user half `__target_auth__:<hash>` of the provider, its scopes
@@ -706,10 +812,15 @@ and its secret versions. Changing the provider or one of the secrets its type se
 token issued under the old settings is never reused; a Target and a Transit Point that use one
 provider with different scopes each keep their own token. The token shows in the Credential Tokens tab like any other. The credential is sent only on a
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
-unauthenticated discovery request, except on the gateway's own agent card fetch. A token that
+unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
+receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
+configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
+credential, the legacy
+`/.well-known/agent.json` fallback of a Fabric card read included. A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
-`passthrough` forwards without the credential, and the cause is logged only. A `401` from the
-target does not evict the cached token.
+`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
+target evicts the cached token only when it refuses that token as `invalid_token` ([see
+above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
 Authentication and reports whether the credential was sent or why it could not be obtained, never
 the token.
@@ -719,6 +830,127 @@ accepts only `static_secret` target authentication, so listing the tools of an M
 an OAuth-protected endpoint needs a static secret for now. A tenant caller may use only its own
 tenant's secret there: an appliance-wide one is refused with `400` in `warn` mode too, since the
 request goes to an endpoint the caller chose and nothing is stored to keep working.
+
+### Target authentication rules
+
+A surface save (create, `PUT` or `PATCH`) checks the
+`static_secret` and `credential_provider` Target authentication of the Target and of every
+Transit Point, in the base surface and in each variant, and refuses a breach with `400`. The
+header and format rules (the first five rows below) refuse in every mode. The https and caller
+rules (the last three rows) belong to the `target_https` and `target_source_auth`
+[credential policy](CONFIGURATION_RELOAD.md#credential-policy) rules: they refuse only while that
+rule is `enforce`; in `warn` (the default) the save succeeds, the gateway logs a warning naming
+the surface, the rule and the `details` below, and the response carries the same text in a
+`Warning: 299` header, as on every save while the breach remains. A save that keeps a breach
+the stored surface already had, while its rule is `enforce`, answers with a `Warning` header too,
+saying the credential is withheld. A stored surface whose breaches cannot be listed, such as
+one with a variant that cannot be resolved, keeps none: a save that repairs it is held to every
+rule. The `details` field names the setting:
+`target.auth`, `transit.points['<alias>'].target_auth`, `target` for an A2A proxy Target, or
+any of them prefixed with `variants['<alias>'].`. Header names are compared without regard to
+case or to `_` against `-`, as the request path compares them. The first refused breach is
+reported, in this order:
+
+| Rule | `details` |
+| --- | --- |
+| `header_name` is an HTTP field name (an RFC 9110 token) | `<field>.header_name must be an HTTP header name` |
+| `header_name` is not reserved, in any case or spelling `-` as `_`: a framing header (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`, `TE`, `Upgrade`, `Trailer`, `Trailers`) or one the gateway strips or sets itself upstream (`X-Transit-Token`, `X-Gateway-Fabric-Hops`, the caller-info headers `X-Caller-Did`, `X-Caller-Identity-Source`, `X-Caller-Dna-Uai`, `X-Gateway-Did`, `X-Did-Identity`, `X-Did-Signed-Identity`, and `X-Gateway-Trace-Id`, `X-Mirrored-Request`, `Mcp-Session-Id`) | `<field>.header_name must not be the reserved header <Name>` |
+| No other credential on the same leg sends that header, in any case or spelling `-` as `_`: a credential binding (`outbound_credentials`, sent on the Target and on every Transit Point that does not withhold delegated credentials, or the Transit Point's `transit_credentials`), a header the leg's `header_metadata_mapping` reads, or the token header of any JWT Bearer method with `forward_header` (a request forwards only the method it was verified by, and any of them can be that method, so each is checked) | `<field>.header_name <name> is already sent by a credential binding`, `... by header metadata mapping` or `... by source authentication` |
+| `header_format` has no CR, LF or NUL | `<field>.header_format must not contain CR, LF or NUL` |
+| `header_format` contains `{value}` exactly once | `<field>.header_format must contain {value} exactly once` |
+| `target_https`: the leg's Target, or the Transit Point's target endpoint, is an `https://` URL with a host; `http://`, `fabric://` and `a2a-proxy://` are not. A `proxy://` Target meets it when its MCP proxy's `base_url` is an `https://` URL with a host, since that is where the credential goes; one naming an MCP proxy that does not exist does not | `<field> sends a credential, so its Target must be an https URL` (`... so its target endpoint must be ...` for a Transit Point, `... so its MCP proxy's base_url must be ...` for a `proxy://` Target) |
+| `target_source_auth`: the Access Point checks its callers: at least one `caller_authentication` method, or `mcp_http.authorization` | `<field> sends a credential, so it needs source authentication on the Access Point` |
+| `target_source_auth`: the Transit Point checks its callers: it requires a transit token, or sets `source_auth` or `mcp_http.authorization`. One that sets `allow_unauthenticated_callers` does not | `<field> sends a credential, so it needs a Transit Point that authenticates its callers` |
+| `target_source_auth`: an A2A or AP2 surface whose Target is `a2a-proxy://`, whose A2A proxy sends its Direct Line credential on each request with or without `target.auth`, has an Access Point that checks its callers. `target_https` does not apply to it | `target is an A2A proxy that sends its backend credential, so it needs source authentication on the Access Point` |
+
+A caller credential the gateway consumes, read by any of the Access Point's methods, is removed
+before the Target credential is added, so only a forwarded JWT Bearer token collides with it.
+The header and format rules (the first five rows) apply to every save, a stored setting
+included: a stored Target authentication with an invalid or reserved `header_name`, a header
+another credential on the leg sends, or a `header_format` without exactly one `{value}` or with
+CR, LF or NUL is refused on its next save, even unchanged, and the request path never sends it
+([below](#target-credential-rules-on-the-request-path)). Only the https and caller rules are
+kept for a stored surface: a `target_https` or `target_source_auth` breach the stored surface
+already had on the same leg (the Target or Transit Point of the base surface or a variant,
+identified by `id`), with the same Target authentication and endpoint (for an A2A proxy Target,
+the same `a2a-proxy://` endpoint), does not block a save, so a stored surface that predates
+those rules still saves unchanged; editing that Target authentication or endpoint, or a change
+elsewhere that creates a new breach on the leg (removing source authentication, say), is
+checked as new: refused, or in `warn`, saved with a warning. Because the id names the leg, a save with two Transit
+Points sharing an `id`, in the surface or in one variant's overrides, is refused with `400`
+`transit.points[<i>]: duplicate id '<id>'. Each transit point id must be unique within the
+surface.` (prefixed with `variants['<alias>'].` for a variant), so a
+new Transit Point cannot take over a stored one's exemption. The predicates live in
+[`config/target_auth_rules.rs`](../src/config/target_auth_rules.rs), and the request path uses
+the same ones. The startup and reload credential policy report logs each stored surface that
+breaks a header or format rule, with rule `target_auth_header` and `enforced` true, beside its
+`target_https` and `target_source_auth` breaches.
+
+### Target credential rules on the request path
+
+Before a `static_secret` or `credential_provider` credential is read or a token is requested,
+the request checks the header and format rules of the save: a `header_name` that is not an HTTP
+field name or is reserved, or a `header_format` without exactly one `{value}` or with CR, LF or
+NUL, is never sent, on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric
+receive, the agent card fetch and a Transit Point. It is treated as a credential that cannot be
+obtained: `fallback` `reject` answers 502 "Target authentication failed", `passthrough` forwards
+the request without it, as for a secret that cannot be read, and either way a
+`target_auth_failed` record names the outcome. The agent card preview reports it as
+`invalid_header`. The rule against a header another credential on the leg sends is checked at
+save only, since the leg's other credential headers are not known to the credential lookup.
+
+A stored surface that predates the rules, or one saved while the rule was `warn`, can still send
+a credential to a Target that is not https, or for callers nobody checks. Two `[credential_policy]` keys (see
+[Credential policy](CONFIGURATION_RELOAD.md#credential-policy)) decide what each request does:
+
+| Rule | Broken when | `warn` (default) | `enforce` |
+| --- | --- | --- | --- |
+| `target_https` | The leg's endpoint is not an `https://` URL with a host (`http://`, `fabric://`, `a2a-proxy://`), or is a `proxy://` Target whose MCP proxy's `base_url` is not one or whose MCP proxy cannot be loaded | The credential is sent; a warning naming the surface id, the surface variant the request resolved to, and the Transit Point alias on a Transit Point leg, is logged once per leg (the base surface, or a variant, each with its own Target and Transit Points) and rule until the gateway restarts | The credential is withheld |
+| `target_source_auth` | The leg checks no caller: for the Target, the Access Point has no `caller_authentication` method and no `mcp_http.authorization`; for a Transit Point, it requires no transit token and sets neither `source_auth` nor `mcp_http.authorization` | As above | The credential is withheld |
+
+The warning is logged only when the credential is sent: a leg where another rule is `enforce` and
+withholds the credential logs none for a rule still in `warn`.
+
+The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
+withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
+`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
+any other discovery read, the `/.well-known/agent.json` fallback included, is a caller's request
+and never gets the credential, so a remote Target that serves its card only at that path and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld under `enforce` is treated
+as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
+request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
+path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
+Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
+`forbidden`. A `target.auth` or Transit Point `target_auth` credential that is withheld or
+cannot be obtained is recorded in the VP Audit Log as a `request_rejected` record with reason
+`target_auth_failed` (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)), and
+so is a request refused for leaving the Target base path, with outcome `rejected` whatever the
+`fallback`. An
+`a2a-proxy://` Target sends its A2A proxy's Direct Line credential rather than `target.auth`:
+that credential follows `target_source_auth` (withheld with a warning, the request goes on
+without it and no audit record is written), on the direct path and Fabric receive alike, and
+`target_https` does not apply to it because it goes to the proxy's own Direct Line endpoint. A
+caller whose authentication failed, including one that carries credentials for more than one
+`caller_authentication` method (`ambiguous_credentials`), and a public discovery read, never get
+the credential in either mode. Only an A2A or AP2 surface sends requests to its `a2a-proxy://`
+Target, on the direct path and Fabric receive alike; a request of any other surface is never
+dispatched to the A2A proxy.
+
+### Auditing Target authentication changes
+
+Every surface write through the management API (create, `PUT`, `PATCH`, a variant create,
+update, patch or delete, and a surface delete) records a `target_auth_changed` event in the VP
+Audit Log for each leg whose Target authentication it added, changed or removed: the Target or a
+Transit Point (by `transit_point_id` and alias), of the base surface (`surface_variant` `_base_`)
+or of a variant as it resolves (by `variant_id` and alias). A change to the base that a variant
+inherits is recorded for that variant too, since its requests now send the new credential. The
+record names the management caller as `actor`, the method before and after (`static_secret`,
+`credential_provider`, `credential_lookup` or `none`), the credential provider id before and
+after, and for a changed setting the parts it replaced (`changed`). It never carries a secret id,
+header name, header format or any value. A write that leaves every Target authentication as it
+was, or changes only the dashboard's `auth_type` hint, records nothing, and so do writes outside
+a management request (startup migrations, replication, a configuration reload). See
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the record.
+
 ### External consent on a Transit Point
 
 A Transit Point's `transit_credentials` with `consent_mode: external` binds an
@@ -959,6 +1191,16 @@ over Fabric can use the Target. Each such refusal is audited `request_rejected` 
 might, answers `connector_unavailable` before any payment is asked for or settled, and reads no
 grant.
 
+### Target base path
+
+The Target credential is sent only to URLs under the Target endpoint, and a Target's redirect is
+returned, never followed. A request whose path climbs out, such as `{route}/%2e%2e/admin` against
+`https://api.example.com/base`, is refused with 502 and nothing is forwarded, whatever the
+`fallback`, and recorded in the VP Audit Log as a `target_auth_failed` refusal with outcome
+`rejected`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
+tool calls; the rules and each path's answer are in
+[Target Credential Scope](PROTOCOLS.md#target-credential-scope).
+
 ## Tenant isolation on a surface's upstream legs
 
 A surface owned by a tenant sends only credentials of its own tenant. The check covers
@@ -1044,7 +1286,7 @@ appliance-wide Direct Line secret answers `409`, whether the proxy moves into a 
 secret becomes appliance-wide.
 
 A refused Target authentication follows the usual 502 "Target authentication failed" (or
-`fallback`), and the cause is logged only. A refused legacy binding records
+`fallback`), and a `target_auth_failed` record in the VP Audit Log names the cause. A refused legacy binding records
 `provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
 or grant is requested, and answers as in
 [When a credential cannot be resolved](#when-a-credential-cannot-be-resolved). On a modern MCP

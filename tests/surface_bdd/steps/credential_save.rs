@@ -6,7 +6,7 @@ use crate::bdd_support::admin_client::RecordedResponse;
 use crate::steps::when::{build_primary_target_surface_payload, ensure_admin_session};
 use crate::world::SurfaceWorld;
 
-async fn send(
+pub(crate) async fn send(
     world: &mut SurfaceWorld,
     method: Method,
     path: &str,
@@ -22,12 +22,14 @@ async fn send(
         .unwrap_or_else(|error| panic!("{path} through admin API: {error}"))
 }
 
+pub(crate) const SECRET_VALUE: &str = "bdd-secret-value";
+
 pub(crate) async fn create_secret(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
 ) {
-    create_secret_with_value(world, secret_id, tenant, "bdd-secret-value").await;
+    create_secret_with_value(world, secret_id, tenant, SECRET_VALUE).await;
 }
 
 async fn create_secret_with_value(
@@ -129,6 +131,13 @@ async fn create_surface_with_secret(
     payload["status"] = json!("disabled");
     payload["tenant_id"] = json!(tenant);
     payload["target"]["auth"] = static_secret(secret_id);
+    // A Target credential is saved only for an https Target of a surface that checks its
+    // callers; these scenarios send no traffic, so an unreachable https address will do.
+    payload["target"]["endpoint"] = json!("https://127.0.0.1:9/");
+    payload["access_point"]["caller_authentication"] = json!({"methods": [{
+        "type": "api_key", "secret_id": secret_id,
+        "extraction": {"source": "http_header", "field": "X-Caller-Key"}
+    }]});
     let response = send(world, Method::POST, "/v1/surfaces", Some(&payload)).await;
     assert_eq!(response.status, 201, "creating surface {route}: {}", response.body);
     world.surface_under_test_id = response.body["surface_id"]
@@ -145,7 +154,7 @@ async fn create_surface_with_secret(
 
 const SEEDED_SURFACE_ID: &str = "bdd-surface";
 
-fn surface_id(world: &SurfaceWorld) -> String {
+pub(crate) fn surface_id(world: &SurfaceWorld) -> String {
     world
         .surface_under_test_id
         .clone()
@@ -158,14 +167,14 @@ fn surface_id(world: &SurfaceWorld) -> String {
         .expect("the surface under test must exist")
 }
 
-async fn stored_surface(world: &mut SurfaceWorld) -> Value {
+pub(crate) async fn stored_surface(world: &mut SurfaceWorld) -> Value {
     let path = format!("/v1/surfaces/{}", surface_id(world));
     let response = send(world, Method::GET, &path, None).await;
     assert_eq!(response.status, 200, "reading the stored surface: {}", response.body);
     response.body
 }
 
-async fn save_surface(
+pub(crate) async fn save_surface(
     world: &mut SurfaceWorld,
     surface: &Value,
 ) {

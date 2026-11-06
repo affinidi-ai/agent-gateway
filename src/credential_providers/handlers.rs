@@ -58,6 +58,9 @@ pub struct CredentialProviderState {
     /// external consent provider may name, with the origins their endpoints may
     /// use beyond the issuer's own host.
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    pub references: super::references::ReferenceStores,
+    /// Decides which referrers a 409 may name; `None` names none.
+    pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
 }
 
 /// A provider as the API returns it, with `resource_origin`, the only origin
@@ -70,6 +73,29 @@ fn provider_body(provider: &CredentialProvider) -> serde_json::Value {
         fields.insert("resource_origin".to_string(), serde_json::Value::String(origin));
     }
     body
+}
+
+const PROVIDER_IN_USE_BY_TARGET_AUTH: &str = "The credential provider is used for Target authentication, which cannot use a provider that needs a user's consent";
+
+async fn viewable_kinds(
+    state: &CredentialProviderState,
+    caller: &Option<Extension<AuthGuardOk>>,
+    pat: &Option<Extension<PatContext>>,
+) -> super::references::ViewableKinds {
+    super::references::ViewableKinds::of_caller(
+        state.rbac.as_ref(),
+        caller
+            .as_ref()
+            .map(|Extension(caller)| caller),
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+}
+
+fn reference_scan_failed(error: anyhow::Error) -> Response {
+    warn!(target: "credential_delegation", %error, "Failed to find what references a credential provider");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"}))).into_response()
 }
 
 /// Why a provider's settings, secret references or consent strategy were rejected.
@@ -170,6 +196,33 @@ async fn validate_consent_strategy(
     Ok(())
 }
 
+async fn stored_secret(
+    state: &CredentialProviderState,
+    secret_id: &str,
+) -> Result<crate::secrets::Secret, ProviderValidationError> {
+    state
+        .secrets_store
+        .get_by_secret_id(secret_id)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to validate credential provider secret reference");
+            ProviderValidationError::SecretLookupFailed
+        })?
+        .ok_or(ProviderValidationError::SecretNotAccessible)
+}
+
+/// Refuse `provider` when a secret it names no longer exists. Run while the save holds the
+/// provider lock, it catches a secret deleted since [`validate_secret_references`] checked it.
+async fn refuse_gone_secrets(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+) -> Result<(), ProviderValidationError> {
+    for secret_id in provider.secret_refs() {
+        stored_secret(state, secret_id).await?;
+    }
+    Ok(())
+}
+
 /// Refuse a secret reference that `may_use`, given the secret's tenant and whether the
 /// reference is kept from the stored provider, does not admit, or the caller's scope does not
 /// cover.
@@ -181,15 +234,7 @@ async fn validate_secret_references(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(), ProviderValidationError> {
     for &(secret_id, kept) in references {
-        let secret = state
-            .secrets_store
-            .get_by_secret_id(secret_id)
-            .await
-            .map_err(|error| {
-                warn!(%error, "Failed to validate credential provider secret reference");
-                ProviderValidationError::SecretLookupFailed
-            })?
-            .ok_or(ProviderValidationError::SecretNotAccessible)?;
+        let secret = stored_secret(state, secret_id).await?;
         if !may_use(secret.tenant_id.as_deref(), kept)
             || !scope_allows_resource(
                 resource_scope(scope),
@@ -706,6 +751,10 @@ pub async fn create_provider(
             Some(metadata.authorization_response_iss_parameter_supported);
     }
 
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+    if let Err(error) = refuse_gone_secrets(&state, &provider).await {
+        return error.into_response();
+    }
     match state
         .store
         .create(provider.clone())
@@ -784,11 +833,14 @@ pub async fn get_provider(
 }
 
 /// PUT /api/v1/credential-providers/{id}
+#[allow(clippy::too_many_arguments)]
 pub async fn update_provider(
     State(state): State<CredentialProviderState>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    pat: Option<Extension<PatContext>>,
     Json(req): Json<UpdateCredentialProviderRequest>,
 ) -> impl IntoResponse {
     let existing = match state.store.get(&id).await {
@@ -913,6 +965,16 @@ pub async fn update_provider(
         updated_at: Utc::now(),
     };
 
+    let retypes_to_need_consent = previous
+        .provider_type
+        .sends_gateway_credential()
+        && !updated
+            .provider_type
+            .sends_gateway_credential();
+    if retypes_to_need_consent && let Err(refusal) = refuse_retype_while_target_auth_uses(&state, &previous).await {
+        return retype_refused(&state, refusal, &context, &scope, &caller, &pat).await;
+    }
+
     if let Err(error) = validate_provider_settings(
         &state,
         &updated,
@@ -926,6 +988,21 @@ pub async fn update_provider(
         return error.into_response();
     }
 
+    let _bindings = if retypes_to_need_consent {
+        let bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        if let Err(refusal) = refuse_retype_while_target_auth_uses(&state, &previous).await {
+            return retype_refused(&state, refusal, &context, &scope, &caller, &pat).await;
+        }
+        BindingsHold::Exclusive { _guard: bindings }
+    } else {
+        BindingsHold::Shared {
+            _guard: crate::identity::handlers::surface_grants::hold_provider_bindings().await,
+        }
+    };
+    if let Err(error) = refuse_gone_secrets(&state, &updated).await {
+        return error.into_response();
+    }
+
     match state
         .store
         .update(updated.clone())
@@ -936,6 +1013,61 @@ pub async fn update_provider(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to update: {}", e)})))
                 .into_response()
         }
+    }
+}
+
+/// The provider bindings lock as an update holds it until its store.
+enum BindingsHold {
+    Exclusive { _guard: tokio::sync::RwLockWriteGuard<'static, ()> },
+    Shared { _guard: tokio::sync::RwLockReadGuard<'static, ()> },
+}
+
+/// Why a provider was not retyped to one that needs a user's consent.
+#[derive(Debug, thiserror::Error)]
+enum RetypeRefusal {
+    #[error("{PROVIDER_IN_USE_BY_TARGET_AUTH}")]
+    InUseByTargetAuth(Vec<super::references::Referrer>),
+    #[error("reference scan failed: {0}")]
+    ScanFailed(anyhow::Error),
+}
+
+/// Refuse to retype `previous` to a provider that needs a user's consent while a surface's
+/// Target authentication uses it. The update holds the provider lock exclusively across this
+/// check and its store, so no surface write binds the provider in between.
+async fn refuse_retype_while_target_auth_uses(
+    state: &CredentialProviderState,
+    previous: &CredentialProvider,
+) -> Result<(), RetypeRefusal> {
+    let referrers = state
+        .references
+        .target_auth_referrers_of_provider(&previous.id)
+        .await
+        .map_err(RetypeRefusal::ScanFailed)?;
+    if referrers.is_empty() {
+        Ok(())
+    } else {
+        Err(RetypeRefusal::InUseByTargetAuth(referrers))
+    }
+}
+
+/// Answer `refusal` with a `409` naming the referrers the caller may see, or a `500`.
+async fn retype_refused(
+    state: &CredentialProviderState,
+    refusal: RetypeRefusal,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    caller: &Option<Extension<AuthGuardOk>>,
+    pat: &Option<Extension<PatContext>>,
+) -> Response {
+    match refusal {
+        RetypeRefusal::InUseByTargetAuth(referrers) => super::references::conflict_response(
+            PROVIDER_IN_USE_BY_TARGET_AUTH,
+            &referrers,
+            &viewable_kinds(state, caller, pat).await,
+            tenant_context(context),
+            resource_scope(scope),
+        ),
+        RetypeRefusal::ScanFailed(error) => reference_scan_failed(error),
     }
 }
 
@@ -1362,6 +1494,8 @@ mod jwt_provider_tests {
             egress_allowlist: None,
             resource_origins: Arc::default(),
             issuers: Arc::default(),
+            references: Default::default(),
+            rbac: None,
         }
     }
 
@@ -1404,6 +1538,8 @@ mod jwt_provider_tests {
         let response = update_provider(
             State(state.clone()),
             Path(id.into()),
+            None,
+            None,
             None,
             None,
             Json(serde_json::from_value(body).unwrap()),
@@ -1674,6 +1810,246 @@ mod jwt_provider_tests {
                 .jwt_subject
                 .as_deref(),
             Some("admin@example.com")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_a_surface_authenticates_with_is_not_retyped_to_need_consent() {
+        use crate::surfaces::AgentSurfaceStore;
+        let directory = tempfile::tempdir().unwrap();
+        let admin = crate::credential_providers::references::test_support::administrator().await;
+        let mut state = with_key_material(&directory).await;
+        state.rbac = Some(admin.rbac.clone());
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                directory
+                    .path()
+                    .join("surfaces"),
+            )
+            .await
+            .unwrap(),
+        );
+        state.references.surfaces = Some(surfaces.clone());
+        let mut ids = Vec::new();
+        for provider_id in ["machine", "bound"] {
+            let (status, created) = create(
+                &state,
+                json!({
+                    "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_client_credentials",
+                    "token_endpoint": "https://192.0.2.1/token",
+                    "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            ids.push(
+                created["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let surface = |surface_id: &str, extra: Value| -> crate::config::agent_surface::AgentSurface {
+            let mut body = json!({
+                "surface_id": surface_id, "name": format!("{surface_id} name"),
+                "access_point": {"listen_address": "0.0.0.0:8443", "route": format!("/{surface_id}"), "protocol": "a2a"},
+                "target": {"endpoint": "https://api.example.com"}
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            serde_json::from_value(body).unwrap()
+        };
+        surfaces
+            .save(&surface(
+                "uses-target-auth",
+                json!({"target": {"endpoint": "https://api.example.com",
+                    "auth": {"method": {"credential_provider": {"provider_id": ids[0]}}}}}),
+            ))
+            .await
+            .unwrap();
+        surfaces
+            .save(&surface("uses-binding", json!({"outbound_credentials": [{"credential_provider_id": ids[1]}]})))
+            .await
+            .unwrap();
+
+        let retype = |pat: Option<PatContext>| {
+            let state = state.clone();
+            let caller = admin.caller.clone();
+            let id = ids[0].clone();
+            async move {
+                body_of(
+                    update_provider(
+                        State(state),
+                        Path(id),
+                        None,
+                        None,
+                        Some(Extension(caller)),
+                        pat.map(Extension),
+                        Json(serde_json::from_value(json!({"provider_type": "oauth2_authorization_code"})).unwrap()),
+                    )
+                    .await
+                    .into_response(),
+                )
+                .await
+            }
+        };
+        let (status, response) = retype(None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["message"], PROVIDER_IN_USE_BY_TARGET_AUTH);
+        assert_eq!(
+            response["references"],
+            json!([{"kind": "surface", "id": "uses-target-auth", "name": "uses-target-auth name"}])
+        );
+        assert_eq!(response["hidden_references"], 0);
+        let (status, response) = retype(Some(PatContext(Some(vec!["credential_providers.edit".into()])))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!((response["references"].clone(), response["hidden_references"].clone()), (json!([]), json!(1)));
+        let (status, response) = update(&state, &ids[1], json!({"provider_type": "oauth2_authorization_code"})).await;
+        assert_eq!(status, StatusCode::OK, "a binding may use a provider that needs consent: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_provider_to_need_consent_waits_for_the_surface_writes_binding_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                directory
+                    .path()
+                    .join("surfaces"),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut state = state;
+        state.references.surfaces = Some(surfaces);
+        let (status, created) = create(
+            &state,
+            json!({
+                "name": "machine", "provider_id": "machine", "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://192.0.2.1/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+        let retype = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                update(
+                    &state,
+                    &id,
+                    json!({
+                        "provider_type": "oauth2_authorization_code",
+                        "authorization_endpoint": "https://192.0.2.1/authorize",
+                        "token_endpoint": "https://192.0.2.1/token"
+                    }),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while futures::FutureExt::now_or_never(crate::identity::handlers::surface_grants::hold_provider_bindings())
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retype queues for the exclusive bindings lock");
+        assert!(!retype.is_finished(), "the retype waits for the surface write that holds the lock");
+        drop(writing);
+        let (status, response) = retype.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["provider_type"], "oauth2_authorization_code");
+    }
+
+    async fn delete_secret_named(
+        state: &CredentialProviderState,
+        secret_id: &str,
+    ) {
+        let secret = state
+            .secrets_store
+            .get_by_secret_id(secret_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .secrets_store
+            .delete(&secret.id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_provider_naming_a_secret_deleted_while_it_waited_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let creating = tokio::spawn({
+            let state = state.clone();
+            async move { create(&state, api_key_provider("key", "CLIENT_SECRET")).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        delete_secret_named(&state, "CLIENT_SECRET").await;
+        drop(deleting);
+
+        let (status, response) = creating.await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        assert!(
+            state
+                .store
+                .find_by_provider_id(None, "key")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn updating_a_provider_to_a_secret_deleted_while_it_waited_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, api_key_provider("key", "CLIENT_ID")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let deleting = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let updating = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { update(&state, &id, json!({"api_key_secret_ref": "CLIENT_SECRET"})).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!updating.is_finished(), "the update waits for the secret delete that holds the lock");
+        delete_secret_named(&state, "CLIENT_SECRET").await;
+        drop(deleting);
+
+        let (status, response) = updating.await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .api_key_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID")
         );
     }
 
@@ -2304,6 +2680,8 @@ mod jwt_provider_tests {
             Path("stored".into()),
             tenant_a_context(),
             None,
+            None,
+            None,
             Json(serde_json::from_value(json!({"name": "Renamed"})).unwrap()),
         )
         .await
@@ -2317,6 +2695,8 @@ mod jwt_provider_tests {
                 State(state.clone()),
                 Path("stored".into()),
                 tenant_a_context(),
+                None,
+                None,
                 None,
                 Json(serde_json::from_value(json!({"api_key_secret_ref": secret_ref})).unwrap()),
             )
@@ -2512,6 +2892,8 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -2658,6 +3040,8 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
         };
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
@@ -2693,9 +3077,10 @@ mod consent_strategy_tests {
             .into_response();
         assert_eq!(read.status(), StatusCode::OK);
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::FORBIDDEN);
 
         let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
@@ -2718,9 +3103,10 @@ mod consent_strategy_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = state_with_provider(&directory, Some("tenant-b")).await;
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::NOT_FOUND);
 
         let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None)
@@ -2742,9 +3128,10 @@ mod consent_strategy_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = state_with_provider(&directory, Some("tenant-a")).await;
 
-        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
-            .await
-            .into_response();
+        let update =
+            update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, None, None, rename())
+                .await
+                .into_response();
         assert_eq!(update.status(), StatusCode::OK);
         assert_eq!(
             state
@@ -2824,6 +3211,8 @@ mod external_provider_tests {
                 crate::credential_providers::external::tests::ISSUER.to_string(),
                 Vec::new(),
             )]))),
+            references: Default::default(),
+            rbac: None,
         }
     }
 
@@ -3216,6 +3605,8 @@ mod external_provider_tests {
                     State(state),
                     Path(id),
                     tenant("tenant-a"),
+                    None,
+                    None,
                     None,
                     Json(serde_json::from_value(body).unwrap()),
                 )

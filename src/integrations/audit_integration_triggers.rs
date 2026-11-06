@@ -189,10 +189,11 @@ mod tests {
     use super::*;
     use crate::audit::events::{
         Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource, RateLimitScope,
-        RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
+        RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, audit_event,
+        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails,
+        TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -504,7 +505,9 @@ mod tests {
             | DelegationAuditAction::PolicyAttached(_)
             | DelegationAuditAction::PolicyDetached(_)
             | DelegationAuditAction::PolicyAttachmentChanged(_)
-            | DelegationAuditAction::PolicyChangeRefused(_) => {}
+            | DelegationAuditAction::PolicyChangeRefused(_)
+            | DelegationAuditAction::TargetAuthChanged(_)
+            | DelegationAuditAction::SecretForceDeleted(_) => {}
         }
     }
 
@@ -569,6 +572,7 @@ mod tests {
                 http_status: Some(404),
                 rpc_error_code: None,
                 requested_variant: None,
+                target_auth: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,
@@ -606,6 +610,25 @@ mod tests {
             DelegationAuditAction::PolicyDetached(policy_change()),
             DelegationAuditAction::PolicyAttachmentChanged(policy_change()),
             DelegationAuditAction::PolicyChangeRefused(policy_change()),
+            DelegationAuditAction::TargetAuthChanged(Box::new(TargetAuthChangeDetails {
+                actor: Actor::user("u-1"),
+                surface_variant: "_base_".to_string(),
+                variant_id: None,
+                leg: TargetAuthLeg::Target,
+                transit_point_id: None,
+                transit_point: None,
+                previous_method: TargetAuthMethodKind::None,
+                method: TargetAuthMethodKind::StaticSecret,
+                previous_provider_id: None,
+                provider_id: None,
+                changed: Vec::new(),
+            })),
+            DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
+                actor: Actor::user("u-1"),
+                secret_id: "billing_api_key".to_string(),
+                force: true,
+                referrers: Vec::new(),
+            })),
         ]
     }
 

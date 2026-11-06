@@ -146,8 +146,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
-  ready: it saves, and callers get 503 until a save adds a Caller Context or turns Public access
-  on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
+  ready: it saves (unless it sends a Target credential, or has an `a2a-proxy://` Target, while
+  `credential_policy.target_source_auth` is `enforce`, which refuses the save with 400), and callers get 503 until a save adds a Caller
+  Context or turns Public access on. A public one, and one stored without `public`, are always ready. `accessPointStatus`
   (`access-point/readiness.ts`) is the one copy of that rule, and the notice uses it. Every
   surface response carries a read-only `access_point_status`, which `toBackendSurface`
   (`src/api.ts`) leaves out of writes.

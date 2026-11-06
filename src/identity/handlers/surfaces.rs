@@ -923,6 +923,7 @@ fn validate_transit_points(
     }
     refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface, stored)?;
+    refuse_duplicate_transit_point_ids(surface)?;
     for variant in &mut surface.variants {
         if let Some(points) = variant
             .overrides
@@ -1018,6 +1019,43 @@ fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), Surface
     Ok(())
 }
 
+/// Refuse two Transit Points with one `id`, on the surface or in a variant's overrides (whose
+/// points replace the surface's). The id names a leg when a save keeps what the stored leg
+/// already had, so it must name one point only.
+fn refuse_duplicate_transit_point_ids(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let base = surface
+        .transit
+        .as_ref()
+        .map(|transit| (String::new(), transit.points.as_slice()));
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            let points = variant
+                .overrides
+                .transit
+                .as_ref()?
+                .points
+                .as_deref()?;
+            Some((format!("variants['{}'].", variant.alias), points))
+        });
+    for (prefix, points) in base
+        .into_iter()
+        .chain(variants)
+    {
+        let mut seen = std::collections::HashSet::with_capacity(points.len());
+        for (idx, point) in points.iter().enumerate() {
+            if !point.id.is_empty() && !seen.insert(point.id.as_str()) {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{idx}]: duplicate id '{}'. Each transit point id must be unique within the surface.",
+                    point.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a Transit Point, on the surface or in a variant's overrides, whose
 /// caller authentication cannot be enforced or whose `source_auth` is invalid.
 /// A Transit Point the save leaves exactly as `stored` has it is not refused
@@ -1103,14 +1141,16 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>)
 /// ([`target_fabric_caller_delegation_warnings`]), and each with external consent
 /// that a variant keeps under its own settings
 /// ([`inherited_external_point_warnings`]), as the Access Point Target's
-/// binding with external consent ([`inherited_target_binding_warnings`]), and
+/// binding with external consent ([`inherited_target_binding_warnings`]),
 /// each enabled view that reaches that binding's vendor without it or a
-/// credential of its own ([`unbound_vendor_view_warnings`]).
+/// credential of its own ([`unbound_vendor_view_warnings`]), and each Target
+/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`.
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1131,6 +1171,7 @@ async fn save_warnings(
         .chain(inherited_external_point_warnings(surface))
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
+        .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
@@ -5393,6 +5434,34 @@ mod validation_tests {
             }}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn two_transit_points_with_one_id_are_refused_in_the_surface_and_in_a_variant() {
+        let point = |id: &str, alias: &str| serde_json::json!({ "id": id, "alias": alias, "target_endpoint": format!("https://{alias}.example") });
+        let distinct = serde_json::json!([point("a-id", "partner"), point("b-id", "peer")]);
+        let shared = serde_json::json!([point("a-id", "partner"), point("a-id", "peer")]);
+        for (points, variant_points, expected) in [
+            (
+                shared.clone(),
+                distinct.clone(),
+                "transit.points[1]: duplicate id 'a-id'. Each transit point id must be unique within the surface.",
+            ),
+            (
+                distinct.clone(),
+                shared,
+                "variants['candidate'].transit.points[1]: duplicate id 'a-id'. Each transit point id must be unique \
+                 within the surface.",
+            ),
+        ] {
+            let mut surface = surface_with_transit_points(points, variant_points);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => assert_eq!(message, expected),
+                other => panic!("expected a 400, got {other:?}"),
+            }
+        }
+        let mut surface = surface_with_transit_points(distinct.clone(), distinct);
+        assert!(validate_transit_points(&mut surface, 30, None).is_ok(), "the variant may reuse the surface's ids");
     }
 
     fn caller_key() -> serde_json::Value {

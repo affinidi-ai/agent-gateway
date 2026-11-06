@@ -470,11 +470,14 @@ pub enum SurfaceProtocol {
 }
 
 /// Caller authentication configuration.
-/// Only the first method is enforced; see [`AgentSurface::source_auth`].
+/// Each request is verified by the one method whose credential it carries,
+/// or by the first method when it carries none. A request carrying
+/// credentials for more than one method fails as `ambiguous_credentials`;
+/// see [`AgentSurface::source_auth_for_request`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallerAuthentication {
-    /// Authentication methods. Only the first is enforced.
+    /// Authentication methods, the first being the primary method.
     pub methods: Vec<SourceAuthConfig>,
     /// RFC 9728 discovery for an MCP Access Point whose JWT Bearer method
     /// accepts tokens from an external authorization server.
@@ -3213,6 +3216,12 @@ impl AgentSurface {
             .starts_with(A2A_PROXY_ENDPOINT_PREFIX)
     }
 
+    /// True when requests are dispatched to an A2A proxy: an A2A or AP2 Access Point with an
+    /// `a2a-proxy://` Target.
+    pub fn dispatches_to_a2a_proxy(&self) -> bool {
+        self.uses_a2a_settings() && self.is_a2a_proxy_target()
+    }
+
     /// The A2A settings requests on this surface are served with: the stored
     /// `access_point.a2a`, or its defaults when absent. An `a2a-proxy://` target
     /// takes the stored versions but always checks the JSON-RPC envelope only.
@@ -3504,7 +3513,9 @@ impl AgentSurface {
             .collect()
     }
 
-    fn authenticates_callers(&self) -> bool {
+    /// Whether the Access Point checks its callers: at least one caller authentication method,
+    /// or a resource access token (`mcp_http.authorization`).
+    pub fn authenticates_callers(&self) -> bool {
         self.has_source_auth()
             || self
                 .mcp_http
