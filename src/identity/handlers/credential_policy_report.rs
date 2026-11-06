@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use super::surface_target_auth::BrokenTargetRule;
 use super::surface_tenancy::{
-    ProviderKeyIssue, collect_surface_reference_keys, provider_key_owners, provider_key_verdict,
+    ProviderKeyIssue, collect_surface_reference_keys, provider_key_ids, provider_key_verdict,
 };
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
@@ -16,7 +16,9 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 use crate::config::target_auth_rules::{HttpsMcpProxies, TargetCredentialRule};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
-use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
+use crate::identity::provider_key_gate::{
+    API_KEY_STORE_UNAVAILABLE, KeyOwnersListing, PROVIDER_KEY_TENANT_RULE, list_key_owners,
+};
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::ResourceKind;
@@ -206,8 +208,44 @@ pub(crate) fn find_breaches(
     findings
 }
 
+/// The key owners the report judges `surfaces` from: `listed`, the listing the provider key check
+/// of the same boot or reload read, else one listing of `api_keys` when a surface names a key id.
+/// `None` when the store could not be read, logged once, so every surface naming a key id is
+/// reported `store_unavailable`.
+pub(crate) async fn report_key_owners(
+    listed: Option<KeyOwnersListing>,
+    api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>,
+    surfaces: &[AgentSurface],
+) -> Option<HashMap<String, Vec<String>>> {
+    let listing = match listed {
+        Some(listing) => listing,
+        None if surfaces
+            .iter()
+            .any(|surface| provider_key_ids(surface).is_ok_and(|ids| !ids.is_empty())) =>
+        {
+            list_key_owners(api_keys).await
+        }
+        None => return None,
+    };
+    listing
+        .inspect_err(|cause| {
+            warn!(
+                rule = PROVIDER_KEY_TENANT_RULE,
+                reason = API_KEY_STORE_UNAVAILABLE,
+                cause,
+                "Credential policy report: the API key store cannot be read, so every surface naming an API key id is reported store_unavailable"
+            )
+        })
+        .ok()
+}
+
 /// Log one warning per credential provider or surface that breaks a credential policy rule.
-pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
+/// `listed` is the API key listing the provider key check of the same boot or reload read, `None`
+/// when it read none.
+pub(crate) async fn report_credential_policy(
+    state: &IdentityApiState,
+    listed: Option<KeyOwnersListing>,
+) {
     let egress = TokenEgress::from_environment();
     let policy = &egress.policy;
     let providers = match &state.credential_provider_store {
@@ -244,9 +282,7 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         .iter()
         .map(|secret| (secret.secret_id.as_str(), secret.tenant_id.as_deref()))
         .collect();
-    let key_owners = provider_key_owners(state)
-        .await
-        .ok();
+    let key_owners = report_key_owners(listed, state.api_key_store.as_deref(), &surfaces).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
 
     log_findings(

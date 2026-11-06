@@ -129,9 +129,10 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     }
 
     let new_config_result = load_base_gateway_config(state).await;
-    let (new_config_result, surfaces_count) = inject_surfaces_into_config(state, new_config_result).await;
+    let (new_config_result, surfaces_count, provider_key_listing) =
+        inject_surfaces_into_config(state, new_config_result).await;
 
-    super::report_credential_policy(state).await;
+    super::report_credential_policy(state, provider_key_listing).await;
 
     let (channels_count, is_fallback, warning) = state
         .channel_manager
@@ -332,13 +333,15 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
 }
 
 /// Append every active `AgentSurface` to the config as a runtime
-/// `ChannelMapping`. Returns the (possibly enriched) config result and the
-/// number of surfaces that were injected.
+/// `ChannelMapping`. Returns the (possibly enriched) config result, the
+/// number of surfaces that were injected, and the API key listing the
+/// provider key check of the active surfaces read, if it read one.
 async fn inject_surfaces_into_config(
     state: &IdentityApiState,
     config_result: anyhow::Result<Arc<GatewayConfig>>,
-) -> (anyhow::Result<Arc<GatewayConfig>>, usize) {
+) -> (anyhow::Result<Arc<GatewayConfig>>, usize, Option<crate::identity::provider_key_gate::KeyOwnersListing>) {
     let mut surfaces_count = 0;
+    let mut provider_key_listing = None;
     let result = match config_result {
         Ok(config) => {
             if let Some(ref surface_store) = state.agent_surface_store {
@@ -353,7 +356,7 @@ async fn inject_surfaces_into_config(
                             .iter()
                             .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
                             .collect();
-                        crate::identity::provider_key_gate::gate()
+                        provider_key_listing = crate::identity::provider_key_gate::gate()
                             .admit_all(active.iter().copied())
                             .await;
                         for surface in active {
@@ -379,7 +382,7 @@ async fn inject_surfaces_into_config(
         }
         Err(e) => Err(e),
     };
-    (result, surfaces_count)
+    (result, surfaces_count, provider_key_listing)
 }
 
 /// Response for single channel reload

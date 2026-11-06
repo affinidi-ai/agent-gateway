@@ -8,7 +8,9 @@ changes:
       description: >-
         Boot and a configuration reload now check every surface that derives a DID from an API
         key against one listing of the API key store, instead of listing the whole store once
-        per surface.
+        per surface, and their credential policy report judges from the same listing. When that
+        listing fails, the report logs it once and lists each surface naming a key id as
+        store_unavailable instead of missing_key.
     - timestamp: '2026-11-05T09:35:33Z'
       title: Stop re-reading an unreadable API key store on every request
       description: >-
@@ -37,8 +39,8 @@ changes:
         The provider key tenant check run when a surface goes live no longer reads the keys of
         a folder it could not load as missing. Surfaces naming an API key id answer 503 until
         the folder can be read, so a surface cannot keep serving another tenant's key DID
-        because that key failed to load. Surface saves, tenant reassignment, the credential
-        policy report and the API key listing still answer without the folder's keys, and
+        because that key failed to load. Surface saves, tenant reassignment and the API key
+        listing still answer without the folder's keys, and
         creating a surface with the id of that folder answers 503.
     - timestamp: '2026-11-05T10:40:17Z'
       title: Keep API key usage apart from the key record so it cannot undo a revoke

@@ -371,6 +371,10 @@ owning surface is gone, is reported under its own rule, one `WARN` line per key 
 `not_ready`, which
 is `true` when the surface is refused at runtime; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+The report judges from the API key listing the provider key check of the same boot or reload
+read. When that listing fails, including when a key folder cannot be loaded, the report logs one
+`WARN` line with `reason=api_key_store_unavailable` and lists every surface naming a key id as
+`store_unavailable`.
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
