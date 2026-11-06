@@ -281,8 +281,9 @@ out without it or is refused, as `target.auth.fallback` says (see
 [Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A
 reference to another tenant's is refused in both modes (see
 [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). A
-stored surface that derives a DID from another tenant's API Key Provider key, or from the key of
-a surface with no tenant, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
+stored surface that derives a DID from another tenant's API Key Provider key, from the key of a
+surface with no tenant, from another surface's key of its own tenant, or from a key whose owning
+surface is gone, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
 those surfaces, then restart with `"enforce"`. An

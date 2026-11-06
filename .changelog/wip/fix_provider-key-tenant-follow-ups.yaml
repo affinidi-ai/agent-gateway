@@ -23,10 +23,11 @@ changes:
       title: Stop surfaces serving the API key DID of a deleted surface under enforce
       description: >-
         Under tenant_credential_isolation enforce, a surface naming an API key whose owning
-        surface no longer exists is not ready, as the key's tenant cannot be told. A new surface
-        cannot be created with an id whose API key folder holds any key record, readable or
-        not and whatever owner it names, such as the kept keys of a deleted surface, so it
-        cannot take over those keys and the DIDs derived from them.
+        surface no longer exists is not ready, as the key's tenant cannot be told. In either
+        mode, creating a surface with an id whose API key folder holds any key record, readable
+        or not and whatever owner it names, such as the kept keys of a deleted surface, answers
+        400, and answers 503 when that folder cannot be read, so a new surface cannot take over
+        those keys and the DIDs derived from them.
     - timestamp: '2026-11-05T09:35:33Z'
       title: Revoke a surface's API keys when the surface is deleted
       description: >-
@@ -40,8 +41,7 @@ changes:
         a folder it could not load as missing. Surfaces naming an API key id answer 503 until
         the folder can be read, so a surface cannot keep serving another tenant's key DID
         because that key failed to load. Surface saves, tenant reassignment and the API key
-        listing still answer without the folder's keys, and
-        creating a surface with the id of that folder answers 503.
+        listing still answer without the folder's keys.
     - timestamp: '2026-11-05T10:40:17Z'
       title: Keep API key usage apart from the key record so it cannot undo a revoke
       description: >-
@@ -50,18 +50,20 @@ changes:
         on one node can no longer write a revoked key back as active on any node. A failed
         usage write is logged and the caller is still accepted. The API key list and detail
         show the usage file's time, or a record's own last use from before this change. A key
-        revoked on another node stops authenticating at this node's next cache refresh. A
-        rotation re-reads the key from disk and refuses one another node revoked, and key
-        records are replaced atomically so concurrent writes cannot leave a partial record.
+        revoked on another node stops authenticating here at this node's next cache refresh, or
+        with cache_refresh_interval_secs at its default of 0, at restart or promotion to
+        Active. A rotation re-reads the key from disk and refuses one another node revoked, and
+        key records are replaced atomically so concurrent writes cannot leave a partial record.
     - timestamp: '2026-11-05T11:30:00Z'
       title: Refuse deleting an API key that a surface still names
       description: >-
         Deleting an API key, also one whose owning surface is gone, now answers 409 while any
         stored surface names the key id in its base or a variant, as an API Key Provider key or
-        a Caller Context secret of that id. Deleting it would let a surface keep serving the key's
-        DID where a gone owner, or another tenant's key, takes it out of service under enforce. The
-        error names the
-        surfaces the caller may see and counts the rest. Revoking the key is still allowed.
+        a Caller Context secret of that id. Deleting it would turn the naming surface's
+        missing_owner verdict, which takes it out of service under enforce, into a missing_key
+        one, which does not, and would turn a secret naming another tenant's key into a plain
+        secret with the same DID. The error names the surfaces the caller may see and counts the
+        rest. Revoking the key is still allowed.
     - timestamp: '2026-11-05T12:30:00Z'
       title: Let a surface name only its own API keys in an Identity
       description: >-
@@ -79,5 +81,5 @@ changes:
         Under tenant_credential_isolation enforce, a stored surface whose Identity names another
         surface's API key, even one of its own tenant, is not ready after upgrade and answers 503,
         and saving it unchanged answers 400. Under warn it keeps serving and is logged as
-        other_surface. In either mode, a create or save that newly names another surface's key
-        answers 400: create the surface, add its API key, then save the surface naming that key.
+        other_surface. To fix such a surface, add an API key to it and save it naming that key;
+        to set up a new one, create the surface, add its API key, then save it naming that key.
