@@ -159,6 +159,11 @@ The Caller Context element lists its caller authentication methods in order, in 
 in the fullscreen editor, each row with a Configure button that opens that method's settings;
 see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+A JWT Bearer Caller Context method requires Accepted Audiences, keeps one stored without them
+until it is changed, and has an **Audience Claim** select (`aud`, `client_id`, `azp`) for identity
+providers that issue no `aud`; see _Caller Context methods_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md).
+
 The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
 authorization server discovery (`caller_authentication.protected_resource`), and Save removes
 a setting the operator switched off in the same PUT; see _Authorization server discovery_ in

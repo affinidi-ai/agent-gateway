@@ -267,7 +267,7 @@ impl SourceAuthMiddleware {
         // 3. Verify
         let claims = self
             .jwt_verifier
-            .validate(token, &jwt_strategy, &config.audiences)
+            .validate(token, &jwt_strategy, &config.audiences, config.audience_claim)
             .await
             .map_err(SourceAuthError::from)?;
         let subject = claims
@@ -783,6 +783,7 @@ mod tests {
     async fn a_published_protected_resource_is_the_only_audience_accepted() {
         let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
             audiences: vec![SURFACE_AGENT_DID_AUDIENCE.to_string(), "https://other.example/mcp".to_string()],
+            audience_claim: crate::jwt_bearer::models::AudienceClaim::ClientId,
             ..Default::default()
         });
         let protected =
@@ -796,6 +797,7 @@ mod tests {
             panic!("expected JWT bearer config");
         };
         assert_eq!(resolved.audiences, vec!["https://gateway.example/mcp/alpha"]);
+        assert_eq!(resolved.audience_claim, crate::jwt_bearer::models::AudienceClaim::Aud);
     }
 
     // ── In-memory Secrets Store ─────────────────────────────────────────────

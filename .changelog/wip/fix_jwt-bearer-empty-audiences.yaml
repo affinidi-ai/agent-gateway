@@ -1,0 +1,31 @@
+branch: fix/jwt-bearer-empty-audiences
+changes:
+  added:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Let a JWT Bearer method match its audiences against client_id or azp
+      description: >-
+        An Access Point jwt_bearer method takes an audience_claim of aud (the default),
+        client_id or azp, so identity providers whose access tokens carry no aud, such as
+        Amazon Cognito, can still be bound to an allow-list. Such a method binds a token only to
+        the client it was issued to, so no per-user grant is released to its callers. The
+        dashboard's Caller Context editor has an Audience Claim select for it.
+  changed:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Deprecate JWT Bearer methods stored without audiences
+      description: >-
+        A JWT Bearer method stored without audiences keeps working and skipping the audience
+        check, but the gateway now warns about it at startup and in a Warning header on each
+        save of its surface. A save that keeps it unchanged is accepted; one that changes it
+        must name an audience. Such methods will be refused in a future release.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Refuse new JWT Bearer methods that accept tokens for any audience
+      description: >-
+        An Access Point JWT Bearer method with an empty audiences list skipped the audience
+        check, so a token its identity provider issued for any other service authenticated the
+        caller it named. The admin API now refuses a new or changed method without an audience,
+        on the surface and in variants, unless the Access Point publishes protected resource
+        metadata, which binds the audience.
+  breaking: []

@@ -560,6 +560,16 @@ pub fn log_additional_source_auth_method_notices(surfaces: &[crate::config::agen
     }
 }
 
+/// Log each surface's [`AgentSurface::unchecked_audience_warnings`](crate::config::agent_surface::AgentSurface::unchecked_audience_warnings)
+/// at `WARN`, as the gateway does once when it starts.
+pub fn log_unchecked_audience_warnings(surfaces: &[crate::config::agent_surface::AgentSurface]) {
+    for surface in surfaces {
+        for warning in surface.unchecked_audience_warnings() {
+            warn!("Surface '{}' ({}): {warning}", surface.name, surface.surface_id);
+        }
+    }
+}
+
 /// Apply [`fall_back_to_first_source_auth_method`] to surfaces held in memory,
 /// as a DynamoDB load does, logging each trim.
 pub fn fall_back_to_first_source_auth_methods_in_memory(surfaces: &mut [crate::config::agent_surface::AgentSurface]) {
@@ -699,7 +709,67 @@ pub fn validate_source_auth_config(
         }
     }
     validate_method_selection(methods, &surface.name)?;
+    validate_jwt_bearer_audiences(surface, stored)?;
     validate_jwt_claim_identity(surface)
+}
+
+/// Each Access Point `jwt_bearer` method must name an audience, so a token
+/// its identity provider issued for another service is refused, unless the
+/// Access Point publishes a protected resource, whose `resource` is then the
+/// audience, matched against `aud`. A method `stored` with the same strategy
+/// and the same audiences, such as an empty list saved before this rule, is
+/// kept, so an unrelated edit still saves; the save warns about it instead.
+fn validate_jwt_bearer_audiences(
+    surface: &crate::config::agent_surface::AgentSurface,
+    stored: Option<&crate::config::agent_surface::AgentSurface>,
+) -> anyhow::Result<()> {
+    use crate::source_auth::SourceAuthConfig;
+
+    let protected_resource = surface
+        .protected_resource()
+        .is_some();
+    for method in surface.source_auth_methods() {
+        let SourceAuthConfig::JwtBearer(config) = method else {
+            continue;
+        };
+        if protected_resource {
+            if !config.audience_claim.is_aud() {
+                anyhow::bail!(
+                    "Channel '{}': jwt_bearer audience_claim must be aud beside caller_authentication.protected_resource, \
+                     whose resource is the audience",
+                    surface.name
+                );
+            }
+            continue;
+        }
+        if config
+            .audiences
+            .iter()
+            .any(|audience| !audience.trim().is_empty())
+        {
+            continue;
+        }
+        let kept = config.audience_claim.is_aud()
+            && stored.is_some_and(|stored| {
+                stored
+                    .protected_resource()
+                    .is_none()
+                    && stored
+                        .source_auth_methods()
+                        .iter()
+                        .any(|stored| stored == method)
+            });
+        if !kept {
+            anyhow::bail!(
+                "Channel '{}': jwt_bearer method (strategy '{}') must name the audiences it accepts, so a token its \
+                 identity provider issued for another service is refused; for an identity provider that issues no \
+                 aud, set audience_claim to client_id or azp and list the clients it accepts",
+                surface.name,
+                config.jwt_verification_strategy_id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validate one source authentication method being saved, set on the Access
@@ -1008,7 +1078,7 @@ mod tests {
     }
 
     fn jwt_method() -> serde_json::Value {
-        serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []})
+        serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": ["api://agent"]})
     }
 
     fn api_key_method(header: &str) -> serde_json::Value {
@@ -1050,6 +1120,109 @@ mod tests {
                 && notices[1].contains("authenticate callers: 2 (did_auth);"),
             "{}",
             notices[1]
+        );
+    }
+
+    fn jwt_with(
+        audiences: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut method = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": audiences});
+        if let (Some(method), Some(extra)) = (method.as_object_mut(), extra.as_object()) {
+            method.extend(extra.clone());
+        }
+        surface_with_caller_auth(serde_json::json!([method]), serde_json::json!({}))
+    }
+
+    fn with_protected_resource(
+        mut surface: crate::config::agent_surface::AgentSurface
+    ) -> crate::config::agent_surface::AgentSurface {
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .unwrap()
+            .protected_resource = Some(crate::protocols::protected_resource::ProtectedResourceConfig {
+            resource: "https://gateway.example/multi".to_string(),
+            authorization_servers: vec!["https://issuer.example".to_string()],
+            scopes: Vec::new(),
+        });
+        surface
+    }
+
+    #[test]
+    fn a_new_jwt_bearer_method_without_an_audience_is_refused() {
+        for audiences in [serde_json::json!([]), serde_json::json!(["", "  "])] {
+            let error = validate_source_auth_config(&jwt_with(audiences.clone(), serde_json::json!({})), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("jwt_bearer method (strategy 'strat-1') must name the audiences it accepts")
+                    && error.contains("audience_claim to client_id or azp"),
+                "{audiences}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jwt_bearer_method_with_an_audience_or_client_list_is_accepted() {
+        validate_source_auth_config(&jwt_with(serde_json::json!(["api://agent"]), serde_json::json!({})), None)
+            .unwrap();
+        validate_source_auth_config(
+            &jwt_with(serde_json::json!(["app-1"]), serde_json::json!({"audience_claim": "client_id"})),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_save_that_keeps_a_stored_method_without_an_audience_is_accepted() {
+        let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        validate_source_auth_config(&stored, Some(&stored)).expect("an unrelated edit keeps the stored method");
+    }
+
+    #[test]
+    fn a_stored_method_without_an_audience_is_kept_only_unchanged() {
+        let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        let other_strategy = surface_with_caller_auth(
+            serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-2", "audiences": []}]),
+            serde_json::json!({}),
+        );
+        let client_bound = jwt_with(serde_json::json!([]), serde_json::json!({"audience_claim": "client_id"}));
+        let header_changed = jwt_with(serde_json::json!([]), serde_json::json!({"token_header": "X-Token"}));
+        for (case, saved) in [
+            ("another strategy", other_strategy),
+            ("client_id with no clients", client_bound),
+            ("another token header", header_changed),
+        ] {
+            assert!(validate_source_auth_config(&saved, Some(&stored)).is_err(), "{case} should be refused");
+        }
+        let was_discovery = with_protected_resource(stored.clone());
+        assert!(
+            validate_source_auth_config(&stored, Some(&was_discovery)).is_err(),
+            "dropping protected_resource leaves no audience, so it is not kept"
+        );
+    }
+
+    #[test]
+    fn a_protected_resource_is_the_audience_and_is_matched_against_aud() {
+        validate_source_auth_config(
+            &with_protected_resource(jwt_with(serde_json::json!([]), serde_json::json!({}))),
+            None,
+        )
+        .expect("the resource is the audience");
+        let error = validate_source_auth_config(
+            &with_protected_resource(jwt_with(
+                serde_json::json!(["app-1"]),
+                serde_json::json!({"audience_claim": "azp"}),
+            )),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("audience_claim must be aud beside caller_authentication.protected_resource"),
+            "{error}"
         );
     }
 

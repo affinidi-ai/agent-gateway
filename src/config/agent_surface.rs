@@ -1635,6 +1635,10 @@ impl TransitPoint {
                      issued for another service, such as the Access Point, is refused"
                 ))
             }
+            SourceAuthConfig::JwtBearer(config) if !config.audience_claim.is_aud() => Some(format!(
+                "Transit Point '{alias}' source_auth jwt_bearer audience_claim must be aud, so a token issued for \
+                 another service, such as the Access Point, is refused"
+            )),
             _ => None,
         }
     }
@@ -8180,6 +8184,21 @@ mod transit_point_caller_authentication_tests {
             "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["api://crm-transit"]
         }}));
         assert_eq!(named.unenforceable_caller_authentication(), None);
+        for claim in ["client_id", "azp"] {
+            let client_bound = point(json!({ "require_transit_token": false, "source_auth": {
+                "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["app-1"],
+                "audience_claim": claim
+            }}));
+            assert_eq!(
+                client_bound.unenforceable_caller_authentication(),
+                Some(
+                    "Transit Point 'partner' source_auth jwt_bearer audience_claim must be aud, so a token issued for \
+                     another service, such as the Access Point, is refused"
+                        .to_string()
+                ),
+                "{claim}"
+            );
+        }
     }
 
     #[test]

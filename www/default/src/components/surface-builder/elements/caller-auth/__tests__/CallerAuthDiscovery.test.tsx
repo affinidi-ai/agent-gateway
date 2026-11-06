@@ -132,6 +132,7 @@ describe('Caller Context editor: authorization server discovery', () => {
     expect(screen.getByLabelText(/Token Header/)).toBeDisabled();
     expect(screen.getByLabelText(/Scheme/)).toBeDisabled();
     expect(screen.getByPlaceholderText('e.g. https://api.example.com')).toBeDisabled();
+    expect(screen.getByTestId('caller-auth-jwt-audience-claim')).toBeDisabled();
     expect(screen.getByTestId('caller-auth-audiences-discovery-note')).toHaveTextContent(
       'the gateway accepts only tokens whose audience is the resource URL'
     );
@@ -140,7 +141,11 @@ describe('Caller Context editor: authorization server discovery', () => {
 
   it('turns discovery on with the listener URL and clears the settings it cannot keep', async () => {
     const latest = await openEditor({
-      initial: jwtConfig({ audiences: ['api'], jwt_forward_header: true }),
+      initial: jwtConfig({
+        audiences: ['api'],
+        jwt_audience_claim: 'client_id',
+        jwt_forward_header: true,
+      }),
     });
     expect(screen.getByTestId('caller-auth-discovery-switch')).not.toBeChecked();
 
@@ -151,6 +156,7 @@ describe('Caller Context editor: authorization server discovery', () => {
     });
     expect(firstMethod(latest)).toMatchObject({
       audiences: [],
+      jwt_audience_claim: 'aud',
       jwt_forward_header: false,
       jwt_token_header: 'Authorization',
       jwt_token_scheme: 'Bearer',
@@ -342,5 +348,34 @@ describe('Caller Context sidebar: authorization server discovery', () => {
       'Authorization server discovery: off'
     );
     expect(screen.getByTestId('caller-auth-panel-method-0')).toHaveTextContent('JWT');
+  });
+});
+
+describe('Caller Context editor: audience claim', () => {
+  it('warns while no audience is listed and says a new method needs one', async () => {
+    await openEditor({ initial: jwtConfig(), protocol: 'a2a' });
+
+    expect(screen.getByTestId('caller-auth-audiences-missing-warning')).toHaveTextContent(
+      'A new method cannot be saved without one'
+    );
+    expect(screen.getByTestId('caller-auth-jwt-audience-claim')).toHaveValue('aud');
+    expect(screen.queryByTestId('caller-auth-jwt-audience-claim-warning')).toBeNull();
+  });
+
+  it('switches to client_id with a warning that grants are withheld', async () => {
+    const latest = await openEditor({
+      initial: jwtConfig({ audiences: ['app-1'] }),
+      protocol: 'a2a',
+    });
+
+    fireEvent.change(screen.getByTestId('caller-auth-jwt-audience-claim'), {
+      target: { value: 'client_id' },
+    });
+
+    expect(firstMethod(latest)).toMatchObject({ jwt_audience_claim: 'client_id' });
+    expect(screen.getByTestId('caller-auth-jwt-audience-claim-warning')).toHaveTextContent(
+      'per-user grants are not released'
+    );
+    expect(screen.queryByTestId('caller-auth-audiences-missing-warning')).toBeNull();
   });
 });

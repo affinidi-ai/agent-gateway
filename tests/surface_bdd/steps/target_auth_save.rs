@@ -66,6 +66,23 @@ async fn surface_draft_with_target_auth(
     world.surface_draft = Some(payload);
 }
 
+/// The draft's Access Point checks JWT Bearer tokens without naming an audience, and its Target
+/// takes no credential.
+#[given(expr = "a surface draft for route {string} whose Access Point checks JWT Bearer tokens naming no audience")]
+async fn surface_draft_checking_jwt_without_audience(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["name"] = json!(route.trim_start_matches('/'));
+    payload["status"] = json!("disabled");
+    let strategy_id = create_caller_jwt_strategy(world).await;
+    payload["access_point"]["caller_authentication"] = json!({"methods": [{
+        "type": "jwt_bearer", "jwt_verification_strategy_id": strategy_id, "audiences": []
+    }]});
+    world.surface_draft = Some(payload);
+}
+
 #[given("the draft's Target is an https URL")]
 fn draft_target_is_https(world: &mut SurfaceWorld) {
     draft(world)["target"]["endpoint"] = json!(UNREACHABLE_HTTPS_TARGET);
@@ -147,11 +164,8 @@ async fn draft_injects_delegated_credential(
     }]);
 }
 
-#[given(expr = "the draft's Access Point forwards the caller's JWT Bearer token in header {string}")]
-async fn draft_forwards_caller_jwt(
-    world: &mut SurfaceWorld,
-    header: String,
-) {
+/// Creates the JWT verification strategy a draft's caller check names, through the admin API.
+async fn create_caller_jwt_strategy(world: &mut SurfaceWorld) -> Value {
     let strategy = json!({
         "name": "BDD caller IdP",
         "expected_issuer": "https://issuer.bdd.example",
@@ -159,9 +173,17 @@ async fn draft_forwards_caller_jwt(
     });
     let created = send(world, Method::POST, "/v1/jwt-verification-strategies", Some(&strategy)).await;
     assert_eq!(created.status, 201, "creating the JWT verification strategy: {}", created.body);
-    let strategy_id = created.body["id"].clone();
+    created.body["id"].clone()
+}
+
+#[given(expr = "the draft's Access Point forwards the caller's JWT Bearer token in header {string}")]
+async fn draft_forwards_caller_jwt(
+    world: &mut SurfaceWorld,
+    header: String,
+) {
+    let strategy_id = create_caller_jwt_strategy(world).await;
     draft(world)["access_point"]["caller_authentication"] = json!({"methods": [{
-        "type": "jwt_bearer", "jwt_verification_strategy_id": strategy_id, "audiences": [],
+        "type": "jwt_bearer", "jwt_verification_strategy_id": strategy_id, "audiences": ["api://agent"],
         "token_header": header, "forward_header": true
     }]});
 }
@@ -318,6 +340,24 @@ async fn operator_has_created_surface_from_draft(world: &mut SurfaceWorld) {
         "the created surface has an id: {}",
         response.body
     );
+}
+
+#[when(expr = "the operator saves the surface reading the caller's JWT Bearer token from header {string}")]
+async fn operator_saves_surface_reading_jwt_from_header(
+    world: &mut SurfaceWorld,
+    header: String,
+) {
+    let mut surface = stored_surface(world).await;
+    let method = surface["access_point"]["caller_authentication"]["methods"]
+        .as_array_mut()
+        .and_then(|methods| {
+            methods
+                .iter_mut()
+                .find(|method| method["type"] == "jwt_bearer")
+        })
+        .expect("the stored surface checks callers with JWT Bearer");
+    method["token_header"] = json!(header);
+    save_surface(world, &surface).await;
 }
 
 #[when("the operator saves the surface without its Access Point's caller check")]

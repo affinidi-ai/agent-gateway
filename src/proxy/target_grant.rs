@@ -221,9 +221,11 @@ pub(crate) enum UncheckedCallers {
     /// DID Auth without `allowed_dids` accepts any DID that signs its
     /// challenge, so whoever mints one is a caller.
     SelfNamed,
-    /// A JWT bearer method without `audiences`, on an Access Point that
-    /// publishes no protected resource, accepts a token its issuer minted for
-    /// any other service, so whoever holds one is a caller.
+    /// A JWT bearer method without `audiences`, or one that checks only the
+    /// client a token was issued to (`audience_claim` `azp` or `client_id`),
+    /// on an Access Point that publishes no protected resource, accepts a
+    /// token its issuer minted for any other service, so whoever holds one is
+    /// a caller.
     AnyAudience,
     /// The gateway's own resource access tokens (`mcp_http.authorization`)
     /// name a caller by the subject its sign-in stated, under the gateway's
@@ -251,8 +253,9 @@ impl UncheckedCallers {
             }
             Self::AnyAudience => {
                 "consent_mode external needs callers authenticated by something the gateway can check: the Access \
-                 Point's jwt_bearer has no audiences, so it accepts a token its issuer minted for any other service; \
-                 list the audiences it accepts, or publish caller_authentication.protected_resource"
+                 Point's jwt_bearer has no audiences or checks only the client a token was issued to, so it accepts a \
+                 token its issuer minted for any other service; list the aud values it accepts, or publish \
+                 caller_authentication.protected_resource"
             }
             Self::NamedWithoutTheirIssuer => {
                 "consent_mode external with subject caller needs callers named with the issuer that named them: the \
@@ -1392,6 +1395,16 @@ mod tests {
                     "{subject:?}, {case}"
                 );
             }
+            let client_bound = authenticating(
+                serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy-1",
+                    "audiences": ["app-1"], "audience_claim": "client_id"}]),
+                None,
+            );
+            assert_eq!(
+                unchecked_callers(&client_bound, subject),
+                Some(UncheckedCallers::AnyAudience),
+                "{subject:?}, a client_id-bound method"
+            );
             let bound = authenticating(serde_json::json!([jwt(serde_json::json!(["https://gateway.example"]))]), None);
             assert_eq!(unchecked_callers(&bound, subject), None, "{subject:?}, an audience");
             let published =
