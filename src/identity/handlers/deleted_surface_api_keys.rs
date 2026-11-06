@@ -46,6 +46,7 @@ pub(crate) async fn revoke_api_keys_of(
         {
             Ok(()) => {
                 crate::identity::provider_key_gate::gate().key_changed(&key.key_id);
+                crate::observability::dashboard::record_api_key_withdrawn(&key.key_id);
                 revoked += 1;
             }
             Err(crate::api_keys::ApiKeyError::AlreadyRevoked { .. }) => {
@@ -348,7 +349,7 @@ mod tests {
             .with_writer(logs.clone())
             .with_ansi(false)
             .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        let _logging = crate::component_tests::helpers::thread_subscriber::set_thread_default(subscriber);
 
         let first = revoke_api_keys_of_unknown_owners(|| Active, &keys, NOW, known(&["live-surface"])).await;
         let second = revoke_api_keys_of_unknown_owners(|| Active, &keys, NOW, known(&["live-surface"])).await;

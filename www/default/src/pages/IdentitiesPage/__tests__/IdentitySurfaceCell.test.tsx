@@ -7,7 +7,7 @@ describe('SurfaceLinkButton', () => {
     const onOpen = jest.fn();
     render(
       <SurfaceLinkButton
-        surface={{ id: 'oxygen', name: 'OXYGEN', archived: false }}
+        surface={{ id: 'oxygen', name: 'OXYGEN', deleted: false }}
         onOpen={onOpen}
         data-testid="identities-surface-link"
       />
@@ -21,30 +21,30 @@ describe('SurfaceLinkButton', () => {
     expect(screen.queryByTestId('identities-surface-deleted-badge')).not.toBeInTheDocument();
   });
 
-  it('shows the surface of an archived identity by name as plain text marked Deleted', () => {
+  it('shows a deleted surface by name as plain text marked Deleted', () => {
     render(
       <SurfaceLinkButton
-        surface={{ id: 'oxygen', name: 'OXYGEN', archived: true }}
+        surface={{ id: 'oxygen', name: 'OXYGEN', deleted: true }}
         onOpen={jest.fn()}
         data-testid="identities-surface-link"
       />
     );
 
-    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent('OXYGEN');
+    expect(screen.getByTestId('identities-surface-deleted')).toHaveTextContent('OXYGEN');
     expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveTextContent('Deleted');
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(screen.queryByTestId('identities-surface-link')).not.toBeInTheDocument();
   });
 
-  it('shows the surface of an archived identity without a known name by its id', () => {
+  it('shows a deleted surface without a known name by its id', () => {
     render(
       <SurfaceLinkButton
-        surface={{ id: 'surface-1', name: 'surface-1', archived: true }}
+        surface={{ id: 'surface-1', name: 'surface-1', deleted: true }}
         onOpen={jest.fn()}
       />
     );
 
-    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent('surface-1');
+    expect(screen.getByTestId('identities-surface-deleted')).toHaveTextContent('surface-1');
     expect(screen.getByTestId('identities-surface-deleted-badge')).toHaveTextContent('Deleted');
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
@@ -55,15 +55,15 @@ describe('IdentitySurfaceCell', () => {
     render(
       <IdentitySurfaceCell
         links={[
-          { id: 'oxygen', name: 'OXYGEN', archived: false },
-          { id: 'gone', name: 'GONE', archived: true },
+          { id: 'oxygen', name: 'OXYGEN', deleted: false },
+          { id: 'gone', name: 'GONE', deleted: true },
         ]}
         onOpenSurface={jest.fn()}
       />
     );
 
     expect(screen.getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
-    expect(screen.getByTestId('identities-surface-archived')).toHaveTextContent('GONE');
+    expect(screen.getByTestId('identities-surface-deleted')).toHaveTextContent('GONE');
     expect(screen.getAllByRole('button')).toHaveLength(1);
   });
 });

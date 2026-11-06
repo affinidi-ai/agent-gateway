@@ -24,17 +24,18 @@ changes:
         "This API key is no longer in use because the associated surface has been deleted."
         for a key whose surface was deleted.
     - timestamp: '2026-11-06T10:00:00Z'
-      title: Mark an identity Archived when every surface it is linked to is deleted
+      title: Mark an identity Revoked when its API key or every surface it used is gone
       description: >-
         The dashboard identity list, on the stats response and the websocket update alike, now
-        carries archived, true when an identity is linked to at least one surface and none of
-        them exists, and false when the surfaces cannot be listed. The Identities page shows an
-        Archived badge on the identity and its surface id as plain text with a Deleted badge
-        instead of a link to a surface that is gone, and selecting the identity, there or in the Dashboard's identity
-        details, says "This identity is no longer in use because the associated surface has been
-        deleted." A surface delete re-sends the identities it archived in the next update. An
-        identity whose own surface was deleted while another surface it used is live shows that
-        live surface, the most recently used one, so a deleted surface is never linked.
+        carries revoked, true when the API key an identity's DID comes from is revoked or
+        deleted, or when every surface the identity is linked to was deleted, and
+        surface_deleted for the latter. A key store or surface store that cannot be read marks
+        nothing for that reason. The Identities page shows a red Revoked badge on the identity
+        and a deleted surface's id as plain text with a Deleted badge instead of a link, and
+        selecting a revoked identity, there or in the Dashboard's identity details, says it is no
+        longer in use. Revoking or deleting a key, or deleting a surface, re-sends the affected
+        identities in the next update. An identity whose own surface was deleted while another
+        surface it used is live shows that live surface, the most recently used one.
   changed:
     - timestamp: '2026-11-05T18:00:00Z'
       title: Let an unrestricted admin read an API key whose surface was deleted

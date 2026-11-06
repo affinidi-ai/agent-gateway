@@ -1208,16 +1208,19 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   caller.
 - When the backend sends none of the naming fields, the Name column still shows, with
   `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
-- An **archived** identity (`archived` on the identity: every surface it is linked to was
-  deleted) gets a secondary "Archived" badge beside its name cell
-  (`components/IdentityArchived.tsx`). `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`)
-  shows its surface, in the **Agent Surface** list and the expanded Summary, as muted plain
-  text, the surface name when
-  the identity carries one and otherwise the surface id, with a secondary "Deleted" badge, and
-  never links. A live surface keeps its link and shows neither badge. Expanding the row, or
-  opening it in the Dashboard's `IdentityDetailsModal`, shows the `alert-info` "This identity
-  is no longer in use because the associated surface has been deleted." The page has no
-  Archived filter.
+- A **revoked** identity (`revoked` on the identity: the API key its DID comes from is revoked
+  or deleted, or every surface it is linked to was deleted) gets a "Revoked" badge beside its
+  name cell (`components/IdentityRevoked.tsx`): a plain Bootstrap `badge text-bg-danger`, solid
+  red with white text like the Revoked status on the API key table, not the shared `Badge`.
+  Expanding the row, or opening it in the
+  Dashboard's `IdentityDetailsModal`, shows the `alert-danger` "This identity is no longer in
+  use: its API key was revoked or deleted, or its surface was deleted." The page has no
+  Revoked filter.
+- A surface of an identity marked `surface_deleted` (every surface it is linked to was
+  deleted) is shown by `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`), in the **Agent
+  Surface** list and the expanded Summary, as muted plain text, the surface name when the
+  identity carries one and otherwise the surface id, with a secondary "Deleted" badge, and never
+  links. A live surface keeps its link and shows no badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
   A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
@@ -1256,8 +1259,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Origin badge                   | `identities-origin-<origin>`                                             |
 | Surface list, surface link     | `identities-surface-list`, `identities-surface-link`                     |
 | Credential principal           | `identities-credential-principal`                                        |
-| Archived badge, message        | `identities-archived-badge`, `identity-archived-info`                    |
-| Deleted surface, its badge     | `identities-surface-archived`, `identities-surface-deleted-badge`        |
+| Revoked badge, message         | `identities-revoked-badge`, `identity-revoked-info`                      |
+| Deleted surface, its badge     | `identities-surface-deleted`, `identities-surface-deleted-badge`         |
 | Recorder filter                | `identities-recorder-filter`                                             |
 | Recorder chip                  | `identities-recorder-chip-<state>`                                       |
 | Recorder tooltip               | `identities-recorder-tooltip`                                            |

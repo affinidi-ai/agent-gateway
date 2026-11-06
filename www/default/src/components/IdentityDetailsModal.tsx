@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { formatDateTime } from '../utils/stringUtils';
 import { apiClient } from '../api';
-import { ArchivedIdentityInfo } from './IdentityArchived';
+import { RevokedIdentityInfo } from './IdentityRevoked';
 
 interface IdentityDetailsModalProps {
   identity: any;
@@ -63,7 +63,7 @@ const IdentityDetailsModal: React.FC<IdentityDetailsModalProps> = ({ identity, o
               <button type="button" className="btn-close" onClick={onClose} aria-label="Close" />
             </div>
             <div className="modal-body p-0">
-              {identity.archived && <ArchivedIdentityInfo className="m-3" />}
+              {identity.revoked && <RevokedIdentityInfo className="m-3" />}
               <div className="accordion" id="identityAccordion">
                 {/* Basic Information */}
                 <div className="card">

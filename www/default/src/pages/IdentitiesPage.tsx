@@ -14,7 +14,7 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { Badge } from '../components/shared/Badge';
 import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
-import { ArchivedIdentityBadge, ArchivedIdentityInfo } from '../components/IdentityArchived';
+import { RevokedIdentityBadge, RevokedIdentityInfo } from '../components/IdentityRevoked';
 import { IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
@@ -539,8 +539,8 @@ const IdentitiesPage: React.FC = () => {
                                               : undefined
                                           }
                                         />
-                                        {identity.archived && (
-                                          <ArchivedIdentityBadge className="ms-2" />
+                                        {identity.revoked && (
+                                          <RevokedIdentityBadge className="ms-2" />
                                         )}
                                       </div>
                                     </td>
@@ -758,8 +758,8 @@ const IdentitiesPage: React.FC = () => {
                                     <tr className="expanded-detail-row">
                                       <td colSpan={hasRecorderStatus ? 11 : 10} className="p-0">
                                         <div className="p-3">
-                                          {identity.archived && (
-                                            <ArchivedIdentityInfo className="mb-2" />
+                                          {identity.revoked && (
+                                            <RevokedIdentityInfo className="mb-2" />
                                           )}
                                           <div
                                             className="accordion"

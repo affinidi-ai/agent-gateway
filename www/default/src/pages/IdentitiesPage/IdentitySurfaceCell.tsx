@@ -18,11 +18,11 @@ export const SurfaceLinkButton: React.FC<SurfaceLinkButtonProps> = ({
   style,
   'data-testid': testId,
 }) => {
-  if (surface.archived) {
+  if (surface.deleted) {
     return (
       <span
         className="d-inline-flex align-items-center flex-nowrap"
-        data-testid="identities-surface-archived"
+        data-testid="identities-surface-deleted"
       >
         <span className="text-muted" title={surface.id} style={style}>
           {surface.name}
