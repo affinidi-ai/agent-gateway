@@ -22,7 +22,7 @@ use crate::config::agent_surface::{AgentSurface, GrantSubject, SurfaceProtocol};
 use crate::config::types::{CredentialInjection, OutboundCredentialBinding};
 use crate::credential_providers::CredentialProvider;
 use crate::delegation_vault::grants::{ACCESS_POINT_TARGET_HOP, DelegatedGrant, GrantKey};
-use crate::delegation_vault::release::{GrantRefusal, ReleaseContext};
+use crate::delegation_vault::release::{GrantRefusal, Refused, ReleaseContext};
 use crate::state::ProxyState;
 
 /// The request to the Access Point Target a grant may be sent with.
@@ -36,7 +36,6 @@ pub(crate) struct TargetRequest<'a> {
     pub headers: &'a axum::http::HeaderMap,
     /// A `2026-07-28` MCP request.
     pub modern: bool,
-    pub body: &'a [u8],
     /// What a refusal's `request_rejected` record names.
     pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
 }
@@ -50,7 +49,6 @@ pub(crate) struct TargetGrantRoute {
     provider: CredentialProvider,
     target_url: String,
     client: reqwest::Client,
-    mcp: bool,
 }
 
 /// The methods a request carrying the grant may have: MCP's Streamable HTTP
@@ -326,8 +324,7 @@ pub(crate) fn refuse_without_the_grant(
     surface: &AgentSurface,
     body: &[u8],
 ) -> Response {
-    let mcp = surface.access_point.protocol == SurfaceProtocol::Mcp;
-    unavailable(surface, mcp, body, "request_without_the_grant")
+    unavailable(surface, "request_without_the_grant").response(surface, body)
 }
 
 /// The refusal of an answer the Target compressed although the gateway asked
@@ -341,8 +338,7 @@ pub(crate) fn refuse_a_compressed_answer(
     if !crate::proxy::upstream_body::is_compressed(answer) {
         return None;
     }
-    let mcp = surface.access_point.protocol == SurfaceProtocol::Mcp;
-    Some(unavailable(surface, mcp, body, "compressed_answer"))
+    Some(unavailable(surface, "compressed_answer").response(surface, body))
 }
 
 /// The JSON-RPC id of an MCP request, for a refusal; `null` when it has none.
@@ -353,87 +349,122 @@ fn mcp_request_id(body: &[u8]) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// Refuse the request with `refusal`, logging why.
+/// Whether `surface`'s Access Point speaks MCP, which refuses with JSON-RPC
+/// errors.
+fn speaks_mcp(surface: &AgentSurface) -> bool {
+    surface.access_point.protocol == SurfaceProtocol::Mcp
+}
+
+/// Refuse the request with `refused`, logging why.
 fn refuse(
     surface: &AgentSurface,
-    mcp: bool,
-    body: &[u8],
-    refusal: &GrantRefusal,
-    reason: &'static str,
-) -> Response {
+    refused: Refused,
+) -> TargetGrantRefusal {
     warn!(
         target: "credential_delegation",
         surface_id = %surface.surface_id,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
-        reason,
-        refusal = refusal.reason(),
+        reason = refused.reason,
+        refusal = refused.refusal.reason(),
         "The Access Point Target's grant by binding cannot be released - refusing the request"
     );
-    refusal.response(mcp.then(|| mcp_request_id(body)))
+    TargetGrantRefusal::Grant(refused)
 }
 
 /// Refuse the request for a reason a new connect would not fix:
 /// `connector_unavailable`.
 fn unavailable(
     surface: &AgentSurface,
-    mcp: bool,
-    body: &[u8],
     reason: &'static str,
-) -> Response {
-    refuse(surface, mcp, body, &GrantRefusal::ConnectorUnavailable, reason)
+) -> TargetGrantRefusal {
+    refuse(
+        surface,
+        Refused {
+            refusal: GrantRefusal::ConnectorUnavailable,
+            reason,
+        },
+    )
 }
 
-/// A refusal of [`route_unaudited`], with what its `request_rejected` record
-/// names.
-struct Refused {
-    response: Response,
-    reason: crate::audit::request_events::RejectionReason,
-    rpc_error_code: Option<i32>,
-}
-
-impl Refused {
-    /// A `2026-07-28` MCP request, refused with `-32022`.
-    fn version(body: &[u8]) -> Self {
-        Self {
-            response: unsupported_modern_request(body),
-            reason: crate::audit::request_events::RejectionReason::VersionUnsupported,
-            rpc_error_code: Some(crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION),
-        }
-    }
-
+/// Why a request to a Target bound by external consent is refused. The
+/// handler answers it in the Access Point's protocol ([`Self::response`]).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TargetGrantRefusal {
+    /// A `2026-07-28` MCP request: such a binding's vendor is reached over a
+    /// session revision.
+    #[error("a 2026-07-28 MCP request")]
+    Version,
     /// A path or query the grant is not sent with ([`path_refused`]).
-    fn path(
-        mcp: bool,
-        body: &[u8],
-    ) -> Self {
-        Self {
-            response: path_refused(mcp, body),
-            reason: crate::audit::request_events::RejectionReason::TargetPathRefused,
-            rpc_error_code: mcp.then_some(crate::mcp::errors::error_codes::INVALID_REQUEST),
-        }
-    }
-
+    #[error("a path or query the grant is not sent with")]
+    Path,
     /// A method the grant is not sent with ([`method_refused`]).
-    fn method(mcp: bool) -> Self {
-        Self {
-            response: method_refused(mcp),
-            reason: crate::audit::request_events::RejectionReason::TargetMethodRefused,
-            rpc_error_code: None,
+    #[error("a method the grant is not sent with")]
+    Method,
+    /// A caller the Access Point did not identify ([`caller_not_identified`]).
+    #[error("a caller the Access Point did not identify")]
+    CallerNotIdentified,
+    /// The grant cannot be released or used, with the reason it is logged with.
+    #[error("{}", .0.reason)]
+    Grant(Refused),
+    /// The retry with a refreshed grant could not be sent.
+    #[error("the retry with a refreshed grant could not be sent")]
+    RetryNotSent,
+    /// The request to the Target could not be built with the grant's headers.
+    #[error("the request to the Target could not be built")]
+    RequestNotBuilt,
+}
+
+impl TargetGrantRefusal {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Version | Self::Path => StatusCode::BAD_REQUEST,
+            Self::Method => StatusCode::METHOD_NOT_ALLOWED,
+            Self::CallerNotIdentified => StatusCode::FORBIDDEN,
+            Self::Grant(refused) => refused.refusal.status(),
+            Self::RetryNotSent => StatusCode::BAD_GATEWAY,
+            Self::RequestNotBuilt => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
-    /// A rule the surface breaks, or anything else a new connect would not fix
-    /// ([`unavailable`]).
-    fn unavailable(
-        surface: &AgentSurface,
+    /// The JSON-RPC error code of the answer, when `mcp`, the Access Point
+    /// speaking MCP, gives it one.
+    fn rpc_error_code(
+        &self,
         mcp: bool,
+    ) -> Option<i32> {
+        use crate::mcp::errors::error_codes;
+        match self {
+            Self::Version => Some(error_codes::UNSUPPORTED_PROTOCOL_VERSION),
+            Self::Path => mcp.then_some(error_codes::INVALID_REQUEST),
+            Self::Grant(Refused {
+                refusal: GrantRefusal::ConnectorUnavailable,
+                ..
+            }) => mcp.then_some(error_codes::INTERNAL_ERROR),
+            Self::CallerNotIdentified | Self::Grant(_) => mcp.then_some(-32001),
+            Self::Method | Self::RetryNotSent | Self::RequestNotBuilt => None,
+        }
+    }
+
+    /// The answer, in the protocol of `surface`'s Access Point: on MCP a
+    /// JSON-RPC error for the id of `body`, the request's.
+    pub(crate) fn response(
+        &self,
+        surface: &AgentSurface,
         body: &[u8],
-        reason: &'static str,
-    ) -> Self {
-        Self {
-            response: unavailable(surface, mcp, body, reason),
-            reason: crate::audit::request_events::RejectionReason::ConnectorUnavailable,
-            rpc_error_code: mcp.then_some(crate::mcp::errors::error_codes::INTERNAL_ERROR),
+    ) -> Response {
+        let mcp = speaks_mcp(surface);
+        match self {
+            Self::Version => unsupported_modern_request(body),
+            Self::Path => path_refused(mcp, body),
+            Self::Method => method_refused(mcp),
+            Self::CallerNotIdentified => caller_not_identified(mcp, body),
+            Self::Grant(refused) => refused
+                .refusal
+                .response(mcp.then(|| mcp_request_id(body))),
+            Self::RetryNotSent => crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, "Upstream request failed"),
+            Self::RequestNotBuilt => {
+                crate::a2a::create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid upstream request")
+            }
         }
     }
 }
@@ -577,25 +608,32 @@ pub(crate) fn target_binding_violation(
 pub(crate) async fn route(
     state: &ProxyState,
     request: TargetRequest<'_>,
-) -> Result<Option<TargetGrantRoute>, Response> {
-    use crate::audit::request_events::{RejectionStage, request_rejected};
+) -> Result<Option<TargetGrantRoute>, TargetGrantRefusal> {
+    use crate::audit::request_events::{RejectionReason, RejectionStage, request_rejected};
     let request_facts = request.facts;
     route_unaudited(state, request)
         .await
-        .map_err(|refused| {
+        .inspect_err(|refused| {
+            let reason = match refused {
+                TargetGrantRefusal::Version => RejectionReason::VersionUnsupported,
+                TargetGrantRefusal::Path => RejectionReason::TargetPathRefused,
+                TargetGrantRefusal::Method => RejectionReason::TargetMethodRefused,
+                TargetGrantRefusal::CallerNotIdentified => RejectionReason::ConsentIdentityRequired,
+                TargetGrantRefusal::Grant(_)
+                | TargetGrantRefusal::RetryNotSent
+                | TargetGrantRefusal::RequestNotBuilt => {
+                    RejectionReason::ConnectorUnavailable
+                }
+            };
             request_rejected(
                 request_facts,
                 RejectionStage::Admission,
-                refused.reason,
+                reason,
+                refused.status().as_u16(),
                 refused
-                    .response
-                    .status()
-                    .as_u16(),
-                refused
-                    .rpc_error_code
+                    .rpc_error_code(speaks_mcp(&state.surface))
                     .map(i64::from),
             );
-            refused.response
         })
 }
 
@@ -603,13 +641,12 @@ pub(crate) async fn route(
 async fn route_unaudited(
     state: &ProxyState,
     request: TargetRequest<'_>,
-) -> Result<Option<TargetGrantRoute>, Refused> {
+) -> Result<Option<TargetGrantRoute>, TargetGrantRefusal> {
     let surface = &state.surface;
     let Some(binding) = surface.target_external_credentials() else {
         return Ok(None);
     };
-    let mcp = surface.access_point.protocol == SurfaceProtocol::Mcp;
-    let body = request.body;
+    let mcp = speaks_mcp(surface);
     if request.modern {
         warn!(
             target: "credential_delegation",
@@ -618,18 +655,18 @@ async fn route_unaudited(
             "A 2026-07-28 MCP request was sent to an Access Point whose Target is bound by external consent - \
              refusing the request"
         );
-        return Err(Refused::version(body));
+        return Err(TargetGrantRefusal::Version);
     }
     let Some(segments) = forwarded_segments(request.path) else {
         log_refusal(surface, "path_not_read_alike");
-        return Err(Refused::path(mcp, body));
+        return Err(TargetGrantRefusal::Path);
     };
     if crate::proxy::paths::is_public_request(request.method, request.path) {
         return Ok(None);
     }
     if mcp && !segments.is_empty() {
         log_refusal(surface, "path_not_the_endpoint");
-        return Err(Refused::path(mcp, body));
+        return Err(TargetGrantRefusal::Path);
     }
     if mcp
         && ((request.method == "GET" && crate::mcp::sse_server::client_wants_sse(request.headers))
@@ -639,42 +676,42 @@ async fn route_unaudited(
     }
     if !methods_with_the_grant(mcp).contains(&request.method) {
         log_refusal(surface, "method_not_sent_the_grant");
-        return Err(Refused::method(mcp));
+        return Err(TargetGrantRefusal::Method);
     }
     if request
         .query
         .is_some_and(|query| !query.is_empty())
     {
         log_refusal(surface, "query_not_sent");
-        return Err(Refused::path(mcp, body));
+        return Err(TargetGrantRefusal::Path);
     }
     let Some(target_url) = forwarded_url(&surface.target.endpoint, &segments) else {
-        return Err(Refused::unavailable(surface, mcp, body, "target_not_a_url"));
+        return Err(unavailable(surface, "target_not_a_url"));
     };
     let Some(subject) = binding.subject else {
-        return Err(Refused::unavailable(surface, mcp, body, "no_subject"));
+        return Err(unavailable(surface, "no_subject"));
     };
     if let Some(unchecked) = unchecked_callers(surface, subject) {
-        return Err(Refused::unavailable(surface, mcp, body, unchecked.reason()));
+        return Err(unavailable(surface,unchecked.reason()));
     }
     if let Some(violation) = target_binding_violation(surface, binding) {
-        return Err(Refused::unavailable(surface, mcp, body, violation.reason()));
+        return Err(unavailable(surface,violation.reason()));
     }
     let (Some(_), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
-        return Err(Refused::unavailable(surface, mcp, body, "stores_unavailable"));
+        return Err(unavailable(surface, "stores_unavailable"));
     };
     let provider = match providers
         .get(&binding.credential_provider_id)
         .await
     {
         Ok(Some(provider)) => provider,
-        Ok(None) | Err(_) => return Err(Refused::unavailable(surface, mcp, body, "provider_unavailable")),
+        Ok(None) | Err(_) => return Err(unavailable(surface, "provider_unavailable")),
     };
     if !provider.is_external_consent() {
-        return Err(Refused::unavailable(surface, mcp, body, "provider_without_issuer"));
+        return Err(unavailable(surface, "provider_without_issuer"));
     }
     if provider.tenant_id != surface.tenant_id {
-        return Err(Refused::unavailable(surface, mcp, body, "provider_of_another_tenant"));
+        return Err(unavailable(surface, "provider_of_another_tenant"));
     }
     let allowlist = state
         .egress_allowlist
@@ -683,7 +720,7 @@ async fn route_unaudited(
         .await
         .is_err()
     {
-        return Err(Refused::unavailable(surface, mcp, body, "destination_not_the_resource"));
+        return Err(unavailable(surface, "destination_not_the_resource"));
     }
     if !crate::credential_providers::external::resource_permitted(
         &provider,
@@ -691,7 +728,7 @@ async fn route_unaudited(
             .network_config
             .external_consent_resource_origins,
     ) {
-        return Err(Refused::unavailable(surface, mcp, body, "resource_not_permitted_for_issuer"));
+        return Err(unavailable(surface, "resource_not_permitted_for_issuer"));
     }
     if crate::credential_providers::external::issuer_permitted(
         &provider,
@@ -702,7 +739,7 @@ async fn route_unaudited(
     )
     .is_err()
     {
-        return Err(Refused::unavailable(surface, mcp, body, "issuer_not_permitted"));
+        return Err(unavailable(surface, "issuer_not_permitted"));
     }
     let timeout = std::time::Duration::from_secs(
         state
@@ -719,7 +756,7 @@ async fn route_unaudited(
                 error = ?error.to_string(),
                 "The Target of a request carrying a grant by binding was refused by Strict egress"
             );
-            Refused::unavailable(surface, mcp, body, "forward_refused_by_strict_egress")
+            unavailable(surface, "forward_refused_by_strict_egress")
         })?;
     Ok(Some(TargetGrantRoute {
         binding: binding.clone(),
@@ -727,7 +764,6 @@ async fn route_unaudited(
         provider,
         target_url,
         client,
-        mcp,
     }))
 }
 
@@ -833,15 +869,6 @@ pub(crate) struct Caller<'a> {
     pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
 }
 
-/// What the gateway answers its caller with, given the Target's response to a
-/// request that carried the Target's grant.
-pub(crate) enum TargetAnswer {
-    /// The Target's response, passed on.
-    Pass(reqwest::Response),
-    /// The gateway's own answer, in place of the Target's.
-    Answered(Response),
-}
-
 impl TargetGrantRoute {
     /// The Strict client pinned to the provider's resource, which every
     /// request on this route is sent with.
@@ -882,8 +909,7 @@ impl TargetGrantRoute {
         &self,
         state: &ProxyState,
         caller: Caller<'_>,
-        body: &[u8],
-    ) -> Result<ReleasedTargetGrant, Response> {
+    ) -> Result<ReleasedTargetGrant, TargetGrantRefusal> {
         let surface = &state.surface;
         let principal = (!caller.source_auth_failed)
             .then(|| crate::proxy::handler::source_auth_user_hash(caller.identity, surface))
@@ -903,7 +929,7 @@ impl TargetGrantRoute {
                 403,
                 None,
             );
-            return Err(caller_not_identified(self.mcp, body));
+            return Err(TargetGrantRefusal::CallerNotIdentified);
         };
         let tenant = surface.tenant_id.as_deref();
         let key = match self.subject {
@@ -919,19 +945,19 @@ impl TargetGrantRoute {
                     &principal,
                 ) {
                     Some(key) => key,
-                    None => return Err(unavailable(surface, self.mcp, body, "caller_without_identity_hash")),
+                    None => return Err(unavailable(surface, "caller_without_identity_hash")),
                 }
             }
         };
         let Some(release) = self.release_context(state) else {
-            return Err(unavailable(surface, self.mcp, body, "stores_unavailable"));
+            return Err(unavailable(surface, "stores_unavailable"));
         };
         let grant = match release
             .release(&self.provider, &key, self.subject)
             .await
         {
             Ok(grant) => grant,
-            Err(refused) => return Err(refuse(surface, self.mcp, body, &refused.refusal, refused.reason)),
+            Err(refused) => return Err(refuse(surface, refused)),
         };
         // Within the binding serving this call, and within every place the
         // surface serves the Target's binding, as storing a grant and the
@@ -947,15 +973,15 @@ impl TargetGrantRoute {
         ) {
             return Err(refuse(
                 surface,
-                self.mcp,
-                body,
-                &GrantRefusal::connect_required(&key, self.subject),
-                "grant_beyond_the_bindings_scopes",
+                Refused {
+                    refusal: GrantRefusal::connect_required(&key, self.subject),
+                    reason: "grant_beyond_the_bindings_scopes",
+                },
             ));
         }
         let headers = self
             .headers_for(&grant)
-            .ok_or_else(|| unavailable(surface, self.mcp, body, "grant_not_a_header_value"))?;
+            .ok_or_else(|| unavailable(surface, "grant_not_a_header_value"))?;
         let released = ReleasedTargetGrant {
             grant,
             key,
@@ -1069,19 +1095,18 @@ impl TargetGrantRoute {
         released: ReleasedTargetGrant,
         response: reqwest::Response,
         retry: Option<reqwest::RequestBuilder>,
-        body: &[u8],
-    ) -> TargetAnswer {
+    ) -> Result<reqwest::Response, TargetGrantRefusal> {
         use crate::delegation_vault::release::{VendorAnswer, vendor_answer, vendor_answer_to_a_retry};
         let surface = &state.surface;
         match vendor_answer(response.status(), response.headers()) {
-            VendorAnswer::Pass => return TargetAnswer::Pass(response),
+            VendorAnswer::Pass => return Ok(response),
             VendorAnswer::Refuse(refused) => {
-                return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+                return Err(refuse(surface, refused));
             }
             VendorAnswer::TokenRejected => drop(response),
         }
         let Some(release) = self.release_context(state) else {
-            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "stores_unavailable"));
+            return Err(unavailable(surface, "stores_unavailable"));
         };
         let fresh = match release
             .retry_grant(&self.provider, &released.key, self.subject, &released.grant, retry.is_some())
@@ -1089,23 +1114,18 @@ impl TargetGrantRoute {
         {
             Ok(fresh) => fresh,
             Err(refused) => {
-                return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+                return Err(refuse(surface, refused));
             }
         };
         let Some(retry) = retry else {
-            return TargetAnswer::Answered(unavailable(
-                surface,
-                self.mcp,
-                body,
-                "vendor_refused_a_large_body_refreshed_for_the_next_call",
-            ));
+            return Err(unavailable(surface, "vendor_refused_a_large_body_refreshed_for_the_next_call"));
         };
         let Some(headers) = self.headers_for(&fresh) else {
-            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "grant_not_a_header_value"));
+            return Err(unavailable(surface, "grant_not_a_header_value"));
         };
         let (client, request) = retry.build_split();
         let Ok(mut request) = request else {
-            return TargetAnswer::Answered(unavailable(surface, self.mcp, body, "retry_not_rebuilt"));
+            return Err(unavailable(surface, "retry_not_rebuilt"));
         };
         for (name, value) in &headers {
             request
@@ -1123,17 +1143,14 @@ impl TargetGrantRoute {
                     error = %error.without_url(),
                     "The retry of a request whose grant the Target refused failed"
                 );
-                return TargetAnswer::Answered(crate::a2a::create_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Upstream request failed",
-                ));
+                return Err(TargetGrantRefusal::RetryNotSent);
             }
         };
         if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
             drop(retried);
-            return TargetAnswer::Answered(refuse(surface, self.mcp, body, &refused.refusal, refused.reason));
+            return Err(refuse(surface, refused));
         }
-        TargetAnswer::Pass(retried)
+        Ok(retried)
     }
 }
 
@@ -1142,11 +1159,9 @@ impl ReleasedTargetGrant {
     pub(crate) fn apply(
         &self,
         request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder, Box<Response>> {
+    ) -> Result<reqwest::RequestBuilder, TargetGrantRefusal> {
         let (client, built) = request.build_split();
-        let mut built = built.map_err(|_| {
-            Box::new(crate::a2a::create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid upstream request"))
-        })?;
+        let mut built = built.map_err(|_| TargetGrantRefusal::RequestNotBuilt)?;
         for (name, value) in &self.headers {
             built
                 .headers_mut()

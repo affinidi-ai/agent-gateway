@@ -3655,7 +3655,6 @@ async fn proxy_handler_with_mcp_runtime(
             query: uri.query(),
             headers: &headers,
             modern: modern_request.is_some(),
-            body: &body_bytes,
             facts: &audit_facts,
         },
     )
@@ -3666,7 +3665,7 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Ok(refused);
+            return Ok(refused.response(&state.surface, &body_bytes));
         }
     };
 
@@ -7040,21 +7039,20 @@ async fn proxy_handler_with_mcp_runtime(
                     source_auth_failed,
                     facts: &audit_facts,
                 },
-                &body_bytes,
             )
             .await
         {
             Ok(released) => {
                 upstream_req = released
                     .apply(upstream_req)
-                    .map_err(|refused| *refused)?;
+                    .map_err(|refused| refused.response(&state.surface, &body_bytes))?;
                 Some(released)
             }
             Err(refused) => {
                 connection_guard
                     .decrement()
                     .await;
-                return Ok(refused);
+                return Ok(refused.response(&state.surface, &body_bytes));
             }
         },
         None => None,
@@ -8119,15 +8117,15 @@ async fn proxy_handler_with_mcp_runtime(
     // never reach the caller.
     let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
         (Some(route), Some(released)) => match route
-            .answer(&state, released, upstream_response, target_grant_retry, &body_bytes)
+            .answer(&state, released, upstream_response, target_grant_retry)
             .await
         {
-            crate::proxy::target_grant::TargetAnswer::Pass(response) => response,
-            crate::proxy::target_grant::TargetAnswer::Answered(refused) => {
+            Ok(response) => response,
+            Err(refused) => {
                 connection_guard
                     .decrement()
                     .await;
-                return Ok(refused);
+                return Ok(refused.response(&state.surface, &body_bytes));
             }
         },
         _ => upstream_response,
