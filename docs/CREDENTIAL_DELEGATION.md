@@ -2049,6 +2049,12 @@ new tenant's view and out of the old one's, since they belong to their provider'
 entries and records can belong to any tenant's callers: revoke its entries before moving it into
 a tenant, which then also reads its audit history.
 
+A delete takes them out of every tenant's view the same way. The deleted provider's remaining
+agent-keyed vault entries and its delegation audit records are no longer any tenant's, so a
+tenant's access token stops reading them, while sessions and appliance-wide access tokens still
+read them. Who reads a record is decided when it is read, from the provider's tenant at that
+moment, not when it was written.
+
 ### Removing grants
 
 Grants by binding are removed one by one or by binding, and each removed grant is deleted, then

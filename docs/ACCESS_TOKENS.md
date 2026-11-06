@@ -370,6 +370,11 @@ tenant's PATs and hides them from the old tenant's
 records can belong to any tenant's callers, so revoke its tokens before moving it into a tenant,
 and expect the tenant to read its history.
 
+Deleting a provider likewise hides its remaining agent-keyed vault tokens and its delegation audit
+records from every tenant PAT, its former tenant's included; sessions and appliance-wide PATs still
+read them. Both follow from ownership being decided at read time, from the provider's current
+tenant.
+
 ## Dashboard
 
 Management tokens are managed from the **Access Tokens** tab of the Secrets page in
