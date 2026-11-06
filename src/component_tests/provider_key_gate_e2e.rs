@@ -3,7 +3,8 @@
 //! serving and the gateway logs the key id and rule; under `enforce`, or while the API key store
 //! is unavailable, its Access Point is not ready: every request is refused with `503`. A surface
 //! names only its own keys: one naming its own key serves in both modes, one naming another
-//! surface's key of its own tenant is held back like one naming another tenant's.
+//! surface's key of its own tenant is held back like one naming another tenant's. Revoking a
+//! surface's own key takes it out of service on the next request in both modes.
 
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -466,4 +467,28 @@ async fn owner_tenant_change_flow() {
     );
     let (status, body) = gate.call(NAMES_OWN).await;
     assert_eq!(status, 200, "a surface moved with its own key keeps serving it: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_surfaces_own_key_takes_it_out_of_service_at_once_in_both_modes() {
+    for mode in [RuleMode::Warn, RuleMode::Enforce] {
+        let gate = Gate::start(mode, true).await;
+        let (status, body) = gate.call(NAMES_OWN).await;
+        assert_eq!(status, 200, "{mode:?}: an active own key serves: {body}");
+
+        let response = gate
+            .admin
+            .post(format!("{}/api/v1/api-keys/{NAMES_OWN}/{KEY_A}/revoke", gate.h.gateway_base))
+            .json(&json!({"actor": "component-test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204, "{mode:?}");
+
+        let reached = gate.reached();
+        assert_not_ready(gate.call(NAMES_OWN).await, "its own key revoked, the next request");
+        assert_eq!(gate.reached(), reached, "{mode:?}: a surface naming a revoked key never reaches the Target");
+        let (status, body) = gate.call("owner-b").await;
+        assert_eq!(status, 200, "{mode:?}: a surface naming no revoked key serves: {body}");
+    }
 }

@@ -427,7 +427,10 @@ pub async fn revoke_key(
         .revoke(&agent_id, &key_id, &request.actor)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            crate::identity::provider_key_gate::gate().key_changed(&key_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -517,6 +520,7 @@ pub async fn delete_key(
         .await
     {
         Ok(()) => {
+            crate::identity::provider_key_gate::gate().key_changed(&key_id);
             info!(
                 actor = %actor,
                 agent_id = %agent_id,

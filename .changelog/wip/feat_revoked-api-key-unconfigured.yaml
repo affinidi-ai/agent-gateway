@@ -1,0 +1,22 @@
+branch: feat/revoked-api-key-unconfigured
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-05T15:41:02Z'
+      title: ⭐ Refuse requests to a surface that derives its DID from a revoked API key
+      description: >-
+        A surface whose Identity slot, Transit Point or legacy Caller Context secret names a
+        revoked API Key Provider key is now not ready in both tenant_credential_isolation modes
+        and answers every request with 503, on the direct path, over Fabric and on its Transit
+        Points, and gets no agent card preview. The DID is derived from the key id with no key
+        lookup, so before this change a revoked key kept its surface's DID. The node that revokes
+        the key, or deletes its surface, refuses the next request; other nodes read the status
+        of the keys a surface names from disk at least every cache_refresh_interval_secs, or
+        every 30 seconds when it is 0. The refusal is logged with reason api_key_revoked and the
+        credential policy report lists the key as revoked_key. A stored surface naming a revoked
+        key, including one whose owning surface was deleted, stops serving after the upgrade
+        under warn as well; rotating a key keeps it serving.
+  breaking: []

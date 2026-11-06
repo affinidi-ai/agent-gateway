@@ -1234,6 +1234,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_surface_naming_its_revoked_api_key_gets_no_preview_and_no_fetch() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("own", Some("tenant-a"))],
+            &[("own", "atgk_preview_revoked")],
+        )
+        .await;
+        crate::config::credential_policy::use_thread_credential_policy(Default::default());
+        gate.api_keys
+            .revoke("own", "atgk_preview_revoked", "test")
+            .await
+            .unwrap();
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let mut surface = surface_with("own", json!({"endpoint": target.url()}));
+        surface.tenant_id = Some("tenant-a".into());
+        surface
+            .identity_slots
+            .external = Some(
+            serde_json::from_value(json!({"type": "from_api_key", "api_key_id": "atgk_preview_revoked"})).unwrap(),
+        );
+        let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
+
+        let refused = memory
+            .preview(&running(surface).await, &caller("u-gate"), PreviewRequest::Read)
+            .await
+            .unwrap();
+
+        assert_eq!(refused, AgentCardPreview::unsupported("own", UnsupportedReason::NotRunning));
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "a surface naming a revoked key is never fetched"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_fetch_shows_the_last_good_card_of_the_same_running_surface_only() {
         let (target, answer) = MockServer::start_with_response_channel(agent_card().to_string()).await;
         let state = state(json!({"endpoint": target.url()})).await;
