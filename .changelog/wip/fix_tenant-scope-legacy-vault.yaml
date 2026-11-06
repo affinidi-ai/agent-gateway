@@ -4,14 +4,12 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-05T15:59:31Z'
-      title: Name the provider's id in the OAuth callback's consent_granted audit record
+      title: Show a tenant's access token the consents its own providers recorded
       description: >-
-        The OAuth callback's consent_granted record named the credential provider's provider_id
-        slug, while every other delegation audit record names the provider's id. A tenant's access
-        token therefore never read its own tenant's consents, and the dashboard's link from such a
-        record to its provider looked the slug up as an id. The record now names the provider's
-        id, in the VP Audit Log and in what Governance Audit integrations receive. Records written
-        by earlier releases keep the slug and are shown only to appliance-wide callers.
+        A tenant's access token never read its own tenant's consent_granted records from the OAuth
+        callback, and the dashboard's link from such a record to its credential provider opened no
+        provider, because the record did not name the provider's id. Both now work for new
+        records; records written by earlier releases are shown only to appliance-wide callers.
   removed: []
   security:
     - timestamp: '2026-11-04T12:55:20Z'
@@ -51,6 +49,14 @@ changes:
         {"error":"Failed to download logs"} instead of an error naming the log directory, and the
         detail is logged.
   breaking:
+    - timestamp: '2026-11-06T15:27:37Z'
+      title: ⭐ Name the provider's id, not its slug, in consent_granted audit records
+      description: >-
+        The OAuth callback's consent_granted record now holds the credential provider's record id
+        in provider_id, as every other delegation audit record does, where it held the provider's
+        provider_id slug. This applies in the VP Audit Log and in what Governance Audit
+        integrations receive. A consumer that matched these records by slug must match the
+        provider's id. Records written by earlier releases keep the slug.
     - timestamp: '2026-11-06T15:01:09Z'
       title: ⭐ Refuse delegation records and logs to tokens scoped by required headers alone
       description: >-
