@@ -8,25 +8,25 @@ changes:
     - timestamp: '2026-11-05T15:12:32Z'
       title: Close SSRF and DNS rebinding gaps in JWKS fetches and provider token calls
       description: >-
-        A JWT verification strategy's JWKS fetch allowed loopback and private-network hosts, and
-        the credential provider validation probe sent its request through a client that resolved
-        the host again after it was checked. Both now go through a pinned client under the Strict
-        egress policy, which refuses cloud metadata, loopback, RFC 1918, link-local and IPv6
-        unique-local addresses and connects only to the address it checked, so a host cannot
-        rebind to an internal address. The JWKS answer is read up to 256 KiB. The JWKS probe and
-        the provider probe now answer fixed error messages instead of the upstream error, and log
-        the detail.
+        A JWT verification strategy's JWKS fetch allowed loopback hosts, credential provider token
+        requests honoured an HTTP proxy that resolved the host again, and the credential provider
+        validation probe sent its request through a client that resolved the host again after it
+        was checked. JWKS fetches, token requests and both probes now go through a pinned client
+        that refuses cloud metadata, loopback and unspecified addresses, connects only to the
+        address it checked so a host cannot rebind to a refused one, and follows no redirects.
+        Private networks stay allowed, so an identity provider inside the operator's network keeps
+        working. The JWKS answer is read up to 256 KiB. The JWKS probe and the provider probe now
+        answer fixed error messages instead of the upstream error, and log the detail.
   breaking:
     - timestamp: '2026-11-05T15:12:32Z'
-      title: Refuse JWKS and token endpoints that do not resolve to public addresses
+      title: Refuse loopback JWKS URIs and send JWKS and token calls without a proxy
       description: >-
-        Creating or updating a JWT verification strategy whose jwks_uri, or a credential provider
-        whose token_endpoint, resolves to a loopback, private-network, link-local or unique-local
-        address now answers 400, and strategies and providers stored with such an address fail
-        their JWKS fetches and token requests. An identity provider or token endpoint inside a
-        private network must be reachable on a public address. These calls also ignore
-        HTTPS_PROXY, HTTP_PROXY and ALL_PROXY, so a host that reaches the internet only through a
-        proxy must allow direct egress to its identity providers; a startup warning names them.
+        Creating or updating a JWT verification strategy whose jwks_uri resolves to loopback, an
+        unspecified address or cloud metadata now answers 400, and a stored one fails its JWKS
+        fetches; credential provider token endpoints were already held to that rule. JWKS fetches
+        and token requests also ignore HTTPS_PROXY, HTTP_PROXY and ALL_PROXY, since a proxy would
+        resolve the host again, so a host that reaches the internet only through a proxy must allow
+        direct egress to its identity providers; a startup warning names them.
     - timestamp: '2026-11-05T15:12:32Z'
       title: Require the JWT verification strategy edit permission for the JWKS URI probe
       description: >-
