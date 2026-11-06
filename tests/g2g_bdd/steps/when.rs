@@ -128,12 +128,17 @@ pub(crate) async fn transit_token_received_by(
 }
 
 /// The transit token on the last request `agent_name` served, other than an
-/// agent card fetch, if it carried one.
+/// agent card fetch, its surface's configured card location included, if it
+/// carried one.
 pub(crate) async fn last_transit_token_received_by(
     world: &G2gWorld,
     agent_name: &str,
 ) -> Option<String> {
     let (gw_index, surface_id) = world.target(agent_name);
+    let card_location = world
+        .surface_spec(gw_index, &surface_id)
+        .agent_card_path
+        .clone();
     world
         .harness()
         .gw(gw_index)
@@ -147,6 +152,12 @@ pub(crate) async fn last_transit_token_received_by(
             !request
                 .path_and_query
                 .contains(".well-known/agent")
+                && card_location.as_deref()
+                    != Some(
+                        request
+                            .path_and_query
+                            .as_str(),
+                    )
         })
         .and_then(|request| {
             request

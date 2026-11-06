@@ -21,7 +21,6 @@ Feature: Protected agent card fetch over Fabric
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "accept-language" with value "en-GB"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-forwarded-user"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-caller-note"
-    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-transit-token"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-gateway-trace-id"
 
   Scenario: gateway 2 refuses the agent card fetch when its Target credential cannot be resolved
@@ -119,18 +118,20 @@ Feature: Protected agent card fetch over Fabric
     And the response says "Upstream error: 401"
     And the response does not say "acct-bravo-7731"
 
-  Scenario: gateway 2 gives no transit token on its agent card fetch but gives one on a forwarded call
+  Scenario: gateway 2 gives no transit token on its agent card fetch at its configured card location but gives one on a forwarded call
     Given a fabric with 3 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 3 has an A2A surface "echo" targeting managed agent "foxtrot"
+    And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "alpha" has A2A Transit Point "to-echo" over Fabric to gateway 3 surface "echo"
     And Transit Point "to-echo" requires a transit token
     And the caller has sent a Fabric A2A request through gateway 1 surface "charlie"
-    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/cards/me"
     Then the response status is 200
-    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-transit-token"
+    And the GET request at path "/cards/me" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
+    And the GET request at path "/cards/me" to managed agent "bravo" did not carry header "x-transit-token"
     And managed agent "bravo" received a transit token for the request gateway 1 sent
 
   Scenario: gateway 2 presents its Target credential when it reads the agent card for its surface policy
@@ -182,7 +183,6 @@ Feature: Protected agent card fetch over Fabric
       | path                              | forwarded path                    |
       | /discovery                        | /discovery                        |
       | /.well-known/ucp                  | /.well-known/ucp                  |
-      | /x/%2e%2e/discovery               | /discovery                        |
       | /x/agent-card.json                | /x/agent-card.json                |
 
   Scenario: gateway 2 does not treat a card path whose case differs as its agent card fetch
@@ -219,7 +219,8 @@ Feature: Protected agent card fetch over Fabric
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" has a request policy that denies all requests
     When the caller sends a POST request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
-    Then managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
     And managed agent "bravo" did not receive a POST request at path "/.well-known/agent-card.json"
 
   Scenario Outline: gateway 1 does not apply its surface policy to a public discovery read

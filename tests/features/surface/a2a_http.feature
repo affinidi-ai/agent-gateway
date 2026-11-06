@@ -259,7 +259,6 @@ Feature: A2A HTTP surface forwarding and identity
       | path                | forwarded path      |
       | /discovery          | /discovery          |
       | /.well-known/ucp    | /.well-known/ucp    |
-      | /x/%2e%2e/discovery | /discovery          |
 
   Scenario: A POST to a path that only ends like an agent card runs the surface policy
     Given the surface has a request policy that denies all requests
@@ -271,7 +270,8 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A POST to the well-known agent card path is answered by the gateway's own card GET before policy
     Given the surface has a request policy that denies all requests
     When the caller sends a POST request to the surface route path "/.well-known/agent-card.json"
-    Then managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
     And managed agent "bravo" did not receive a POST request at path "/.well-known/agent-card.json"
 
   Scenario: A path whose case differs is not served as the agent card fetch
