@@ -486,14 +486,13 @@ const IdentitiesPage: React.FC = () => {
                         <table className="table table-hover table-sm identities-table">
                           <thead>
                             <tr>
-                              <th>Agent Name</th>
+                              <th>Name</th>
                               <th>DID</th>
                               <th>Agent Surface</th>
                               <th>Trust Score</th>
                               <th>Attestation</th>
                               <th title="Universal Agent Identifier">UAI</th>
                               <th>Created</th>
-                              {/* <th>Usage Count</th> */}
                               <th>Last Used</th>
                               <th>Origin</th>
                               {hasRecorderStatus && <th>Recorder</th>}
@@ -645,11 +644,6 @@ const IdentitiesPage: React.FC = () => {
                                           : 'Never'}
                                       </small>
                                     </td>
-                                    {/* <td>
-                                      <small>
-                                        {identity.usage_count || identity.use_count || 0}
-                                      </small>
-                                    </td> */}
                                     <td>
                                       <small>
                                         {identity.last_used_at || identity.last_used
@@ -750,7 +744,7 @@ const IdentitiesPage: React.FC = () => {
                                   </tr>
                                   {isExpanded && (
                                     <tr className="expanded-detail-row">
-                                      <td colSpan={hasRecorderStatus ? 12 : 11} className="p-0">
+                                      <td colSpan={hasRecorderStatus ? 11 : 10} className="p-0">
                                         <div className="p-3">
                                           <div
                                             className="accordion"

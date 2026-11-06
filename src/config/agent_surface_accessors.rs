@@ -295,11 +295,15 @@ impl AgentSurface {
             .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
     }
 
-    /// Whether the surface configures a managed agent identity, on its target or on any
-    /// Transit Point.
+    /// Whether the surface issues a managed agent identity: an `a2a-proxy://` target always
+    /// does, otherwise one configured on its target or on any Transit Point. Unlike
+    /// [`Self::transit_point_has_managed_identity`], a target `from_jwt_claim` counts, since
+    /// the target is reached on the inbound leg where that mode applies.
     pub fn has_managed_identity(&self) -> bool {
-        self.managed_identity()
-            .is_some()
+        self.is_a2a_proxy_target()
+            || self
+                .managed_identity()
+                .is_some()
             || self
                 .transit
                 .as_ref()
@@ -1394,6 +1398,10 @@ mod tests {
             .identity_injection
             .identity_type = Some("from_jwt_claim".to_string());
         assert!(target_only.has_managed_identity());
+
+        let mut a2a_proxy = surface(SurfaceProtocol::A2a);
+        a2a_proxy.target.endpoint = "a2a-proxy://worker".to_string();
+        assert!(a2a_proxy.has_managed_identity());
     }
 
     #[test]

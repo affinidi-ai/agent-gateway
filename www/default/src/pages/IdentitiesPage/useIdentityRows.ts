@@ -97,7 +97,7 @@ export function useIdentityRows<T extends Identity>({
       return [
         identity.name,
         identity.did,
-        identity.channel_name,
+        identity.origin === 'managed' ? undefined : identity.channel_name,
         identity.identity_hash,
         identity.display_name,
         identity.surface_name,

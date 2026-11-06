@@ -21,7 +21,9 @@ use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
     CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
 };
-use crate::trust_registry_verification::recorder_status::{RecorderStatus, TrustRecorderStatusStore, global_store};
+use crate::trust_registry_verification::recorder_status::{
+    RecorderState, RecorderStatus, TrustRecorderStatusStore, global_store,
+};
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
 // Store proxy start time
@@ -2262,7 +2264,8 @@ pub(crate) async fn build_identity_list_with(
 }
 
 /// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
-/// `not_attempted` before the first one. Every other identity carries none.
+/// `not_attempted` before the first one. A DID managed on several such surfaces carries the
+/// worst of their outcomes. Every other identity carries none.
 async fn recorder_status_for(
     identity: &IdentityInfo,
     surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
@@ -2271,24 +2274,39 @@ async fn recorder_status_for(
     if identity.origin != Some(IdentityOrigin::Managed) {
         return None;
     }
-    let surface = surfaces_by_id.get(
-        identity
-            .surface_id
-            .as_deref()?,
-    )?;
-    if surface
-        .trust_recorder()?
-        .entries
-        .is_empty()
-    {
-        return None;
-    }
-    Some(
-        recorder_status
+    let mut worst: Option<RecorderStatus> = None;
+    for managed in &identity.managed_surfaces {
+        let Some(surface) = surfaces_by_id.get(managed.surface_id.as_str()) else {
+            continue;
+        };
+        if surface
+            .trust_recorder()
+            .is_none_or(|recorder| recorder.entries.is_empty())
+        {
+            continue;
+        }
+        let status = recorder_status
             .status_for(&surface.surface_id, &identity.did)
             .await
-            .unwrap_or_else(RecorderStatus::not_attempted),
-    )
+            .unwrap_or_else(RecorderStatus::not_attempted);
+        if worst
+            .as_ref()
+            .is_none_or(|w| recorder_severity(status.state) > recorder_severity(w.state))
+        {
+            worst = Some(status);
+        }
+    }
+    worst
+}
+
+fn recorder_severity(state: RecorderState) -> u8 {
+    match state {
+        RecorderState::Recorded => 0,
+        RecorderState::NotAttempted => 1,
+        RecorderState::Skipped => 2,
+        RecorderState::Partial => 3,
+        RecorderState::Failed => 4,
+    }
 }
 
 /// Helper function to build channel list
@@ -2959,6 +2977,52 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert_eq!(helium.state, RecorderState::Failed);
+        }
+
+        #[tokio::test]
+        async fn test_shared_managed_did_carries_the_worst_outcome_of_its_recorder_surfaces() {
+            use crate::trust_registry_verification::recorder_status::{
+                EntryStatus, RecorderState, TrustRecorderStatusStore,
+            };
+            let status_store = TrustRecorderStatusStore::in_memory();
+            for (surface_id, failed) in [("oxygen", 0), ("helium", 1)] {
+                status_store
+                    .record(
+                        surface_id,
+                        "did:example:shared",
+                        vec![EntryStatus::from_counts("tr-1", 1 - failed, 0, failed, None)],
+                        Utc::now(),
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut record = managed("did:example:shared", "oxygen");
+            record
+                .channel_usage
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::Managed));
+            let rows = list_with_recorder(
+                vec![record],
+                &[
+                    surface_with_recorder("oxygen", "OXYGEN"),
+                    surface_with_recorder("helium", "HELIUM"),
+                    surface("argon", "ARGON"),
+                ],
+                &status_store,
+            )
+            .await;
+
+            let row = &rows["did:example:shared"];
+            assert_eq!(row.surface_id, None);
+            assert_eq!(
+                row.trust_recorder
+                    .as_ref()
+                    .map(|status| status.state),
+                Some(RecorderState::Failed)
+            );
         }
 
         #[tokio::test]

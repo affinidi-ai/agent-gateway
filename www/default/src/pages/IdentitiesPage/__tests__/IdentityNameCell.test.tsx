@@ -128,6 +128,44 @@ describe('IdentityNameCell', () => {
     expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
   });
 
+  describe('without the DID', () => {
+    const renderNameOnly = (identity: Partial<NamedIdentity>, fallbackName?: string) =>
+      render(
+        <IdentityNameCell
+          identity={{ did: LONG_DID, ...identity }}
+          showDid={false}
+          fallbackName={fallbackName}
+        />
+      );
+
+    it('shows the fallback name when the identity has no display name', () => {
+      renderNameOnly({}, 'legacy-agent');
+
+      expect(screen.getByTestId('identities-name')).toHaveTextContent('legacy-agent');
+      expect(screen.queryByTestId('identities-name-empty')).not.toBeInTheDocument();
+      expect(screen.queryByTitle(LONG_DID)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-copy-did-button')).not.toBeInTheDocument();
+    });
+
+    it('shows a muted Unnamed Agent without a fallback name', () => {
+      renderNameOnly({});
+
+      const empty = screen.getByTestId('identities-name-empty');
+      expect(empty).toHaveTextContent('Unnamed Agent');
+      expect(empty).toHaveClass('text-muted', 'fst-italic');
+      expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(screen.queryByTitle(LONG_DID)).not.toBeInTheDocument();
+    });
+
+    it('prefers the display name over the fallback name', () => {
+      renderNameOnly({ display_name: 'OXYGEN', display_name_source: 'surface_name' }, 'legacy');
+
+      expect(screen.getByTestId('identities-name')).toHaveTextContent('OXYGEN');
+      expect(screen.queryByText('legacy')).not.toBeInTheDocument();
+      expect(screen.queryByTitle(LONG_DID)).not.toBeInTheDocument();
+    });
+  });
+
   it('shows a single-surface managed DID by its name, without the shared lines', () => {
     renderCell({
       display_name: 'alpha',

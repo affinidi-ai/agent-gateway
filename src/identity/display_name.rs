@@ -120,7 +120,7 @@ fn is_managed(record: &AgentIdentityRecord) -> bool {
 }
 
 /// Whether a usage entry in `role` makes `surface` a managed surface of the DID. Entries
-/// recorded before roles count only on a surface that configures a managed identity.
+/// recorded before roles count only on a surface that issues a managed identity.
 fn counts_as_managed(
     role: Option<IdentityOrigin>,
     surface: &AgentSurface,
@@ -199,7 +199,9 @@ pub fn resolve_managed_display_name(
 type SurfacesByDid = HashMap<String, BTreeSet<String>>;
 
 /// Snapshot of [`managed_surfaces_by_did`], reloaded once older than its TTL or when asked
-/// about a DID it does not contain, so a newly issued identity is seen at once.
+/// about a DID it does not contain, so a newly issued identity is seen at once. The snapshot
+/// also holds the live surface list, so a surface deleted or reconfigured since it was taken
+/// is seen only after the next reload.
 pub struct SurfacesByDidCache {
     ttl: Duration,
     snapshot: Mutex<Option<(Instant, SurfacesByDid)>>,
@@ -261,11 +263,11 @@ impl SurfacesByDidCache {
                 return None;
             }
         };
-        let by_did = managed_surfaces_by_did(&records, |id| {
-            live_surfaces
-                .iter()
-                .find(|s| s.surface_id == id)
-        });
+        let live_by_id: HashMap<&str, &AgentSurface> = live_surfaces
+            .iter()
+            .map(|s| (s.surface_id.as_str(), s))
+            .collect();
+        let by_did = managed_surfaces_by_did(&records, |id| live_by_id.get(id).copied());
         let surfaces = by_did
             .get(did)
             .cloned()
@@ -736,6 +738,16 @@ mod tests {
         ];
 
         assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha", "charlie"]));
+    }
+
+    #[test]
+    fn managed_surfaces_count_entries_without_role_on_a2a_proxy_surfaces() {
+        let mut record = managed("did:web:a", "proxy");
+        record.channel_usage = vec![usage("proxy", None)];
+        let mut proxy = surface("proxy", "PROXY");
+        proxy.target.endpoint = "a2a-proxy://worker".to_string();
+
+        assert_eq!(by_did_over(&[record], &[proxy])["did:web:a"], set(&["proxy"]));
     }
 
     #[test]

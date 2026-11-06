@@ -859,19 +859,23 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   identity.
 - Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
   adds to the set rather than replacing it.
-- The name cell shows the display name prominently, with the shortened DID in monospace
-  beside it and a copy button for the full DID. Without a name, the shortened DID and
-  copy button are the primary line, with no placeholder chip. While a caller name
-  lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
-  DID. A verified agent name renders as `local · host` with a verified marker. A caller's
-  Agent Card name (`agent_card`), a managed agent's target Agent Card name
-  (`target_agent_card`) and a surface name show no badge.
+- The **Name** column (`IdentityNameCell` with `showDid={false}`) shows the display name
+  prominently. The header is "Name", not "Agent Name": the column holds display names, and
+  _agent name_ is the verified `host/@local` handle only. While a caller name lookup is
+  pending (`display_name_pending`), it shows a muted "resolving…" line. A verified agent
+  name renders as `local · host` with a verified marker. A caller's Agent Card name
+  (`agent_card`), a managed agent's target Agent Card name (`target_agent_card`) and a
+  surface name show no badge. Without a display name, it shows `metadata.agent_name`, else
+  a muted, italic "Unnamed Agent".
+- The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
+  monospace with a copy button for the full DID, then the version badge and SCID when set.
+- The table has no Usage Count column; the usage count is still in the expanded details and
+  the API.
 - A **shared managed DID** is the managed agent on more than one live surface: its
   `managed_surfaces` (every live surface where the DID is the managed agent, sorted by name;
-  omitted when empty) has two or more entries. It is one row. Its name cell shows a muted,
+  omitted when empty) has two or more entries. It is one row. Its Name cell shows a muted,
   italic "Unnamed Agent" (so it is not mistaken for an Agent Card named that), then "N
-  surfaces", then the shortened DID with its copy button, as on named rows. This applies
-  even if a `display_name` arrives.
+  surfaces". This applies even if a `display_name` arrives.
 - The **Agent Surface** cell lists every surface in `managed_surfaces` for a shared managed
   DID, each linking to `/surfaces/<surface_id>` (live name preferred), not the last-used
   `channel_*` surface. Other rows show their single surface link as before. The credential
@@ -882,12 +886,15 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.
 - Managed rows show an origin badge, the live surface name linking to
   `/surfaces/<surface_id>`, and the credential principal as a separate field.
-- Search also matches the surface names in `managed_surfaces`.
-- When the backend sends none of the naming fields, the page renders as it did without
-  them: no name line or origin badge.
+- Search also matches the surface names in `managed_surfaces`. It does not match the
+  last-used `channel_name` of a managed row, which may be a surface where the DID was only a
+  caller.
+- When the backend sends none of the naming fields, the Name column still shows, with
+  `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
-  `types.ts`), present only when the identity's surface has a Trust Recorder. It is the
-  gateway recorder's last known outcome, not a live registry check. When any identity has it,
+  `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
+  A shared managed DID carries the worst outcome across those surfaces. It is the gateway
+  recorder's last known outcome, not a live registry check. When any identity has it,
   the table gains a **Recorder** column and the filter row gains a **Recorder** select; with
   none, neither appears and the page looks as before.
   - The column holds `IdentityRecorderChip`, a shared `Badge` (never colour-only: the text is
@@ -910,6 +917,7 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | ------------------------------ | ------------------------------------------------------------------------ |
 | Identity row                   | `identities-row-<did>`                                                   |
 | Name, pending, verified        | `identities-name`, `identities-name-pending`, `identities-name-verified` |
+| No name                        | `identities-name-empty`                                                  |
 | Shared managed DID name, count | `identities-unnamed-agent`, `identities-shared-surface-count`            |
 | Copy DID                       | `identities-copy-did-button`                                             |
 | Origin badge                   | `identities-origin-<origin>`                                             |

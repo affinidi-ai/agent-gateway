@@ -125,8 +125,8 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
         (fallbackName ? (
           <strong data-testid="identities-name">{fallbackName}</strong>
         ) : (
-          <span className="text-muted" data-testid="identities-name-empty">
-            -
+          <span className="text-muted fst-italic" data-testid="identities-name-empty">
+            Unnamed Agent
           </span>
         ))}
       {showDid && (

@@ -116,6 +116,15 @@ describe('useIdentityRows managed surfaces', () => {
     expect(dids(rows([shared, single], { searchTerm: 'bravo' }))).toEqual(['did:shared']);
   });
 
+  it('does not find a managed DID by a surface where it was only a caller', () => {
+    const legacy: Identity = {
+      ...identity('did:legacy'),
+      channel_config_id: 's-delta',
+      channel_name: 'delta',
+    };
+    expect(dids(rows([shared, legacy], { searchTerm: 'delta' }))).toEqual(['did:legacy']);
+  });
+
   it('has no unnamed-only filter or count', () => {
     const view = rows([shared, identity('did:anon')]);
     expect(view).not.toHaveProperty('unnamedCount');

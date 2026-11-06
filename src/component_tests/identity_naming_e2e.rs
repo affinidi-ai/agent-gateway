@@ -15,6 +15,7 @@ use crate::observability::IdentityInfo;
 use crate::observability::caller_names::{CallerNameService, CallerNameSources};
 use crate::observability::dashboard::{build_identity_list_with, identities_changed_since};
 use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
+use crate::trust_registries::reference_fields::surface_reference_values;
 
 const CALLER_DID: &str = "did:web:acme.com:billing";
 const CARD_URL: &str = "https://acme.com/.well-known/agent-card.json";
@@ -278,6 +279,81 @@ async fn surface_where_the_managed_agent_was_only_a_caller_is_not_listed() {
     assert_eq!(row["display_name"], json!("alpha"));
     assert_eq!(row["surface_id"], json!("alpha"));
     assert_eq!(row["managed_surfaces"], json!([{ "surface_id": "alpha", "surface_name": "alpha" }]));
+}
+
+#[tokio::test]
+async fn managed_agent_that_calls_another_surface_keeps_its_name_through_issuance() {
+    let fixture = Fixture::new(&[("oxygen", "oxygen"), ("delta", "delta")]).await;
+    let (issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer_with(fixture.identities.clone()).await;
+    issuer.set_surface_store(fixture.surfaces.clone());
+    let hash = || Some("bravo-key-hash".to_string());
+    let bravo_key = || {
+        HashMap::from([
+            ("credential_type".to_string(), json!("api_key")),
+            ("api_key_id".to_string(), json!("bravo-key")),
+        ])
+    };
+
+    let managed = issuer
+        .issue_or_get_managed_credential(bravo_key(), hash(), Some("oxygen".into()), None)
+        .await
+        .expect("managed credential");
+    let caller = issuer
+        .issue_or_get_caller_credential(bravo_key(), hash(), Some("delta".into()), None)
+        .await
+        .expect("caller credential");
+    assert_eq!(caller.did, managed.did);
+    let reissued = issuer
+        .issue_or_get_managed_credential(bravo_key(), hash(), Some("oxygen".into()), None)
+        .await
+        .expect("managed credential again");
+
+    assert_eq!(credential_subject(&reissued.credential)["name"], json!("oxygen"));
+    let row = serde_json::to_value(&fixture.rows().await[&managed.did]).expect("row JSON");
+    assert_eq!(row["display_name"], json!("oxygen"));
+    assert_eq!(row["managed_surfaces"], json!([{ "surface_id": "oxygen", "surface_name": "oxygen" }]));
+    let records = fixture
+        .identities
+        .list_all()
+        .await
+        .expect("identities");
+    let live = fixture
+        .surfaces
+        .list_all()
+        .await
+        .expect("surfaces");
+    let oxygen = live
+        .iter()
+        .find(|s| s.surface_id == "oxygen")
+        .expect("oxygen");
+    let published: Vec<(String, String)> = surface_reference_values(oxygen, &records, &live)
+        .into_iter()
+        .map(|value| {
+            (
+                value.id,
+                value
+                    .name
+                    .as_str()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        published.contains(&(managed.did.clone(), "oxygen".to_string())),
+        "oxygen must publish its managed agent name: {published:?}"
+    );
+}
+
+fn credential_subject(jwt: &str) -> Value {
+    use base64::Engine;
+    let payload = jwt
+        .split('.')
+        .nth(1)
+        .expect("JWT payload segment");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    serde_json::from_slice::<Value>(&bytes).expect("JSON payload")["credentialSubject"].clone()
 }
 
 #[tokio::test]
