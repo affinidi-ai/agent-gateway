@@ -479,10 +479,15 @@ agent card response. The client does not follow redirects. A non-2xx answer, a 3
 reaches the peer as its status with the body "Upstream error: <status>", as on the direct path, so
 nothing the Target says about the credential reaches the peer.
 
-Every other public read skips caller authentication and is forwarded as the peer sent it, without
-the credential: another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the
-card path, the legacy `/.well-known/agent.json`, and a card path with a query, dot segments,
-percent-escapes or another case. A credential that cannot be resolved under
+Every other public read skips caller authentication and is forwarded without the credential:
+another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the card path, the
+legacy `/.well-known/agent.json`, and a card path with a query, dot segments or percent-escapes.
+Without a configured card location it is forwarded as the peer sent it. On a surface with a
+configured card location, every `GET` or `HEAD` of a discovery path is sent to that location on the
+Target's origin, still without the credential. A card path in another case, such as
+`/.well-known/Agent-Card.json`, is not a public read, because the discovery path match is
+case-sensitive: it is a caller's request, source authentication runs on it, and it carries the
+credential when the caller authenticated. A credential that cannot be resolved under
 `target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as the
 direct path and the MCP proxy path.
 
@@ -491,10 +496,15 @@ Two things differ from the direct path:
 - The direct path answers a request of any method to `/.well-known/agent-card.json` or the legacy
   `/.well-known/agent.json` with its card fetch. Over Fabric only a `GET` of
   `/.well-known/agent-card.json` or the configured card location is the card fetch; any other read
-  of a card path is forwarded as sent, without `target.auth`.
-- Over Fabric a `GET` at the configured card location is the card fetch for any caller: the
-  gateway sends it as its own request with `target.auth` and returns the card. That includes a
-  caller who failed source authentication on a surface that forwards failed callers to policy.
+  of a card path is a public read without `target.auth`, or a caller's request as described above.
+- Over Fabric a `GET` at the configured card location is the card fetch: the gateway sends it as
+  its own request with `target.auth` and returns the card. When that location is not a public
+  discovery path, such as `/cards/me`, source authentication still runs on it first. A caller who
+  failed source authentication gets the card on a surface that forwards failed callers to policy,
+  but a closed surface (`access_point.public: false`) or one whose
+  `caller_authentication.on_failure` is `reject` answers `401`. The sending gateway's own card
+  fetch carries no caller credential, so on such a surface it gets `401` at the configured
+  location.
 
 The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
 from the gateway's secrets store rather than opening one per request. Under

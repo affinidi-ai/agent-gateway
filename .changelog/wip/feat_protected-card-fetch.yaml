@@ -28,9 +28,10 @@ changes:
         from the peer, with no delegated credential, transit token or trace id. Its answer
         reaches the peer with only the headers that describe the card, and a refusal with only
         its status. Any other public read, a HEAD of the card path or the legacy agent.json
-        included, is forwarded as sent without the credential. A GET at the configured card
-        location is the card fetch for any caller, including one who failed source
-        authentication on a surface that forwards failed callers to policy. The card read for
+        included, is forwarded without the credential. A GET at the configured card location is
+        the card fetch after source authentication, including for a caller who failed it on a
+        surface that forwards failed callers to policy; a closed surface or one that rejects
+        failed callers answers it 401. The card read for
         policy input now presents the Target credential and is cached per surface and Target
         authentication for up to 60 seconds.
   removed: []

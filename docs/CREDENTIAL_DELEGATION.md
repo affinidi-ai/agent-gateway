@@ -999,11 +999,16 @@ provider with different scopes each keep their own token. The token shows in the
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
 receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
-configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
-credential, the legacy
-`/.well-known/agent.json` fallback of a Fabric card read included. A token that
+configured card location; a `HEAD`, a query, `/discovery` and every other discovery read a peer
+sends get no credential, a peer's read of the legacy `/.well-known/agent.json` included. The
+receiving gateway's own card read for its policy input is a card fetch too: it presents the
+credential at the configured card location, or else at `<target>/.well-known/agent.json` (see
+[`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
-`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
+`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the
+VP Audit Log names the cause. The policy card read is the exception: it writes no record, logs a
+warning and leaves the policy input without a card, or under `passthrough` reads the card without
+the credential ([`POLICY.md`](POLICY.md#other-pinned-egress-sinks)). A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
 above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
