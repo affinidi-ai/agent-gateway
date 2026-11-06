@@ -1,7 +1,10 @@
 //! API handlers for delegation vault management and OAuth callback
 
 use super::{
-    DelegationToken, DelegationTokenListItem, notifier::SharedVaultPopulationNotifier, oauth,
+    DelegationToken, DelegationTokenListItem,
+    notifier::SharedVaultPopulationNotifier,
+    oauth,
+    read_scope::{VaultReadScope, VaultReader},
     storage::DelegationVaultStorage,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
@@ -16,7 +19,7 @@ use axum::{
     Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -55,14 +58,50 @@ pub struct DelegationVaultState {
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
+/// A read refused because the credential providers could not be read. It
+/// answers `500` with `refusal` and no detail.
+struct ProvidersUnreadable {
+    refusal: &'static str,
+}
+
+impl IntoResponse for ProvidersUnreadable {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": self.refusal }))).into_response()
+    }
+}
+
+/// What the caller may read of the agent-keyed tokens and the delegation
+/// audit. While the credential providers cannot be read, a caller that needs
+/// them is refused with `refusal` and no detail.
+async fn caller_read_scope(
+    state: &DelegationVaultState,
+    reader: &VaultReader,
+    action: &'static str,
+    refusal: &'static str,
+) -> Result<VaultReadScope, ProvidersUnreadable> {
+    VaultReadScope::of(Some(state.provider_store.as_ref()), reader)
+        .await
+        .map_err(|error| {
+            warn!(
+                target: "credential_delegation",
+                action,
+                error = %error,
+                "Delegation vault read refused: the credential providers could not be read"
+            );
+            ProvidersUnreadable { refusal }
+        })
+}
+
 /// GET /api/v1/delegation-vault
 pub async fn list_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
 ) -> impl IntoResponse {
-    // Fail closed: listing enumerates every user's/agent's grants, so it must be
-    // attributable to an authenticated actor — symmetric with the revokes.
+    // Fail closed: the list shows other users' and agents' grants, every one
+    // the caller's read scope covers, so it must be attributable to an
+    // authenticated actor, as the revokes are.
     if management_caller_context(caller.as_ref(), delegation.as_ref()).is_none() {
         warn!(
             target: "credential_delegation",
@@ -72,6 +111,10 @@ pub async fn list_tokens(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let scope = match caller_read_scope(&state, &reader, "list", "Failed to list").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     match state
         .vault_store
@@ -81,13 +124,14 @@ pub async fn list_tokens(
         Ok(tokens) => {
             let items: Vec<DelegationTokenListItem> = tokens
                 .iter()
+                .filter(|t| scope.reads(Some(&t.credential_provider_id)))
                 .map(|t| t.into())
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(items).unwrap())).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to list: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "list", error = %e, "Delegation token list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to list"}))).into_response()
         }
     }
 }
@@ -97,6 +141,7 @@ pub async fn get_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a single-grant read must be attributable to an authenticated
@@ -111,23 +156,27 @@ pub async fn get_token(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let scope = match caller_read_scope(&state, &reader, "get", "Failed to get").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     match state
         .vault_store
         .get(&id)
         .await
     {
-        Ok(Some(token)) => {
+        Ok(Some(token)) if scope.reads(Some(&token.credential_provider_id)) => {
             // Return metadata only — never expose access_token/refresh_token via API
             let item: DelegationTokenListItem = (&token).into();
             (StatusCode::OK, Json(serde_json::to_value(item).unwrap())).into_response()
         }
-        Ok(None) => {
+        Ok(_) => {
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to get: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "get", error = %e, "Delegation token read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to get"}))).into_response()
         }
     }
 }
@@ -137,6 +186,7 @@ pub async fn revoke_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a revoke must be attributable to an authenticated actor.
@@ -153,6 +203,15 @@ pub async fn revoke_token(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "revoke",
+            "Delegation token revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
@@ -185,8 +244,14 @@ pub async fn revoke_token(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                id = %loggable::untrusted(&id),
+                action = "revoke",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation token revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
@@ -196,6 +261,7 @@ pub async fn revoke_user_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(user_hash): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a mass-revoke must be attributable to an authenticated actor.
@@ -212,6 +278,15 @@ pub async fn revoke_user_tokens(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            user_hash = %loggable::untrusted(&user_hash),
+            action = "revoke_all",
+            "Delegation mass-revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
@@ -242,8 +317,14 @@ pub async fn revoke_user_tokens(
             (StatusCode::OK, Json(serde_json::json!({"revoked": count}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                user_hash = %loggable::untrusted(&user_hash),
+                action = "revoke_all",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation mass-revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
@@ -585,7 +666,7 @@ pub async fn oauth_callback(
                     super::audit::DelegationAuditAction::ConsentGranted,
                     Some(&oauth_state.agent_did),
                     Some(&oauth_state.user_identity_hash),
-                    Some(&oauth_state.provider_id),
+                    Some(&provider.id),
                     Some(&oauth_state.surface_id),
                 );
                 evt.scopes = Some(granted_scopes.clone());
@@ -765,13 +846,21 @@ pub struct AuditLogQuery {
 }
 
 /// GET /api/v1/delegation-audit
-pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoResponse {
+pub async fn list_audit_events(
+    State(state): State<DelegationVaultState>,
+    reader: VaultReader,
+    Query(query): Query<AuditLogQuery>,
+) -> impl IntoResponse {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query
         .page_size
         .unwrap_or(25)
         .clamp(1, 100);
     let filter = query.filter.as_deref();
+    let scope = match caller_read_scope(&state, &reader, "audit", "Failed to read audit log").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     // Exclude VP-audit categories (policy decisions / trust checks) up front so
     // `events`, `total`, and `total_pages` stay consistent — they belong to the
@@ -784,16 +873,14 @@ pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoR
             exclude_vp_audit: true,
             ..Default::default()
         },
+        &scope,
     )
     .await
     {
         Ok(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response(),
         Err(e) => {
-            warn!(target: "credential_delegation", error = %e, "Failed to read audit log");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to read audit log: {}", e)})),
-            )
+            warn!(target: "credential_delegation", action = "audit", error = %e, "Failed to read audit log");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to read audit log"})))
                 .into_response()
         }
     }

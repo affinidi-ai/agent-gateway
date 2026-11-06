@@ -22,12 +22,50 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use super::read_scope::VaultReadScope;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
 use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
 static AUDIT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUDIT_PATH_OVERRIDE: Option<PathBuf>;
+}
+
+/// Runs `future` reading the VP Audit Log from `path` instead of the one set
+/// up at startup.
+#[cfg(test)]
+pub async fn reading_audit_log_from<F: std::future::Future>(
+    path: PathBuf,
+    future: F,
+) -> F::Output {
+    AUDIT_PATH_OVERRIDE
+        .scope(Some(path), future)
+        .await
+}
+
+/// Runs `future` as if no VP Audit Log were set up, so reading it fails.
+#[cfg(test)]
+pub async fn without_an_audit_log<F: std::future::Future>(future: F) -> F::Output {
+    AUDIT_PATH_OVERRIDE
+        .scope(None, future)
+        .await
+}
+
+#[cfg(not(test))]
+fn audit_log_path() -> Option<PathBuf> {
+    AUDIT_PATH.get().cloned()
+}
+
+#[cfg(test)]
+fn audit_log_path() -> Option<PathBuf> {
+    AUDIT_PATH_OVERRIDE
+        .try_with(Option::clone)
+        .unwrap_or_else(|_| AUDIT_PATH.get().cloned())
+}
 
 /// The audit pipeline, run only while the node is Active.
 static AUDIT_PIPELINE: OnceLock<PipelineControl> = OnceLock::new();
@@ -125,7 +163,11 @@ pub struct DelegationAuditEvent {
     /// SHA-256 hash of the user's identity
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
-    /// Credential provider ID (machine-readable)
+    /// The id of the credential provider involved. A tenant's access token
+    /// reads the record only when that provider is its tenant's. A
+    /// `consent_granted` the OAuth callback wrote in earlier releases holds
+    /// the provider's `provider_id` slug instead, so only appliance-wide
+    /// callers read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     /// Human-readable provider name
@@ -1611,17 +1653,18 @@ pub struct AuditLogFilter<'a> {
     pub exclude_vp_audit: bool,
 }
 
-/// Read the audit log file with pagination (newest first). Every [`AuditLogFilter`]
-/// is applied **before** pagination and the category tally so `total`,
-/// `total_pages`, and `category_counts` stay consistent with the returned page.
+/// Read the audit log file with pagination (newest first). Only the records
+/// `reader` may read are kept, and every [`AuditLogFilter`] is applied to them
+/// **before** pagination and the category tally, so `total`, `total_pages`,
+/// and `category_counts` stay consistent with the returned page and count no
+/// other record.
 pub async fn read_audit_log(
     page: usize,
     page_size: usize,
     opts: AuditLogFilter<'_>,
+    reader: &VaultReadScope,
 ) -> anyhow::Result<AuditLogPage> {
-    let path = AUDIT_PATH
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?;
+    let path = audit_log_path().ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?;
 
     let content = tokio::fs::read_to_string(path)
         .await
@@ -1640,6 +1683,7 @@ pub async fn read_audit_log(
             }
             serde_json::from_str::<DelegationAuditEvent>(line).ok()
         })
+        .filter(|event| reader.reads(event.provider_id.as_deref()))
         .collect();
 
     enrich_policy_decisions_from_signed_vps(&mut events);

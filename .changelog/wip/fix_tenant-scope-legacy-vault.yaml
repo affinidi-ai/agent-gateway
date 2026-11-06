@@ -1,0 +1,73 @@
+branch: fix/tenant-scope-legacy-vault
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-05T15:59:31Z'
+      title: Show a tenant's access token the consents its own providers recorded
+      description: >-
+        A tenant's access token never read its own tenant's consent_granted records from the OAuth
+        callback, and the dashboard's link from such a record to its credential provider opened no
+        provider, because the record did not name the provider's id. Both now work for new
+        records; records written by earlier releases are shown only to appliance-wide callers.
+  removed: []
+  security:
+    - timestamp: '2026-11-04T12:55:20Z'
+      title: Show a tenant's access token only its own tenant's delegation vault tokens
+      description: >-
+        GET /api/v1/delegation-vault and GET /api/v1/delegation-vault/{id} returned every tenant's
+        agent-keyed tokens, as metadata, to a tenant's access token. A vault token now belongs to
+        its credential provider's tenant: a tenant's access token lists only its own tenant's, and
+        reading another answers 404 like a missing token. Tokens of an appliance-wide, missing or
+        deleted provider are shown only to appliance-wide callers, since an appliance-wide provider
+        can hold any tenant's callers' tokens. Sessions and appliance-wide access tokens still read
+        every token.
+    - timestamp: '2026-11-04T13:10:56Z'
+      title: Show a tenant's access token only its own tenant's delegation audit records
+      description: >-
+        GET /api/v1/delegation-audit and GET /v1/audit returned the whole audit log to a tenant's
+        access token. It now gets only records whose credential provider belongs to its tenant,
+        and totals, category counts and the text filter cover only those. Records without a
+        provider, such as policy decisions, and records of an appliance-wide, missing or deleted
+        provider are shown only to appliance-wide callers. Dashboard sessions and appliance-wide
+        access tokens still read the whole log.
+    - timestamp: '2026-11-05T15:38:38Z'
+      title: Keep store error detail out of delegation vault and audit error answers
+      description: >-
+        The delegation vault's list, read and revoke routes, its revoke of a user's tokens and
+        GET /api/v1/delegation-audit answered a failed store read or revoke with the store's error
+        text, which can quote storage file paths. They now answer a fixed body, such as
+        {"error":"Failed to revoke"}, and log the detail instead. The revokes log it escaped,
+        since it can quote the id the caller sent.
+    - timestamp: '2026-11-06T15:23:03Z'
+      title: Refuse the server log download to a tenant's access token
+      description: >-
+        GET /v1/logs/download served the server logs, which hold every tenant's request and
+        credential delegation detail, to any caller with audit.view, a tenant's access token or one
+        scoped by a resource pattern included. It now answers such a token 403; sessions and
+        appliance-wide access tokens still download the logs. A failed download answers
+        {"error":"Failed to download logs"} instead of an error naming the log directory, and the
+        detail is logged.
+  breaking:
+    - timestamp: '2026-11-06T15:27:37Z'
+      title: ⭐ Name the provider's id, not its slug, in consent_granted audit records
+      description: >-
+        The OAuth callback's consent_granted record now holds the credential provider's record id
+        in provider_id, as every other delegation audit record does, where it held the provider's
+        provider_id slug. This applies in the VP Audit Log and in what Governance Audit
+        integrations receive. A consumer that matched these records by slug must match the
+        provider's id. Records written by earlier releases keep the slug.
+    - timestamp: '2026-11-06T15:01:09Z'
+      title: ⭐ Refuse delegation records and logs to tokens scoped by required headers alone
+      description: >-
+        An access token scoped by required headers alone, or by a resource pattern without a
+        tenant, read every tenant's agent-keyed vault tokens and delegation audit records on
+        GET /api/v1/delegation-vault, GET /api/v1/delegation-vault/{id}, GET
+        /api/v1/delegation-audit and GET /v1/audit, and one scoped by required headers alone could
+        revoke any tenant's tokens. Such a token now reads none of them: lists and audit pages are
+        empty and every token answers 404. DELETE /api/v1/delegation-vault/{id} and DELETE
+        /api/v1/delegation-vault/by-user/{user_hash} now answer 403 to every caller but a session or
+        an appliance-wide access token, and keep the tokens, and GET /v1/logs/download answers 403
+        to such a token. Automation that read or revoked these records, or downloaded the logs,
+        with such a token needs an appliance-wide access token, or a tenant's token to read its
+        own tenant's records.
