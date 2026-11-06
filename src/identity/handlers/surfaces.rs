@@ -4446,11 +4446,14 @@ async fn revoke_api_keys_of_deleted_surface(
         .into_iter()
         .filter(|key| key.agent_id == surface_id && key.status == crate::api_keys::ApiKeyStatus::Active)
     {
-        if let Err(error) = api_keys
+        match api_keys
             .revoke(surface_id, &key.key_id, SURFACE_DELETE_ACTOR)
             .await
         {
-            error!(surface = %surface_id, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface");
+            Ok(()) => crate::identity::provider_key_gate::gate().key_changed(&key.key_id),
+            Err(error) => {
+                error!(surface = %surface_id, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface")
+            }
         }
     }
 }

@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use super::surface_target_auth::BrokenTargetRule;
 use super::surface_tenancy::{
-    ProviderKeyIssue, collect_surface_reference_keys, provider_key_ids, provider_key_verdict,
+    KeyListing, ProviderKeyIssue, collect_surface_reference_keys, provider_key_ids, provider_key_verdict,
 };
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
@@ -91,8 +91,8 @@ pub(crate) struct SkippedSurface {
     pub error: String,
 }
 
-/// An API Key Provider key id a stored surface derives a DID from that it may not use, or whose
-/// key or owning surface is gone.
+/// An API Key Provider key id a stored surface derives a DID from that it may not use, that is
+/// revoked, or whose key or owning surface is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderKeyFinding {
     pub surface_id: String,
@@ -111,7 +111,7 @@ pub(crate) fn find_breaches(
     providers: &[CredentialProvider],
     surfaces: &[AgentSurface],
     secret_tenants: &HashMap<&str, Option<&str>>,
-    key_owners: Option<&HashMap<String, Vec<String>>>,
+    key_owners: Option<&KeyListing>,
     egress: &TokenEgress,
     https_proxies: &HttpsMcpProxies,
 ) -> Findings {
@@ -216,7 +216,7 @@ pub(crate) async fn report_key_owners(
     listed: Option<KeyOwnersListing>,
     api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>,
     surfaces: &[AgentSurface],
-) -> Option<HashMap<String, Vec<String>>> {
+) -> Option<KeyListing> {
     let listing = match listed {
         Some(listing) => listing,
         None if surfaces
@@ -330,7 +330,7 @@ fn log_findings(
             api_key_id = %finding.issue.key_id,
             issue = finding.issue.kind.as_str(),
             not_ready = finding.issue.kind.is_breach(),
-            "Stored surface derives a DID from an API key it may not use, or whose key or surface is gone"
+            "Stored surface derives a DID from an API key it may not use, or that is revoked, or whose key or surface is gone"
         );
     }
     for skipped in &findings.skipped {
@@ -1033,7 +1033,7 @@ mod tests {
 
     fn provider_key_findings(
         naming_surfaces: Vec<AgentSurface>,
-        owners: Option<&HashMap<String, Vec<String>>>,
+        owners: Option<&KeyListing>,
         isolation: crate::config::credential_policy::RuleMode,
     ) -> Vec<(String, &'static str, bool)> {
         let mut surfaces = vec![
@@ -1053,7 +1053,7 @@ mod tests {
             .collect()
     }
 
-    fn key_owners() -> HashMap<String, Vec<String>> {
+    fn key_owners() -> KeyListing {
         [
             ("atgk_t1", "owner-t1"),
             ("atgk_t2", "owner-t2"),
@@ -1062,7 +1062,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(key, owner)| (key.to_string(), vec![owner.to_string()]))
-        .collect()
+        .collect::<HashMap<_, _>>()
+        .into()
     }
 
     #[test]
@@ -1112,6 +1113,28 @@ mod tests {
                 .is_empty(),
             "a surface naming its own key is not reported"
         );
+    }
+
+    #[test]
+    fn a_surface_naming_a_revoked_provider_key_is_reported_revoked_key_in_both_modes() {
+        use crate::config::credential_policy::RuleMode;
+        let mut owners = key_owners();
+        owners.revoked = ["atgk_t1".to_string()].into();
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(
+                provider_key_findings(
+                    vec![
+                        naming("owner-t1", Some("t1"), "atgk_t1"),
+                        legacy_caller("legacy-own", Some("t1"), "atgk_t1", true),
+                        naming("owner-t2", Some("t2"), "atgk_t2"),
+                    ],
+                    Some(&owners),
+                    mode
+                ),
+                vec![("owner-t1".to_string(), "revoked_key", true), ("legacy-own".to_string(), "revoked_key", true),],
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

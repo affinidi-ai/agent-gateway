@@ -2,12 +2,17 @@
 //! derives such a DID with no key lookup, so a stored surface naming a key it may not use is
 //! held back here: under `tenant_credential_isolation: warn` it is only logged, under `enforce`
 //! it is not ready, and while the API key store cannot be read a surface naming a key id that has
-//! not been checked is not ready. Verdicts are taken when a surface goes live and on the first
-//! request that finds none for the key ids the served surface names, and kept per surface id; a
-//! key id judged while the store could not be read, like one found missing, is judged again once
-//! its recheck is due, and the verdicts that read a surface as a key's owner are dropped when that
-//! surface changes. Admitting the surfaces of a boot or reload reads the API key store once, and
-//! the credential policy report of that boot or reload judges from the same listing.
+//! not been checked is not ready. A surface naming a revoked key is not ready in every mode.
+//! Verdicts are taken when a surface goes live and on the first request that finds none for the
+//! key ids the served surface names, and kept per surface id. Such a judgment lists the whole API
+//! key store and reads from disk the key folders of the surface and of the owners of the keys it
+//! names, so a key another node created or revoked is seen. A key id found then is judged again
+//! once its recheck is due, by one request at a time, from those folders alone, read from disk;
+//! a key id found missing, or judged while the store could not be read, is judged again from a
+//! whole listing. The verdicts that read a surface as a key's owner are dropped when that surface
+//! changes, and those that judged a key when this node changes its status.
+//! Admitting the surfaces of a boot or reload reads the API key store once, and the credential
+//! policy report of that boot or reload judges from the same listing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,8 +24,8 @@ use tracing::{info, warn};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::handlers::surface_tenancy::{
-    ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, complete_provider_key_owners_in, judge_provider_keys,
-    provider_key_ids, served_provider_key_ids,
+    KeyListing, ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, complete_provider_key_listing_in,
+    judge_provider_keys, provider_key_ids, served_provider_key_ids,
 };
 use crate::source_auth::errors::NotReadyReason;
 
@@ -30,28 +35,29 @@ pub const PROVIDER_KEY_TENANT_RULE: &str = "provider_key_tenant";
 /// The reason a surface naming a key id is not ready while the API key store cannot be read.
 pub const API_KEY_STORE_UNAVAILABLE: &str = "api_key_store_unavailable";
 
-/// The surfaces owning each API key, by key id, from one listing of the API key store that
-/// loaded every key folder, or why the store could not be read.
-pub type KeyOwnersListing = Result<HashMap<String, Vec<String>>, &'static str>;
+/// The reason a surface naming a revoked key is not ready.
+pub const API_KEY_REVOKED: &str = "api_key_revoked";
 
-/// Lists the owners of every key of `api_keys`; an error when there is no store or the keys of a
-/// key folder could not be loaded.
+/// The surfaces owning each API key, by key id, and the revoked key ids, from one listing of the
+/// API key store that loaded every key folder, or why the store could not be read.
+pub type KeyOwnersListing = Result<KeyListing, &'static str>;
+
+/// Lists the owners and status of every key of `api_keys`; an error when there is no store or
+/// the keys of a key folder could not be loaded.
 pub(crate) async fn list_key_owners(api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>) -> KeyOwnersListing {
-    complete_provider_key_owners_in(api_keys.ok_or("the API key store is not configured")?)
+    complete_provider_key_listing_in(api_keys.ok_or("the API key store is not configured")?)
         .await
         .map_err(|_| "listing API keys failed")
 }
 
-/// How long a key id found missing, whose owning surface was missing, or judged while the API
-/// key store could not be read, is kept as judged without `cache_refresh_interval_secs`. A key
-/// another node creates shows up in this node's API key store at the next listing, so the id is
-/// judged again after this long, but no sooner: a surface naming a key that does not exist, or
-/// served while the store cannot be read, lists the API key store at most this often.
+/// How long a key id is kept as judged without `cache_refresh_interval_secs`. A key another
+/// node creates or revokes is read at the next judgment, so the id is judged again after this
+/// long, but no sooner: a surface naming a key id reads the key folders of the keys it names
+/// from disk, and lists the API key store for a key found missing, at most this often.
 const MISSING_KEY_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long a missing key id is kept as judged: `cache_refresh_interval_secs` when set, the
-/// interval at which this node's stores pick up other nodes' writes, else
-/// [`MISSING_KEY_RECHECK`].
+/// How long a key id is kept as judged: `cache_refresh_interval_secs` when set, the interval at
+/// which this node's stores pick up other nodes' writes, else [`MISSING_KEY_RECHECK`].
 fn missing_key_recheck() -> std::time::Duration {
     match crate::storage::filesystem::cache_refresh_interval_secs() {
         0 => MISSING_KEY_RECHECK,
@@ -65,20 +71,25 @@ struct Sources {
     surfaces: Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
 }
 
-/// The surfaces owning each key, by key id, and the store their tenants are read from.
+/// The surfaces owning each key, by key id, the revoked key ids, the stores the keys and their
+/// surfaces' tenants are read from, and whether the keys come from a listing of the whole store.
 struct Owners {
-    keys: HashMap<String, Vec<String>>,
+    keys: KeyListing,
+    api_keys: Arc<dyn crate::api_keys::store::ApiKeyStore>,
     surfaces: Arc<dyn crate::surfaces::AgentSurfaceStore>,
+    complete: bool,
 }
 
-/// The key ids judged for a surface of `tenant_id`, those of them it may not use, those judged
-/// while the stores could not be read, the surfaces read as their owners, and when each id found
-/// missing or judged during an outage is judged again.
+/// The key ids judged for a surface of `tenant_id`, those found in a key folder, those of them it
+/// may not use, those revoked, those judged while the stores could not be read, the surfaces read
+/// as their owners, and when each id is judged again.
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     tenant_id: Option<String>,
     judged: HashSet<String>,
+    found: HashSet<String>,
     refused: HashSet<String>,
+    revoked: HashSet<String>,
     unavailable: HashSet<String>,
     owners: HashSet<String>,
     recheck: HashMap<String, Instant>,
@@ -102,54 +113,93 @@ impl Entry {
                         .is_none_or(|at| now < *at)
             }))
         .then(|| {
-            if ids
-                .all()
-                .any(|id| self.unavailable.contains(id))
-            {
-                return Some(NotReadyReason::ApiKeyStoreUnavailable);
-            }
-            ids.all()
-                .any(|id| self.refused.contains(id))
-                .then_some(NotReadyReason::ProviderKeyTenant)
+            let any = |set: &HashSet<String>| {
+                ids.all()
+                    .any(|id| set.contains(id))
+            };
+            refusal(any(&self.unavailable), any(&self.revoked), any(&self.refused))
         })
     }
 
-    /// The verdict `issues` gives for `ids`, judging an id found missing, or one the stores
-    /// could not judge, again at `recheck_at`.
+    /// When the entry judged every id of `ids` for `tenant_id` and each one due for a recheck at
+    /// `now` was found in a key folder: those ids, to be judged again from the key folders of the
+    /// surfaces read as their owners, which are returned too.
+    fn found_due(
+        &self,
+        tenant_id: Option<&str>,
+        ids: &ProviderKeyIds,
+        now: Instant,
+    ) -> Option<(ProviderKeyIds, HashSet<String>)> {
+        let due = |id: &String| {
+            self.recheck
+                .get(id)
+                .is_some_and(|at| now >= *at)
+        };
+        let eligible = self.tenant_id.as_deref() == tenant_id
+            && ids
+                .all()
+                .all(|id| self.judged.contains(id) && (!due(id) || self.found.contains(id)))
+            && ids.all().any(due);
+        eligible.then(|| {
+            let pick = |list: &[String]| {
+                list.iter()
+                    .filter(|id| due(id))
+                    .cloned()
+                    .collect()
+            };
+            (
+                ProviderKeyIds {
+                    keys: pick(&ids.keys),
+                    legacy_secrets: pick(&ids.legacy_secrets),
+                },
+                self.owners.clone(),
+            )
+        })
+    }
+
+    /// The verdict `issues` gives for `ids`, judging again at `recheck_at` every id found in a key
+    /// folder, found missing, or judged while the stores could not be read.
     fn of(
         surface: &AgentSurface,
         ids: &ProviderKeyIds,
         verdict: &Verdict,
         recheck_at: Instant,
     ) -> Self {
+        let ids_where = |keep: &dyn Fn(ProviderKeyIssueKind) -> bool| {
+            verdict
+                .issues
+                .iter()
+                .filter(|issue| keep(issue.kind))
+                .map(|issue| issue.key_id.clone())
+                .collect()
+        };
         Self {
             tenant_id: surface.tenant_id.clone(),
             judged: ids.all().cloned().collect(),
-            unavailable: verdict
-                .issues
-                .iter()
-                .filter(|issue| issue.kind == ProviderKeyIssueKind::StoreUnavailable)
-                .map(|issue| issue.key_id.clone())
-                .collect(),
-            refused: verdict
-                .issues
-                .iter()
-                .filter(|issue| issue.kind.is_breach() && issue.kind != ProviderKeyIssueKind::StoreUnavailable)
-                .map(|issue| issue.key_id.clone())
-                .collect(),
+            found: verdict.found.clone(),
+            unavailable: ids_where(&|kind| kind == ProviderKeyIssueKind::StoreUnavailable),
+            revoked: ids_where(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
+            refused: ids_where(&|kind| {
+                kind.is_breach()
+                    && !matches!(kind, ProviderKeyIssueKind::StoreUnavailable | ProviderKeyIssueKind::RevokedKey)
+            }),
             owners: verdict.owners.clone(),
-            recheck: verdict
-                .issues
-                .iter()
-                .filter(|issue| {
-                    matches!(
-                        issue.kind,
-                        ProviderKeyIssueKind::MissingKey
-                            | ProviderKeyIssueKind::MissingOwner { .. }
-                            | ProviderKeyIssueKind::StoreUnavailable
-                    )
+            recheck: ids
+                .all()
+                .filter(|id| {
+                    verdict.found.contains(*id)
+                        || verdict
+                            .issues
+                            .iter()
+                            .any(|issue| {
+                                issue.key_id == **id
+                                    && matches!(
+                                        issue.kind,
+                                        ProviderKeyIssueKind::MissingKey | ProviderKeyIssueKind::StoreUnavailable
+                                    )
+                            })
                 })
-                .map(|issue| (issue.key_id.clone(), recheck_at))
+                .map(|id| (id.clone(), recheck_at))
                 .collect(),
         }
     }
@@ -165,14 +215,19 @@ impl Entry {
             return;
         }
         for id in &later.judged {
+            self.found.remove(id);
             self.refused.remove(id);
+            self.revoked.remove(id);
             self.unavailable.remove(id);
             self.recheck.remove(id);
         }
         self.judged
             .extend(later.judged);
+        self.found.extend(later.found);
         self.refused
             .extend(later.refused);
+        self.revoked
+            .extend(later.revoked);
         self.unavailable
             .extend(later.unavailable);
         self.owners
@@ -184,19 +239,39 @@ impl Entry {
 
 struct Verdict {
     issues: Vec<ProviderKeyIssue>,
+    found: HashSet<String>,
     owners: HashSet<String>,
     store_unavailable: bool,
 }
 
 impl Verdict {
     fn reason(&self) -> Option<NotReadyReason> {
-        if self.store_unavailable {
-            return Some(NotReadyReason::ApiKeyStoreUnavailable);
-        }
-        self.issues
-            .iter()
-            .any(|issue| issue.kind.is_breach())
-            .then_some(NotReadyReason::ProviderKeyTenant)
+        let any = |kind: &dyn Fn(ProviderKeyIssueKind) -> bool| {
+            self.issues
+                .iter()
+                .any(|issue| kind(issue.kind))
+        };
+        refusal(
+            self.store_unavailable,
+            any(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
+            any(&|kind| kind.is_breach()),
+        )
+    }
+}
+
+/// Why a surface is refused: while the stores cannot be read, then for a revoked key, then for
+/// a key it may not use.
+fn refusal(
+    unavailable: bool,
+    revoked: bool,
+    refused: bool,
+) -> Option<NotReadyReason> {
+    if unavailable {
+        Some(NotReadyReason::ApiKeyStoreUnavailable)
+    } else if revoked {
+        Some(NotReadyReason::ApiKeyRevoked)
+    } else {
+        refused.then_some(NotReadyReason::ProviderKeyTenant)
     }
 }
 
@@ -204,7 +279,8 @@ impl Verdict {
 pub struct ProviderKeyGate {
     sources: std::sync::RwLock<Sources>,
     entries: DashMap<String, Entry>,
-    owner_changes: AtomicU64,
+    rechecks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    changes: AtomicU64,
     store_outage_logged: AtomicBool,
     #[cfg(test)]
     missing_key_recheck: std::sync::Mutex<Option<std::time::Duration>>,
@@ -289,8 +365,14 @@ impl ProviderKeyGate {
         if naming.is_empty() {
             return None;
         }
-        let owner_changes = self.owner_changes();
-        let listing = self.list_owners().await;
+        let changes = self.changes();
+        let listing = self
+            .list_owners_from_disk(
+                naming
+                    .iter()
+                    .map(|(surface, ids)| (surface.surface_id.as_str(), ids)),
+            )
+            .await;
         for (surface, ids) in naming {
             let verdict = self
                 .judge_from(surface, &ids, &listing)
@@ -300,11 +382,11 @@ impl ProviderKeyGate {
                 .entries
                 .entry(surface.surface_id.clone())
             {
-                dashmap::Entry::Occupied(kept) if self.owner_changes() != owner_changes => {
+                dashmap::Entry::Occupied(kept) if self.changes() != changes => {
                     kept.remove();
                 }
                 dashmap::Entry::Occupied(mut kept) => *kept.get_mut() = judged,
-                dashmap::Entry::Vacant(vacant) if self.owner_changes() == owner_changes => {
+                dashmap::Entry::Vacant(vacant) if self.changes() == changes => {
                     vacant.insert(judged);
                 }
                 dashmap::Entry::Vacant(_) => {}
@@ -320,6 +402,8 @@ impl ProviderKeyGate {
     ) {
         self.entries
             .remove(surface_id);
+        self.rechecks
+            .remove(surface_id);
     }
 
     /// Drops every verdict that read `surface_id` as the owner of a key, so a surface naming its
@@ -329,7 +413,7 @@ impl ProviderKeyGate {
         &self,
         surface_id: &str,
     ) {
-        self.owner_changes
+        self.changes
             .fetch_add(1, Ordering::SeqCst);
         self.entries
             .retain(|_, entry| {
@@ -337,6 +421,19 @@ impl ProviderKeyGate {
                     .owners
                     .contains(surface_id)
             });
+    }
+
+    /// Drops every verdict that judged `key_id`, so a surface naming the key is judged again on
+    /// its next request after this node revokes or deletes it. Called once the key's change is
+    /// stored; a judgment already reading the stores when this runs is not kept.
+    pub fn key_changed(
+        &self,
+        key_id: &str,
+    ) {
+        self.changes
+            .fetch_add(1, Ordering::SeqCst);
+        self.entries
+            .retain(|_, entry| !entry.judged.contains(key_id));
     }
 
     /// Why a request to `surface`, as served, is refused because it derives a DID from a key id,
@@ -356,7 +453,13 @@ impl ProviderKeyGate {
         {
             return reason;
         }
-        let owner_changes = self.owner_changes();
+        if let Some(reason) = self
+            .recheck_found(surface, &ids)
+            .await
+        {
+            return reason;
+        }
+        let changes = self.changes();
         let verdict = self
             .judge(surface, &ids)
             .await;
@@ -365,7 +468,7 @@ impl ProviderKeyGate {
             .entries
             .entry(surface.surface_id.clone())
         {
-            _ if self.owner_changes() != owner_changes => {}
+            _ if self.changes() != changes => {}
             dashmap::Entry::Occupied(mut kept) => kept.get_mut().merge(judged),
             dashmap::Entry::Vacant(vacant) => {
                 vacant.insert(judged);
@@ -374,10 +477,56 @@ impl ProviderKeyGate {
         verdict.reason()
     }
 
-    /// How many key owners have changed, read before a judgment and again, under the entry's
-    /// lock, before its verdict is kept.
-    fn owner_changes(&self) -> u64 {
-        self.owner_changes
+    /// Judges again, one request at a time per surface, the due key ids of a kept verdict that
+    /// were found in a key folder, from the key folders of the surface and of the surfaces read as
+    /// their owners, read from disk, without listing the whole store: owners stay valid, as key
+    /// ids are never reused, and a key folder this verdict does not read cannot refuse it. `None`
+    /// when no such verdict applies, or it no longer covers `ids` once merged, so the surface is
+    /// judged from a whole listing.
+    async fn recheck_found(
+        &self,
+        surface: &AgentSurface,
+        ids: &ProviderKeyIds,
+    ) -> Option<Option<NotReadyReason>> {
+        let tenant_id = surface.tenant_id.as_deref();
+        let flight = self
+            .rechecks
+            .entry(surface.surface_id.clone())
+            .or_default()
+            .clone();
+        let _flight = flight.lock().await;
+        let (due, mut folders) = {
+            let entry = self
+                .entries
+                .get(&surface.surface_id)?;
+            if let Some(reason) = entry.decides(tenant_id, ids, Instant::now()) {
+                return Some(reason);
+            }
+            entry.found_due(tenant_id, ids, Instant::now())?
+        };
+        folders.insert(surface.surface_id.clone());
+        let changes = self.changes();
+        let listing = self
+            .list_folders(folders, &due)
+            .await;
+        let verdict = self
+            .judge_from(surface, &due, &listing)
+            .await;
+        let judged = Entry::of(surface, &due, &verdict, self.recheck_at());
+        let mut kept = self
+            .entries
+            .get_mut(&surface.surface_id)?;
+        if self.changes() != changes {
+            return None;
+        }
+        kept.merge(judged);
+        kept.decides(tenant_id, ids, Instant::now())
+    }
+
+    /// How many key owners and keys have changed, read before a judgment and again, under the
+    /// entry's lock, before its verdict is kept.
+    fn changes(&self) -> u64 {
+        self.changes
             .load(Ordering::SeqCst)
     }
 
@@ -399,8 +548,9 @@ impl ProviderKeyGate {
             .decides(surface.tenant_id.as_deref(), &ids, Instant::now())?
         {
             Some(NotReadyReason::ApiKeyStoreUnavailable) => Some(API_KEY_STORE_UNAVAILABLE),
-            Some(_) => Some(PROVIDER_KEY_TENANT_RULE),
-            None => None,
+            Some(NotReadyReason::ApiKeyRevoked) => Some(API_KEY_REVOKED),
+            Some(NotReadyReason::ProviderKeyTenant) => Some(PROVIDER_KEY_TENANT_RULE),
+            Some(NotReadyReason::NoSourceAuthentication) | None => None,
         }
     }
 
@@ -414,7 +564,7 @@ impl ProviderKeyGate {
             .contains_key(surface_id)
     }
 
-    /// When a key id found missing now is judged again.
+    /// When a key id judged now is judged again.
     fn recheck_at(&self) -> Instant {
         #[cfg(test)]
         if let Some(recheck) = *self
@@ -427,7 +577,7 @@ impl ProviderKeyGate {
         Instant::now() + missing_key_recheck()
     }
 
-    /// The owners of every key, read from the API key store, or why they cannot be.
+    /// The owners and status of every key, read from the API key store, or why they cannot be.
     async fn list_owners(&self) -> Result<Owners, &'static str> {
         let sources = self
             .sources
@@ -438,7 +588,51 @@ impl ProviderKeyGate {
             return Err("the API key store is not configured");
         };
         let keys = list_key_owners(Some(api_keys.as_ref())).await?;
-        Ok(Owners { keys, surfaces })
+        Ok(Owners {
+            keys,
+            api_keys,
+            surfaces,
+            complete: true,
+        })
+    }
+
+    /// The keys of `ids` held in the key folders `folders`, read from disk, and nothing else.
+    async fn list_folders(
+        &self,
+        folders: HashSet<String>,
+        ids: &ProviderKeyIds,
+    ) -> Result<Owners, &'static str> {
+        let sources = self
+            .sources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (Some(api_keys), Some(surfaces)) = (sources.api_keys, sources.surfaces) else {
+            return Err("the API key store is not configured");
+        };
+        let mut owners = Owners {
+            keys: KeyListing::default(),
+            api_keys,
+            surfaces,
+            complete: false,
+        };
+        let named = ids
+            .all()
+            .map(String::as_str)
+            .collect();
+        take_in_from_disk(&mut owners, folders, &named).await?;
+        Ok(owners)
+    }
+
+    /// [`Self::list_owners`], with the keys each surface of `naming` names, by surface id, read
+    /// from disk, so a key another node created or revoked is judged as it is stored.
+    async fn list_owners_from_disk<'a>(
+        &self,
+        naming: impl IntoIterator<Item = (&'a str, &'a ProviderKeyIds)>,
+    ) -> Result<Owners, &'static str> {
+        let mut owners = self.list_owners().await?;
+        read_named_keys_from_disk(&mut owners, naming).await?;
+        Ok(owners)
     }
 
     async fn judge(
@@ -446,7 +640,9 @@ impl ProviderKeyGate {
         surface: &AgentSurface,
         ids: &ProviderKeyIds,
     ) -> Verdict {
-        let listing = self.list_owners().await;
+        let listing = self
+            .list_owners_from_disk([(surface.surface_id.as_str(), ids)])
+            .await;
         self.judge_from(surface, ids, &listing)
             .await
     }
@@ -459,13 +655,19 @@ impl ProviderKeyGate {
     ) -> Verdict {
         let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
         let tenant_id = surface.tenant_id.as_deref();
-        let Owners { keys: owners, surfaces } = match listing {
+        let Owners {
+            keys: owners,
+            surfaces,
+            complete,
+            ..
+        } = match listing {
             Ok(owners) => owners,
             Err(cause) => return self.store_outage(surface, ids, isolation, cause),
         };
         let mut owner_ids: Vec<String> = Vec::new();
         for id in ids.all() {
             for owner_id in owners
+                .owners
                 .get(id)
                 .into_iter()
                 .flatten()
@@ -483,9 +685,10 @@ impl ProviderKeyGate {
                 Err(_) => return self.store_outage(surface, ids, isolation, "reading a key's surface failed"),
             }
         }
-        if self
-            .store_outage_logged
-            .swap(false, Ordering::Relaxed)
+        if *complete
+            && self
+                .store_outage_logged
+                .swap(false, Ordering::Relaxed)
         {
             info!("The API key store can be read again: surfaces naming an API key id are judged as they serve");
         }
@@ -497,6 +700,15 @@ impl ProviderKeyGate {
         log(surface, &issues);
         Verdict {
             issues,
+            found: ids
+                .all()
+                .filter(|id| {
+                    owners
+                        .owners
+                        .contains_key(*id)
+                })
+                .cloned()
+                .collect(),
             owners: owner_ids
                 .into_iter()
                 .collect(),
@@ -533,10 +745,61 @@ impl ProviderKeyGate {
                 &HashMap::new(),
                 isolation,
             ),
+            found: HashSet::new(),
             owners: HashSet::new(),
             store_unavailable: true,
         }
     }
+}
+
+/// Reads from disk the key folder of each surface of `naming` and of every surface `owners`
+/// lists as owning a key id one of them names, each folder once, and takes in the named keys they
+/// hold, so a key another node created or revoked since this node loaded the folder is listed as
+/// stored. Only those folders are read; their cached keys are refreshed.
+async fn read_named_keys_from_disk<'a>(
+    owners: &mut Owners,
+    naming: impl IntoIterator<Item = (&'a str, &'a ProviderKeyIds)>,
+) -> Result<(), &'static str> {
+    let mut folders: HashSet<String> = HashSet::new();
+    let mut named: HashSet<&str> = HashSet::new();
+    for (surface_id, ids) in naming {
+        folders.insert(surface_id.to_string());
+        for id in ids.all() {
+            named.insert(id.as_str());
+            folders.extend(
+                owners
+                    .keys
+                    .owners
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+    }
+    take_in_from_disk(owners, folders, &named).await
+}
+
+/// Reads each key folder of `folders` from disk and takes the keys of `named` it holds into
+/// `owners`; an error when a folder cannot be read.
+async fn take_in_from_disk(
+    owners: &mut Owners,
+    folders: HashSet<String>,
+    named: &HashSet<&str>,
+) -> Result<(), &'static str> {
+    for folder in folders {
+        let keys = owners
+            .api_keys
+            .list_from_disk(&folder)
+            .await
+            .map_err(|_| "reading a key folder from disk failed")?;
+        for key in keys {
+            if named.contains(key.key_id.as_str()) {
+                owners.keys.add(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One line per verdict that finds anything: the surface, its tenant, the rule, and each key id
@@ -559,7 +822,7 @@ fn log(
         rule = PROVIDER_KEY_TENANT_RULE,
         api_key_ids = %found,
         not_ready = issues.iter().any(|issue| issue.kind.is_breach()),
-        "Surface derives a DID from an API key it may not use, or whose key or surface is gone"
+        "Surface derives a DID from an API key it may not use, or that is revoked, or whose key or surface is gone"
     );
 }
 
@@ -686,9 +949,17 @@ mod tests {
         let later = now + std::time::Duration::from_secs(30);
         let entry = Entry {
             tenant_id: Some("tenant-a".into()),
-            judged: [KEY_A.to_string(), KEY_B.to_string(), "atgk_missing".to_string(), "atgk_unread".to_string()]
-                .into(),
+            judged: [
+                KEY_A.to_string(),
+                KEY_B.to_string(),
+                "atgk_missing".to_string(),
+                "atgk_unread".to_string(),
+                "atgk_revoked".to_string(),
+            ]
+            .into(),
             refused: [KEY_B.to_string()].into(),
+            found: HashSet::new(),
+            revoked: ["atgk_revoked".to_string()].into(),
             unavailable: ["atgk_unread".to_string()].into(),
             owners: HashSet::new(),
             recheck: [("atgk_missing".to_string(), later), ("atgk_unread".to_string(), later)].into(),
@@ -707,6 +978,18 @@ mod tests {
             "a missing key is judged again once its recheck is due"
         );
         assert_eq!(entry.decides(Some("tenant-a"), &ids(&[KEY_A, "atgk_unread"]), now), Some(Some(outage)));
+        let revoked = NotReadyReason::ApiKeyRevoked;
+        assert_eq!(entry.decides(Some("tenant-a"), &ids(&["atgk_revoked"]), now), Some(Some(revoked)));
+        assert_eq!(
+            entry.decides(Some("tenant-a"), &ids(&[KEY_B, "atgk_revoked"]), now),
+            Some(Some(revoked)),
+            "a revoked key is named before a key the surface may not use"
+        );
+        assert_eq!(
+            entry.decides(Some("tenant-a"), &ids(&["atgk_revoked", "atgk_unread"]), now),
+            Some(Some(outage)),
+            "an outage is named first"
+        );
         assert_eq!(
             entry.decides(Some("tenant-a"), &ids(&["atgk_unread"]), later),
             None,
@@ -951,6 +1234,8 @@ mod tests {
         failures: AtomicUsize,
         listings: Arc<AtomicUsize>,
         owner_changed_while_listing: Option<(&'static ProviderKeyGate, &'static str)>,
+        key_changed_while_listing: Option<(&'static ProviderKeyGate, &'static str)>,
+        disk_reads: Arc<AtomicUsize>,
     }
 
     impl FlakyKeys {
@@ -964,6 +1249,8 @@ mod tests {
                 failures: AtomicUsize::new(failures),
                 listings: Arc::default(),
                 owner_changed_while_listing: None,
+                key_changed_while_listing: None,
+                disk_reads: Arc::default(),
             }
         }
     }
@@ -1010,6 +1297,17 @@ mod tests {
                 .await
         }
 
+        async fn list_from_disk(
+            &self,
+            agent_id: &str,
+        ) -> crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>> {
+            self.disk_reads
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .list_from_disk(agent_id)
+                .await
+        }
+
         async fn list_all(&self) -> crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>> {
             self.listings
                 .fetch_add(1, Ordering::SeqCst);
@@ -1022,6 +1320,9 @@ mod tests {
             }
             if let Some((gate, owner)) = self.owner_changed_while_listing {
                 gate.owner_changed(owner);
+            }
+            if let Some((gate, key_id)) = self.key_changed_while_listing {
+                gate.key_changed(key_id);
             }
             self.inner.list_all().await
         }
@@ -1170,7 +1471,489 @@ mod tests {
             .entries
             .get("later")
             .unwrap();
-        assert!(entry.recheck.is_empty() && entry.refused.contains(later), "{entry:?}");
+        assert!(
+            entry.refused.contains(later)
+                && entry
+                    .recheck
+                    .contains_key(later),
+            "{entry:?}"
+        );
+    }
+
+    fn use_isolation(mode: crate::config::credential_policy::RuleMode) {
+        crate::config::credential_policy::use_thread_credential_policy(
+            crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_revoked_on_this_node_refuses_the_surfaces_naming_it_at_once_in_both_modes() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let enforced = gate().await;
+            use_isolation(mode);
+            let own = naming("owner-a", "tenant-a", external(KEY_A));
+            let active = naming("owner-b", "tenant-b", external(KEY_B));
+            enforced
+                .gate
+                .admit_all([&own, &active])
+                .await;
+            assert_eq!(
+                enforced
+                    .gate
+                    .refuses(&own)
+                    .await,
+                None,
+                "{mode:?}"
+            );
+
+            enforced
+                .api_keys
+                .revoke("owner-a", KEY_A, "test")
+                .await
+                .unwrap();
+            enforced
+                .gate
+                .key_changed(KEY_A);
+
+            assert!(
+                enforced
+                    .gate
+                    .has_verdict("owner-b"),
+                "a verdict that judged another key is kept"
+            );
+            assert_eq!(
+                enforced
+                    .gate
+                    .refuses(&own)
+                    .await,
+                Some(NotReadyReason::ApiKeyRevoked),
+                "{mode:?}: the first request after the revoke"
+            );
+            assert_eq!(
+                enforced
+                    .gate
+                    .refuses(&own)
+                    .await,
+                Some(NotReadyReason::ApiKeyRevoked),
+                "{mode:?}: the kept verdict"
+            );
+            assert_eq!(
+                enforced
+                    .gate
+                    .recorded_refusal(&own),
+                Some(API_KEY_REVOKED)
+            );
+            assert_eq!(
+                enforced
+                    .gate
+                    .refuses(&active)
+                    .await,
+                None,
+                "{mode:?}: an active own key still serves"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_revoked_on_another_node_is_refused_once_the_recheck_is_due_and_not_before() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        use_isolation(crate::config::credential_policy::RuleMode::Warn);
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        other_node(&enforced)
+            .await
+            .revoke("owner-a", KEY_A, "test")
+            .await
+            .unwrap();
+        let cached_status = |enforced: &super::test_support::EnforcedGate| {
+            let api_keys = enforced.api_keys.clone();
+            async move {
+                api_keys
+                    .list("owner-a")
+                    .await
+                    .unwrap()[0]
+                    .status
+            }
+        };
+        assert_eq!(cached_status(&enforced).await, crate::api_keys::ApiKeyStatus::Active, "this node's cache is stale");
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None,
+            "within the recheck interval the kept verdict stands"
+        );
+
+        expire_rechecks(enforced.gate, "owner-a");
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            Some(NotReadyReason::ApiKeyRevoked),
+            "once due, the key's folder is read from disk"
+        );
+        assert_eq!(cached_status(&enforced).await, crate::api_keys::ApiKeyStatus::Revoked);
+    }
+
+    async fn other_node(enforced: &super::test_support::EnforcedGate) -> crate::api_keys::FileSystemApiKeyStore {
+        crate::api_keys::FileSystemApiKeyStore::new(
+            &enforced
+                .dir
+                .path()
+                .join("api_keys")
+                .to_string_lossy(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_key_another_node_added_to_a_loaded_folder_and_revoked_is_refused_once_the_recheck_is_due() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        use_isolation(crate::config::credential_policy::RuleMode::Warn);
+        let later = "atgk_gate_added";
+        let other_node = other_node(&enforced).await;
+        other_node
+            .create_with_material("owner-a", later.to_string(), "atgs_added".to_string(), "client", None, "test")
+            .await
+            .unwrap();
+        other_node
+            .revoke("owner-a", later, "test")
+            .await
+            .unwrap();
+        let names_later = naming("owner-a", "tenant-a", external(later));
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&names_later)
+                .await,
+            Some(NotReadyReason::ApiKeyRevoked),
+            "the surface's own folder is read from disk, though this node loaded it before the key was added"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitting_a_surface_reads_the_status_of_the_keys_it_names_from_disk() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        use_isolation(crate::config::credential_policy::RuleMode::Warn);
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let cross = naming("cross", "tenant-a", external(KEY_B));
+        other_node(&enforced)
+            .await
+            .revoke("owner-b", KEY_B, "test")
+            .await
+            .unwrap();
+        other_node(&enforced)
+            .await
+            .revoke("owner-a", KEY_A, "test")
+            .await
+            .unwrap();
+
+        enforced
+            .gate
+            .admit_all([&own, &cross])
+            .await;
+
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&own),
+            Some(API_KEY_REVOKED)
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&cross),
+            Some(API_KEY_REVOKED),
+            "another surface's key is read from its owner's folder"
+        );
+    }
+
+    /// Makes every recheck kept for `surface_id` due now, leaving later ones at the usual interval.
+    fn due_now(
+        gate: &ProviderKeyGate,
+        surface_id: &str,
+    ) {
+        gate.entries
+            .get_mut(surface_id)
+            .unwrap()
+            .recheck
+            .values_mut()
+            .for_each(|at| *at = Instant::now());
+    }
+
+    /// Makes `folder` of the API key store of `enforced` unreadable; `false` when running as root,
+    /// where every read succeeds.
+    fn lock_folder(
+        enforced: &super::test_support::EnforcedGate,
+        folder: &str,
+    ) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = enforced
+            .dir
+            .path()
+            .join("api_keys")
+            .join(folder);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read_dir(&path).is_err()
+    }
+
+    fn unlock_folder(
+        enforced: &super::test_support::EnforcedGate,
+        folder: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            enforced
+                .dir
+                .path()
+                .join("api_keys")
+                .join(folder),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_due_recheck_reads_only_its_own_folders_so_an_unrelated_unreadable_folder_does_not_refuse_it() {
+        let enforced = gate().await;
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        let locked = lock_folder(&enforced, "owner-b");
+        let fresh = Arc::new(other_node(&enforced).await);
+        enforced
+            .gate
+            .set_sources(Some(fresh), Some(enforced.surfaces.clone()));
+        due_now(enforced.gate, "owner-a");
+
+        let rechecked = enforced
+            .gate
+            .refuses(&own)
+            .await;
+        let first = enforced
+            .gate
+            .refuses(&naming("first", "tenant-a", external(KEY_A)))
+            .await;
+        unlock_folder(&enforced, "owner-b");
+        if !locked {
+            return;
+        }
+
+        assert_eq!(rechecked, None, "its own folder reads fine");
+        assert_eq!(first, Some(NotReadyReason::ApiKeyStoreUnavailable), "a first judgment still lists the whole store");
+    }
+
+    #[tokio::test]
+    async fn a_due_recheck_whose_own_folder_is_unreadable_refuses_as_unavailable() {
+        let enforced = gate().await;
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        let locked = lock_folder(&enforced, "owner-a");
+        due_now(enforced.gate, "owner-a");
+
+        let rechecked = enforced
+            .gate
+            .refuses(&own)
+            .await;
+        unlock_folder(&enforced, "owner-a");
+        if !locked {
+            return;
+        }
+
+        assert_eq!(rechecked, Some(NotReadyReason::ApiKeyStoreUnavailable));
+    }
+
+    #[tokio::test]
+    async fn requests_that_find_the_same_recheck_due_read_the_folders_once() {
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        let disk_reads = flaky.disk_reads.clone();
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        assert_eq!(listings.load(Ordering::SeqCst), 1);
+        let before = disk_reads.load(Ordering::SeqCst);
+        due_now(enforced.gate, "owner-a");
+
+        let answers = futures::future::join_all((0..5).map(|_| enforced.gate.refuses(&own))).await;
+
+        assert_eq!(answers, vec![None; 5]);
+        assert_eq!(disk_reads.load(Ordering::SeqCst) - before, 1, "one read of the one folder");
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "a recheck lists no whole store");
+    }
+
+    #[tokio::test]
+    async fn rotating_a_key_keeps_its_surface_serving_and_a_revoked_key_stays_revoked() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        enforced
+            .gate
+            .admit(&own)
+            .await;
+
+        enforced
+            .api_keys
+            .rotate("owner-a", KEY_A, "test")
+            .await
+            .unwrap();
+        expire_rechecks(enforced.gate, "owner-a");
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None,
+            "a rotated key stays active"
+        );
+
+        enforced
+            .api_keys
+            .revoke("owner-a", KEY_A, "test")
+            .await
+            .unwrap();
+        enforced
+            .gate
+            .key_changed(KEY_A);
+        let rotated = enforced
+            .api_keys
+            .rotate("owner-a", KEY_A, "test")
+            .await;
+        assert!(
+            rotated
+                .as_ref()
+                .is_err_and(|error| error.to_string() == format!("API key already revoked: {KEY_A}")),
+            "{:?}",
+            rotated.map(|created| created.key_id)
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            Some(NotReadyReason::ApiKeyRevoked)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judgment_a_key_change_overtakes_is_not_kept() {
+        let enforced = gate().await;
+        let keys = FlakyKeys::failing(&enforced, 0);
+        enforced.gate.set_sources(
+            Some(Arc::new(FlakyKeys {
+                key_changed_while_listing: Some((enforced.gate, KEY_A)),
+                ..keys
+            })),
+            Some(enforced.surfaces.clone()),
+        );
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        assert!(
+            !enforced
+                .gate
+                .has_verdict("owner-a"),
+            "a verdict a key change overtook is not kept"
+        );
+    }
+
+    #[test]
+    fn a_revoked_key_is_a_breach_in_both_modes_reported_once_whoever_owns_it() {
+        use crate::config::credential_policy::RuleMode;
+        let mut listing: KeyListing = HashMap::from([
+            (KEY_A.to_string(), vec!["owner-a".to_string()]),
+            (KEY_B.to_string(), vec!["owner-b".to_string()]),
+        ])
+        .into();
+        listing.revoked = [KEY_A.to_string(), KEY_B.to_string()].into();
+        let tenants: HashMap<&str, Option<&str>> =
+            [("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))].into();
+        let legacy = |id: &str| ProviderKeyIds {
+            keys: Vec::new(),
+            legacy_secrets: vec![id.to_string()],
+        };
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let judge = |surface_id: &str, ids: &ProviderKeyIds| {
+                judge_provider_keys(surface_id, Some("tenant-a"), ids, Some(&listing), &tenants, mode)
+                    .into_iter()
+                    .map(|issue| (issue.key_id, issue.kind))
+                    .collect::<Vec<_>>()
+            };
+            let revoked = |id: &str| vec![(id.to_string(), ProviderKeyIssueKind::RevokedKey)];
+            assert_eq!(judge("owner-a", &ids(&[KEY_A])), revoked(KEY_A), "{mode:?}: its own key");
+            assert_eq!(judge("borrower", &ids(&[KEY_B])), revoked(KEY_B), "{mode:?}: another tenant's key");
+            assert_eq!(judge("owner-a", &legacy(KEY_A)), revoked(KEY_A), "{mode:?}: a legacy secret");
+            assert_eq!(judge("owner-a", &legacy("atgk_gone")), vec![], "{mode:?}: a legacy secret no key has");
+        }
+        assert!(ProviderKeyIssueKind::RevokedKey.is_breach());
+        assert_eq!(ProviderKeyIssueKind::RevokedKey.as_str(), "revoked_key");
+    }
+
+    #[test]
+    fn a_key_id_is_listed_revoked_when_any_of_its_records_is() {
+        let meta = |agent: &str, status| crate::api_keys::ApiKeyMeta {
+            key_id: KEY_A.to_string(),
+            agent_id: agent.to_string(),
+            status,
+            ..serde_json::from_value(serde_json::json!({
+                "key_id": KEY_A, "agent_id": agent, "client_id": "client", "status": "active",
+                "created_at": "2026-01-01T00:00:00Z", "issuer": {"actor": "test", "method": "test"},
+                "needs_rotation": false
+            }))
+            .unwrap()
+        };
+        let mut listing = KeyListing::default();
+        listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Active));
+        assert!(listing.revoked.is_empty());
+        listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Revoked));
+        listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Active));
+        assert_eq!(listing.revoked, [KEY_A.to_string()].into());
+        assert_eq!(listing.owners[KEY_A], vec!["owner-a".to_string()], "an owner is listed once");
     }
 
     #[test]
@@ -1285,7 +2068,7 @@ mod tests {
     /// The provider key rows the credential policy report gives `surfaces` from `owners`.
     fn report_rows(
         surfaces: &[AgentSurface],
-        owners: Option<&HashMap<String, Vec<String>>>,
+        owners: Option<&KeyListing>,
     ) -> Vec<(String, &'static str, bool)> {
         crate::identity::handlers::credential_policy_report::find_breaches(
             &[],
@@ -1359,7 +2142,13 @@ mod tests {
         assert!(listed.is_none());
         let owners = report_key_owners(listed, Some(flaky.as_ref()), &[plain.clone(), inactive.clone()]).await;
         assert_eq!(listings.load(Ordering::SeqCst), 1, "the report reads for a stored surface naming a key id");
-        assert_eq!(owners.unwrap().get(KEY_B), Some(&vec!["owner-b".to_string()]));
+        assert_eq!(
+            owners
+                .unwrap()
+                .owners
+                .get(KEY_B),
+            Some(&vec!["owner-b".to_string()])
+        );
 
         assert_eq!(report_key_owners(None, Some(flaky.as_ref()), &[plain]).await, None);
         assert_eq!(listings.load(Ordering::SeqCst), 1, "no surface names a key id: no listing");
@@ -1482,8 +2271,11 @@ mod tests {
 
     #[test]
     fn another_surfaces_key_is_judged_other_surface_and_another_tenants_only_other_tenant() {
-        let owners: HashMap<String, Vec<String>> =
-            [(KEY_A.to_string(), vec!["owner-a".to_string()]), (KEY_B.to_string(), vec!["owner-b".to_string()])].into();
+        let owners: KeyListing = HashMap::from([
+            (KEY_A.to_string(), vec!["owner-a".to_string()]),
+            (KEY_B.to_string(), vec!["owner-b".to_string()]),
+        ])
+        .into();
         let tenants: HashMap<&str, Option<&str>> =
             [("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))].into();
         let judge = |surface_id: &str, ids: &ProviderKeyIds, isolation| {
@@ -1564,7 +2356,7 @@ mod tests {
             .refuses(&naming("own", "tenant-a", external(KEY_A)))
             .await;
         let lenient = crate::identity::handlers::surface_tenancy::provider_key_owners_in(other_node.as_ref()).await;
-        let strict = complete_provider_key_owners_in(other_node.as_ref()).await;
+        let strict = complete_provider_key_listing_in(other_node.as_ref()).await;
         let cross = [naming("cross", "tenant-a", external(KEY_B))];
         let reported = crate::identity::handlers::credential_policy_report::report_key_owners(
             None,

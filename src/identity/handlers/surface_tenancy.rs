@@ -1814,6 +1814,8 @@ pub(crate) enum ProviderKeyIssueKind {
     MissingOwner { enforced: bool },
     /// The API key store is unavailable, so the key's owner cannot be told.
     StoreUnavailable,
+    /// The key is revoked, so its DID must not be derived; a breach in every isolation mode.
+    RevokedKey,
 }
 
 impl ProviderKeyIssueKind {
@@ -1825,6 +1827,7 @@ impl ProviderKeyIssueKind {
             Self::MissingKey => "missing_key",
             Self::MissingOwner { .. } => "missing_owner",
             Self::StoreUnavailable => "store_unavailable",
+            Self::RevokedKey => "revoked_key",
         }
     }
 
@@ -1833,6 +1836,7 @@ impl ProviderKeyIssueKind {
         matches!(
             self,
             Self::StoreUnavailable
+                | Self::RevokedKey
                 | Self::OtherTenant { enforced: true }
                 | Self::ApplianceKey { enforced: true }
                 | Self::OtherSurface { enforced: true }
@@ -1851,7 +1855,7 @@ pub(crate) struct ProviderKeyIssue {
 /// whose key or owner is gone ([`judge_provider_keys`] on [`provider_key_ids`]).
 pub(crate) fn provider_key_verdict(
     surface: &AgentSurface,
-    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    owners: Option<&KeyListing>,
     surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
@@ -1865,16 +1869,17 @@ pub(crate) fn provider_key_verdict(
     ))
 }
 
-/// The issues of the key ids `ids` the surface `surface_id` of `tenant_id` names. A key the
-/// surface owns itself has none, whatever tenant the stores read for it. A key of another
-/// tenant is reported as that, not also as another surface's. A legacy secret is
-/// reported only when a key of that id belongs to another surface. `owners` is `None` when the
-/// API key store is unavailable; `surface_tenants` maps every stored surface id to its tenant.
+/// The issues of the key ids `ids` the surface `surface_id` of `tenant_id` names. A revoked key,
+/// the surface's own or not, is reported only as revoked. Otherwise a key the surface owns
+/// itself has none, whatever tenant the stores read for it. A key of another tenant is reported
+/// as that, not also as another surface's. A legacy secret is reported only when a key of that
+/// id is revoked or belongs to another surface. `owners` is `None` when the API key store is
+/// unavailable; `surface_tenants` maps every stored surface id to its tenant.
 pub(crate) fn judge_provider_keys(
     surface_id: &str,
     tenant_id: Option<&str>,
     ids: &ProviderKeyIds,
-    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    owners: Option<&KeyListing>,
     surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Vec<ProviderKeyIssue> {
@@ -1901,12 +1906,19 @@ pub(crate) fn judge_provider_keys(
                 .map(|key_id| (key_id, true)),
         )
     {
-        let Some(owner_ids) = owners.get(key_id) else {
+        let Some(owner_ids) = owners.owners.get(key_id) else {
             if !legacy {
                 issue(key_id, ProviderKeyIssueKind::MissingKey);
             }
             continue;
         };
+        if owners
+            .revoked
+            .contains(key_id)
+        {
+            issue(key_id, ProviderKeyIssueKind::RevokedKey);
+            continue;
+        }
         for owner_id in owner_ids {
             if owner_id == surface_id {
                 continue;
@@ -1986,35 +1998,71 @@ pub(crate) async fn refuse_id_owning_api_keys(
     Ok(())
 }
 
+/// The surfaces owning each API Key Provider key, by key id, and the ids of the revoked keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyListing {
+    pub owners: std::collections::HashMap<String, Vec<String>>,
+    /// Key ids with a revoked record; a key id held by more than one surface is revoked when any
+    /// of its records is.
+    pub revoked: HashSet<String>,
+}
+
+impl KeyListing {
+    /// Takes in `key`; once revoked in any record read, its id stays revoked.
+    pub(crate) fn add(
+        &mut self,
+        key: crate::api_keys::ApiKeyMeta,
+    ) {
+        if key.status == crate::api_keys::ApiKeyStatus::Revoked {
+            self.revoked
+                .insert(key.key_id.clone());
+        }
+        let owners = self
+            .owners
+            .entry(key.key_id)
+            .or_default();
+        if !owners.contains(&key.agent_id) {
+            owners.push(key.agent_id);
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<std::collections::HashMap<String, Vec<String>>> for KeyListing {
+    fn from(owners: std::collections::HashMap<String, Vec<String>>) -> Self {
+        Self {
+            owners,
+            revoked: HashSet::new(),
+        }
+    }
+}
+
 /// [`provider_key_owners`] read from `store`. A key folder that could not be loaded is left out.
 pub(crate) async fn provider_key_owners_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
 ) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    owners_by_key(store.list_all().await)
+    key_listing(store.list_all().await).map(|listing| listing.owners)
 }
 
-/// [`provider_key_owners_in`], an error when the keys of an agent could not be loaded.
-pub(crate) async fn complete_provider_key_owners_in(
+/// The [`KeyListing`] of `store`, an error when the keys of an agent could not be loaded.
+pub(crate) async fn complete_provider_key_listing_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    owners_by_key(
+) -> Result<KeyListing, SurfaceApiError> {
+    key_listing(
         store
             .list_all_complete()
             .await,
     )
 }
 
-fn owners_by_key(
+fn key_listing(
     keys: crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>>
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+) -> Result<KeyListing, SurfaceApiError> {
+    let mut listing = KeyListing::default();
     for key in keys.map_err(|error| internal("API key", error))? {
-        owners
-            .entry(key.key_id)
-            .or_default()
-            .push(key.agent_id);
+        listing.add(key);
     }
-    Ok(owners)
+    Ok(listing)
 }
 
 fn push_reference(

@@ -1289,16 +1289,30 @@ node or another, is not seen by the check.
 
 A surface goes live without a save at boot, on a configuration reload, when the cache refresh
 scan or another node's write changes it, and on the first request to a version no check has seen.
-Each time, the gateway checks its key ids against their owning surfaces and logs one `WARN` line
-per surface that names a key it may not use, or whose key or owning surface is gone. The line
-names the `surface`, its `tenant`, `rule="provider_key_tenant"`, each key id with its issue
-(`other_tenant`, `appliance_key`, `other_surface`, `missing_key` or `missing_owner`) and
-`not_ready`. A key of another tenant is reported as `other_tenant` only; `other_surface` is a key
-of another surface the surface may otherwise reference. It carries no secret. When a surface that
+Each time, the gateway checks its key ids against their owning surfaces and the keys' status,
+and logs one `WARN` line per surface that names a key it may not use, a revoked key, or a key
+whose key or owning surface is gone. The line names the `surface`, its `tenant`,
+`rule="provider_key_tenant"`, each key id with its issue (`revoked_key`, `other_tenant`,
+`appliance_key`, `other_surface`, `missing_key` or `missing_owner`) and `not_ready`. A revoked
+key is reported as `revoked_key` only, whoever owns it. A key of another tenant is reported as
+`other_tenant` only; `other_surface` is a key of another surface the surface may otherwise
+reference. It carries no secret. When a surface that
 owns keys changes the same ways, or by a save, or is deleted, every surface naming one of its
 keys is checked again on its next request.
 
-- Under `tenant_credential_isolation: warn` the surface keeps serving.
+- In either mode, a surface naming a revoked key (`revoked_key`), its own or any other, is not
+  ready: its DID is derived from the key id with no key lookup, so a revoked key would otherwise
+  keep it. On the node that revokes the key, through `POST
+  /v1/api-keys/{agent_id}/{key_id}/revoke` or by deleting the key's surface, every surface naming
+  the key is checked again on its next request, so the next request is refused. Every other node
+  reads the key's status from disk when the surface goes live and again on the first request
+  after `cache_refresh_interval_secs` (30 seconds when it is `0`), so a revocation another node
+  wrote is seen within that interval even when `cache_refresh_interval_secs` is `0`. That
+  recheck reads only the key folders of the surface and of the surfaces found owning its keys,
+  not the whole store; one request per surface makes it while requests arriving together wait
+  for its verdict, and requests between rechecks are answered from the kept verdict. Rotating a
+  key keeps it active, so the surface keeps serving; a revoked key cannot be rotated.
+- Otherwise, under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
   tenant, the key of a surface with no tenant, the key of any other surface (`other_surface`), or
   a key whose owning surface cannot be found (`missing_owner`) is not ready. A stored surface
@@ -1331,17 +1345,23 @@ keys is checked again on its next request.
   not be visible here yet, so the request after
   `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
   appeared by then is held to the rules above. Until then the verdict is kept, so a surface
-  naming a key that does not exist does not read the API key store on every request. Each read
-  of the API key store picks up the keys of a surface whose first key another node created; a
-  key another node adds for a surface whose keys this node already holds shows up only with
+  naming a key that does not exist does not read the API key store on every request. Each check
+  picks up the keys of a surface whose first key another node created, and reads from disk the
+  key folder of the surface checked and of the surfaces owning the keys it names, so a key
+  another node added to or revoked in those folders is seen. A key another node adds to any
+  other folder whose keys this node already holds shows up only with
   `cache_refresh_interval_secs` greater than `0`, or when this node becomes Active (see
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)).
 - While the API key store cannot be read, a surface naming an `atgk_` id is not ready in either
   mode unless it was checked before the outage and has not gone live again since; a surface that
-  goes live during the outage loses its earlier verdict. The outage is logged once. The outage
-  verdict is kept like a missing key's, so the request after `cache_refresh_interval_secs` (30
-  seconds when it is `0`) checks again and the surface serves once a read succeeds; requests
-  before then are refused without reading the store.
+  goes live during the outage loses its earlier verdict. A surface checked before the outage
+  whose keys were all found keeps serving through its rechecks as long as the key folders those
+  rechecks read can be read; when one of them cannot, it is not ready like a surface checked
+  during the outage. A surface naming a key that was missing is checked again against the whole
+  store, so an outage then makes it not ready. The outage is logged once. The outage verdict is
+  kept like a missing key's, so the request after `cache_refresh_interval_secs` (30 seconds when
+  it is `0`) checks again and the surface serves once a read succeeds; requests before then are
+  refused without reading the store.
 - When a surface goes live, the store counts as unreadable while the keys of any surface's key
   folder cannot be loaded, for example when the folder cannot be read, so a key in that folder
   is never mistaken for a missing one. Saves, tenant reassignment and the `GET /v1/api-keys`
@@ -1356,16 +1376,20 @@ keys is checked again on its next request.
 
 The check also covers a Caller Context API Key `secret_id` that starts with `atgk_` on a view
 whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is
-reported like a key id when a key of that id belongs to a surface the surface may not
-reference, or to a surface with no tenant; otherwise it is a plain secret and is not reported.
-A key whose owning surface was deleted is not reported for such a secret, so a surface using it
-keeps that key's DID in either mode. Only a secret stored before the prefix was reserved can
-reach this, since new secret ids may not start with `atgk_`.
+reported like a key id when a key of that id is revoked, or belongs to a surface the surface
+may not reference, or to a surface with no tenant; otherwise it is a plain secret and is not
+reported. A key whose owning surface was deleted is not reported as `missing_owner` for such a
+secret; deleting the surface revokes the key, so it is reported as `revoked_key` and the surface
+is not ready in either mode. Only if the delete could not revoke the key, because its folder
+could not be read, does a surface using it keep that key's DID. Only a secret stored before the
+prefix was reserved can reach this, since new secret ids may not start with `atgk_`.
 
 A not-ready surface refuses every request with `503` before source authentication, policy and
 the target, on direct inbound, Fabric receive and its Transit Points, as a [not ready Access
-Point](#not-ready-access-points) does. The refusal is logged with `reason=provider_key_tenant`,
-or `reason=api_key_store_unavailable` during a store outage, and recorded in the Audit Log as
+Point](#not-ready-access-points) does. The refusal is logged with `reason=api_key_revoked` for a
+revoked key, `reason=provider_key_tenant` for a key the surface may not use, or
+`reason=api_key_store_unavailable` during a store outage, which is named first, and recorded in
+the Audit Log as
 `request_rejected` with the reason `access_point_not_ready` (a Transit Point refusal is logged
 only). The agent card preview of such a surface reports `unsupported_reason: not_running` and
 fetches nothing. The surface response's `access_point_status` stays `ready`, and the Audit Log
