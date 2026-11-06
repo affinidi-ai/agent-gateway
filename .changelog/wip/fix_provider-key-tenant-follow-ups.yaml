@@ -70,6 +70,12 @@ changes:
         failing disk or share is read at most once per interval per surface.
   removed: []
   security:
+    - timestamp: '2026-11-06T15:30:00Z'
+      title: Update actix-web and actix-http to releases with published fixes
+      description: >-
+        actix-web moves from 4.14.0 to 4.18.2 and actix-http from 3.13.1 to 3.20.3, pulled in
+        through the MCP OpenAPI dependency, so the dependency audit no longer reports their
+        advisories on chunked request trailers and on compressed request bodies.
     - timestamp: '2026-11-05T09:35:33Z'
       title: Stop Identities serving the API key DID of a deleted surface under enforce
       description: >-
