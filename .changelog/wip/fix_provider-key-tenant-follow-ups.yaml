@@ -51,4 +51,13 @@ changes:
         revoked on another node stops authenticating at this node's next cache refresh. A
         rotation re-reads the key from disk and refuses one another node revoked, and key
         records are replaced atomically so concurrent writes cannot leave a partial record.
+    - timestamp: '2026-11-05T11:30:00Z'
+      title: Refuse deleting an API key that a surface still names
+      description: >-
+        Deleting an API key, also one whose owning surface is gone, now answers 409 while any
+        stored surface names the key id in its base or a variant, as an API Key Provider key or
+        a Caller Context secret of that id. Deleting it would let a surface keep serving the key's
+        DID where a gone owner, or another tenant's key, takes it out of service under enforce. The
+        error names the
+        surfaces the caller may see and counts the rest. Revoking the key is still allowed.
   breaking: []
