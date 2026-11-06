@@ -2561,3 +2561,161 @@ async fn an_unreadable_api_key_folder_refuses_only_a_create_taking_its_id() {
         &format!("Surface ID '{LOCKED_OWNER}' is not available"),
     );
 }
+
+async fn harness_with_key_dir() -> (GatewayHarness, Api, std::path::PathBuf) {
+    let mut client = None;
+    let mut key_dir = None;
+    let harness = GatewayHarness::start(|_, _, bootstrap| {
+        client = Some(configure_admin_api(bootstrap));
+        key_dir = Some(api_keys_dir(bootstrap));
+    })
+    .await;
+    let api = Api {
+        secret_uuids: Default::default(),
+        client: client.unwrap(),
+        base: harness.gateway_base.clone(),
+        listener: harness
+            .gateway_base
+            .replace("127.0.0.1", "localhost"),
+        target: harness.mock.url(),
+    };
+    (harness, api, key_dir.unwrap())
+}
+
+async fn other_node_key_store(key_dir: &std::path::Path) -> crate::api_keys::FileSystemApiKeyStore {
+    crate::api_keys::FileSystemApiKeyStore::new(&key_dir.to_string_lossy())
+        .await
+        .unwrap()
+}
+
+async fn create_with_id(
+    api: &Api,
+    route: &str,
+    surface_id: &str,
+) -> (u16, Value) {
+    let mut surface = api.surface(route, Some("tenant-a"), json!({}));
+    surface["surface_id"] = json!(surface_id);
+    api.create(&surface).await
+}
+
+async fn delete_surface(
+    api: &Api,
+    surface_id: &str,
+) -> (u16, Value) {
+    api.send(
+        api.client
+            .delete(api.url(&format!("surfaces/{surface_id}"))),
+    )
+    .await
+}
+
+async fn stored_key_status(
+    key_dir: &std::path::Path,
+    owner: &str,
+    key_id: &str,
+) -> crate::api_keys::ApiKeyStatus {
+    use crate::api_keys::store::ApiKeyStore as _;
+    other_node_key_store(key_dir)
+        .await
+        .get_record(owner, key_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_folder_holding_any_key_record_keeps_its_id_taken() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    let (_harness, api, key_dir) = harness_with_key_dir().await;
+    other_node_key_store(&key_dir)
+        .await
+        .create("misplaced-owner", "client", None, "component-test")
+        .await
+        .unwrap();
+    std::fs::rename(key_dir.join("misplaced-owner"), key_dir.join("holding-folder")).unwrap();
+    for (folder, file) in [
+        ("unparseable-folder", "atgk_00000000000000000000000000000e01.json"),
+        ("undecryptable-folder", "atgk_00000000000000000000000000000e02.json.enc"),
+    ] {
+        std::fs::create_dir_all(key_dir.join(folder)).unwrap();
+        std::fs::write(
+            key_dir
+                .join(folder)
+                .join(file),
+            b"{\"key_id\": }\n}}",
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(key_dir.join("empty-folder")).unwrap();
+
+    let mut refused = Vec::new();
+    for surface_id in ["holding-folder", "unparseable-folder", "undecryptable-folder"] {
+        refused.push((surface_id, create_with_id(&api, &format!("/smoke/{surface_id}"), surface_id).await));
+    }
+    let (empty_status, empty_body) = create_with_id(&api, "/smoke/empty-folder", "empty-folder").await;
+
+    for (surface_id, (status, body)) in refused {
+        assert_eq!(status, 400, "{surface_id}: {body}");
+        assert_eq!(body["details"], format!("Surface ID '{surface_id}' is not available"), "{body}");
+    }
+    assert!(matches!(empty_status, 200 | 201), "a folder without keys does not take the id: {empty_body}");
+    assert_eq!(empty_body["surface_id"], "empty-folder", "{empty_body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_surface_revokes_a_key_another_node_created_after_boot() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    let (_harness, api, key_dir) = harness_with_key_dir().await;
+    let (status, body) = create_with_id(&api, "/smoke/remote-keyed", "remote-keyed").await;
+    assert!(matches!(status, 200 | 201), "{status} {body}");
+    let created = other_node_key_store(&key_dir)
+        .await
+        .create("remote-keyed", "client", None, "component-test")
+        .await
+        .unwrap();
+
+    let (status, body) = delete_surface(&api, "remote-keyed").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        stored_key_status(&key_dir, "remote-keyed", &created.key_id).await,
+        crate::api_keys::ApiKeyStatus::Revoked
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_surface_whose_key_folder_cannot_be_read_still_deletes_it() {
+    use crate::api_keys::store::ApiKeyStore as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_harness, api, key_dir) = harness_with_key_dir().await;
+    let (status, body) = create_with_id(&api, "/smoke/locked-keyed", "locked-keyed").await;
+    assert!(matches!(status, 200 | 201), "{status} {body}");
+    let created = other_node_key_store(&key_dir)
+        .await
+        .create("locked-keyed", "client", None, "component-test")
+        .await
+        .unwrap();
+    let folder = key_dir.join("locked-keyed");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&folder).is_ok() {
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let (status, body) = delete_surface(&api, "locked-keyed").await;
+    let (stored_status, _) = api
+        .send(
+            api.client
+                .get(api.url("surfaces/locked-keyed")),
+        )
+        .await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored_status, 404, "the surface is deleted");
+    assert_eq!(
+        stored_key_status(&key_dir, "locked-keyed", &created.key_id).await,
+        crate::api_keys::ApiKeyStatus::Active
+    );
+}

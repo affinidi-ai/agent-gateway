@@ -222,7 +222,10 @@ pub async fn list_all_keys(
         .filter(|surface| surface_allows_api_keys(surface, &context, false))
         .map(|surface| surface.surface_id.clone())
         .collect();
-    match store.list_all().await {
+    match store
+        .list_all_with_last_use()
+        .await
+    {
         Ok(mut keys) => {
             keys.retain(|key| {
                 collection_key_allowed(&key.agent_id, &key.key_id, &allowed_agents, access, &context, &scope)

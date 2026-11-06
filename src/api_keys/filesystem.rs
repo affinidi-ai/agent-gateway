@@ -3,14 +3,18 @@
 //! Stores API keys as JSON files organized by agent:
 //! ```text
 //! _storage/api_keys/{agent_id}/{key_id}.json
+//! _storage/api_keys/{agent_id}/.{key_id}.last_used
 //! ```
+//!
+//! The `.last_used` file holds the key's last use, kept apart from the record so a usage
+//! write never rewrites the key's status.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -48,6 +52,40 @@ pub struct FileSystemApiKeyStore {
     /// Serializes lazy per-agent store creation so two concurrent writers for a
     /// new agent don't build (and leak) two stores for the same directory.
     create_lock: Mutex<()>,
+    /// Per-agent locks held across the read, status check and write of a key record, so a
+    /// revoke, rotation or delete on this node never undoes another on this node.
+    record_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// When this node last recorded each key's use: (agent_id, key_id) -> time.
+    last_uses: DashMap<(String, String), DateTime<Utc>>,
+    usage_write_interval: chrono::TimeDelta,
+}
+
+/// The shortest time between two usage writes of one key on a node; validations in between
+/// write nothing.
+const USAGE_WRITE_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
+/// Suffix of the file beside a key record that holds the key's last use. It is neither
+/// `.json` nor `.json.enc`, so the record loader and the key-record check skip it.
+const USAGE_FILE_SUFFIX: &str = ".last_used";
+
+/// Replaces a usage file through a temporary file in the same folder, so a reader never sees a
+/// partial time. The folder is never created: a missing folder fails the write.
+async fn write_usage_file(
+    path: &std::path::Path,
+    used_at: &str,
+) -> std::io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temporary = PathBuf::from(temporary);
+    let written = async {
+        fs::write(&temporary, used_at).await?;
+        fs::rename(&temporary, path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    written
 }
 
 impl FileSystemApiKeyStore {
@@ -66,6 +104,9 @@ impl FileSystemApiKeyStore {
             stores: Arc::new(DashMap::new()),
             hash_index: Arc::new(DashMap::new()),
             create_lock: Mutex::new(()),
+            record_locks: DashMap::new(),
+            last_uses: DashMap::new(),
+            usage_write_interval: USAGE_WRITE_INTERVAL,
         };
 
         // Build per-agent stores and load existing keys into memory
@@ -125,17 +166,27 @@ impl FileSystemApiKeyStore {
         Ok(skipped)
     }
 
-    /// Every key of the agents loaded so far.
-    async fn list_loaded(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+    /// Every key of the agents loaded so far, from the cache; with `last_use`, each key's
+    /// latest use is read from its usage file.
+    async fn list_loaded(
+        &self,
+        last_use: bool,
+    ) -> ApiKeyResult<Vec<ApiKeyMeta>> {
         let stores: Vec<_> = self
             .stores
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
         let mut all = Vec::new();
-        for store in stores {
+        for (agent_id, store) in stores {
             for record in store.list_all().await? {
+                let record = if last_use {
+                    self.with_last_use(&agent_id, record)
+                        .await
+                } else {
+                    record
+                };
                 all.push(ApiKeyMeta::from(record));
             }
         }
@@ -261,6 +312,156 @@ impl FileSystemApiKeyStore {
             .await
     }
 
+    /// One key record read from disk, bypassing the cache, so a rotation starts from the key
+    /// as stored. Only that record is read; a folder that is gone holds no record. The
+    /// secret-hash lookup is left as is: a stale entry resolves to the cached record, whose
+    /// hash is checked.
+    async fn record_on_disk(
+        &self,
+        agent_id: &str,
+        key_id: &str,
+    ) -> ApiKeyResult<Option<ApiKeyRecord>> {
+        if crate::storage::validate_storage_id(agent_id).is_err() || !fs::try_exists(self.agent_dir(agent_id)).await? {
+            return Ok(None);
+        }
+        Ok(crate::storage::filesystem::uncached_storage::<ApiKeyRecord>(self.agent_dir(agent_id), "api_key")
+            .await?
+            .get(key_id)
+            .await?)
+    }
+
+    #[cfg(test)]
+    fn with_usage_write_interval(
+        mut self,
+        interval: chrono::TimeDelta,
+    ) -> Self {
+        self.usage_write_interval = interval;
+        self
+    }
+
+    /// The file in the agent's key folder that holds a key's last use; `None`, logged, when
+    /// either id is not a valid storage id.
+    fn usage_path(
+        &self,
+        agent_id: &str,
+        key_id: &str,
+    ) -> Option<PathBuf> {
+        if let Err(error) =
+            crate::storage::validate_storage_id(agent_id).and_then(|()| crate::storage::validate_storage_id(key_id))
+        {
+            warn!(%error, "Skipped the usage file of an API key with an invalid id");
+            return None;
+        }
+        Some(
+            self.agent_dir(agent_id)
+                .join(format!(".{key_id}{USAGE_FILE_SUFFIX}")),
+        )
+    }
+
+    /// Records a key's use in its usage file, at most once per usage write interval on this
+    /// node, and returns the last use this node knows of. Only the usage file is written, never
+    /// the key record, so a usage write cannot undo a revocation, and the agent's folder is
+    /// never created. When the key was deleted or rotated while the file was written, the file
+    /// is removed again. A failed write is logged and the use is still returned.
+    async fn record_use(
+        &self,
+        agent_id: &str,
+        key_id: &str,
+        secret_hash: Option<&str>,
+    ) -> DateTime<Utc> {
+        let now = Utc::now();
+        {
+            let mut last = self
+                .last_uses
+                .entry((agent_id.to_string(), key_id.to_string()))
+                .or_insert(now - self.usage_write_interval);
+            if now - *last < self.usage_write_interval {
+                return *last;
+            }
+            *last = now;
+        }
+        let Some(path) = self.usage_path(agent_id, key_id) else {
+            return now;
+        };
+        if let Err(error) = write_usage_file(&path, &now.to_rfc3339()).await {
+            warn!(agent_id = %agent_id, key_id = %key_id, %error, "Failed to record an API key's last use");
+            return now;
+        }
+        let still_held = self
+            .get_record_internal(agent_id, key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.secret_hash.as_deref() == secret_hash);
+        if !still_held {
+            self.forget_use(agent_id, key_id)
+                .await;
+        }
+        now
+    }
+
+    /// The key's last use read from its usage file, `None` when it has none or it cannot be read.
+    async fn stored_last_use(
+        &self,
+        agent_id: &str,
+        key_id: &str,
+    ) -> Option<DateTime<Utc>> {
+        let stored = fs::read_to_string(self.usage_path(agent_id, key_id)?)
+            .await
+            .ok()?;
+        DateTime::parse_from_rfc3339(stored.trim())
+            .ok()
+            .map(|used| used.with_timezone(&Utc))
+    }
+
+    /// The record of a key in `agent_id`'s folder with `last_used_at` taken from its usage
+    /// file. A record written before usage files existed keeps its own `last_used_at` until its
+    /// key is used again.
+    async fn with_last_use(
+        &self,
+        agent_id: &str,
+        mut record: ApiKeyRecord,
+    ) -> ApiKeyRecord {
+        if let Some(used) = self
+            .stored_last_use(agent_id, &record.key_id)
+            .await
+        {
+            record.last_used_at = Some(used);
+        }
+        record
+    }
+
+    /// Removes a key's usage file and this node's record of its last use.
+    async fn forget_use(
+        &self,
+        agent_id: &str,
+        key_id: &str,
+    ) {
+        self.last_uses
+            .remove(&(agent_id.to_string(), key_id.to_string()));
+        let Some(path) = self.usage_path(agent_id, key_id) else {
+            return;
+        };
+        match fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(agent_id = %agent_id, key_id = %key_id, %error, "Failed to remove an API key's usage file")
+            }
+        }
+    }
+
+    /// The lock serializing the read, status check and write of one agent's key records.
+    fn record_lock(
+        &self,
+        agent_id: &str,
+    ) -> Arc<Mutex<()>> {
+        self.record_locks
+            .entry(agent_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Insert or replace this record's `secret_hash -> key_id` entry.
     fn index_secret_hash(
         &self,
@@ -286,7 +487,8 @@ impl FileSystemApiKeyStore {
     }
 
     /// Persist a key record through its agent's generic store (encrypting at
-    /// rest when configured) and refresh the store's cache.
+    /// rest when configured) and refresh the store's cache. The file is replaced
+    /// atomically, so a concurrent writer or reader never sees a partial record.
     async fn save_record(
         &self,
         record: &ApiKeyRecord,
@@ -294,7 +496,9 @@ impl FileSystemApiKeyStore {
         let store = self
             .agent_store(&record.agent_id)
             .await?;
-        store.save(record).await?;
+        store
+            .save_atomic(record)
+            .await?;
         Ok(())
     }
 
@@ -429,20 +633,20 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         &self,
         agent_id: &str,
     ) -> ApiKeyResult<Vec<ApiKeyMeta>> {
-        let keys = match self
+        let Some(store) = self
             .stores
             .get(agent_id)
             .map(|s| s.value().clone())
-        {
-            Some(store) => store
-                .list_all()
-                .await?
-                .into_iter()
-                .map(ApiKeyMeta::from)
-                .collect(),
-            None => Vec::new(),
+        else {
+            return Ok(Vec::new());
         };
-
+        let mut keys = Vec::new();
+        for record in store.list_all().await? {
+            keys.push(ApiKeyMeta::from(
+                self.with_last_use(agent_id, record)
+                    .await,
+            ));
+        }
         Ok(keys)
     }
 
@@ -476,22 +680,50 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         self.list(agent_id).await
     }
 
+    /// Reads the agent folder's entries without parsing them, so a record that cannot be
+    /// parsed or decrypted counts too.
+    async fn holds_key_records(
+        &self,
+        agent_id: &str,
+    ) -> ApiKeyResult<bool> {
+        if crate::storage::validate_storage_id(agent_id).is_err() {
+            return Ok(false);
+        }
+        let mut entries = match fs::read_dir(self.agent_dir(agent_id)).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".json") || name.ends_with(".json.enc") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn get_record(
         &self,
         agent_id: &str,
         key_id: &str,
     ) -> ApiKeyResult<Option<ApiKeyRecord>> {
-        let record = self
+        let Some(record) = self
             .get_record_internal(agent_id, key_id)
-            .await?;
-        if record.is_some() {
-            info!(
-                agent_id = %agent_id,
-                key_id = %key_id,
-                "API key record retrieved"
-            );
-        }
-        Ok(record)
+            .await?
+        else {
+            return Ok(None);
+        };
+        info!(
+            agent_id = %agent_id,
+            key_id = %key_id,
+            "API key record retrieved"
+        );
+        Ok(Some(
+            self.with_last_use(agent_id, record)
+                .await,
+        ))
     }
 
     async fn revoke(
@@ -500,6 +732,8 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         key_id: &str,
         actor: &str,
     ) -> ApiKeyResult<()> {
+        let lock = self.record_lock(agent_id);
+        let _guard = lock.lock().await;
         let mut record = self
             .get_record_internal(agent_id, key_id)
             .await?
@@ -532,8 +766,13 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         key_id: &str,
         actor: &str,
     ) -> ApiKeyResult<ApiKeyCreated> {
+        let lock = self.record_lock(agent_id);
+        let _guard = lock.lock().await;
+        self.get_record_internal(agent_id, key_id)
+            .await?
+            .ok_or_else(|| ApiKeyError::not_found(key_id))?;
         let mut record = self
-            .get_record_internal(agent_id, key_id)
+            .record_on_disk(agent_id, key_id)
             .await?
             .ok_or_else(|| ApiKeyError::not_found(key_id))?;
 
@@ -556,6 +795,8 @@ impl ApiKeyStore for FileSystemApiKeyStore {
 
         self.save_record(&record)
             .await?;
+        self.forget_use(agent_id, key_id)
+            .await;
 
         // Swap the index entry: drop the superseded hash, add the new one.
         if let Some(ref old) = old_hash {
@@ -587,6 +828,8 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         key_id: &str,
         actor: &str,
     ) -> ApiKeyResult<()> {
+        let lock = self.record_lock(agent_id);
+        let _guard = lock.lock().await;
         let record = self
             .get_record_internal(agent_id, key_id)
             .await?
@@ -594,6 +837,8 @@ impl ApiKeyStore for FileSystemApiKeyStore {
 
         self.delete_record(agent_id, key_id)
             .await?;
+        self.forget_use(agent_id, key_id)
+            .await;
 
         if let Some(ref hash) = record.secret_hash {
             self.unindex_secret_hash(agent_id, hash);
@@ -615,18 +860,13 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         agent_id: &str,
         key_id: &str,
     ) -> ApiKeyResult<()> {
-        if let Some(mut record) = self
+        if let Some(record) = self
             .get_record_internal(agent_id, key_id)
             .await?
+            .filter(|record| record.status == ApiKeyStatus::Active)
         {
-            record.last_used_at = Some(Utc::now());
-            // Best-effort update, don't fail on error
-            if let Err(e) = self
-                .save_record(&record)
-                .await
-            {
-                debug!("Failed to update last_used_at for {}: {}", key_id, e);
-            }
+            self.record_use(agent_id, key_id, record.secret_hash.as_deref())
+                .await;
         }
         Ok(())
     }
@@ -637,7 +877,12 @@ impl ApiKeyStore for FileSystemApiKeyStore {
 
     async fn list_all(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
         self.load_new_agents().await?;
-        self.list_loaded().await
+        self.list_loaded(false).await
+    }
+
+    async fn list_all_with_last_use(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
+        self.load_new_agents().await?;
+        self.list_loaded(true).await
     }
 
     async fn list_all_complete(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
@@ -648,7 +893,7 @@ impl ApiKeyStore for FileSystemApiKeyStore {
                 skipped.len()
             )));
         }
-        self.list_loaded().await
+        self.list_loaded(false).await
     }
 }
 
@@ -664,28 +909,15 @@ impl ApiKeyValidator for FileSystemApiKeyStore {
             .await?
         {
             Some(mut record) if record.status == ApiKeyStatus::Active => {
+                record.last_used_at = Some(
+                    self.record_use(agent_id, &record.key_id, record.secret_hash.as_deref())
+                        .await,
+                );
                 debug!(
                     agent_id = %agent_id,
                     key_id = %record.key_id,
                     "API key validated"
                 );
-
-                // Record usage so the list/detail pages reflect real activity.
-                // Best-effort and persisted through the store; a write failure
-                // must not fail an otherwise-valid authentication.
-                record.last_used_at = Some(Utc::now());
-                if let Err(e) = self
-                    .save_record(&record)
-                    .await
-                {
-                    debug!(
-                        agent_id = %agent_id,
-                        key_id = %record.key_id,
-                        error = %e,
-                        "Failed to persist last_used_at on validation"
-                    );
-                }
-
                 Ok(Some(ApiKeyMeta::from(record)))
             }
             Some(record) => {
@@ -1398,6 +1630,606 @@ mod tests {
                 .is_some(),
             "last_used_at must be persisted, not just cached"
         );
+    }
+
+    async fn open_store(temp_dir: &TempDir) -> FileSystemApiKeyStore {
+        FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn stored_record(
+        temp_dir: &TempDir,
+        key_id: &str,
+    ) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(
+                temp_dir
+                    .path()
+                    .join("agent-1")
+                    .join(format!("{key_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn usage_file(
+        temp_dir: &TempDir,
+        key_id: &str,
+    ) -> std::path::PathBuf {
+        temp_dir
+            .path()
+            .join("agent-1")
+            .join(format!(".{key_id}{USAGE_FILE_SUFFIX}"))
+    }
+
+    #[tokio::test]
+    async fn usage_writes_after_a_revoke_through_another_store_leave_it_revoked() {
+        let (first, temp_dir) = create_test_store().await;
+        let created = first
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let second = open_store(&temp_dir)
+            .await
+            .with_usage_write_interval(chrono::TimeDelta::zero());
+        assert!(
+            second
+                .validate("agent-1", &created.secret)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        first
+            .revoke("agent-1", &created.key_id, "test-actor")
+            .await
+            .unwrap();
+
+        let before_refresh = second
+            .validate("agent-1", &created.secret)
+            .await
+            .unwrap();
+        second
+            .touch_usage("agent-1", &created.key_id)
+            .await
+            .unwrap();
+        second
+            .refresh_from_disk()
+            .await
+            .unwrap();
+        let after_refresh = second
+            .validate("agent-1", &created.secret)
+            .await
+            .unwrap();
+
+        assert!(before_refresh.is_some(), "this node holds the key as active until its cache is refreshed");
+        assert!(after_refresh.is_none());
+        let record = stored_record(&temp_dir, &created.key_id);
+        assert_eq!(record["status"], "revoked", "{record}");
+        assert!(record["revoked_at"].is_string(), "{record}");
+        assert!(record["last_used_at"].is_null(), "usage never goes into the record: {record}");
+        assert!(usage_file(&temp_dir, &created.key_id).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_usage_write_still_accepts_the_caller() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (store, temp_dir) = create_test_store().await;
+        let created = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let folder = temp_dir
+            .path()
+            .join("agent-1");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(folder.join("writable"), b"").is_ok() {
+            std::fs::remove_file(folder.join("writable")).unwrap();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let validated = store
+            .validate("agent-1", &created.secret)
+            .await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let meta = validated
+            .unwrap()
+            .expect("the caller is accepted");
+        assert_eq!(meta.key_id, created.key_id);
+        assert!(!usage_file(&temp_dir, &created.key_id).exists());
+        assert_eq!(stored_record(&temp_dir, &created.key_id)["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn key_meta_shows_the_usage_file_time_and_falls_back_to_a_legacy_record() {
+        let (store, temp_dir) = create_test_store().await;
+        let used = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let legacy = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let used_at = store
+            .validate("agent-1", &used.secret)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .unwrap();
+        let mut legacy_record = stored_record(&temp_dir, &legacy.key_id);
+        legacy_record["last_used_at"] = serde_json::json!("2026-01-01T00:00:00Z");
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("agent-1")
+                .join(format!("{}.json", legacy.key_id)),
+            serde_json::to_vec(&legacy_record).unwrap(),
+        )
+        .unwrap();
+
+        let fresh = open_store(&temp_dir).await;
+        let listed = fresh
+            .list("agent-1")
+            .await
+            .unwrap();
+        let last_use = |key_id: &str| {
+            listed
+                .iter()
+                .find(|key| key.key_id == key_id)
+                .unwrap()
+                .last_used_at
+        };
+
+        assert_eq!(last_use(&used.key_id), Some(used_at));
+        assert_eq!(
+            last_use(&legacy.key_id),
+            Some(
+                "2026-01-01T00:00:00Z"
+                    .parse()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            fresh
+                .get_record("agent-1", &used.key_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at,
+            Some(used_at)
+        );
+        assert!(stored_record(&temp_dir, &used.key_id)["last_used_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn deleting_or_rotating_a_key_removes_its_usage_file() {
+        let (store, temp_dir) = create_test_store().await;
+        let deleted = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let rotated = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        for key in [&deleted, &rotated] {
+            store
+                .validate("agent-1", &key.secret)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(usage_file(&temp_dir, &key.key_id).exists());
+        }
+
+        store
+            .delete("agent-1", &deleted.key_id, "test-actor")
+            .await
+            .unwrap();
+        store
+            .rotate("agent-1", &rotated.key_id, "test-actor")
+            .await
+            .unwrap();
+
+        assert!(!usage_file(&temp_dir, &deleted.key_id).exists());
+        assert!(!usage_file(&temp_dir, &rotated.key_id).exists());
+        assert!(
+            store
+                .get_record("agent-1", &rotated.key_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_with_a_traversing_key_id_writes_no_usage_file_outside_its_folder() {
+        let (first, temp_dir) = create_test_store().await;
+        let created = first
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let mut tampered = stored_record(&temp_dir, &created.key_id);
+        tampered["key_id"] = serde_json::json!("/../escape");
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("agent-1")
+                .join(format!("{}.json", created.key_id)),
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        let store = open_store(&temp_dir).await;
+
+        let validated = store
+            .validate("agent-1", &created.secret)
+            .await;
+        let listed = store.list("agent-1").await;
+
+        assert!(validated.is_ok(), "{validated:?}");
+        assert!(listed.is_ok(), "{listed:?}");
+        let root: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(root, vec![std::ffi::OsString::from("agent-1")]);
+        let usage_files: Vec<_> = std::fs::read_dir(
+            temp_dir
+                .path()
+                .join("agent-1"),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| {
+            name.to_string_lossy()
+                .contains(USAGE_FILE_SUFFIX)
+        })
+        .collect();
+        assert!(usage_files.is_empty(), "{usage_files:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_racing_a_validation_leaves_no_usage_file() {
+        for _ in 0..50 {
+            let (store, temp_dir) = create_test_store().await;
+            let store = Arc::new(store.with_usage_write_interval(chrono::TimeDelta::zero()));
+            let created = store
+                .create("agent-1", "client-1", None, "test-actor")
+                .await
+                .unwrap();
+            let validator = store.clone();
+            let secret = created.secret.clone();
+            let validations = tokio::spawn(async move {
+                for _ in 0..5 {
+                    validator
+                        .validate("agent-1", &secret)
+                        .await
+                        .unwrap();
+                }
+            });
+            let deleter = store.clone();
+            let key_id = created.key_id.clone();
+            let delete = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                deleter
+                    .delete("agent-1", &key_id, "test-actor")
+                    .await
+                    .unwrap();
+            });
+            validations.await.unwrap();
+            delete.await.unwrap();
+
+            assert!(!usage_file(&temp_dir, &created.key_id).exists());
+            assert!(
+                !store
+                    .last_uses
+                    .contains_key(&("agent-1".to_string(), created.key_id.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotating_a_key_reads_only_its_own_record_from_disk() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (store, temp_dir) = create_test_store().await;
+        let rotated = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let sibling = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let sibling_file = temp_dir
+            .path()
+            .join("agent-1")
+            .join(format!("{}.json", sibling.key_id));
+        std::fs::set_permissions(&sibling_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&sibling_file).is_ok() {
+            std::fs::set_permissions(&sibling_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+
+        let rotation = store
+            .rotate("agent-1", &rotated.key_id, "test-actor")
+            .await;
+        let sibling_validated = store
+            .validate("agent-1", &sibling.secret)
+            .await;
+        std::fs::set_permissions(&sibling_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        rotation.unwrap();
+        assert!(
+            sibling_validated
+                .unwrap()
+                .is_some(),
+            "an unreadable sibling stays cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_within_the_interval_writes_nothing() {
+        let (store, temp_dir) = create_test_store().await;
+        let created = store
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let first_use = store
+            .validate("agent-1", &created.secret)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at;
+        let written = std::fs::read(usage_file(&temp_dir, &created.key_id)).unwrap();
+
+        let again = store
+            .validate("agent-1", &created.secret)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at;
+        store
+            .touch_usage("agent-1", &created.key_id)
+            .await
+            .unwrap();
+
+        assert!(first_use.is_some());
+        assert_eq!(again, first_use);
+        assert_eq!(std::fs::read(usage_file(&temp_dir, &created.key_id)).unwrap(), written);
+    }
+
+    #[tokio::test]
+    async fn rotating_on_a_stale_store_refuses_a_key_another_store_revoked() {
+        let (first, temp_dir) = create_test_store().await;
+        let created = first
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let second = open_store(&temp_dir).await;
+        first
+            .revoke("agent-1", &created.key_id, "test-actor")
+            .await
+            .unwrap();
+
+        let rotated = second
+            .rotate("agent-1", &created.key_id, "test-actor")
+            .await;
+
+        assert!(matches!(rotated, Err(ApiKeyError::AlreadyRevoked { .. })), "{rotated:?}");
+        let on_disk = open_store(&temp_dir)
+            .await
+            .get_record("agent-1", &created.key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk.status, ApiKeyStatus::Revoked);
+    }
+
+    #[tokio::test]
+    async fn rotating_an_active_key_on_another_store_still_rotates_it() {
+        let (first, temp_dir) = create_test_store().await;
+        let created = first
+            .create("agent-1", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let second = open_store(&temp_dir).await;
+
+        let rotated = second
+            .rotate("agent-1", &created.key_id, "test-actor")
+            .await
+            .unwrap();
+
+        assert_eq!(rotated.key_id, created.key_id);
+        let fresh = open_store(&temp_dir).await;
+        assert!(
+            fresh
+                .validate("agent-1", &rotated.secret)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            fresh
+                .validate("agent-1", &created.secret)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_usage_write_racing_a_revoke_on_the_same_store_never_undoes_it() {
+        for _ in 0..100 {
+            let (store, temp_dir) = create_test_store().await;
+            let store = Arc::new(store.with_usage_write_interval(chrono::TimeDelta::zero()));
+            let created = store
+                .create("agent-1", "client-1", None, "test-actor")
+                .await
+                .unwrap();
+            let validator = store.clone();
+            let secret = created.secret.clone();
+            let validations = tokio::spawn(async move {
+                for _ in 0..5 {
+                    validator
+                        .validate("agent-1", &secret)
+                        .await
+                        .unwrap();
+                }
+            });
+            let revoker = store.clone();
+            let key_id = created.key_id.clone();
+            let revoke = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                revoker
+                    .revoke("agent-1", &key_id, "test-actor")
+                    .await
+                    .unwrap();
+            });
+            validations.await.unwrap();
+            revoke.await.unwrap();
+
+            let on_disk = open_store(&temp_dir)
+                .await
+                .get_record("agent-1", &created.key_id)
+                .await
+                .unwrap()
+                .expect("the record stays readable");
+            assert_eq!(on_disk.status, ApiKeyStatus::Revoked);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_folder_holds_key_records_whether_or_not_they_load() {
+        let (store, temp_dir) = create_test_store().await;
+        for (agent, file) in [("bad-json", "atgk_a.json"), ("bad-enc", "atgk_b.json.enc")] {
+            std::fs::create_dir_all(temp_dir.path().join(agent)).unwrap();
+            std::fs::write(
+                temp_dir
+                    .path()
+                    .join(agent)
+                    .join(file),
+                b"{not a record",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(temp_dir.path().join("empty")).unwrap();
+        std::fs::create_dir_all(
+            temp_dir
+                .path()
+                .join("only-temp"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("only-temp")
+                .join(".atgk_c.json.1.tmp"),
+            b"{",
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            temp_dir
+                .path()
+                .join("only-usage"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("only-usage")
+                .join(format!(".atgk_d{USAGE_FILE_SUFFIX}")),
+            b"2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        assert!(
+            !store
+                .holds_key_records("only-usage")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_from_disk("only-usage")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .holds_key_records("bad-json")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .holds_key_records("bad-enc")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_from_disk("bad-json")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the record does not load"
+        );
+        assert!(
+            !store
+                .holds_key_records("empty")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .holds_key_records("only-temp")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .holds_key_records("missing")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !temp_dir
+                .path()
+                .join("missing")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_agent_folder_fails_the_key_record_check() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (store, temp_dir) = create_test_store().await;
+        let folder = temp_dir.path().join("locked");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&folder).is_ok() {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let held = store
+            .holds_key_records("locked")
+            .await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(held.is_err());
     }
 
     #[tokio::test]
