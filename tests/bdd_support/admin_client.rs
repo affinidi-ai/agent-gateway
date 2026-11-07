@@ -226,6 +226,23 @@ impl AdminApiClient {
         recorded_response(response).await
     }
 
+    /// Like [`Self::send_recorded_json`], but keeps a plain-text error body as a JSON string.
+    pub async fn send_recorded_json_keeping_text<B>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<RecordedResponse>
+    where
+        B: Serialize + ?Sized,
+    {
+        let url = self.admin_url(path);
+        let response = self
+            .send_request(method, &url, body)
+            .await?;
+        recorded_response_keeping_text(response).await
+    }
+
     /// Mints a personal access token as this operator from `request` and returns a client that
     /// presents it as its bearer credential, sending `headers` on every request.
     pub async fn personal_access_token_client(

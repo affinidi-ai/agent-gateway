@@ -149,6 +149,11 @@ Key or API Key Provider; see _Surface Builder_ in
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,
+`sasl_plaintext` or `sasl_ssl`) and, for a SASL one, the SASL mechanism (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`); see
+_Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 

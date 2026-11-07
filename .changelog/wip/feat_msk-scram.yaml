@@ -1,0 +1,22 @@
+branch: feat/msk-scram
+changes:
+  added:
+    - timestamp: '2026-11-07T12:00:00Z'
+      title: Connect Kafka stream endpoints over TLS and SASL/SCRAM, as Amazon MSK needs
+      description: >-
+        A Kafka stream endpoint takes two optional fields, security_protocol (plaintext,
+        ssl, sasl_plaintext or sasl_ssl) and sasl_mechanism (PLAIN, SCRAM-SHA-256 or
+        SCRAM-SHA-512), so the gateway can publish to Amazon MSK with SASL_SSL and
+        SCRAM-SHA-512. TLS verifies the brokers against the host's system CA store. An
+        endpoint without them keeps working as before: auth_type sasl is SASL_PLAINTEXT
+        with PLAIN, anything else plaintext. A save with an unknown protocol or mechanism,
+        or a SASL protocol without a mechanism, username or password, is refused with 400.
+        The cached producer is rebuilt when either field changes. The dashboard's endpoint
+        editor replaces its Authentication select with a Security protocol select offering all
+        four protocols, adds the mechanism for a SASL one, and saves every configuration the
+        API accepts back unchanged. See docs/INTEGRATIONS.md.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
