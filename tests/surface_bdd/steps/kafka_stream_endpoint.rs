@@ -2,7 +2,7 @@ use cucumber::{then, when};
 use reqwest::Method;
 use serde_json::json;
 
-use crate::steps::credential_save::send;
+use crate::steps::when::ensure_admin_session;
 use crate::world::SurfaceWorld;
 
 const SASL_PASSWORD: &str = "bdd-kafka-password";
@@ -28,7 +28,14 @@ async fn operator_creates_kafka_stream_endpoint(
             "sasl_password": SASL_PASSWORD
         }
     });
-    let response = send(world, Method::POST, "/v1/integrations/endpoints", Some(&body)).await;
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json_keeping_text(Method::POST, "/v1/integrations/endpoints", Some(&body))
+        .await
+        .expect("create the Kafka stream endpoint through the admin API");
     world.admin_response = Some(response);
 }
 
