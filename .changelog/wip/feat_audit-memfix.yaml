@@ -84,5 +84,14 @@ changes:
         read no longer fails the read at all: the records behind it are still returned, and the
         response is marked `truncated`.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-07T10:45:00Z'
+      title: Take the patched actix releases for four advisories
+      description: >-
+        The gateway reaches `actix-web` and `actix-http` through its OpenAPI MCP support, and four
+        advisories published against them on 6 November are fixed in releases the project already
+        allowed: RUSTSEC-2026-0448 and RUSTSEC-2026-0455, where a compressed request body could
+        exhaust memory and CPU before any extractor limit applied, RUSTSEC-2026-0447, the same
+        through a different path, and RUSTSEC-2026-0446, request smuggling through malformed
+        chunked request trailers. Only the lock file changed.
   breaking: []
