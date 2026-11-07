@@ -272,7 +272,7 @@ impl Inner {
         }
         let total = self
             .history_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| Some(held.saturating_sub(bytes)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| Some(held.saturating_sub(bytes)))
             .map_or(0, |held| held.saturating_sub(bytes));
         crate::delegation_vault::audit::publish_history_bytes(total);
     }

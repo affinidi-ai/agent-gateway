@@ -70,7 +70,7 @@ impl From<crate::delegation_vault::audit::AuditLogPage> for AuditLogResponse {
 pub async fn get_audit_log(
     State(_state): State<IdentityApiState>,
     Query(query): Query<AuditLogQuery>,
-) -> Result<Json<AuditLogResponse>, (StatusCode, String)> {
+) -> Result<Json<AuditLogResponse>, (StatusCode, Json<serde_json::Value>)> {
     let limit = query.limit.clamp(1, 500);
     let page = query.page.max(1);
 
@@ -98,15 +98,18 @@ pub async fn get_audit_log(
 }
 
 /// Answers with the page, or with `500` when the read failed. An empty page
-/// would assert that this is the whole of the administrator's evidence.
+/// would assert that this is the whole of the administrator's evidence. The
+/// failure is a JSON `{"error": …}` body, the shape `/v1/delegation-audit`
+/// answers a failed read of the same history with; the io detail stays in the
+/// log.
 fn respond(
     result: anyhow::Result<crate::delegation_vault::audit::AuditLogPage>
-) -> Result<Json<AuditLogResponse>, (StatusCode, String)> {
+) -> Result<Json<AuditLogResponse>, (StatusCode, Json<serde_json::Value>)> {
     match result {
         Ok(page) => Ok(Json(AuditLogResponse::from(page))),
         Err(e) => {
             tracing::warn!(target: "credential_delegation", error = %e, "Failed to read the VP Audit Log");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to read the audit log".to_string()))
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to read the audit log"}))))
         }
     }
 }
@@ -118,11 +121,15 @@ mod tests {
 
     #[test]
     fn a_read_that_failed_is_answered_with_an_error_not_an_empty_page() {
-        let (status, message) = respond(Err(anyhow::anyhow!("Audit logger not initialized")))
+        let (status, Json(body)) = respond(Err(anyhow::anyhow!("Audit logger not initialized")))
             .expect_err("a failed read must not answer with a page");
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "Failed to read the audit log", "the io detail stays in the log");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "Failed to read the audit log"}),
+            "the same JSON shape as /v1/delegation-audit, and the io detail stays in the log"
+        );
     }
 
     #[test]

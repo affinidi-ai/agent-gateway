@@ -330,9 +330,12 @@ sequenceDiagram
 agent-pay can also hold a payment for human review; the request is then answered `202`, or
 JSON-RPC error `1003` for MCP and A2A, and the client retries later. Payment receipts, metrics and
 a payments ledger are kept for every call, with the reason a payment was refused or failed. The
-Payments page is one list of payments. The payment audit events stay available from
-`GET /api/admin/payments/audit`. Local x402 and MPP
-verification is no longer supported.
+Payments page is one list of payments. The payment audit events are read from
+`GET /api/admin/payments/audit`, which returns them out of the audit log: it reaches as far back
+as the audit log's own retention keeps, and one read examines at most its newest 256 MiB, so a
+response says `truncated` when it stopped before the end of the history and `dropped_records` when
+the history held records it could not read — either makes its counts lower bounds. See
+[Audit log](#audit-log). Local x402 and MPP verification is no longer supported.
 See [Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy).
 
 ## Observability
@@ -371,7 +374,9 @@ the gateway authorised, for whom, and under which policy.
 Entries are written as JSON Lines to a file that is rotated once it reaches its size cap, keeping
 every rotated file beside it by default, so no audit record is deleted; it can also be set to
 keep a fixed number of them and delete anything older. The sizes are set by `[audit]` in
-`config.toml`; see
+`config.toml`, and they are read at startup only. One read of the audit API examines at most the
+newest 256 MiB of that history and marks the response `truncated` when it stopped before the end,
+so the dashboard shows its counts as lower bounds rather than as the whole log; see
 [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). Each policy decision
 records the exact policy version and content hash that decided. On calls through a Transit
 Point, policy decisions are also carried inside the signed workload-binding presentation,

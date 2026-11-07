@@ -502,6 +502,19 @@ returns; a text search matches the record as it is stored, so searching for a va
 decoding fills in — a policy version or content hash on one of those older rows — does not find
 it.
 
+That second walk is bounded twice over: by the same scan limit as the first, and by 1024 embedded
+policy decisions collected across the whole page, so one trace whose presentation carries an
+unexpected number of them cannot grow a read. Both bounds mean **such a row can come back with no
+policy version and no content hash**, and which rows are filled in depends on the order the
+history is in rather than on the row: the walk stops at whichever presentations it reaches first,
+and stops early once it has found every trace the page asked for. A row shows the two fields
+itself, with no walk involved, whenever they were recorded with it, which is every policy decision
+written since those fields existed. An absent version or hash on an older row therefore means the
+read did not reach that row's presentation, never that the decision was made without a policy.
+Filtering the read to that row's `trace_id` gives the walk one trace to look for and no other
+page to share its 1024 with, so it is the way to see such a row enriched — unless its presentation
+lies beyond the scan limit, which no filter moves.
+
 One limit bounds the walk: a read examines `vp_audit_log_max_bytes` × (`vp_audit_log_keep` + 2)
 bytes of the history, capped at 256 MiB, counted in the history's own bytes — the lines it drops
 or passes over cost it too. With the default rotation — 8 MiB files and every one of them kept —
@@ -538,19 +551,28 @@ It is also set, whatever the size of the history, when a rotated file is missing
 of it (a crash during a rotation) or cannot be read (a permission change, a backup tool): the
 walk reads past such a file to the records behind it, logs it once, and says the history it
 returned is incomplete, rather than failing the read and hiding a live log that reads perfectly
-well. Only the live log being unreadable fails a read.
+well.
+
+Only the live log fails a read, and it does so in two cases: when it cannot be opened (a
+permission change), and when it is not a regular file at all — a directory, a FIFO or a socket at
+its path. Both mean the gateway cannot read its own audit log, so the read is answered with `500`
+rather than with the rotated history alone presented as the whole of it. Neither is reported as a
+gap: `truncated` also means the scan limit ran out, a normal successful partial read, so a
+misconfigured appliance would be indistinguishable from a busy one.
 
 A single line that does not fit the walk's 1 MiB line buffer — which the gateway never
 writes — is skipped, and only that line: the records read beside it are still returned, including
 the one whose newline closes the chunk the oversized line starts in. No file can cost a read more
 than that buffer and the two 64 KiB chunks it is measured across, however it was damaged or
-edited, and a rotated name that is not a regular file is passed over rather than opened. A line
+edited, and a rotated name that is not a regular file is passed over rather than opened — only
+the rotated names, the live log's own being the case above. A line
 the walk skipped, and a line that does not parse as a record, are counted in `dropped_records`:
 a page never counts a record it could not read as absent.
 
-A read that fails is answered with `500` by both audit endpoints. Neither answers an unreadable
-log with an empty page, which would assert that the administrator is looking at all of the
-evidence.
+A read that fails is answered with `500` by both audit endpoints, with the JSON body
+`{"error": "Failed to read the audit log"}`; what failed stays in the gateway's own log. Neither
+answers an unreadable log with an empty page, which would assert that the administrator is looking
+at all of the evidence.
 
 A page read with `truncated: true` or a non-zero `dropped_records` shows every number that came
 from the walk as a lower bound: the Audit page and the Credentials → Audit tab render the record

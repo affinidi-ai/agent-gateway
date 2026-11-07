@@ -2736,7 +2736,10 @@ mod tests {
     fn a_read_stops_at_its_scan_budget_and_reports_partial_counts() {
         let dir = tempfile::TempDir::new().unwrap();
         let newest = audit_line("second");
-        let budget = newest.len() as u64;
+        // One byte under the newest record: the walk stops once it has consumed
+        // *more* than the budget, so a budget it has not yet exceeded always
+        // returns the record it is reading, however small that budget is.
+        let budget = newest.len() as u64 - 1;
         let path = written(&dir, &format!("{}{newest}", audit_line("first")));
 
         let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), budget).unwrap();

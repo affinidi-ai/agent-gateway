@@ -175,6 +175,35 @@ describe('AuditPage', () => {
     expect(screen.queryByTestId('audit-total-badge')).not.toBeInTheDocument();
   });
 
+  it('says the records could not be read, not that the log is empty', async () => {
+    mockGet.mockRejectedValue(new Error('Failed to read the audit log (500)'));
+
+    renderPage();
+
+    const failure = await screen.findByTestId('audit-error');
+    expect(failure).toHaveTextContent('Failed to read the audit log (500)');
+    expect(failure).toHaveTextContent('That is not the same as the log holding none.');
+    expect(screen.queryByTestId('audit-empty')).not.toBeInTheDocument();
+    expect(screen.queryByText('No governance events yet')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('audit-empty-truncated')).not.toBeInTheDocument();
+    // Refresh is the way back from a failed read, so it stays usable even
+    // though the read returned no records.
+    expect(screen.getByTestId('audit-refresh')).toBeEnabled();
+  });
+
+  it('reads the log again when a failed read is retried', async () => {
+    mockGet
+      .mockRejectedValueOnce(new Error('Failed to read the audit log (500)'))
+      .mockResolvedValue({ data: AUDIT_RESPONSE });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('audit-error-retry'));
+
+    expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('audit-error')).not.toBeInTheDocument();
+  });
+
   it('shows the counts of a complete read as they are', async () => {
     mockGet.mockResolvedValue({ data: { ...AUDIT_RESPONSE, total: 120 } });
 

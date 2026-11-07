@@ -19,6 +19,12 @@ export interface UseAuditLog {
   historyBytes: number;
   /** Advisory size the history is shown against; `0` for none. */
   softCapBytes: number;
+  /**
+   * Why the last read failed, or `null` when it succeeded. A failed read
+   * returns no records, which is not the same as a log that holds none, so the
+   * page shows this instead of its empty state.
+   */
+  error: string | null;
   page: number;
   totalPages: number;
   category: string;
@@ -89,6 +95,7 @@ export function useAuditLog(): UseAuditLog {
   const [flowFilter, setFlowFilter] = useState<FlowFilter>(initial.flow);
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>(initial.scope);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
 
   const load = useCallback(
@@ -113,6 +120,7 @@ export function useAuditLog(): UseAuditLog {
         if (currentScope) params.set('scope', currentScope);
 
         const { data } = await apiClient.get<AuditResponse>(`/audit?${params.toString()}`);
+        setError(null);
         setEntries(data.events ?? []);
         setTotal(data.total ?? 0);
         setCategoryCounts(data.category_counts ?? {});
@@ -122,9 +130,14 @@ export function useAuditLog(): UseAuditLog {
         setCountsAreLowerBounds((data.truncated ?? false) || (data.dropped_records ?? 0) > 0);
         setHistoryBytes(data.history_bytes ?? 0);
         setSoftCapBytes(data.soft_cap_bytes ?? 0);
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : 'Failed to load audit entries';
+      } catch (failure) {
+        const msg = failure instanceof Error ? failure.message : 'Failed to load audit entries';
         showToast('error', msg);
+        // The gateway answers an unreadable audit log with an error rather than
+        // an empty page, so the page keeps the failure after the toast has
+        // faded instead of showing the empty state and telling an
+        // administrator there is nothing to see.
+        setError(msg);
         setEntries([]);
         setTotal(0);
         setCategoryCounts({});
@@ -221,6 +234,7 @@ export function useAuditLog(): UseAuditLog {
     flowFilter,
     scopeFilter,
     isLoading,
+    error,
     expandedIdx,
     setPage,
     setSearchInput,

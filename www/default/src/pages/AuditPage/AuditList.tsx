@@ -1,5 +1,6 @@
 import React from 'react';
 import AuditListItem from './AuditListItem';
+import { AppButton } from '../../components/shared/AppButton';
 import FieldHelp from '../../components/shared/FieldHelp';
 import type { UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
@@ -18,6 +19,14 @@ interface AuditListProps {
    * searched, not that the log is empty.
    */
   countsAreLowerBounds?: boolean;
+  /**
+   * Why the last read failed, when it did. The gateway answers a read it could
+   * not make with an error rather than an empty page, so the list says the
+   * records could not be read instead of claiming the log holds none.
+   */
+  error?: string | null;
+  /** Reads the log again, for the retry offered with the error. */
+  onRetry?: () => void;
   onPageChange: (updater: number | ((p: number) => number)) => void;
   /** Names the users policy changes were made by. */
   userName?: UserNameResolver;
@@ -32,6 +41,8 @@ const AuditList: React.FC<AuditListProps> = ({
   page,
   totalPages,
   countsAreLowerBounds = false,
+  error = null,
+  onRetry,
   onPageChange,
   userName,
 }) => {
@@ -50,6 +61,32 @@ const AuditList: React.FC<AuditListProps> = ({
           </li>
         ))}
       </ul>
+    );
+  }
+
+  // Before the empty state: a read that failed returned no records, which says
+  // nothing about what the log holds. Showing the empty state here would tell
+  // an administrator the gateway recorded nothing.
+  if (error) {
+    return (
+      <div className="alert alert-danger" role="alert" data-testid="audit-error">
+        <i className="fas fa-exclamation-circle me-2" aria-hidden="true" />
+        Failed to load audit log: {error}
+        {onRetry && (
+          <AppButton
+            variant="outline-danger"
+            size="sm"
+            className="ms-3"
+            data-testid="audit-error-retry"
+            onClick={onRetry}
+          >
+            Retry
+          </AppButton>
+        )}
+        <div className="small mt-2 mb-0">
+          No audit records could be read. That is not the same as the log holding none.
+        </div>
+      </div>
     );
   }
 

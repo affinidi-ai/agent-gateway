@@ -63,7 +63,18 @@ changes:
         content hash of a policy decision written before those fields existed are filled in from
         its trace's signed presentation. Searching for one of those two values therefore no longer
         finds such a row, where the previous whole-file read did; every other search is unchanged,
-        and a page still shows the filled-in values.
+        and a page still shows the values it filled in, within the bounds of the entry below.
+    - timestamp: '2026-11-07T11:30:00Z'
+      title: Bound what an audit page fills in from the signed presentations
+      description: >-
+        A policy decision written before the policy version and content hash were recorded with
+        the record takes both from its trace's signed presentation, which the previous whole-file
+        read always found. That look-up is now a second bounded walk: it stops at the read's scan
+        limit, and at 1024 embedded decisions across the page. Such a row can therefore come back
+        with no policy version and no content hash, and which of them are filled in follows the
+        order of the history rather than the row. A row recorded with the two fields — every
+        policy decision written since they existed — shows them with no look-up at all, and
+        filtering a read to one `trace_id` gives the walk that row alone to find.
   fixed:
     - timestamp: '2026-11-07T10:00:00Z'
       title: ⭐ Keep the Audit page from running the gateway out of memory
@@ -80,7 +91,13 @@ changes:
       description: >-
         The Audit page showed an empty log when the gateway could not read the audit file,
         asserting that an administrator was seeing all of the evidence when it had seen none of
-        it. Both audit endpoints now answer a failed read with 500. A rotated file that cannot be
+        it. Both audit endpoints now answer a failed read with 500 and the JSON body
+        `{"error": "Failed to read the audit log"}`, what failed staying in the gateway's own log.
+        The Audit page and the Credentials audit tab show that failure, with a Retry, in place of
+        their empty state, so a read that returned nothing is never passed off as a log that holds
+        nothing. A live log that is not a regular file at all — a directory, a FIFO or a socket
+        left at its path — is answered the same way, rather than returning the rotated history as
+        though it were the whole log. A rotated file that cannot be
         read no longer fails the read at all: the records behind it are still returned, and the
         response is marked `truncated`.
   removed: []
@@ -93,5 +110,7 @@ changes:
         allowed: RUSTSEC-2026-0448 and RUSTSEC-2026-0455, where a compressed request body could
         exhaust memory and CPU before any extractor limit applied, RUSTSEC-2026-0447, the same
         through a different path, and RUSTSEC-2026-0446, request smuggling through malformed
-        chunked request trailers. Only the lock file changed.
+        chunked request trailers. Only the lock file changed: no dependency was added or removed
+        from `Cargo.toml`, and taking the patched releases moved a handful of transitive pins with
+        them.
   breaking: []

@@ -1062,6 +1062,13 @@ only that.
   `AuditFilters` (the same prop name), and the shared `FilterChipGroup` / `FilterOverflowMenu`.
   Category counts are rendered with `showBadge={false}` on this page, so only the overflow menu's
   zero marker shows one today.
+- A **read that failed** is not an empty log. The gateway answers a read it could not make with
+  `500`, so `useAuditLog` keeps the message in `error`, and `AuditList` renders the
+  `alert alert-danger` panel (`audit-error`) with a Retry (`audit-error-retry`) **instead of** the
+  empty state, saying no records could be read and that this is not the log holding none. The
+  toast stays, for the moment the read fails; the panel is what is still there after it fades.
+  Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
+  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
 - `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
   `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
 - `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin

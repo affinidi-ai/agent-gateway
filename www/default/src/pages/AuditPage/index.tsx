@@ -60,6 +60,10 @@ const AuditPage: React.FC = () => {
   // produced is a lower bound.
   const total = audit.countsAreLowerBounds ? `${audit.total}+` : audit.total;
 
+  // A read that failed returned no records, so Refresh has to stay usable: it
+  // is the way back from the error.
+  const refreshDisabled = audit.total === 0 && audit.error === null;
+
   const changePage = (updater: number | ((p: number) => number)) => {
     audit.setExpandedIdx(null);
     audit.setPage(updater);
@@ -124,7 +128,7 @@ const AuditPage: React.FC = () => {
             <AppButton
               variant="primary"
               size="md"
-              disabled={audit.total === 0}
+              disabled={refreshDisabled}
               onClick={audit.reload}
               data-testid="audit-refresh"
               iconStart={<i className="fas fa-sync-alt me-1" aria-hidden="true" />}
@@ -147,6 +151,8 @@ const AuditPage: React.FC = () => {
                 page={audit.page}
                 totalPages={audit.totalPages}
                 countsAreLowerBounds={audit.countsAreLowerBounds}
+                error={audit.error}
+                onRetry={audit.reload}
                 onPageChange={changePage}
                 userName={userName}
               />

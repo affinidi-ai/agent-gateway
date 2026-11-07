@@ -56,6 +56,16 @@ endif
 endif
 ifneq ($(BREW_OPENSSL_PREFIX),)
 export OPENSSL_ROOT_DIR := $(BREW_OPENSSL_PREFIX)
+# OPENSSL_ROOT_DIR steers cmake only. openssl-sys resolves separately, through
+# pkg-config, and Homebrew's openssl@4 wins there — but OpenSSL 4 removed the
+# ENGINE API that librdkafka calls, so the link then fails on undefined
+# _ENGINE_* symbols. OPENSSL_DIR makes openssl-sys use the same OpenSSL cmake
+# was pointed at.
+export OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
+# openssl-sys reads the target-scoped name first, which is the one that has to
+# win on Apple Silicon.
+export AARCH64_APPLE_DARWIN_OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
+export X86_64_APPLE_DARWIN_OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
 # The cmake crate blanks CMAKE_PREFIX_PATH in the child unless it is set here,
 # so cmake's find_package(OpenSSL) never reaches Homebrew without this. Guarded
 # so a sub-make does not prepend the prefix a second time.

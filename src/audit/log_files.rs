@@ -429,9 +429,10 @@ impl HistoryLines {
         Some(rotated_path(&self.live, next))
     }
 
-    /// Opens the next file of the history, unless it is gone, is not a regular
-    /// file, is one already read under another name, or is a rotated file this
-    /// walk cannot read.
+    /// Opens the next file of the history, unless it is gone, is one already
+    /// read under another name, or is a rotated file this walk cannot read or
+    /// that is not a regular file. A live log that is not a regular file fails
+    /// the walk (see [`not_regular`]).
     fn open_file(
         &mut self,
         path: &Path,
@@ -442,6 +443,7 @@ impl HistoryLines {
         // audit reads share — for as long as nobody writes to it.
         match fs::metadata(path) {
             Ok(data) if data.is_file() => {}
+            Ok(_) if !rotated => return Err(not_regular(path)),
             Ok(_) => return Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return self.unreadable(path, e, rotated),
@@ -455,7 +457,12 @@ impl HistoryLines {
             Ok(data) => data,
             Err(e) => return self.unreadable(path, e, rotated),
         };
+        // Checked again on the open file: the name could have been replaced
+        // between the two calls.
         if !data.is_file() {
+            if !rotated {
+                return Err(not_regular(path));
+            }
             return Ok(None);
         }
         if !self
@@ -472,7 +479,8 @@ impl HistoryLines {
     /// the history as incomplete, so a `.1` a backup tool left unreadable
     /// cannot turn every audit read into a `500` and hide a live log that
     /// reads perfectly well. The live log itself is still an error, because a
-    /// read that cannot open it has seen none of the evidence.
+    /// read that cannot open it has seen none of the evidence; so is a live log
+    /// that is not a regular file (see [`not_regular`]).
     fn unreadable(
         &mut self,
         path: &Path,
@@ -539,6 +547,18 @@ impl HistoryLines {
             }
         }
     }
+}
+
+/// The failure a live log that is not a regular file — a directory, a FIFO or
+/// a socket at its path — ends a walk with. The gateway cannot read its own
+/// audit log, which is the situation a permission failure leaves it in, and
+/// that already fails the read: a read that has seen none of the evidence must
+/// not answer with the rotated history as though it were the whole of it.
+/// Reporting a gap instead would mark the response `truncated`, which also
+/// means the scan budget ran out — a normal, successful partial read — so a
+/// misconfigured appliance would be indistinguishable from a busy one.
+fn not_regular(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a regular file", path.display()))
 }
 
 /// Rotates the live log: it takes the position after the highest the history
@@ -866,6 +886,30 @@ mod tests {
         fs::write(rotated_path(&path, 2), "rotated\n").unwrap();
 
         assert_eq!(walk(&path), vec!["live", "rotated"], "the walk reads past it instead of failing");
+    }
+
+    #[test]
+    fn a_live_log_that_is_not_a_regular_file_fails_the_walk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        // A directory at the live log's path rather than a mode: root, which an
+        // appliance container commonly runs as, reads a file whatever its mode
+        // says, so a mode would make this test pass without the walk failing.
+        fs::create_dir(&path).unwrap();
+        fs::write(rotated_path(&path, 1), "rotated\n").unwrap();
+
+        let mut lines = HistoryLines::open(&path);
+        let error = lines
+            .next_line()
+            .expect_err("the rotated history alone must not be handed back as the whole of it");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !lines.gap(),
+            "the read fails outright rather than coming back marked incomplete, which also means the scan budget ran out"
+        );
     }
 
     #[test]

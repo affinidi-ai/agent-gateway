@@ -190,7 +190,9 @@ An audit response says what a read did not return in two fields: `truncated` (it
 the end of the history) and `dropped_records` (the history holds records it could not read).
 Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
 number from that read with a trailing `+`, an empty page of such a read says the records searched
-held none rather than that the log is empty, and nothing else changes. The Audit Log also shows the size of the history against the advisory
+held none rather than that the log is empty, and nothing else changes. A read the gateway could
+not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
 `[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
 `utils/formatBytes.ts`; see _Audit page: partial reads and
 log size_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-partial-reads-and-log-size).
