@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
 import { topAndTail, formatDateTime, formatDuration } from '../utils/stringUtils';
+import { formatBytes } from '../utils/formatBytes';
 import { useFabricResolver } from '../utils/useFabricResolver';
 import { AppButton } from '../components/shared/AppButton';
 import { AgentSurface, apiClient } from '../api';
@@ -213,14 +214,6 @@ const TasksPage: React.FC = () => {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const formatBytes = (bytes: number): string => {
-    if (bytes === 0) return '0 B';
-    if (bytes < 1024) return bytes.toFixed(0) + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
-    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-  };
 
   // Duration formatting now handled by shared utility in stringUtils
   // Using short form for compact task display

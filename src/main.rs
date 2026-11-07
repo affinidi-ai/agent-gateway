@@ -1459,6 +1459,7 @@ fn render_default_bootstrap_toml(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        audit: config::AuditConfig::default(),
     };
     let toml_str = toml::to_string_pretty(&config)?;
     Ok(toml_str)

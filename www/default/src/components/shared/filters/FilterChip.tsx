@@ -9,6 +9,8 @@ interface FilterChipProps {
   onClick: () => void;
   ariaPressed?: boolean;
   showBadge?: boolean;
+  /** Whether `count` is a lower bound, shown with a trailing `+`. */
+  countIsLowerBound?: boolean;
 }
 
 /**
@@ -23,6 +25,7 @@ export const FilterChip: React.FC<FilterChipProps> = ({
   onClick,
   ariaPressed,
   showBadge = true,
+  countIsLowerBound = false,
 }) => (
   <button
     type="button"
@@ -62,11 +65,16 @@ export const FilterChip: React.FC<FilterChipProps> = ({
     {label}
     {count === 0 && (
       <span style={{ fontSize: '0.75rem', color: 'inherit', opacity: 0.7, marginLeft: '0.25rem' }}>
-        (0)
+        ({countIsLowerBound ? '0+' : '0'})
       </span>
     )}
     {showBadge && count !== undefined && count > 0 && (
-      <Badge value={count} tone={selected ? 'primary' : 'secondary'} size="sm" className="ms-1" />
+      <Badge
+        value={countIsLowerBound ? `${count}+` : count}
+        tone={selected ? 'primary' : 'secondary'}
+        size="sm"
+        className="ms-1"
+      />
     )}
   </button>
 );

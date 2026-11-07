@@ -673,6 +673,45 @@ fn vp_audit_log_includes_policy_decision(world: &mut SurfaceWorld) {
     );
 }
 
+#[then(expr = "the VP Audit Log includes the record with trace {string}")]
+fn vp_audit_log_includes_the_record_with_trace(
+    world: &mut SurfaceWorld,
+    trace_id: String,
+) {
+    let events = audit_response_events(world, "VP Audit Log");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["trace_id"] == serde_json::json!(trace_id)),
+        "expected the VP Audit Log to include the record of trace '{trace_id}', got {events:?}"
+    );
+}
+
+#[then("the audit read response says it did not reach the end of the history")]
+fn audit_read_response_says_it_did_not_reach_the_end_of_the_history(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    assert_eq!(
+        body["truncated"],
+        serde_json::json!(true),
+        "a read that could not reach the end of the history must say so, got {body}"
+    );
+}
+
+#[then("the audit read response says it reached the end of the history")]
+fn audit_read_response_says_it_reached_the_end_of_the_history(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    assert_eq!(body["truncated"], serde_json::json!(false), "the read reached the end of the history, got {body}");
+}
+
+#[then("the audit read response counts a record it could not read")]
+fn audit_read_response_counts_a_record_it_could_not_read(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    let dropped = body["dropped_records"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the audit read response must count the records it could not read, got {body}"));
+    assert!(dropped >= 1, "expected at least one record counted as unreadable, got {body}");
+}
+
 #[then("the VP Audit Log records that the request policy failed to evaluate")]
 async fn vp_audit_log_records_request_policy_evaluation_failure(world: &mut SurfaceWorld) {
     expect_vp_audit_record(
