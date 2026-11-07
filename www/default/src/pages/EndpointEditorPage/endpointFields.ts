@@ -144,9 +144,32 @@ export const ENDPOINT_FIELDS: Record<EndpointType, FieldSpec[]> = {
       defaultValue: 'none',
       options: [
         { value: 'none', label: 'None' },
-        { value: 'sasl', label: 'SASL PLAIN' },
+        { value: 'sasl', label: 'SASL' },
       ],
       shownWhen: platformIs('kafka'),
+    },
+    {
+      name: 'security_protocol',
+      label: 'Security protocol',
+      kind: 'select',
+      defaultValue: 'sasl_plaintext',
+      options: [
+        { value: 'sasl_plaintext', label: 'SASL_PLAINTEXT' },
+        { value: 'sasl_ssl', label: 'SASL_SSL (TLS)' },
+      ],
+      help: 'SASL_SSL verifies the brokers against the gateway host’s CA bundle, as Amazon MSK needs.',
+      shownWhen: values => platformIs('kafka')(values) && values.auth_type === 'sasl',
+    },
+    {
+      name: 'sasl_mechanism',
+      label: 'SASL mechanism',
+      kind: 'select',
+      defaultValue: 'PLAIN',
+      options: ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'].map(mechanism => ({
+        value: mechanism,
+        label: mechanism,
+      })),
+      shownWhen: values => platformIs('kafka')(values) && values.auth_type === 'sasl',
     },
     {
       name: 'sasl_username',

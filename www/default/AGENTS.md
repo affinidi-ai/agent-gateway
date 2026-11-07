@@ -1445,7 +1445,11 @@ identities: an integration receives every event of its event set, from every res
   (`endpoint-type-select`) and fixed after.
 - The fields of each type come from `ENDPOINT_FIELDS` in `endpointFields.ts`, which lists only
   what the gateway's publishers read: email `cc` and `bcc`; Slack `bot_name` and
-  `icon_emoji`, no channel; stream SASL only for Kafka, no AWS keys. Each field is
+  `icon_emoji`, no channel; stream SASL only for Kafka, no AWS keys. Kafka with SASL shows
+  **Security protocol** (`sasl_plaintext` or `sasl_ssl`, default `sasl_plaintext`) and **SASL
+  mechanism** (`PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`, default `PLAIN`): the defaults are
+  what the gateway uses for a stored endpoint without them. TLS without SASL (`ssl`) is set
+  through the API only. Each field is
   `endpoint-<field>-input`; the others are `endpoint-name-input`, `endpoint-active-switch`,
   `endpoint-save-button` and `endpoint-cancel-button`.
 - **Send test** (`endpoint-test-button`) tests the saved endpoint, so it is disabled while

@@ -155,6 +155,37 @@ describe('a new endpoint', () => {
     expect(screen.getByLabelText(/redis url/i)).toBeInTheDocument();
   });
 
+  test('a Kafka endpoint can use SASL over TLS with SCRAM', async () => {
+    renderEditor('/integrations/endpoints/new?type=stream');
+
+    type(/^name/i, 'MSK');
+    type(/topic or stream/i, 'gw1.audit');
+    type(/brokers/i, 'b-1.msk.example:9196');
+    type(/authentication/i, 'sasl');
+    type(/security protocol/i, 'sasl_ssl');
+    type(/sasl mechanism/i, 'SCRAM-SHA-512');
+    type(/sasl username/i, 'gw1');
+    type(/sasl password/i, 'pw');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() =>
+      expect(mocked.createEndpoint).toHaveBeenCalledWith(
+        expect.objectContaining({
+          configuration: {
+            platform: 'kafka',
+            topic: 'gw1.audit',
+            brokers: 'b-1.msk.example:9196',
+            auth_type: 'sasl',
+            security_protocol: 'sasl_ssl',
+            sasl_mechanism: 'SCRAM-SHA-512',
+            sasl_username: 'gw1',
+            sasl_password: 'pw',
+          },
+        })
+      )
+    );
+  });
+
   test('is not saved while required fields are empty, and says which', () => {
     renderEditor('/integrations/endpoints/new?type=webhook');
 

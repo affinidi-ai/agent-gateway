@@ -54,6 +54,8 @@ describe('fields per endpoint type', () => {
       'topic',
       'brokers',
       'auth_type',
+      'security_protocol',
+      'sasl_mechanism',
       'sasl_username',
       'sasl_password',
     ]);
@@ -74,6 +76,60 @@ describe('fields per endpoint type', () => {
     expect(names(ENDPOINT_FIELDS.stream)).not.toEqual(
       expect.arrayContaining(['access_key', 'secret_key', 'auth_token'])
     );
+  });
+
+  test('Kafka SASL offers the protocols and mechanisms the gateway accepts', () => {
+    const optionsOf = (name: string) =>
+      ENDPOINT_FIELDS.stream
+        .find(field => field.name === name)
+        ?.options?.map(option => option.value);
+
+    expect(optionsOf('security_protocol')).toEqual(['sasl_plaintext', 'sasl_ssl']);
+    expect(optionsOf('sasl_mechanism')).toEqual(['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512']);
+  });
+});
+
+describe('Kafka SASL settings', () => {
+  const kafka = (configuration: Record<string, unknown>) =>
+    stored({
+      type: 'stream',
+      configuration: {
+        platform: 'kafka',
+        topic: 'events',
+        brokers: 'b:9092',
+        auth_type: 'sasl',
+        sasl_username: 'svc',
+        ...configuration,
+      },
+      secrets: ['sasl_password'],
+    });
+
+  test('default to SASL_PLAINTEXT with PLAIN, as the gateway reads an endpoint without them', () => {
+    expect(initialForm('stream').values).toMatchObject({
+      security_protocol: 'sasl_plaintext',
+      sasl_mechanism: 'PLAIN',
+    });
+    expect(initialForm('stream', kafka({})).values).toMatchObject({
+      security_protocol: 'sasl_plaintext',
+      sasl_mechanism: 'PLAIN',
+    });
+  });
+
+  test('a stored endpoint shows and sends its own protocol and mechanism', () => {
+    const form = initialForm(
+      'stream',
+      kafka({ security_protocol: 'sasl_ssl', sasl_mechanism: 'SCRAM-SHA-512' })
+    );
+
+    expect(buildConfiguration('stream', form, true)).toEqual({
+      platform: 'kafka',
+      topic: 'events',
+      brokers: 'b:9092',
+      auth_type: 'sasl',
+      security_protocol: 'sasl_ssl',
+      sasl_mechanism: 'SCRAM-SHA-512',
+      sasl_username: 'svc',
+    });
   });
 });
 
