@@ -600,10 +600,19 @@ pub struct AuditConfig {
     pub vp_audit_log_max_bytes: u64,
 
     /// Rotated VP Audit Log files kept beside the live one, oldest deleted
-    /// first. `0` keeps every rotated file, so no audit record is deleted and
-    /// the history grows until the disk fills.
+    /// first. `0`, the default, keeps every rotated file, so no audit record is
+    /// deleted and the history grows until the disk fills. A positive value
+    /// bounds the history and deletes the records that fall out of it.
     #[serde(default = "default_vp_audit_log_keep")]
     pub vp_audit_log_keep: usize,
+
+    /// Size of the VP Audit Log history an operator wants to be told about, in
+    /// bytes. Advisory only: nothing is enforced, no record is deleted and no
+    /// write is refused above it. The dashboard shows the history against it,
+    /// which matters because the default retention deletes nothing. `0` shows
+    /// the size with no mark.
+    #[serde(default = "default_vp_audit_log_soft_cap_bytes")]
+    pub vp_audit_log_soft_cap_bytes: u64,
 }
 
 fn default_vp_audit_log_max_bytes() -> u64 {
@@ -614,11 +623,16 @@ fn default_vp_audit_log_keep() -> usize {
     crate::audit::log_files::KEEP_ROTATED
 }
 
+fn default_vp_audit_log_soft_cap_bytes() -> u64 {
+    crate::audit::log_files::HISTORY_SOFT_CAP_BYTES
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             vp_audit_log_max_bytes: default_vp_audit_log_max_bytes(),
             vp_audit_log_keep: default_vp_audit_log_keep(),
+            vp_audit_log_soft_cap_bytes: default_vp_audit_log_soft_cap_bytes(),
         }
     }
 }
@@ -631,10 +645,10 @@ impl AuditConfig {
     }
 
     /// Refuses a rotation size small enough to cost more than it saves: the
-    /// writer rotates under the append lock on the request path, so a cap of a
-    /// few hundred bytes rotates on nearly every record and leaves a history of
-    /// tiny files holding almost no evidence. `0`, which switches rotation off,
-    /// is still allowed.
+    /// writer rotates under the append lock in the audit dispatcher, so a cap
+    /// of a few hundred bytes rotates on nearly every record, holding the
+    /// records behind it up, and leaves a history of tiny files holding almost
+    /// no evidence. `0`, which switches rotation off, is still allowed.
     pub fn validate(&self) -> Result<(), String> {
         if self.vp_audit_log_max_bytes > 0 && self.vp_audit_log_max_bytes < crate::audit::log_files::MIN_LIVE_MAX_BYTES
         {
@@ -4805,7 +4819,36 @@ mod log_redaction_config_tests {
         let audit: AuditConfig = toml::from_str("vp_audit_log_keep = 0").expect("parses");
 
         assert_eq!(audit.rotation().keep, 0, "rotation deletes no rotated file");
-        assert!(!audit.is_default());
+        assert!(audit.is_default(), "keeping every rotated file is what an unconfigured appliance does");
+    }
+
+    #[test]
+    fn the_advisory_history_size_is_read_from_the_audit_section() {
+        let set: AuditConfig = toml::from_str("vp_audit_log_soft_cap_bytes = 2147483648").expect("parses");
+        let off: AuditConfig = toml::from_str("vp_audit_log_soft_cap_bytes = 0").expect("parses");
+
+        assert_eq!(set.vp_audit_log_soft_cap_bytes, 2_147_483_648);
+        assert_eq!(off.vp_audit_log_soft_cap_bytes, 0, "0 asks for no mark at all");
+        assert_eq!(
+            AuditConfig::default().vp_audit_log_soft_cap_bytes,
+            1024 * 1024 * 1024,
+            "an operator is told about the history at 1 GiB by default"
+        );
+        assert_eq!(set.validate(), Ok(()), "the advisory size is never a startup failure");
+        assert_eq!(off.validate(), Ok(()));
+        assert_eq!(set.rotation(), AuditConfig::default().rotation(), "it changes no rotation behaviour");
+    }
+
+    #[test]
+    fn the_built_in_rotation_deletes_no_audit_record() {
+        let audit = AuditConfig::default();
+
+        assert_eq!(
+            audit.rotation().keep,
+            0,
+            "an appliance that configures nothing keeps every audit record, as it did before the log was rotated"
+        );
+        assert!(audit.rotation().max_bytes > 0, "the live file is still rotated, so a read stays bounded");
     }
 
     #[test]

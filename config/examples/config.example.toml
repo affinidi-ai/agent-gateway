@@ -233,17 +233,25 @@ log_directory = "../_storage/logs"  # Directory to write log files (logs to stdo
 # Log redaction is set in gateway.json `logging.redaction`, not here. It is on by default.
 
 # VP Audit Log file rotation (optional; the defaults are shown).
-# The live log is rotated once it reaches vp_audit_log_max_bytes, and
-# vp_audit_log_keep rotated files are kept beside it. Records older than those
-# files are deleted and counted nowhere, so forward anything that must outlive
-# them to a Governance Audit integration, or set vp_audit_log_keep to 0 to keep
-# every rotated file on the appliance — the history then grows until the disk
-# fills, an audit log that fills the disk stops being written, and each rotation
-# renames every file it keeps, so rotation slows as the history grows.
+# The live log is rotated once it reaches vp_audit_log_max_bytes, so the file a
+# read walks stays small. By default nothing is deleted: vp_audit_log_keep = 0
+# keeps every rotated file, and the history grows with the appliance's request
+# rate until the disk fills — an audit log that fills the disk stops being
+# written, so watch the space, and expect /v1/audit to answer truncated = true
+# once the history passes 256 MiB, the most one read examines.
+# Set vp_audit_log_keep to a positive number to bound the history instead: the
+# oldest records are then deleted outright and counted nowhere, so forward
+# anything that must outlive them to a Governance Audit integration first.
 # A vp_audit_log_max_bytes between 1 and 65535 fails startup. Startup only.
+# vp_audit_log_soft_cap_bytes is advisory only: it changes no behaviour at all.
+# Nothing is deleted, no write is refused and no rotation happens because of it.
+# It exists so the Audit page can show the history growing against a size you
+# chose, which matters because the default retention never deletes anything.
+# 0 shows the size with no mark.
 # [audit]
-# vp_audit_log_max_bytes = 8388608  # 8 MiB; 0 switches rotation off, otherwise at least 65536
-# vp_audit_log_keep = 8             # rotated files kept; 0 keeps every file
+# vp_audit_log_max_bytes = 8388608       # 8 MiB; 0 switches rotation off, otherwise at least 65536
+# vp_audit_log_keep = 0                  # 0 keeps every rotated file; N keeps the newest N and deletes the rest
+# vp_audit_log_soft_cap_bytes = 1073741824  # 1 GiB; advisory, shown on the Audit page. 0 shows no mark
 
 # Extension Inspection Configuration (optional)
 [extension_inspection]

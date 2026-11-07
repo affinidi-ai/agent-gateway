@@ -1037,6 +1037,40 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 
+## Audit page: partial reads and log size
+
+An audit read walks the stored history and may not return all of it. The response says so in two
+separate fields: `truncated` (the read stopped before the end — its scan limit, or a rotated file
+missing or unreadable) and `dropped_records` (records in the history it could not read — a line
+too long to assemble, or one an interrupted append left half-written). **Either one makes the
+counts lower bounds**; `useAuditLog` folds them into one `countsAreLowerBounds`, and the UI knows
+only that.
+
+- When the counts are lower bounds every number that came from that walk renders with a trailing
+  `+` and nothing else changes: the record badge (`audit-total-badge`) reads `1243+`, the pager
+  reads `Page 5 of 687+`, and a category count reads `24643+` (`0+` for the zero marker).
+  Otherwise the numbers render exactly as before. No banner, notice, colour or tooltip.
+- The badge shows while `total > 0` **or** the counts are lower bounds, so `0+` is never hidden,
+  and such an empty page reads **"No governance events found in the records searched."**
+  (`audit-empty-truncated`) instead of "No governance events yet" and its advice to enable VP
+  Auditing: the log is not known to be empty, so that advice would be wrong.
+- The flag reaches them through `useAuditLog` (`countsAreLowerBounds`), `AuditList` and
+  `AuditFilters` (the same prop name), and the shared `FilterChipGroup` / `FilterOverflowMenu`.
+  Category counts are rendered with `showBadge={false}` on this page, so only the overflow menu's
+  zero marker shows one today.
+- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
+  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+- `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
+  bar: neutral under the configured size, amber over it, and over it a line naming the two
+  things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced
+  at `[audit] vp_audit_log_soft_cap_bytes`, no record is deleted and the log keeps growing. With
+  `soft_cap_bytes` of `0` the size shows alone, with no bar, and with no `history_bytes` the
+  line is not shown at all rather than claiming an empty history. The values come from
+  `history_bytes` and `soft_cap_bytes` on the audit response.
+- Sizes in bytes are formatted by `utils/formatBytes.ts` — one implementation for the whole
+  dashboard, in binary units (`312 MiB`, `1.5 GiB`). The Metrics and Tasks pages use it too;
+  do not add a page-local copy.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the

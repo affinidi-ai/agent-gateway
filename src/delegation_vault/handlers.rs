@@ -817,6 +817,9 @@ mod audit_response_tests {
             total_pages: 1,
             category_counts: std::collections::BTreeMap::new(),
             truncated: true,
+            dropped_records: 0,
+            history_bytes: 2048,
+            soft_cap_bytes: 1024,
         }
     }
 

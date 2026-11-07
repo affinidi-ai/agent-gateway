@@ -41,6 +41,13 @@ pub struct AuditLogResponse {
     /// Whether the read stopped before the end of the audit history: the
     /// counts then describe the records it reached, not the whole history.
     pub truncated: bool,
+    /// Records the history holds that the read could not return. The counts
+    /// are lower bounds by this many.
+    pub dropped_records: usize,
+    /// Bytes the audit history takes on disk, live log and rotated files.
+    pub history_bytes: u64,
+    /// The advisory size an operator asked to be told about, `0` for none.
+    pub soft_cap_bytes: u64,
 }
 
 impl From<crate::delegation_vault::audit::AuditLogPage> for AuditLogResponse {
@@ -53,6 +60,9 @@ impl From<crate::delegation_vault::audit::AuditLogPage> for AuditLogResponse {
             total_pages: page.total_pages,
             category_counts: page.category_counts,
             truncated: page.truncated,
+            dropped_records: page.dropped_records,
+            history_bytes: page.history_bytes,
+            soft_cap_bytes: page.soft_cap_bytes,
         }
     }
 }
@@ -125,6 +135,9 @@ mod tests {
             total_pages: 1,
             category_counts: std::collections::BTreeMap::from([("token_injected".to_string(), 3)]),
             truncated: true,
+            dropped_records: 2,
+            history_bytes: 4096,
+            soft_cap_bytes: 1024,
         };
 
         let Json(response) = respond(Ok(page)).expect("a page is answered with 200");
@@ -133,6 +146,13 @@ mod tests {
         assert_eq!(body["truncated"], serde_json::json!(true));
         assert_eq!(body["total"], serde_json::json!(3));
         assert_eq!(body["category_counts"]["token_injected"], serde_json::json!(3));
+        assert_eq!(body["history_bytes"], serde_json::json!(4096), "the size of the history is answered with it");
+        assert_eq!(body["soft_cap_bytes"], serde_json::json!(1024));
+        assert_eq!(
+            body["dropped_records"],
+            serde_json::json!(2),
+            "the records the read could not return are counted apart from stopping early"
+        );
     }
 
     #[test]
@@ -145,6 +165,9 @@ mod tests {
             total_pages: 1,
             category_counts: std::collections::BTreeMap::new(),
             truncated: false,
+            dropped_records: 0,
+            history_bytes: 0,
+            soft_cap_bytes: 0,
         };
 
         let Json(response) = respond(Ok(page)).expect("a page is answered with 200");

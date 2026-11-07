@@ -11,6 +11,13 @@ interface AuditListProps {
   onSelect: (idx: number) => void;
   page: number;
   totalPages: number;
+  /**
+   * Whether the read's counts are lower bounds: it stopped before the end of
+   * the history, or met records it could not read. The page count then reads
+   * `of 687+`, and finding nothing means nothing was found in the records
+   * searched, not that the log is empty.
+   */
+  countsAreLowerBounds?: boolean;
   onPageChange: (updater: number | ((p: number) => number)) => void;
   /** Names the users policy changes were made by. */
   userName?: UserNameResolver;
@@ -24,6 +31,7 @@ const AuditList: React.FC<AuditListProps> = ({
   onSelect,
   page,
   totalPages,
+  countsAreLowerBounds = false,
   onPageChange,
   userName,
 }) => {
@@ -62,16 +70,26 @@ const AuditList: React.FC<AuditListProps> = ({
         >
           <i className="fas fa-clipboard-list fa-2x text-primary" aria-hidden="true" />
         </div>
-        <p className="mb-1 fw-semibold">No governance events yet</p>
-        <p className="small mb-0" style={{ maxWidth: 360 }}>
-          Trigger an agent action, or enable VP Auditing{' '}
-          <FieldHelp testId="field-help-audit-empty-vp" ariaLabel="About VP Auditing">
-            VP Auditing records a signed Verifiable Presentation for every policy decision, trust
-            check, and credential injection so you can prove after the fact what the gateway allowed
-            or denied and why.
-          </FieldHelp>{' '}
-          in Settings › Security, to generate audit evidence.
-        </p>
+        {countsAreLowerBounds ? (
+          // The read did not return everything the history holds, so the log
+          // is not known to be empty and the advice below would be wrong.
+          <p className="mb-1 fw-semibold" data-testid="audit-empty-truncated">
+            No governance events found in the records searched.
+          </p>
+        ) : (
+          <>
+            <p className="mb-1 fw-semibold">No governance events yet</p>
+            <p className="small mb-0" style={{ maxWidth: 360 }}>
+              Trigger an agent action, or enable VP Auditing{' '}
+              <FieldHelp testId="field-help-audit-empty-vp" ariaLabel="About VP Auditing">
+                VP Auditing records a signed Verifiable Presentation for every policy decision,
+                trust check, and credential injection so you can prove after the fact what the
+                gateway allowed or denied and why.
+              </FieldHelp>{' '}
+              in Settings › Security, to generate audit evidence.
+            </p>
+          </>
+        )}
       </div>
     );
   }
@@ -98,6 +116,7 @@ const AuditList: React.FC<AuditListProps> = ({
         >
           <span className="small text-muted">
             Page {page} of {totalPages}
+            {countsAreLowerBounds ? '+' : ''}
           </span>
           <div>
             <button

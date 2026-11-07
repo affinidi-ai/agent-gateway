@@ -1,5 +1,4 @@
 import React, { useMemo } from 'react';
-import { Nav } from 'react-bootstrap';
 import SearchInput from '../../components/shared/SearchInput';
 import { FilterChipGroup, FilterOverflowMenu } from '../../components/shared/filters';
 import type { FilterOption } from '../../components/shared/filters';
@@ -23,6 +22,11 @@ interface AuditFiltersProps {
   onFlowChange: (v: FlowFilter) => void;
   scopeFilter: ScopeFilter;
   onScopeChange: (v: ScopeFilter) => void;
+  /**
+   * Whether the read stopped before the end of the history, so every category
+   * count is a lower bound and is shown with a trailing `+`.
+   */
+  countsAreLowerBounds?: boolean;
 }
 
 const FLOW_OPTIONS: FilterOption[] = [
@@ -58,6 +62,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
   onFlowChange,
   scopeFilter,
   onScopeChange,
+  countsAreLowerBounds = false,
 }) => {
   // Helper: Split options into inline (show always) and overflow (low-frequency/zero-count)
   const splitByFrequency = (
@@ -235,6 +240,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
               onSelect={handleCategoryToggle}
               multiple={true}
               showBadge={false}
+              countsAreLowerBounds={countsAreLowerBounds}
             />
             {categoryOverflowChips.length > 0 && (
               <FilterOverflowMenu
@@ -248,6 +254,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
                 onClear={handleCategoryClear}
                 facetLabel="Category"
                 showBadge={false}
+                countsAreLowerBounds={countsAreLowerBounds}
               />
             )}
           </div>

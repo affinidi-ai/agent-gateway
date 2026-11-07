@@ -51,6 +51,16 @@ interface AuditLogPage {
   page: number;
   page_size: number;
   total_pages: number;
+  /**
+   * Whether the read stopped before the end of the audit history, so `total`
+   * and `total_pages` describe the records it reached.
+   */
+  truncated?: boolean;
+  /**
+   * Records the history holds that the read could not return. The counts are
+   * lower bounds by this many even when the read reached the end.
+   */
+  dropped_records?: number;
 }
 
 interface CredentialAuditTabProps {
@@ -464,6 +474,10 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
   );
 
   const totalPages = data ? data.total_pages : 1;
+  // A read that stopped before the end of the history, or that met records it
+  // could not read, counted less than the history holds, so its totals are
+  // lower bounds.
+  const more = data?.truncated || (data?.dropped_records ?? 0) > 0 ? '+' : '';
 
   const PaginationControls: React.FC = () => {
     if (totalPages <= 1) return null;
@@ -479,7 +493,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
       <div className="d-flex justify-content-between align-items-center mt-2 px-1">
         <small className="text-muted">
           {data
-            ? `${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, data.total)} of ${data.total}`
+            ? `${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, data.total)} of ${data.total}${more}`
             : ''}
         </small>
         <nav>
@@ -519,7 +533,11 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-clipboard-list me-1" /> Credential Delegation Audit Log
           {data && (
-            <Badge value={data.total} className="ms-2" ariaLabel={`${data.total} audit events`} />
+            <Badge
+              value={`${data.total}${more}`}
+              className="ms-2"
+              ariaLabel={`${data.total}${more} audit events`}
+            />
           )}
         </h6>
         <div className="d-flex align-items-center gap-2">
