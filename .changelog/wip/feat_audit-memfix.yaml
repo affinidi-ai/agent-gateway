@@ -102,7 +102,7 @@ changes:
         read no longer fails the read at all: the records behind it are still returned, and the
         response is marked `truncated`.
     - timestamp: '2026-11-07T13:20:00Z'
-      title: Show how many records each audit category holds, and no count where there is none
+      title: Show how many records each audit category holds
       description: >-
         The Audit page's Category filter counted every category and then showed the number for
         none of them: a category with records displayed no count at all, and only an empty one
