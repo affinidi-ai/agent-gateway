@@ -120,7 +120,7 @@ pub enum KafkaConfigError {
 }
 
 /// Checks the connection settings a Kafka endpoint's producer would be built with.
-pub fn validate_config(config: &Value) -> Result<(), KafkaConfigError> {
+fn validate_connection(config: &Value) -> Result<(), KafkaConfigError> {
     KafkaSecurity::from_config(config).map(drop)
 }
 
@@ -276,6 +276,13 @@ async fn producer_for(
 
 #[async_trait]
 impl StreamPublisher for KafkaPublisher {
+    fn validate_config(
+        &self,
+        config: &Value,
+    ) -> Result<()> {
+        Ok(validate_connection(config)?)
+    }
+
     async fn publish(
         &self,
         topic: &str,
@@ -375,29 +382,29 @@ mod tests {
                 .as_object_mut()
                 .expect("object")
                 .remove(field);
-            validate_config(&config)
+            validate_connection(&config)
         };
 
-        assert_eq!(validate_config(&msk), Ok(()));
+        assert_eq!(validate_connection(&msk), Ok(()));
         assert_eq!(without("sasl_mechanism"), Err(KafkaConfigError::MissingSaslMechanism));
         assert_eq!(without("sasl_username"), Err(KafkaConfigError::MissingSaslUsername));
         assert_eq!(without("sasl_password"), Err(KafkaConfigError::MissingSaslPassword));
         assert_eq!(
-            validate_config(&json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN", "sasl_username": "", "sasl_password": "pw"})),
+            validate_connection(&json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN", "sasl_username": "", "sasl_password": "pw"})),
             Err(KafkaConfigError::MissingSaslUsername)
         );
     }
 
     #[test]
     fn an_endpoint_without_security_protocol_keeps_its_auth_type() {
-        assert_eq!(validate_config(&json!({})), Ok(()));
-        assert_eq!(validate_config(&json!({"auth_type": "none", "sasl_username": "svc"})), Ok(()));
+        assert_eq!(validate_connection(&json!({})), Ok(()));
+        assert_eq!(validate_connection(&json!({"auth_type": "none", "sasl_username": "svc"})), Ok(()));
         assert_eq!(
-            validate_config(&json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"})),
+            validate_connection(&json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"})),
             Ok(())
         );
         assert_eq!(
-            validate_config(&json!({"auth_type": "sasl", "sasl_username": "svc"})),
+            validate_connection(&json!({"auth_type": "sasl", "sasl_username": "svc"})),
             Err(KafkaConfigError::MissingSaslPassword)
         );
     }
@@ -406,17 +413,17 @@ mod tests {
     fn unknown_protocols_and_mechanisms_are_refused() {
         for protocol in [json!("SASL_SSL"), json!("tls"), json!(1)] {
             assert_eq!(
-                validate_config(&json!({"security_protocol": protocol})),
+                validate_connection(&json!({"security_protocol": protocol})),
                 Err(KafkaConfigError::UnknownSecurityProtocol),
                 "{protocol}"
             );
         }
         assert_eq!(
-            validate_config(&json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"})),
+            validate_connection(&json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"})),
             Err(KafkaConfigError::UnknownSaslMechanism)
         );
         assert_eq!(
-            validate_config(&json!({"security_protocol": "ssl", "sasl_mechanism": "scram-sha-512"})),
+            validate_connection(&json!({"security_protocol": "ssl", "sasl_mechanism": "scram-sha-512"})),
             Err(KafkaConfigError::UnknownSaslMechanism)
         );
     }
