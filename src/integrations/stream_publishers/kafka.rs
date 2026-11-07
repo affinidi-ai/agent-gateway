@@ -235,8 +235,15 @@ fn connection_settings(
     brokers: &str,
     config: &Value,
 ) -> String {
-    serde_json::json!([brokers, config.get("auth_type"), config.get("sasl_username"), config.get("sasl_password")])
-        .to_string()
+    serde_json::json!([
+        brokers,
+        config.get("auth_type"),
+        config.get("security_protocol"),
+        config.get("sasl_mechanism"),
+        config.get("sasl_username"),
+        config.get("sasl_password")
+    ])
+    .to_string()
 }
 
 async fn producer_for(
@@ -446,6 +453,32 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(native(&moved), native(&other), "producers are never shared across endpoints");
+    }
+
+    #[tokio::test]
+    async fn a_security_protocol_or_sasl_mechanism_change_builds_a_new_producer() {
+        let endpoint_id = format!("kafka-cache-{}", uuid::Uuid::new_v4());
+        let sasl = |protocol: &str, mechanism: &str| {
+            json!({
+                "security_protocol": protocol,
+                "sasl_mechanism": mechanism,
+                "sasl_username": "gw1",
+                "sasl_password": "pw"
+            })
+        };
+
+        let plain = producer_for(&endpoint_id, "127.0.0.1:1", &sasl("sasl_plaintext", "PLAIN"))
+            .await
+            .unwrap();
+        let scram = producer_for(&endpoint_id, "127.0.0.1:1", &sasl("sasl_plaintext", "SCRAM-SHA-512"))
+            .await
+            .unwrap();
+        assert_ne!(native(&plain), native(&scram), "a mechanism change builds a new producer");
+
+        let tls = producer_for(&endpoint_id, "127.0.0.1:1", &sasl("sasl_ssl", "SCRAM-SHA-512"))
+            .await
+            .unwrap();
+        assert_ne!(native(&scram), native(&tls), "a protocol change builds a new producer");
     }
 
     #[tokio::test]
