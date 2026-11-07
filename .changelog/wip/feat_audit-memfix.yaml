@@ -35,7 +35,8 @@ changes:
         default; `0` shows the size alone). It enforces nothing: no record is deleted, no write is
         refused and the log keeps growing past it. It is there because the default retention never
         deletes anything, so the growth is worth watching; past the size the page names the two
-        things an operator can do about it.
+        things an operator can do about it. About the Audit Log explains what the size covers and
+        that the advisory size enforces nothing, so a filling bar does not read as a deadline.
   changed:
     - timestamp: '2026-11-07T10:00:00Z'
       title: ⭐ Rotate the VP Audit Log instead of appending to one unbounded file
@@ -100,6 +101,16 @@ changes:
         though it were the whole log. A rotated file that cannot be
         read no longer fails the read at all: the records behind it are still returned, and the
         response is marked `truncated`.
+    - timestamp: '2026-11-07T13:20:00Z'
+      title: Show how many records each audit category holds, and no count where there is none
+      description: >-
+        The Audit page's Category filter counted every category and then showed the number for
+        none of them: a category with records displayed no count at all, and only an empty one
+        was marked, so the only number on the row was a zero. The count now shows on each
+        category, as a lower bound with a trailing `+` when the read did not reach the end of
+        the history. The Flow and Type filters were given a count of zero for every option even
+        though the gateway sends no count for them, which read as "none of these" and hid every
+        option behind the overflow menu; they now show no number at all.
   removed: []
   security:
     - timestamp: '2026-11-07T10:45:00Z'

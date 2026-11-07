@@ -120,6 +120,26 @@ describe('AuditPage', () => {
     expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
   });
 
+  it('shows how many records each category holds on its chip', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, category_counts: { policy_decision: 24643, trust_check: 0 } },
+    });
+
+    renderPage();
+
+    const categoryFacet = facet('Category:');
+    // The count is the whole point of the facet: it says what selecting a
+    // category would give you before you select it.
+    expect(
+      await within(categoryFacet).findByTestId('filter-chip-policy_decision')
+    ).toHaveTextContent('24643');
+    // A category the read found none of keeps its zero marker instead.
+    fireEvent.click(within(categoryFacet).getByTestId('filter-overflow-trigger-category'));
+    expect(screen.getByTestId('filter-overflow-checkbox-trust_check')).toHaveAccessibleName(
+      /\(0\)/
+    );
+  });
+
   it('shows the counts of a partial read as lower bounds', async () => {
     mockGet.mockResolvedValue({
       data: { ...AUDIT_RESPONSE, total: 120, truncated: true },

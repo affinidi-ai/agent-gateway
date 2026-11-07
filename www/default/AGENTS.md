@@ -1060,8 +1060,10 @@ only that.
   Auditing: the log is not known to be empty, so that advice would be wrong.
 - The flag reaches them through `useAuditLog` (`countsAreLowerBounds`), `AuditList` and
   `AuditFilters` (the same prop name), and the shared `FilterChipGroup` / `FilterOverflowMenu`.
-  Category counts are rendered with `showBadge={false}` on this page, so only the overflow menu's
-  zero marker shows one today.
+  The Category facet renders its counts, so a category with records reads `24643` (or `24643+`
+  when the counts are lower bounds) and one with none keeps the `(0)` / `(0+)` zero marker. The
+  Decision, Flow and Scope facets pass `showBadge={false}`: their chips carry no count, so a
+  badge there would have nothing to show.
 - A **read that failed** is not an empty log. The gateway answers a read it could not make with
   `500`, so `useAuditLog` keeps the message in `error`, and `AuditList` renders the
   `alert alert-danger` panel (`audit-error`) with a Retry (`audit-error-retry`) **instead of** the
@@ -1559,6 +1561,12 @@ identities: an integration receives every event of its event set, from every res
 - The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says each integration with an
   event set holding audit events receives them independently of the log, at least once, so
   receivers deduplicate on `event_id`.
+- Its **Storage** section explains the size shown above the table: the live log plus every
+  rotated file, rotated at `vp_audit_log_max_bytes`, with every rotated file kept by default
+  so nothing is deleted. It states that `vp_audit_log_soft_cap_bytes` is advisory — passing it
+  deletes nothing and refuses no write — and that bounding the history means setting
+  `vp_audit_log_keep`, which does delete the records that fall out of the window. The panel is
+  where that is explained, because the bar itself carries no copy beyond the two actions.
 
 ## Laptop layouts
 
