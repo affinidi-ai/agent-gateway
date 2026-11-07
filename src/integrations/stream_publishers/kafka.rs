@@ -111,17 +111,29 @@ pub enum KafkaConfigError {
     UnknownSecurityProtocol,
     #[error("sasl_mechanism must be one of PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512")]
     UnknownSaslMechanism,
+    #[error("A SASL security_protocol needs a sasl_mechanism")]
+    MissingSaslMechanism,
+    #[error("A SASL security_protocol needs a sasl_username")]
+    MissingSaslUsername,
+    #[error("A SASL security_protocol needs a sasl_password")]
+    MissingSaslPassword,
+}
+
+/// Checks the connection settings a Kafka endpoint's producer would be built with.
+pub fn validate_config(config: &Value) -> Result<(), KafkaConfigError> {
+    KafkaSecurity::from_config(config).map(drop)
 }
 
 struct SaslCredentials<'a> {
     mechanism: SaslMechanism,
     username: &'a str,
-    password: Option<&'a str>,
+    password: &'a str,
 }
 
 /// How the producer connects and authenticates. An endpoint without `security_protocol` keeps
-/// the older `auth_type`: `sasl` with a `sasl_username` is SASL_PLAINTEXT, anything else
-/// plaintext.
+/// the older `auth_type`: `sasl` with a `sasl_username` is SASL_PLAINTEXT with PLAIN unless
+/// `sasl_mechanism` says otherwise, anything else plaintext. A SASL protocol needs a mechanism,
+/// a username and a password.
 struct KafkaSecurity<'a> {
     protocol: SecurityProtocol,
     sasl: Option<SaslCredentials<'a>>,
@@ -134,21 +146,31 @@ impl<'a> KafkaSecurity<'a> {
         let mechanism: Option<SaslMechanism> =
             optional_field(config, "sasl_mechanism", KafkaConfigError::UnknownSaslMechanism)?;
         let username = text_field(config, "sasl_username");
-        let legacy_sasl = text_field(config, "auth_type") == Some("sasl") && username.is_some();
+        let legacy_sasl =
+            protocol.is_none() && text_field(config, "auth_type") == Some("sasl") && username.is_some();
         let protocol = protocol.unwrap_or(if legacy_sasl {
             SecurityProtocol::SaslPlaintext
         } else {
             SecurityProtocol::Plaintext
         });
-        let sasl = match username {
-            Some(username) if protocol.uses_sasl() => Some(SaslCredentials {
-                mechanism: mechanism.unwrap_or(SaslMechanism::Plain),
-                username,
-                password: text_field(config, "sasl_password"),
-            }),
-            _ => None,
+        if !protocol.uses_sasl() {
+            return Ok(Self { protocol, sasl: None });
+        }
+        let sasl = SaslCredentials {
+            mechanism: mechanism
+                .or(legacy_sasl.then_some(SaslMechanism::Plain))
+                .ok_or(KafkaConfigError::MissingSaslMechanism)?,
+            username: username
+                .filter(|username| !username.is_empty())
+                .ok_or(KafkaConfigError::MissingSaslUsername)?,
+            password: text_field(config, "sasl_password")
+                .filter(|password| !password.is_empty())
+                .ok_or(KafkaConfigError::MissingSaslPassword)?,
         };
-        Ok(Self { protocol, sasl })
+        Ok(Self {
+            protocol,
+            sasl: Some(sasl),
+        })
     }
 
     fn apply(
@@ -161,9 +183,7 @@ impl<'a> KafkaSecurity<'a> {
         if let Some(sasl) = &self.sasl {
             kafka_config.set("sasl.mechanism", sasl.mechanism.librdkafka_name());
             kafka_config.set("sasl.username", sasl.username);
-            if let Some(password) = sasl.password {
-                kafka_config.set("sasl.password", password);
-            }
+            kafka_config.set("sasl.password", sasl.password);
         }
     }
 }
@@ -332,6 +352,66 @@ mod tests {
 
         let explicit_plaintext = configured(json!({"security_protocol": "plaintext"}));
         assert_eq!(explicit_plaintext.get("security.protocol"), None);
+    }
+
+    #[test]
+    fn a_sasl_protocol_needs_a_mechanism_a_username_and_a_password() {
+        let msk = json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_mechanism": "SCRAM-SHA-512",
+            "sasl_username": "gw1",
+            "sasl_password": "pw"
+        });
+        let without = |field: &str| {
+            let mut config = msk.clone();
+            config
+                .as_object_mut()
+                .expect("object")
+                .remove(field);
+            validate_config(&config)
+        };
+
+        assert_eq!(validate_config(&msk), Ok(()));
+        assert_eq!(without("sasl_mechanism"), Err(KafkaConfigError::MissingSaslMechanism));
+        assert_eq!(without("sasl_username"), Err(KafkaConfigError::MissingSaslUsername));
+        assert_eq!(without("sasl_password"), Err(KafkaConfigError::MissingSaslPassword));
+        assert_eq!(
+            validate_config(&json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN", "sasl_username": "", "sasl_password": "pw"})),
+            Err(KafkaConfigError::MissingSaslUsername)
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_security_protocol_keeps_its_auth_type() {
+        assert_eq!(validate_config(&json!({})), Ok(()));
+        assert_eq!(validate_config(&json!({"auth_type": "none", "sasl_username": "svc"})), Ok(()));
+        assert_eq!(
+            validate_config(&json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"})),
+            Ok(())
+        );
+        assert_eq!(
+            validate_config(&json!({"auth_type": "sasl", "sasl_username": "svc"})),
+            Err(KafkaConfigError::MissingSaslPassword)
+        );
+    }
+
+    #[test]
+    fn unknown_protocols_and_mechanisms_are_refused() {
+        for protocol in [json!("SASL_SSL"), json!("tls"), json!(1)] {
+            assert_eq!(
+                validate_config(&json!({"security_protocol": protocol})),
+                Err(KafkaConfigError::UnknownSecurityProtocol),
+                "{protocol}"
+            );
+        }
+        assert_eq!(
+            validate_config(&json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"})),
+            Err(KafkaConfigError::UnknownSaslMechanism)
+        );
+        assert_eq!(
+            validate_config(&json!({"security_protocol": "ssl", "sasl_mechanism": "scram-sha-512"})),
+            Err(KafkaConfigError::UnknownSaslMechanism)
+        );
     }
 
     #[tokio::test]
