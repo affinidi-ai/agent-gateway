@@ -291,6 +291,28 @@ pub fn build_target_ok_response() -> serde_json::Value {
     })
 }
 
+/// A managed-agent body that doubles as an agent card naming `agent_did` in its
+/// trust registry extension, which the gateway reads as the agent's DID;
+/// message-send forwards still return 200 with this body.
+pub fn build_target_agent_card_naming_did(agent_did: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "ok": true, "marker": "g2g-target" },
+        "name": "g2g-target-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {
+            "extensions": [
+                {
+                    "uri": "https://fabric.affinidi.io/extensions/trust-registry",
+                    "params": { "agent_did": agent_did }
+                }
+            ]
+        }
+    })
+}
+
 /// A managed-agent body that doubles as an agent card declaring the
 /// `agent-identity/v1` extension. A minting target surface serves this so the
 /// receiving gateway can inject the agent-identity-credential VP into the card

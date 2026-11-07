@@ -18,7 +18,7 @@
 # Run:    make docker-run-dev
 
 ARG NODE_VERSION=22.23.4
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.99.1
 
 ###############################################################################
 # base — Rust toolchain + native build dependencies

@@ -3156,14 +3156,16 @@ async fn exchange(
         &hop.gateway_id,
         match &sent {
             Ok(_) => TransportOutcome::Reached,
-            Err(FabricForwardError::NoResponse(_)) if shortened => TransportOutcome::Inconclusive,
+            Err(FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_)) if shortened => {
+                TransportOutcome::Inconclusive
+            }
             Err(_) => TransportOutcome::Failed,
         },
         Instant::now(),
     );
     let response = match sent {
         Ok(response) => response,
-        Err(FabricForwardError::NoResponse(_)) => {
+        Err(FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_)) => {
             return Exchange::answered(
                 PaymentDelegationDecision::unconfirmed(504, "payment gateway did not answer in time"),
                 true,
@@ -3590,8 +3592,14 @@ pub(crate) mod tests {
                     tokio::time::sleep(delay).await;
                 }
                 match answer {
-                    Ok((status, headers, body)) => Ok(FabricForwardResponse { status, headers, body }),
+                    Ok((status, headers, body)) => Ok(FabricForwardResponse {
+                        status,
+                        headers,
+                        body,
+                        refused_by_gateway: false,
+                    }),
                     Err("timeout") => Err(FabricForwardError::NoResponse("gw".into())),
+                    Err("reply not received") => Err(FabricForwardError::ReplyNotReceived("gw".into())),
                     Err(_) => Err(FabricForwardError::GatewayNotConnected("gw".into())),
                 }
             })
@@ -5827,11 +5835,13 @@ pub(crate) mod tests {
             status: 200,
             headers: HashMap::from([("payment-receipt".to_string(), vec![huge_header])]),
             body: Vec::new(),
+            refused_by_gateway: false,
         }));
         assert!(!oversized(&FabricForwardResponse {
             status: 200,
             headers: HashMap::new(),
             body: vec![0; MAX_RESPONSE_BODY_BYTES],
+            refused_by_gateway: false,
         }));
     }
 
@@ -5998,6 +6008,12 @@ pub(crate) mod tests {
             (
                 "timeout",
                 MockGate::failing("timeout"),
+                StatusCode::GATEWAY_TIMEOUT,
+                "payment gateway did not answer in time",
+            ),
+            (
+                "reply not received",
+                MockGate::failing("reply not received"),
                 StatusCode::GATEWAY_TIMEOUT,
                 "payment gateway did not answer in time",
             ),

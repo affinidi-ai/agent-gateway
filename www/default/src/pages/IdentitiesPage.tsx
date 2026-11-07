@@ -14,9 +14,11 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { Badge } from '../components/shared/Badge';
 import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
-import { CredentialPrincipalLabel, IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
+import { IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
+import { IdentitySurfaceCell } from './IdentitiesPage/IdentitySurfaceCell';
+import { isSharedManagedDid } from './IdentitiesPage/sharedManagedDid';
 import {
   RECORDER_FILTER_OPTIONS,
   isRecorderFilter,
@@ -25,6 +27,11 @@ import {
 import { useIdentityRows } from './IdentitiesPage/useIdentityRows';
 import IssuersTab from './SettingsPage/IssuersTab';
 import AuthoritiesTab from './SettingsPage/AuthoritiesTab';
+
+const metadataAgentName = (metadata?: { agent_name?: unknown }): string | undefined =>
+  typeof metadata?.agent_name === 'string' && metadata.agent_name !== ''
+    ? metadata.agent_name
+    : undefined;
 
 const IdentitiesPage: React.FC = () => {
   const { actions, getCurrentStats } = useApp();
@@ -38,7 +45,6 @@ const IdentitiesPage: React.FC = () => {
   const [loadingDidDocument, setLoadingDidDocument] = useState(false);
   const identityRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
   const [searchTerm, setSearchTerm] = useState('');
-  const [showUnnamedOnly, setShowUnnamedOnly] = useState(false);
   const [recorderFilter, setRecorderFilter] = useState<RecorderFilter>('all');
   const [issuersCount, setIssuersCount] = useState(0);
   const [authoritiesCount, setAuthoritiesCount] = useState(0);
@@ -136,7 +142,7 @@ const IdentitiesPage: React.FC = () => {
           ...identity,
           is_local: true,
           is_didwebvh: true,
-          name: identity.metadata?.agent_name || identity.did.split(':').pop(),
+          name: metadataAgentName(identity.metadata) || identity.did.split(':').pop(),
           created_at: identity.created_at,
         });
       } else {
@@ -157,14 +163,13 @@ const IdentitiesPage: React.FC = () => {
     filteredIdentities,
     hasNamingMetadata,
     hasRecorderStatus,
-    unnamedCount,
     liveSurfaceNames,
     surfaceLinkFor,
+    surfaceLinksFor,
   } = useIdentityRows({
     identities,
     channels: stats?.channels,
     searchTerm,
-    showUnnamedOnly,
     recorderFilter,
   });
 
@@ -405,18 +410,6 @@ const IdentitiesPage: React.FC = () => {
             placeholder="Filter Agent Identities, Issuers, Authorities..."
             width="384px"
           />
-          {hasNamingMetadata && activeTab === 'identities' && (
-            <button
-              type="button"
-              className={`btn btn-sm ms-2 ${showUnnamedOnly ? 'btn-primary' : 'btn-outline-secondary'}`}
-              aria-pressed={showUnnamedOnly}
-              onClick={() => setShowUnnamedOnly(prev => !prev)}
-              data-testid="identities-unnamed-filter-button"
-            >
-              <i className="fas fa-filter me-1" aria-hidden="true"></i>
-              Unnamed only ({unnamedCount})
-            </button>
-          )}
           {hasRecorderStatus && activeTab === 'identities' && (
             <div className="d-flex align-items-center ms-3">
               <label
@@ -480,9 +473,7 @@ const IdentitiesPage: React.FC = () => {
                         className="ms-2"
                         ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
-                          searchTerm ||
-                          (hasNamingMetadata && showUnnamedOnly) ||
-                          (hasRecorderStatus && recorderFilter !== 'all')
+                          searchTerm || (hasRecorderStatus && recorderFilter !== 'all')
                             ? ` of ${identities.length}`
                             : undefined
                         }
@@ -500,13 +491,13 @@ const IdentitiesPage: React.FC = () => {
                         <table className="table table-hover table-sm identities-table">
                           <thead>
                             <tr>
-                              <th>{hasNamingMetadata ? 'Identity' : 'DID'}</th>
+                              <th>Name</th>
+                              <th>DID</th>
                               <th>Agent Surface</th>
                               <th>Trust Score</th>
                               <th>Attestation</th>
                               <th title="Universal Agent Identifier">UAI</th>
                               <th>Created</th>
-                              <th>Usage Count</th>
                               <th>Last Used</th>
                               <th>Origin</th>
                               {hasRecorderStatus && <th>Recorder</th>}
@@ -517,6 +508,7 @@ const IdentitiesPage: React.FC = () => {
                             {filteredIdentities.map(identity => {
                               const isExpanded = expandedIdentityDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
+                              const sharedManagedDid = isSharedManagedDid(identity);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -536,6 +528,8 @@ const IdentitiesPage: React.FC = () => {
                                         <IdentityNameCell
                                           identity={identity}
                                           showName={hasNamingMetadata}
+                                          showDid={false}
+                                          fallbackName={metadataAgentName(identity.metadata)}
                                           liveSurfaceName={
                                             identity.surface_id
                                               ? liveSurfaceNames.get(identity.surface_id)
@@ -543,6 +537,9 @@ const IdentitiesPage: React.FC = () => {
                                           }
                                         />
                                       </div>
+                                    </td>
+                                    <td>
+                                      <IdentityNameCell identity={identity} showName={false} />
                                       {identity.version !== undefined &&
                                         identity.version !== null && (
                                           <span className="badge badge-primary ml-2">
@@ -556,24 +553,12 @@ const IdentitiesPage: React.FC = () => {
                                       )}
                                     </td>
                                     <td>
-                                      {surfaceLink ? (
-                                        <button
-                                          type="button"
-                                          onClick={e => {
-                                            e.stopPropagation();
-                                            navigate(`/surfaces/${surfaceLink.id}`);
-                                          }}
-                                          className="btn btn-link p-0 align-baseline text-primary"
-                                          style={{ fontSize: '0.75rem' }}
-                                          data-testid="identities-surface-link"
-                                        >
-                                          {surfaceLink.name}
-                                        </button>
-                                      ) : (
-                                        <span className="text-muted">-</span>
-                                      )}
-                                      <CredentialPrincipalLabel
+                                      <IdentitySurfaceCell
+                                        links={surfaceLinksFor(identity)}
                                         principal={identity.credential_principal}
+                                        onOpenSurface={surfaceId =>
+                                          navigate(`/surfaces/${surfaceId}`)
+                                        }
                                       />
                                     </td>
                                     <td>
@@ -666,11 +651,6 @@ const IdentitiesPage: React.FC = () => {
                                     </td>
                                     <td>
                                       <small>
-                                        {identity.usage_count || identity.use_count || 0}
-                                      </small>
-                                    </td>
-                                    <td>
-                                      <small>
                                         {identity.last_used_at || identity.last_used
                                           ? timeAgo((identity.last_used_at || identity.last_used)!)
                                           : 'Never'}
@@ -720,7 +700,10 @@ const IdentitiesPage: React.FC = () => {
                                     {hasRecorderStatus && (
                                       <td>
                                         {identity.trust_recorder ? (
-                                          <IdentityRecorderChip status={identity.trust_recorder} />
+                                          <IdentityRecorderChip
+                                            status={identity.trust_recorder}
+                                            surface={identity.trust_recorder_surface}
+                                          />
                                         ) : (
                                           <span className="text-muted">-</span>
                                         )}
@@ -819,7 +802,7 @@ const IdentitiesPage: React.FC = () => {
                                                           <small>{identity.identity_hash}</small>
                                                         </div>
                                                       </div>
-                                                      {surfaceLink && (
+                                                      {surfaceLink && !sharedManagedDid && (
                                                         <div className="mb-2">
                                                           <small className="font-weight-bold text-muted">
                                                             {identity.surface_id

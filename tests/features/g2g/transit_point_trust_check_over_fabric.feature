@@ -14,5 +14,5 @@ Feature: Transit Point Trust Check over Fabric
     And Transit Point "tr1" has a target-leg Trust Check
     When managed agent "delta" sends an A2A message/send request through Transit Point "tr1" with header "x-api-key" set to "tr1-caller-key"
     Then the response status is 200
-    And managed agent "bravo" served its agent card
+    And managed agent "bravo" served its agent card once
     And managed agent "bravo" received one forwarded message

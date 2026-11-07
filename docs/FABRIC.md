@@ -668,7 +668,11 @@ not through the Transit Point, with a count of 1 and a trace id of its own. It r
 its Target credential when it has one, and falls back to `/.well-known/agent.json`, which the
 remote reads as a public discovery read without that credential; a remote Target that serves its
 card only at the legacy path and requires its credential there is reported as
-`AGENT_CARD_UNAVAILABLE`.
+`AGENT_CARD_UNAVAILABLE`. A `404` or `503` the remote gateway answers itself (an unknown or
+inactive surface) ends the read without the fallback. See [`POLICY.md`](POLICY.md) for which reads are
+cached. An Access Point with a `fabric://` Target gives its surface policy the card it serves,
+built in process: one read over Fabric at its card location, uncached, within
+`a2a.timeout_seconds` or the surface's shorter request timeout.
 The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
 the agent sending the token it was given each time; two agents that call each other's Access
 Points are not bounded by it, nor are agents that keep calling through any of the resets above.

@@ -6,7 +6,7 @@ Affinidi Agent Gateway is a single Rust binary (`agent-gateway`) with a dashboar
 
 ## Development Requirements
 
-- Rust `1.95.0` or newer, 2024 Edition (the minimum is declared in [`Cargo.toml`](Cargo.toml))
+- Rust `1.99.1` or newer, 2024 Edition (the minimum is declared in [`Cargo.toml`](Cargo.toml))
 - Node.js and npm (to build and run the dashboard under `www/default/`)
 
 Runtime state uses an in-memory DashMap cache backed by filesystem JSON storage — there is no

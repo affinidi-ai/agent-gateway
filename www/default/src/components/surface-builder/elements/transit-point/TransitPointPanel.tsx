@@ -327,7 +327,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         )}
       </div>
 
-      {supportsAgentCard && (
+      {supportsAgentCard && endpointType === 'url' && !isFabricEndpoint(config.target_endpoint) && (
         <div className="config-section">
           <label>Agent Card</label>{' '}
           <div className="d-flex align-items-center gap-1">

@@ -278,6 +278,30 @@ impl AgentSurface {
             .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
     }
 
+    /// Whether the surface issues a managed agent identity: an `a2a-proxy://` target always
+    /// does, otherwise one configured on its target or on any Transit Point. Unlike
+    /// [`Self::transit_point_has_managed_identity`], a target `from_jwt_claim` counts, since
+    /// the target is reached on the inbound leg where that mode applies.
+    pub fn has_managed_identity(&self) -> bool {
+        self.is_a2a_proxy_target()
+            || self
+                .managed_identity()
+                .is_some()
+            || self
+                .transit
+                .as_ref()
+                .is_some_and(|transit| {
+                    transit
+                        .points
+                        .iter()
+                        .any(|point| {
+                            point
+                                .managed_identity
+                                .is_some()
+                        })
+                })
+    }
+
     /// Why this surface's caller authentication cannot tell apart the users a
     /// paired gateway sends requests for over Fabric, or `None` when it can.
     /// Delegated per-user credentials for Fabric callers, on its Target and on
@@ -1482,6 +1506,33 @@ mod tests {
             ..Default::default()
         }));
         assert!(s.inject_identity_vp(), "dropping Identity element on inbound edge should imply VP injection");
+    }
+
+    #[test]
+    fn has_managed_identity_reads_the_target_and_every_transit_point() {
+        let mut point: crate::config::agent_surface::TransitPoint =
+            serde_json::from_value(serde_json::json!({"alias": "out", "target_endpoint": "https://out.example"}))
+                .unwrap();
+        let mut s = surface(SurfaceProtocol::A2a);
+        s.transit = Some(serde_json::from_value(serde_json::json!({"points": [point.clone()]})).unwrap());
+        assert!(!s.has_managed_identity());
+
+        point.managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromMtls {
+            certificate_id: "cert".to_string(),
+        });
+        s.transit = Some(serde_json::from_value(serde_json::json!({"points": [point]})).unwrap());
+        assert!(s.has_managed_identity());
+
+        let mut target_only = surface(SurfaceProtocol::A2a);
+        target_only
+            .target
+            .identity_injection
+            .identity_type = Some("from_jwt_claim".to_string());
+        assert!(target_only.has_managed_identity());
+
+        let mut a2a_proxy = surface(SurfaceProtocol::A2a);
+        a2a_proxy.target.endpoint = "a2a-proxy://worker".to_string();
+        assert!(a2a_proxy.has_managed_identity());
     }
 
     #[test]

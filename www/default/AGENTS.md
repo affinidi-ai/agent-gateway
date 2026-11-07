@@ -340,6 +340,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Neither the panel, its canvas summary, the
   Transit Point factory nor a variant's overrides set `sign_requests`, which the gateway
   ignores.
+- The Transit Point panel's **Agent Card** section (**Override Agent Card Location**) is shown
+  for an A2A or AP2 Transit Point with a URL destination only. A gateway destination
+  (`fabric://`) reads the card at the remote gateway's discovery paths, so the section is
+  hidden there; a stored `agent_card_path` is kept and ignored.
 - The Transit Point panel's **Who can call this Transit Point** section
   (`TransitCallerSection.tsx`, rules in `callerAuth.ts`) holds the transit token switch
   (`transit-point-require-transit-token-switch`), the **Caller authentication** select
@@ -1085,9 +1089,10 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 ## Identities page
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
-`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
-unnamed filter, recorder filter, and surface links in the `useIdentityRows` hook, and the row
-parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search, recorder
+filter, and surface links in the `useIdentityRows` hook, the shared managed DID check in
+`sharedManagedDid.ts`, and the row parts `IdentityNameCell`, `IdentitySurfaceCell`,
+`IdentityOriginBadge`, and `IdentityRecorderChip`.
 
 - Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
   Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
@@ -1095,24 +1100,48 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
   identity.
 - Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
   adds to the set rather than replacing it.
-- The name cell shows the display name prominently, with the shortened DID in monospace
-  beside it and a copy button for the full DID. Without a name, the shortened DID and
-  copy button are the primary line, with no placeholder chip. While a caller name
-  lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
-  DID. A name conflict shows the DID as primary with a "name conflict" marker beside it.
-  A verified agent name renders as `local · host` with a verified marker. A caller's
-  Agent Card name (`agent_card`), a managed agent's target Agent Card name
-  (`target_agent_card`) and a surface name show no badge.
-- The unnamed filter and its count include only rows with no name and no pending lookup.
+- The **Name** column (`IdentityNameCell` with `showDid={false}`) shows the display name
+  prominently. The header is "Name", not "Agent Name": the column holds display names, and
+  _agent name_ is the verified `host/@local` handle only. While a caller name lookup is
+  pending (`display_name_pending`), it shows a muted "resolving…" line. A verified agent
+  name renders as `local · host` with a verified marker. A caller's Agent Card name
+  (`agent_card`), a managed agent's target Agent Card name (`target_agent_card`) and a
+  surface name show no badge. Without a display name, it shows `metadata.agent_name` when that
+  is a non-empty string, else a muted, italic "Unnamed Agent".
+- The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
+  monospace with a copy button for the full DID, then the version badge and SCID when set.
+- The table has no Usage Count column; the usage count is still in the expanded details and
+  the API.
+- A **shared managed DID** is the managed agent on more than one live surface: its
+  `managed_surfaces` (every live surface where the DID is the managed agent, sorted by name;
+  omitted when empty) has two or more entries. It is one row. Its Name cell shows a muted,
+  italic "Unnamed Agent" (so it is not mistaken for an Agent Card named that), then "N
+  surfaces". This applies even if a `display_name` arrives.
+- The **Agent Surface** cell lists every surface in `managed_surfaces` for a shared managed
+  DID, each linking to `/surfaces/<surface_id>` (live name preferred), not the last-used
+  `channel_*` surface. Other rows show their single surface link as before. The credential
+  principal sits beneath the surfaces.
+- The expanded details of a shared managed DID leave out the Agent Surface entry, so the
+  surface names appear only in the Agent Surface cell. Single-surface rows keep it.
 - The **Origin** column holds the origin badge (Managed Agent or External Caller), or
   LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.
 - Managed rows show an origin badge, the live surface name linking to
   `/surfaces/<surface_id>`, and the credential principal as a separate field.
-- When the backend sends none of the naming fields, the page renders as it did without
-  them: no name line, filter, or origin badge.
+- Search also matches the surface names in `managed_surfaces`. It does not match the
+  last-used `channel_name` of a managed row, which may be a surface where the DID was only a
+  caller.
+- When the backend sends none of the naming fields, the Name column still shows, with
+  `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
-  `types.ts`), present only when the identity's surface has a Trust Recorder. It is the
-  gateway recorder's last known outcome, not a live registry check. When any identity has it,
+  `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
+  A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
+  Partly recorded > Skipped > Not attempted yet > Recorded. "Not attempted yet" outranks
+  "Recorded", so a DID recorded on one surface whose other surface's recorder has not run
+  shows "Not attempted yet". Such a DID also carries `trust_recorder_surface` (a
+  `ManagedSurfaceRef`, sent only for a shared managed DID), the surface whose outcome
+  `trust_recorder` holds; the chip's accessible name reads "Trust Recorder status on
+  <surface>: <state>" and its tooltip opens with "Recorder on <surface>". It is the gateway
+  recorder's last known outcome, not a live registry check. When any identity has it,
   the table gains a **Recorder** column and the filter row gains a **Recorder** select; with
   none, neither appears and the page looks as before.
   - The column holds `IdentityRecorderChip`, a shared `Badge` (never colour-only: the text is
@@ -1125,26 +1154,28 @@ parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
     text; no registry error text is ever shown.
   - The **Recorder** select (`recorderFilter.ts`, a pure predicate) offers All, Recorded,
     Partly recorded, Failed, Skipped, Not attempted yet, and No recorder (identities without
-    the field). It is page state like the unnamed filter, and combines with the search and the
-    unnamed filter (AND).
+    the field). It is page state and combines with the search (AND).
   - A websocket identity update replaces the whole identity, so a changed `trust_recorder`
     outcome shows without a reload. The backend includes an identity in the delta when its
     recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
     reload.
 
-| Element                            | Test id                                                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Identity row                       | `identities-row-<did>`                                                                               |
-| Name, pending, conflict, verified  | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified` |
-| Copy DID                           | `identities-copy-did-button`                                                                         |
-| Origin badge                       | `identities-origin-<origin>`                                                                         |
-| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal`                                         |
-| Unnamed filter                     | `identities-unnamed-filter-button`                                                                   |
-| Recorder filter                    | `identities-recorder-filter`                                                                         |
-| Recorder chip                      | `identities-recorder-chip-<state>`                                                                   |
-| Recorder tooltip                   | `identities-recorder-tooltip`                                                                        |
-| Tooltip last attempt, reason       | `identities-recorder-last-attempt`, `identities-recorder-reason`                                     |
-| Tooltip registry entry             | `identities-recorder-entry-<registry id>`                                                            |
+| Element                        | Test id                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| Identity row                   | `identities-row-<did>`                                                   |
+| Name, pending, verified        | `identities-name`, `identities-name-pending`, `identities-name-verified` |
+| No name                        | `identities-name-empty`                                                  |
+| Shared managed DID name, count | `identities-unnamed-agent`, `identities-shared-surface-count`            |
+| Copy DID                       | `identities-copy-did-button`                                             |
+| Origin badge                   | `identities-origin-<origin>`                                             |
+| Surface list, surface link     | `identities-surface-list`, `identities-surface-link`                     |
+| Credential principal           | `identities-credential-principal`                                        |
+| Recorder filter                | `identities-recorder-filter`                                             |
+| Recorder chip                  | `identities-recorder-chip-<state>`                                       |
+| Recorder tooltip               | `identities-recorder-tooltip`                                            |
+| Tooltip recorder surface       | `identities-recorder-surface`                                            |
+| Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
+| Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 
 ## Connections page
 

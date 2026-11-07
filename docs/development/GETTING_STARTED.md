@@ -27,7 +27,7 @@ Install these before starting:
 | --- | --- |
 | Git | Used to clone and work with the repository |
 | Homebrew | Used by `make install-deps` |
-| Rust `1.95.0` or newer | The minimum version is declared in [`Cargo.toml`](../../Cargo.toml) |
+| Rust `1.99.1` or newer | The minimum version is declared in [`Cargo.toml`](../../Cargo.toml) |
 | Node.js and npm | Required to build and run the dashboard |
 | A WebAuthn-capable browser and authenticator | For example, Safari or Chrome with Touch ID, or a compatible security key |
 
