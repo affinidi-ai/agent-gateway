@@ -146,8 +146,7 @@ impl<'a> KafkaSecurity<'a> {
         let mechanism: Option<SaslMechanism> =
             optional_field(config, "sasl_mechanism", KafkaConfigError::UnknownSaslMechanism)?;
         let username = text_field(config, "sasl_username");
-        let legacy_sasl =
-            protocol.is_none() && text_field(config, "auth_type") == Some("sasl") && username.is_some();
+        let legacy_sasl = protocol.is_none() && text_field(config, "auth_type") == Some("sasl") && username.is_some();
         let protocol = protocol.unwrap_or(if legacy_sasl {
             SecurityProtocol::SaslPlaintext
         } else {
@@ -167,10 +166,7 @@ impl<'a> KafkaSecurity<'a> {
                 .filter(|password| !password.is_empty())
                 .ok_or(KafkaConfigError::MissingSaslPassword)?,
         };
-        Ok(Self {
-            protocol,
-            sasl: Some(sasl),
-        })
+        Ok(Self { protocol, sasl: Some(sasl) })
     }
 
     fn apply(
@@ -178,10 +174,18 @@ impl<'a> KafkaSecurity<'a> {
         kafka_config: &mut ClientConfig,
     ) {
         if self.protocol != SecurityProtocol::Plaintext {
-            kafka_config.set("security.protocol", self.protocol.librdkafka_name());
+            kafka_config.set(
+                "security.protocol",
+                self.protocol
+                    .librdkafka_name(),
+            );
         }
         if let Some(sasl) = &self.sasl {
-            kafka_config.set("sasl.mechanism", sasl.mechanism.librdkafka_name());
+            kafka_config.set(
+                "sasl.mechanism",
+                sasl.mechanism
+                    .librdkafka_name(),
+            );
             kafka_config.set("sasl.username", sasl.username);
             kafka_config.set("sasl.password", sasl.password);
         }
@@ -390,7 +394,9 @@ mod tests {
         assert_eq!(without("sasl_username"), Err(KafkaConfigError::MissingSaslUsername));
         assert_eq!(without("sasl_password"), Err(KafkaConfigError::MissingSaslPassword));
         assert_eq!(
-            validate_connection(&json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN", "sasl_username": "", "sasl_password": "pw"})),
+            validate_connection(
+                &json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN", "sasl_username": "", "sasl_password": "pw"})
+            ),
             Err(KafkaConfigError::MissingSaslUsername)
         );
     }
@@ -419,7 +425,9 @@ mod tests {
             );
         }
         assert_eq!(
-            validate_connection(&json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"})),
+            validate_connection(
+                &json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"})
+            ),
             Err(KafkaConfigError::UnknownSaslMechanism)
         );
         assert_eq!(

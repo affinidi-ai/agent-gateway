@@ -57,5 +57,10 @@ fn endpoint_hides_sasl_password(world: &mut SurfaceWorld) {
         .expect("admin API response")
         .body;
     assert_eq!(body["secrets"], json!(["sasl_password"]), "{body}");
-    assert!(!body.to_string().contains(SASL_PASSWORD), "{body}");
+    assert!(
+        !body
+            .to_string()
+            .contains(SASL_PASSWORD),
+        "{body}"
+    );
 }
