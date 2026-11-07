@@ -146,7 +146,7 @@ describe('a new endpoint', () => {
     expect(screen.getByLabelText(/brokers/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/sasl username/i)).not.toBeInTheDocument();
 
-    type(/authentication/i, 'sasl');
+    type(/security protocol/i, 'sasl_plaintext');
     expect(screen.getByLabelText(/sasl username/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/sasl password/i)).toBeInTheDocument();
 
@@ -161,7 +161,6 @@ describe('a new endpoint', () => {
     type(/^name/i, 'MSK');
     type(/topic or stream/i, 'gw1.audit');
     type(/brokers/i, 'b-1.msk.example:9196');
-    type(/authentication/i, 'sasl');
     type(/security protocol/i, 'sasl_ssl');
     type(/sasl mechanism/i, 'SCRAM-SHA-512');
     type(/sasl username/i, 'gw1');
@@ -175,7 +174,6 @@ describe('a new endpoint', () => {
             platform: 'kafka',
             topic: 'gw1.audit',
             brokers: 'b-1.msk.example:9196',
-            auth_type: 'sasl',
             security_protocol: 'sasl_ssl',
             sasl_mechanism: 'SCRAM-SHA-512',
             sasl_username: 'gw1',
@@ -337,6 +335,72 @@ describe('a stored endpoint', () => {
     expect(screen.getByTestId('endpoint-signing_secret-clear-button')).toBeInTheDocument();
   });
 
+  test('a SASL_SSL Kafka endpoint saved through the API keeps its settings and password when renamed', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        name: 'MSK',
+        type: 'stream',
+        configuration: {
+          platform: 'kafka',
+          topic: 'gw1.audit',
+          brokers: 'b-1.msk.example:9196',
+          security_protocol: 'sasl_ssl',
+          sasl_mechanism: 'SCRAM-SHA-512',
+          sasl_username: 'gw1',
+        },
+        secrets: ['sasl_password'],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('MSK');
+
+    type(/^name/i, 'MSK audit');
+    fireEvent.click(screen.getByTestId('endpoint-save-button'));
+
+    await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
+    const [, request] = mocked.updateEndpoint.mock.calls[0];
+    expect(request.name).toBe('MSK audit');
+    expect(request.configuration).toEqual({
+      platform: 'kafka',
+      topic: 'gw1.audit',
+      brokers: 'b-1.msk.example:9196',
+      security_protocol: 'sasl_ssl',
+      sasl_mechanism: 'SCRAM-SHA-512',
+      sasl_username: 'gw1',
+    });
+    expect(request.configuration).not.toHaveProperty('sasl_password');
+  });
+
+  test('a TLS-only Kafka endpoint keeps its security protocol when renamed', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        name: 'Kafka TLS',
+        type: 'stream',
+        configuration: {
+          platform: 'kafka',
+          topic: 'events',
+          brokers: 'broker:9093',
+          security_protocol: 'ssl',
+        },
+        secrets: [],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('Kafka TLS');
+
+    type(/^name/i, 'Kafka over TLS');
+    fireEvent.click(screen.getByTestId('endpoint-save-button'));
+
+    await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
+    const [, request] = mocked.updateEndpoint.mock.calls[0];
+    expect(request.configuration).toEqual({
+      platform: 'kafka',
+      topic: 'events',
+      brokers: 'broker:9093',
+      security_protocol: 'ssl',
+    });
+  });
+
   test('switching SASL off clears the stored SASL password instead of keeping it unseen', async () => {
     mocked.getEndpoint.mockResolvedValue(
       stored({
@@ -354,7 +418,9 @@ describe('a stored endpoint', () => {
     renderEditor('/integrations/endpoints/e1');
     await screen.findByDisplayValue('events');
 
-    fireEvent.change(screen.getByTestId('endpoint-auth_type-input'), { target: { value: 'none' } });
+    fireEvent.change(screen.getByTestId('endpoint-security_protocol-input'), {
+      target: { value: 'plaintext' },
+    });
     fireEvent.click(screen.getByTestId('endpoint-save-button'));
 
     await waitFor(() =>
@@ -365,7 +431,7 @@ describe('a stored endpoint', () => {
             platform: 'kafka',
             topic: 'events',
             brokers: 'b:9092',
-            auth_type: 'none',
+            security_protocol: 'plaintext',
             sasl_password: null,
           },
         })

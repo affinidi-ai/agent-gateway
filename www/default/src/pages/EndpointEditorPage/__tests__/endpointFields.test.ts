@@ -45,26 +45,29 @@ describe('fields per endpoint type', () => {
     expect(names(ENDPOINT_FIELDS.slack)).toEqual(['webhook_url', 'bot_name', 'icon_emoji']);
   });
 
-  test('stream shows SASL only for Kafka with SASL, and no AWS keys', () => {
+  test('stream shows SASL only for Kafka with a SASL protocol, and no AWS keys', () => {
     const shown = (configuration: Record<string, unknown>) =>
       names(visibleFields('stream', configuration));
-
-    expect(shown({ platform: 'kafka', auth_type: 'sasl' })).toEqual([
+    const sasl = [
       'platform',
       'topic',
       'brokers',
-      'auth_type',
       'security_protocol',
       'sasl_mechanism',
       'sasl_username',
       'sasl_password',
-    ]);
-    expect(shown({ platform: 'kafka', auth_type: 'none' })).toEqual([
-      'platform',
-      'topic',
-      'brokers',
-      'auth_type',
-    ]);
+    ];
+
+    expect(shown({ platform: 'kafka', security_protocol: 'sasl_ssl' })).toEqual(sasl);
+    expect(shown({ platform: 'kafka', security_protocol: 'sasl_plaintext' })).toEqual(sasl);
+    for (const security_protocol of ['plaintext', 'ssl']) {
+      expect(shown({ platform: 'kafka', security_protocol })).toEqual([
+        'platform',
+        'topic',
+        'brokers',
+        'security_protocol',
+      ]);
+    }
     expect(shown({ platform: 'pulsar' })).toEqual(['platform', 'topic', 'brokers']);
     expect(shown({ platform: 'kinesis' })).toEqual([
       'platform',
@@ -78,54 +81,79 @@ describe('fields per endpoint type', () => {
     );
   });
 
-  test('Kafka SASL offers the protocols and mechanisms the gateway accepts', () => {
+  test('Kafka offers the protocols and mechanisms the gateway accepts', () => {
     const optionsOf = (name: string) =>
       ENDPOINT_FIELDS.stream
         .find(field => field.name === name)
         ?.options?.map(option => option.value);
 
-    expect(optionsOf('security_protocol')).toEqual(['sasl_plaintext', 'sasl_ssl']);
+    expect(optionsOf('security_protocol')).toEqual([
+      'plaintext',
+      'ssl',
+      'sasl_plaintext',
+      'sasl_ssl',
+    ]);
     expect(optionsOf('sasl_mechanism')).toEqual(['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512']);
   });
 });
 
-describe('Kafka SASL settings', () => {
+describe('Kafka security settings', () => {
   const kafka = (configuration: Record<string, unknown>) =>
     stored({
       type: 'stream',
-      configuration: {
-        platform: 'kafka',
-        topic: 'events',
-        brokers: 'b:9092',
-        auth_type: 'sasl',
-        sasl_username: 'svc',
-        ...configuration,
-      },
+      configuration: { platform: 'kafka', topic: 'events', brokers: 'b:9092', ...configuration },
       secrets: ['sasl_password'],
     });
 
-  test('default to SASL_PLAINTEXT with PLAIN, as the gateway reads an endpoint without them', () => {
+  test('a new endpoint starts as plaintext with PLAIN ready for SASL', () => {
     expect(initialForm('stream').values).toMatchObject({
-      security_protocol: 'sasl_plaintext',
+      security_protocol: 'plaintext',
       sasl_mechanism: 'PLAIN',
     });
-    expect(initialForm('stream', kafka({})).values).toMatchObject({
+  });
+
+  test('a stored endpoint with auth_type sasl and no protocol reads as the gateway reads it', () => {
+    expect(
+      initialForm('stream', kafka({ auth_type: 'sasl', sasl_username: 'svc' })).values
+    ).toMatchObject({ security_protocol: 'sasl_plaintext', sasl_mechanism: 'PLAIN' });
+    expect(initialForm('stream', kafka({ auth_type: 'sasl' })).values).toMatchObject({
+      security_protocol: 'plaintext',
+    });
+    expect(
+      initialForm(
+        'stream',
+        kafka({ auth_type: 'sasl', sasl_username: 'svc', security_protocol: 'sasl_ssl' })
+      ).values
+    ).toMatchObject({ security_protocol: 'sasl_ssl' });
+  });
+
+  test('a legacy SASL endpoint is saved with the protocol and mechanism it used', () => {
+    const form = initialForm('stream', kafka({ auth_type: 'sasl', sasl_username: 'svc' }));
+
+    expect(buildConfiguration('stream', form, true)).toEqual({
+      platform: 'kafka',
+      topic: 'events',
+      brokers: 'b:9092',
       security_protocol: 'sasl_plaintext',
       sasl_mechanism: 'PLAIN',
+      sasl_username: 'svc',
     });
   });
 
   test('a stored endpoint shows and sends its own protocol and mechanism', () => {
     const form = initialForm(
       'stream',
-      kafka({ security_protocol: 'sasl_ssl', sasl_mechanism: 'SCRAM-SHA-512' })
+      kafka({
+        security_protocol: 'sasl_ssl',
+        sasl_mechanism: 'SCRAM-SHA-512',
+        sasl_username: 'svc',
+      })
     );
 
     expect(buildConfiguration('stream', form, true)).toEqual({
       platform: 'kafka',
       topic: 'events',
       brokers: 'b:9092',
-      auth_type: 'sasl',
       security_protocol: 'sasl_ssl',
       sasl_mechanism: 'SCRAM-SHA-512',
       sasl_username: 'svc',
@@ -293,13 +321,13 @@ describe('buildConfiguration for stored secrets the form now hides', () => {
 
   test('switching SASL off clears the stored SASL password', () => {
     const form = initialForm('stream', kafka(['sasl_password']));
-    form.values.auth_type = 'none';
+    form.values.security_protocol = 'ssl';
 
     expect(buildConfiguration('stream', form, true)).toEqual({
       platform: 'kafka',
       topic: 'events',
       brokers: 'b:9092',
-      auth_type: 'none',
+      security_protocol: 'ssl',
       sasl_password: null,
     });
   });
@@ -324,7 +352,7 @@ describe('buildConfiguration for stored secrets the form now hides', () => {
 
   test('a stored secret reference the form now hides is cleared too', () => {
     const form = initialForm('stream', kafka([], { sasl_password: '$SECRET:kafka-password' }));
-    form.values.auth_type = 'none';
+    form.values.security_protocol = 'plaintext';
 
     expect(buildConfiguration('stream', form, true)).toMatchObject({ sasl_password: null });
   });

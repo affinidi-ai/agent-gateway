@@ -11,8 +11,10 @@ changes:
         endpoint without them keeps working as before: auth_type sasl is SASL_PLAINTEXT
         with PLAIN, anything else plaintext. A save with an unknown protocol or mechanism,
         or a SASL protocol without a mechanism, username or password, is refused with 400.
-        The cached producer is rebuilt when either field changes, and the dashboard's
-        endpoint editor offers both under SASL. See docs/INTEGRATIONS.md.
+        The cached producer is rebuilt when either field changes. The dashboard's endpoint
+        editor replaces its Authentication select with a Security protocol select offering all
+        four protocols, adds the mechanism for a SASL one, and saves every configuration the
+        API accepts back unchanged. See docs/INTEGRATIONS.md.
   changed: []
   fixed: []
   removed: []

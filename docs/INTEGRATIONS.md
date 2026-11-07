@@ -629,9 +629,10 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 
 - **Endpoints** show the fields of their type. Secret fields are never shown once stored: they
   can be kept, replaced or cleared, or point to an appliance-wide secret with
-  `$SECRET:<secret_id>`. A saved endpoint can send a test message. A Kafka endpoint with SASL
-  picks its security protocol (`sasl_plaintext` or `sasl_ssl`) and SASL mechanism; `ssl`
-  without SASL is set through the API only.
+  `$SECRET:<secret_id>`. A saved endpoint can send a test message. A Kafka endpoint picks its
+  security protocol, all four of them, and for a SASL protocol its mechanism, username and
+  password. An endpoint stored without `security_protocol` opens with the protocol the gateway
+  uses for it, and saving writes `security_protocol` in place of `auth_type`.
 - **Event sets** pick events from the catalog, grouped by family and audit events by their
   audit group, with search. Audit events are picked and saved like any other.
 - **Integrations** join an endpoint and an event set and hold the template for the endpoint's
