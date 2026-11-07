@@ -4,6 +4,8 @@ use moka::future::Cache;
 use once_cell::sync::Lazy;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::Duration;
 use tracing::debug;
@@ -54,10 +56,144 @@ pub(crate) async fn warm_producer(endpoint_id: &str) {
         .expect("producer");
 }
 
+/// The Kafka `security.protocol` an endpoint connects with, as its `security_protocol` field
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SecurityProtocol {
+    Plaintext,
+    Ssl,
+    SaslPlaintext,
+    SaslSsl,
+}
+
+impl SecurityProtocol {
+    fn librdkafka_name(self) -> &'static str {
+        match self {
+            Self::Plaintext => "PLAINTEXT",
+            Self::Ssl => "SSL",
+            Self::SaslPlaintext => "SASL_PLAINTEXT",
+            Self::SaslSsl => "SASL_SSL",
+        }
+    }
+
+    fn uses_sasl(self) -> bool {
+        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
+    }
+}
+
+/// The Kafka `sasl.mechanism` an endpoint authenticates with, as its `sasl_mechanism` field
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum SaslMechanism {
+    #[serde(rename = "PLAIN")]
+    Plain,
+    #[serde(rename = "SCRAM-SHA-256")]
+    ScramSha256,
+    #[serde(rename = "SCRAM-SHA-512")]
+    ScramSha512,
+}
+
+impl SaslMechanism {
+    fn librdkafka_name(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
+/// Why a Kafka endpoint's connection settings cannot be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum KafkaConfigError {
+    #[error("security_protocol must be one of plaintext, ssl, sasl_plaintext or sasl_ssl")]
+    UnknownSecurityProtocol,
+    #[error("sasl_mechanism must be one of PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512")]
+    UnknownSaslMechanism,
+}
+
+struct SaslCredentials<'a> {
+    mechanism: SaslMechanism,
+    username: &'a str,
+    password: Option<&'a str>,
+}
+
+/// How the producer connects and authenticates. An endpoint without `security_protocol` keeps
+/// the older `auth_type`: `sasl` with a `sasl_username` is SASL_PLAINTEXT, anything else
+/// plaintext.
+struct KafkaSecurity<'a> {
+    protocol: SecurityProtocol,
+    sasl: Option<SaslCredentials<'a>>,
+}
+
+impl<'a> KafkaSecurity<'a> {
+    fn from_config(config: &'a Value) -> Result<Self, KafkaConfigError> {
+        let protocol: Option<SecurityProtocol> =
+            optional_field(config, "security_protocol", KafkaConfigError::UnknownSecurityProtocol)?;
+        let mechanism: Option<SaslMechanism> =
+            optional_field(config, "sasl_mechanism", KafkaConfigError::UnknownSaslMechanism)?;
+        let username = text_field(config, "sasl_username");
+        let legacy_sasl = text_field(config, "auth_type") == Some("sasl") && username.is_some();
+        let protocol = protocol.unwrap_or(if legacy_sasl {
+            SecurityProtocol::SaslPlaintext
+        } else {
+            SecurityProtocol::Plaintext
+        });
+        let sasl = match username {
+            Some(username) if protocol.uses_sasl() => Some(SaslCredentials {
+                mechanism: mechanism.unwrap_or(SaslMechanism::Plain),
+                username,
+                password: text_field(config, "sasl_password"),
+            }),
+            _ => None,
+        };
+        Ok(Self { protocol, sasl })
+    }
+
+    fn apply(
+        &self,
+        kafka_config: &mut ClientConfig,
+    ) {
+        if self.protocol != SecurityProtocol::Plaintext {
+            kafka_config.set("security.protocol", self.protocol.librdkafka_name());
+        }
+        if let Some(sasl) = &self.sasl {
+            kafka_config.set("sasl.mechanism", sasl.mechanism.librdkafka_name());
+            kafka_config.set("sasl.username", sasl.username);
+            if let Some(password) = sasl.password {
+                kafka_config.set("sasl.password", password);
+            }
+        }
+    }
+}
+
+fn text_field<'a>(
+    config: &'a Value,
+    field: &str,
+) -> Option<&'a str> {
+    config
+        .get(field)
+        .and_then(Value::as_str)
+}
+
+/// `field` parsed as `T`, or `None` when absent or null.
+fn optional_field<T: DeserializeOwned>(
+    config: &Value,
+    field: &str,
+    unknown: KafkaConfigError,
+) -> Result<Option<T>, KafkaConfigError> {
+    config
+        .get(field)
+        .filter(|value| !value.is_null())
+        .map(|value| T::deserialize(value).map_err(|_| unknown))
+        .transpose()
+}
+
 fn client_config(
     brokers: &str,
     config: &Value,
-) -> ClientConfig {
+) -> Result<ClientConfig, KafkaConfigError> {
     let mut kafka_config = ClientConfig::new();
     kafka_config.set("bootstrap.servers", brokers);
     kafka_config.set("message.timeout.ms", "30000");
@@ -70,27 +206,8 @@ fn client_config(
     kafka_config.set("metadata.max.age.ms", "180000"); // Refresh metadata every 3 min
     kafka_config.set("log_level", "3"); // Reduce log verbosity (warn level)
 
-    // Add authentication if configured
-    if let Some(auth_type) = config
-        .get("auth_type")
-        .and_then(|v| v.as_str())
-        && auth_type == "sasl"
-        && let Some(username) = config
-            .get("sasl_username")
-            .and_then(|v| v.as_str())
-    {
-        kafka_config.set("security.protocol", "SASL_PLAINTEXT");
-        kafka_config.set("sasl.mechanism", "PLAIN");
-        kafka_config.set("sasl.username", username);
-        if let Some(password) = config
-            .get("sasl_password")
-            .and_then(|v| v.as_str())
-        {
-            kafka_config.set("sasl.password", password);
-        }
-    }
-
-    kafka_config
+    KafkaSecurity::from_config(config)?.apply(&mut kafka_config);
+    Ok(kafka_config)
 }
 
 /// Every configuration input that shapes the producer's connection.
@@ -115,7 +232,7 @@ async fn producer_for(
     {
         return Ok(cached.producer);
     }
-    let producer: FutureProducer = client_config(brokers, config)
+    let producer: FutureProducer = client_config(brokers, config)?
         .create()
         .context("Failed to create Kafka producer")?;
     PRODUCERS
@@ -175,21 +292,46 @@ mod tests {
         producer.client().native_ptr() as usize
     }
 
+    fn configured(config: Value) -> ClientConfig {
+        client_config("broker:9092", &config).expect("valid configuration")
+    }
+
     #[test]
     fn client_config_sets_sasl_only_when_configured() {
-        let plain = client_config("broker:9092", &json!({}));
+        let plain = configured(json!({}));
         assert_eq!(plain.get("bootstrap.servers"), Some("broker:9092"));
         assert_eq!(plain.get("security.protocol"), None);
 
-        let sasl =
-            client_config("broker:9092", &json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"}));
+        let sasl = configured(json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"}));
         assert_eq!(sasl.get("security.protocol"), Some("SASL_PLAINTEXT"));
         assert_eq!(sasl.get("sasl.mechanism"), Some("PLAIN"));
         assert_eq!(sasl.get("sasl.username"), Some("svc"));
         assert_eq!(sasl.get("sasl.password"), Some("pw"));
 
-        let sasl_without_user = client_config("broker:9092", &json!({"auth_type": "sasl"}));
+        let sasl_without_user = configured(json!({"auth_type": "sasl"}));
         assert_eq!(sasl_without_user.get("security.protocol"), None);
+    }
+
+    #[test]
+    fn client_config_sets_the_configured_security_protocol_and_sasl_mechanism() {
+        let scram = configured(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_mechanism": "SCRAM-SHA-512",
+            "sasl_username": "gw1",
+            "sasl_password": "pw"
+        }));
+        assert_eq!(scram.get("security.protocol"), Some("SASL_SSL"));
+        assert_eq!(scram.get("sasl.mechanism"), Some("SCRAM-SHA-512"));
+        assert_eq!(scram.get("sasl.username"), Some("gw1"));
+        assert_eq!(scram.get("sasl.password"), Some("pw"));
+
+        let tls = configured(json!({"security_protocol": "ssl", "auth_type": "sasl", "sasl_username": "svc"}));
+        assert_eq!(tls.get("security.protocol"), Some("SSL"));
+        assert_eq!(tls.get("sasl.mechanism"), None);
+        assert_eq!(tls.get("sasl.username"), None);
+
+        let explicit_plaintext = configured(json!({"security_protocol": "plaintext"}));
+        assert_eq!(explicit_plaintext.get("security.protocol"), None);
     }
 
     #[tokio::test]
