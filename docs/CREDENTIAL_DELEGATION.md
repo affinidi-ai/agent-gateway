@@ -1793,7 +1793,12 @@ only decides, by the file names, which claim came first. Then:
 Tokens obtained but not kept, because the scopes were wider, or the binding was removed or
 narrowed while the person consented, are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
 "expires_at"}`, or `{"status": "failed", "reason"}` with a fixed reason; the authorization
-server's words are never echoed or logged.
+server's words are never echoed or logged, with one exception. A `scope_widened` answer adds
+`widened_scopes`, the scopes granted beyond those asked for (as the provider compares them), so
+the operator can see what the vendor added and set the provider's comparison: only names spelled
+entirely as RFC 6749 scope tokens (`%x21 / %x23-5B / %x5D-7E`, so no space, quote, backslash or
+control character), 1 to 128 bytes each and at most 16, in the vendor's order; any other is left
+out. The connect's log line names the same, and a refresh refused for a wider grant logs them too.
 
 | Status | `reason` | When |
 | --- | --- | --- |

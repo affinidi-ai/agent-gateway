@@ -681,11 +681,20 @@ impl ReleaseContext<'_> {
                         .expires_in
                         .map(|seconds| now + chrono::Duration::seconds(seconds)),
                 };
-                if !provider
-                    .scope_comparison
-                    .widened(&requested, &tokens.scopes)
-                    .is_empty()
-                {
+                let (wider, widened) = {
+                    let extra = provider
+                        .scope_comparison
+                        .widened(&requested, &tokens.scopes);
+                    (!extra.is_empty(), crate::credential_providers::scope_comparison::named_scopes(&extra))
+                };
+                if wider {
+                    tracing::warn!(
+                        target: "credential_delegation",
+                        grant_id = %before.id,
+                        credential_provider_id = %provider.id,
+                        widened_scopes = ?widened,
+                        "A refresh was refused: the vendor granted scopes beyond those asked for"
+                    );
                     let abandoned = self
                         .vault
                         .fail_grant_refresh(claim, FailedRefresh::Abandoned, now)
