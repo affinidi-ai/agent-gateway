@@ -484,7 +484,42 @@ mod live_tests {
             .expect("the gateway's own signing context");
         assert_ne!(gateway_context.as_str(), agent.context_id, "an agent must not share the gateway's signing context");
 
-        // 5. The VTA signs on behalf of that agent's key.
+        // 5. The VTA signs with that agent's key: a credential issued as the
+        //    agent's own context, over the connection authenticated as the
+        //    published auth DID.
+        use crate::identity::ssi::vc_issuer::{AgentIdentity, IssueVcPayload, VcIssuer};
+        let credential = crate::vta::vc_issuer::VtaVcIssuer::new(Arc::clone(&client), agent.context_id.clone())
+            .issue(IssueVcPayload::AgentIdentity(AgentIdentity {
+                did: std::borrow::Cow::Borrowed("did:key:zLiveChainSubject"),
+                identity_fields: std::borrow::Cow::Owned(std::collections::HashMap::new()),
+                workload_binding: None,
+                display_name: None,
+            }))
+            .await
+            .expect("the VTA signs for the agent's own key");
+        assert_eq!(credential["issuer"], json!(agent.did), "issued as the agent's own context");
+        assert_eq!(credential["proof"]["cryptosuite"], json!("eddsa-jcs-2022"));
+
+        // 6. And it verifies against that agent's key — a signature nobody can
+        //    check is not an outcome.
+        let public_key = agent
+            .did
+            .strip_prefix("did:key:")
+            .expect("did:key");
+        let proof: affinidi_data_integrity::DataIntegrityProof =
+            serde_json::from_value(credential["proof"].clone()).expect("proof deserialises");
+        let mut unsigned = credential.clone();
+        unsigned
+            .as_object_mut()
+            .expect("object")
+            .remove("proof");
+        let (_base, public_bytes) = multibase::decode(public_key).expect("multibase");
+        proof
+            .verify_with_public_key(&unsigned, &public_bytes[2..], affinidi_data_integrity::VerifyOptions::default())
+            .expect("the credential must verify against the agent's own key");
+
+        // 7. The agent's presentation is signed by the same key, over the same
+        //    connection, and never touches a key the gateway holds.
         let issuer = VtaVpIssuer::new(
             Arc::new(RegistryVtaClients::new(Arc::clone(&client), None)),
             Arc::new(Bound(AgentBinding {
@@ -495,41 +530,31 @@ mod live_tests {
         );
         let vp = issuer
             .issue(VpIssuerPayload::Credentials(Credentials {
-                // No key supplied, because the gateway does not have one.
                 holder_key: None,
                 holder_did: std::borrow::Cow::Borrowed(&agent.did),
-                verifiable_credentials: std::borrow::Cow::Owned(vec![json!({
-                    "@context": ["https://www.w3.org/ns/credentials/v2"],
-                    "type": ["VerifiableCredential"],
-                    "issuer": "did:example:issuer",
-                    "credentialSubject": { "id": agent.did },
-                })]),
+                verifiable_credentials: std::borrow::Cow::Owned(vec![credential]),
                 challenge: None,
                 domain: None,
             }))
             .await
-            .expect("the VTA signs for the agent's own key");
-
+            .expect("the VTA signs the agent's presentation");
         assert_eq!(vp["holder"], json!(agent.did));
         assert_eq!(vp["proof"]["proofPurpose"], json!("authentication"));
-
-        // 6. And it verifies against that agent's key — a signature nobody can
-        //    check is not an outcome.
-        let public_key = agent
-            .did
-            .strip_prefix("did:key:")
-            .expect("did:key");
-        let proof: affinidi_data_integrity::DataIntegrityProof =
-            serde_json::from_value(vp["proof"].clone()).expect("proof deserialises");
-        let mut unsigned = vp.clone();
-        unsigned
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .expect("resolver");
+        let mut vp_unsigned = vp.clone();
+        vp_unsigned
             .as_object_mut()
             .expect("object")
             .remove("proof");
-        let (_base, public_bytes) = multibase::decode(public_key).expect("multibase");
-        proof
-            .verify_with_public_key(&unsigned, &public_bytes[2..], affinidi_data_integrity::VerifyOptions::default())
-            .expect("the agent's presentation must verify against the agent's own key");
+        crate::identity::ssi::di_jcs::verify_jcs_proof(
+            &vp_unsigned,
+            &vp["proof"],
+            Arc::clone(crate::gateways::did_cache::shared_resolver()),
+        )
+        .await
+        .expect("the presentation must verify against the agent's own key");
 
         eprintln!("LIVE_CHAIN_OK auth={auth_did} agent={}", agent.did);
     }

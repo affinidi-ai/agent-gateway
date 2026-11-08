@@ -19,12 +19,9 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
 
 use crate::vta::client::VtaRestClient;
-
-/// `vta/contexts/get/1.0`.
-const TASK_CONTEXTS_GET: &str = "https://trusttasks.org/spec/vta/contexts/get/1.0";
+use crate::vta::context_identity::ContextIdentityResolver;
 
 /// `keys/sign-jws/0.1`.
 const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
@@ -58,21 +55,10 @@ pub trait ContextSigner: Send + Sync {
     ) -> Result<String>;
 }
 
-/// The context's DID and the key it designates.
-#[derive(Debug, Clone)]
-struct ContextIdentity {
-    did: String,
-    key_id: String,
-}
-
-/// Signs as a VTA context, using the key that context designates.
+/// Signs as a VTA context, using the key that backs the context's DID.
 pub struct VtaContextSigner {
     client: Arc<VtaRestClient>,
-    context_id: String,
-    /// Resolved once and reused. The pair is immutable in practice — the
-    /// provisioning path that sets them is write-once — so re-reading it per
-    /// signature would add a round trip for a value that cannot change.
-    identity: RwLock<Option<ContextIdentity>>,
+    context: ContextIdentityResolver,
 }
 
 impl VtaContextSigner {
@@ -81,56 +67,20 @@ impl VtaContextSigner {
         context_id: String,
     ) -> Self {
         Self {
+            context: ContextIdentityResolver::new(Arc::clone(&client), context_id),
             client,
-            context_id,
-            identity: RwLock::new(None),
         }
-    }
-
-    /// The context's DID and designated key, read once.
-    async fn identity(&self) -> Result<ContextIdentity> {
-        if let Some(identity) = self
-            .identity
-            .read()
-            .await
-            .as_ref()
-        {
-            return Ok(identity.clone());
-        }
-
-        let response = self
-            .client
-            .dispatch_signed::<Value>(TASK_CONTEXTS_GET, json!({ "id": self.context_id }))
-            .await
-            .map_err(|e| anyhow!("reading context `{}` to sign as it: {e}", self.context_id))?;
-        let record = response
-            .get("payload")
-            .unwrap_or(&response);
-
-        let did = record
-            .get("did")
-            .and_then(|d| d.as_str())
-            .ok_or_else(|| {
-                anyhow!("context `{}` has no DID, so nothing it signs would be attributable", self.context_id)
-            })?
-            .to_string();
-        let key_id = record
-            .get("issuerKeyId")
-            .or_else(|| record.get("issuer_key_id"))
-            .and_then(|k| k.as_str())
-            .ok_or_else(|| anyhow!("context `{}` designates no signing key", self.context_id))?
-            .to_string();
-
-        let identity = ContextIdentity { did, key_id };
-        *self.identity.write().await = Some(identity.clone());
-        Ok(identity)
     }
 }
 
 #[async_trait]
 impl ContextSigner for VtaContextSigner {
     async fn issuer_did(&self) -> Result<String> {
-        Ok(self.identity().await?.did)
+        Ok(self
+            .context
+            .identity()
+            .await?
+            .did)
     }
 
     async fn sign_typ(
@@ -138,36 +88,31 @@ impl ContextSigner for VtaContextSigner {
         claims: &Value,
         typ: &str,
     ) -> Result<String> {
-        let identity = self.identity().await?;
+        let identity = self
+            .context
+            .identity()
+            .await?;
         // `kid` is the context DID's own verification method. A `did:key`
         // document declares exactly one, whose id is the DID plus its own
         // multibase fragment — so naming it keeps a verifier from having to
         // guess, and a verifier that ignores `kid` still lands on the same key.
-        let kid = format!(
-            "{}#{}",
-            identity.did,
-            identity
-                .did
-                .strip_prefix("did:key:")
-                .unwrap_or(&identity.key_id)
-        );
         let request = json!({
             "keyId": identity.key_id,
-            "header": { "typ": typ, "kid": kid },
+            "header": { "typ": typ, "kid": identity.verification_method },
             "payload": claims,
         });
         let response: SignJwsResult = self
             .client
             .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
             .await
-            .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context_id))?;
+            .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context.context_id()))?;
         // Fail closed on attribution: a peer resolves the claimed DID and
         // demands the signing key be declared there, so the VTA must have used
         // exactly the key this context designates, under its algorithm.
         if response.key_id != identity.key_id {
             return Err(anyhow!(
                 "signing as context `{}`: VTA echoed key `{}` but `{}` was requested",
-                self.context_id,
+                self.context.context_id(),
                 response.key_id,
                 identity.key_id
             ));
@@ -175,7 +120,7 @@ impl ContextSigner for VtaContextSigner {
         if response.alg != SIGNING_ALGORITHM {
             return Err(anyhow!(
                 "signing as context `{}`: VTA signed with `{}`; the context key uses `{SIGNING_ALGORITHM}`",
-                self.context_id,
+                self.context.context_id(),
                 response.alg
             ));
         }
@@ -202,6 +147,45 @@ mod tests {
             .expect("build client"),
         );
         VtaContextSigner::new(client, context_id.to_string())
+    }
+
+    /// The attestation names the context DID's own verification method and is
+    /// signed by the key that backs that DID — what a peer resolving the claimed
+    /// issuer needs in order to accept it.
+    #[tokio::test]
+    async fn the_attestation_is_signed_by_the_key_behind_the_context_did() {
+        use crate::vta::context_identity::mock::MockContextVta;
+
+        let vta = MockContextVta::new("gw", "gw-issuer");
+        let url = vta.spawn().await;
+        let signer = VtaContextSigner::new(vta.client(&url), "gw".to_string());
+
+        assert_eq!(
+            signer
+                .issuer_did()
+                .await
+                .unwrap(),
+            vta.did()
+        );
+        let jws = signer
+            .sign_typ(&json!({ "sub": "x" }), "gateway-issuer-attestation+jwt")
+            .await
+            .expect("signed");
+
+        let header = jws.split('.').next().unwrap();
+        let header: Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, header).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["kid"], json!(vta.verification_method()));
+        assert_eq!(header["typ"], json!("gateway-issuer-attestation+jwt"));
+        let sent = vta
+            .last_sign_request
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(sent["keyId"], json!("gw-issuer"));
     }
 
     /// An unreachable agent is an error, never a fallback to a local key: the

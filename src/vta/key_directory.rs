@@ -170,7 +170,7 @@ impl KeyRef {
 /// [`KeyDirectory::authority_for`], so the two can never disagree.
 ///
 /// The VTA backend signs JWS (`keys/sign-jws`, VTA-06) and issues credentials
-/// under the *context's* own issuer DID (`credentials/issue-in-context`), which
+/// under the *context's* own issuer DID (`keys/sign-document`), which
 /// is what lets a surface's own agent sign the credential embedded in the
 /// presentation it forwards. It cannot yet build a standalone Data Integrity
 /// proof for an arbitrary document, so asking it to is still a
@@ -1691,7 +1691,7 @@ mod tests {
     /// `local` the same as "no opinion" — so the surface fell through to the
     /// appliance default and carried on issuing through the agent. Observed
     /// live: flipping the setting to local produced a byte-identical agent
-    /// trace, with `credentials/issue-in-context` still signing as the
+    /// trace, with `keys/sign-document` still signing as the
     /// appliance context.
     #[tokio::test]
     async fn a_surface_asking_for_the_local_key_is_not_sent_to_the_appliance_default() {
@@ -1734,7 +1734,7 @@ mod tests {
     // ---- capability negotiation ------------------------------------------
 
     /// The agent issues credentials under its context's own issuer DID
-    /// (`credentials/issue-in-context`, exercised live in
+    /// (`keys/sign-document`, exercised live in
     /// `vta::appliance_di::live_tests`), which is what lets a surface's agent
     /// sign the credential embedded in the presentation it forwards.
     ///

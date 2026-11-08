@@ -223,10 +223,10 @@ connection records and pairing state are unaffected.
 ```bash
 cd ../verifiable-trust-infrastructure
 
-# Build the VTA (includes the VTA-06 keys/sign-jws task). Build this target
-# specifically: a workspace-wide `cargo build` can unify the `test-support`
-# feature in, which compiles the agent's response-conformance gate into the
-# binary and turns `contexts/get` into a 500 (see Troubleshooting).
+# Build the VTA (it serves keys/sign-jws and keys/sign-document, both specified
+# upstream). Build this target specifically: a workspace-wide `cargo build` can
+# unify the `test-support` feature in, which compiles the agent's
+# response-conformance gate into the binary.
 cargo build -p vta-service --features webvh --bin vta
 
 # One-time setup (prints the VTA did:webvh and base URL http://localhost:3000).
@@ -254,7 +254,7 @@ seam, and verifies the compact JWS against the key's published public key:
 cd trust-gateway
 VTA_LIVE_URL=http://127.0.0.1:3000 \
 VTA_LIVE_DID="did:webvh:<scid>:localhost%3A3000" \
-  cargo test --bin agent-trust-gateway \
+  cargo test --bin agent-gateway \
     vta::authority::poc_tests::live_sign_token_against_real_vta_verifies \
     -- --ignored --nocapture
 ```
@@ -289,9 +289,20 @@ members, a JWT-only output distinct from credential signing) are covered in the
 `b64`, `jwk`, `jku` and `x5u` in `header`; the gateway sends only `typ` and
 `kid`, so none of them can arise from this side.
 
+Credentials go through the other specified task, `keys/sign-document/0.1`
+(`src/vta/context_identity.rs`). The gateway builds the credential itself, with
+the same builder the local issuer uses, and names the context's own `did:key` as
+its `issuer`. The agent builds the `eddsa-jcs-2022` proof and signs only as the
+DID the document names, only with a key that DID's own document lists for the
+requested relationship — so the credential can only come from the context's key,
+never from the agent's own. The gateway checks the answer against what it asked
+for (key, signer, verification method, purpose, challenge and domain, and that
+the document is exactly what it sent) before attributing anything to the
+context. `src/vta/context_identity.rs`'s tests cover each of those refusals.
+
 ## Scope notes
 
-- DI-credential issuance via the VTA (`credentials/issue`) and JWKS discovery
+- DI-credential issuance via the VTA (`keys/sign-document`) and JWKS discovery
   for local verification are wired in VTA-08; this PoC covers the JWT path.
 - Every Trust Task the gateway sends on the signing path carries a control-key
   DI proof: `keys/sign-jws/0.1` declares its request proof **mandatory**, so a
@@ -299,7 +310,7 @@ members, a JWT-only output distinct from credential signing) are covered in the
   exists; the proof says *this* request came from the key behind it.
 - The live tests need a grant that is **`--role admin` *and* scoped to one
   context**, which is the combination they jointly describe:
-  `vta acl create --did <control did> --role initiator --contexts gwtest --capabilities context-create,key-mint,sign,sign-jws`
+  `vta acl create --did <control did> --role initiator --contexts gwtest --capabilities context-create,key-mint,sign,sign-jws,sign-document`
   followed by `vta acl update <control did> --role admin`. The role is what
   `live_grant_scope_is_parsed_from_the_real_token` checks is detected as
   over-privileged; the context scoping is what makes
@@ -368,14 +379,16 @@ cannot use a dashboard.
 
 3. **Run the grant command the gateway prints**, on the agent, as an
    administrator. This is the one consent step; the gateway never holds admin
-   on the agent. With provisioning enabled it confers exactly four
-   capabilities — `context-create`, `key-mint`, `sign`, `sign-jws` — scoped to
-   one context, and uses `vta acl create` because `vta import-did` carries no
-   `--capabilities` flag.
+   on the agent. With provisioning enabled it confers exactly five
+   capabilities — `context-create`, `key-mint`, `sign`, `sign-jws`,
+   `sign-document` — scoped to one context, and uses `vta acl create` because
+   `vta import-did` carries no `--capabilities` flag.
 
-   `sign-jws` is **not** implied by `sign`: a grant carrying only `sign` passes
-   pairing and then refuses every `keys/sign-jws` call at runtime. An agent
-   granted before this capability existed must be re-granted.
+   `sign-jws` and `sign-document` are **not** implied by `sign`: a grant
+   carrying only `sign` passes pairing and then refuses every
+   `keys/sign-jws` (tokens, issuer attestation) or `keys/sign-document`
+   (agent-identity credential) call at runtime. An agent granted before either
+   capability existed must be re-granted.
 
 4. **Verify.** `GET /v1/vta/status` reports the tier and resolution;
    `GET /v1/key-management/inventory` lists connections, per-surface mappings,
@@ -529,9 +542,36 @@ on what arrives: the embedded credential's issuer should be the agent.
 | `429 rate_limited` | the agent's auth bucket (dev default: burst 10, refill 1/5 s). The gateway honours `retryAfterSecs` and retries once, capped at 2 s |
 | `export: not valid in this context` | `export VAR=1 cmd` — use `VAR=1 cmd` |
 | `context … has no DID, so it cannot sign as itself` | a hand-made context with no identity; the gateway grants one on first use, so this means that call was refused — check the grant carries `context-create` |
-| **Pairing verifies, then every signature fails** | the grant predates the `sign-jws` capability. `sign` is not accepted as a substitute, and the shortfall is invisible until the first signing call — re-run the `vta acl create` command with `sign-jws` included |
-| `422 proofRequired` on a signing call | the request reached the agent without its control-key proof. `keys/sign-jws/0.1` requires one; a bearer token alone is not enough |
-| `500 responseSchemaViolation … 'issuerKeyId' was unexpected` on `contexts/get` | **A development-build symptom only — rebuild the agent and it goes away.** The agent's context record carries `issuerKeyId` and `proofKeyIds`, which its published `vta/contexts/get/1.0` response schema does not define (`additionalProperties: false`), so the agent's own response-conformance gate replaces its reply with a 500. That gate is `#[cfg(any(test, feature = "test-support"))]` and is compiled out of production builds. A workspace-wide `cargo build` can pull `test-support` in through feature unification; `cargo build -p vta-service --features webvh --bin vta` does not, and every live test passes against that binary. It only ever appears once a context has been given a signing key — before that both members are omitted. The durable fix is to define the two members in a later revision of the task specification, which lives in the published `trust-tasks-rs` crate rather than in either repository; raised upstream. |
+| **Pairing verifies, then every signature fails** | the grant predates the `sign-jws` or `sign-document` capability. `sign` is accepted as a substitute for neither, and the shortfall is invisible until the first signing call — re-run the `vta acl create` command with both included |
+| `422 proofRequired` on a signing call | the request reached the agent without its control-key proof. `keys/sign-jws/0.1` requires one; a bearer token alone is not enough (the gateway signs every request to the signing tasks) |
+
+### How an agent's presentation is signed
+
+A newly onboarded agent's key lives in its own trust agent context, so the
+presentation it makes is signed there, with `keys/sign-document/0.1`, and the
+gateway never has the private half.
+
+That task reads the signer from a document's `issuer` or `controller`, and a
+presentation names its holder with `holder`. So the presentation sent for
+signing carries **both**, set to the same agent DID:
+
+- the trust agent finds its signer in `controller`, signs only as that DID, and
+  only with a key that DID's document lists under `authentication`;
+- `holder` stays, so the presentation still names who is presenting, and the
+  gateway's own verifier — which reads `holder` — is unchanged.
+
+The one visible difference from a presentation the gateway signs itself is that
+extra `controller` member. A verifier elsewhere that rejects unknown members
+would reject it; one that ignores them will not notice. A challenge and a domain
+are bound into the proof when the caller supplies them, and the gateway's
+verifier (`src/identity/ssi/di_jcs.rs`) checks `eddsa-jcs-2022` itself so that
+binding is part of what it verifies — changing the challenge or domain afterwards
+breaks the proof. The gateway refuses to sign if the context's DID is not the
+holder the presentation names.
+
+A revision of the task that recognises `holder` directly would make the extra
+member unnecessary; it is a one-line removal in `src/vta/vp_issuer.rs` when that
+exists.
 
 ### Rolling back
 

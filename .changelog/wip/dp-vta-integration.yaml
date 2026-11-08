@@ -1,8 +1,51 @@
 branch: dp-vta-integration
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-08T10:00:00Z'
+      title: Sign agent credentials through a trust agent with its specified signing task
+      description: >-
+        An agent-identity credential issued through a connected trust agent is
+        now built by the gateway, exactly as it builds one it signs itself, and
+        signed by the trust agent's standard document-signing task instead of a
+        task made only for this integration. The credential names the agent's
+        own context as its issuer, and the trust agent signs it only with the
+        key behind that context, so it can no longer be made to sign as the
+        trust agent itself. The gateway checks the answer against what it asked
+        for, and refuses it if the key, the signer, the proof or the document
+        differ. Gateways that were connected before this must be granted again:
+        the permission to sign documents is separate from the general signing
+        permission, so a connection paired earlier still verifies and then
+        fails the first credential it signs. The setup guide has the new
+        command and the failure to look for.
+    - timestamp: '2026-11-08T10:05:00Z'
+      title: Sign an agent's presentation in its trust agent without holding its key
+      description: >-
+        An agent whose key lives in a trust agent now has its presentation
+        signed there too, by the same document-signing task as its credential,
+        so the gateway never has the private half. The trust agent finds the
+        signer in a controller member, which a presentation does not normally
+        carry, so the presentation sent for signing names the agent as both its
+        holder and its controller. The holder is still named, and the gateway's
+        own check, which reads the holder, is unchanged and still refuses a
+        proof made by anyone else. The one visible difference is that extra
+        member; a verifier elsewhere that rejects members it does not know would
+        refuse it. A challenge and a domain are now bound into the signed proof
+        rather than refused. The gateway will not sign if the agent's own
+        context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-08T10:20:00Z'
+      title: Verify a trust-agent presentation bound to a challenge or domain
+      description: >-
+        A presentation signed by a trust agent can be bound to a challenge and a
+        domain, which become part of what is signed. The check the gateway used
+        for that kind of signature did not know about them: it dropped them and
+        then rebuilt bytes nobody had signed, so every such presentation failed,
+        however genuine. The gateway now checks the signature itself, including
+        both members, so a presentation bound to a challenge verifies and one
+        whose challenge or domain was changed afterwards, which is what replaying
+        it elsewhere would need, does not. Presentations that are not bound to
+        either verify exactly as before.
     - timestamp: '2026-10-27T05:00:00Z'
       title: Sign through a trust agent again by proving who is asking
       description: >-
@@ -26,6 +69,16 @@ changes:
         inventory cannot be read; it reports the problem in its own tab.
   removed: []
   security:
+    - timestamp: '2026-11-08T10:10:00Z'
+      title: Name a trust-agent context's identity only from a key it holds
+      description: >-
+        A gateway that provisions its own contexts could name any DID for a
+        context it had been granted access to. It may now name only the DID of
+        an active signing key that lives in that context, and only once, so a
+        context cannot be given an identity it does not control. The same
+        change removes the separate step that told the trust agent which key a
+        context signs credentials with: the context's identity is the key
+        itself, so there is nothing left to point at the wrong key.
     - timestamp: '2026-10-27T02:00:00Z'
       title: Remove an unreachable check from the self-issued token path
       description: >-
@@ -81,8 +134,9 @@ changes:
         What moves once connected: the key the gateway signs its own tokens and
         credentials with, the keys of agents onboarded from that point on, and
         the signed statement a gateway sends a peer gateway to say which issuer
-        it stands behind. Each agent gets its own separate space inside the
-        trust agent, so one agent's key can never sign for another, and the
+        it stands behind. Each agent gets its own
+        separate space inside the trust agent, so one agent's key can never
+        sign for another, and the
         gateway asks for a signature when it needs one rather than holding
         anything. Setting this up is a single approval step the operator
         performs on their own trust agent; the gateway is never an
@@ -107,8 +161,8 @@ changes:
         cannot claim an assurance it has not earned.
         Agents that already exist keep their current keys permanently. Moving
         them would change their identifiers and invalidate credentials already
-        issued to them, so connecting a trust agent affects new agents only,
-        and the inventory answers which agents still hold a key here. An
+        issued to them, so connecting a trust agent never changes an existing
+        agent, and the inventory answers which agents still hold a key here. An
         operator guide covers connecting, what it changes, how to roll back,
         and the limits of doing so: an agent created while connected cannot be
         carried back, because the gateway never held its key.

@@ -145,7 +145,8 @@ pub struct PairingPayload {
 /// `initiator` rather than `application` because provisioning a signing key
 /// needs `key-mint`, which the agent derives for `admin` and `initiator` only.
 /// The grant is nonetheless **narrower** than the old one: naming capabilities
-/// explicitly reduces it to exactly `{context-create, key-mint, sign}`, where
+/// explicitly reduces it to exactly
+/// `{context-create, key-mint, sign, sign-jws, sign-document}`, where
 /// `application` conferred the whole role.
 pub const REQUESTED_ROLE: &str = "initiator";
 

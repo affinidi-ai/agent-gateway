@@ -4078,7 +4078,7 @@ mod live_connection_tests {
                     "could not mint a key as {}.\n\
                      Grant it first (stop the VTA, it holds a file lock):\n  \
                      vta --config <cfg> acl create --did {} --role initiator \
-                     --contexts <context> --capabilities context-create,key-mint,sign\n\
+                     --contexts <context> --capabilities context-create,key-mint,sign,sign-jws,sign-document\n\
                      underlying error: {e}",
                     control_did(),
                     control_did(),
@@ -4286,83 +4286,14 @@ mod live_connection_tests {
 #[cfg(test)]
 mod surface_injection_tests {
     use super::*;
-    use axum::{Json as AxumJson, Router, extract::State, routing::post};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Clone)]
-    struct Recorder {
-        issue_calls: Arc<AtomicUsize>,
-        last_context: Arc<std::sync::Mutex<Option<String>>>,
-    }
-
-    /// Minimal agent: authenticates anything, records credential issuance and
-    /// returns a credential shaped like the real `issue-in-context` reply.
-    async fn trust_tasks(
-        State(rec): State<Recorder>,
-        AxumJson(body): AxumJson<serde_json::Value>,
-    ) -> AxumJson<serde_json::Value> {
-        let type_uri = body
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if type_uri.contains("auth/challenge") {
-            return AxumJson(json!({ "challenge": "c", "sessionId": "s" }));
-        }
-        if type_uri.contains("auth/authenticate") {
-            return AxumJson(json!({
-                "session": { "id": "s", "subject": body["issuer"] },
-                "tokens": { "accessToken": "tok", "tokenType": "Bearer", "expiresIn": 3600 }
-            }));
-        }
-        if type_uri.contains("contexts/get") {
-            // Already identified, so the issuer does not try to give it one.
-            return AxumJson(json!({
-                "context": { "id": "ctx-a", "did": "did:key:zCtx", "issuerKeyId": "ctx-a-issuer",
-                             "designatedPurposes": ["assertionMethod"] }
-            }));
-        }
-        if type_uri.contains("credentials/issue-in-context") {
-            rec.issue_calls
-                .fetch_add(1, Ordering::SeqCst);
-            *rec.last_context
-                .lock()
-                .unwrap() = body["payload"]["contextId"]
-                .as_str()
-                .map(str::to_owned);
-            return AxumJson(json!({
-                "credentialId": "urn:uuid:1",
-                "credential": {
-                    "@context": ["https://www.w3.org/2018/credentials/v1"],
-                    "type": ["VerifiableCredential"],
-                    "issuer": "did:key:zCtx",
-                    "credentialSubject": { "id": body["payload"]["holder"] },
-                    "proof": { "type": "DataIntegrityProof", "verificationMethod": "did:key:zCtx#zCtx" }
-                },
-                "verificationMethod": "did:key:zCtx#zCtx"
-            }));
-        }
-        AxumJson(json!({ "ok": true }))
-    }
-
-    async fn spawn_agent() -> (String, Recorder) {
-        let rec = Recorder {
-            issue_calls: Arc::new(AtomicUsize::new(0)),
-            last_context: Arc::new(std::sync::Mutex::new(None)),
-        };
-        let app = Router::new()
-            .route("/trust-tasks", post(trust_tasks))
-            .with_state(rec.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .unwrap();
-        });
-        (format!("http://{addr}"), rec)
+    /// A trust agent that holds the surface's context key and really signs, so
+    /// the credential the surface's agent issues is a real one.
+    async fn spawn_agent() -> (String, crate::vta::context_identity::mock::MockContextVta) {
+        let vta = crate::vta::context_identity::mock::MockContextVta::new("ctx-a", "ctx-a-issuer");
+        let url = vta.spawn().await;
+        (url, vta)
     }
 
     /// The whole chain, as the proxy drives it: a surface that names an agent
@@ -4489,35 +4420,40 @@ mod surface_injection_tests {
             .await
             .expect("onboard an agent");
         let agent_did = onboarded.did;
-        recorder
-            .issue_calls
-            .store(0, Ordering::SeqCst);
+        let signed_before = recorder.sign_calls();
         let outcome = issuer
             .create_agent_identity_presentation_with_binding(&agent_did, &fields, None, None, None, Some("surface-1"))
             .await;
-        // The outcome is deliberately not asserted: this mock returns a
-        // skeleton credential, not one rich enough to assemble a presentation
-        // from. What is being proved is that the surface's agent was *asked* —
-        // every bug behind this symptom silently signed locally instead, and
-        // produced a perfectly valid presentation while doing so.
-        let _ = outcome;
+        // The presentation itself is asserted below only through what the agent
+        // was asked to do: every bug behind this symptom silently signed
+        // locally instead, and produced a perfectly valid presentation while
+        // doing so, so a valid presentation proves nothing here.
+        let presentation = outcome.expect("the surface's presentation is assembled");
+        assert!(!presentation.is_empty(), "a presentation was produced");
 
-        assert_eq!(
-            recorder
-                .issue_calls
-                .load(Ordering::SeqCst),
-            1,
-            "the surface's agent must issue the embedded credential; 0 means the \
+        assert!(
+            recorder.sign_calls() > signed_before,
+            "the surface's agent must sign the embedded credential; no new signature means the \
              gateway signed locally and the agent never saw the request"
         );
         assert_eq!(
             recorder
-                .last_context
+                .last_context_read
                 .lock()
                 .unwrap()
                 .as_deref(),
             Some("ctx-a"),
             "issued in the surface's own context"
+        );
+        assert_eq!(
+            recorder
+                .last_sign_request
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r["keyId"].clone()),
+            Some(json!("ctx-a-issuer")),
+            "signed with the key that backs the surface's context"
         );
     }
 }

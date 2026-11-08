@@ -52,6 +52,49 @@ pub trait VcIssuer: Send + Sync {
     ) -> Result<Value>;
 }
 
+/// The unsigned agent-identity credential, as `issuer` would issue it.
+///
+/// Shared by every issuer so a credential signed by the gateway's own key and
+/// one signed by a trust agent are the same document apart from the proof: a
+/// verifier checking one must not be able to tell the other by shape.
+pub fn build_agent_identity_credential(
+    issuer_did: &str,
+    agent: &AgentIdentity<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value> {
+    // The structured workload binding when present, the flat identity fields
+    // otherwise.
+    let mut credential_subject = if let Some(ref binding) = agent.workload_binding {
+        json!({
+            "id": agent.did.as_ref(),
+            "workloadBinding": binding,
+        })
+    } else {
+        let identity_json =
+            serde_json::to_value(&*agent.identity_fields).context("Failed to serialize identity fields")?;
+        json!({
+            "id": agent.did.as_ref(),
+            "identityFields": identity_json,
+        })
+    };
+    if let Some(name) = agent.display_name.as_deref() {
+        credential_subject["name"] = json!(name);
+    }
+
+    Ok(json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            CTX_AGENT_IDENTITY_V1_URL.to_string()
+        ],
+        "type": ["VerifiableCredential", "AgentIdentityCredential"],
+        "issuer": issuer_did,
+        "validFrom": now.to_rfc3339(),
+        "validUntil": (now + chrono::Duration::days(VC_LIFETIME_DAYS)).to_rfc3339(),
+        "credentialSubject": credential_subject,
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+    }))
+}
+
 pub struct LocalVcIssuer {
     config: Arc<RwLock<VCIssuerConfig>>,
     signer: Arc<dyn VcSigner>,
@@ -185,38 +228,7 @@ impl VcIssuer for LocalVcIssuer {
         let proxy_did = config.proxy_did.clone();
         drop(config);
 
-        // Build credential subject — use workloadBinding if provided, else legacy identityFields
-        let mut credential_subject = if let Some(ref wb) = air.workload_binding {
-            json!({
-                "id": air.did.as_ref(),
-                "workloadBinding": wb,
-            })
-        } else {
-            let identity_json =
-                serde_json::to_value(&*air.identity_fields).context("Failed to serialize identity fields")?;
-            json!({
-                "id": air.did.as_ref(),
-                "identityFields": identity_json,
-            })
-        };
-        if let Some(name) = air.display_name.as_deref() {
-            credential_subject["name"] = json!(name);
-        }
-
-        // Create unsigned VC v2 payload
-        let now = chrono::Utc::now();
-        let credential = json!({
-            "@context": [
-                "https://www.w3.org/ns/credentials/v2",
-                CTX_AGENT_IDENTITY_V1_URL.to_string()
-            ],
-            "type": ["VerifiableCredential", "AgentIdentityCredential"],
-            "issuer": proxy_did,
-            "validFrom": now.to_rfc3339(),
-            "validUntil": (now + chrono::Duration::days(VC_LIFETIME_DAYS)).to_rfc3339(),
-            "credentialSubject": credential_subject,
-            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        });
+        let credential = build_agent_identity_credential(&proxy_did, &air, chrono::Utc::now())?;
 
         // Sign using SSI library
 

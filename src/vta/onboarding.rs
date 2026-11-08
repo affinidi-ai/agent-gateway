@@ -42,8 +42,8 @@ pub fn grant_command(
 /// The grant command for a gateway that also provisions its own per-surface
 /// contexts (`[vta] auto_provision_contexts`).
 ///
-/// Adds the narrow `context-create` capability (VTA-16) and the two the
-/// provisioning sequence actually uses. It is **not** folded into
+/// Adds the narrow `context-create` capability (VTA-16) and the ones the
+/// provisioning and signing sequences actually use. It is **not** folded into
 /// [`grant_command`] because it is a strictly larger grant: an operator who
 /// does not auto-provision should not be asked for it, and one who does should
 /// see that they are granting something extra.
@@ -67,20 +67,23 @@ pub fn grant_command(
 /// **Why the capabilities are spelled out.** `effective_capabilities` treats
 /// explicitly named role-derived capabilities as a *narrowing*: naming them
 /// reduces the grant to exactly those. So this command confers precisely
-/// `{context-create, key-mint, sign, sign-jws}` — strictly less than the whole
-/// `application` role the original command handed over, despite the
-/// higher-sounding role name.
+/// `{context-create, key-mint, sign, sign-jws, sign-document}` — strictly less
+/// than the whole `application` role the original command handed over, despite
+/// the higher-sounding role name.
 ///
-/// `sign-jws` is named explicitly because the VTA does **not** accept `sign` as
-/// a substitute for it: a grant without it pairs and verifies cleanly, then
-/// refuses every signing call at runtime.
+/// `sign-jws` and `sign-document` are named explicitly because the VTA does
+/// **not** accept `sign` as a substitute for either: a grant without them pairs
+/// and verifies cleanly, then refuses every token or credential signing call at
+/// runtime. `sign-jws` covers tokens and the issuer attestation;
+/// `sign-document` covers the agent-identity credential. A gateway paired
+/// before `sign-document` existed has to be granted again.
 pub fn grant_command_with_provisioning(
     control_did: &str,
     context_id: &str,
 ) -> String {
     format!(
         "vta acl create --did {control_did} --role initiator --contexts {context_id} \
-         --capabilities context-create,key-mint,sign,sign-jws --label agent-gateway"
+         --capabilities context-create,key-mint,sign,sign-jws,sign-document --label agent-gateway"
     )
 }
 
@@ -379,8 +382,8 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    /// The provisioning grant must confer the three capabilities the sequence
-    /// uses, under a role that actually derives `key-mint`.
+    /// The provisioning grant must confer every capability the provisioning and
+    /// signing sequences use, under a role that actually derives `key-mint`.
     ///
     /// Regression: the command used to name `--role application`, which the
     /// VTA derives **without** `key-mint`, so an operator who ran it got a
@@ -397,7 +400,7 @@ mod tests {
             command.contains("--role initiator"),
             "`application` does not derive key-mint, so provisioning would fail: {command}"
         );
-        for capability in ["context-create", "key-mint", "sign", "sign-jws"] {
+        for capability in ["context-create", "key-mint", "sign", "sign-jws", "sign-document"] {
             assert!(command.contains(capability), "the provisioning sequence needs `{capability}`: {command}");
         }
         assert!(command.contains("--contexts acme"), "`acl create` spells it --contexts: {command}");

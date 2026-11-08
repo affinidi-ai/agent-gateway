@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::vta::VtaError;
 use crate::vta::client::VtaRestClient;
+use crate::vta::context_identity::payload_of;
 use crate::vta::key_directory::ContextId;
 use crate::vta::provisioning::ContextCreator;
 
@@ -41,9 +42,6 @@ const TASK_CONTEXTS_GET: &str = "https://trusttasks.org/spec/vta/contexts/get/1.
 /// Not `contexts/update/1.0`: that one edits the whole record and is
 /// super-admin, which the gateway deliberately is not.
 const TASK_CONTEXTS_UPDATE_DID: &str = "https://trusttasks.org/spec/vta/contexts/update-did/1.1";
-
-/// `vta/contexts/set-issuer-key/0.1` (VTA-28).
-const TASK_CONTEXTS_SET_ISSUER_KEY: &str = "https://trusttasks.org/spec/vta/contexts/set-issuer-key/0.1";
 
 /// `keys/create/0.1`.
 const TASK_KEYS_CREATE: &str = "https://trusttasks.org/spec/keys/create/0.1";
@@ -90,32 +88,12 @@ fn context_id_from_response(response: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The body of a Trust Task response.
-///
-/// Every answer arrives wrapped in an envelope that carries its own fields —
-/// including a top-level `id`. Reading through `payload` first is what keeps a
-/// caller from binding to the envelope's uuid instead of the thing it asked
-/// for; falling back to the whole value keeps the flat shape working.
-fn payload_of(response: &serde_json::Value) -> &serde_json::Value {
-    response
-        .get("payload")
-        .unwrap_or(response)
-}
-
 /// Creates sub-contexts under the gateway's own context.
 pub struct GatewayContextCreator {
     client: Arc<VtaRestClient>,
     /// The context the gateway was granted. Every context it creates is a child
     /// of this one — which is also the only place the capability lets it create.
     parent_context_id: String,
-    /// Proof purposes the context's key is designated for, beyond the default
-    /// issuer designation.
-    ///
-    /// A proof's key is resolved from (context, `proofPurpose`), so a context
-    /// whose key is only an issuer cannot produce an `authentication` proof —
-    /// which is exactly what a holder signing a presentation needs. Empty for a
-    /// context that only ever issues.
-    proof_purposes: Vec<String>,
 }
 
 impl GatewayContextCreator {
@@ -123,23 +101,7 @@ impl GatewayContextCreator {
         client: Arc<VtaRestClient>,
         parent_context_id: String,
     ) -> Self {
-        Self {
-            client,
-            parent_context_id,
-            proof_purposes: Vec::new(),
-        }
-    }
-
-    /// Also designate the context's key for these proof purposes.
-    pub fn with_proof_purposes(
-        mut self,
-        purposes: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.proof_purposes = purposes
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        self
+        Self { client, parent_context_id }
     }
 
     /// The context itself, created or adopted.
@@ -178,14 +140,19 @@ impl GatewayContextCreator {
 
     /// Give the context an identity it can sign with.
     ///
-    /// A context with no DID and no designated key exists but cannot issue
-    /// anything: `credentials/issue-in-context` has nothing to sign as. So
+    /// A context with no DID exists but cannot sign as anything: a credential
+    /// issued as it has no `issuer`, and a proof has no verification method. So
     /// "created" has to mean "usable", or the first signature fails at a point
     /// where the cause is far away from the cure.
     ///
-    /// Every step is conditional on the current record, which is what makes a
-    /// retry safe. It also has to be: the provisioning path is **write-once**,
-    /// so re-sending a DID the context already has is refused by design.
+    /// The identity is a key minted in the context and the `did:key` of that
+    /// key. The DID is a consequence of the key, so the verification method a
+    /// verifier resolves is the key that signs, with nothing to publish and no
+    /// designation to keep in step with it.
+    ///
+    /// Conditional on the current record, which is what makes a retry safe. It
+    /// also has to be: the provisioning path is **write-once**, so re-sending a
+    /// DID the context already has is refused by design.
     async fn ensure_signing_identity(
         &self,
         context_id: &str,
@@ -194,27 +161,11 @@ impl GatewayContextCreator {
         let record = self
             .get_context(context_id)
             .await?;
-        let has_did = record
+        if record
             .get("did")
             .and_then(|d| d.as_str())
-            .is_some();
-        let has_key = record
-            .get("issuerKeyId")
-            .or_else(|| record.get("issuer_key_id"))
-            .and_then(|k| k.as_str())
-            .is_some();
-        let designated = designated_purposes(&record);
-        let missing_purposes: Vec<&str> = self
-            .proof_purposes
-            .iter()
-            .map(String::as_str)
-            .filter(|p| {
-                !designated
-                    .iter()
-                    .any(|d| d == p)
-            })
-            .collect();
-        if has_did && has_key && missing_purposes.is_empty() {
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -222,27 +173,8 @@ impl GatewayContextCreator {
         let public_key = self
             .ensure_issuer_key(context_id, &key_id)
             .await?;
-
-        if !has_did {
-            // `did:key:<multibase>` of the very key the context will sign with,
-            // so the verification method a verifier resolves really does
-            // resolve to that key — no registry, no publication step.
-            let did = format!("did:key:{public_key}");
-            self.configure(TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": did }))
-                .await?;
-        }
-        if !has_key {
-            self.configure(TASK_CONTEXTS_SET_ISSUER_KEY, json!({ "id": context_id, "keyId": key_id }))
-                .await?;
-        }
-        for purpose in missing_purposes {
-            self.configure(
-                TASK_CONTEXTS_SET_ISSUER_KEY,
-                json!({ "id": context_id, "keyId": key_id, "proofPurpose": purpose }),
-            )
-            .await?;
-        }
-        Ok(())
+        self.configure(TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": format!("did:key:{public_key}") }))
+            .await
     }
 
     /// A configuration step that tolerates having already been taken.
@@ -324,16 +256,6 @@ impl GatewayContextCreator {
     }
 }
 
-/// The proof purposes a context record already designates a key for.
-fn designated_purposes(record: &serde_json::Value) -> Vec<String> {
-    record
-        .get("proofKeyIds")
-        .or_else(|| record.get("proof_key_ids"))
-        .and_then(|m| m.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
 /// The `publicKey` of a key record, wherever the response put it.
 fn public_key_of(payload: &serde_json::Value) -> Option<String> {
     let record = payload
@@ -405,12 +327,11 @@ impl ContextCreator for GatewayContextCreator {
 impl GatewayContextCreator {
     /// Give an **existing** context an identity so it can issue.
     ///
-    /// A context created by hand (`vta context create`) has no DID and no
-    /// designated key, so `credentials/issue-in-context` refuses it with
-    /// "context `x` has no DID, so it cannot sign as itself". That is a
-    /// perfectly good context for signing *with a named key* — which is what
-    /// STS tokens do — so the operator has no reason to expect it to need
-    /// anything more until issuance fails.
+    /// A context created by hand (`vta context create`) has no DID, so a
+    /// credential issued as it has no `issuer`. That is a perfectly good
+    /// context for signing *with a named key* — which is what STS tokens do —
+    /// so the operator has no reason to expect it to need anything more until
+    /// issuance fails.
     ///
     /// The agent allows this: a caller holding `context-create` may set a DID
     /// **while it is unset**, which is exactly the state a hand-made context
@@ -490,15 +411,14 @@ fn already_exists(error: &VtaError) -> bool {
 /// Whether a configuration step failed because the field was already set.
 ///
 /// The write-once provisioning path refuses a second write by name ("already
-/// has a DID", "already designates"), which is the same outcome the caller
-/// wanted. Narrow on purpose: a plain refusal — no capability, context out of
+/// has a DID"), which is the same outcome the caller wanted. Narrow on purpose: a plain refusal — no capability, context out of
 /// reach — must surface, because swallowing it would report a context as ready
 /// to sign when it has no identity at all.
 fn already_configured(error: &VtaError) -> bool {
-    let detail = error
+    error
         .log_detail()
-        .to_ascii_lowercase();
-    detail.contains("already has a did") || detail.contains("already designates")
+        .to_ascii_lowercase()
+        .contains("already has a did")
 }
 
 #[cfg(test)]
@@ -556,9 +476,6 @@ mod tests {
         assert!(already_configured(&VtaError::Protocol(
             "context `gw/sfc-abc` already has a DID; changing it is an administrator's act".to_string()
         )));
-        assert!(already_configured(&VtaError::Protocol(
-            "context `gw/sfc-abc` already designates a signing key for this purpose".to_string()
-        )));
         assert!(
             !already_configured(&VtaError::Protocol("permission denied: forbidden: super admin required".to_string())),
             "a plain refusal must surface, or the context is reported ready with no identity"
@@ -611,10 +528,10 @@ mod tests {
     }
 }
 
-/// Live end-to-end against a real `vta-service`, exercising the whole chain
-/// VTA-16 + VTA-28 + VTA-11b put together: the gateway provisions its own
-/// context with a *non-admin* grant, designates a key in it, issues an
-/// agent-identity credential as that context, and verifies the proof.
+/// Live end-to-end against a real `vta-service`: the gateway provisions its own
+/// context with a *non-admin* grant, gives it a `did:key` identity from a key
+/// minted inside it, issues an agent-identity credential as that context with
+/// `keys/sign-document`, and verifies the proof.
 ///
 /// Ignored by default — it needs a VTA listening locally — so it never runs in
 /// the normal suite. Run it manually:
@@ -623,7 +540,7 @@ mod tests {
 /// VTA_LIVE_URL=http://127.0.0.1:3000 \
 /// VTA_LIVE_DID=did:webvh:<scid>:localhost%3A3000 \
 /// VTA_LIVE_PARENT_CONTEXT=<the context the gateway was granted> \
-///   cargo test --bin agent-trust-gateway \
+///   cargo test --bin agent-gateway \
 ///     vta::context_creator::live_tests \
 ///     -- --ignored --nocapture --test-threads=1
 /// ```
@@ -699,13 +616,7 @@ mod live_tests {
             .as_str()
             .expect("the provisioned context must carry a DID")
             .to_string();
-        let key_id = record
-            .get("issuerKeyId")
-            .or_else(|| record.get("issuer_key_id"))
-            .and_then(|k| k.as_str())
-            .expect("the provisioned context must designate an issuer key")
-            .to_string();
-        eprintln!("PROVISIONED_DID={issuer_did} PROVISIONED_KEY={key_id}");
+        eprintln!("PROVISIONED_DID={issuer_did}");
 
         // The issuer key is **internal**, so its record is not readable and
         // its private half never leaves the VTA — which is the custody
@@ -717,7 +628,7 @@ mod live_tests {
             .expect("the provisioned DID must be a did:key, so it resolves to the signing key")
             .to_string();
 
-        // 3. Issue an agent-identity credential as that context (VTA-11b).
+        // 3. Issue an agent-identity credential as that context.
         let issuer = crate::vta::vc_issuer::VtaVcIssuer::new(Arc::clone(&client), context_id.clone());
         let agent_did = "did:peer:live-agent";
         let mut fields = HashMap::new();
@@ -761,20 +672,20 @@ mod live_tests {
         eprintln!("LIVE_OK context={context_id} issuer={issuer_did}");
     }
 
-    /// VTA-12: an agent's **holder** key lives in its own VTA context, so the
-    /// gateway signs the agent's presentation without ever holding its private
-    /// key. Proves the whole chain: provision → present → verify.
+    /// An agent's **holder** key lives in its own VTA context, so the gateway
+    /// never holds it. Provisioning works and is idempotent, the agent's DID is
+    /// the `did:key` of the key the trust agent minted, and the agent's
+    /// presentation is signed by that key — bound to a challenge and a domain —
+    /// without the gateway ever having the private half.
     #[tokio::test]
     #[ignore = "requires a running vta-service with the context-create capability granted; run manually"]
-    async fn live_an_agent_presentation_is_signed_without_a_gateway_held_key() {
+    async fn live_an_agent_is_provisioned_and_presents_with_a_key_the_gateway_never_held() {
         use crate::identity::ssi::vp_issuer::{Credentials, VpIssuer, VpIssuerPayload};
         use crate::vta::agent_contexts::{AgentKeyProvisioner, VtaAgentProvisioner};
-        use crate::vta::vp_issuer::{AgentContexts, VtaVpIssuer};
+        use crate::vta::vp_issuer::{AgentBinding, AgentContexts, VtaVpIssuer};
 
         let (client, parent) = live_client();
 
-        // 1. Provision the agent. The key is minted inside the VTA and the
-        //    agent's DID follows from it, so no private half ever exists here.
         let provisioner = VtaAgentProvisioner::new(
             GatewayContextCreator::new(Arc::clone(&client), parent.clone()),
             crate::vta::connections::BOOTSTRAP_CONNECTION_ID.to_string(),
@@ -792,24 +703,22 @@ mod live_tests {
             "an agent DID must resolve to the VTA-held key with no update key to steal, got `{}`",
             agent.did
         );
+        assert!(provisioner.available(), "a trust agent as the provisioner must be used: new agents belong in it");
 
-        // Idempotent: a retry after a timeout must adopt the same identity
-        // rather than mint a second one for the same agent.
         let again = provisioner
             .provision(&identity_hash)
             .await
             .expect("re-provisioning the same agent must be a no-op");
         assert_eq!(again, agent, "a retry must not mint a second identity");
 
-        // 2. Sign a presentation as that agent, holding no key.
         struct Fixed(String);
         #[async_trait]
         impl AgentContexts for Fixed {
             async fn binding_for(
                 &self,
                 _agent_did: &str,
-            ) -> anyhow::Result<Option<crate::vta::vp_issuer::AgentBinding>> {
-                Ok(Some(crate::vta::vp_issuer::AgentBinding {
+            ) -> anyhow::Result<Option<AgentBinding>> {
+                Ok(Some(AgentBinding {
                     context_id: self.0.clone(),
                     connection_id: None,
                 }))
@@ -825,7 +734,6 @@ mod live_tests {
                 panic!("the local signer must not be reached: it would use a key the gateway should not have")
             }
         }
-
         let issuer = VtaVpIssuer::new(
             Arc::new(crate::vta::agent_contexts::RegistryVtaClients::new(Arc::clone(&client), None)),
             Arc::new(Fixed(agent.context_id.clone())),
@@ -833,8 +741,6 @@ mod live_tests {
         );
         let vp = issuer
             .issue(VpIssuerPayload::Credentials(Credentials {
-                // The point of the whole ticket: no key is supplied, because
-                // the gateway does not have one.
                 holder_key: None,
                 holder_did: std::borrow::Cow::Borrowed(&agent.did),
                 verifiable_credentials: std::borrow::Cow::Owned(vec![json!({
@@ -843,35 +749,189 @@ mod live_tests {
                     "issuer": "did:example:issuer",
                     "credentialSubject": { "id": agent.did },
                 })]),
-                challenge: None,
-                domain: None,
+                challenge: Some(std::borrow::Cow::Borrowed("live-nonce")),
+                domain: Some(std::borrow::Cow::Borrowed("verifier.example")),
             }))
             .await
             .expect("the agent's own trust agent signs its presentation");
 
         assert_eq!(vp["holder"], json!(agent.did));
+        assert_eq!(vp["controller"], json!(agent.did), "the trust agent reads its signer from here");
         assert_eq!(vp["proof"]["proofPurpose"], json!("authentication"));
         assert_eq!(vp["proof"]["cryptosuite"], json!("eddsa-jcs-2022"));
+        assert_eq!(vp["proof"]["challenge"], json!("live-nonce"));
+        assert_eq!(vp["proof"]["domain"], json!("verifier.example"));
 
-        // 3. Verify the holder proof against the agent's own key — a
-        //    presentation that cannot be verified is not an outcome.
-        let public_key = agent
-            .did
-            .strip_prefix("did:key:")
-            .expect("did:key");
-        let proof: affinidi_data_integrity::DataIntegrityProof =
-            serde_json::from_value(vp["proof"].clone()).expect("proof deserialises");
+        // Verified by the gateway's own verifier — the consumer that matters —
+        // because it reconstructs the challenge and domain the proof is bound to.
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .expect("resolver");
         let mut unsigned = vp.clone();
         unsigned
             .as_object_mut()
             .expect("vp is an object")
             .remove("proof");
-        let (_base, public_bytes) = multibase::decode(public_key).expect("multibase public key");
-        proof
-            .verify_with_public_key(&unsigned, &public_bytes[2..], affinidi_data_integrity::VerifyOptions::default())
-            .expect("the presentation must verify against the agent's own key");
+        crate::identity::ssi::di_jcs::verify_jcs_proof(
+            &unsigned,
+            &vp["proof"],
+            Arc::clone(crate::gateways::did_cache::shared_resolver()),
+        )
+        .await
+        .expect("the presentation must verify, bound to its challenge and domain");
 
         eprintln!("LIVE_HOLDER_OK agent={}", agent.did);
+    }
+
+    /// A credential naming the **trust agent's own DID** as its issuer cannot be
+    /// obtained through a context key. `keys/sign-document` signs only as the
+    /// DID a document names and only with a key that DID's document lists, and
+    /// the context's key is not the trust agent's — so the gateway cannot mint
+    /// a credential that claims to come from the trust agent itself.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service with the context-create capability granted; run manually"]
+    async fn live_a_context_key_cannot_sign_as_the_trust_agents_own_did() {
+        use crate::vta::context_identity::ContextIdentityResolver;
+
+        let (client, parent) = live_client();
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID");
+        let creator = GatewayContextCreator::new(Arc::clone(&client), parent);
+        let context_id = creator
+            .create_context(&format!("ctx:_global/forge-{}", uuid::Uuid::new_v4()))
+            .await
+            .expect("provision a context")
+            .as_str()
+            .to_string();
+        let identity = ContextIdentityResolver::new(Arc::clone(&client), context_id)
+            .identity()
+            .await
+            .expect("identity");
+
+        let outcome: Result<Value, VtaError> = client
+            .dispatch_signed(
+                "https://trusttasks.org/spec/keys/sign-document/0.1",
+                json!({
+                    "keyId": identity.key_id,
+                    "document": {
+                        "@context": ["https://www.w3.org/ns/credentials/v2"],
+                        "type": ["VerifiableCredential"],
+                        "issuer": vta_did,
+                        "credentialSubject": { "id": "did:key:zVictim" },
+                    },
+                    "proofPurpose": "assertionMethod",
+                }),
+            )
+            .await;
+
+        let err = match outcome {
+            Ok(signed) => panic!("a context key must not sign as the trust agent's own DID, got {signed}"),
+            Err(e) => e,
+        };
+        let detail = err.log_detail();
+        assert!(
+            !detail.contains("proofRequired"),
+            "refused for the wrong reason (the request was not signed): {detail}"
+        );
+        eprintln!("LIVE_FORGERY_REFUSED detail={detail}");
+    }
+
+    /// A document that already carries a proof is refused rather than silently
+    /// re-proofed: dropping the old proof would hand back a document with only
+    /// ours and no indication the caller's was discarded.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service with the context-create capability granted; run manually"]
+    async fn live_a_document_that_already_carries_a_proof_is_refused() {
+        use crate::vta::context_identity::{ContextIdentityResolver, PURPOSE_ASSERTION_METHOD};
+
+        let (client, parent) = live_client();
+        let creator = GatewayContextCreator::new(Arc::clone(&client), parent);
+        let context_id = creator
+            .create_context(&format!("ctx:_global/proofed-{}", uuid::Uuid::new_v4()))
+            .await
+            .expect("provision a context")
+            .as_str()
+            .to_string();
+        let resolver = ContextIdentityResolver::new(Arc::clone(&client), context_id);
+        let identity = resolver
+            .identity()
+            .await
+            .expect("identity");
+
+        let outcome = resolver
+            .sign_document(
+                json!({
+                    "@context": ["https://www.w3.org/ns/credentials/v2"],
+                    "type": ["VerifiableCredential"],
+                    "issuer": identity.did,
+                    "credentialSubject": { "id": "did:key:zAgent" },
+                    "proof": { "type": "DataIntegrityProof", "proofValue": "zAlreadyThere" },
+                }),
+                PURPOSE_ASSERTION_METHOD,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(outcome.is_err(), "an existing proof must be refused, not replaced");
+    }
+
+    /// The provisioning grant lets a gateway name a context's DID **once**, and
+    /// only a DID the context itself controls. A DID of any other method, or a
+    /// `did:key` nothing in the context holds, is an administrator's decision.
+    ///
+    /// Needs a caller that is **not** an administrator — an administrator keeps
+    /// the ordinary gate, which is exactly what this rule is not about — so it
+    /// authenticates as its own control key (seed `[43; 32]`, printed as
+    /// `GATEWAY_PROVISIONER_DID`) holding only the provisioning grant:
+    ///
+    /// ```text
+    /// vta acl create --did <GATEWAY_PROVISIONER_DID> --role initiator \
+    ///   --contexts <parent> --capabilities context-create,key-mint,sign,sign-jws,sign-document
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires a running vta-service and a provisioning-only grant for the printed DID; run manually"]
+    async fn live_the_gateway_may_name_only_a_did_its_context_controls() {
+        let (_admin_client, parent) = live_client();
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID");
+        let provisioner = Arc::new(ControlKey::from_seed([43u8; 32]));
+        eprintln!("GATEWAY_PROVISIONER_DID={}", provisioner.did());
+        let client = Arc::new(
+            VtaRestClient::new(&url, &vta_did, provisioner, Duration::from_secs(15), 8, None).expect("build client"),
+        );
+        let creator = GatewayContextCreator::new(Arc::clone(&client), parent.clone());
+        let leaf = format!("bare-{}", uuid::Uuid::new_v4().simple());
+        let context_id = creator
+            .ensure_context(&leaf, "a context with no identity", &format!("{parent}/{leaf}"))
+            .await
+            .expect("create a bare context");
+
+        for did in ["did:web:example.com", "did:key:z6MkNobodyInThisContextHoldsThis"] {
+            let outcome: Result<Value, VtaError> = client
+                .dispatch_signed(TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": did }))
+                .await;
+            assert!(outcome.is_err(), "`{did}` is not a DID this context controls, so naming it must be refused");
+        }
+        let record = creator
+            .get_context(&context_id)
+            .await
+            .expect("read it back");
+        assert!(record.get("did").is_none(), "a refused write left a DID behind: {record}");
+
+        creator
+            .ensure_signing_identity(&context_id, &leaf)
+            .await
+            .expect("naming the did:key of a key the context holds is what provisioning does");
+        let record = creator
+            .get_context(&context_id)
+            .await
+            .expect("read it back");
+        assert!(
+            record["did"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("did:key:")),
+            "{record}"
+        );
     }
 
     /// The property that makes the fabric issuer attestation migratable: an
@@ -895,7 +955,7 @@ mod live_tests {
 
         let (client, parent) = live_client();
 
-        // A provisioned context: DID + designated key, exactly what the
+        // A provisioned context: a DID and the key behind it, exactly what the
         // gateway's own context looks like after onboarding.
         let creator = GatewayContextCreator::new(Arc::clone(&client), parent.clone());
         let name = format!("ctx:_global/attest-{}", uuid::Uuid::new_v4());

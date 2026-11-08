@@ -3,8 +3,9 @@
 //! `ssi` implements no JCS cryptosuite at any released version, and none exists
 //! upstream either — so a credential signed by the Verifiable Trust Agent
 //! (which signs `eddsa-jcs-2022`) cannot be verified through the `ssi` pipeline
-//! the rest of this module uses. This supplies that one suite via
-//! `affinidi-data-integrity`, the same crate the VTA signs with.
+//! the rest of this module uses. This supplies that one suite itself — the
+//! procedure the VTA signs with, which `affinidi-data-integrity` cannot verify
+//! for a proof bound to a challenge or a domain.
 //!
 //! **Scope is deliberately narrow.** This decides nothing: it answers "do these
 //! bytes verify under this key" and nothing else. Proof presence, the
@@ -19,15 +20,18 @@
 //! carrying this gateway's own `AgentIdentityCredential` context. JCS needs no
 //! context resolution at all, which is why only this direction works.
 
-use affinidi_data_integrity::crypto_suites::CryptoSuite;
+use affinidi_data_integrity::DataIntegrityError;
 use affinidi_data_integrity::did_vm::{DidKeyResolver, ResolvedKey, VerificationMethodResolver};
-use affinidi_data_integrity::{DataIntegrityError, DataIntegrityProof, VerifyOptions};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_secrets_resolver::secrets::KeyType;
 use anyhow::{Context as AnyhowContext, Result};
 use async_trait::async_trait;
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+const JCS_CRYPTOSUITE: &str = "eddsa-jcs-2022";
 
 /// Resolves a `verificationMethod` URI to its public key, for DID methods the
 /// gateway already serves.
@@ -188,22 +192,68 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>> {
 /// already removed** — JCS canonicalization is presence-sensitive, so hashing a
 /// document that still carried a proof reproduces nothing a signer produced.
 ///
-/// `allowed_suites` is pinned to the JCS suite so this function cannot be
-/// reached with a proof it was not chosen for, even by accident.
+/// The signed bytes are `SHA-256(JCS(proof options)) || SHA-256(JCS(document))`,
+/// where the proof options are every member of the proof except `proofValue`.
+/// That includes a `challenge` and a `domain` when the proof carries them, which
+/// is the reason this is done here rather than by `affinidi-data-integrity`:
+/// its proof type has no such members, so it drops them and then reconstructs
+/// bytes nobody signed — a proof bound to a challenge could never verify.
+///
+/// Only `eddsa-jcs-2022` is accepted, so this cannot be reached with a proof it
+/// was not chosen for. Key resolution is the same [`GatewayVmResolver`] as
+/// before; what the key is *allowed* to sign for stays decided in
+/// [`super::verifier`].
 pub async fn verify_jcs_proof(
     document: &Value,
     proof: &Value,
     did_cache: Arc<DIDCacheClient>,
 ) -> Result<()> {
-    let proof: DataIntegrityProof =
-        serde_json::from_value(proof.clone()).context("proof is not a Data Integrity proof")?;
+    let members = proof
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("proof is not a Data Integrity proof"))?;
+    let text = |name: &str| {
+        members
+            .get(name)
+            .and_then(Value::as_str)
+    };
+    if text("type") != Some("DataIntegrityProof") {
+        anyhow::bail!("proof is not a Data Integrity proof");
+    }
+    if text("cryptosuite") != Some(JCS_CRYPTOSUITE) {
+        anyhow::bail!("eddsa-jcs-2022 verification was given a {:?} proof", text("cryptosuite"));
+    }
+    let verification_method =
+        text("verificationMethod").ok_or_else(|| anyhow::anyhow!("proof names no verification method"))?;
+    let proof_value = text("proofValue").ok_or_else(|| anyhow::anyhow!("proof carries no proofValue"))?;
 
-    let resolver = GatewayVmResolver::new(did_cache);
-    let options = VerifyOptions::new().with_allowed_suites(vec![CryptoSuite::EddsaJcs2022]);
+    let (_, signature) = multibase::decode(proof_value).context("proofValue is not multibase")?;
+    let signature = Signature::from_slice(&signature)
+        .map_err(|e| anyhow::anyhow!("proofValue is not an Ed25519 signature: {e}"))?;
 
-    proof
-        .verify(document, &resolver, options)
+    let mut options = members.clone();
+    options.remove("proofValue");
+    let canonical = |value: &Value| {
+        serde_json_canonicalizer::to_string(value)
+            .map_err(|e| anyhow::anyhow!("canonicalising for eddsa-jcs-2022: {e}"))
+    };
+    let mut hash_data = Vec::with_capacity(64);
+    hash_data.extend_from_slice(&Sha256::digest(canonical(&Value::Object(options))?.as_bytes()));
+    hash_data.extend_from_slice(&Sha256::digest(canonical(document)?.as_bytes()));
+
+    let key = GatewayVmResolver::new(did_cache)
+        .resolve_vm(verification_method)
         .await
+        .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))?;
+    if key.key_type != KeyType::Ed25519 {
+        anyhow::bail!("eddsa-jcs-2022 proof verification failed: {verification_method} is not an Ed25519 key");
+    }
+    let key: [u8; 32] = key
+        .public_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: the key is not 32 bytes"))?;
+    VerifyingKey::from_bytes(&key)
+        .and_then(|key| key.verify_strict(&hash_data, &signature))
         .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))
 }
 

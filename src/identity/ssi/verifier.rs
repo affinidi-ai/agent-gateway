@@ -1009,14 +1009,29 @@ mod tests {
         verification_method: &str,
         proof_purpose: &str,
     ) -> Value {
-        use affinidi_data_integrity::crypto_suites::CryptoSuite;
-        use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
-        use affinidi_secrets_resolver::secrets::Secret;
-
         credential
             .as_object_mut()
             .expect("credential is an object")
             .insert("issuer".into(), json!(issuer_did));
+
+        let proof = sign_jcs_proof(&credential, key, verification_method, proof_purpose).await;
+        credential
+            .as_object_mut()
+            .unwrap()
+            .insert("proof".into(), proof);
+        credential
+    }
+
+    /// An `eddsa-jcs-2022` proof over `document` exactly as it stands.
+    async fn sign_jcs_proof(
+        document: &Value,
+        key: &ed25519_dalek::SigningKey,
+        verification_method: &str,
+        proof_purpose: &str,
+    ) -> Value {
+        use affinidi_data_integrity::crypto_suites::CryptoSuite;
+        use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+        use affinidi_secrets_resolver::secrets::Secret;
 
         let mut private = vec![0x80, 0x26];
         private.extend_from_slice(&key.to_bytes());
@@ -1025,7 +1040,7 @@ mod tests {
         secret.id = verification_method.to_string();
 
         let proof = DataIntegrityProof::sign(
-            &credential,
+            document,
             &secret,
             SignOptions::new()
                 .with_proof_purpose(proof_purpose)
@@ -1033,12 +1048,7 @@ mod tests {
         )
         .await
         .expect("JCS signing should succeed");
-
-        credential
-            .as_object_mut()
-            .unwrap()
-            .insert("proof".into(), serde_json::to_value(&proof).expect("proof serialises"));
-        credential
+        serde_json::to_value(&proof).expect("proof serialises")
     }
 
     /// A `did:key` identity: the signing key, the DID, and its verification
@@ -1211,6 +1221,180 @@ mod tests {
             .expect("an all-JCS presentation must verify");
         assert_eq!(result.holder_did, holder_did);
         assert_eq!(result.credentials[0].issuer_did, issuer_did);
+    }
+
+    /// The presentation a trust agent signs for an agent: it names its holder
+    /// with `holder` and, so the agent can find its signer, with `controller`
+    /// as well. The verifier reads `holder`, so the extra member changes
+    /// nothing — and the credential inside still has to be about that holder.
+    #[tokio::test]
+    async fn verifies_a_trust_agent_presentation_that_also_names_a_controller() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let (holder_key, holder_did, holder_vm) = did_key_identity();
+
+        let vc = sign_jcs(
+            unsigned_agent_vc(&holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let mut vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": holder_did,
+            "controller": holder_did,
+            "verifiableCredential": [vc],
+            "id": "urn:uuid:7a7a0000-0000-4000-8000-000000000003",
+        });
+        let proof = sign_jcs_proof(&vp, &holder_key, &holder_vm, "authentication").await;
+        vp["proof"] = proof;
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("a presentation that also names a controller must verify");
+        assert_eq!(result.holder_did, holder_did);
+        assert_eq!(result.credentials[0].subject_did, holder_did);
+    }
+
+    /// The `controller` is not a way to present as someone else: a proof made by
+    /// a key that is not the holder's is rejected however the document names its
+    /// signer.
+    #[tokio::test]
+    async fn rejects_a_presentation_signed_by_someone_other_than_its_holder() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let (_holder_key, holder_did, _holder_vm) = did_key_identity();
+        let (other_key, other_did, other_vm) = did_key_identity();
+
+        let vc = sign_jcs(
+            unsigned_agent_vc(&holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let mut vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": holder_did,
+            "controller": other_did,
+            "verifiableCredential": [vc],
+            "id": "urn:uuid:7a7a0000-0000-4000-8000-000000000004",
+        });
+        let proof = sign_jcs_proof(&vp, &other_key, &other_vm, "authentication").await;
+        vp["proof"] = proof;
+
+        assert!(
+            verify(&f, &vp).await.is_err(),
+            "a proof from a key that is not the holder's must not verify as the holder"
+        );
+    }
+
+    /// An `eddsa-jcs-2022` proof built the way the trust agent builds one: the
+    /// proof options carry the verification method, the purpose and any
+    /// challenge or domain, and the signature covers
+    /// `SHA-256(JCS(options)) || SHA-256(JCS(document))`.
+    fn trust_agent_proof(
+        document: &Value,
+        key: &ed25519_dalek::SigningKey,
+        verification_method: &str,
+        challenge: Option<&str>,
+        domain: Option<&str>,
+    ) -> Value {
+        use sha2::{Digest, Sha256};
+
+        let mut options = json!({
+            "type": "DataIntegrityProof",
+            "cryptosuite": "eddsa-jcs-2022",
+            "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "verificationMethod": verification_method,
+            "proofPurpose": "authentication",
+        });
+        if let Some(context) = document.get("@context") {
+            options["@context"] = context.clone();
+        }
+        if let Some(challenge) = challenge {
+            options["challenge"] = json!(challenge);
+        }
+        if let Some(domain) = domain {
+            options["domain"] = json!(domain);
+        }
+        let jcs = |v: &Value| serde_json_canonicalizer::to_string(v).expect("canonicalise");
+        let mut hash_data = Vec::new();
+        hash_data.extend_from_slice(&Sha256::digest(jcs(&options).as_bytes()));
+        hash_data.extend_from_slice(&Sha256::digest(jcs(document).as_bytes()));
+        let signature = ed25519_dalek::Signer::sign(key, &hash_data);
+        options["proofValue"] = json!(multibase::encode(multibase::Base::Base58Btc, signature.to_bytes()));
+        options
+    }
+
+    async fn bound_presentation(
+        challenge: Option<&str>,
+        domain: Option<&str>,
+    ) -> (Value, String) {
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let (holder_key, holder_did, holder_vm) = did_key_identity();
+        let vc = sign_jcs(
+            unsigned_agent_vc(&holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let mut vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": holder_did,
+            "controller": holder_did,
+            "verifiableCredential": [vc],
+            "id": "urn:uuid:7a7a0000-0000-4000-8000-000000000005",
+        });
+        vp["proof"] = trust_agent_proof(&vp, &holder_key, &holder_vm, challenge, domain);
+        (vp, holder_did)
+    }
+
+    /// A proof bound to a challenge and a domain verifies: both are part of what
+    /// was signed, so the verifier has to reconstruct them to check anything.
+    /// (The library this once used drops them, and every such proof failed.)
+    #[tokio::test]
+    async fn verifies_a_jcs_presentation_bound_to_a_challenge_and_domain() {
+        let f = fixture().await;
+        let (vp, holder_did) = bound_presentation(Some("nonce-1"), Some("verifier.example")).await;
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("a proof bound to a challenge and a domain must verify");
+        assert_eq!(result.holder_did, holder_did);
+        assert_eq!(vp["proof"]["challenge"], json!("nonce-1"));
+    }
+
+    /// The binding is part of the signature: changing the challenge or the
+    /// domain afterwards — which is what replaying a proof somewhere else would
+    /// need — breaks it.
+    #[tokio::test]
+    async fn rejects_a_jcs_proof_whose_challenge_or_domain_was_changed_after_signing() {
+        let f = fixture().await;
+        for member in ["challenge", "domain"] {
+            let (mut vp, _) = bound_presentation(Some("nonce-1"), Some("verifier.example")).await;
+            vp["proof"][member] = json!("someone-else");
+            let err = verify(&f, &vp)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a changed {member} must not verify"));
+            assert!(err.contains("verification failed"), "{member}: refused for the wrong reason: {err}");
+        }
+        let (mut vp, _) = bound_presentation(Some("nonce-1"), None).await;
+        vp["proof"]["domain"] = json!("added-afterwards");
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("a domain added after signing must not verify");
+        assert!(err.contains("verification failed"), "refused for the wrong reason: {err}");
     }
 
     /// An unsigned document must never reach a verification decision, whichever

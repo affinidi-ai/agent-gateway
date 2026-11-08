@@ -53,7 +53,7 @@ pub struct VtaConnectionRegistry {
     bootstrap: Option<Arc<dyn CredentialAuthority>>,
     /// The client behind that same bootstrap connector, for callers that talk
     /// to the VTA without being a [`CredentialAuthority`] — agent holder
-    /// proofs, which go through `proofs/attach`. Shared rather than re-dialled
+    /// proofs, which go through `keys/sign-document`. Shared rather than re-dialled
     /// because the VTA supersedes an earlier session when a second one opens
     /// for the same control DID.
     bootstrap_client: Option<Arc<VtaRestClient>>,
@@ -311,7 +311,7 @@ impl VtaConnectionRegistry {
     ///
     /// Split out because not everything that talks to a VTA is a
     /// [`CredentialAuthority`]: agent holder proofs go through
-    /// `proofs/attach`, which needs the client itself. Both paths must come
+    /// `keys/sign-document`, which needs the client itself. Both paths must come
     /// through here so a connection's usability rules — disabled, unpaired,
     /// unvalidated, data-plane isolation — are enforced once, not per caller.
     async fn build_client(

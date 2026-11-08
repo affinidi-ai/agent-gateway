@@ -1,10 +1,9 @@
 //! Per-agent VTA contexts (VTA-12): provisioning an agent identity whose
 //! private key never exists on this host, and finding it again later.
 //!
-//! An agent's holder key lives in its own VTA context because `proofs/attach`
-//! resolves the signing key from (context, `proofPurpose`) and accepts no key
-//! id — so one context signs as exactly one holder, and N agents need N
-//! contexts.
+//! An agent's holder key lives in its own VTA context because
+//! `keys/sign-document` signs only as the DID the document names — so one
+//! context signs as exactly one holder, and N agents need N contexts.
 //!
 //! The agent's DID is the `did:key` of that context's key. That ordering
 //! matters: the DID is a *consequence* of the key the VTA minted, so there is
@@ -20,7 +19,7 @@ use async_trait::async_trait;
 use crate::identity::store::IdentityStore;
 use crate::vta::context_creator::GatewayContextCreator;
 use crate::vta::provisioning::ContextCreator;
-use crate::vta::vp_issuer::{AgentContexts, HOLDER_PROOF_PURPOSE};
+use crate::vta::vp_issuer::AgentContexts;
 
 /// Prefix on a derived agent context name, so an operator reading the VTA can
 /// tell an agent's context from a surface's.
@@ -110,14 +109,7 @@ impl VtaAgentProvisioner {
         creator: GatewayContextCreator,
         connection_id: String,
     ) -> Self {
-        // The holder proof is an `authentication` proof, and the VTA resolves
-        // a different key per purpose with no fallback for that one. A context
-        // designated only as an issuer would create fine and then fail to sign
-        // a presentation, so the designation is part of provisioning.
-        Self {
-            creator: creator.with_proof_purposes([HOLDER_PROOF_PURPOSE]),
-            connection_id,
-        }
+        Self { creator, connection_id }
     }
 }
 
