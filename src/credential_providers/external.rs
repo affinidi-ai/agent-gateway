@@ -19,7 +19,10 @@
 //! - [`refuse_changes`] keeps the issuer, the endpoints, the client fields and
 //!   `resource` fixed for the provider's life: a different value is a new provider.
 //! - [`check_grant_destination`] binds the provider's grants to where they are
-//!   sent: a Transit Point carries them only to the origin of `resource`.
+//!   sent: a Transit Point carries them only to the origin of `resource`, and a
+//!   `proxy://` Transit Point only to an MCP Proxy of its tenant, served only
+//!   through surfaces, whose `base_url` has that origin
+//!   ([`check_proxy_grant_destination`]).
 //!
 //! So a token that can edit providers or surfaces cannot point a provider whose
 //! grants are stored at an endpoint of its choosing, which would collect them on
@@ -903,27 +906,136 @@ pub async fn check_grant_destination(
     target_endpoint: &str,
     exact_allowlist: Option<&str>,
 ) -> Result<url::Origin, &'static str> {
-    if target_endpoint.starts_with("fabric://") {
-        return Err("consent_mode external never forwards over Fabric");
+    grant_origin(provider, target_endpoint, exact_allowlist)
+        .await
+        .map_err(|refused| match refused {
+            DestinationRefused::Fabric => "consent_mode external never forwards over Fabric",
+            DestinationRefused::NoResource => NO_RESOURCE,
+            DestinationRefused::NotPublicHttps => {
+                "consent_mode external needs a target_endpoint that is a public https URL"
+            }
+            DestinationRefused::OtherOrigin => {
+                "consent_mode external needs a target_endpoint with the origin of the credential provider's resource"
+            }
+        })
+}
+
+const NO_RESOURCE: &str = "the credential provider names no resource";
+
+/// The refusal of a grant to the MCP Proxy a `proxy://` Transit Point names
+/// that is missing or of another tenant: the two are not told apart.
+pub const PROXY_UNAVAILABLE: &str = "consent_mode external needs an MCP Proxy of the surface's own tenant";
+
+/// Why [`grant_origin`] refused a destination.
+enum DestinationRefused {
+    Fabric,
+    NoResource,
+    NotPublicHttps,
+    OtherOrigin,
+}
+
+/// The origin of `provider`'s `resource`, when `destination` is a public
+/// `https` URL (or a fixture `exact_allowlist` admits) with that origin.
+async fn grant_origin(
+    provider: &CredentialProvider,
+    destination: &str,
+    exact_allowlist: Option<&str>,
+) -> Result<url::Origin, DestinationRefused> {
+    if destination.starts_with("fabric://") {
+        return Err(DestinationRefused::Fabric);
     }
     let resource = provider
         .resource
         .as_deref()
         .and_then(|resource| url::Url::parse(resource).ok())
-        .ok_or("the credential provider names no resource")?;
-    let target = url::Url::parse(target_endpoint)
-        .map_err(|_| "consent_mode external needs a target_endpoint that is a public https URL")?;
-    if !is_strict_https_url(target_endpoint)
-        && !crate::egress::exactly_allowlisted(target_endpoint, exact_allowlist).await
-    {
-        return Err("consent_mode external needs a target_endpoint that is a public https URL");
+        .ok_or(DestinationRefused::NoResource)?;
+    let target = url::Url::parse(destination).map_err(|_| DestinationRefused::NotPublicHttps)?;
+    if !is_strict_https_url(destination) && !crate::egress::exactly_allowlisted(destination, exact_allowlist).await {
+        return Err(DestinationRefused::NotPublicHttps);
     }
     if target.origin() != resource.origin() {
-        return Err(
-            "consent_mode external needs a target_endpoint with the origin of the credential provider's resource",
-        );
+        return Err(DestinationRefused::OtherOrigin);
     }
     Ok(resource.origin())
+}
+
+/// Whether the MCP Proxy `proxy` may be sent the grants of a Transit Point on
+/// a surface of `tenant_id` whose target is `proxy://<its id>`: it is that
+/// tenant's, and it is served only through surfaces (`direct_access: false`),
+/// so nothing reaches its backend with a grant but the Transit Point that
+/// holds it. A missing proxy and another tenant's are refused alike
+/// ([`PROXY_UNAVAILABLE`]).
+pub fn proxy_may_carry_grants(
+    proxy: &crate::mcp_proxies::types::McpProxy,
+    tenant_id: Option<&str>,
+) -> Result<(), &'static str> {
+    if proxy.tenant_id.as_deref() != tenant_id {
+        return Err(PROXY_UNAVAILABLE);
+    }
+    if proxy.direct_access {
+        return Err("consent_mode external needs an MCP Proxy served only through surfaces: set the MCP Proxy's \
+             direct_access to false");
+    }
+    Ok(())
+}
+
+/// Whether a Transit Point on a surface of `tenant_id` whose target is
+/// `proxy://<id>`, the MCP Proxy `proxy`, may carry the grants of the
+/// external consent provider `provider`, and if so the origin they may be
+/// sent to: the origin of the provider's `resource`, as for an `https`
+/// Transit Point ([`check_grant_destination`]).
+///
+/// The proxy must be one [`proxy_may_carry_grants`] permits, and its
+/// `base_url`, where its tool calls go, a public `https` URL with that origin.
+/// The check runs when the surface is saved, when a connect starts, and on
+/// every call with the proxy the call is sent through, so a proxy edited
+/// afterwards to point elsewhere is never sent the grant.
+pub async fn check_proxy_grant_destination(
+    provider: &CredentialProvider,
+    proxy: &crate::mcp_proxies::types::McpProxy,
+    tenant_id: Option<&str>,
+    exact_allowlist: Option<&str>,
+) -> Result<url::Origin, &'static str> {
+    proxy_may_carry_grants(proxy, tenant_id)?;
+    grant_origin(provider, &proxy.base_url, exact_allowlist)
+        .await
+        .map_err(|refused| match refused {
+            DestinationRefused::NoResource => NO_RESOURCE,
+            DestinationRefused::Fabric | DestinationRefused::NotPublicHttps => {
+                "consent_mode external needs an MCP Proxy whose base_url is a public https URL"
+            }
+            DestinationRefused::OtherOrigin => {
+                "consent_mode external needs an MCP Proxy whose base_url has the origin of the credential provider's \
+                 resource"
+            }
+        })
+}
+
+/// Where a Transit Point on a surface of `tenant_id` whose target is
+/// `target_endpoint` sends the grants of `provider`: an `https` target's
+/// origin ([`check_grant_destination`]), or for `proxy://<id>` the origin of
+/// that MCP Proxy's `base_url`, read from `proxies`
+/// ([`check_proxy_grant_destination`]).
+pub async fn check_transit_grant_destination(
+    provider: &CredentialProvider,
+    target_endpoint: &str,
+    proxies: Option<&dyn crate::mcp_proxies::McpProxyStore>,
+    tenant_id: Option<&str>,
+    exact_allowlist: Option<&str>,
+) -> Result<url::Origin, &'static str> {
+    let Some(proxy_id) = target_endpoint.strip_prefix("proxy://") else {
+        return check_grant_destination(provider, target_endpoint, exact_allowlist).await;
+    };
+    let Some(store) = proxies else {
+        return Err(PROXY_UNAVAILABLE);
+    };
+    let proxy = store
+        .get(proxy_id)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(PROXY_UNAVAILABLE)?;
+    check_proxy_grant_destination(provider, &proxy, tenant_id, exact_allowlist).await
 }
 
 #[cfg(test)]
@@ -1006,6 +1118,122 @@ pub(crate) mod tests {
             check_grant_destination(&fixture, "fabric://127.0.0.1:9/mcp", allowlist)
                 .await
                 .is_err()
+        );
+    }
+
+    /// An MCP Proxy of `tenant`, served only through surfaces, whose tool
+    /// calls go to `base_url`.
+    pub(crate) fn grant_proxy(
+        id: &str,
+        tenant: Option<&str>,
+        base_url: &str,
+    ) -> crate::mcp_proxies::types::McpProxy {
+        let mut proxy = crate::mcp_proxies::types::McpProxy::new(
+            id.into(),
+            String::new(),
+            base_url.into(),
+            String::new(),
+            "/mcp".into(),
+            format!("/{id}"),
+        );
+        proxy.id = id.into();
+        proxy.tenant_id = tenant.map(str::to_string);
+        proxy.direct_access = false;
+        proxy
+    }
+
+    /// A `proxy://` Transit Point carries a grant only to an MCP Proxy of the
+    /// surface's tenant, served only through surfaces, whose `base_url` is a
+    /// public `https` URL with the origin of the provider's resource; a
+    /// missing proxy and another tenant's are refused alike.
+    #[tokio::test]
+    async fn a_grant_goes_through_a_proxy_only_to_the_providers_resource_from_the_surfaces_own_tenant() {
+        use crate::mcp_proxies::McpProxyStore;
+        let provider = external_provider();
+        let resource = url::Url::parse("https://203.0.113.10/mcp")
+            .unwrap()
+            .origin();
+        let permitted = grant_proxy("drive", Some("tenant-a"), "https://203.0.113.10/drive/v3");
+        assert_eq!(
+            check_proxy_grant_destination(&provider, &permitted, Some("tenant-a"), None).await,
+            Ok(resource.clone())
+        );
+        let mut direct = permitted.clone();
+        direct.direct_access = true;
+        for (case, proxy, tenant, expected) in [
+            ("another tenant's proxy", permitted.clone(), Some("tenant-b"), PROXY_UNAVAILABLE),
+            (
+                "an operator's proxy on a tenant's surface",
+                grant_proxy("drive", None, "https://203.0.113.10/x"),
+                Some("tenant-a"),
+                PROXY_UNAVAILABLE,
+            ),
+            ("a tenant's proxy on an operator's surface", permitted.clone(), None, PROXY_UNAVAILABLE),
+            (
+                "a proxy anyone can call directly",
+                direct,
+                Some("tenant-a"),
+                "consent_mode external needs an MCP Proxy served only through surfaces: set the MCP Proxy's \
+                 direct_access to false",
+            ),
+            (
+                "another origin",
+                grant_proxy("drive", Some("tenant-a"), "https://203.0.113.66/drive/v3"),
+                Some("tenant-a"),
+                "consent_mode external needs an MCP Proxy whose base_url has the origin of the credential \
+                 provider's resource",
+            ),
+            (
+                "another port",
+                grant_proxy("drive", Some("tenant-a"), "https://203.0.113.10:8443/drive/v3"),
+                Some("tenant-a"),
+                "consent_mode external needs an MCP Proxy whose base_url has the origin of the credential \
+                 provider's resource",
+            ),
+            (
+                "http",
+                grant_proxy("drive", Some("tenant-a"), "http://203.0.113.10/drive/v3"),
+                Some("tenant-a"),
+                "consent_mode external needs an MCP Proxy whose base_url is a public https URL",
+            ),
+        ] {
+            assert_eq!(check_proxy_grant_destination(&provider, &proxy, tenant, None).await, Err(expected), "{case}");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .create(&permitted)
+            .await
+            .unwrap();
+        let proxies: Option<&dyn McpProxyStore> = Some(&store);
+        assert_eq!(
+            check_transit_grant_destination(&provider, "proxy://drive", proxies, Some("tenant-a"), None).await,
+            Ok(resource.clone())
+        );
+        assert_eq!(
+            check_transit_grant_destination(&provider, "https://203.0.113.10/mcp", proxies, Some("tenant-a"), None)
+                .await,
+            Ok(resource),
+            "an https Transit Point is checked as before"
+        );
+        for (case, endpoint, proxies, tenant) in [
+            ("a missing proxy", "proxy://missing", proxies, Some("tenant-a")),
+            ("another tenant's proxy", "proxy://drive", proxies, Some("tenant-b")),
+            ("no proxy store", "proxy://drive", None, Some("tenant-a")),
+        ] {
+            assert_eq!(
+                check_transit_grant_destination(&provider, endpoint, proxies, tenant, None).await,
+                Err(PROXY_UNAVAILABLE),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            check_grant_destination(&provider, "proxy://drive", None).await,
+            Err("consent_mode external needs a target_endpoint that is a public https URL"),
+            "the Access Point's Target is never an MCP Proxy with a grant"
         );
     }
 

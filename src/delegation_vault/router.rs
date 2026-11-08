@@ -316,6 +316,7 @@ mod tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            mcp_proxy_store: None,
         }
     }
 

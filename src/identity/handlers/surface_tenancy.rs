@@ -136,7 +136,11 @@ async fn validate_target_auth_methods(
 ///   provider with an issuer is bound by no other consent mode.
 /// - Its Transit Point, or the Target, sends the grants only to the provider's
 ///   `resource`: a public `https` target with that origin, never a `fabric://`
-///   route, and that resource is permitted for the provider's issuer.
+///   route, and that resource is permitted for the provider's issuer. A
+///   Transit Point's target may instead be `proxy://<id>`, an MCP Proxy of the
+///   surface's tenant, served only through surfaces, whose `base_url` has that
+///   origin; such a Transit Point speaks MCP, sends the grant in a header and
+///   has no `target_auth` of its own.
 /// - The Target's grant goes in a header, in place of the caller's credential
 ///   and of any `target.auth` credential of the Target's own.
 /// - Its Transit Point id names one Transit Point in one place: it appears
@@ -165,6 +169,10 @@ pub async fn validate_external_consent_bindings(
             .network_config
             .external_consent_issuers
             .as_ref(),
+        state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn McpProxyStore),
     )
     .await
 }
@@ -184,6 +192,7 @@ async fn check_external_consent_bindings(
     storage: GrantStorage,
     resource_origins: &std::collections::HashMap<String, Vec<String>>,
     issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    proxies: Option<&dyn McpProxyStore>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
     check_access_point_target_places(surface)?;
@@ -201,6 +210,7 @@ async fn check_external_consent_bindings(
         storage,
         resource_origins,
         issuers,
+        proxies,
     };
     for (prefix, view) in &views {
         for (index, binding) in view
@@ -225,7 +235,7 @@ async fn check_external_consent_bindings(
             check_callers(&views, subject).map_err(refuse)?;
             check_access_point_target_binding(view, binding).map_err(refuse)?;
             rules
-                .check(&binding.credential_provider_id, &view.target.endpoint, &refuse)
+                .check(&binding.credential_provider_id, GrantTarget::AccessPointTarget(&view.target.endpoint), &refuse)
                 .await?;
         }
         for (index, point) in view
@@ -270,8 +280,9 @@ async fn check_external_consent_bindings(
                      Point's identity_injection.inject_vp and workload_binding, and remove its managed_identity",
                 ));
             }
+            check_proxy_transit_point(point, binding).map_err(refuse)?;
             rules
-                .check(&binding.credential_provider_id, &point.target_endpoint, &refuse)
+                .check(&binding.credential_provider_id, GrantTarget::TransitPoint(&point.target_endpoint), &refuse)
                 .await?;
         }
     }
@@ -385,17 +396,65 @@ struct GrantRules<'a> {
     storage: GrantStorage,
     resource_origins: &'a std::collections::HashMap<String, Vec<String>>,
     issuers: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    proxies: Option<&'a dyn McpProxyStore>,
+}
+
+/// Where a `consent_mode: external` binding sends its grants: the endpoint of
+/// the Access Point's Target, or of a Transit Point, which alone may be an MCP
+/// Proxy (`proxy://<id>`).
+#[derive(Clone, Copy)]
+enum GrantTarget<'a> {
+    AccessPointTarget(&'a str),
+    TransitPoint(&'a str),
+}
+
+/// A `proxy://` Transit Point with a `consent_mode: external` binding speaks
+/// MCP, and sends its MCP Proxy's backend the grant alone, in a header: no
+/// `target_auth` of its own goes with it or in its place.
+fn check_proxy_transit_point(
+    point: &crate::config::agent_surface::TransitPoint,
+    binding: &crate::config::agent_surface::TransitCredentials,
+) -> Result<(), &'static str> {
+    if !point
+        .target_endpoint
+        .starts_with("proxy://")
+    {
+        return Ok(());
+    }
+    if point.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+        return Err("consent_mode external on a Transit Point whose target is an MCP Proxy needs protocol mcp");
+    }
+    if point.target_auth.is_some() {
+        return Err(
+            "consent_mode external on a Transit Point whose target is an MCP Proxy sends the grant as its only \
+             credential: remove the Transit Point's target_auth",
+        );
+    }
+    if binding
+        .inject_as
+        .to_binding_injection()
+        .header_name()
+        .is_none()
+    {
+        return Err(
+            "consent_mode external on a Transit Point whose target is an MCP Proxy sends the grant in a header: \
+             inject_as bearer_header or custom_header",
+        );
+    }
+    Ok(())
 }
 
 impl GrantRules<'_> {
     /// The vault can keep the binding's grants, and its provider, of the
     /// surface's own tenant and with an issuer, sends them only to
     /// `destination`, the origin of its permitted `resource`, under an issuer
-    /// the operator permits.
+    /// the operator permits; a Transit Point's `proxy://` destination is an MCP
+    /// Proxy of the surface's tenant, served only through surfaces, whose
+    /// `base_url` has that origin.
     async fn check(
         &self,
         provider_id: &str,
-        destination: &str,
+        destination: GrantTarget<'_>,
         refuse: &(dyn Fn(&str) -> SurfaceApiError + Sync),
     ) -> Result<(), SurfaceApiError> {
         if !self.storage.encrypted {
@@ -423,9 +482,22 @@ impl GrantRules<'_> {
         if provider.tenant_id.as_deref() != self.tenant_id {
             return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
         }
-        crate::credential_providers::external::check_grant_destination(&provider, destination, None)
-            .await
-            .map_err(refuse)?;
+        match destination {
+            GrantTarget::AccessPointTarget(endpoint) => {
+                crate::credential_providers::external::check_grant_destination(&provider, endpoint, None).await
+            }
+            GrantTarget::TransitPoint(endpoint) => {
+                crate::credential_providers::external::check_transit_grant_destination(
+                    &provider,
+                    endpoint,
+                    self.proxies,
+                    self.tenant_id,
+                    None,
+                )
+                .await
+            }
+        }
+        .map_err(refuse)?;
         if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins) {
             return Err(refuse(
                 "the credential provider's resource is not permitted for its issuer: on the issuer's host or one of \
@@ -1576,6 +1648,9 @@ fn collect_effective_surface_references(
             }
             if let Some(id) = endpoint_id(&point.target_endpoint, "fabric://") {
                 push_reference(references, ResourceKind::Gateways, id);
+            }
+            if let Some(id) = endpoint_id(&point.target_endpoint, "proxy://") {
+                push_reference(references, ResourceKind::McpProxies, id);
             }
         }
     }
@@ -3733,6 +3808,29 @@ mod tests {
         assert_eq!(endpoint_id("fabric://", "fabric://"), None);
     }
 
+    /// A Transit Point whose target is an MCP Proxy references that proxy, as
+    /// a `proxy://` Target does, so a save checks the surface may use it.
+    #[test]
+    fn a_transit_point_references_the_mcp_proxy_it_targets() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://target-tools"},
+            "transit": {"points": [
+                {"id": "tp-1", "alias": "drive", "target_endpoint": "proxy://drive", "protocol": "mcp"},
+                {"id": "tp-2", "alias": "vendor", "target_endpoint": "https://vendor.example/mcp", "protocol": "mcp"}
+            ]}
+        }))
+        .unwrap();
+        let proxies: HashSet<_> = collect_surface_reference_keys(&surface)
+            .unwrap()
+            .into_iter()
+            .filter(|reference| reference.kind == ResourceKind::McpProxies)
+            .map(|reference| reference.id)
+            .collect();
+        assert_eq!(proxies, HashSet::from(["target-tools".to_string(), "drive".to_string()]));
+    }
+
     #[test]
     fn collects_trust_registries_from_both_legs_and_variants() {
         let mut surface = AgentSurface::default();
@@ -3985,12 +4083,160 @@ mod tests {
         surface: AgentSurface,
         storage: GrantStorage,
     ) -> Result<(), String> {
-        check_external_consent_bindings(Some(providers), &surface, storage, &std::collections::HashMap::new(), None)
-            .await
-            .map_err(|error| match error {
-                SurfaceApiError::BadRequest(message) => message,
-                other => panic!("expected a 400, got {other:?}"),
-            })
+        checked_through(providers, surface, storage, None).await
+    }
+
+    /// The bindings of `surface` checked with the MCP Proxies of `proxies`.
+    async fn checked_through(
+        providers: &std::sync::Arc<dyn CredentialProviderStorage>,
+        surface: AgentSurface,
+        storage: GrantStorage,
+        proxies: Option<&dyn McpProxyStore>,
+    ) -> Result<(), String> {
+        check_external_consent_bindings(
+            Some(providers),
+            &surface,
+            storage,
+            &std::collections::HashMap::new(),
+            None,
+            proxies,
+        )
+        .await
+        .map_err(|error| match error {
+            SurfaceApiError::BadRequest(message) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        })
+    }
+
+    /// `tenant-a`'s MCP Proxies and one of `tenant-b`'s: `drive` sends its
+    /// tool calls to the origin of the vendor's resource, `elsewhere` to
+    /// another origin, and `direct` can be called on its own route.
+    async fn grant_proxies(directory: &tempfile::TempDir) -> crate::mcp_proxies::FileSystemMcpProxyStore {
+        use crate::credential_providers::external::tests::grant_proxy;
+        let store = crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            directory
+                .path()
+                .join("mcp_proxies"),
+        )
+        .await
+        .unwrap();
+        let mut direct = grant_proxy("direct", Some("tenant-a"), "https://203.0.113.30/drive/v3");
+        direct.direct_access = true;
+        for proxy in [
+            grant_proxy("drive", Some("tenant-a"), "https://203.0.113.30/drive/v3"),
+            grant_proxy("elsewhere", Some("tenant-a"), "https://203.0.113.66/drive/v3"),
+            direct,
+            grant_proxy("of-tenant-b", Some("tenant-b"), "https://203.0.113.30/drive/v3"),
+        ] {
+            store
+                .create(&proxy)
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    /// An MCP Transit Point whose target is the MCP Proxy `proxy`.
+    fn proxy_point(
+        proxy: &str,
+        binding: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({"id": "tp-1", "alias": "drive", "target_endpoint": format!("proxy://{proxy}"),
+            "protocol": "mcp", "require_transit_token": true, "transit_credentials": binding})
+    }
+
+    /// A `proxy://` Transit Point binds a grant only to an MCP Proxy of the
+    /// surface's tenant, served only through surfaces, whose `base_url` has the
+    /// origin of the provider's resource; it speaks MCP, sends the grant in a
+    /// header and no `target_auth` of its own. The Access Point's Target is
+    /// never such a proxy.
+    #[tokio::test]
+    async fn a_proxy_transit_point_binds_a_grant_only_to_its_tenants_proxy_of_the_resources_origin() {
+        use crate::credential_providers::external::PROXY_UNAVAILABLE;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let storage = GrantStorage {
+            encrypted: true,
+            stable_ids: true,
+        };
+        let owner = external("external-a", Some("owner"));
+        let check = |point: serde_json::Value| {
+            let surface = surface_with_points(serde_json::json!([point]), serde_json::json!([]), None);
+            checked_through(&providers, surface, storage, Some(&proxies))
+        };
+        for subject in ["owner", "caller"] {
+            assert_eq!(check(proxy_point("drive", external("external-a", Some(subject)))).await, Ok(()), "{subject}");
+        }
+
+        let mut with_target_auth = proxy_point("drive", owner.clone());
+        with_target_auth["target_auth"] =
+            serde_json::json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}});
+        let mut a2a = proxy_point("drive", owner.clone());
+        a2a["protocol"] = serde_json::json!("a2a");
+        let mut in_meta = owner.clone();
+        in_meta["inject_as"] = serde_json::json!({"type": "meta", "field": "token"});
+        for (case, point, expected) in [
+            (
+                "an MCP Proxy of another origin",
+                proxy_point("elsewhere", owner.clone()),
+                "consent_mode external needs an MCP Proxy whose base_url has the origin of the credential provider's \
+                 resource",
+            ),
+            (
+                "an MCP Proxy anyone can call on its own route",
+                proxy_point("direct", owner.clone()),
+                "consent_mode external needs an MCP Proxy served only through surfaces",
+            ),
+            ("another tenant's MCP Proxy", proxy_point("of-tenant-b", owner.clone()), PROXY_UNAVAILABLE),
+            ("a missing MCP Proxy", proxy_point("missing", owner.clone()), PROXY_UNAVAILABLE),
+            (
+                "a target_auth of its own",
+                with_target_auth,
+                "consent_mode external on a Transit Point whose target is an MCP Proxy sends the grant as its only credential",
+            ),
+            (
+                "another protocol",
+                a2a,
+                "consent_mode external on a Transit Point whose target is an MCP Proxy needs protocol mcp",
+            ),
+            (
+                "a grant in _meta",
+                proxy_point("drive", in_meta),
+                "consent_mode external on a Transit Point whose target is an MCP Proxy sends the grant in a header",
+            ),
+        ] {
+            let message = check(point)
+                .await
+                .expect_err(case);
+            assert!(
+                message.starts_with(&format!("transit.points[0].transit_credentials: {expected}")),
+                "{case}: {message}"
+            );
+        }
+        let without_proxies = checked(
+            &providers,
+            surface_with_points(serde_json::json!([proxy_point("drive", owner.clone())]), serde_json::json!([]), None),
+            true,
+        )
+        .await
+        .expect_err("no MCP Proxy store");
+        assert!(without_proxies.ends_with(PROXY_UNAVAILABLE), "{without_proxies}");
+
+        let target = checked_through(
+            &providers,
+            target_surface(serde_json::json!([owner]), serde_json::json!({"target": {"endpoint": "proxy://drive"}})),
+            storage,
+            Some(&proxies),
+        )
+        .await
+        .expect_err("the Access Point's Target");
+        assert!(
+            target.starts_with(
+                "outbound_credentials[0]: consent_mode external needs a target_endpoint that is a public https URL"
+            ),
+            "{target}"
+        );
     }
 
     /// With `external_consent_issuers` set, a binding's provider must name a
@@ -4014,6 +4260,7 @@ mod tests {
                     storage,
                     &std::collections::HashMap::new(),
                     issuers.as_ref(),
+                    None,
                 )
                 .await
             }
@@ -4684,6 +4931,7 @@ mod tests {
             },
             &std::collections::HashMap::new(),
             Some(&std::collections::HashMap::new()),
+            None,
         )
         .await;
         match unlisted {

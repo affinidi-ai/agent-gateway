@@ -1030,7 +1030,7 @@ The Transit Point itself must send the grant only where it belongs:
 
 | Field | Rule |
 | --- | --- |
-| `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
+| `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`, or `proxy://<id>`, an MCP Proxy whose `base_url` has that origin ([Through an MCP Proxy](#through-an-mcp-proxy)). A `fabric://` route is refused: a grant never crosses Fabric |
 | No presentation of the agent | No identity VP (`identity_injection.inject_vp`, or a `managed_identity` of the Transit Point's own) and no enabled `workload_binding`, as on the Access Point Target ([below](#external-consent-on-the-access-point-target)): a presentation of the managed agent would describe the agent to the vendor, which could present it elsewhere. A Transit Point injects no DID of the surface's, so there is no DID mode to refuse. One stored outside the API with a presentation answers `connector_unavailable` and reads no grant |
 | `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. The exception is a variant that lists no Transit Points of its own: it serves the surface's under the same ids, and so releases the same grants, even when it overrides `transit.shared` (transit policy, rate limit, OPA policy, source auth) or the Access Point. Only a surface editor can set this up, and could weaken the surface itself just as well, so it is allowed: a save answers with a `Warning` header for each Transit Point with `consent_mode: external` that an enabled variant, with transit on, keeps this way. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
 
@@ -1100,7 +1100,7 @@ the request's id, with the reason in its `data`; on any other (`http`, A2A) it i
 | --- | --- | --- | --- |
 | `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
 | `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
-| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource`, the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
 
 A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
 identity hash. A binding that some other path reached with a provider that has an `issuer`, the
@@ -1159,6 +1159,54 @@ addresses, redirects returned rather than followed, and no proxy. It is never fo
 Fabric. A `fabric://` Transit Point withholds delegated credentials unless
 `fabric_delegated_credentials` is set, and with it set the grant is refused, so a grant never
 reaches a stored surface that predates these rules.
+
+#### Through an MCP Proxy
+
+A vendor with a REST API and no MCP server of its own, such as Google Drive, is reached through
+one of the gateway's MCP Proxies: an OpenAPI spec served as MCP tools whose calls go to the
+proxy's `base_url`. A Transit Point whose `target_endpoint` is `proxy://<id>` is answered by
+that MCP Proxy ([`src/proxy/outbound_handler.rs`](../src/proxy/outbound_handler.rs),
+`step_forward_request_mcp_proxy`): `initialize` and `tools/list` come from its spec, a
+notification is accepted (`202`) with nothing sent, a `tools/call` calls the proxy's backend,
+any method but `POST` answers `405`, and a `2026-07-28` request is refused with `-32022`. The
+surface must be able to reference the proxy, as it must a `proxy://` Target: one of its own
+tenant, or an appliance-wide one for a tenant's surface. A surface save refuses a Transit Point
+that names any other, and a call to a missing proxy, one the surface may not reference, or
+through a Transit Point whose `protocol` is not `mcp` answers `503` (`This Transit Point is
+unavailable`), with the reason in the log. The surface's own timeout, retry, circuit
+breaker and mirroring belong to its Access Point's Target and do not apply: the Transit Point's
+`networking.timeout` bounds the call, and its `mcp_http` the backend's request and answer.
+
+A `proxy://` Transit Point sends its MCP Proxy's backend no credential of its own: one with a
+`target_auth`, or a delegated credential of a binding other than `consent_mode: external`, is
+refused when it is called (`503`). It may carry a `consent_mode: external` binding, whose grant
+goes to the backend under the same rules as an `https` target's:
+
+| Field | Rule |
+| --- | --- |
+| `protocol` | `mcp` |
+| The MCP Proxy | Of the surface's own tenant, exactly, and served only through surfaces (`direct_access: false`), so its backend is reached with the grant only through the Transit Point that holds it. A proxy anyone can call on its own route is refused |
+| Its `base_url` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource` |
+| `inject_as` | A header: `bearer_header` (the default) or `custom_header`. The grant is the call's only credential |
+| `target_auth` | None |
+
+They are checked when the surface is saved (`400`), when a connect starts (`409`,
+`binding_not_servable`), and on every call: when the grant is released, and again with the proxy
+record the call is sent through. So a proxy edited afterwards to point elsewhere, another
+`base_url` or `direct_access` turned on, is never sent the grant: the call answers
+`connector_unavailable`. Only a tool call carries the grant, and only to that origin, never
+outside the proxy's base path, through pinned Strict egress (`https` only, internal addresses
+refused, the connection pinned to the vetted addresses, redirects refused, no proxy), as a grant
+goes to an `https` target; `initialize`, `tools/list` and notifications reach no backend.
+
+The backend's answer to a tool call is the tool's result, a `403` for anything but scope
+included, except an answer that refuses the grant, which is handled as an `https` vendor's
+([above](#external-consent-on-a-transit-point)): a `401` whose `Bearer` challenge rejects the
+token gets one refresh and one retry through the proxy, a second `401`, or one without such a
+challenge, answers `connector_unavailable`, and a `403` whose challenge says
+`insufficient_scope` answers `scope_insufficient`. The backend's body is not passed on in these
+cases. The Access Point's Target is never an MCP Proxy with a grant: a `proxy://` Target's
+binding is refused ([below](#external-consent-on-the-access-point-target)).
 
 ### External consent on the Access Point Target
 
@@ -1345,7 +1393,9 @@ accessible", and refuses it everywhere in `enforce` mode. The startup credential
 names such a surface. A provider holding only its own tenant's secrets attaches freely.
 
 A2A Proxies hold their own secret. An MCP Proxy holds no credential of its own: its upstream
-authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
+authentication is the surface's Target authentication, checked above, or behind a `proxy://`
+Transit Point the grant of its `consent_mode: external` binding ([Through an MCP
+Proxy](#through-an-mcp-proxy)). An A2A Proxy holds its
 Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
 another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
 accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with

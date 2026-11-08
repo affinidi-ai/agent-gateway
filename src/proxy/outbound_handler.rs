@@ -5554,6 +5554,21 @@ fn refuse_external_grant(
     refuse_grant(ctx, crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable, reason)
 }
 
+/// The refusal of a `2026-07-28` MCP request on a Transit Point that reaches
+/// its target over a session revision only, naming the revision it serves.
+fn modern_mcp_unsupported(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    OutboundPipelineError::McpValidation(Box::new(crate::mcp::request_validation::McpRequestValidationError {
+        status: StatusCode::BAD_REQUEST,
+        id: mcp_refusal_id(ctx),
+        code: crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+        message: "Unsupported protocol version".into(),
+        data: Some(serde_json::json!({
+            "requested": crate::mcp::MCP_MODERN_VERSION,
+            "supported": [crate::mcp::MCP_LEGACY_VERSION],
+        })),
+    }))
+}
+
 /// The grant by binding a request carries, with what releasing it again
 /// needs.
 pub struct ReleasedGrant {
@@ -5574,7 +5589,11 @@ pub struct ReleasedGrant {
 /// first. Like every delegated credential, the grant is released only for a
 /// request whose caller is identified, whichever account it is. A
 /// `2026-07-28` MCP request is refused: such a binding's vendor is reached
-/// over a session revision.
+/// over a session revision. The grant goes only to the origin of its
+/// provider's `resource`: the Transit Point's `https` target, or for
+/// `proxy://<id>` the `base_url` of that MCP Proxy of the surface's tenant,
+/// served only through surfaces
+/// ([`crate::credential_providers::external::check_transit_grant_destination`]).
 async fn step_inject_external_grant(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -5593,18 +5612,7 @@ async fn step_inject_external_grant(
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             "A 2026-07-28 MCP request was sent to a Transit Point with external consent - refusing the request"
         );
-        return Err(OutboundPipelineError::McpValidation(Box::new(
-            crate::mcp::request_validation::McpRequestValidationError {
-                status: StatusCode::BAD_REQUEST,
-                id: mcp_refusal_id(ctx),
-                code: crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
-                message: "Unsupported protocol version".into(),
-                data: Some(serde_json::json!({
-                    "requested": crate::mcp::MCP_MODERN_VERSION,
-                    "supported": [crate::mcp::MCP_LEGACY_VERSION],
-                })),
-            },
-        )));
+        return Err(modern_mcp_unsupported(ctx));
     }
     let (Some(vault), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
         return Err(refuse_external_grant(ctx, "stores_unavailable"));
@@ -5659,10 +5667,17 @@ async fn step_inject_external_grant(
     if provider.tenant_id != ctx.surface.tenant_id {
         return Err(refuse_external_grant(ctx, "provider_of_another_tenant"));
     }
-    let Ok(destination) = crate::credential_providers::external::check_grant_destination(
+    let Ok(destination) = crate::credential_providers::external::check_transit_grant_destination(
         &provider,
         &ctx.virtual_channel
             .target_endpoint,
+        state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
+        ctx.surface
+            .tenant_id
+            .as_deref(),
         state
             .egress_allowlist
             .as_deref(),
@@ -5904,10 +5919,12 @@ enum UpstreamResponse {
 
 /// [12] Forward Request — sends the outbound request to the external agent.
 ///
-/// Two transports are supported, selected by the transit point's
+/// Three transports are supported, selected by the transit point's
 /// `target_endpoint`:
 /// * `fabric://{gateway_id}/{channel_id}` — gateway-to-gateway forwarding over
 ///   DIDComm (the prepared request is shipped to a remote gateway channel).
+/// * `proxy://{mcp_proxy_id}`: the gateway's own MCP Proxy answers
+///   ([`step_forward_request_mcp_proxy`]).
 /// * anything else — a direct HTTP(S) request via the shared `reqwest` client.
 async fn step_forward_request(
     state: &OutboundProxyState,
@@ -5927,8 +5944,252 @@ async fn step_forward_request(
         return step_forward_request_fabric(state, ctx).await;
     }
 
-    let response = step_forward_request_http(state, ctx).await?;
+    let response = forward_once(state, ctx).await?;
     Ok(UpstreamResponse::Http(response))
+}
+
+/// Send the request once to a Transit Point's `proxy://` MCP Proxy or its
+/// HTTP(S) target.
+async fn forward_once(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<reqwest::Response, OutboundPipelineError> {
+    match ctx
+        .virtual_channel
+        .target_endpoint
+        .strip_prefix("proxy://")
+    {
+        Some(proxy_id) => {
+            let proxy_id = proxy_id.to_string();
+            step_forward_request_mcp_proxy(state, ctx, &proxy_id).await
+        }
+        None => step_forward_request_http(state, ctx).await,
+    }
+}
+
+/// An answer the gateway makes itself, in the shape of an upstream's.
+fn own_answer(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    let mut response = axum::http::Response::new(reqwest::Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    reqwest::Response::from(response)
+}
+
+/// Refuse a request to a `proxy://` Transit Point, logging why: the reason
+/// names a setting, never a value of it.
+fn refuse_mcp_proxy_transit(
+    ctx: &OutboundPipelineContext,
+    reason: &'static str,
+) -> OutboundPipelineError {
+    warn!(
+        request_id = %ctx.request_id,
+        alias = %ctx.virtual_channel.alias,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        reason,
+        "A Transit Point whose target is an MCP Proxy cannot serve the request - refusing it"
+    );
+    OutboundPipelineError::TransitPointUnavailable {
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// The grant a request to a `proxy://` Transit Point carries to `proxy`'s
+/// backend, if it carries one. The grant is the request's only credential: a
+/// `proxy://` Transit Point sends its MCP Proxy no `target_auth` and no
+/// delegated credential of any other binding. The proxy is checked again,
+/// as the call sends it: of the surface's tenant, served only through
+/// surfaces, with a `base_url` of the grant's origin; and the grant goes in a
+/// header.
+fn proxy_grant(
+    state: &OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+    proxy: &crate::mcp_proxies::types::McpProxy,
+) -> Result<Option<crate::mcp_proxies::handlers::ProxyGrant>, OutboundPipelineError> {
+    if ctx
+        .virtual_channel
+        .target_auth
+        .is_some()
+    {
+        return Err(refuse_mcp_proxy_transit(ctx, "target_auth_on_a_proxy_transit_point"));
+    }
+    let Some(destination) = ctx.grant_destination.clone() else {
+        if !ctx
+            .delegated_credential_headers
+            .is_empty()
+            || ctx
+                .modern_delegation
+                .is_some()
+        {
+            return Err(refuse_mcp_proxy_transit(ctx, "delegated_credentials_on_a_proxy_transit_point"));
+        }
+        return Ok(None);
+    };
+    if crate::credential_providers::external::proxy_may_carry_grants(
+        proxy,
+        ctx.surface
+            .tenant_id
+            .as_deref(),
+    )
+    .is_err()
+        || !url::Url::parse(&proxy.base_url).is_ok_and(|base_url| base_url.origin() == destination)
+    {
+        return Err(refuse_external_grant(ctx, "mcp_proxy_not_the_grants_destination"));
+    }
+    let mut headers = ctx
+        .delegated_credential_headers
+        .iter();
+    let (Some((name, value)), None) = (headers.next(), headers.next()) else {
+        return Err(refuse_external_grant(ctx, "grant_not_in_one_header"));
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(refuse_external_grant(ctx, "grant_not_in_one_header"));
+    };
+    Ok(Some(crate::mcp_proxies::handlers::ProxyGrant {
+        header: (name.to_string(), value.to_string()),
+        destination,
+        exact_allowlist: state.egress_allowlist.clone(),
+    }))
+}
+
+/// [12] A Transit Point whose target is `proxy://<id>`: the gateway's MCP
+/// Proxy of that id, one the surface may reference (its own tenant's, or an
+/// appliance-wide one for a tenant's surface; a grant needs its own tenant's),
+/// answers a session revision MCP request itself, and calls its REST backend
+/// for a tool. `initialize` and `tools/list` come from the proxy's spec; a
+/// notification is accepted with nothing sent; any method but `POST` is not
+/// allowed, and a `2026-07-28` request is refused. A grant by binding goes to
+/// the backend in its header
+/// ([`proxy_grant`]), and a backend answer that refuses it is answered with
+/// its status and challenges only, so [`step_answer_a_refused_grant`] treats
+/// it as an `https` vendor's. The answer is shaped as an upstream's, so the
+/// response steps that follow see it alike.
+async fn step_forward_request_mcp_proxy(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    proxy_id: &str,
+) -> Result<reqwest::Response, OutboundPipelineError> {
+    use crate::mcp_proxies::McpProxyStore;
+    use crate::mcp_proxies::handlers::{McpProxyCallError, TransitProxyAnswer};
+
+    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+        return Err(refuse_mcp_proxy_transit(ctx, "proxy_transit_point_without_protocol_mcp"));
+    }
+    if ctx.original_method != Method::POST {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ALLOW, axum::http::HeaderValue::from_static("POST"));
+        return Ok(own_answer(StatusCode::METHOD_NOT_ALLOWED, headers, Vec::new()));
+    }
+    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(_)) = ctx
+        .mcp_classification
+        .as_ref()
+    {
+        return Err(modern_mcp_unsupported(ctx));
+    }
+    let proxy = match state.mcp_proxy_store.as_ref() {
+        Some(store) => store
+            .get(proxy_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    }
+    .filter(|proxy| {
+        crate::tenancy::can_reference(
+            ctx.surface
+                .tenant_id
+                .as_deref(),
+            proxy.tenant_id.as_deref(),
+        )
+    })
+    .ok_or_else(|| refuse_mcp_proxy_transit(ctx, "mcp_proxy_unavailable"))?;
+    let grant = proxy_grant(state, ctx, &proxy)?;
+    let request = ctx
+        .body_bytes
+        .as_deref()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .filter(serde_json::Value::is_object);
+    let Some(request) = request else {
+        let refusal = serde_json::json!({"jsonrpc": "2.0", "id": null,
+            "error": {"code": crate::mcp::errors::error_codes::INVALID_REQUEST, "message": "Invalid Request"}});
+        return Ok(own_answer(
+            StatusCode::BAD_REQUEST,
+            json_headers(),
+            refusal
+                .to_string()
+                .into_bytes(),
+        ));
+    };
+    if request.get("id").is_none() {
+        return Ok(own_answer(StatusCode::ACCEPTED, HeaderMap::new(), Vec::new()));
+    }
+    let id = request.get("id").cloned();
+    let limits = ctx
+        .virtual_channel
+        .mcp_http
+        .clone()
+        .unwrap_or_default();
+    let config_id = ctx
+        .surface
+        .config_id()
+        .unwrap_or("unknown")
+        .to_string();
+    debug!(
+        request_id = %ctx.request_id,
+        alias = %ctx.virtual_channel.alias,
+        proxy_id = %proxy.id,
+        "Outbound: answering through the Transit Point's MCP Proxy"
+    );
+    let answer = tokio::time::timeout(
+        resolve_outbound_timeout(ctx),
+        crate::mcp_proxies::handlers::serve_through_transit_point(&proxy, request, grant, &limits, &config_id),
+    )
+    .await
+    .map_err(|_| OutboundPipelineError::UpstreamTimeout)?;
+    match answer {
+        Ok(TransitProxyAnswer::Response(response)) => Ok(own_answer(
+            StatusCode::OK,
+            json_headers(),
+            response
+                .to_string()
+                .into_bytes(),
+        )),
+        Ok(TransitProxyAnswer::GrantRefused { status, challenges }) => {
+            let mut headers = HeaderMap::new();
+            for challenge in challenges {
+                headers.append(axum::http::header::WWW_AUTHENTICATE, challenge);
+            }
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
+            Ok(own_answer(status, headers, Vec::new()))
+        }
+        Err(McpProxyCallError::OutsideTargetBase) => {
+            Err(refuse_external_grant(ctx, "tool_call_outside_the_mcp_proxy_base_path"))
+        }
+        Err(McpProxyCallError::Failed(message)) => {
+            warn!(
+                request_id = %ctx.request_id,
+                alias = %ctx.virtual_channel.alias,
+                proxy_id = %proxy.id,
+                error = ?message,
+                "The Transit Point's MCP Proxy answered with an error"
+            );
+            let error = serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                "message": format!("MCP proxy error: {message}"),
+            }});
+            Ok(own_answer(StatusCode::OK, json_headers(), error.to_string().into_bytes()))
+        }
+    }
+}
+
+/// The headers of a JSON answer the gateway makes itself.
+fn json_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+    headers
 }
 
 /// The client a request carrying a grant by binding is sent with: to the
@@ -6628,7 +6889,10 @@ fn refuse_a_compressed_mcp_answer(
 /// the scope: a wider scope is never asked for silently. Any other answer, and
 /// any answer to a call that carries no such grant, passes through. The
 /// Access Point's Target decides alike
-/// ([`crate::delegation_vault::release::vendor_answer`]).
+/// ([`crate::delegation_vault::release::vendor_answer`]), and so does a
+/// `proxy://` Transit Point on its MCP Proxy's backend's answer to a tool call
+/// ([`step_forward_request_mcp_proxy`]), whose retry goes through the proxy
+/// again.
 async fn step_answer_a_refused_grant(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -6691,7 +6955,7 @@ async fn step_answer_a_refused_grant(
     apply_grant_injections(ctx, &injections)?;
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
     audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
-    let retried = step_forward_request_http(state, ctx).await?;
+    let retried = forward_once(state, ctx).await?;
     if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
         drop(retried);
         return Err(refuse_grant(ctx, refused.refusal, refused.reason));
@@ -7706,6 +7970,7 @@ mod tests {
             transit_token_issuer: None,
             delegation_vault_store: None,
             credential_provider_store: None,
+            mcp_proxy_store: None,
             consent_identity_strategies: None,
             source_auth_middleware: None,
             mcp_continuations: None,
@@ -18185,6 +18450,421 @@ mod tests {
         .unwrap();
         assert_eq!(body["reason"], "connector_unavailable");
         assert_eq!(body["status"], 503);
+    }
+
+    /// The OpenAPI spec of the fixture MCP Proxy: one tool, `search_files`, a
+    /// `GET` of `/files`.
+    const DRIVE_SPEC: &str = r#"{"openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+        "paths": {"/files": {"get": {"operationId": "search_files", "summary": "Search files",
+            "parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}],
+            "responses": {"200": {"description": "Files"}}}}}}"#;
+
+    /// `state` with the MCP Proxy `drive` of `tenant`, served only through
+    /// surfaces, whose tool calls go to `base_url`.
+    async fn with_drive_proxy(
+        mut state: OutboundProxyState,
+        directory: &std::path::Path,
+        tenant: Option<&str>,
+        base_url: &str,
+    ) -> OutboundProxyState {
+        use crate::mcp_proxies::McpProxyStore;
+        let store = crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.join("mcp_proxies"))
+            .await
+            .unwrap();
+        let mut proxy = crate::credential_providers::external::tests::grant_proxy("drive", tenant, base_url);
+        proxy.openapi_spec = DRIVE_SPEC.into();
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        state.mcp_proxy_store = Some(Arc::new(store));
+        state
+    }
+
+    /// Change the stored MCP Proxy `drive`.
+    async fn edit_drive_proxy(
+        state: &OutboundProxyState,
+        edit: impl FnOnce(&mut crate::mcp_proxies::types::McpProxy),
+    ) {
+        use crate::mcp_proxies::McpProxyStore;
+        let store = state
+            .mcp_proxy_store
+            .as_ref()
+            .unwrap();
+        let mut proxy = store
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        edit(&mut proxy);
+        store
+            .update(&proxy)
+            .await
+            .unwrap();
+    }
+
+    /// An MCP Transit Point whose target is the MCP Proxy `drive`, and whose
+    /// binding asks for external consent of the fixture vendor for `subject`,
+    /// or that has no binding.
+    fn drive_surface(subject: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", subject.unwrap_or("owner"));
+        point["target_endpoint"] = json!("proxy://drive");
+        point["protocol"] = json!("mcp");
+        if subject.is_none() {
+            point
+                .as_object_mut()
+                .unwrap()
+                .remove("transit_credentials");
+        }
+        transit_surface(json!([point]), json!([]))
+    }
+
+    /// A call of `body` on the `drive` Transit Point of `surface`.
+    fn drive_call(
+        surface: &crate::config::agent_surface::AgentSurface,
+        body: serde_json::Value,
+    ) -> OutboundPipelineContext {
+        let mut ctx = external_grant_context(surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        ctx.body_bytes = Some(Bytes::from(body.to_string()));
+        ctx
+    }
+
+    fn search_files(id: u64) -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "search_files", "arguments": {"q": "budget"}}})
+    }
+
+    /// Release, forward and answer a refused grant, as the pipeline does, and
+    /// read the answer.
+    async fn answered(
+        state: &OutboundProxyState,
+        ctx: &mut OutboundPipelineContext,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value), OutboundPipelineError> {
+        step_inject_credentials(state, ctx).await?;
+        let upstream = step_forward_request(state, ctx).await?;
+        let upstream = step_answer_a_refused_grant(state, ctx, upstream).await?;
+        let UpstreamResponse::Http(response) = upstream else {
+            panic!("an MCP Proxy answers in the shape of an HTTP upstream");
+        };
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .unwrap();
+        Ok((status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)))
+    }
+
+    /// A Transit Point whose target is an MCP Proxy answers `initialize`,
+    /// `tools/list` and notifications itself, and sends its grant, in its
+    /// header, only with a tool call, to the proxy's backend. Neither the token
+    /// nor the backend's answer reaches a log line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_transit_point_sends_its_grant_only_with_a_tool_call_to_its_mcp_proxys_backend() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor =
+            RecordingServer::start_answering(vec![Answer::json(200, json!({"files": [{"name": "budget-sheet-7"}]}))])
+                .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_drive_proxy(
+            fixture_grant_state(directory.path(), &authorization_server, &vendor).await,
+            directory.path(),
+            None,
+            &format!("{}/drive/v3", vendor.origin()),
+        )
+        .await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key, "proxied-token-7f3a", 3600).await;
+        let surface = drive_surface(Some("owner"));
+        let logs = FormattedLogs::capture();
+
+        let (status, initialized) = answered(
+            &state,
+            &mut drive_call(&surface, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
+        )
+        .await
+        .unwrap();
+        assert_eq!((status, initialized["id"].clone()), (reqwest::StatusCode::OK, json!(1)));
+        assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+        let (_, listed) =
+            answered(&state, &mut drive_call(&surface, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})))
+                .await
+                .unwrap();
+        assert_eq!(listed["result"]["tools"][0]["name"], "search_files");
+        let (status, _) = answered(
+            &state,
+            &mut drive_call(&surface, json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+        let mut read = drive_call(&surface, json!({}));
+        read.original_method = Method::GET;
+        let (status, _) = answered(&state, &mut read)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        assert!(vendor.requests().is_empty(), "only a tool call reaches the backend");
+
+        let (status, called) = answered(&state, &mut drive_call(&surface, search_files(7)))
+            .await
+            .unwrap();
+        assert_eq!((status, called["id"].clone()), (reqwest::StatusCode::OK, json!(7)));
+        assert_eq!(called["result"]["isError"], false);
+        assert!(
+            called
+                .to_string()
+                .contains("budget-sheet-7"),
+            "{called}"
+        );
+        let requests = vendor.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .0
+                .starts_with("GET /drive/v3/files?q=budget "),
+            "{:?}",
+            requests[0].0
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer proxied-token-7f3a"]);
+        let text = logs.text();
+        assert!(!text.contains("proxied-token-7f3a"), "{text}");
+        assert!(!text.contains("budget-sheet-7"), "{text}");
+    }
+
+    /// The backend's `401` that rejects the grant, through the MCP Proxy, gets
+    /// one refresh and one retry through the proxy, as an `https` vendor's
+    /// does; a second `401` refuses the call with a fixed reason, and the
+    /// backend's words never reach the agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_transit_points_backend_401_refreshes_the_grant_and_retries_once() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = |answer: Answer| answer.with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        let rejected = || challenge(Answer::json(401, json!({"error": "vendor-words-401"})));
+        let authorization_server = RecordingServer::start_answering(vec![
+            refresh_answer("second"),
+            refresh_answer("third"),
+            Answer::status(200),
+        ])
+        .await;
+        let vendor = RecordingServer::start_answering(vec![rejected(), Answer::json(200, json!({"files": []}))]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_drive_proxy(
+            fixture_grant_state(directory.path(), &authorization_server, &vendor).await,
+            directory.path(),
+            None,
+            &format!("{}/drive/v3", vendor.origin()),
+        )
+        .await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = drive_surface(Some("owner"));
+        let (status, called) = answered(&state, &mut drive_call(&surface, search_files(1)))
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(called["result"]["isError"], false);
+        assert_eq!(vendor_bearers(&vendor), ["Bearer first", "Bearer second"]);
+
+        let rejecting = RecordingServer::start_answering(vec![rejected()]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_drive_proxy(
+            fixture_grant_state(directory.path(), &authorization_server, &rejecting).await,
+            directory.path(),
+            None,
+            &format!("{}/drive/v3", rejecting.origin()),
+        )
+        .await;
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let refused = answered(&state, &mut drive_call(&surface, search_files(2)))
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable));
+        assert_eq!(vendor_bearers(&rejecting), ["Bearer first", "Bearer third"]);
+        let body = axum::body::to_bytes(
+            refused
+                .into_response()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("connector_unavailable"), "{body}");
+        assert!(!body.contains("vendor-words-401"), "{body}");
+    }
+
+    /// A grant goes through an MCP Proxy only while the proxy, of the surface's
+    /// tenant and served only through surfaces, sends its tool calls to the
+    /// origin of the grant's resource, checked when the grant is released and
+    /// again with the proxy the call is sent through; and only as the Transit
+    /// Point's one credential. Otherwise nothing reaches either server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_that_would_send_the_grant_elsewhere_is_never_sent_it() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::json(200, json!({"files": []}))]).await;
+        let elsewhere = RecordingServer::start_answering(vec![Answer::json(200, json!({"files": []}))]).await;
+        let resource_base = format!("{}/drive/v3", vendor.origin());
+        let elsewhere_base = format!("{}/drive/v3", elsewhere.origin());
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        let fresh_state = |tenant: Option<&'static str>| {
+            let (authorization_server, vendor, elsewhere, resource_base, key) =
+                (&authorization_server, &vendor, &elsewhere, resource_base.clone(), key.clone());
+            async move {
+                let directory = tempfile::tempdir().unwrap();
+                let mut state = with_drive_proxy(
+                    fixture_grant_state(directory.path(), authorization_server, vendor).await,
+                    directory.path(),
+                    tenant,
+                    &resource_base,
+                )
+                .await;
+                state.egress_allowlist =
+                    Some(format!("{},{},{}", authorization_server.origin(), vendor.origin(), elsewhere.origin()));
+                store_grant(&state, key, "never-sent", 3600).await;
+                (directory, state)
+            }
+        };
+        let surface = drive_surface(Some("owner"));
+
+        let (_directory, state) = fresh_state(None).await;
+        edit_drive_proxy(&state, |proxy| proxy.base_url = elsewhere_base.clone()).await;
+        let refused = answered(&state, &mut drive_call(&surface, search_files(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "another origin at release");
+
+        let (_directory, state) = fresh_state(None).await;
+        let mut ctx = drive_call(&surface, search_files(2));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("the proxy sends to the resource when the grant is released");
+        edit_drive_proxy(&state, |proxy| proxy.base_url = elsewhere_base.clone()).await;
+        let refused = step_forward_request(&state, &mut ctx)
+            .await
+            .err()
+            .expect("the proxy was edited before the call was sent");
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "edited after release");
+
+        let (_directory, state) = fresh_state(None).await;
+        edit_drive_proxy(&state, |proxy| proxy.direct_access = true).await;
+        let refused = answered(&state, &mut drive_call(&surface, search_files(3)))
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "direct callers");
+
+        let (_directory, state) = fresh_state(Some("tenant-b")).await;
+        let refused = answered(&state, &mut drive_call(&surface, search_files(4)))
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "another tenant's proxy");
+
+        let (_directory, state) = fresh_state(None).await;
+        let mut with_target_auth = drive_surface(Some("owner"));
+        with_target_auth
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .target_auth = Some(
+            serde_json::from_value(
+                json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}}),
+            )
+            .unwrap(),
+        );
+        let refused = answered(&state, &mut drive_call(&with_target_auth, search_files(5)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, OutboundPipelineError::TransitPointUnavailable { .. }),
+            "a target_auth of its own: {refused:?}"
+        );
+
+        assert!(vendor.requests().is_empty(), "{:?}", vendor.requests());
+        assert!(
+            elsewhere
+                .requests()
+                .is_empty(),
+            "{:?}",
+            elsewhere.requests()
+        );
+    }
+
+    /// A Transit Point whose target is an MCP Proxy and that has no grant sends
+    /// its backend no credential, and takes no other: a `target_auth` of its
+    /// own is refused, as is a proxy the surface may not reference (another
+    /// tenant's, or a tenant's on an appliance-wide surface) and a
+    /// `2026-07-28` request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_transit_point_without_a_grant_sends_its_backend_no_credential() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let backend = RecordingServer::start_answering(vec![Answer::json(200, json!({"files": []}))]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_drive_proxy(
+            test_outbound_state(),
+            directory.path(),
+            Some("tenant-a"),
+            &format!("{}/drive/v3", backend.origin()),
+        )
+        .await;
+        let mut surface = drive_surface(None);
+        surface.tenant_id = Some("tenant-a".into());
+        let (status, called) = answered(&state, &mut drive_call(&surface, search_files(1)))
+            .await
+            .unwrap();
+        assert_eq!((status, called["result"]["isError"].clone()), (reqwest::StatusCode::OK, json!(false)));
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .0
+                .contains("authorization:"),
+            "{:?}",
+            requests[0].0
+        );
+
+        let mut with_target_auth = surface.clone();
+        with_target_auth
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .target_auth = Some(
+            serde_json::from_value(
+                json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}}),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            answered(&state, &mut drive_call(&with_target_auth, search_files(2))).await,
+            Err(OutboundPipelineError::TransitPointUnavailable { .. })
+        ));
+        for tenant in [Some("tenant-b"), None] {
+            let mut other = surface.clone();
+            other.tenant_id = tenant.map(str::to_string);
+            assert!(
+                matches!(
+                    answered(&state, &mut drive_call(&other, search_files(3))).await,
+                    Err(OutboundPipelineError::TransitPointUnavailable { .. })
+                ),
+                "{tenant:?}"
+            );
+        }
+        let mut modern = drive_call(&surface, search_files(4));
+        modern.mcp_classification = modern_pipeline_context("tools/call").mcp_classification;
+        assert!(matches!(
+            answered(&state, &mut modern).await,
+            Err(OutboundPipelineError::McpValidation(error))
+                if error.code == crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION
+        ));
+        assert_eq!(backend.requests().len(), 1, "nothing else reaches the backend");
     }
 
     /// A refresh that would widen the grant's scopes is not kept: the grant is

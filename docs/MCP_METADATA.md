@@ -566,6 +566,14 @@ gates and credential preparation, with surface timeout/circuit-breaker
 controls and the common modern final-response pipeline. Standalone inbound
 headers are used for mirror validation, not as REST Target credentials.
 
+A Transit Point whose `target_endpoint` is `proxy://<id>` is answered by that
+MCP Proxy over session revisions only: `initialize` (`2024-11-05`),
+`tools/list` and `tools/call` after the Transit Point's own gates, a
+notification accepted with `202`, any method but `POST` answered `405`, and a
+`2026-07-28` request refused with `-32022` naming `2024-11-05`. Its backend gets
+no credential but a `consent_mode: external` grant; see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy).
+
 The OpenAPI library rebuilds parameter schemas and can drop extension
 annotations. Modern catalog construction restores request-body and
 path/operation parameter schemas from the stored OpenAPI source, matching

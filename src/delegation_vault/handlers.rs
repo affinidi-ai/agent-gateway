@@ -56,6 +56,9 @@ pub struct DelegationVaultState {
     pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
     /// gateway.json's `external_consent_issuers`.
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// The MCP Proxies a `proxy://` Transit Point's binding sends its grants
+    /// through.
+    pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
 }
 
 /// GET /api/v1/delegation-vault

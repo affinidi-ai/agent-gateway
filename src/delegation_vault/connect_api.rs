@@ -351,16 +351,30 @@ pub async fn start_connect(
         Ok(provider) => provider,
         Err((status, code)) => return error(status, code, "The binding's provider cannot be connected"),
     };
-    if crate::credential_providers::external::check_grant_destination(
-        &provider,
-        &binding.target_endpoint,
-        state
-            .egress_allowlist
-            .as_deref(),
-    )
-    .await
-    .is_err()
-    {
+    let exact_allowlist = state
+        .egress_allowlist
+        .as_deref();
+    let destination = if binding.hop == crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP {
+        crate::credential_providers::external::check_grant_destination(
+            &provider,
+            &binding.target_endpoint,
+            exact_allowlist,
+        )
+        .await
+    } else {
+        crate::credential_providers::external::check_transit_grant_destination(
+            &provider,
+            &binding.target_endpoint,
+            state
+                .mcp_proxy_store
+                .as_deref()
+                .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
+            tenant_id,
+            exact_allowlist,
+        )
+        .await
+    };
+    if destination.is_err() {
         return error(
             StatusCode::CONFLICT,
             "binding_not_servable",
@@ -1354,6 +1368,7 @@ mod tests {
                 egress_allowlist: Some(format!("{issuer},{vendor_origin}")),
                 resource_origins: Default::default(),
                 issuers: Default::default(),
+                mcp_proxy_store: None,
             };
             Self {
                 _directory: directory,
@@ -1556,6 +1571,73 @@ mod tests {
                 .contains("access-1"),
             "no token is listed"
         );
+    }
+
+    /// A Transit Point whose target is an MCP Proxy starts a connect only while
+    /// that proxy, of the surface's tenant and served only through surfaces,
+    /// sends its tool calls to the origin of the provider's resource: a proxy
+    /// edited to point elsewhere, or opened to direct callers, is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_transit_point_connects_only_while_its_mcp_proxy_sends_to_the_resource() {
+        use crate::credential_providers::external::tests::grant_proxy;
+        use crate::mcp_proxies::McpProxyStore;
+        let mut fixture = Fixture::new(vec![token_answer("proxy-access")]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let servable = grant_proxy("drive", Some("tenant-a"), &format!("{}/drive/v3", fixture.vendor_origin));
+        proxies
+            .create(&servable)
+            .await
+            .unwrap();
+        fixture.state.mcp_proxy_store = Some(proxies.clone());
+        fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap()
+            .save(
+                &serde_json::from_value(json!({
+                    "surface_id": "drive-agent", "name": "drive-agent", "tenant_id": "tenant-a",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/drive", "protocol": "mcp"},
+                    "target": {"endpoint": "https://managed.example/agent"},
+                    "transit": {"points": [{"id": "drive-hop", "alias": "drive", "target_endpoint": "proxy://drive",
+                        "protocol": "mcp", "require_transit_token": true,
+                        "transit_credentials": {"credential_provider_id": "vendor", "consent_mode": "external",
+                            "subject": "owner", "scopes": ["read"]}}]}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let start = json!({"surface_id": "drive-agent", "hop": "drive-hop", "credential_provider_id": "vendor",
+            "subject": "owner", "redirect_uri": CALLBACK});
+        let (status, started) = fixture
+            .start(Some("tenant-a"), start.clone())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+
+        let mut elsewhere = servable.clone();
+        elsewhere.base_url = "http://127.0.0.1:10/drive/v3".into();
+        let mut direct = servable.clone();
+        direct.direct_access = true;
+        for (case, proxy) in [("another origin", elsewhere), ("direct callers", direct)] {
+            proxies
+                .update(&proxy)
+                .await
+                .unwrap();
+            let (status, refused) = fixture
+                .start(Some("tenant-a"), start.clone())
+                .await;
+            assert_eq!(
+                (status, refused["code"].clone()),
+                (StatusCode::CONFLICT, json!("binding_not_servable")),
+                "{case}"
+            );
+        }
     }
 
     /// The Access Point Target's binding is connected under the hop `target`:

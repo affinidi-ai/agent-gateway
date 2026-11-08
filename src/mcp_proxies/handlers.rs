@@ -2946,46 +2946,14 @@ pub async fn execute_mcp_request(
             Ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": proxy.name.clone(),
-                        "version": "1.0.0"
-                    }
-                }
+                "result": initialize_result(proxy)
             }))
         }
-        McpCall::ToolsList => {
-            let tool_names = server.get_tool_names();
-            info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
-
-            let mut tools = Vec::new();
-            for tool_name in tool_names {
-                if let Some(metadata) = server.get_tool_metadata(&tool_name) {
-                    let input_schema = if proxy.flatten_post_params {
-                        flatten_input_schema(&metadata.parameters)
-                    } else {
-                        metadata.parameters.clone()
-                    };
-                    tools.push(serde_json::json!({
-                        "name": metadata.name,
-                        "description": metadata.description,
-                        "inputSchema": input_schema,
-                    }));
-                }
-            }
-
-            Ok(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": tools
-                }
-            }))
-        }
+        McpCall::ToolsList => Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": tools_list_result(proxy, &server)
+        })),
         McpCall::ToolsCall {
             tool_name,
             arguments,
@@ -3157,13 +3125,153 @@ pub async fn execute_mcp_request(
             Ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "content": result.content,
-                    "isError": result.is_error
-                }
+                "result": tool_call_result(result)
             }))
         }
     }
+}
+
+/// The `initialize` result a legacy MCP Proxy answers with.
+fn initialize_result(proxy: &McpProxy) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": proxy.name.clone(),
+            "version": "1.0.0"
+        }
+    })
+}
+
+/// The `tools/list` result of a legacy MCP Proxy: every tool `server` loaded
+/// from its spec.
+fn tools_list_result(
+    proxy: &McpProxy,
+    server: &McpServer,
+) -> serde_json::Value {
+    let tool_names = server.get_tool_names();
+    info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
+    let tools: Vec<serde_json::Value> = tool_names
+        .iter()
+        .filter_map(|tool_name| server.get_tool_metadata(tool_name))
+        .map(|metadata| {
+            let input_schema = if proxy.flatten_post_params {
+                flatten_input_schema(&metadata.parameters)
+            } else {
+                metadata.parameters.clone()
+            };
+            serde_json::json!({
+                "name": metadata.name,
+                "description": metadata.description,
+                "inputSchema": input_schema,
+            })
+        })
+        .collect();
+    serde_json::json!({ "tools": tools })
+}
+
+/// The `tools/call` result of a legacy MCP Proxy.
+fn tool_call_result(result: rmcp::model::CallToolResult) -> serde_json::Value {
+    serde_json::json!({
+        "content": result.content,
+        "isError": result.is_error
+    })
+}
+
+/// The grant by binding a Transit Point sends its MCP Proxy's backend: the
+/// header it goes in, and `destination`, the origin of its provider's
+/// `resource`, the only origin a call carrying it is sent to. `exact_allowlist`
+/// is the BDD allow-list of fixtures, `None` in production.
+pub struct ProxyGrant {
+    pub header: (String, String),
+    pub destination: url::Origin,
+    pub exact_allowlist: Option<String>,
+}
+
+/// What an MCP Proxy behind a Transit Point answered.
+#[derive(Debug)]
+pub enum TransitProxyAnswer {
+    /// The JSON-RPC response.
+    Response(serde_json::Value),
+    /// The backend refused the grant a tool call carried, as
+    /// [`crate::delegation_vault::release::vendor_answer`] reads its answer:
+    /// its status and `WWW-Authenticate` challenges, never its body, so the
+    /// Transit Point refreshes the grant or refuses the call as it does for an
+    /// `https` target.
+    GrantRefused { status: u16, challenges: Vec<axum::http::HeaderValue> },
+}
+
+/// Serve a legacy MCP request for a Transit Point whose target is
+/// `proxy://<id>`: `initialize` and `tools/list` from the proxy's spec, and a
+/// `tools/call` through its REST backend. With `grant`, a tool call carries
+/// the grant's header and goes only to its `destination`, through Strict,
+/// `https`-only egress, never outside the proxy's base path; a backend answer
+/// that refuses the grant is [`TransitProxyAnswer::GrantRefused`]. Without one,
+/// the call carries no credential. The surface's own timeout, retry, circuit
+/// breaker and mirroring are its Target's and do not apply.
+pub async fn serve_through_transit_point(
+    proxy: &McpProxy,
+    request: serde_json::Value,
+    grant: Option<ProxyGrant>,
+    limits: &crate::config::McpHttpConfig,
+    config_id: &str,
+) -> Result<TransitProxyAnswer, McpProxyCallError> {
+    let header = grant
+        .as_ref()
+        .map(|grant| grant.header.clone());
+    let PreparedMcpRequest { server, request, call } = prepare_mcp_request(proxy, request, header, config_id)?;
+    let result = match call {
+        McpCall::Initialize => initialize_result(proxy),
+        McpCall::ToolsList => tools_list_result(proxy, &server),
+        McpCall::ToolsCall {
+            tool_name,
+            arguments,
+            credentialed,
+        } => {
+            let tool = server
+                .get_tool(&tool_name)
+                .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
+            let result = match (credentialed.as_deref(), grant.as_ref()) {
+                (Some((stored, headers)), Some(grant)) => match super::modern_rest::call_with_grant(
+                    stored.directory.as_str(),
+                    &stored.metadata,
+                    &arguments,
+                    headers,
+                    limits,
+                    &stored.content_type,
+                    &grant.destination,
+                    grant
+                        .exact_allowlist
+                        .as_deref(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
+                        return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
+                    }
+                    Err(error) => return Err(format!("Tool execution failed: {error}").into()),
+                },
+                (None, None) => call_legacy_tool(tool, &arguments, None, limits, None)
+                    .await
+                    .map_err(|error| format!("Tool execution failed: {error}"))?,
+                _ => {
+                    return Err("Tool execution failed: the grant could not be prepared"
+                        .to_string()
+                        .into());
+                }
+            };
+            tool_call_result(result)
+        }
+    };
+    Ok(TransitProxyAnswer::Response(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned(),
+        "result": result
+    })))
 }
 
 #[cfg(test)]

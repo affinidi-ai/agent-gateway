@@ -248,7 +248,8 @@ Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
-forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
+forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
+`consent_mode: external` grant) → response and agent-card rewrite → metrics. The stages from trust context to MCP
 tool gating are skipped for discovery reads.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary

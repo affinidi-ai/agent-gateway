@@ -26,6 +26,24 @@ pub(super) enum RestError {
     Unavailable,
     #[error("REST tool execution failed")]
     Execution,
+    /// The backend refused the grant by binding the call carried, as
+    /// [`crate::delegation_vault::release::vendor_answer`] reads its answer: its
+    /// status and `WWW-Authenticate` challenges, never its body.
+    #[error("REST backend refused the grant")]
+    GrantRefused { status: u16, challenges: Vec<HeaderValue> },
+}
+
+/// How the client of a credentialed tool call is vetted.
+#[derive(Clone, Copy)]
+enum RestEgress<'a> {
+    /// A stored backend, under the Configured egress policy;
+    /// `exact_allowlist` is the BDD allow-list of fixtures.
+    Configured { exact_allowlist: Option<&'a str> },
+    /// A call that carries a grant by binding: only to `destination`, the
+    /// origin of its provider's `resource`, through Strict, `https`-only egress
+    /// pinned to the vetted addresses, as a Transit Point sends a grant
+    /// ([`crate::egress::pinned_vendor_client`]).
+    Grant { destination: &'a url::Origin, exact_allowlist: Option<&'a str> },
 }
 
 struct OfflineSchemas;
@@ -610,6 +628,92 @@ pub(super) async fn call(
     egress_allowlist: Option<&str>,
     sent_token: Option<&SentServiceToken<'_>>,
 ) -> Result<CallToolResult, RestError> {
+    send(
+        base_url,
+        metadata,
+        arguments,
+        target_headers,
+        limits,
+        content_type,
+        RestEgress::Configured {
+            exact_allowlist: egress_allowlist,
+        },
+        sent_token,
+    )
+    .await
+}
+
+/// A tool call that carries a grant by binding in `target_headers`: sent only
+/// to `destination`, the origin of the grant's `resource`, through Strict,
+/// `https`-only egress pinned to the vetted addresses (`exact_allowlist`, the
+/// BDD allow-list, alone admits a fixture). An answer that refuses the grant,
+/// as [`crate::delegation_vault::release::vendor_answer`] reads it, is
+/// [`RestError::GrantRefused`], without its body, so the caller can refresh
+/// the grant or refuse the call with a fixed reason.
+pub(super) async fn call_with_grant(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    destination: &url::Origin,
+    exact_allowlist: Option<&str>,
+) -> Result<CallToolResult, RestError> {
+    send(
+        base_url,
+        metadata,
+        arguments,
+        target_headers,
+        limits,
+        content_type,
+        RestEgress::Grant { destination, exact_allowlist },
+        None,
+    )
+    .await
+}
+
+/// The client a credentialed tool call to `url` is sent with, vetted as
+/// `egress` says and pinned to the vetted address, so DNS cannot rebind it
+/// between the check and the call. Redirects stay off.
+async fn pinned_client(
+    url: &Url,
+    timeout: Duration,
+    egress: RestEgress<'_>,
+) -> Result<reqwest::Client, RestError> {
+    match egress {
+        RestEgress::Configured { exact_allowlist } => {
+            let raw_url = url.to_string();
+            let exact_allowlist = exact_allowlist.map(str::to_string);
+            Ok(tokio::task::spawn_blocking(move || {
+                crate::egress::pinned_configured_client(&raw_url, timeout, exact_allowlist.as_deref())
+            })
+            .await
+            .map_err(|_| RestError::Unavailable)?
+            .map_err(|_| RestError::Target)?
+            .0)
+        }
+        RestEgress::Grant { destination, exact_allowlist } => {
+            if url.origin() != *destination {
+                return Err(RestError::Target);
+            }
+            crate::egress::pinned_vendor_client(url.as_str(), timeout, exact_allowlist)
+                .await
+                .map_err(|_| RestError::Target)
+        }
+    }
+}
+
+async fn send(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    egress: RestEgress<'_>,
+    sent_token: Option<&SentServiceToken<'_>>,
+) -> Result<CallToolResult, RestError> {
     if serde_json::to_vec(arguments)
         .map_err(|_| RestError::Arguments)?
         .len()
@@ -654,20 +758,7 @@ pub(super) async fn call(
             )
             .max(1),
         );
-    // Resolve the target once, vet it with the save-time policy and pin the client
-    // to that address, so DNS cannot rebind it to loopback between the save-time
-    // check and this call. Redirects stay off.
-    let client = {
-        let raw_url = url.to_string();
-        let egress_allowlist = egress_allowlist.map(str::to_string);
-        tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw_url, Duration::from_secs(timeout), egress_allowlist.as_deref())
-        })
-        .await
-        .map_err(|_| RestError::Unavailable)?
-        .map_err(|_| RestError::Target)?
-        .0
-    };
+    let client = pinned_client(&url, Duration::from_secs(timeout), egress).await?;
     let headers = request_headers(&parameters, target_headers)?;
     if headers
         .iter()
@@ -704,6 +795,22 @@ pub(super) async fn call(
         sent_token
             .forget_if_refused(response.status().as_u16(), response.headers())
             .await;
+    }
+    if let RestEgress::Grant { .. } = egress
+        && !matches!(
+            crate::delegation_vault::release::vendor_answer(response.status(), response.headers()),
+            crate::delegation_vault::release::VendorAnswer::Pass
+        )
+    {
+        return Err(RestError::GrantRefused {
+            status: response.status().as_u16(),
+            challenges: response
+                .headers()
+                .get_all(axum::http::header::WWW_AUTHENTICATE)
+                .iter()
+                .cloned()
+                .collect(),
+        });
     }
     if response
         .status()
@@ -1507,5 +1614,84 @@ mod tests {
         assert_eq!(resource_uri(&url), "https://www.example.com/download/files/abc");
         let root = Url::parse("https://www.example.com/?q=1").unwrap();
         assert_eq!(resource_uri(&root), "https://www.example.com/");
+    }
+
+    /// A tool call that carries a grant goes only to the grant's origin,
+    /// through Strict egress, which admits the loopback fixture only from the
+    /// test allow-list. An answer that refuses the grant comes back as its
+    /// status and challenges, never its body; any other answer, a `403` that
+    /// is not about the grant's scope among them, is the tool's result.
+    #[tokio::test]
+    async fn a_call_with_a_grant_goes_only_to_its_origin_and_reports_a_refused_grant() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = r#"Bearer error="invalid_token""#;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"files": []})),
+            Answer::json(401, json!({"error": "vendor-words"})).with_header("WWW-Authenticate", challenge),
+            Answer::json(403, json!({"error": "not shared with you"})),
+        ])
+        .await;
+        let origin = vendor.origin();
+        let destination = Url::parse(&origin)
+            .unwrap()
+            .origin();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer granted"));
+        let limits = McpHttpConfig::default();
+        let sent = |destination: &url::Origin, exact_allowlist: Option<&str>| {
+            let (base, headers, limits, destination, exact_allowlist) = (
+                origin.clone(),
+                headers.clone(),
+                limits.clone(),
+                destination.clone(),
+                exact_allowlist.map(str::to_string),
+            );
+            async move {
+                call_with_grant(
+                    &base,
+                    &metadata("/files"),
+                    &json!({}),
+                    &headers,
+                    &limits,
+                    "application/json",
+                    &destination,
+                    exact_allowlist.as_deref(),
+                )
+                .await
+            }
+        };
+
+        let answered = sent(&destination, Some(&origin))
+            .await
+            .unwrap();
+        assert_eq!(answered.is_error, Some(false));
+        match sent(&destination, Some(&origin)).await {
+            Err(RestError::GrantRefused { status, challenges }) => {
+                assert_eq!(status, 401);
+                assert_eq!(challenges, [HeaderValue::from_static(challenge)]);
+            }
+            other => panic!("expected the refused grant, got {other:?}"),
+        }
+        let forbidden = sent(&destination, Some(&origin))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.is_error, Some(true), "a 403 that is not about scope is the tool's own error");
+
+        let elsewhere = Url::parse("http://127.0.0.1:9")
+            .unwrap()
+            .origin();
+        assert!(matches!(sent(&elsewhere, Some(&origin)).await, Err(RestError::Target)), "another origin");
+        assert!(
+            matches!(sent(&destination, None).await, Err(RestError::Target)),
+            "Strict egress refuses the loopback fixture without the test allow-list"
+        );
+        let requests = vendor.requests();
+        assert_eq!(requests.len(), 3, "only the permitted calls reach the backend");
+        assert!(
+            requests
+                .iter()
+                .all(|(head, _)| head.starts_with("GET /files ") && head.contains("authorization: Bearer granted")),
+            "{requests:?}"
+        );
     }
 }

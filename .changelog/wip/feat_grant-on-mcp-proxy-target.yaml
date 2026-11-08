@@ -1,0 +1,42 @@
+branch: feat/grant-on-mcp-proxy-target
+changes:
+  added:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Serve a Transit Point whose target is an MCP Proxy
+      description: >-
+        A Transit Point whose target_endpoint is proxy://<id> was forwarded as if the id were a
+        host name, so every call failed. It is now answered by that MCP Proxy, one the surface
+        may reference: initialize and tools/list from its spec, a notification accepted with
+        nothing sent, and a tools/call through its REST backend, under the Transit Point's own
+        timeout and mcp_http limits; any method but POST answers 405 and a 2026-07-28 request
+        is refused with -32022. Such a Transit Point sends its backend no target_auth and no
+        delegated credential but a consent_mode external grant: one with either is refused
+        when called. A surface save now checks that a Transit Point may reference the MCP Proxy
+        it names, as it checks a proxy:// Target.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Send an external consent grant through a Transit Point's MCP Proxy
+      description: >-
+        A Transit Point whose target is proxy://<id> may now carry a consent_mode external
+        binding, so a vendor with a REST API and no MCP server of its own, such as Google Drive,
+        gets a per-person grant the gateway keeps, refreshes and revokes, in place of a fixed
+        token. Only a tool call carries the grant, in its header, to the proxy's backend; a
+        backend 401 that rejects the token gets one refresh and one retry through the proxy,
+        and a refused grant answers connect_required, scope_insufficient or
+        connector_unavailable, as on an https target, without the backend's words.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Bind a grant through an MCP Proxy only to the provider's resource
+      description: >-
+        A grant goes through a Transit Point's MCP Proxy only while that proxy is of the
+        surface's own tenant, served only through surfaces (direct_access false), and its
+        base_url is a public https URL with the origin of the provider's resource, and only
+        while the Transit Point speaks MCP, sends the grant in a header and has no target_auth.
+        The rules are checked when the surface is saved, when a connect starts, when the grant
+        is released and again with the proxy the call is sent through, so a proxy edited
+        afterwards to point elsewhere is never sent the grant; the tool call itself goes only
+        to that origin, through pinned Strict egress with redirects refused. The Access Point's
+        Target is still never an MCP Proxy with a grant.
+  breaking: []
