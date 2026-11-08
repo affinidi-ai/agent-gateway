@@ -1,6 +1,14 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-08T22:30:00Z'
+      title: Recover from a replaced bundled trust agent with --vta-rebootstrap
+      description: >-
+        agent-gateway --vta-rebootstrap forgets the pinned bundled trust agent
+        and retires its signing key, which stays published so tokens it signed
+        still verify; the next start bootstraps again under a new key id.
+        Without --yes it only shows what it would do. It is never run
+        automatically: a new trust agent means new keys and DIDs.
     - timestamp: '2026-11-08T22:00:00Z'
       title: ⭐ Connect the bundled trust agent automatically on first start
       description: >-

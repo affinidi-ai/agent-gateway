@@ -43,9 +43,15 @@ pub const IDENTITY_FILE: &str = "vta-identity.env";
 /// material so it is encrypted at rest with it.
 pub const STATE_FILE: &str = "vta_bundled_state.json";
 
-/// The id of the signing key minted in the gateway's context. Fixed, so a retry
-/// after a timeout adopts the key it already made instead of creating another.
-pub const SIGNING_KEY_ID: &str = "gateway-jwt-1";
+/// Keys retired by a re-bootstrap, waiting to be carried into the next state.
+pub const RETIRED_FILE: &str = "vta_bundled_retired.json";
+
+/// The id of the signing key for a generation. Fixed per generation, so a retry
+/// after a timeout adopts the key it already made instead of creating another,
+/// and distinct across generations, so a retired key's `kid` is never reused.
+pub fn signing_key_id(generation: usize) -> String {
+    format!("gateway-jwt-{generation}")
+}
 
 const KEY_LABEL: &str = "agent-gateway signing key";
 const FORMAT: u32 = 1;
@@ -113,7 +119,19 @@ pub struct BundledState {
     /// internal key's record afterwards, and without it the key cannot be
     /// published for verification.
     pub signing_key_public: String,
+    /// Signing keys of earlier bootstraps, published beside the active one so
+    /// tokens they signed still verify.
+    #[serde(default)]
+    pub retired_keys: Vec<RetiredKey>,
     pub bootstrapped_at: DateTime<Utc>,
+}
+
+/// A signing key an earlier bootstrap made, no longer signing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredKey {
+    pub key_id: String,
+    pub public_key: String,
+    pub retired_at: DateTime<Utc>,
 }
 
 /// The result of one bootstrap, for the status API.
@@ -180,6 +198,24 @@ async fn save_state(
     crate::encryption::secret_file::write_secret_file(&state_path(storage), &text)
         .await
         .map_err(|e| format!("could not persist the bundled state: {e}"))
+}
+
+pub fn retired_path(storage: &Path) -> PathBuf {
+    storage.join(RETIRED_FILE)
+}
+
+async fn load_retired(storage: &Path) -> Result<Vec<RetiredKey>, String> {
+    match crate::encryption::secret_file::read_secret_file(&retired_path(storage)).await {
+        Ok(Some(text)) => serde_json::from_str(&text).map_err(|e| format!("the retired-key record is unreadable: {e}")),
+        Ok(None) => Ok(Vec::new()),
+        Err(e) => Err(format!("could not read the retired-key record: {e}")),
+    }
+}
+
+async fn remove_secret(path: &Path) {
+    for candidate in [path.to_path_buf(), crate::encryption::secret_file::secret_enc_path(path)] {
+        let _ = tokio::fs::remove_file(candidate).await;
+    }
 }
 
 /// The enrolment note: public data only.
@@ -314,7 +350,10 @@ impl Failure {
         } else {
             BootstrapState::EnrolmentRefused
         };
-        Self::new(state, format!("{step}: {}", error.log_detail()))
+        tracing::debug!(target: "vta_audit", step, detail = error.log_detail(), "the trust agent refused a bootstrap step");
+        // The terse form only: the response body can name internals and is not
+        // for the status API. It is in the debug log above.
+        Self::new(state, format!("{step}: {error}"))
     }
 }
 
@@ -386,6 +425,7 @@ fn key_public(record: &Value) -> Option<String> {
 async fn find_signing_key(
     client: &VtaRestClient,
     context_id: &str,
+    key_id: &str,
 ) -> Result<Option<SigningKey>, Failure> {
     let keys = super::context_identity::list_context_keys(client, context_id, None)
         .await
@@ -393,7 +433,7 @@ async fn find_signing_key(
     let Some(record) = keys.iter().find(|k| {
         k.get("keyId")
             .and_then(Value::as_str)
-            == Some(SIGNING_KEY_ID)
+            == Some(key_id)
     }) else {
         return Ok(None);
     };
@@ -408,22 +448,24 @@ async fn find_signing_key(
     {
         return Err(Failure::new(
             BootstrapState::EnrolmentRefused,
-            format!("key `{SIGNING_KEY_ID}` exists but is not an active Ed25519 key"),
+            format!("key `{key_id}` exists but is not an active Ed25519 key"),
         ));
     }
-    let public = key_public(record).ok_or_else(|| {
-        Failure::new(BootstrapState::EnrolmentRefused, format!("key `{SIGNING_KEY_ID}` has no public key"))
-    })?;
+    let public = key_public(record)
+        .ok_or_else(|| Failure::new(BootstrapState::EnrolmentRefused, format!("key `{key_id}` has no public key")))?;
     Ok(Some(SigningKey { public }))
 }
 
-async fn create_signing_key(client: &VtaRestClient) -> Result<SigningKey, Failure> {
+async fn create_signing_key(
+    client: &VtaRestClient,
+    key_id: &str,
+) -> Result<SigningKey, Failure> {
     let created: Value = client
         .dispatch_signed(
             TASK_KEYS_CREATE,
             json!({
                 "keyType": "ed25519",
-                "keyId": SIGNING_KEY_ID,
+                "keyId": key_id,
                 "label": KEY_LABEL,
                 "internal": true,
             }),
@@ -561,24 +603,34 @@ async fn connect(
     who.assert_bundled_grant(context_id)
         .map_err(|e| Failure::new(refusal(previously_connected), e.log_detail().to_string()))?;
 
-    let existing = find_signing_key(&client, context_id).await?;
+    let retired = match state {
+        Some(state) => state.retired_keys.clone(),
+        None => load_retired(storage)
+            .await
+            .map_err(misconfigured)?,
+    };
+    let key_id = state
+        .map(|s| s.signing_key_id.clone())
+        .unwrap_or_else(|| signing_key_id(retired.len() + 1));
+
+    let existing = find_signing_key(&client, context_id, &key_id).await?;
     let signing_key_public = match (state, existing) {
         (Some(state), Some(key)) if key.public == state.signing_key_public => key.public,
         (Some(_), Some(_)) => {
             return Err(Failure::new(
                 BootstrapState::VtaReplaced,
-                format!("key `{SIGNING_KEY_ID}` now has a different public key than the one this gateway recorded"),
+                format!("key `{key_id}` now has a different public key than the one this gateway recorded"),
             ));
         }
         (Some(_), None) => {
             return Err(Failure::new(
                 BootstrapState::VtaLost,
-                format!("the trust agent holds no key `{SIGNING_KEY_ID}` in context `{context_id}`"),
+                format!("the trust agent holds no key `{key_id}` in context `{context_id}`"),
             ));
         }
         (None, Some(key)) => key.public,
         (None, None) => {
-            create_signing_key(&client)
+            create_signing_key(&client, &key_id)
                 .await?
                 .public
         }
@@ -593,14 +645,62 @@ async fn connect(
         base_url: base_url.to_string(),
         context_id: context_id.to_string(),
         control_did,
-        signing_key_id: SIGNING_KEY_ID.to_string(),
+        signing_key_id: key_id,
         signing_key_public,
+        retired_keys: retired,
         bootstrapped_at: Utc::now(),
     };
     save_state(storage, &fresh)
         .await
         .map_err(misconfigured)?;
+    remove_secret(&retired_path(storage)).await;
     Ok(fresh)
+}
+
+/// What `--vta-rebootstrap` does, as an operator-facing report.
+///
+/// The recovery for a trust agent that was replaced or lost its key, which is
+/// never done automatically: a new trust agent means new keys and DIDs. It
+/// forgets the pinned trust agent and retires the current signing key, which
+/// stays published so tokens it signed still verify. Nothing is deleted from a
+/// trust agent, and no key is exported or re-created here; the next start
+/// bootstraps again as on first start, under a new key id.
+pub async fn rebootstrap(
+    storage: &Path,
+    confirmed: bool,
+) -> Result<String, String> {
+    let state = load_state(storage)
+        .await?
+        .ok_or("nothing to re-bootstrap: no bundled bootstrap is recorded on this gateway")?;
+    let mut retired = state.retired_keys.clone();
+    if !retired
+        .iter()
+        .any(|k| k.key_id == state.signing_key_id)
+    {
+        retired.push(RetiredKey {
+            key_id: state.signing_key_id.clone(),
+            public_key: state
+                .signing_key_public
+                .clone(),
+            retired_at: Utc::now(),
+        });
+    }
+    let plan = format!(
+        "This forgets the pinned trust agent `{}` and retires signing key `{}`, which stays published so tokens it \
+         signed still verify. The next start bootstraps again under key `{}`.",
+        state.vta_did,
+        state.signing_key_id,
+        signing_key_id(retired.len() + 1)
+    );
+    if !confirmed {
+        return Ok(format!("{plan}\nNothing was changed. Run again with --yes to do it."));
+    }
+    let text = serde_json::to_string_pretty(&retired).map_err(|e| format!("could not encode the retired keys: {e}"))?;
+    crate::encryption::secret_file::write_secret_file(&retired_path(storage), &text)
+        .await
+        .map_err(|e| format!("could not persist the retired keys: {e}"))?;
+    remove_secret(&state_path(storage)).await;
+    Ok(format!("{plan}\nDone. Start the gateway again to bootstrap."))
 }
 
 /// Fold a bootstrap result into the `[vta]` block the rest of startup reads.
@@ -624,6 +724,14 @@ pub fn apply(
                     .signing_key_public
                     .clone(),
             );
+            config.retiring_keys = state
+                .retired_keys
+                .iter()
+                .map(|k| crate::config::vta::RetiringKey {
+                    key_id: k.key_id.clone(),
+                    public_key: Some(k.public_key.clone()),
+                })
+                .collect();
             config.auto_provision_contexts = true;
         }
         None => config.enabled = false,
@@ -687,8 +795,9 @@ mod tests {
             base_url: "http://127.0.0.1:8100".to_string(),
             context_id: "gateway".to_string(),
             control_did: "did:key:z6MkGw".to_string(),
-            signing_key_id: SIGNING_KEY_ID.to_string(),
+            signing_key_id: signing_key_id(1),
             signing_key_public: "z6MkKey".to_string(),
+            retired_keys: Vec::new(),
             bootstrapped_at: Utc::now(),
         }
     }
@@ -746,6 +855,30 @@ mod tests {
         };
         assert_eq!(Failure::from_vta(&denied, "x", false).state, BootstrapState::EnrolmentRefused);
         assert_eq!(Failure::from_vta(&denied, "x", true).state, BootstrapState::Revoked);
+    }
+
+    #[test]
+    fn a_refusal_detail_never_carries_the_trust_agents_response_body() {
+        let denied = VtaError::Http {
+            status: 403,
+            body: r#"{"payload":{"code":"permissionDenied"},"secret":"INTERNAL-DETAIL"}"#.to_string(),
+        };
+        let failure = Failure::from_vta(&denied, "authenticating", false);
+        assert!(
+            !failure
+                .detail
+                .contains("INTERNAL-DETAIL"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("403")
+                && failure
+                    .detail
+                    .contains("permissionDenied"),
+            "{}",
+            failure.detail
+        );
     }
 
     #[test]
@@ -979,7 +1112,7 @@ mod tests {
             .expect("recorded");
         assert_eq!(state.vta_did, VTA);
         assert_eq!(state.context_id, "gateway");
-        assert_eq!(state.signing_key_id, SIGNING_KEY_ID);
+        assert_eq!(state.signing_key_id, "gateway-jwt-1");
         assert_eq!(state.signing_key_public, "z6MkMintedPublicKey", "captured at creation");
         assert_eq!(mock.creates(), 1);
         assert_eq!(outcome.status.owner, "unclaimed");
@@ -1042,7 +1175,7 @@ mod tests {
             .unwrap()
             .keys
             .push(json!({
-                "keyId": SIGNING_KEY_ID, "keyType": "ed25519", "status": "active", "publicKey": "z6MkEarlier",
+                "keyId": "gateway-jwt-1", "keyType": "ed25519", "status": "active", "publicKey": "z6MkEarlier",
             }));
         let fixture = Fixture::new(&serve(&mock).await);
         fixture.publish_identity(VTA);
@@ -1228,5 +1361,137 @@ mod tests {
 
         assert_eq!(outcome.status.state, BootstrapState::Misconfigured);
         assert_eq!(mock.creates(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rebootstrap_without_confirmation_changes_nothing() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        fixture.run().await;
+
+        let report = rebootstrap(fixture.storage.path(), false)
+            .await
+            .expect("dry run");
+
+        assert!(report.contains("Nothing was changed"), "{report}");
+        assert!(
+            load_state(fixture.storage.path())
+                .await
+                .unwrap()
+                .is_some(),
+            "the state is untouched"
+        );
+        assert!(
+            load_retired(fixture.storage.path())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_rebootstrap_retires_the_key_and_the_next_start_mints_under_a_new_kid() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let first = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+
+        rebootstrap(fixture.storage.path(), true)
+            .await
+            .expect("rebootstrap");
+        assert!(
+            load_state(fixture.storage.path())
+                .await
+                .unwrap()
+                .is_none(),
+            "the pin is forgotten"
+        );
+
+        let second = fixture.run().await;
+
+        assert_eq!(second.status.state, BootstrapState::Connected, "{:?}", second.status.detail);
+        let state = second.state.expect("second");
+        assert_eq!(state.signing_key_id, "gateway-jwt-2", "a retired kid is never reused");
+        assert_eq!(state.retired_keys.len(), 1);
+        assert_eq!(state.retired_keys[0].key_id, first.signing_key_id);
+        assert_eq!(state.retired_keys[0].public_key, first.signing_key_public);
+        assert_eq!(mock.creates(), 2);
+        assert!(
+            load_retired(fixture.storage.path())
+                .await
+                .unwrap()
+                .is_empty(),
+            "carried into the state, so cleared"
+        );
+
+        let mut config = fixture.config.clone();
+        apply(
+            &mut config,
+            &Outcome {
+                status: second.status,
+                state: Some(state),
+            },
+        );
+        assert_eq!(
+            config
+                .signing_key_id
+                .as_deref(),
+            Some("gateway-jwt-2")
+        );
+        assert_eq!(config.retiring_keys.len(), 1, "the old key is still published");
+        assert_eq!(config.retiring_keys[0].key_id, "gateway-jwt-1");
+        assert_eq!(
+            config.retiring_keys[0]
+                .public_key
+                .as_deref(),
+            Some(
+                first
+                    .signing_key_public
+                    .as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_rebootstrap_keeps_every_earlier_key() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        fixture.run().await;
+        rebootstrap(fixture.storage.path(), true)
+            .await
+            .unwrap();
+        fixture.run().await;
+        rebootstrap(fixture.storage.path(), true)
+            .await
+            .unwrap();
+
+        let third = fixture
+            .run()
+            .await
+            .state
+            .expect("third");
+
+        assert_eq!(third.signing_key_id, "gateway-jwt-3");
+        let retired: Vec<_> = third
+            .retired_keys
+            .iter()
+            .map(|k| k.key_id.as_str())
+            .collect();
+        assert_eq!(retired, ["gateway-jwt-1", "gateway-jwt-2"]);
+    }
+
+    #[tokio::test]
+    async fn rebootstrapping_a_gateway_that_never_bootstrapped_is_refused() {
+        let storage = tempfile::tempdir().unwrap();
+        let err = rebootstrap(storage.path(), true)
+            .await
+            .expect_err("nothing to do");
+        assert!(err.contains("nothing to re-bootstrap"), "{err}");
     }
 }

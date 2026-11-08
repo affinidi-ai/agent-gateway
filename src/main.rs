@@ -125,6 +125,16 @@ struct Args {
     #[arg(long, value_name = "INPUT_FILE")]
     decrypt_export: Option<PathBuf>,
 
+    /// Forget the pinned bundled trust agent and retire its signing key, so the
+    /// next start bootstraps against whatever answers now. The recovery for a
+    /// replaced or emptied sidecar; shows what it would do unless --yes is given.
+    #[arg(long)]
+    vta_rebootstrap: bool,
+
+    /// Confirm --vta-rebootstrap.
+    #[arg(long)]
+    yes: bool,
+
     /// Output path (used with --decrypt-export, defaults to export.zip)
     #[arg(long, value_name = "OUTPUT_FILE", default_value = "export.zip")]
     output: PathBuf,
@@ -307,6 +317,19 @@ async fn async_main() -> Result<()> {
     // Initialize global encryption config for all storage operations
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
+
+    if args.vta_rebootstrap {
+        let issuer_storage = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .vc_keys,
+        );
+        let report = vta::bundled::rebootstrap(&issuer_storage, args.yes)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
 
     // Boot migration: decrypt any residual field-level ENC[...] values left by an
     // earlier build to plaintext, before any store is loaded into a model. Whole-file
