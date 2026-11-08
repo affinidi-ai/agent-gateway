@@ -149,11 +149,6 @@ impl VtaRestClient {
         parse_response(&body)
     }
 
-    /// The control DID this client authenticates as.
-    pub fn control_did(&self) -> &str {
-        self.control_key.did()
-    }
-
     /// Run the full DI-signed auth handshake and cache the session tokens.
     pub async fn authenticate(&self) -> Result<(), VtaError> {
         // 1. challenge (unsigned): payload = { subject: <control did> }.

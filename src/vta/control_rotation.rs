@@ -505,7 +505,11 @@ mod tests {
 
         assert_eq!(rotated.previous_did, old.did());
         assert_ne!(rotated.new_did, old.did());
-        assert_eq!(mock.0.lock().unwrap().allowed, [rotated.new_did.clone()], "the entry moved; the old DID is gone");
+        assert_eq!(
+            mock.0.lock().unwrap().allowed,
+            std::slice::from_ref(&rotated.new_did),
+            "the entry moved; the old DID is gone"
+        );
         assert_eq!(mock.0.lock().unwrap().swaps, [(old.did().to_string(), rotated.new_did.clone())]);
         let current = ControlKey::from_seed(
             read_seed(&path)

@@ -585,12 +585,11 @@ async fn connect(
     // A rotation that a crash interrupted is finished (or abandoned) before the
     // key is used, so the gateway authenticates with the one that is current.
     let control_key_path = super::appliance_control_key_path(storage);
-    if let Some(rotated) = super::control_rotation::settle_pending(config, &published, &control_key_path)
+    let settled = super::control_rotation::settle_pending(config, &published, &control_key_path)
         .await
-        .map_err(|e| Failure::from_vta(&e, "settling an interrupted control-key rotation", previously_connected))?
-    {
+        .map_err(|e| Failure::from_vta(&e, "settling an interrupted control-key rotation", previously_connected))?;
+    if settled.is_some() {
         tracing::info!(target: "vta_audit", "finished an interrupted control-key rotation");
-        let _ = rotated;
     }
     let control_key = super::ensure_appliance_control_key(storage)
         .await
