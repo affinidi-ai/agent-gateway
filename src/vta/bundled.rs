@@ -582,6 +582,25 @@ async fn connect(
     })?;
     status.vta_did = Some(published.clone());
 
+    // A rotation that a crash interrupted is finished (or abandoned) before the
+    // key is used, so the gateway authenticates with the one that is current.
+    let control_key_path = super::appliance_control_key_path(storage);
+    if let Some(rotated) = super::control_rotation::settle_pending(config, &published, &control_key_path)
+        .await
+        .map_err(|e| Failure::from_vta(&e, "settling an interrupted control-key rotation", previously_connected))?
+    {
+        tracing::info!(target: "vta_audit", "finished an interrupted control-key rotation");
+        let _ = rotated;
+    }
+    let control_key = super::ensure_appliance_control_key(storage)
+        .await
+        .map_err(|e| misconfigured(format!("the gateway's control key: {}", e.log_detail())))?;
+    let control_did = control_key.did().to_string();
+    status.control_did = Some(control_did.clone());
+    write_enrolment(&dir, &control_did)
+        .await
+        .map_err(misconfigured)?;
+
     let client = VtaRestClient::new(
         base_url,
         &published,
@@ -637,7 +656,15 @@ async fn connect(
     };
 
     if let Some(state) = state {
-        return Ok(state.clone());
+        if state.control_did == control_did {
+            return Ok(state.clone());
+        }
+        let mut updated = state.clone();
+        updated.control_did = control_did;
+        save_state(storage, &updated)
+            .await
+            .map_err(misconfigured)?;
+        return Ok(updated);
     }
     let fresh = BundledState {
         format: FORMAT,
@@ -701,6 +728,41 @@ pub async fn rebootstrap(
         .map_err(|e| format!("could not persist the retired keys: {e}"))?;
     remove_secret(&state_path(storage)).await;
     Ok(format!("{plan}\nDone. Start the gateway again to bootstrap."))
+}
+
+/// What `--vta-rotate-control-key` does, as an operator-facing report.
+///
+/// Moves the gateway's access entry on the bundled trust agent to a new control
+/// `did:key`, using `acl/swap-key`. Run it with the gateway **stopped**: a trust
+/// agent supersedes a DID's session when it authenticates again, and the running
+/// connector holds the old key in memory.
+pub async fn rotate_control_key(
+    config: &VtaConfig,
+    storage: &Path,
+    confirmed: bool,
+) -> Result<String, String> {
+    let state = load_state(storage)
+        .await?
+        .ok_or("nothing to rotate: no bundled bootstrap is recorded on this gateway")?;
+    let plan = format!(
+        "This moves this gateway's access entry on the trust agent `{}` from `{}` to a new did:key, with the same \
+         grant. Anyone holding the current key could do the same, so a rotation is hygiene, not recovery from a \
+         leak; the trust agent audits every swap. Stop the gateway first.",
+        state.vta_did, state.control_did
+    );
+    if !confirmed {
+        return Ok(format!("{plan}\nNothing was changed. Run again with --yes to do it."));
+    }
+    let rotated = super::control_rotation::rotate(config, &state.vta_did, &super::appliance_control_key_path(storage))
+        .await
+        .map_err(|e| {
+            format!("the rotation failed: {e}. Nothing is lost: if the swap did happen, the next start finishes it.")
+        })?;
+    let mut updated = state;
+    updated.control_did = rotated.new_did.clone();
+    save_state(storage, &updated).await?;
+    write_enrolment(Path::new(&config.bootstrap_dir), &rotated.new_did).await?;
+    Ok(format!("{plan}\nDone. The control key is now `{}`. Start the gateway again.", rotated.new_did))
 }
 
 /// Fold a bootstrap result into the `[vta]` block the rest of startup reads.
@@ -971,6 +1033,7 @@ mod tests {
         capabilities: Vec<&'static str>,
         keys: Vec<Value>,
         creates: usize,
+        allowed: Option<Vec<String>>,
     }
 
     impl Mock {
@@ -981,6 +1044,7 @@ mod tests {
                 capabilities: super::super::onboarding::GRANT_CAPABILITIES.to_vec(),
                 keys: Vec::new(),
                 creates: 0,
+                allowed: None,
             })))
         }
 
@@ -1006,7 +1070,14 @@ mod tests {
             return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
         }
         if task.contains("auth/authenticate") {
-            if !vta.enrolled {
+            let issuer = body["issuer"]
+                .as_str()
+                .unwrap_or_default();
+            let permitted = vta
+                .allowed
+                .as_ref()
+                .is_none_or(|a| a.iter().any(|d| d == issuer));
+            if !vta.enrolled || !permitted {
                 return (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } })))
                     .into_response();
             }
@@ -1493,5 +1564,88 @@ mod tests {
             .await
             .expect_err("nothing to do");
         assert!(err.contains("nothing to re-bootstrap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_the_trust_agent_finished_before_a_crash_is_completed_at_the_next_start() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let first = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+
+        // The swap happened on the trust agent, then the gateway died before it
+        // promoted the new key: only the new DID is enrolled, the key is pending.
+        let new_key = super::super::control_key::ControlKey::generate();
+        mock.0.lock().unwrap().allowed = Some(vec![new_key.did().to_string()]);
+        let current = super::super::appliance_control_key_path(fixture.storage.path());
+        crate::encryption::secret_file::write_secret_file(
+            &super::super::control_rotation::pending_key_path(&current),
+            &new_key.seed_hex(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = fixture.run().await;
+
+        assert_eq!(outcome.status.state, BootstrapState::Connected, "{:?}", outcome.status.detail);
+        let state = outcome.state.expect("state");
+        assert_eq!(state.control_did, new_key.did(), "the record follows the key that is now current");
+        assert_ne!(state.control_did, first.control_did);
+        assert_eq!(mock.creates(), 1, "no second signing key");
+        let note = std::fs::read_to_string(
+            fixture
+                .boot
+                .path()
+                .join(ENROLMENT_FILE),
+        )
+        .unwrap();
+        assert_eq!(note, enrolment_contents(new_key.did()), "a future re-enrolment names the current key");
+        assert!(
+            !super::super::control_rotation::pending_key_path(&current).exists()
+                && !crate::encryption::secret_file::secret_enc_path(&super::super::control_rotation::pending_key_path(
+                    &current
+                ))
+                .exists(),
+            "the pending key is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_key_the_trust_agent_never_accepted_is_dropped_and_the_current_key_kept() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let first = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+
+        // The gateway died before the swap was sent: only the current DID is enrolled.
+        mock.0.lock().unwrap().allowed = Some(vec![first.control_did.clone()]);
+        let never_used = super::super::control_key::ControlKey::generate();
+        let current = super::super::appliance_control_key_path(fixture.storage.path());
+        crate::encryption::secret_file::write_secret_file(
+            &super::super::control_rotation::pending_key_path(&current),
+            &never_used.seed_hex(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = fixture.run().await;
+
+        assert_eq!(outcome.status.state, BootstrapState::Connected, "{:?}", outcome.status.detail);
+        assert_eq!(
+            outcome
+                .state
+                .unwrap()
+                .control_did,
+            first.control_did,
+            "unchanged"
+        );
     }
 }

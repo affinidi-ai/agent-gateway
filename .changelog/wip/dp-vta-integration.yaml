@@ -1,6 +1,16 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-08T23:00:00Z'
+      title: Rotate the gateway's trust agent control key without a new grant
+      description: >-
+        agent-gateway --vta-rotate-control-key --yes moves the gateway's
+        access entry on the bundled trust agent to a new control did:key with
+        acl/swap-key. The trust agent copies the entry exactly, so the grant
+        cannot widen, and the new key is stored as pending first, so a crash
+        part-way is finished at the next start. Run it with the gateway
+        stopped. It is hygiene, not recovery from a leak: whoever holds the
+        current key can rotate it away, and recovery is an operator re-grant.
     - timestamp: '2026-11-08T22:30:00Z'
       title: Recover from a replaced bundled trust agent with --vta-rebootstrap
       description: >-

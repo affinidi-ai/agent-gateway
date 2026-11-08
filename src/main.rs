@@ -131,7 +131,13 @@ struct Args {
     #[arg(long)]
     vta_rebootstrap: bool,
 
-    /// Confirm --vta-rebootstrap.
+    /// Move this gateway's access entry on the bundled trust agent to a new
+    /// control did:key (acl/swap-key), with the same grant. Run with the gateway
+    /// stopped; shows what it would do unless --yes is given.
+    #[arg(long)]
+    vta_rotate_control_key: bool,
+
+    /// Confirm --vta-rebootstrap or --vta-rotate-control-key.
     #[arg(long)]
     yes: bool,
 
@@ -317,6 +323,19 @@ async fn async_main() -> Result<()> {
     // Initialize global encryption config for all storage operations
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
+
+    if args.vta_rotate_control_key {
+        let issuer_storage = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .vc_keys,
+        );
+        let report = vta::bundled::rotate_control_key(&bootstrap_config.vta, &issuer_storage, args.yes)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
 
     if args.vta_rebootstrap {
         let issuer_storage = std::path::PathBuf::from(
