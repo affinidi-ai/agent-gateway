@@ -4194,7 +4194,7 @@ mod live_connection_tests {
                 keys: SigningKeys {
                     active: Some(SigningKey {
                         key_id: active_key.clone(),
-                        public_key: Some(active_public_key),
+                        public_key: Some(active_public_key.clone()),
                         label: None,
                         added_at: now,
                         retired_at: None,
@@ -4275,8 +4275,8 @@ mod live_connection_tests {
             .expect("the stored connection signs");
         assert_eq!(
             payload(&first)["issuer"],
-            vta_did,
-            "a connection-backed surface must be issued by the agent, not the gateway"
+            format!("did:key:{active_public_key}"),
+            "a connection-backed surface must be issued by the key that signed it — its own did:key, never the gateway's"
         );
         assert_ne!(payload(&first)["issuer"], local_did);
         assert_eq!(header(&first)["kid"], active_key, "it must sign with the connection's key, never its context");
