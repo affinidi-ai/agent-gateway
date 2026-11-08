@@ -1126,6 +1126,10 @@ pub async fn vta_status(
             "self_administered": config.mode.allows_self_administration(),
             "auto_provision_contexts": config.auto_provision_contexts,
             "control_did": control_did,
+            "control_did_method": config.effective_control_did_method().as_str(),
+            // How the bundled sidecar's first-start bootstrap went, and who
+            // owns it. Absent unless this gateway runs one.
+            "bootstrap": crate::vta::bundled::status(),
             // What this appliance signs with when nobody has said, and why
             // (VTA-26). Reported so "why is it signing with this?" never
             // requires reading config or code.

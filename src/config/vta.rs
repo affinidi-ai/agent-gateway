@@ -104,6 +104,18 @@ impl VtaMode {
     }
 }
 
+fn default_bootstrap_dir() -> String {
+    "/bootstrap".to_string()
+}
+
+fn default_bootstrap_wait_secs() -> u64 {
+    90
+}
+
+/// The context a bundled gateway is enrolled in. Fixed by the sidecar's
+/// entrypoint, so the gateway never chooses it.
+pub const BUNDLED_CONTEXT_ID: &str = "gateway";
+
 fn default_timeout_ms() -> u64 {
     5_000
 }
@@ -294,6 +306,28 @@ pub struct VtaConfig {
     #[serde(default)]
     pub auth_did: Option<String>,
 
+    /// Connect to the bundled sidecar with no operator action: write the
+    /// gateway's control DID for the sidecar to enrol, wait for the sidecar's
+    /// own DID and pin it, authenticate, check the grant, and create the
+    /// signing key.
+    ///
+    /// Only for `mode = "embedded"` over loopback. With this on, `vta_did`,
+    /// `context_id` and `signing_key_id` come from the bootstrap and need not
+    /// be set; one that is set acts as an extra check.
+    #[serde(default)]
+    pub auto_bootstrap: bool,
+
+    /// The folder shared with the sidecar. The gateway writes
+    /// `gateway-enrolment.env` there and reads `vta-identity.env`. Public
+    /// data only: nothing secret is ever written here.
+    #[serde(default = "default_bootstrap_dir")]
+    pub bootstrap_dir: String,
+
+    /// How long startup waits for the sidecar to publish its identity and
+    /// answer, before reporting `waiting_for_vta`.
+    #[serde(default = "default_bootstrap_wait_secs")]
+    pub bootstrap_wait_secs: u64,
+
     /// Which DID the gateway authenticates to the trust agent as. Absent means
     /// "decide from the deployment": see
     /// [`effective_control_did_method`](Self::effective_control_did_method).
@@ -391,6 +425,9 @@ impl Default for VtaConfig {
             mode: VtaMode::default(),
             auth_key_source: None,
             auth_did: None,
+            auto_bootstrap: false,
+            bootstrap_dir: default_bootstrap_dir(),
+            bootstrap_wait_secs: default_bootstrap_wait_secs(),
             control_did_method: None,
             publish_auth_did: None,
             auth_verification_method: None,
@@ -437,8 +474,12 @@ impl VtaConfig {
             }
         };
         require("base_url", &self.base_url)?;
-        require("vta_did", &self.vta_did)?;
-        require("context_id", &self.context_id)?;
+        if self.auto_bootstrap {
+            self.validate_auto_bootstrap()?;
+        } else {
+            require("vta_did", &self.vta_did)?;
+            require("context_id", &self.context_id)?;
+        }
         if let (Some(method), Some(publish)) = (self.control_did_method, self.publish_auth_did) {
             let publishes = method == ControlDidMethod::DidWebvh;
             if publishes != publish {
@@ -458,7 +499,9 @@ impl VtaConfig {
         // Pinned signing key last: an enabled connector that cannot sign is a
         // misconfiguration, so fail closed at startup rather than at the first
         // signing call.
-        require("signing_key_id", &self.signing_key_id)?;
+        if !self.auto_bootstrap {
+            require("signing_key_id", &self.signing_key_id)?;
+        }
         // A quota window of zero would make the limit meaningless (every call
         // starts a fresh window), so reject it rather than silently disabling
         // the control.
@@ -519,6 +562,53 @@ impl VtaConfig {
         Ok(())
     }
 
+    /// What `auto_bootstrap` needs to be true. It connects to a sidecar this
+    /// deployment ships, so it is refused for anything else: a sidecar that is
+    /// reached over a network, or enrolled with a DID it cannot resolve.
+    fn validate_auto_bootstrap(&self) -> Result<(), String> {
+        if self.mode != VtaMode::Bundled {
+            return Err("[vta] auto_bootstrap is only for the bundled sidecar (`mode = \"embedded\"`)".to_string());
+        }
+        let base_url = self
+            .base_url
+            .as_deref()
+            .unwrap_or_default();
+        if !is_loopback_url(base_url) {
+            return Err(format!(
+                "[vta] auto_bootstrap needs a loopback `base_url` (127.0.0.1, localhost or [::1]); got `{base_url}`"
+            ));
+        }
+        if self.auth_did.is_some() {
+            return Err(
+                "[vta] auto_bootstrap enrols the gateway's own did:key, so `auth_did` must not be set".to_string()
+            );
+        }
+        if self.effective_control_did_method() != ControlDidMethod::DidKey {
+            return Err(
+                "[vta] auto_bootstrap enrols a did:key; set `control_did_method = \"did_key\"` or leave it unset"
+                    .to_string(),
+            );
+        }
+        if let Some(context) = self.context_id.as_deref()
+            && context != BUNDLED_CONTEXT_ID
+        {
+            return Err(format!(
+                "[vta] auto_bootstrap enrols the gateway in context `{BUNDLED_CONTEXT_ID}`; `context_id` must be that or unset"
+            ));
+        }
+        if self
+            .bootstrap_dir
+            .trim()
+            .is_empty()
+        {
+            return Err("[vta] bootstrap_dir must not be empty".to_string());
+        }
+        if self.bootstrap_wait_secs == 0 {
+            return Err("[vta] bootstrap_wait_secs must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+
     /// The DID method the gateway authenticates as, decided in this order:
     ///
     /// 1. `auth_did` set: the operator hosts their own identity.
@@ -569,6 +659,19 @@ impl VtaConfig {
             && self
                 .mode
                 .supports_custody_claim()
+    }
+}
+
+/// Whether `url` names this host alone.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 
@@ -649,6 +752,98 @@ mod tests {
         agreeing
             .validate()
             .expect("agreeing settings are fine");
+    }
+
+    #[test]
+    fn auto_bootstrap_needs_no_vta_coordinates_on_a_bundled_loopback_block() {
+        let cfg: VtaConfig = toml::from_str(
+            r#"
+            enabled = true
+            mode = "embedded"
+            auto_bootstrap = true
+            base_url = "http://127.0.0.1:8100"
+            "#,
+        )
+        .expect("parse");
+        cfg.validate()
+            .expect("the bootstrap supplies vta_did, context and key");
+        assert_eq!(cfg.bootstrap_dir, "/bootstrap");
+        assert_eq!(cfg.bootstrap_wait_secs, 90);
+    }
+
+    #[test]
+    fn auto_bootstrap_is_refused_off_the_bundled_tier_or_off_loopback() {
+        let appliance: VtaConfig =
+            toml::from_str("enabled = true\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"")
+                .expect("parse");
+        assert!(
+            appliance
+                .validate()
+                .expect_err("appliance")
+                .contains("bundled")
+        );
+
+        for url in
+            ["http://vta:8100", "https://vta.example.com", "http://10.0.0.5:8100", "http://127.0.0.1.evil.example:8100"]
+        {
+            let cfg: VtaConfig = toml::from_str(&format!(
+                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{url}\""
+            ))
+            .expect("parse");
+            assert!(
+                cfg.validate()
+                    .expect_err(url)
+                    .contains("loopback"),
+                "{url}"
+            );
+        }
+        for url in ["http://localhost:8100", "http://[::1]:8100", "http://127.0.0.1:8100"] {
+            let cfg: VtaConfig = toml::from_str(&format!(
+                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{url}\""
+            ))
+            .expect("parse");
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+    }
+
+    #[test]
+    fn auto_bootstrap_enrols_a_did_key_in_the_fixed_context_only() {
+        let base = "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\n";
+        let webvh: VtaConfig = toml::from_str(&format!("{base}control_did_method = \"did_webvh\"")).expect("parse");
+        assert!(
+            webvh
+                .validate()
+                .expect_err("webvh")
+                .contains("did:key")
+        );
+        let own: VtaConfig = toml::from_str(&format!("{base}auth_did = \"did:key:z6MkGw\"")).expect("parse");
+        assert!(
+            own.validate()
+                .expect_err("auth_did")
+                .contains("auth_did")
+        );
+        let other: VtaConfig = toml::from_str(&format!("{base}context_id = \"mine\"")).expect("parse");
+        assert!(
+            other
+                .validate()
+                .expect_err("context")
+                .contains("gateway")
+        );
+        let same: VtaConfig = toml::from_str(&format!("{base}context_id = \"gateway\"")).expect("parse");
+        same.validate()
+            .expect("the fixed context is fine");
+    }
+
+    #[test]
+    fn a_block_without_auto_bootstrap_still_requires_its_coordinates() {
+        let cfg: VtaConfig =
+            toml::from_str("enabled = true\nmode = \"embedded\"\nbase_url = \"http://127.0.0.1:8100\"").expect("parse");
+        assert!(
+            cfg.validate()
+                .expect_err("vta_did")
+                .contains("vta_did")
+        );
     }
 
     #[test]

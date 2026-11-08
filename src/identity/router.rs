@@ -2515,11 +2515,14 @@ pub async fn create_identity_api_router(
 
     // What this appliance signs with when nobody has said (VTA-26). `auto`
     // keeps the local issuer key; the bundled agent is an explicit opt-in.
-    let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::with_availability(
-        crate::vta::onboarding_default::resolve(&sts_vta_config),
-        // The bundled agent is "available" exactly when the connector it
-        // needs actually built; a failure here must report, not block.
-        sts_vta_config.enabled,
+    let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::with_bundled_bootstrap(
+        crate::vta::onboarding_default::with_availability(
+            crate::vta::onboarding_default::resolve(&sts_vta_config),
+            // The bundled agent is "available" exactly when the connector it
+            // needs actually built; a failure here must report, not block.
+            sts_vta_config.enabled,
+        ),
+        crate::vta::bundled::status().as_ref(),
     ));
     info!(
         target: "vta_audit",

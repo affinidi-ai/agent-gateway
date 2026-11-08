@@ -1,6 +1,18 @@
 branch: dp-vta-integration
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-08T22:00:00Z'
+      title: ⭐ Connect the bundled trust agent automatically on first start
+      description: >-
+        With [vta] mode = "embedded" and auto_bootstrap = true the gateway
+        writes its own did:key for the sidecar to enrol, waits for the
+        sidecar to publish its DID and pins it, authenticates, checks it holds
+        exactly the expected grant, and creates a non-exportable signing key,
+        with no operator action and no manual grant. A restart keeps the same
+        identity. A replaced, emptied or revoking sidecar is reported on
+        GET /v1/vta/status and never re-enrolled automatically; a gateway that
+        had been connected refuses to sign rather than switch issuer key, and
+        one that never connected signs locally.
   changed:
     - timestamp: '2026-11-08T21:30:00Z'
       title: Stop granting raw sign to the gateway on a trust agent

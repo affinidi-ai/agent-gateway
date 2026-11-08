@@ -25,6 +25,7 @@ pub mod appliance_di;
 pub mod audit;
 pub mod auth_did;
 pub mod authority;
+pub mod bundled;
 pub mod client;
 pub mod connections;
 pub mod connections_admin;

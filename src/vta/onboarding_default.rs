@@ -132,6 +132,52 @@ pub fn with_availability(
     }
 }
 
+/// Fold in how the bundled bootstrap actually went.
+///
+/// - Connected, or no bootstrap at all: nothing changes.
+/// - Not connected, and **never** connected: the sidecar has signed nothing, so
+///   the gateway falls back to its local key and says so. Onboarding is not
+///   blocked.
+/// - Not connected, but **once** connected: tokens were already issued under
+///   the sidecar's key, so signing with a different key would change the issuer
+///   under callers' feet. The backend stays `bundled`, signing is refused, and
+///   the reason says what to do.
+pub fn with_bundled_bootstrap(
+    resolved: DefaultResolution,
+    status: Option<&crate::vta::bundled::BootstrapStatus>,
+) -> DefaultResolution {
+    use crate::vta::bundled::BootstrapState;
+
+    let Some(status) = status.filter(|s| s.state != BootstrapState::Connected) else {
+        return resolved;
+    };
+    let detail = status
+        .detail
+        .as_deref()
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default();
+    if status.previously_connected {
+        return DefaultResolution {
+            backend: "bundled",
+            reason: format!(
+                "the bundled agent is {:?}{detail}, so signing is refused rather than switching issuer key: {}",
+                status.state, status.advice
+            ),
+            explicit: true,
+            fallback_from: None,
+        };
+    }
+    DefaultResolution {
+        backend: "local",
+        reason: format!(
+            "the bundled agent is {:?}{detail}, so this gateway is signing with its own local key: {}",
+            status.state, status.advice
+        ),
+        explicit: true,
+        fallback_from: Some("bundled"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +301,86 @@ mod tests {
 
         let bundled = resolve(&explicit_bundled());
         assert_eq!(with_availability(bundled.clone(), true), bundled, "an available agent is used as chosen");
+    }
+
+    fn bootstrap_status(
+        state: crate::vta::bundled::BootstrapState,
+        previously_connected: bool,
+    ) -> crate::vta::bundled::BootstrapStatus {
+        crate::vta::bundled::BootstrapStatus {
+            state,
+            advice: state.advice(),
+            detail: None,
+            vta_did: None,
+            control_did: None,
+            context_id: "gateway".to_string(),
+            bootstrapped_at: None,
+            previously_connected,
+            owner: "unclaimed",
+        }
+    }
+
+    #[test]
+    fn a_connected_or_absent_bootstrap_changes_nothing() {
+        use crate::vta::bundled::BootstrapState;
+        let resolved = DefaultResolution::bundled("explicit", true);
+        assert_eq!(with_bundled_bootstrap(resolved.clone(), None), resolved);
+        let connected = bootstrap_status(BootstrapState::Connected, true);
+        assert_eq!(with_bundled_bootstrap(resolved.clone(), Some(&connected)), resolved);
+    }
+
+    #[test]
+    fn a_bootstrap_that_never_connected_falls_back_to_local_and_says_why() {
+        use crate::vta::bundled::BootstrapState;
+        let status = bootstrap_status(BootstrapState::WaitingForVta, false);
+
+        let resolution = with_bundled_bootstrap(DefaultResolution::bundled("explicit", true), Some(&status));
+
+        assert_eq!(resolution.backend, "local");
+        assert_eq!(resolution.fallback_from, Some("bundled"));
+        assert!(
+            resolution
+                .reason
+                .contains("WaitingForVta"),
+            "{}",
+            resolution.reason
+        );
+        assert!(
+            resolution
+                .reason
+                .contains("start the bundled trust agent"),
+            "{}",
+            resolution.reason
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_that_was_connected_never_falls_back_to_a_different_issuer_key() {
+        use crate::vta::bundled::BootstrapState;
+        for state in [
+            BootstrapState::Revoked,
+            BootstrapState::VtaLost,
+            BootstrapState::VtaReplaced,
+            BootstrapState::WaitingForVta,
+        ] {
+            let status = bootstrap_status(state, true);
+
+            let resolution = with_bundled_bootstrap(DefaultResolution::bundled("explicit", true), Some(&status));
+
+            assert_eq!(resolution.backend, "bundled", "{state:?} must not switch to local");
+            assert!(
+                resolution
+                    .fallback_from
+                    .is_none(),
+                "{state:?}"
+            );
+            assert!(
+                resolution
+                    .reason
+                    .contains("refused"),
+                "{}",
+                resolution.reason
+            );
+        }
     }
 }

@@ -548,6 +548,22 @@ mod tests {
             .expect("the entrypoint enrols exactly the bundled grant");
     }
 
+    /// Live check of how a trust agent refuses a control key it has no access
+    /// entry for, which is how a revoked or never-enrolled gateway looks.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service; run manually"]
+    async fn live_an_unenrolled_key_is_refused() {
+        let key = Arc::new(ControlKey::from_seed([7u8; 32]));
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:8100".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID to the VTA did:key");
+        let client = VtaRestClient::new(&url, &vta_did, key, Duration::from_secs(15), 8, None).expect("build client");
+        let err = client
+            .authenticate()
+            .await
+            .expect_err("an unenrolled key must be refused");
+        eprintln!("LIVE_REFUSED: {err:?}");
+    }
+
     /// Live VTA-05 check: the real session token's grant scope parses, and the
     /// admin-seeded control key (`vta import-did --role admin`) is correctly
     /// detected as **over-privileged** (not least-privilege). Same manual setup
