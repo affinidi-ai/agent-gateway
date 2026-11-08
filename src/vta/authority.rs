@@ -75,9 +75,10 @@ struct KeyPublic {
 /// [`CredentialAuthority`] backed by a VTA.
 pub struct VtaCredentialAuthority {
     client: Arc<VtaRestClient>,
-    /// The issuer DID whose VTA-held key signs tokens. Established at onboarding
-    /// (VTA-05); until then it defaults to the VTA service DID.
-    issuer_did: String,
+    /// The `iss` the tokens claim is the `did:key` of the signing key itself,
+    /// derived from its public half (see [`Self::issuer_did`]). Cached once
+    /// resolved: a key's public half cannot change.
+    issuer_did_cache: RwLock<Option<String>>,
     /// The pinned VTA key record id that signs the gateway's tokens. The
     /// gateway names the key; the VTA holds it.
     signing_key_id: String,
@@ -107,13 +108,12 @@ pub struct VtaCredentialAuthority {
 impl VtaCredentialAuthority {
     pub fn new(
         client: Arc<VtaRestClient>,
-        issuer_did: String,
         signing_key_id: String,
         audit: Option<VtaAuditSink>,
     ) -> Self {
         Self {
             client,
-            issuer_did,
+            issuer_did_cache: RwLock::new(None),
             signing_key_id,
             retiring_keys: Vec::new(),
             signing_key_public: None,
@@ -169,6 +169,25 @@ impl VtaCredentialAuthority {
     ) -> Self {
         self.quota = quota;
         self
+    }
+
+    /// The signing key's multibase public key (`z6Mk…`), which is also the
+    /// method-specific id of its `did:key`. From the operator-supplied value
+    /// when present, else from the VTA via `keys/show`. Checked to be an
+    /// Ed25519 key before a DID is built from it.
+    async fn signing_key_public_multibase(&self) -> Result<String, VtaError> {
+        let public_key = match &self.signing_key_public {
+            Some(public_key) => public_key.clone(),
+            None => {
+                let result: KeyShowResult = self
+                    .client
+                    .dispatch(TASK_KEYS_SHOW, json!({ "keyId": self.signing_key_id }))
+                    .await?;
+                result.key.public_key
+            }
+        };
+        ed25519_multibase_to_jwk(&public_key, &self.signing_key_id)?;
+        Ok(public_key)
     }
 
     /// Resolve one VTA key's public JWK.
@@ -277,8 +296,30 @@ fn ed25519_multibase_to_jwk(
 
 #[async_trait]
 impl CredentialAuthority for VtaCredentialAuthority {
+    /// The `did:key` of the key that signs, so the claimed issuer is
+    /// self-certifying: its document is the signing key and nothing else, a
+    /// verifier resolves it with no hosting and no registry, and nobody — least
+    /// of all a compromised gateway, which holds no signing key — can point it
+    /// at another key. It is also unique to the key, so two gateways sharing a
+    /// VTA never claim the same issuer.
     async fn issuer_did(&self) -> Result<String> {
-        Ok(self.issuer_did.clone())
+        if let Some(did) = self
+            .issuer_did_cache
+            .read()
+            .await
+            .clone()
+        {
+            return Ok(did);
+        }
+        let public_key = self
+            .signing_key_public_multibase()
+            .await?;
+        let did = format!("did:key:{public_key}");
+        *self
+            .issuer_did_cache
+            .write()
+            .await = Some(did.clone());
+        Ok(did)
     }
 
     async fn issuer_jwks(&self) -> Result<Value> {
@@ -503,7 +544,7 @@ mod poc_tests {
             VtaRestClient::new(base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None)
                 .expect("build client"),
         );
-        VtaCredentialAuthority::new(client, "did:webvh:vta.example".to_string(), signing_key_id.to_string(), None)
+        VtaCredentialAuthority::new(client, signing_key_id.to_string(), None)
     }
 
     /// Verify a compact JWS against `vk`, returning the decoded (header, payload).
@@ -714,6 +755,62 @@ mod poc_tests {
         assert_eq!(jwks, jwks_again);
     }
 
+    /// The claimed issuer is the `did:key` of the signing key: resolving it
+    /// yields that key and nothing else, so no one who controls the gateway can
+    /// repoint it, and a different key is a different issuer.
+    #[tokio::test]
+    async fn the_issuer_is_the_did_key_of_the_signing_key() {
+        use crate::identity::authority::CredentialAuthority;
+        let signing = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let (base, _vta) = spawn(Arc::clone(&signing)).await;
+        let auth = authority(&base, "key-gateway-jwt");
+
+        let did = auth
+            .issuer_did()
+            .await
+            .expect("issuer did");
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(
+            signing
+                .verifying_key()
+                .as_bytes(),
+        );
+        assert_eq!(did, format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, &prefixed)));
+        assert_ne!(did, "did:webvh:vta.example", "never the trust agent's own DID");
+        assert_eq!(
+            auth.issuer_did()
+                .await
+                .unwrap(),
+            did,
+            "stable once resolved"
+        );
+
+        let other_signing = Arc::new(SigningKey::from_bytes(&[14u8; 32]));
+        let (other_base, _other_vta) = spawn(other_signing).await;
+        let other = authority(&other_base, "key-gateway-jwt");
+        assert_ne!(
+            other
+                .issuer_did()
+                .await
+                .unwrap(),
+            did,
+            "two keys never claim the same issuer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_signing_key_yields_no_issuer_rather_than_a_wrong_one() {
+        use crate::identity::authority::CredentialAuthority;
+        let signing = Arc::new(SigningKey::from_bytes(&[15u8; 32]));
+        let (base, _vta) = spawn(signing).await;
+        let auth = authority(&base, "key-gateway-jwt").with_signing_key_public(Some("not-a-key".to_string()));
+        assert!(
+            auth.issuer_did()
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn a_successful_sign_emits_a_data_minimized_audit_record() {
         use crate::vta::audit::{AuditEmitter, AuditRecord, VtaAuditSink, hash_hex};
@@ -743,12 +840,7 @@ mod poc_tests {
         let client = Arc::new(
             VtaRestClient::new(&base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None).unwrap(),
         );
-        let auth = VtaCredentialAuthority::new(
-            client,
-            "did:webvh:vta.example".to_string(),
-            "key-gateway-jwt".to_string(),
-            Some(sink),
-        );
+        let auth = VtaCredentialAuthority::new(client, "key-gateway-jwt".to_string(), Some(sink));
 
         let jws = auth
             .sign_token(&json!({ "sub": "urn:agent:audited" }))
@@ -781,10 +873,9 @@ mod poc_tests {
         // the local key still verifies in-flight tokens while the VTA key signs.
         let local_jwk =
             json!({ "kty": "OKP", "crv": "Ed25519", "x": "bG9jYWw", "use": "sig", "alg": "EdDSA", "kid": "key-1" });
-        let auth =
-            VtaCredentialAuthority::new(client, "did:webvh:vta.example".to_string(), "active-key".to_string(), None)
-                .with_retiring_keys(vec![("retiring-key".to_string(), None)])
-                .with_carried_over_jwks(vec![local_jwk]);
+        let auth = VtaCredentialAuthority::new(client, "active-key".to_string(), None)
+            .with_retiring_keys(vec![("retiring-key".to_string(), None)])
+            .with_carried_over_jwks(vec![local_jwk]);
 
         let jwks = auth
             .issuer_jwks()
@@ -854,8 +945,7 @@ mod poc_tests {
         // The mock answers `keys/show` for any id, so simulate an unresolvable
         // key by pointing the carried-over path at nothing and relying on the
         // active key alone being required.
-        let auth =
-            VtaCredentialAuthority::new(client, "did:webvh:vta.example".to_string(), "active-key".to_string(), None);
+        let auth = VtaCredentialAuthority::new(client, "active-key".to_string(), None);
         let jwks = auth
             .issuer_jwks()
             .await
@@ -877,13 +967,8 @@ mod poc_tests {
         let client = Arc::new(
             VtaRestClient::new(&base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None).unwrap(),
         );
-        let auth = VtaCredentialAuthority::new(
-            client,
-            "did:webvh:vta.example".to_string(),
-            "key-gateway-jwt".to_string(),
-            None,
-        )
-        .with_quota(crate::vta::quota::SignQuota::new(2, 60));
+        let auth = VtaCredentialAuthority::new(client, "key-gateway-jwt".to_string(), None)
+            .with_quota(crate::vta::quota::SignQuota::new(2, 60));
 
         auth.sign_token(&json!({ "sub": "a" }))
             .await
@@ -997,7 +1082,7 @@ mod poc_tests {
         }
         let sink = crate::vta::audit::VtaAuditSink::spawn(8, Arc::new(Capture(Arc::clone(&captured))));
 
-        let auth = VtaCredentialAuthority::new(Arc::clone(&client), vta_did.clone(), key_id, Some(sink))
+        let auth = VtaCredentialAuthority::new(Arc::clone(&client), key_id, Some(sink))
             // VTA-17: an internal key's record is never returned by the VTA — to
             // anyone, at any role — so its public half comes from the
             // `keys/create` response, captured into config at provisioning.

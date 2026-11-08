@@ -284,9 +284,6 @@ impl VtaConnectionRegistry {
             .client(&connection.id)
             .await?;
 
-        // The issuer DID defaults to the VTA service DID until onboarding
-        // establishes a context-scoped one (VTA-05).
-        let issuer_did = connection.vta_did.clone();
         // The key the caller named, else the one `Provision a signing key`
         // recorded as active. A context is **not** a key: passing
         // `default_context_id` here made the agent refuse with "key `<context>`
@@ -303,7 +300,7 @@ impl VtaConnectionRegistry {
             })
             .unwrap_or_default();
 
-        Ok(Arc::new(VtaCredentialAuthority::new(client, issuer_did, signing_key_id, None)))
+        Ok(Arc::new(VtaCredentialAuthority::new(client, signing_key_id, None)))
     }
 
     /// The dialled client for a connection, before any signing role is put on

@@ -7,9 +7,9 @@
 enabled = true
 
 # Appliance signing default, for installs that do not enable `[vta]` at all.
-# `auto` (the default) gives a new install the bundled agent and leaves an
-# existing install on the local key it already signs with. Set it explicitly
-# for a fleet or IaC install so the dashboard is never needed.
+# `auto` (the default) keeps the local issuer key; `bundled` opts in to the
+# bundled agent. Set it explicitly for a fleet or IaC install so the dashboard
+# is never needed.
 # default_backend = "bundled"
 
 # `embedded` is the wire spelling of the bundled deployment, kept for config

@@ -2320,19 +2320,10 @@ pub async fn create_identity_api_router(
     }
     let key_directory = std::sync::Arc::new(key_directory);
 
-    // What this appliance signs with when nobody has said (VTA-26). An
-    // existing install is detected by the presence of a local issuer key,
-    // because that key exists precisely because this gateway has already been
-    // signing with it — so upgrading changes nothing and migrates nothing.
-    // A fresh install has nothing to preserve and takes the better default.
-    let install_kind = crate::vta::onboarding_default::InstallKind::from_local_key_present(
-        sts_vc_issuer
-            .get_issuer_did()
-            .await
-            .is_ok(),
-    );
+    // What this appliance signs with when nobody has said (VTA-26). `auto`
+    // keeps the local issuer key; the bundled agent is an explicit opt-in.
     let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::with_availability(
-        crate::vta::onboarding_default::resolve(&sts_vta_config, install_kind),
+        crate::vta::onboarding_default::resolve(&sts_vta_config),
         // The bundled agent is "available" exactly when the connector it
         // needs actually built; a failure here must report, not block.
         sts_vta_config.enabled,
@@ -2360,6 +2351,7 @@ pub async fn create_identity_api_router(
                 vta_config: std::sync::Arc::new(sts_vta_config.clone()),
                 provisioner: Some(std::sync::Arc::clone(&context_provisioner)),
                 default_resolution: std::sync::Arc::clone(&default_resolution),
+                identity_store: Some(sts_vc_issuer.get_identity_store()),
             },
             sts_secrets_store.clone(),
         )

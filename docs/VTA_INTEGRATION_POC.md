@@ -113,10 +113,25 @@ What a relying party sees changes in exactly two ways:
 
 | Claim / header | Local backend | VTA backend |
 |---|---|---|
-| `iss` | the gateway issuer DID | **the VTA-backed issuer DID** (`issuer_did()` of the active backend) |
+| `iss` | the gateway issuer DID | **the `did:key` of the VTA signing key** (`issuer_did()` of the active backend) |
 | `kid` | `key-1` | the **pinned VTA key id** |
 | `alg` | `EdDSA` | `EdDSA` (the **VTA** sets it from the key record) |
 | everything else | unchanged | unchanged |
+
+**Why `iss` is a `did:key`, not the gateway DID or the trust agent's DID.** A
+`did:key` is the public key written as a DID, so its document is that key and
+nothing else: it resolves with no hosting, nobody can repoint it, and a
+compromised gateway — which holds no signing key — cannot make tokens verify
+under a key of its own choosing. The gateway DID's document and the JWKS are
+both served by the gateway, so anything anchored there can be rewritten by
+whoever controls the host. The trust agent's own DID does not list the key at
+all, and two gateways sharing one agent would claim the same issuer. A
+different key is a different issuer, so **rotating the signing key changes
+`iss`**; the loopback ID-JAG check accepts any `did:key` issuer whose key the
+gateway still publishes, so tokens signed before a rotation or by a
+per-surface key keep verifying. A verifier that wants this protection resolves
+`iss` rather than trusting the gateway's JWKS, and `kid` remains the key
+record id, not a verification-method id.
 
 Both the **`iss` value** and the **verification keys** come from the *same*
 `CredentialAuthority`, so they can never disagree:
@@ -341,6 +356,14 @@ change their DIDs, invalidating credentials already issued to them and any
 trust-registry record that names them. A long-lived deployment will therefore
 keep most of its agents on gateway-held keys indefinitely. If you need them
 moved, that is a re-onboarding exercise with a DID change, not a setting.
+
+**Disconnecting strands the agents onboarded while connected.** Their keys live
+in the trust agent, so revoking, deleting or disabling the connection stops them
+signing, and the only recovery is re-onboarding with a new DID. The gateway
+therefore refuses those three actions with `409` while any agent keeps its key
+in the connection, naming how many. Repeat the request with
+`?acknowledge_stranded_agents=true` to proceed; the dashboard asks for a second
+click on Revoke with that message.
 
 `GET /v1/key-management/inventory` answers "which agents still have a key on
 this disk" directly, per record.

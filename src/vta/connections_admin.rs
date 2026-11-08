@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -45,6 +45,73 @@ pub struct VtaConnectionAdminState {
     /// Resolved once at startup — it is a property of the install, not of a
     /// request.
     pub default_resolution: Arc<crate::vta::onboarding_default::DefaultResolution>,
+    /// Agent identities, so a connection that holds agents' keys cannot be
+    /// disconnected without the caller acknowledging they will be stranded.
+    pub identity_store: Option<Arc<dyn crate::identity::store::IdentityStore>>,
+}
+
+/// Query for the actions that stop a connection signing.
+#[derive(Debug, Default, Deserialize)]
+pub struct DisconnectQuery {
+    /// Proceed although agents whose keys live in this connection will stop
+    /// being able to sign.
+    #[serde(default)]
+    pub acknowledge_stranded_agents: bool,
+}
+
+/// How many agents hold their key in `connection_id`. A record written before
+/// the connection was tracked can only have used the bootstrap one.
+async fn agents_holding_keys(
+    state: &VtaConnectionAdminState,
+    connection_id: &str,
+) -> usize {
+    let Some(store) = state.identity_store.as_ref() else {
+        return 0;
+    };
+    match store.list_all().await {
+        Ok(records) => records
+            .iter()
+            .filter(|record| {
+                record
+                    .vta_context_id
+                    .is_some()
+                    && record
+                        .vta_connection_id
+                        .as_deref()
+                        .unwrap_or(crate::vta::connections::BOOTSTRAP_CONNECTION_ID)
+                        == connection_id
+            })
+            .count(),
+        Err(e) => {
+            error!(error = %e, "Failed to list agent identities before disconnecting a VTA connection");
+            0
+        }
+    }
+}
+
+/// Refuse to stop a connection signing while agents' keys live in it, unless
+/// the caller acknowledged the consequence. Those agents cannot be moved: their
+/// keys are in the trust agent, so they would have to be re-onboarded under a
+/// new DID.
+async fn guard_stranded_agents(
+    state: &VtaConnectionAdminState,
+    connection_id: &str,
+    acknowledged: bool,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if acknowledged {
+        return Ok(());
+    }
+    let held = agents_holding_keys(state, connection_id).await;
+    if held == 0 {
+        return Ok(());
+    }
+    Err((
+        StatusCode::CONFLICT,
+        ErrorBody::json(format!(
+            "{held} agent(s) keep their key in this trust agent and cannot sign without it. They cannot be moved; \
+             they would have to be re-onboarded with a new DID."
+        )),
+    ))
 }
 
 /// Body for create / update.
@@ -395,6 +462,7 @@ pub async fn update_connection(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
     secrets_store: Option<Extension<Arc<dyn SecretsStore>>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
@@ -434,6 +502,12 @@ pub async fn update_connection(
             ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
         )
             .into_response();
+    }
+    if existing.enabled
+        && !body.enabled
+        && let Err(e) = guard_stranded_agents(&state, &id, query.acknowledge_stranded_agents).await
+    {
+        return e.into_response();
     }
     // Ownership is not reassignable here (see the tenancy section of AGENTS.md).
     body.tenant_id = existing.tenant_id.clone();
@@ -482,6 +556,7 @@ pub async fn delete_connection(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -517,6 +592,9 @@ pub async fn delete_connection(
             error!(id = %id, error = %e, "Failed to load VTA connection before delete");
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response();
         }
+    }
+    if let Err(e) = guard_stranded_agents(&state, &id, query.acknowledge_stranded_agents).await {
+        return e.into_response();
     }
     match state.store.delete(&id).await {
         Ok(()) => {
@@ -736,6 +814,7 @@ pub async fn revoke_connection(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -757,6 +836,9 @@ pub async fn revoke_connection(
         Err(e) => return e.into_response(),
     };
 
+    if let Err(e) = guard_stranded_agents(&state, &id, query.acknowledge_stranded_agents).await {
+        return e.into_response();
+    }
     let pairing = crate::vta::pairing::revoke(&connection.pairing);
     info!(target: "vta_audit", connection_id = %id, "VTA connection revoked");
     match persist_pairing(&state, connection, pairing).await {
@@ -1342,6 +1424,104 @@ mod tests {
         }
     }
 
+    async fn admin_state(
+        identity_store: Option<Arc<dyn crate::identity::store::IdentityStore>>
+    ) -> (VtaConnectionAdminState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::vta::connections::FileSystemVtaConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .expect("connection store");
+        let state = VtaConnectionAdminState {
+            store: Arc::new(store),
+            registry: None,
+            vta_config: Arc::new(VtaConfig::default()),
+            provisioner: None,
+            default_resolution: Arc::new(crate::vta::onboarding_default::resolve(&VtaConfig::default())),
+            identity_store,
+        };
+        (state, dir)
+    }
+
+    fn agent(
+        did: &str,
+        context: Option<&str>,
+        connection: Option<&str>,
+    ) -> crate::identity::AgentIdentityRecord {
+        crate::identity::AgentIdentityRecord {
+            did: did.to_string(),
+            identity_hash: format!("hash-{did}"),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            vta_context_id: context.map(str::to_string),
+            vta_connection_id: connection.map(str::to_string),
+            channel_config_id: None,
+            is_local: true,
+            verified: true,
+            origin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnecting_is_refused_while_agents_keep_their_key_in_the_connection() {
+        let store = Arc::new(crate::identity::test_helpers::MockIdentityStore::new());
+        for record in [
+            agent("did:key:a", Some("ctx-a"), Some("other")),
+            agent("did:key:b", Some("ctx-b"), Some("other")),
+            agent("did:key:c", Some("ctx-c"), None),
+            agent("did:key:d", None, Some("other")),
+        ] {
+            crate::identity::store::IdentityStore::create(&*store, record)
+                .await
+                .expect("store");
+        }
+        let (state, _dir) = admin_state(Some(store)).await;
+
+        let (status, body) = guard_stranded_agents(&state, "other", false)
+            .await
+            .expect_err("two agents hold keys in `other`");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.0
+                .error
+                .contains("2 agent(s)"),
+            "unexpected message: {}",
+            body.0.error
+        );
+
+        assert_eq!(agents_holding_keys(&state, "other").await, 2, "a record with no context holds nothing");
+        assert_eq!(
+            agents_holding_keys(&state, crate::vta::connections::BOOTSTRAP_CONNECTION_ID).await,
+            1,
+            "a record from before connections were tracked belongs to the bootstrap one"
+        );
+        assert!(
+            guard_stranded_agents(&state, "other", true)
+                .await
+                .is_ok(),
+            "acknowledging proceeds"
+        );
+        assert!(
+            guard_stranded_agents(&state, "unused", false)
+                .await
+                .is_ok(),
+            "an empty connection is free to go"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_identity_store_nothing_blocks_a_disconnect() {
+        let (state, _dir) = admin_state(None).await;
+        assert!(
+            guard_stranded_agents(&state, "any", false)
+                .await
+                .is_ok()
+        );
+    }
+
     /// The whole point of the fallback: an operator pairing the `[vta]` block
     /// must be shown the DID to grant. Before this it was a 400, and the DID
     /// appeared nowhere readable — redacted in logs, encrypted on disk.
@@ -1486,12 +1666,8 @@ mod live_key_tests {
 
         // Sign with exactly that key, the way the registry does for a surface.
         use crate::identity::authority::CredentialAuthority;
-        let authority = crate::vta::authority::VtaCredentialAuthority::new(
-            Arc::clone(&client),
-            env("VTA_LIVE_DID"),
-            key.key_id.clone(),
-            None,
-        );
+        let authority =
+            crate::vta::authority::VtaCredentialAuthority::new(Arc::clone(&client), key.key_id.clone(), None);
         let jwt = authority
             .sign_token(&serde_json::json!({ "sub": "wizard-live-test", "ctx": context }))
             .await

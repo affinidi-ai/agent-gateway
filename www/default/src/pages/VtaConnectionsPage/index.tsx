@@ -9,7 +9,7 @@ import { ConnectVtaWizard } from './ConnectVtaWizard';
 import { NewVtaConnectionForm } from './NewVtaConnectionForm';
 import { VtaConnectionsList } from './VtaConnectionsList';
 import { VtaTierBanner } from './VtaTierBanner';
-import { useVtaConnections } from './useVtaConnections';
+import { StrandedAgentsError, useVtaConnections } from './useVtaConnections';
 import type { NewVtaConnection, VtaConnection } from './types';
 
 /**
@@ -35,6 +35,7 @@ const VtaConnectionsPage: React.FC = () => {
   const [pairing, setPairing] = useState<VtaConnection | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
+  const [strandedConfirm, setStrandedConfirm] = useState<string | null>(null);
 
   const canEdit = hasPermission('vta_connections.edit');
   const canDelete = hasPermission('vta_connections.delete');
@@ -78,15 +79,22 @@ const VtaConnectionsPage: React.FC = () => {
       setConfirmRevoke(null);
       setBusyId(connection.id);
       try {
-        await revoke(connection);
+        await revoke(connection, strandedConfirm === connection.id);
+        setStrandedConfirm(null);
         showToast('success', `${connection.name} is revoked and can no longer sign.`);
       } catch (e) {
-        showToast('error', e instanceof Error ? e.message : 'Revoke failed.');
+        if (e instanceof StrandedAgentsError) {
+          setStrandedConfirm(connection.id);
+          setConfirmRevoke(connection.id);
+          showToast('error', `${e.message} Click Revoke again to proceed.`);
+        } else {
+          showToast('error', e instanceof Error ? e.message : 'Revoke failed.');
+        }
       } finally {
         setBusyId(null);
       }
     },
-    [confirmRevoke, revoke]
+    [confirmRevoke, strandedConfirm, revoke]
   );
 
   /** Create, then go straight to pairing: a connection is of no use unpaired. */

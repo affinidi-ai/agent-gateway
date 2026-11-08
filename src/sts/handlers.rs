@@ -317,6 +317,22 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
                 .await;
         }
 
+        // A VTA-signed token claims the `did:key` of the key that signed it, so
+        // a surface mapped to its own key, or a key retired by a rotation,
+        // claims a different issuer than the appliance's current one. It is
+        // still ours when that key is one this gateway publishes.
+        if iss.starts_with("did:key:")
+            && let Ok(jwks) = self
+                .self_authority
+                .issuer_jwks()
+                .await
+            && jwks_publishes_did_key(&jwks, &iss)
+        {
+            return self
+                .verify_local_jwt(token, &iss)
+                .await;
+        }
+
         let strategies = self
             .strategies
             .list()
@@ -1577,6 +1593,33 @@ pub(crate) fn gateway_self_trust_strategy(
         created_at: now,
         updated_at: now,
     })
+}
+
+/// Whether `jwks` publishes the Ed25519 key that `did` (a `did:key`) is.
+fn jwks_publishes_did_key(
+    jwks: &Value,
+    did: &str,
+) -> bool {
+    use base64::Engine;
+    let Some(multibase_key) = did.strip_prefix("did:key:") else {
+        return false;
+    };
+    let Ok((_base, bytes)) = multibase::decode(multibase_key) else {
+        return false;
+    };
+    if bytes.len() != 34 || bytes[..2] != [0xed, 0x01] {
+        return false;
+    }
+    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes[2..]);
+    jwks.get("keys")
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter().any(|k| {
+                k.get("x")
+                    .and_then(Value::as_str)
+                    == Some(x.as_str())
+            })
+        })
 }
 
 /// Read the (unverified) `iss` from a JWT for strategy selection. The signature
@@ -3343,6 +3386,23 @@ mod tests {
             }
             other => panic!("expected a Static jwks source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_did_key_issuer_is_ours_only_when_its_key_is_published() {
+        let x_bytes = [7u8; 32];
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(&x_bytes);
+        let did = format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, &prefixed));
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x_bytes);
+
+        let published = json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": x, "kid": "k" }] });
+        assert!(jwks_publishes_did_key(&published, &did));
+
+        let other = json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": "AAAA", "kid": "k" }] });
+        assert!(!jwks_publishes_did_key(&other, &did), "a key we do not publish is not ours");
+        assert!(!jwks_publishes_did_key(&published, "did:web:example.com"), "only a did:key can be matched");
+        assert!(!jwks_publishes_did_key(&published, "did:key:not-multibase!"));
     }
 
     #[test]

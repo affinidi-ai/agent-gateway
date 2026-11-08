@@ -177,10 +177,9 @@ pub struct VtaConfig {
 
     /// What this appliance signs with when nobody has said (VTA-26).
     ///
-    /// `auto` (the default) decides from the install: a **new** install takes
-    /// the bundled agent and asks nothing, an **existing** install keeps the
-    /// local key it has already been signing with. Settable explicitly so a
-    /// fleet or IaC install never needs the dashboard.
+    /// `auto` (the default) keeps the local issuer key, whatever the install
+    /// looks like; `bundled` opts into the bundled agent. Settable explicitly
+    /// so a fleet or IaC install never needs the dashboard.
     ///
     /// Ignored when [`Self::enabled`] is set: an explicitly configured agent
     /// always wins, because a default that could override configured behaviour

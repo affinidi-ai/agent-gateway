@@ -165,7 +165,8 @@ pub struct OnboardingRecord {
     pub control_did: String,
     /// The VTA context the scoped grant lives in.
     pub context_id: String,
-    /// The issuer DID the gateway's artifacts are signed under.
+    /// The VTA service DID the grant was issued by. Not the `iss` of the
+    /// tokens the gateway signs, which is the `did:key` of its signing key.
     pub issuer_did: String,
     /// When the grant was recorded.
     pub granted_at: DateTime<Utc>,

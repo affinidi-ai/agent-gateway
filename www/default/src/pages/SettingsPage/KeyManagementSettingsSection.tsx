@@ -23,8 +23,8 @@ interface VtaStatus {
 /**
  * Key management, collapsed out of the default path (VTA-26).
  *
- * A new install is not asked anything about keys or agents: the gateway picks
- * a working default and reports it here. Everything configurable lives behind
+ * A gateway is not asked anything about keys or agents: it keeps signing with
+ * its local key by default and reports that here. Everything configurable lives behind
  * this disclosure so the easy path stays easy, and so an operator who *does*
  * care can see which backend is active, why, and how to change it — without
  * reading config or code.

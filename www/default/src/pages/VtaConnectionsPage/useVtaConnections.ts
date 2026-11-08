@@ -16,6 +16,8 @@ async function readError(response: Response, endpoint?: string): Promise<string>
   return explainFailure(detail, endpoint);
 }
 
+export class StrandedAgentsError extends Error {}
+
 export interface VtaConnectionsState {
   connections: VtaConnection[];
   deployment: VtaDeploymentStatus | null;
@@ -26,7 +28,7 @@ export interface VtaConnectionsState {
   pair: (connection: VtaConnection) => Promise<PairingPayload>;
   verify: (connection: VtaConnection) => Promise<VtaConnection>;
   provisionKey: (connection: VtaConnection) => Promise<VtaConnection>;
-  revoke: (connection: VtaConnection) => Promise<void>;
+  revoke: (connection: VtaConnection, acknowledgeStrandedAgents?: boolean) => Promise<void>;
 }
 
 export function useVtaConnections(): VtaConnectionsState {
@@ -124,11 +126,15 @@ export function useVtaConnections(): VtaConnectionsState {
   );
 
   const revoke = useCallback(
-    async (connection: VtaConnection) => {
+    async (connection: VtaConnection, acknowledgeStrandedAgents = false) => {
+      const query = acknowledgeStrandedAgents ? '?acknowledge_stranded_agents=true' : '';
       const response = await apiClient.fetch(
-        `${BASE}/${encodeURIComponent(connection.id)}/revoke`,
+        `${BASE}/${encodeURIComponent(connection.id)}/revoke${query}`,
         { method: 'POST' }
       );
+      if (response.status === 409) {
+        throw new StrandedAgentsError(await readError(response, connection.endpoint));
+      }
       if (!response.ok) throw new Error(await readError(response, connection.endpoint));
       replace((await response.json()) as VtaConnection);
     },

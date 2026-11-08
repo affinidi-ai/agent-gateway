@@ -2,6 +2,36 @@ branch: dp-vta-integration
 changes:
   added: []
   changed:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Issue trust-agent-signed tokens under the DID of the signing key
+      description: >-
+        Tokens and ID-JAGs signed through a trust agent now claim the did:key
+        of the key that signed them as their issuer, instead of the trust
+        agent's service DID. That DID's document never listed the key, so the
+        tokens only verified through the gateway's JWKS, and two gateways
+        sharing one trust agent claimed the same issuer. A did:key is the key
+        itself, so it cannot be repointed by anyone who controls the gateway.
+        Rotating the signing key now changes the issuer; the gateway still
+        accepts its own tokens from a retired or per-surface key. Verifiers
+        that pin the old issuer must be updated.
+    - timestamp: '2026-11-08T12:05:00Z'
+      title: Keep the local signing key by default; make the bundled trust agent opt-in
+      description: >-
+        The default signing backend is now the gateway's own key on every
+        install, new or existing. Choosing the bundled trust agent takes
+        default_backend = "bundled". Defaulting new installs to it put a second
+        service in every deployment, and inferring the choice from whether a
+        local key was on disk meant a rebuilt volume or a sidecar that was down
+        at startup could silently change which backend signed.
+    - timestamp: '2026-11-08T12:10:00Z'
+      title: Ask before disconnecting a trust agent that holds agent keys
+      description: >-
+        Revoking, deleting or disabling a trust-agent connection now fails with
+        a conflict while agents keep their key in it, naming how many, unless
+        the request acknowledges they will be stranded. Those agents cannot be
+        moved and would need re-onboarding with a new DID. The dashboard shows
+        the message and asks for a second click on Revoke. The setup guide
+        explains that there is no migration for existing agents.
     - timestamp: '2026-11-08T10:00:00Z'
       title: Sign agent credentials through a trust agent with its specified signing task
       description: >-

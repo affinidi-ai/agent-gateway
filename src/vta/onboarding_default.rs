@@ -1,20 +1,9 @@
 //! What a gateway signs with when nobody has said.
 //!
-//! A new install must ask nothing about keys or agents: it picks a working
-//! default and just works. An **existing** install must change nothing at all
-//! — upgrading is not consent, and the key it has been signing with is the key
-//! it keeps signing with until an operator opts in.
-//!
-//! Those two requirements point in opposite directions, so the distinction is
-//! made explicitly rather than inferred from config that looks the same in
-//! both cases.
-//!
-//! ## How "existing install" is detected
-//!
-//! By the presence of a local issuer key on disk. That is the honest signal:
-//! the key exists precisely because this gateway has already been signing with
-//! it, and anything it signed is verifiable against it. A fresh install has
-//! nothing to preserve, so it is free to take the better default.
+//! A gateway keeps signing with its local issuer key unless an operator opts
+//! into the bundled agent or connects their own. Nothing is inferred from the
+//! state of the disk: a rebuilt volume or a sidecar that happens to be down
+//! must never change which backend signs.
 //!
 //! ## The reversibility invariant
 //!
@@ -31,35 +20,14 @@ use crate::config::vta::{VtaConfig, VtaMode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultBackend {
-    /// Decide from the install: bundled for a new one, local for an existing
-    /// one. The default, because it is the only value that is right for both.
+    /// The in-process issuer key, for now. The default; the bundled agent
+    /// is an explicit opt-in.
     #[default]
     Auto,
     /// Always the in-process issuer key, whatever the install looks like.
     LegacyLocal,
     /// Always the bundled sidecar.
     Bundled,
-}
-
-/// Whether this gateway has signed anything before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallKind {
-    /// No local issuer key on disk — nothing to preserve.
-    Fresh,
-    /// A local issuer key already exists, so something may already have been
-    /// signed with it.
-    Existing,
-}
-
-impl InstallKind {
-    /// Classify from whether a local issuer key is already present.
-    pub fn from_local_key_present(present: bool) -> Self {
-        if present {
-            Self::Existing
-        } else {
-            Self::Fresh
-        }
-    }
 }
 
 /// What the appliance will actually sign with, and why.
@@ -109,10 +77,7 @@ impl DefaultResolution {
 /// An explicitly enabled `[vta]` block always wins: the operator has already
 /// said what they want, and a default that could override it would be a
 /// default that changes configured behaviour.
-pub fn resolve(
-    config: &VtaConfig,
-    install: InstallKind,
-) -> DefaultResolution {
+pub fn resolve(config: &VtaConfig) -> DefaultResolution {
     if config.enabled {
         let backend = if config.mode == VtaMode::Bundled {
             "bundled"
@@ -131,33 +96,25 @@ pub fn resolve(
         };
     }
 
-    match (config.default_backend, install) {
-        (DefaultBackend::LegacyLocal, _) => {
+    match config.default_backend {
+        DefaultBackend::Auto => DefaultResolution::local(
+            "this gateway signs with its own local issuer key; connect an agent to change that",
+            false,
+        ),
+        DefaultBackend::LegacyLocal => {
             DefaultResolution::local("`default_backend = \"legacy_local\"` was set explicitly", true)
         }
-        (DefaultBackend::Bundled, _) => {
+        DefaultBackend::Bundled => {
             DefaultResolution::bundled("`default_backend = \"bundled\"` was set explicitly", true)
         }
-        // Upgrading is not consent. An existing install keeps signing with the
-        // key it already signed with, and nothing is migrated.
-        (DefaultBackend::Auto, InstallKind::Existing) => DefaultResolution::local(
-            "this gateway already has a local issuer key, so it keeps using it; connect an agent to change that",
-            false,
-        ),
-        (DefaultBackend::Auto, InstallKind::Fresh) => DefaultResolution::bundled(
-            "a new install defaults to the bundled agent, so there is nothing to set up",
-            false,
-        ),
     }
 }
 
 /// Fold in whether the chosen backend is actually usable.
 ///
 /// A bundled agent that did not come up must not block onboarding, and must
-/// not be papered over either. Falling back to the **local** key is safe here
-/// precisely because this path is only reachable on a fresh install or an
-/// explicit choice: there is no older key whose artifacts would stop
-/// verifying, so nothing signs with a key an operator would not expect.
+/// not be papered over either. Only an explicit `bundled` choice can reach
+/// this, and the fallback is reported in the resolution rather than silent.
 pub fn with_availability(
     resolved: DefaultResolution,
     bundled_available: bool,
@@ -195,75 +152,38 @@ mod tests {
         }
     }
 
-    // ---- the two install shapes ------------------------------------------
-
     #[test]
-    fn a_fresh_install_needs_no_questions_and_gets_the_bundled_agent() {
-        let resolved = resolve(&disabled(), InstallKind::Fresh);
-        assert_eq!(resolved.backend, "bundled");
-        assert!(!resolved.explicit, "nobody was asked");
-        assert!(
-            resolved
-                .reason
-                .contains("new install"),
-            "the reason must be operator-readable: {}",
-            resolved.reason
-        );
-    }
-
-    /// Upgrading is not consent: the key this gateway already signed with is
-    /// the key it keeps signing with.
-    #[test]
-    fn an_existing_install_keeps_its_local_key_with_no_behaviour_change() {
-        let resolved = resolve(&disabled(), InstallKind::Existing);
+    fn auto_signs_with_the_local_key_and_asks_nothing() {
+        let resolved = resolve(&disabled());
         assert_eq!(resolved.backend, "local");
-        assert!(!resolved.explicit);
-        assert!(
-            resolved
-                .reason
-                .contains("already has a local issuer key"),
-            "unexpected reason: {}",
-            resolved.reason
-        );
+        assert!(!resolved.explicit, "nobody was asked");
         assert!(
             resolved
                 .fallback_from
                 .is_none(),
             "nothing failed; this is the intended outcome"
         );
+        assert!(
+            resolved
+                .reason
+                .contains("local issuer key"),
+            "the reason must be operator-readable: {}",
+            resolved.reason
+        );
     }
 
     #[test]
-    fn the_install_kind_follows_the_presence_of_a_local_key() {
-        assert_eq!(InstallKind::from_local_key_present(true), InstallKind::Existing);
-        assert_eq!(InstallKind::from_local_key_present(false), InstallKind::Fresh);
-    }
+    fn an_explicit_default_is_honoured() {
+        let local = resolve(&VtaConfig {
+            default_backend: DefaultBackend::LegacyLocal,
+            ..disabled()
+        });
+        assert_eq!(local.backend, "local");
+        assert!(local.explicit, "a configured value is an explicit choice");
 
-    // ---- explicit configuration wins -------------------------------------
-
-    #[test]
-    fn an_explicit_default_is_honoured_on_both_install_shapes() {
-        for install in [InstallKind::Fresh, InstallKind::Existing] {
-            let local = resolve(
-                &VtaConfig {
-                    default_backend: DefaultBackend::LegacyLocal,
-                    ..disabled()
-                },
-                install,
-            );
-            assert_eq!(local.backend, "local");
-            assert!(local.explicit, "a configured value is an explicit choice");
-
-            let bundled = resolve(
-                &VtaConfig {
-                    default_backend: DefaultBackend::Bundled,
-                    ..disabled()
-                },
-                install,
-            );
-            assert_eq!(bundled.backend, "bundled");
-            assert!(bundled.explicit);
-        }
+        let bundled = resolve(&explicit_bundled());
+        assert_eq!(bundled.backend, "bundled");
+        assert!(bundled.explicit);
     }
 
     /// Fleet and IaC installs must never need the dashboard, so the default is
@@ -272,11 +192,11 @@ mod tests {
     fn the_default_is_settable_from_config() {
         let cfg: VtaConfig = toml::from_str("default_backend = \"bundled\"").expect("parse");
         assert_eq!(cfg.default_backend, DefaultBackend::Bundled);
-        assert_eq!(resolve(&cfg, InstallKind::Existing).backend, "bundled");
+        assert_eq!(resolve(&cfg).backend, "bundled");
 
-        // Absent means `auto`, which is the only value right for both shapes.
         let bare: VtaConfig = toml::from_str("").expect("parse");
         assert_eq!(bare.default_backend, DefaultBackend::Auto);
+        assert_eq!(resolve(&bare).backend, "local", "absent means the local key, never the bundled agent");
     }
 
     /// A default that could override configured behaviour would not be a
@@ -288,25 +208,30 @@ mod tests {
                 default_backend: backend,
                 ..enabled(VtaMode::Appliance)
             };
-            let resolved = resolve(&cfg, InstallKind::Existing);
+            let resolved = resolve(&cfg);
             assert_eq!(resolved.backend, "vta", "the configured agent must win over `{backend:?}`");
             assert!(resolved.explicit);
         }
 
-        let bundled = resolve(&enabled(VtaMode::Bundled), InstallKind::Fresh);
-        assert_eq!(bundled.backend, "bundled");
+        assert_eq!(resolve(&enabled(VtaMode::Bundled)).backend, "bundled");
     }
 
     // ---- safe fallback ----------------------------------------------------
 
+    fn explicit_bundled() -> VtaConfig {
+        VtaConfig {
+            default_backend: DefaultBackend::Bundled,
+            ..disabled()
+        }
+    }
+
     #[test]
     fn an_unavailable_bundled_agent_does_not_block_onboarding() {
-        let resolved = with_availability(resolve(&disabled(), InstallKind::Fresh), false);
+        let resolved = with_availability(resolve(&explicit_bundled()), false);
 
-        // Onboarding completes: there is a usable answer, not an error.
         assert_eq!(resolved.backend, "local");
-        // And it is reported, not papered over.
         assert_eq!(resolved.fallback_from, Some("bundled"));
+        assert!(resolved.explicit, "the operator's choice is still reported as explicit");
         assert!(
             resolved
                 .reason
@@ -325,18 +250,10 @@ mod tests {
 
     #[test]
     fn availability_only_affects_a_bundled_choice() {
-        let local = resolve(&disabled(), InstallKind::Existing);
+        let local = resolve(&disabled());
         assert_eq!(with_availability(local.clone(), false), local, "a local default has nothing to fall back from");
 
-        let bundled = resolve(&disabled(), InstallKind::Fresh);
+        let bundled = resolve(&explicit_bundled());
         assert_eq!(with_availability(bundled.clone(), true), bundled, "an available agent is used as chosen");
-    }
-
-    /// The fallback is only ever to the local key, and only where no older key
-    /// exists — so nothing signs with a key an operator would not expect.
-    #[test]
-    fn the_fallback_never_reaches_an_existing_install_implicitly() {
-        let resolved = resolve(&disabled(), InstallKind::Existing);
-        assert_eq!(resolved.backend, "local", "an existing install never auto-selects bundled, so it cannot fall back");
     }
 }

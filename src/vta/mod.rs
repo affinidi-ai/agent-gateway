@@ -163,10 +163,6 @@ pub async fn select_signing_backends(
         .to_string();
 
     let control_key = build_control_key(config).await?;
-    // The issuer DID is established at onboarding (VTA-05); until then it
-    // defaults to the VTA service DID.
-    let issuer_did = vta_did.to_string();
-
     // Customer-sovereign onboarding (VTA-05): print the exact one-consent-step
     // grant command the customer runs on their VTA, and set up the post-auth
     // grant-scope + record checks. The gateway never holds VTA admin itself.
@@ -184,7 +180,7 @@ pub async fn select_signing_backends(
     let onboarding = onboarding::OnboardingState::new(
         record_path,
         context_id.to_string(),
-        issuer_did.clone(),
+        vta_did.to_string(),
         std::time::Duration::from_secs(ROTATION_MIN_INTERVAL_SECS),
     );
 
@@ -254,7 +250,7 @@ pub async fn select_signing_backends(
 
     Ok(SelectedSigning {
         authority: Arc::new(
-            VtaCredentialAuthority::new(Arc::clone(&client), issuer_did, signing_key_id, audit)
+            VtaCredentialAuthority::new(Arc::clone(&client), signing_key_id, audit)
                 .with_signing_key_public(
                     config
                         .signing_key_public
